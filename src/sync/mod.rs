@@ -82,13 +82,17 @@ impl<T: Transport> SyncEngine<T> {
             let pb = ProgressBar::new(tasks.len() as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
                     .unwrap()
                     .progress_chars("#>-"),
             );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb
         };
 
+        // TODO: Parallel execution with tokio::spawn and semaphore for concurrency control
+        // Current: Sequential execution (simple, correct)
+        // Future: Parallel with Arc<Semaphore> to limit concurrent operations
         for (task_count, task) in tasks.into_iter().enumerate() {
             // Only update progress bar for actual actions or every 10 files
             let should_update = !matches!(task.action, SyncAction::Skip) || task_count % 10 == 0;
