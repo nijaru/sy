@@ -52,62 +52,147 @@ See [DESIGN.md](DESIGN.md) for comprehensive technical decisions.
 
 ## Project Structure
 
+See [DESIGN.md](DESIGN.md) section 2024-2092 for complete module organization.
+
 ```
 sy/
 ├── src/
-│   ├── main.rs           # CLI entry point
-│   ├── sync/             # Core sync logic
-│   │   ├── delta.rs      # rsync algorithm
-│   │   ├── parallel.rs   # Parallel transfers
-│   │   └── resume.rs     # Resume support
-│   ├── hash/             # Hashing (xxHash3, BLAKE3)
-│   ├── compress/         # Compression (zstd, lz4)
-│   ├── transport/        # SSH/local transport
-│   └── ui/               # Progress bars, output
-├── benches/              # Criterion benchmarks
-│   ├── hash_bench.rs
-│   └── compression_bench.rs
-└── tests/                # Integration tests
+│   ├── main.rs                 # CLI entry point
+│   ├── cli.rs                  # Argument parsing (clap)
+│   ├── config.rs               # Config file parsing
+│   │
+│   ├── sync/
+│   │   ├── mod.rs              # Sync orchestration
+│   │   ├── scanner.rs          # Directory traversal
+│   │   ├── strategy.rs         # Transfer strategy selection
+│   │   ├── transfer.rs         # File transfer logic
+│   │   ├── delta.rs            # Rsync algorithm
+│   │   └── resume.rs           # Resume logic
+│   │
+│   ├── integrity/
+│   │   ├── mod.rs
+│   │   ├── hash.rs             # xxHash3, BLAKE3, Adler-32
+│   │   ├── checksum.rs         # Block-level checksums
+│   │   └── verify.rs           # Verification modes
+│   │
+│   ├── transport/
+│   │   ├── mod.rs
+│   │   ├── local.rs            # Local filesystem
+│   │   ├── ssh.rs              # SSH custom protocol
+│   │   ├── sftp.rs             # SFTP fallback
+│   │   └── network.rs          # Network detection
+│   │
+│   ├── compress/
+│   │   ├── mod.rs
+│   │   ├── zstd.rs             # Zstandard
+│   │   ├── lz4.rs              # LZ4
+│   │   └── adaptive.rs         # Compression selection
+│   │
+│   ├── filter/
+│   │   ├── mod.rs
+│   │   ├── gitignore.rs        # Gitignore parser
+│   │   ├── rsync.rs            # Rsync filter rules
+│   │   └── engine.rs           # Filter matching engine
+│   │
+│   ├── progress/
+│   │   ├── mod.rs
+│   │   ├── tracker.rs          # Progress tracking
+│   │   ├── display.rs          # Terminal UI
+│   │   └── eta.rs              # ETA calculation
+│   │
+│   ├── metadata/
+│   │   ├── mod.rs
+│   │   ├── permissions.rs      # Unix permissions
+│   │   ├── xattr.rs            # Extended attributes
+│   │   └── acl.rs              # Access control lists
+│   │
+│   ├── error.rs                # Error types
+│   ├── bandwidth.rs            # Token bucket rate limiting
+│   └── ssh_config.rs           # SSH config parsing
+│
+├── tests/
+│   ├── integration/            # Integration tests
+│   ├── property/               # Property tests (proptest)
+│   └── stress/                 # Stress tests
+│
+├── benches/                    # Criterion benchmarks
+├── docs/                       # User documentation
+├── .claude/
+│   └── CLAUDE.md               # AI assistant context
+├── Cargo.toml
+├── README.md
+├── DESIGN.md                   # Comprehensive technical design (2,400+ lines)
+└── CONTRIBUTING.md             # This file
 ```
 
-## Implementation Phases
+## Implementation Roadmap
 
-### Phase 1: Foundation (Current)
-- [x] CLI skeleton with clap
+See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
+
+### Phase 1: MVP (v0.1.0) - **Current Phase**
+**Goal**: Basic local sync working
+
 - [x] Project structure
-- [x] Documentation (README, DESIGN, CONTRIBUTING)
-- [ ] Basic file walking (walkdir + ignore)
-- [ ] Simple copy (no delta, no compression)
+- [x] Documentation (README, DESIGN, CONTRIBUTING, CLAUDE.md)
+- [ ] CLI argument parsing (clap)
+- [ ] Local filesystem traversal (walkdir + ignore)
+- [ ] File comparison (size + mtime)
+- [ ] Full file copy (no delta)
+- [ ] Basic progress display (indicatif)
+- [ ] Unit tests
 
-### Phase 2: Core Sync
-- [ ] rsync algorithm (rolling hash + delta)
-- [ ] xxHash3 integrity checks
-- [ ] Skip unchanged files (size + mtime)
-- [ ] Basic progress bars
+**Deliverable**: `sy /src /dst` works locally
 
-### Phase 3: Parallelization
-- [ ] Parallel file transfers (tokio)
-- [ ] Parallel chunk transfers for large files
-- [ ] Worker pool management
-- [ ] Throughput benchmarks
+### Phase 2: Network Sync (v0.2.0)
+**Goal**: Remote sync via SSH
 
-### Phase 4: Compression
-- [ ] File type detection (skip already-compressed)
-- [ ] Adaptive compression (test network vs CPU)
-- [ ] zstd/lz4 integration
-- [ ] Compression benchmarks
+- [ ] SSH transport layer
+- [ ] SFTP fallback
+- [ ] Network bandwidth detection
+- [ ] SSH config parsing
+- [ ] Basic error handling
 
-### Phase 5: Advanced Features
-- [ ] Resume interrupted transfers
-- [ ] BLAKE3 verification mode
-- [ ] gitignore/syncignore support
-- [ ] Config file support (~/.config/sy/config.toml)
-- [ ] Bandwidth limiting
+**Deliverable**: `sy /src remote:/dst` works
 
-### Phase 6: Transport
-- [ ] SSH integration (use existing ssh, not custom)
-- [ ] Remote path parsing (user@host:/path)
-- [ ] Network error handling
+### Phase 3: Performance (v0.3.0)
+**Goal**: Parallel transfers
+
+- [ ] Parallel file transfers
+- [ ] Parallel chunk transfers
+- [ ] Adaptive compression
+- [ ] Network detection (LAN vs WAN)
+- [ ] Progress UI at scale
+
+**Deliverable**: Fast sync for various scenarios
+
+### Phase 4: Delta Sync (v0.4.0)
+**Goal**: Rsync algorithm
+
+- [ ] Adler-32 rolling hash
+- [ ] Block signature generation
+- [ ] Delta computation
+- [ ] Resume support
+
+**Deliverable**: Efficient updates of changed files
+
+### Phase 5: Reliability (v0.5.0)
+**Goal**: Multi-layer integrity
+
+- [ ] Block-level checksums (xxHash3)
+- [ ] End-to-end verification (BLAKE3)
+- [ ] Verification modes
+- [ ] Atomic operations
+- [ ] Crash recovery
+
+**Deliverable**: Verifiable integrity
+
+### Phases 6-10
+See [DESIGN.md](DESIGN.md) for:
+- Phase 6: Edge cases & advanced features
+- Phase 7: Scale to millions of files
+- Phase 8: UX polish
+- Phase 9: Testing & documentation
+- Phase 10: v1.0 release
 
 ## Testing Strategy
 

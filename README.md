@@ -1,116 +1,208 @@
 # sy
 
-Modern rsync alternative in Rust - Fast, parallel file synchronization with smart compression and beautiful output.
+> Modern file synchronization tool - rsync, reimagined
 
-## Why `sy`?
+**sy** (pronounced "sigh") is a modern file sync tool built in Rust, inspired by the UX of `eza`, `fd`, and `ripgrep`. It's not a drop-in rsync replacement - it's a reimagining of file sync with verifiable integrity, adaptive performance, and transparent tradeoffs.
 
-Modern CLI tools like `fd`, `rg`, `bat`, and `eza` showed that reimplementing classic Unix tools with better defaults and UX creates massive value. `sy` does the same for `rsync`:
+## Status
 
-- **Better defaults** - No more `-avz` incantations; sensible behavior out of the box
-- **Parallel everything** - Multiple files + chunked large files (like rclone's `--multi-thread-streams`)
-- **Smart compression** - Adaptive zstd/lz4 with file-type awareness, or skip entirely on fast networks
-- **Beautiful output** - Progress bars, colors, human-readable sizes (not spam)
-- **Intuitive CLI** - Simple commands that make sense
+🚧 **Design Phase Complete** - Implementation starting 2025 Q1
 
-## Quick Start
+See [DESIGN.md](DESIGN.md) for comprehensive technical design (2,400+ lines of detailed specifications).
+
+## Vision
+
+**The Problem**: rsync is single-threaded, has confusing flags, and doesn't verify integrity end-to-end. Modern tools like rclone are faster but complex. We can do better.
+
+**The Goal**: A file sync tool that:
+- ✅ Auto-detects network conditions and optimizes accordingly
+- ✅ Verifies integrity with multi-layer checksums
+- ✅ Has beautiful progress display and helpful errors
+- ✅ Works great out of the box with smart defaults
+- ✅ Scales from a few files to millions
+
+## Key Features (Planned)
+
+### Adaptive Performance
+```bash
+# Auto-detects: Local? LAN? WAN? Optimizes for each
+sy ~/src /backup                    # Local: max parallelism, no compression
+sy ~/src server:/backup             # LAN: parallel + minimal delta
+sy ~/src remote:/backup             # WAN: compression + delta + BBR
+```
+
+### Verifiable Integrity
+```bash
+# Multiple verification modes
+sy ~/src remote:/dst                # Fast: xxHash3 block checksums
+sy ~/src remote:/dst --verify       # Cryptographic: BLAKE3 end-to-end
+sy ~/src remote:/dst --paranoid     # Maximum: multiple passes + comparison reads
+```
+
+### Beautiful UX
+```
+Syncing ~/src → remote:/dest
+
+[████████████████████----] 75% | 15.2 GB/s | ETA 12s
+  ├─ config.json ✓
+  ├─ database.db ⣾ (chunk 45/128, 156 MB/s)
+  └─ videos/large.mp4 ⏸ (queued)
+
+Files: 1,234 total | 892 synced | 312 skipped | 30 queued
+```
+
+### Smart Defaults
+- Auto-detects gitignore patterns in repositories
+- Refuses to delete >50% of destination (safety check)
+- Warns about file descriptor limits before hitting them
+- Detects sparse files and transfers efficiently
+- Handles cross-platform filename conflicts
+
+## Comparison
+
+| Feature | rsync | rclone | sy |
+|---------|-------|--------|-----|
+| Parallel file transfers | ❌ | ✅ | ✅ |
+| Parallel chunk transfers | ❌ | ✅ | ✅ |
+| Delta sync | ✅ | ❌ | ✅ |
+| End-to-end checksums | ❌ | ✅ | ✅ |
+| Adaptive compression | ❌ | ❌ | ✅ |
+| Network auto-detection | ❌ | ❌ | ✅ |
+| Modern UX | ❌ | ⚠️ | ✅ |
+| Config files | ❌ | ✅ | ✅ |
+
+## Example Usage
 
 ```bash
 # Basic sync
 sy ./src remote:/dest
 
-# Preview changes first
-sy ./src remote:/dest --preview
+# Preview changes (dry-run)
+sy ./src remote:/dest --dry-run
 
-# Fast mode (LZ4 compression)
-sy ./src remote:/dest --fast
+# Mirror (delete files not in source)
+sy ./src remote:/dest --delete
 
-# Max compression for slow networks
-sy ./src remote:/dest --max-compression
+# Fast LAN transfer
+sy ./src nas:/backup --mode lan
 
-# Verify integrity after transfer
-sy ./src remote:/dest --verify
+# WAN with compression
+sy ./src server:/backup --mode wan
+
+# Maximum verification
+sy ./important remote:/backup --paranoid
+
+# Use saved profile
+sy backup-home  # Uses ~/.config/sy/config.toml
 ```
 
-## Key Features
+## Design Highlights
 
-### Performance
-- **Parallel file transfers** - Configurable worker threads
-- **Parallel chunk transfers** - Split large files, transfer chunks concurrently
-- **Fast hashing** - xxHash3 (10x faster than MD5) for integrity checks
-- **Smart delta sync** - rsync algorithm with modern optimizations
+### Reliability: Multi-Layer Defense
+- **Layer 1**: TCP checksums (99.99% detection)
+- **Layer 2**: xxHash3 per-block (fast corruption detection)
+- **Layer 3**: BLAKE3 end-to-end (cryptographic verification)
+- **Layer 4**: Optional multiple passes + comparison reads
 
-### Compression
-- **Adaptive** - Tests network vs CPU speed, chooses best strategy
-- **File-type aware** - Skips already-compressed files (.jpg, .mp4, .zip, etc.)
-- **Modern algorithms** - zstd (balanced), lz4 (fast), or none (LAN speeds)
-- **Auto-tuning** - Benchmarks first chunk, caches decision per connection
+Research shows 5% of 100 Gbps transfers have corruption TCP doesn't detect. We verify at multiple layers.
 
-### Safety & Reliability
-- **Atomic operations** - Safe transfers, no partial corruption
-- **Resume support** - Continue interrupted transfers
-- **Preview mode** - See changes before applying
-- **Verification** - Optional BLAKE3 cryptographic checksums
+### Performance: Adaptive Strategies
+Different scenarios need different approaches:
+- **Local**: Maximum parallelism, kernel optimizations (copy_file_range, clonefile)
+- **LAN**: Parallel transfers, selective delta, minimal compression
+- **WAN**: Delta sync, adaptive compression, BBR congestion control
 
-### UX
-- **gitignore support** - Respects `.gitignore` and `.syncignore` files
-- **Config files** - Save common sync pairs in `~/.config/sy/config.toml`
-- **Clear errors** - "Permission denied on /path/file.txt" not cryptic codes
-- **Progress bars** - Real-time speed, ETA, file/overall progress
+### Scale: Millions of Files
+- Stream processing (no loading entire tree into RAM)
+- Bloom filters for efficient deletion
+- State caching for incremental syncs
+- Parallel directory traversal
 
-## Design Philosophy
+See [DESIGN.md](DESIGN.md) for full technical details.
 
-Inspired by modern Rust CLI tools:
-- **Minimal** - Short command like `fd`, obvious meaning
-- **Smart** - Good defaults, don't require flags for common use
-- **Fast** - Rust performance, parallel operations
-- **Beautiful** - Terminal UX matters
+## Design Complete! ✅
 
-## Technical Stack
+The design phase is finished with comprehensive specifications for:
 
-- **rsync algorithm** - Rolling hash + checksums (state-of-the-art for delta sync)
-- **xxHash3** - Fast integrity checks (non-cryptographic)
-- **BLAKE3** - Cryptographic verification when requested
-- **zstd/lz4** - Modern compression algorithms
-- **tokio** - Async runtime for parallel operations
-- **indicatif** - Beautiful progress bars
+1. **Core Architecture** - Parallel sync, delta algorithm, integrity verification
+2. **Edge Cases** - 8 major categories (symlinks, sparse files, cross-platform, etc.)
+3. **Advanced Features** - Filters, bandwidth limiting, progress UI, SSH integration
+4. **Error Handling** - Threshold-based with categorization and reporting
+5. **Testing Strategy** - Unit, integration, property, and stress tests
+6. **Implementation Roadmap** - 10 phases from MVP to v1.0
 
-## Roadmap
+Total design document: **2,400+ lines** of detailed specifications, code examples, and rationale.
 
-- [ ] Core rsync algorithm implementation
-- [ ] Parallel file transfers
-- [ ] Parallel chunk transfers for large files
-- [ ] Adaptive compression with file-type detection
-- [ ] gitignore/syncignore support
-- [ ] Config file support
-- [ ] Bandwidth limiting
-- [ ] Resume interrupted transfers
-- [ ] Verification mode with BLAKE3
-- [ ] SSH transport layer
+## Implementation Roadmap
 
-## Development
+### Phase 1: MVP (v0.1.0)
+- Basic local sync
+- File comparison (size + mtime)
+- Full file copy
+- Simple progress display
 
-Built with modern Rust tooling:
+### Phase 2: Network Sync (v0.2.0)
+- SSH transport
+- SFTP fallback
+- Network detection
+- SSH config integration
 
-```bash
-# Setup (using uv)
-uv sync
+### Phase 3: Performance (v0.3.0)
+- Parallel file transfers
+- Parallel chunk transfers
+- Adaptive compression
+- Progress UI at scale
 
-# Run
-uv run sy --help
+### Phase 4: Delta Sync (v0.4.0)
+- Rsync algorithm (Adler-32)
+- Block signatures
+- Delta computation
+- Resume support
 
-# Test
-uv run pytest
+### Phase 5: Reliability (v0.5.0)
+- Multi-layer checksums
+- Verification modes
+- Atomic operations
+- Crash recovery
 
-# Benchmark
-uv run criterion
-```
+### Phases 6-10
+- Edge cases & advanced features
+- Extreme scale optimization
+- UX polish
+- Testing & documentation
+- v1.0 release
 
-## Inspiration
+## Contributing
 
-- Modern CLI tools: `fd`, `rg`, `bat`, `eza`, `dust`
-- Fast sync: `rclone` parallel transfers, `rsync` algorithm
-- Research: xxHash3/BLAKE3 performance, zstd adaptive compression
+Design phase is complete. Implementation starting soon!
+
+Interested in contributing? Areas we'll need help with:
+- Rsync algorithm implementation
+- SSH protocol optimization
+- Cross-platform testing
+- Performance benchmarking
+- Documentation
 
 ## License
 
 MIT
+
+## Acknowledgments
+
+Inspired by:
+- **rsync** - The algorithm that started it all
+- **rclone** - Proof that parallel transfers work
+- **eza**, **fd**, **ripgrep** - Beautiful UX in Rust CLI tools
+- **Syncthing** - Block-based integrity model
+
+Research that informed the design:
+- **Jeff Geerling** (2025) - rclone vs rsync benchmarks
+- **ACM 2024** - "QUIC is not Quick Enough over Fast Internet"
+- **ScienceDirect 2021** - File transfer corruption studies
+- **Multiple papers** - rsync algorithm analysis, hash performance, compression strategies
+
+---
+
+**Next Steps**: Begin Phase 1 implementation (MVP - basic local sync)
+
+**Questions?** See [DESIGN.md](DESIGN.md) for comprehensive technical details.
