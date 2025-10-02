@@ -324,14 +324,46 @@ enum SyncError {
 1. **Create feature branch**: `git checkout -b feature/parallel-chunks`
 2. **Write tests**: Cover new functionality
 3. **Benchmark if perf-related**: Show before/after numbers
-4. **Update docs**: README, DESIGN.md if architecture changes
-5. **Clean commits**: Squash WIP commits, write clear messages
-6. **Run checks**:
+4. **Check performance**: Run regression tests and benchmarks
+5. **Update docs**: README, DESIGN.md if architecture changes
+6. **Clean commits**: Squash WIP commits, write clear messages
+7. **Run checks**:
    ```bash
    cargo test
+   cargo test --release --test performance_test
    cargo clippy -- -D warnings
    cargo fmt -- --check
    ```
+
+### Performance-Related Changes
+
+If your PR affects performance:
+
+1. **Run performance regression tests**:
+   ```bash
+   cargo test --release --test performance_test -- --nocapture
+   ```
+
+2. **Benchmark against main branch**:
+   ```bash
+   ./scripts/bench-compare.sh main
+   ```
+
+3. **Include results in PR description**:
+   ```markdown
+   ## Performance Impact
+
+   Benchmarked against main branch:
+   - sync_small_files/100: -15.2% (faster) ✓
+   - sync_large_files/10MB: +2.1% (within threshold)
+   - All regression tests passing
+   ```
+
+4. **Update baselines if intentionally faster**:
+   - Update thresholds in `tests/performance_test.rs`
+   - Document improvement in CHANGELOG.md
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed performance testing guide.
 
 ## Questions?
 
