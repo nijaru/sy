@@ -114,8 +114,8 @@ src/
 - ssh2: Mature, C bindings, widely used
 - Consolidated all sync operations in single spawn_blocking for proper async/sync boundary handling
 
-**Completed**: 2025-10-01
-**Commits**: TBD
+**Completed**: 2025-10-02
+**Commits**: c308b45
 
 ### Task 4: Remote Scanner (Week 2-3) ✅ **COMPLETE**
 
