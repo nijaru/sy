@@ -37,7 +37,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         }
 
         if !source.is_dir {
-            self.copy_file(&source.path, dest_path).await?;
+            // Use delta sync for updates
+            self.transport.sync_file_with_delta(&source.path, dest_path).await?;
+            tracing::info!("Updated: {} -> {}", source.path.display(), dest_path.display());
         }
 
         Ok(())
