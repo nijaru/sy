@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2025-10-02
+
+### Added
+- **Delta Sync Implementation** - Full rsync algorithm for efficient file updates
+  - Adler-32 rolling hash for fast block matching
+  - xxHash3 strong checksums for block verification
+  - Adaptive block size calculation (√filesize, capped 512B-128KB)
+  - Partial block matching for file-end edge cases
+  - Compression ratio reporting (% literal data transferred)
+- Delta sync support for LocalTransport (local-to-local sync)
+- Delta sync support for SshTransport (local-to-remote sync via SFTP)
+- Delta sync support for DualTransport (automatic routing)
+- Atomic file updates via temp file + rename pattern
+- `sync_file_with_delta()` method in Transport trait
+
+### Changed
+- File updates now use delta sync instead of full copy when beneficial
+- Transferrer now calls `sync_file_with_delta()` for file updates
+- Added `tempfile` as regular dependency (was dev-only)
+- Module structure: added `mod delta;` to binary crate for proper resolution
+
+### Fixed
+- Cargo module resolution issue preventing delta module access from binary
+- Edge case: Block count calculation for partial blocks (test expectation fix)
+- Edge case: Partial block matching at file end now works correctly
+
+### Performance
+- **50MB file with 1KB change**: Delta sync transfers only changed blocks (0.0% literal data)
+- **Bandwidth savings**: Dramatically reduced for incremental updates
+- Downloads remote file for checksum computation (future: compute checksums remotely)
+
+### Testing
+- Added 21 delta sync tests (total: 64 tests, all passing)
+- Tests cover: block size calculation, rolling hash, checksum computation, delta generation, delta application
+- End-to-end validation of delta sync for both local and remote scenarios
+
+### Documentation
+- Updated README with delta sync features and benefits
+- Updated comparison table showing delta sync implemented
+- Updated roadmap to show Phase 2 progress (SSH + Delta)
+- Added delta sync usage examples
+
+### Technical
+- **Delta Module Structure**:
+  - `delta/mod.rs` - Block size calculation
+  - `delta/rolling.rs` - Adler-32 rolling hash (156 test iterations)
+  - `delta/checksum.rs` - xxHash3 strong checksums + block metadata
+  - `delta/generator.rs` - Delta operation generation (Copy/Data ops)
+  - `delta/applier.rs` - Delta application with temp file atomicity
+- **Algorithm**: Classic rsync (Andrew Tridgell 1996) with modern hashes
+- **Block Operations**: Copy {offset, size} for matches, Data(Vec<u8>) for literals
+- **Hash Map Lookup**: O(1) weak hash lookup, strong hash verification on collision
+
 ## [0.0.2] - 2025-10-02
 
 ### Added
