@@ -1,4 +1,5 @@
 pub mod local;
+pub mod ssh;
 
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
