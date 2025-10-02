@@ -52,7 +52,9 @@ impl<T: Transport> SyncEngine<T> {
         let mut tasks = Vec::with_capacity(source_files.len());
 
         for file in &source_files {
-            let task = planner.plan_file(file, destination);
+            let task = planner
+                .plan_file_async(file, destination, &self.transport)
+                .await?;
             tasks.push(task);
         }
 

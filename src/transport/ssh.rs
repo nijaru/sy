@@ -62,6 +62,9 @@ impl SshTransport {
             )))
         })?;
 
+        let mut stderr = String::new();
+        let _ = channel.stderr().read_to_string(&mut stderr);
+
         channel.wait_close().map_err(|e| {
             SyncError::Io(std::io::Error::other(format!("Failed to close channel: {}", e)))
         })?;
@@ -75,8 +78,8 @@ impl SshTransport {
 
         if exit_status != 0 {
             return Err(SyncError::Io(std::io::Error::other(format!(
-                "Command failed with exit code {}: {}",
-                exit_status, output
+                "Command '{}' failed with exit code {}\nstdout: {}\nstderr: {}",
+                command, exit_status, output, stderr
             ))));
         }
 

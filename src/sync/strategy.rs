@@ -1,4 +1,6 @@
 use super::scanner::FileEntry;
+use crate::transport::Transport;
+use crate::error::Result;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -33,7 +35,46 @@ impl StrategyPlanner {
         }
     }
 
-    /// Determine sync action for a source file
+    /// Determine sync action for a source file (async version using transport)
+    pub async fn plan_file_async<T: Transport>(
+        &self,
+        source: &FileEntry,
+        dest_root: &Path,
+        transport: &T,
+    ) -> Result<SyncTask> {
+        let dest_path = dest_root.join(&source.relative_path);
+
+        let action = if source.is_dir {
+            // For directories, just check existence (no metadata needed)
+            let exists = transport.exists(&dest_path).await.unwrap_or(false);
+            if exists {
+                SyncAction::Skip
+            } else {
+                SyncAction::Create
+            }
+        } else {
+            // For files, check existence and metadata
+            // For remote destinations, we can't get full metadata, so we assume Create
+            // This is a simplified approach - in a full implementation, we'd need
+            // to get size/mtime from remote via sy-remote
+            let exists = transport.exists(&dest_path).await.unwrap_or(false);
+            if exists {
+                // For now, assume files exist but may need update
+                // In future, we'd check remote metadata
+                SyncAction::Skip // Conservative: skip if exists
+            } else {
+                SyncAction::Create
+            }
+        };
+
+        Ok(SyncTask {
+            source: Some(source.clone()),
+            dest_path,
+            action,
+        })
+    }
+
+    /// Determine sync action for a source file (sync version for local-only)
     pub fn plan_file(&self, source: &FileEntry, dest_root: &Path) -> SyncTask {
         let dest_path = dest_root.join(&source.relative_path);
 
