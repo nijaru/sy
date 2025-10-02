@@ -15,8 +15,9 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
-# Async runtime (Phase 1: minimal usage)
-tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
+# Async runtime (Phase 2: used for transport abstraction)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+async-trait = "0.1"
 
 # Filesystem
 walkdir = "2"
