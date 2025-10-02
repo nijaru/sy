@@ -1,6 +1,6 @@
 [package]
 name = "sy"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 authors = ["Nick Russo <nick@nijaru.dev>"]
 description = "Modern rsync alternative - Fast, parallel file synchronization"
@@ -48,6 +48,7 @@ ssh2 = "0.9"
 whoami = "1"
 dirs = "5"
 regex = "1"
+futures = "0.3.31"
 
 [dev-dependencies]
 criterion = "0.5"

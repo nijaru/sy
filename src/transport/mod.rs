@@ -63,3 +63,36 @@ pub trait Transport: Send + Sync {
     /// Remove a file or directory
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()>;
 }
+
+// Implement Transport for Arc<T> where T: Transport
+// This allows sharing transports across tasks in parallel execution
+#[async_trait]
+impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
+    async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        (**self).scan(path).await
+    }
+
+    async fn exists(&self, path: &Path) -> Result<bool> {
+        (**self).exists(path).await
+    }
+
+    async fn metadata(&self, path: &Path) -> Result<std::fs::Metadata> {
+        (**self).metadata(path).await
+    }
+
+    async fn create_dir_all(&self, path: &Path) -> Result<()> {
+        (**self).create_dir_all(path).await
+    }
+
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
+        (**self).copy_file(source, dest).await
+    }
+
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
+        (**self).sync_file_with_delta(source, dest).await
+    }
+
+    async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
+        (**self).remove(path, is_dir).await
+    }
+}
