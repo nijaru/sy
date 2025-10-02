@@ -1,0 +1,30 @@
+[package]
+name = "sy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nick Russo <nick@nijaru.dev>"]
+description = "Modern rsync alternative - Fast, parallel file synchronization"
+repository = "https://github.com/nijaru/sy"
+license = "MIT"
+keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "cargo"] }
+tokio = { version = "1", features = ["full"] }
+indicatif = "0.17"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
+zstd = "0.13"
+lz4_flex = "0.11"
+walkdir = "2"
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+proptest = "1"
