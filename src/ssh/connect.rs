@@ -30,8 +30,8 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
             std::io::Error::other(format!("Failed to create SSH session: {}", e))
         ))?;
 
-        // Set session to non-blocking for async
-        session.set_blocking(false);
+        // Keep session blocking for handshake and authentication
+        // (we're already in spawn_blocking context)
         session.set_timeout(DEFAULT_TIMEOUT.as_millis() as u32);
 
         // Set TCP stream
