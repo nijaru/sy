@@ -133,15 +133,18 @@ impl Transport for LocalTransport {
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // For local-to-local operations, delta sync overhead exceeds benefit
-        // The cost of computing checksums + rolling hash + delta generation/application
-        // is higher than direct file copy for local files.
+        // Even with O(1) rolling hash, the overhead of:
+        // - Computing checksums for destination file
+        // - Generating delta operations
+        // - Applying delta (random seeks + writes)
+        // exceeds the cost of a simple sequential copy for local files.
         //
         // Delta sync is beneficial for:
         // - Remote transfers (network bandwidth limited)
-        // - Very large files with small changes
+        // - Very large files (>1GB) with small changes
         //
-        // TODO: Optimize rolling hash (currently O(n*block_size) instead of O(n))
-        // TODO: Add heuristic to enable delta sync for very large local files
+        // TODO: Add size-based heuristic (e.g., enable for files >1GB)
+        // TODO: Benchmark on SSDs vs HDDs
         tracing::debug!("Local transport: using full copy (delta sync disabled for local-to-local)");
         return self.copy_file(source, dest).await;
 
