@@ -6,7 +6,17 @@
 
 ## Status
 
-🚧 **Design Phase Complete** - Implementation starting 2025 Q1
+✅ **Phase 1 MVP Complete** - Basic local sync working!
+
+```bash
+# Install (from source)
+cargo install --path .
+
+# Basic usage
+sy /source /destination           # Sync directories
+sy /source /destination --dry-run # Preview changes
+sy /source /destination --delete  # Mirror mode
+```
 
 See [DESIGN.md](DESIGN.md) for comprehensive technical design (2,400+ lines of detailed specifications).
 
@@ -135,11 +145,13 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 
 ## Implementation Roadmap
 
-### Phase 1: MVP (v0.1.0)
-- Basic local sync
-- File comparison (size + mtime)
-- Full file copy
-- Simple progress display
+### ✅ Phase 1: MVP (v0.1.0) - COMPLETE
+- ✅ Basic local sync
+- ✅ File comparison (size + mtime)
+- ✅ Full file copy
+- ✅ Simple progress display
+- ✅ .gitignore support
+- ✅ Dry-run and delete modes
 
 ### Phase 2: Network Sync (v0.2.0)
 - SSH transport

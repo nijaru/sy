@@ -10,19 +10,35 @@ keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
-clap = { version = "4", features = ["derive", "cargo"] }
-tokio = { version = "1", features = ["full"] }
-indicatif = "0.17"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-blake3 = "1"
-zstd = "0.13"
-lz4_flex = "0.11"
-walkdir = "2"
-ignore = "0.4"
+# CLI & Config
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+# Async runtime (Phase 1: minimal usage)
+tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
+
+# Filesystem
+walkdir = "2"
+ignore = "0.4"
+filetime = "0.2"
+
+# Progress & Logging
+indicatif = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
 anyhow = "1"
 thiserror = "1"
+
+# Hash functions (for future phases, included now to avoid rebuild churn)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
+
+# Compression (for future phases)
+zstd = "0.13"
+lz4_flex = "0.11"
 
 [dev-dependencies]
 criterion = "0.5"
