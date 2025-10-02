@@ -131,6 +131,21 @@ impl Transport for LocalTransport {
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+        // For local-to-local operations, delta sync overhead exceeds benefit
+        // The cost of computing checksums + rolling hash + delta generation/application
+        // is higher than direct file copy for local files.
+        //
+        // Delta sync is beneficial for:
+        // - Remote transfers (network bandwidth limited)
+        // - Very large files with small changes
+        //
+        // TODO: Optimize rolling hash (currently O(n*block_size) instead of O(n))
+        // TODO: Add heuristic to enable delta sync for very large local files
+        tracing::debug!("Local transport: using full copy (delta sync disabled for local-to-local)");
+        return self.copy_file(source, dest).await;
+
+        // Original delta sync code (disabled for performance reasons)
+        /*
         // Check if destination exists
         if !self.exists(dest).await? {
             tracing::debug!("Destination doesn't exist, using full copy");
@@ -212,6 +227,7 @@ impl Transport for LocalTransport {
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+        */
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
