@@ -71,7 +71,8 @@ sy /source /destination -vv     # Trace level
 - **Rsync Algorithm**: Uses Adler-32 rolling hash + xxHash3 strong checksums
 - **Block-Level Updates**: Only transfers changed blocks, not entire files
 - **Adaptive Block Size**: Automatically calculates optimal block size (√filesize)
-- **Local & Remote**: Works for both local-to-local and local-to-remote (SSH)
+- **Remote Operations**: Enabled for SSH/SFTP transfers (network bandwidth is bottleneck)
+- **Local Operations**: Disabled (computation overhead exceeds copy cost)
 - **Compression Reporting**: Shows exactly how much data was saved
 
 ### 📋 Common Use Cases

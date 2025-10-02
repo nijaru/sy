@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Delta sync disabled for local-to-local operations (191x performance improvement)
+- LocalTransport now uses direct copy instead of delta sync
+
+### Performance
+- **Local sync improvement**: 26.9s → 0.14s (191x faster)
+- Root cause: Rolling hash O(n*block_size) overhead exceeds local copy benefit
+- Decision: Keep delta sync for remote operations where network cost dominates
+
 ## [0.0.3] - 2025-10-02
 
 ### Added
