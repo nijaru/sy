@@ -1,6 +1,7 @@
 mod cli;
 mod error;
 mod sync;
+mod transport;
 
 use anyhow::Result;
 use clap::Parser;
