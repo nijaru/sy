@@ -167,6 +167,12 @@ See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
 - [ ] Network detection (LAN vs WAN)
 - [ ] Progress UI at scale
 
+**Implementation techniques**:
+- [ ] Parallel scanning with rayon (scan source and destination concurrently)
+- [ ] Parallel file operations with rayon (concurrent file copies)
+- [ ] Memory-mapped I/O for very large files (>100MB)
+- [ ] Async I/O with tokio for network operations
+
 **Deliverable**: Fast sync for various scenarios
 
 ### Phase 4: Delta Sync (v0.4.0)
