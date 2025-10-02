@@ -75,6 +75,7 @@ impl StrategyPlanner {
     }
 
     /// Determine sync action for a source file (sync version for local-only)
+    #[allow(dead_code)]
     pub fn plan_file(&self, source: &FileEntry, dest_root: &Path) -> SyncTask {
         let dest_path = dest_root.join(&source.relative_path);
 

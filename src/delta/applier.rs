@@ -34,6 +34,7 @@ pub fn apply_delta(old_file: &Path, delta: &Delta, new_file: &Path) -> io::Resul
 }
 
 /// Apply delta when there's no old file (full reconstruction from literals)
+#[allow(dead_code)]
 pub fn apply_delta_no_base(delta: &Delta, new_file: &Path) -> io::Result<()> {
     let mut new = File::create(new_file)?;
 

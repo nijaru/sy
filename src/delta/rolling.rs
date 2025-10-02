@@ -89,6 +89,7 @@ impl Adler32 {
     }
 
     /// Reset the hasher
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.a = 1;
         self.b = 0;
