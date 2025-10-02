@@ -54,16 +54,16 @@ impl StrategyPlanner {
             }
         } else {
             // For files, check existence and metadata
-            // For remote destinations, we can't get full metadata, so we assume Create
-            // This is a simplified approach - in a full implementation, we'd need
-            // to get size/mtime from remote via sy-remote
-            let exists = transport.exists(&dest_path).await.unwrap_or(false);
-            if exists {
-                // For now, assume files exist but may need update
-                // In future, we'd check remote metadata
-                SyncAction::Skip // Conservative: skip if exists
-            } else {
-                SyncAction::Create
+            match transport.metadata(&dest_path).await {
+                Ok(dest_meta) => {
+                    let needs_update = self.needs_update(source, &dest_meta);
+                    if needs_update {
+                        SyncAction::Update
+                    } else {
+                        SyncAction::Skip
+                    }
+                }
+                Err(_) => SyncAction::Create,
             }
         };
 

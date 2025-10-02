@@ -1,4 +1,4 @@
-use super::{local::LocalTransport, ssh::SshTransport, Transport};
+use super::{dual::DualTransport, local::LocalTransport, ssh::SshTransport, Transport};
 use crate::error::Result;
 use crate::path::SyncPath;
 use crate::ssh::config::{parse_ssh_config, SshConfig};
@@ -10,7 +10,7 @@ use std::path::Path;
 /// This allows SyncEngine to work with both local and remote paths seamlessly.
 pub enum TransportRouter {
     Local(LocalTransport),
-    Ssh(SshTransport),
+    Dual(DualTransport),
 }
 
 impl TransportRouter {
@@ -18,8 +18,8 @@ impl TransportRouter {
     ///
     /// Rules:
     /// - Local → Local: Use LocalTransport
-    /// - Remote → Local: Use SshTransport (pull)
-    /// - Local → Remote: Use SshTransport (push)
+    /// - Remote → Local: Use DualTransport (SSH for source, Local for dest)
+    /// - Local → Remote: Use DualTransport (Local for source, SSH for dest)
     /// - Remote → Remote: Not supported yet (would require two SSH connections)
     pub async fn new(source: &SyncPath, destination: &SyncPath) -> Result<Self> {
         match (source, destination) {
@@ -27,23 +27,39 @@ impl TransportRouter {
                 // Both local: use local transport
                 Ok(TransportRouter::Local(LocalTransport::new()))
             }
-            (SyncPath::Remote { host, user, .. }, SyncPath::Local(_))
-            | (SyncPath::Local(_), SyncPath::Remote { host, user, .. }) => {
-                // One is remote: use SSH transport
+            (SyncPath::Local(_), SyncPath::Remote { host, user, .. }) => {
+                // Local → Remote: use DualTransport
                 let config = if let Some(user) = user {
-                    // Explicit user provided
                     SshConfig {
                         hostname: host.clone(),
                         user: user.clone(),
                         ..Default::default()
                     }
                 } else {
-                    // Parse from SSH config
                     parse_ssh_config(host)?
                 };
 
-                let ssh_transport = SshTransport::new(&config).await?;
-                Ok(TransportRouter::Ssh(ssh_transport))
+                let source_transport = Box::new(LocalTransport::new());
+                let dest_transport = Box::new(SshTransport::new(&config).await?);
+                let dual = DualTransport::new(source_transport, dest_transport);
+                Ok(TransportRouter::Dual(dual))
+            }
+            (SyncPath::Remote { host, user, .. }, SyncPath::Local(_)) => {
+                // Remote → Local: use DualTransport
+                let config = if let Some(user) = user {
+                    SshConfig {
+                        hostname: host.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    parse_ssh_config(host)?
+                };
+
+                let source_transport = Box::new(SshTransport::new(&config).await?);
+                let dest_transport = Box::new(LocalTransport::new());
+                let dual = DualTransport::new(source_transport, dest_transport);
+                Ok(TransportRouter::Dual(dual))
             }
             (SyncPath::Remote { .. }, SyncPath::Remote { .. }) => {
                 // Both remote: not supported yet
@@ -60,42 +76,42 @@ impl Transport for TransportRouter {
     async fn scan(&self, path: &Path) -> Result<Vec<crate::sync::scanner::FileEntry>> {
         match self {
             TransportRouter::Local(t) => t.scan(path).await,
-            TransportRouter::Ssh(t) => t.scan(path).await,
+            TransportRouter::Dual(t) => t.scan(path).await,
         }
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
         match self {
             TransportRouter::Local(t) => t.exists(path).await,
-            TransportRouter::Ssh(t) => t.exists(path).await,
+            TransportRouter::Dual(t) => t.exists(path).await,
         }
     }
 
     async fn metadata(&self, path: &Path) -> Result<std::fs::Metadata> {
         match self {
             TransportRouter::Local(t) => t.metadata(path).await,
-            TransportRouter::Ssh(t) => t.metadata(path).await,
+            TransportRouter::Dual(t) => t.metadata(path).await,
         }
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
         match self {
             TransportRouter::Local(t) => t.create_dir_all(path).await,
-            TransportRouter::Ssh(t) => t.create_dir_all(path).await,
+            TransportRouter::Dual(t) => t.create_dir_all(path).await,
         }
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
         match self {
             TransportRouter::Local(t) => t.copy_file(source, dest).await,
-            TransportRouter::Ssh(t) => t.copy_file(source, dest).await,
+            TransportRouter::Dual(t) => t.copy_file(source, dest).await,
         }
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
         match self {
             TransportRouter::Local(t) => t.remove(path, is_dir).await,
-            TransportRouter::Ssh(t) => t.remove(path, is_dir).await,
+            TransportRouter::Dual(t) => t.remove(path, is_dir).await,
         }
     }
 }

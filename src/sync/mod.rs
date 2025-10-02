@@ -65,7 +65,7 @@ impl<T: Transport> SyncEngine<T> {
         }
 
         // Execute sync operations
-        let transferrer = Transferrer::new(self.dry_run);
+        let transferrer = Transferrer::new(&self.transport, self.dry_run);
         let mut stats = SyncStats {
             files_scanned: source_files.len(),
             files_created: 0,
@@ -106,7 +106,7 @@ impl<T: Transport> SyncEngine<T> {
             match task.action {
                 SyncAction::Create => {
                     if let Some(source) = &task.source {
-                        transferrer.create(source, &task.dest_path)?;
+                        transferrer.create(source, &task.dest_path).await?;
                         stats.files_created += 1;
                         if !source.is_dir {
                             stats.bytes_transferred += source.size;
@@ -115,7 +115,7 @@ impl<T: Transport> SyncEngine<T> {
                 }
                 SyncAction::Update => {
                     if let Some(source) = &task.source {
-                        transferrer.update(source, &task.dest_path)?;
+                        transferrer.update(source, &task.dest_path).await?;
                         stats.files_updated += 1;
                         if !source.is_dir {
                             stats.bytes_transferred += source.size;
@@ -126,7 +126,8 @@ impl<T: Transport> SyncEngine<T> {
                     stats.files_skipped += 1;
                 }
                 SyncAction::Delete => {
-                    transferrer.delete(&task.dest_path)?;
+                    let is_dir = task.dest_path.is_dir();
+                    transferrer.delete(&task.dest_path, is_dir).await?;
                     stats.files_deleted += 1;
                 }
             }

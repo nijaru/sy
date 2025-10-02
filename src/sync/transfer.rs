@@ -1,88 +1,74 @@
-use crate::error::{Result, SyncError};
+use crate::error::Result;
 use crate::sync::scanner::FileEntry;
-use std::fs;
+use crate::transport::Transport;
 use std::path::Path;
 
-pub struct Transferrer {
+pub struct Transferrer<'a, T: Transport> {
+    transport: &'a T,
     dry_run: bool,
 }
 
-impl Transferrer {
-    pub fn new(dry_run: bool) -> Self {
-        Self { dry_run }
+impl<'a, T: Transport> Transferrer<'a, T> {
+    pub fn new(transport: &'a T, dry_run: bool) -> Self {
+        Self { transport, dry_run }
     }
 
     /// Create a new file or directory
-    pub fn create(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
+    pub async fn create(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
         if self.dry_run {
             tracing::info!("Would create: {}", dest_path.display());
             return Ok(());
         }
 
         if source.is_dir {
-            self.create_directory(dest_path)?;
+            self.create_directory(dest_path).await?;
         } else {
-            self.copy_file(&source.path, dest_path)?;
+            self.copy_file(&source.path, dest_path).await?;
         }
 
         Ok(())
     }
 
     /// Update an existing file
-    pub fn update(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
+    pub async fn update(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
         if self.dry_run {
             tracing::info!("Would update: {}", dest_path.display());
             return Ok(());
         }
 
         if !source.is_dir {
-            self.copy_file(&source.path, dest_path)?;
+            self.copy_file(&source.path, dest_path).await?;
         }
 
         Ok(())
     }
 
     /// Delete a file or directory
-    pub fn delete(&self, dest_path: &Path) -> Result<()> {
+    pub async fn delete(&self, dest_path: &Path, is_dir: bool) -> Result<()> {
         if self.dry_run {
             tracing::info!("Would delete: {}", dest_path.display());
             return Ok(());
         }
 
-        if dest_path.is_dir() {
-            fs::remove_dir_all(dest_path).map_err(SyncError::Io)?;
-        } else {
-            fs::remove_file(dest_path).map_err(SyncError::Io)?;
-        }
-
+        self.transport.remove(dest_path, is_dir).await?;
         tracing::info!("Deleted: {}", dest_path.display());
         Ok(())
     }
 
-    fn create_directory(&self, path: &Path) -> Result<()> {
-        fs::create_dir_all(path).map_err(SyncError::Io)?;
+    async fn create_directory(&self, path: &Path) -> Result<()> {
+        self.transport.create_dir_all(path).await?;
         tracing::debug!("Created directory: {}", path.display());
         Ok(())
     }
 
-    fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(SyncError::Io)?;
+            self.transport.create_dir_all(parent).await?;
         }
 
-        // Copy file
-        fs::copy(source, dest).map_err(|e| SyncError::CopyError {
-            path: source.to_path_buf(),
-            source: e,
-        })?;
-
-        // Preserve modification time
-        if let Ok(source_meta) = fs::metadata(source) {
-            if let Ok(mtime) = source_meta.modified() {
-                let _ = filetime::set_file_mtime(dest, filetime::FileTime::from_system_time(mtime));
-            }
-        }
+        // Copy file using transport
+        self.transport.copy_file(source, dest).await?;
 
         tracing::debug!("Copied: {} -> {}", source.display(), dest.display());
         Ok(())
@@ -92,12 +78,14 @@ impl Transferrer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::local::LocalTransport;
+    use std::fs;
     use std::path::PathBuf;
     use std::time::SystemTime;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_copy_file() {
+    #[tokio::test]
+    async fn test_copy_file() {
         let source_dir = TempDir::new().unwrap();
         let dest_dir = TempDir::new().unwrap();
 
@@ -112,16 +100,17 @@ mod tests {
             is_dir: false,
         };
 
-        let transferrer = Transferrer::new(false);
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false);
         let dest_path = dest_dir.path().join("test.txt");
-        transferrer.create(&file_entry, &dest_path).unwrap();
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
 
         assert!(dest_path.exists());
         assert_eq!(fs::read_to_string(&dest_path).unwrap(), "test content");
     }
 
-    #[test]
-    fn test_dry_run() {
+    #[tokio::test]
+    async fn test_dry_run() {
         let source_dir = TempDir::new().unwrap();
         let dest_dir = TempDir::new().unwrap();
 
@@ -136,16 +125,17 @@ mod tests {
             is_dir: false,
         };
 
-        let transferrer = Transferrer::new(true); // dry_run = true
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, true); // dry_run = true
         let dest_path = dest_dir.path().join("test.txt");
-        transferrer.create(&file_entry, &dest_path).unwrap();
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
 
         // File should NOT exist in dry-run mode
         assert!(!dest_path.exists());
     }
 
-    #[test]
-    fn test_create_directory() {
+    #[tokio::test]
+    async fn test_create_directory() {
         let dest_dir = TempDir::new().unwrap();
 
         let dir_entry = FileEntry {
@@ -156,9 +146,10 @@ mod tests {
             is_dir: true,
         };
 
-        let transferrer = Transferrer::new(false);
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false);
         let dest_path = dest_dir.path().join("subdir");
-        transferrer.create(&dir_entry, &dest_path).unwrap();
+        transferrer.create(&dir_entry, &dest_path).await.unwrap();
 
         assert!(dest_path.exists());
         assert!(dest_path.is_dir());

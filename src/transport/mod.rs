@@ -1,3 +1,4 @@
+pub mod dual;
 pub mod local;
 pub mod router;
 pub mod ssh;
