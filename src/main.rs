@@ -7,9 +7,11 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
 use sync::SyncEngine;
+use transport::local::LocalTransport;
 use tracing_subscriber::{fmt, EnvFilter};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -42,11 +44,12 @@ fn main() -> Result<()> {
         }
     }
 
-    // Create sync engine
-    let engine = SyncEngine::new(cli.dry_run, cli.delete, cli.quiet);
+    // Create transport and sync engine
+    let transport = LocalTransport::new();
+    let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet);
 
     // Run sync
-    let stats = engine.sync(&cli.source, &cli.destination)?;
+    let stats = engine.sync(&cli.source, &cli.destination).await?;
 
     // Print summary
     if !cli.quiet {

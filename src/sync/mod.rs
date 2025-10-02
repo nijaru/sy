@@ -3,8 +3,8 @@ pub mod strategy;
 pub mod transfer;
 
 use crate::error::Result;
+use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
-use scanner::Scanner;
 use std::path::Path;
 use strategy::{StrategyPlanner, SyncAction};
 use transfer::Transferrer;
@@ -18,22 +18,24 @@ pub struct SyncStats {
     pub bytes_transferred: u64,
 }
 
-pub struct SyncEngine {
+pub struct SyncEngine<T: Transport> {
+    transport: T,
     dry_run: bool,
     delete: bool,
     quiet: bool,
 }
 
-impl SyncEngine {
-    pub fn new(dry_run: bool, delete: bool, quiet: bool) -> Self {
+impl<T: Transport> SyncEngine<T> {
+    pub fn new(transport: T, dry_run: bool, delete: bool, quiet: bool) -> Self {
         Self {
+            transport,
             dry_run,
             delete,
             quiet,
         }
     }
 
-    pub fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
+    pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
         tracing::info!(
             "Starting sync: {} → {}",
             source.display(),
@@ -42,8 +44,7 @@ impl SyncEngine {
 
         // Scan source directory
         tracing::debug!("Scanning source directory...");
-        let scanner = Scanner::new(source);
-        let source_files = scanner.scan()?;
+        let source_files = self.transport.scan(source).await?;
         tracing::info!("Found {} items in source", source_files.len());
 
         // Plan sync operations

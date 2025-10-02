@@ -8,16 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Transport abstraction layer for local and remote operations
+- LocalTransport implementation wrapping Phase 1 functionality
+- Async Transport trait for future SSH/SFTP support
+- 6 comprehensive LocalTransport unit tests
 - Performance regression tests (7 tests) with conservative baselines
 - Comparative benchmarks against rsync and cp
 - Performance optimizations (10% improvement in idempotent sync)
 - Future optimization roadmap documentation
+- Phase 2 implementation plan (docs/PHASE2_PLAN.md)
 
 ### Changed
+- SyncEngine now generic over Transport trait
+- sync() method is now async
+- main() uses tokio runtime (#[tokio::main])
 - Pre-allocated vectors to reduce allocations
 - Skip metadata reads for directory existence checks
 - Batched progress bar updates to reduce overhead
 - Use enumerate() instead of explicit counter loops (clippy)
+
+### Technical
+- Added async-trait dependency
+- Added tokio rt-multi-thread feature
+- All 55 tests passing (21 unit + 6 transport + 28 others)
+- No performance regression
 
 ### Performance
 - **100 files**: 40-79% faster than rsync/cp
