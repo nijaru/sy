@@ -20,12 +20,15 @@ pub enum DeltaOp {
 #[derive(Debug, Clone)]
 pub struct Delta {
     pub ops: Vec<DeltaOp>,
+    #[allow(dead_code)]
     pub source_size: u64,
+    #[allow(dead_code)]
     pub block_size: usize,
 }
 
 impl Delta {
     /// Calculate compression ratio
+    #[allow(dead_code)]
     pub fn compression_ratio(&self) -> f64 {
         let literal_bytes: usize = self.ops.iter()
             .filter_map(|op| match op {
