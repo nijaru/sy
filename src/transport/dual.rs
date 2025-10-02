@@ -1,4 +1,4 @@
-use super::Transport;
+use super::{Transport, TransferResult};
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
@@ -45,13 +45,13 @@ impl Transport for DualTransport {
         self.dest.create_dir_all(path).await
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Special handling: need to read from source, write to dest
         // For now, assume source is local (will need enhancement for remote→remote)
         self.dest.copy_file(source, dest).await
     }
 
-    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Delegate delta sync to destination transport
         // Assumes source is accessible by dest transport (e.g., local source, remote dest)
         self.dest.sync_file_with_delta(source, dest).await

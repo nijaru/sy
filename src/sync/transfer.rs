@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransferResult};
 use std::path::Path;
 
 pub struct Transferrer<'a, T: Transport> {
@@ -14,35 +14,38 @@ impl<'a, T: Transport> Transferrer<'a, T> {
     }
 
     /// Create a new file or directory
-    pub async fn create(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
+    /// Returns Some(TransferResult) for files, None for directories
+    pub async fn create(&self, source: &FileEntry, dest_path: &Path) -> Result<Option<TransferResult>> {
         if self.dry_run {
             tracing::info!("Would create: {}", dest_path.display());
-            return Ok(());
+            return Ok(None);
         }
 
         if source.is_dir {
             self.create_directory(dest_path).await?;
+            Ok(None)
         } else {
-            self.copy_file(&source.path, dest_path).await?;
+            let result = self.copy_file(&source.path, dest_path).await?;
+            Ok(Some(result))
         }
-
-        Ok(())
     }
 
     /// Update an existing file
-    pub async fn update(&self, source: &FileEntry, dest_path: &Path) -> Result<()> {
+    /// Returns Some(TransferResult) for files, None for directories
+    pub async fn update(&self, source: &FileEntry, dest_path: &Path) -> Result<Option<TransferResult>> {
         if self.dry_run {
             tracing::info!("Would update: {}", dest_path.display());
-            return Ok(());
+            return Ok(None);
         }
 
         if !source.is_dir {
             // Use delta sync for updates
-            self.transport.sync_file_with_delta(&source.path, dest_path).await?;
+            let result = self.transport.sync_file_with_delta(&source.path, dest_path).await?;
             tracing::info!("Updated: {} -> {}", source.path.display(), dest_path.display());
+            Ok(Some(result))
+        } else {
+            Ok(None)
         }
-
-        Ok(())
     }
 
     /// Delete a file or directory
@@ -63,17 +66,17 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         Ok(())
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
             self.transport.create_dir_all(parent).await?;
         }
 
         // Copy file using transport
-        self.transport.copy_file(source, dest).await?;
+        let result = self.transport.copy_file(source, dest).await?;
 
         tracing::debug!("Copied: {} -> {}", source.display(), dest.display());
-        Ok(())
+        Ok(result)
     }
 }
 

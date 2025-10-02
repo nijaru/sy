@@ -6,9 +6,7 @@ use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
-use std::sync::Arc;
 use strategy::{StrategyPlanner, SyncAction};
-use tokio::sync::Semaphore;
 use transfer::Transferrer;
 
 pub struct SyncStats {
@@ -112,20 +110,18 @@ impl<T: Transport> SyncEngine<T> {
             match task.action {
                 SyncAction::Create => {
                     if let Some(source) = &task.source {
-                        transferrer.create(source, &task.dest_path).await?;
-                        stats.files_created += 1;
-                        if !source.is_dir {
-                            stats.bytes_transferred += source.size;
+                        if let Some(result) = transferrer.create(source, &task.dest_path).await? {
+                            stats.bytes_transferred += result.bytes_written;
                         }
+                        stats.files_created += 1;
                     }
                 }
                 SyncAction::Update => {
                     if let Some(source) = &task.source {
-                        transferrer.update(source, &task.dest_path).await?;
-                        stats.files_updated += 1;
-                        if !source.is_dir {
-                            stats.bytes_transferred += source.size;
+                        if let Some(result) = transferrer.update(source, &task.dest_path).await? {
+                            stats.bytes_transferred += result.bytes_written;
                         }
+                        stats.files_updated += 1;
                     }
                 }
                 SyncAction::Skip => {

@@ -1,5 +1,4 @@
-use super::Transport;
-use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta, DeltaOp};
+use super::{Transport, TransferResult};
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
@@ -56,7 +55,7 @@ impl Transport for LocalTransport {
             .map_err(SyncError::Io)
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
             self.create_dir_all(parent).await?;
@@ -124,13 +123,15 @@ impl Transport for LocalTransport {
                 }
             }
 
-            Ok(())
+            Ok(bytes_written)
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
+        .and_then(|r| r)
+        .map(TransferResult::new)
     }
 
-    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // For local-to-local operations, delta sync overhead exceeds benefit
         // The cost of computing checksums + rolling hash + delta generation/application
         // is higher than direct file copy for local files.

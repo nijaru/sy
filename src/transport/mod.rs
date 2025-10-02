@@ -8,6 +8,19 @@ use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use std::path::Path;
 
+/// Result of a file transfer operation
+#[derive(Debug, Clone, Copy)]
+pub struct TransferResult {
+    /// Actual bytes written (may differ from file size for delta sync)
+    pub bytes_written: u64,
+}
+
+impl TransferResult {
+    pub fn new(bytes_written: u64) -> Self {
+        Self { bytes_written }
+    }
+}
+
 /// Transport abstraction for local and remote file operations
 ///
 /// This trait provides a unified interface for file operations that works
@@ -32,15 +45,17 @@ pub trait Transport: Send + Sync {
 
     /// Copy a file from source to destination
     ///
-    /// This preserves modification time and handles parent directory creation
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()>;
+    /// This preserves modification time and handles parent directory creation.
+    /// Returns the number of bytes actually written.
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult>;
 
     /// Sync a file using delta sync if destination exists
     ///
     /// This uses the rsync algorithm to transfer only changed blocks when
     /// the destination file already exists. Falls back to full copy if
     /// destination doesn't exist or delta sync isn't beneficial.
-    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+    /// Returns the number of bytes actually transferred.
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Default implementation: fall back to full copy
         self.copy_file(source, dest).await
     }
