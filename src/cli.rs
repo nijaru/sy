@@ -106,7 +106,10 @@ mod tests {
         };
         let result = cli.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be a directory"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be a directory"));
     }
 
     #[test]

@@ -30,7 +30,11 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
-        println!("Syncing {} → {}", cli.source.display(), cli.destination.display());
+        println!(
+            "Syncing {} → {}",
+            cli.source.display(),
+            cli.destination.display()
+        );
 
         if cli.dry_run {
             println!("Mode: Dry-run (no changes will be made)\n");
@@ -53,7 +57,10 @@ fn main() -> Result<()> {
         if cli.delete {
             println!("  Files deleted:    {}", stats.files_deleted);
         }
-        println!("  Bytes transferred: {}", format_bytes(stats.bytes_transferred));
+        println!(
+            "  Bytes transferred: {}",
+            format_bytes(stats.bytes_transferred)
+        );
     }
 
     Ok(())

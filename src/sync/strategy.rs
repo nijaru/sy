@@ -90,11 +90,7 @@ impl StrategyPlanner {
     }
 
     /// Find files to delete (in destination but not in source)
-    pub fn plan_deletions(
-        &self,
-        source_files: &[FileEntry],
-        dest_root: &Path,
-    ) -> Vec<SyncTask> {
+    pub fn plan_deletions(&self, source_files: &[FileEntry], dest_root: &Path) -> Vec<SyncTask> {
         let mut deletions = Vec::new();
 
         // Build set of source paths for quick lookup
