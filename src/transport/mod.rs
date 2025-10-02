@@ -35,6 +35,16 @@ pub trait Transport: Send + Sync {
     /// This preserves modification time and handles parent directory creation
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()>;
 
+    /// Sync a file using delta sync if destination exists
+    ///
+    /// This uses the rsync algorithm to transfer only changed blocks when
+    /// the destination file already exists. Falls back to full copy if
+    /// destination doesn't exist or delta sync isn't beneficial.
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Default implementation: fall back to full copy
+        self.copy_file(source, dest).await
+    }
+
     /// Remove a file or directory
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()>;
 }
