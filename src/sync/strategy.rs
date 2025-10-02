@@ -37,13 +37,15 @@ impl StrategyPlanner {
     pub fn plan_file(&self, source: &FileEntry, dest_root: &Path) -> SyncTask {
         let dest_path = dest_root.join(&source.relative_path);
 
-        let action = if !dest_path.exists() {
-            SyncAction::Create
-        } else if source.is_dir {
-            // Directory exists, skip
-            SyncAction::Skip
+        let action = if source.is_dir {
+            // For directories, just check existence (no metadata needed)
+            if dest_path.exists() {
+                SyncAction::Skip
+            } else {
+                SyncAction::Create
+            }
         } else {
-            // File exists, check if needs update
+            // For files, check existence and metadata
             match std::fs::metadata(&dest_path) {
                 Ok(dest_meta) => {
                     let needs_update = self.needs_update(source, &dest_meta);

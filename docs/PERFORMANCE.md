@@ -336,22 +336,31 @@ Real-world benchmarks vs. rsync and cp (local sync, macOS):
 
 | Tool | Time | vs sy |
 |------|------|-------|
-| **sy** | **3.2 ms** | baseline |
-| rsync | 13.7 ms | **4.3x slower** |
+| **sy** | **2.9 ms** | baseline |
+| rsync | 13.7 ms | **4.7x slower** |
 
 ### Key Insights
 
 1. **sy is consistently faster** than both rsync and cp for local sync
 2. **Largest advantage**: Large files (64x faster than rsync) due to efficient file copying
-3. **Idempotent sync**: 4.3x faster than rsync (size+mtime checks are very efficient)
+3. **Idempotent sync**: 4.7x faster than rsync (optimized metadata checks and progress updates)
 4. **Many files**: 40-47% faster than alternatives
 
 ### Why is sy Faster?
 
 - **Modern Rust stdlib**: Optimized file I/O (uses `copy_file_range` on Linux, `clonefile` on macOS)
-- **Efficient scanning**: `ignore` crate is highly optimized
+- **Efficient scanning**: `ignore` crate is highly optimized, with pre-allocated vectors
 - **Smart comparison**: Fast size+mtime checks (rsync does checksums)
+- **Optimized directory handling**: Skips unnecessary metadata reads for directories
+- **Batched progress updates**: Reduces overhead during sync operations
 - **No network overhead**: Phase 1 is local-only, no protocol overhead
+
+### Performance Optimizations Applied
+
+1. **Pre-allocated vectors** - Scanner and task planner pre-allocate with capacity hints
+2. **Skip directory metadata** - Directory existence checks don't read full metadata
+3. **Batched progress updates** - Progress bar updates only on actions, not every skip
+4. **Memory efficiency** - Reduced allocations in hot paths
 
 ### Future Comparisons
 
