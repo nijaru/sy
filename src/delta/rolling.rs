@@ -9,11 +9,13 @@
 /// - B: sum of (n-i+1) * byte[i] for each byte
 ///
 /// The final checksum is (B << 16) | A
+///
+/// Note: We don't maintain the window in memory since the hash state
+/// (a, b) is sufficient for O(1) rolling updates.
 #[derive(Debug, Clone)]
 pub struct Adler32 {
     a: u32,
     b: u32,
-    window: Vec<u8>,
     block_size: usize,
 }
 
@@ -25,7 +27,6 @@ impl Adler32 {
         Self {
             a: 1,
             b: 0,
-            window: Vec::with_capacity(block_size),
             block_size,
         }
     }
@@ -47,28 +48,22 @@ impl Adler32 {
     pub fn update_block(&mut self, block: &[u8]) {
         self.a = 1;
         self.b = 0;
-        self.window.clear();
 
         for &byte in block {
             self.a = (self.a + byte as u32) % MOD_ADLER;
             self.b = (self.b + self.a) % MOD_ADLER;
-            self.window.push(byte);
         }
     }
 
     /// Roll the hash: remove old byte, add new byte
     /// This is the key operation for rsync algorithm
     ///
-    /// O(1) incremental update using Adler-32 rolling formula:
+    /// True O(1) incremental update using Adler-32 rolling formula:
     /// - A_new = (A_old - old_byte + new_byte) mod M
     /// - B_new = (B_old - block_size * old_byte + A_new - 1) mod M
+    ///
+    /// No window maintenance needed - hash state (a, b) is sufficient.
     pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
-        // Update window
-        if self.window.len() >= self.block_size {
-            self.window.remove(0);
-        }
-        self.window.push(new_byte);
-
         let old = old_byte as u32;
         let new = new_byte as u32;
         let n = self.block_size as u32;
@@ -93,7 +88,6 @@ impl Adler32 {
     pub fn reset(&mut self) {
         self.a = 1;
         self.b = 0;
-        self.window.clear();
     }
 }
 
