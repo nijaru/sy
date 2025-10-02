@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # Async runtime (Phase 2: used for transport abstraction)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 async-trait = "0.1"
 
 # Filesystem
@@ -42,6 +42,7 @@ zstd = "0.13"
 lz4_flex = "0.11"
 
 # SSH (Phase 2)
+ssh2 = "0.9"
 whoami = "1"
 dirs = "5"
 regex = "1"

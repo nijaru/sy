@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Async Transport trait for future SSH/SFTP support
 - SSH config parser (~/.ssh/config support)
 - SSH config struct with all major directives
+- SSH connection establishment module (connect.rs)
+- SSH authentication (agent, identity files, default keys)
+- TCP connection with timeout handling
 - 11 comprehensive SSH config unit tests
 - 6 comprehensive LocalTransport unit tests
 - Performance regression tests (7 tests) with conservative baselines
@@ -32,9 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Technical
 - Added async-trait dependency
-- Added tokio rt-multi-thread feature
+- Added tokio rt-multi-thread and time features
 - Added whoami, dirs, regex dependencies for SSH config
-- All 66 tests passing (32 unit + 34 integration/property/perf/edge)
+- Added ssh2 dependency for SSH connectivity
+- All 67 tests passing (33 unit + 34 integration/property/perf/edge)
 - No performance regression
 
 ### Performance

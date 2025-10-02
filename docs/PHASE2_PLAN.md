@@ -91,28 +91,31 @@ src/
 **Completed**: 2025-10-01
 **Commits**: ede17ba
 
-### Task 3: Basic SSH Connection (Week 2)
+### Task 3: Basic SSH Connection (Week 2) ✅ **COMPLETE**
 
 **Goal**: Establish SSH connection to remote host
 
-- [ ] Add SSH library dependency (ssh2 or russh)
-- [ ] Implement connection establishment
-- [ ] Support authentication methods:
-  - [ ] SSH key (most common)
-  - [ ] SSH agent
-  - [ ] Password (interactive)
-- [ ] Handle connection errors gracefully
-- [ ] Add timeout handling
-- [ ] Test connection to localhost
-- [ ] Test connection to real remote host
+- [x] Add SSH library dependency (ssh2)
+- [x] Implement connection establishment (TCP + handshake)
+- [x] Support authentication methods:
+  - [x] SSH key (most common)
+  - [x] SSH agent
+  - [ ] Password (interactive) - deferred
+- [x] Handle connection errors gracefully
+- [x] Add timeout handling (30 second default)
+- [ ] Test connection to localhost (deferred to Task 9)
+- [ ] Test connection to real remote host (deferred to Task 9)
 
 **Dependencies**:
-- `ssh2` crate (bindings to libssh2)
-- OR `russh` (pure Rust implementation)
+- ✅ `ssh2` crate (bindings to libssh2)
+- ✅ `tokio` with `time` feature
 
-**Decision needed**: ssh2 vs russh
+**Decision**: ssh2 chosen
 - ssh2: Mature, C bindings, widely used
-- russh: Pure Rust, async-first, modern
+- Consolidated all sync operations in single spawn_blocking for proper async/sync boundary handling
+
+**Completed**: 2025-10-01
+**Commits**: TBD
 
 ### Task 4: Remote Scanner (Week 2-3)
 
