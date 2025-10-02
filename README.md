@@ -255,18 +255,27 @@ Phase 1 includes comprehensive testing at multiple levels:
 cargo test
 
 # Run specific test suites
-cargo test --lib          # Unit tests only
-cargo test --test integration_test  # Integration tests
-cargo test --test property_test     # Property-based tests
+cargo test --lib                      # Unit tests only
+cargo test --test integration_test    # Integration tests
+cargo test --test property_test       # Property-based tests
+cargo test --test edge_cases_test     # Edge case tests
+cargo test --release --test performance_test  # Performance regression tests
+
+# Run benchmarks
+cargo bench
 
 # Run with output
 cargo test -- --nocapture
 ```
 
-**Test Coverage (31 tests total):**
+**Test Coverage (49 tests total):**
 - **Unit Tests (15)**: Core module functionality, CLI validation, error handling
-- **Integration Tests (11)**: End-to-end sync scenarios, edge cases
+- **Integration Tests (11)**: End-to-end sync scenarios, error handling
 - **Property-Based Tests (5)**: Invariants that always hold (idempotency, completeness)
+- **Edge Case Tests (11)**: Unicode, deep nesting, large files, special characters
+- **Performance Regression Tests (7)**: Ensure performance stays within bounds
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for performance testing and regression tracking.
 
 ## Contributing
 
