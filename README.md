@@ -7,6 +7,7 @@
 ## Status
 
 ✅ **Phase 1 MVP Complete** - Basic local sync working!
+🚀 **Phase 2 In Progress** - SSH transport + Delta sync implemented! (v0.0.3)
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -54,10 +55,11 @@ sy /source /destination -v      # Debug level
 sy /source /destination -vv     # Trace level
 ```
 
-## Features (Phase 1)
+## Features
 
-### ✅ What Works Now
+### ✅ What Works Now (v0.0.3)
 
+**Local Sync (Phase 1 - Complete)**:
 - **Smart File Sync**: Compares size + modification time (1s tolerance)
 - **Git-Aware**: Automatically respects `.gitignore` patterns
 - **Safe by Default**: Preview changes with `--dry-run`
@@ -65,10 +67,17 @@ sy /source /destination -vv     # Trace level
 - **Flexible Logging**: From quiet to trace level
 - **Edge Cases**: Handles unicode, deep nesting, large files, empty dirs
 
+**Delta Sync (Phase 2 - Implemented)**:
+- **Rsync Algorithm**: Uses Adler-32 rolling hash + xxHash3 strong checksums
+- **Block-Level Updates**: Only transfers changed blocks, not entire files
+- **Adaptive Block Size**: Automatically calculates optimal block size (√filesize)
+- **Local & Remote**: Works for both local-to-local and local-to-remote (SSH)
+- **Compression Reporting**: Shows exactly how much data was saved
+
 ### 📋 Common Use Cases
 
 ```bash
-# Backup your project
+# Backup your project (uses delta sync for updates)
 sy ~/my-project ~/backups/my-project
 
 # Sync to external drive
@@ -77,8 +86,12 @@ sy ~/Documents /Volumes/Backup/Documents --delete
 # Preview what would change
 sy ~/src ~/dest --dry-run
 
-# Sync with detailed logging
-sy ~/src ~/dest -vv
+# Sync with detailed logging (see delta sync in action)
+RUST_LOG=info sy ~/src ~/dest
+
+# Delta sync automatically activates for file updates
+# Example output: "Delta sync: 3242 ops, 0.1% literal data"
+# This means only 0.1% of the file was transferred!
 ```
 
 ## Vision
@@ -131,16 +144,17 @@ Files: 1,234 total | 892 synced | 312 skipped | 30 queued
 
 ## Comparison
 
-| Feature | rsync | rclone | sy |
+| Feature | rsync | rclone | sy (v0.0.3) |
 |---------|-------|--------|-----|
-| Parallel file transfers | ❌ | ✅ | ✅ |
-| Parallel chunk transfers | ❌ | ✅ | ✅ |
-| Delta sync | ✅ | ❌ | ✅ |
-| End-to-end checksums | ❌ | ✅ | ✅ |
-| Adaptive compression | ❌ | ❌ | ✅ |
-| Network auto-detection | ❌ | ❌ | ✅ |
+| Parallel file transfers | ❌ | ✅ | 🚧 Planned |
+| Parallel chunk transfers | ❌ | ✅ | 🚧 Planned |
+| Delta sync | ✅ | ❌ | ✅ **Implemented!** |
+| Block checksums | ✅ MD5 | ❌ | ✅ xxHash3 |
+| End-to-end checksums | ❌ | ✅ | 🚧 Planned |
+| Adaptive compression | ❌ | ❌ | 🚧 Planned |
+| Network auto-detection | ❌ | ❌ | 🚧 Planned |
 | Modern UX | ❌ | ⚠️ | ✅ |
-| Config files | ❌ | ✅ | ✅ |
+| Config files | ❌ | ✅ | 🚧 Planned |
 
 ## Example Usage
 
@@ -217,25 +231,24 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 - ✅ Performance optimizations (10% faster than initial implementation)
 - ✅ Comparative benchmarks (vs rsync and cp)
 
-### Phase 2: Network Sync (v0.2.0) - **Next Phase**
-- SSH transport
-- SFTP fallback
-- Network detection
-- SSH config integration
+### 🚀 Phase 2: Network Sync + Delta (v0.0.3) - **IN PROGRESS**
+- ✅ SSH transport (SFTP-based)
+- ✅ SSH config integration
+- ✅ **Delta sync implemented** (rsync algorithm)
+- ✅ Adler-32 rolling hash + xxHash3 checksums
+- ✅ Block-level updates for local and remote files
+- ✅ Adaptive block size calculation
+- 🚧 Network detection (planned)
+- 🚧 Resume support (planned)
+
+**Performance Win**: Delta sync dramatically reduces bandwidth usage by transferring only changed blocks instead of entire files.
 
 See [docs/PHASE2_PLAN.md](docs/PHASE2_PLAN.md) for detailed implementation plan.
 
-### Phase 3: Performance (v0.3.0)
+### Phase 3: Parallelism (v0.0.4+)
 - Parallel file transfers
 - Parallel chunk transfers
-- Adaptive compression
 - Progress UI at scale
-
-### Phase 4: Delta Sync (v0.4.0)
-- Rsync algorithm (Adler-32)
-- Block signatures
-- Delta computation
-- Resume support
 
 ### Phase 5: Reliability (v0.5.0)
 - Multi-layer checksums
