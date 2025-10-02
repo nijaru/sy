@@ -67,26 +67,29 @@ src/
 **Completed**: 2025-10-01
 **Commits**: 8c8389b, af520a1
 
-### Task 2: SSH Config Parsing (Week 1-2)
+### Task 2: SSH Config Parsing (Week 1-2) ✅ **COMPLETE**
 
 **Goal**: Parse and apply SSH configuration
 
-- [ ] Create `ssh_config` module
-- [ ] Parse `~/.ssh/config` file
-- [ ] Support key directives:
-  - [ ] Host, HostName, Port, User
-  - [ ] IdentityFile
-  - [ ] ProxyJump
-  - [ ] ControlMaster, ControlPath, ControlPersist
-  - [ ] Compression
-- [ ] Handle pattern matching (wildcards, negation)
-- [ ] Apply defaults (port 22, current user, etc.)
-- [ ] Unit tests for config parsing
-- [ ] Integration test with real SSH config
+- [x] Create `ssh_config` module
+- [x] Parse `~/.ssh/config` file
+- [x] Support key directives:
+  - [x] Host, HostName, Port, User
+  - [x] IdentityFile
+  - [x] ProxyJump
+  - [x] ControlMaster, ControlPath, ControlPersist
+  - [x] Compression
+- [x] Handle pattern matching (wildcards, negation)
+- [x] Apply defaults (port 22, current user, etc.)
+- [x] Unit tests for config parsing (11 tests)
+- [ ] Integration test with real SSH config (deferred to Task 3)
 
 **Dependencies**:
-- Consider using `ssh2` or `russh` crate
-- Or implement minimal parser
+- ✅ Implemented custom parser (no external SSH config parser needed)
+- ✅ Added whoami, dirs, regex
+
+**Completed**: 2025-10-01
+**Commits**: ede17ba
 
 ### Task 3: Basic SSH Connection (Week 2)
 
