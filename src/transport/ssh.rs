@@ -140,18 +140,121 @@ impl Transport for SshTransport {
     }
 
     async fn metadata(&self, _path: &Path) -> Result<std::fs::Metadata> {
-        unimplemented!("SSH transport metadata not yet implemented")
+        // For now, return error - metadata is complex to bridge from remote to local
+        Err(SyncError::Io(std::io::Error::other(
+            "SSH transport metadata requires local Metadata struct which doesn't work for remote files"
+        )))
     }
 
-    async fn create_dir_all(&self, _path: &Path) -> Result<()> {
-        unimplemented!("SSH transport create_dir_all not yet implemented")
+    async fn create_dir_all(&self, path: &Path) -> Result<()> {
+        let path_str = path.to_string_lossy();
+        let command = format!("mkdir -p '{}'", path_str);
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            let cmd = command.clone();
+            move || Self::execute_command(session, &cmd)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        Ok(())
     }
 
-    async fn copy_file(&self, _source: &Path, _dest: &Path) -> Result<()> {
-        unimplemented!("SSH transport copy_file not yet implemented")
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Use SFTP for file transfer
+        let source_path = source.to_path_buf();
+        let dest_path = dest.to_path_buf();
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            move || {
+                let session = session.lock().map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                })?;
+
+                // Read local file
+                let content = std::fs::read(&source_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read source file {}: {}", source_path.display(), e),
+                    ))
+                })?;
+
+                // Get source metadata for mtime
+                let metadata = std::fs::metadata(&source_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to get metadata for {}: {}", source_path.display(), e),
+                    ))
+                })?;
+
+                // Get SFTP session
+                let sftp = session.sftp().map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                })?;
+
+                // Write to remote file
+                let mut remote_file = sftp.create(&dest_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to create remote file {}: {}",
+                        dest_path.display(),
+                        e
+                    )))
+                })?;
+
+                std::io::Write::write_all(&mut remote_file, &content).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to write to remote file {}: {}",
+                        dest_path.display(),
+                        e
+                    )))
+                })?;
+
+                // Set modification time
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                        let mtime = duration.as_secs();
+                        let atime = mtime; // Use same time for access time
+                        let _ = sftp.setstat(
+                            &dest_path,
+                            ssh2::FileStat {
+                                size: Some(content.len() as u64),
+                                uid: None,
+                                gid: None,
+                                perm: None,
+                                atime: Some(atime),
+                                mtime: Some(mtime),
+                            },
+                        );
+                    }
+                }
+
+                Ok::<(), crate::error::SyncError>(())
+            }
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        Ok(())
     }
 
-    async fn remove(&self, _path: &Path, _is_dir: bool) -> Result<()> {
-        unimplemented!("SSH transport remove not yet implemented")
+    async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
+        let path_str = path.to_string_lossy();
+        let command = if is_dir {
+            format!("rm -rf '{}'", path_str)
+        } else {
+            format!("rm -f '{}'", path_str)
+        };
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            let cmd = command.clone();
+            move || Self::execute_command(session, &cmd)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        Ok(())
     }
 }

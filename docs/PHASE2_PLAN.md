@@ -163,18 +163,22 @@ sy-remote scan /path/to/dir
 - [ ] Performance testing vs local baseline
 - [ ] Fallback logic when custom protocol unavailable
 
-### Task 6: File Transfer (Week 3-4)
+### Task 6: File Transfer (Week 3-4) 🚧 **IN PROGRESS**
 
 **Goal**: Transfer files over SSH
 
-- [ ] Implement `SshTransport::write()` for file upload
-- [ ] Implement `SshTransport::read()` for file download (less common)
-- [ ] Stream large files (avoid loading into memory)
-- [ ] Progress tracking for network transfers
+- [x] Implement `SshTransport::copy_file()` for file upload via SFTP
+- [x] Implement `SshTransport::create_dir_all()` for remote directory creation
+- [x] Implement `SshTransport::remove()` for file/dir deletion
+- [x] Preserve modification time on remote files
+- [ ] Stream large files (avoid loading into memory) - current impl loads full file
+- [ ] Progress tracking for network transfers (deferred to Task 8)
 - [ ] Resume support (basic - Phase 4 will improve)
-- [ ] Error handling (network timeout, disk full, etc.)
-- [ ] Test with various file sizes (small, medium, large)
-- [ ] Verify data integrity (checksum after transfer)
+- [ ] Error handling improvements (network timeout, disk full, etc.)
+- [ ] Test with various file sizes (small, medium, large) - deferred to Task 9
+- [ ] Verify data integrity (checksum after transfer) - deferred to Task 9
+
+**Status**: Basic SFTP file transfer complete, optimization and testing deferred
 
 ### Task 7: Network Detection (Week 4)
 

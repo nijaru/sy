@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - sy-remote helper binary for efficient remote directory scanning
 - JSON-based remote protocol for file metadata transfer
 - Remote scanning via SSH exec
+- SFTP-based file transfer (copy_file method)
+- Remote directory creation (create_dir_all)
+- Remote file/directory deletion (remove)
+- Modification time preservation for remote files
 - 11 comprehensive SSH config unit tests
 - 6 comprehensive LocalTransport unit tests
 - Performance regression tests (7 tests) with conservative baselines
