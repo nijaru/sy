@@ -200,55 +200,69 @@ See [DESIGN.md](DESIGN.md) for:
 
 ## Testing Strategy
 
-### Unit Tests
+**Current Status**: Phase 1 has 31 comprehensive tests across 3 categories.
+
+### Unit Tests (15 tests)
+Located in `src/*/tests.rs` modules:
+```bash
+cargo test --lib
+```
+
+Tests include:
+- Scanner: file scanning, .gitignore support
+- Strategy: file comparison, sync planning
+- Transfer: file copy operations
+- CLI: argument validation, log levels
+
+Example:
 ```rust
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_xxhash3_correctness() {
-        // Verify hash function correctness
-    }
-
-    #[test]
-    fn test_compression_selection() {
-        // Test file type detection logic
+    fn test_scanner_gitignore() {
+        // Verify .gitignore patterns work
     }
 }
 ```
 
-### Integration Tests
+### Integration Tests (11 tests)
+Located in `tests/integration_test.rs`:
+```bash
+cargo test --test integration_test
+```
+
+Tests include:
+- Basic sync workflows
+- Dry-run and delete modes
+- .gitignore support
+- Nested directories
+- Error handling
+
+### Property-Based Tests (5 tests)
+Located in `tests/property_test.rs`:
+```bash
+cargo test --test property_test
+```
+
+Tests invariants that always hold:
 ```rust
-// tests/sync_test.rs
-#[test]
-fn test_full_sync() {
-    // Create temp dirs, sync, verify
-}
+use proptest::prelude::*;
 
-#[test]
-fn test_resume_interrupted() {
-    // Simulate network failure, resume
+proptest! {
+    #[test]
+    fn prop_sync_idempotent(file_count in 1usize..10) {
+        // Syncing twice should give identical results
+    }
 }
 ```
 
-### Benchmarks
+### Benchmarks (Future)
 ```rust
 // benches/hash_bench.rs
 fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("xxhash3 1GB", |b| {
         b.iter(|| xxh3::hash64(black_box(&data)))
     });
-}
-```
-
-### Property Tests
-```rust
-use proptest::prelude::*;
-
-proptest! {
-    #[test]
-    fn test_sync_idempotent(files: Vec<FileData>) {
-        // Syncing twice should be identical
-    }
 }
 ```
 

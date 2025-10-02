@@ -50,9 +50,9 @@ impl Transferrer {
         }
 
         if dest_path.is_dir() {
-            fs::remove_dir_all(dest_path).map_err(|e| SyncError::Io(e))?;
+            fs::remove_dir_all(dest_path).map_err(SyncError::Io)?;
         } else {
-            fs::remove_file(dest_path).map_err(|e| SyncError::Io(e))?;
+            fs::remove_file(dest_path).map_err(SyncError::Io)?;
         }
 
         tracing::info!("Deleted: {}", dest_path.display());
@@ -60,7 +60,7 @@ impl Transferrer {
     }
 
     fn create_directory(&self, path: &Path) -> Result<()> {
-        fs::create_dir_all(path).map_err(|e| SyncError::Io(e))?;
+        fs::create_dir_all(path).map_err(SyncError::Io)?;
         tracing::debug!("Created directory: {}", path.display());
         Ok(())
     }
@@ -68,7 +68,7 @@ impl Transferrer {
     fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| SyncError::Io(e))?;
+            fs::create_dir_all(parent).map_err(SyncError::Io)?;
         }
 
         // Copy file
