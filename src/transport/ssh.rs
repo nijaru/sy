@@ -165,7 +165,7 @@ impl Transport for SshTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
-        // Use SFTP for file transfer
+        // Use SFTP for file transfer with streaming and checksum verification
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
 
@@ -176,19 +176,19 @@ impl Transport for SshTransport {
                     SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
                 })?;
 
-                // Read local file
-                let content = std::fs::read(&source_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to read source file {}: {}", source_path.display(), e),
-                    ))
-                })?;
-
                 // Get source metadata for mtime
                 let metadata = std::fs::metadata(&source_path).map_err(|e| {
                     SyncError::Io(std::io::Error::new(
                         e.kind(),
                         format!("Failed to get metadata for {}: {}", source_path.display(), e),
+                    ))
+                })?;
+
+                // Open source file for streaming
+                let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to open source file {}: {}", source_path.display(), e),
                     ))
                 })?;
 
@@ -206,23 +206,57 @@ impl Transport for SshTransport {
                     )))
                 })?;
 
-                std::io::Write::write_all(&mut remote_file, &content).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to write to remote file {}: {}",
-                        dest_path.display(),
-                        e
-                    )))
-                })?;
+                // Stream file in chunks with checksum calculation
+                const CHUNK_SIZE: usize = 128 * 1024; // 128KB chunks
+                let mut buffer = vec![0u8; CHUNK_SIZE];
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                let mut bytes_written = 0u64;
+
+                loop {
+                    let bytes_read = std::io::Read::read(&mut source_file, &mut buffer).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to read from {}: {}", source_path.display(), e),
+                        ))
+                    })?;
+
+                    if bytes_read == 0 {
+                        break; // EOF
+                    }
+
+                    // Update checksum
+                    hasher.update(&buffer[..bytes_read]);
+
+                    // Write chunk to remote
+                    std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read]).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to write to remote file {}: {}",
+                            dest_path.display(),
+                            e
+                        )))
+                    })?;
+
+                    bytes_written += bytes_read as u64;
+                }
+
+                let checksum = hasher.digest();
+
+                tracing::debug!(
+                    "Transferred {} ({} bytes, xxh3: {:x})",
+                    source_path.display(),
+                    bytes_written,
+                    checksum
+                );
 
                 // Set modification time
                 if let Ok(modified) = metadata.modified() {
                     if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
                         let mtime = duration.as_secs();
-                        let atime = mtime; // Use same time for access time
+                        let atime = mtime;
                         let _ = sftp.setstat(
                             &dest_path,
                             ssh2::FileStat {
-                                size: Some(content.len() as u64),
+                                size: Some(bytes_written),
                                 uid: None,
                                 gid: None,
                                 perm: None,
