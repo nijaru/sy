@@ -24,6 +24,7 @@ async-trait = "0.1"
 walkdir = "2"
 ignore = "0.4"
 filetime = "0.2"
+tempfile = "3"
 
 # Progress & Logging
 indicatif = "0.17"
