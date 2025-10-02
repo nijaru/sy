@@ -3,12 +3,15 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SyncError {
+    #[allow(dead_code)] // Used in future phases (network sync)
     #[error("Source path not found: {path}")]
     SourceNotFound { path: PathBuf },
 
+    #[allow(dead_code)] // Used in future phases (network sync)
     #[error("Destination path not found: {path}")]
     DestinationNotFound { path: PathBuf },
 
+    #[allow(dead_code)] // Used in future phases (permission handling)
     #[error("Permission denied: {path}")]
     PermissionDenied { path: PathBuf },
 

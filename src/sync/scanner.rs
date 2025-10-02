@@ -37,13 +37,13 @@ impl Scanner {
 
         for result in walker {
             let entry = result.map_err(|e| {
-                SyncError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                SyncError::Io(std::io::Error::other(e.to_string()))
             })?;
 
             let path = entry.path().to_path_buf();
             let metadata = entry.metadata().map_err(|e| SyncError::ReadDirError {
                 path: path.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })?;
 
             // Skip the root directory itself
@@ -102,7 +102,7 @@ mod tests {
 
         // Initialize git repo (required for .gitignore to work)
         std::process::Command::new("git")
-            .args(&["init"])
+            .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();

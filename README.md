@@ -152,6 +152,7 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 - ✅ Simple progress display
 - ✅ .gitignore support
 - ✅ Dry-run and delete modes
+- ✅ Comprehensive test suite (31 tests: unit, integration, property-based)
 
 ### Phase 2: Network Sync (v0.2.0)
 - SSH transport
@@ -183,6 +184,28 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 - UX polish
 - Testing & documentation
 - v1.0 release
+
+## Testing
+
+Phase 1 includes comprehensive testing at multiple levels:
+
+```bash
+# Run all tests
+cargo test
+
+# Run specific test suites
+cargo test --lib          # Unit tests only
+cargo test --test integration_test  # Integration tests
+cargo test --test property_test     # Property-based tests
+
+# Run with output
+cargo test -- --nocapture
+```
+
+**Test Coverage (31 tests total):**
+- **Unit Tests (15)**: Core module functionality, CLI validation, error handling
+- **Integration Tests (11)**: End-to-end sync scenarios, edge cases
+- **Property-Based Tests (5)**: Invariants that always hold (idempotency, completeness)
 
 ## Contributing
 
