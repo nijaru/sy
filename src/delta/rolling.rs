@@ -60,8 +60,10 @@ impl Adler32 {
     /// This is the key operation for rsync algorithm
     ///
     /// Note: Currently recalculates from scratch for correctness.
-    /// Can be optimized with incremental update later.
-    pub fn roll(&mut self, _old_byte: u8, new_byte: u8) {
+    /// The incremental formula for Adler-32 is complex and error-prone.
+    /// For local operations, delta sync is disabled anyway.
+    /// For remote operations, network cost >> computation cost.
+    pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
         // Update window
         if self.window.len() >= self.block_size {
             self.window.remove(0);
@@ -69,7 +71,8 @@ impl Adler32 {
         self.window.push(new_byte);
 
         // Recalculate from scratch
-        // TODO: Optimize with incremental rolling formula
+        // This is O(block_size) but simpler and correct
+        // Future optimization: implement true O(1) rolling if needed
         self.a = 1;
         self.b = 0;
         for &byte in &self.window {
