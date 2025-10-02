@@ -41,6 +41,11 @@ blake3 = "1"
 zstd = "0.13"
 lz4_flex = "0.11"
 
+# SSH (Phase 2)
+whoami = "1"
+dirs = "5"
+regex = "1"
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
