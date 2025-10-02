@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_compute_checksums() {
-        // Create test file
+        // Create test file (51 bytes)
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(b"Hello, World! This is a test file for checksumming.").unwrap();
         temp_file.flush().unwrap();
@@ -76,7 +76,7 @@ mod tests {
         // Compute checksums
         let checksums = compute_checksums(temp_file.path(), 16).unwrap();
 
-        // Should have ceil(52 / 16) = 4 blocks
+        // Should have ceil(51 / 16) = 4 blocks (3 full + 1 partial)
         assert_eq!(checksums.len(), 4);
 
         // Check first block
@@ -84,11 +84,11 @@ mod tests {
         assert_eq!(checksums[0].offset, 0);
         assert_eq!(checksums[0].size, 16);
 
-        // Check last block (partial)
+        // Check last block (partial - 3 bytes)
         let last = &checksums[3];
         assert_eq!(last.index, 3);
         assert_eq!(last.offset, 48);
-        assert_eq!(last.size, 4); // "ing."
+        assert_eq!(last.size, 3); // "ng."
     }
 
     #[test]

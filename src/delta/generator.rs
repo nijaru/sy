@@ -97,9 +97,10 @@ pub fn generate_delta(
 
     while pos < source_data.len() {
         let mut found_match = false;
+        let remaining = source_data.len() - pos;
 
-        // Only try to match if we have a full block
-        if pos + block_size <= source_data.len() {
+        // Try to match full blocks first
+        if remaining >= block_size {
             let weak = rolling.digest();
 
             // Check if weak hash matches any destination blocks
@@ -134,6 +135,35 @@ pub fn generate_delta(
                         if pos + block_size <= source_data.len() {
                             rolling.update_block(&source_data[pos..pos + block_size]);
                         }
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Partial block at end - try to match against partial blocks in dest
+            let partial_block = &source_data[pos..];
+            let weak = Adler32::hash(partial_block);
+
+            if let Some(candidates) = checksum_map.get(&weak) {
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                hasher.update(partial_block);
+                let strong = hasher.digest();
+
+                for checksum in candidates {
+                    if checksum.size == partial_block.len() && checksum.strong == strong {
+                        // Found matching partial block!
+                        if !literal_buffer.is_empty() {
+                            ops.push(DeltaOp::Data(literal_buffer.clone()));
+                            literal_buffer.clear();
+                        }
+
+                        ops.push(DeltaOp::Copy {
+                            offset: checksum.offset,
+                            size: checksum.size,
+                        });
+
+                        pos += partial_block.len();
+                        found_match = true;
                         break;
                     }
                 }
