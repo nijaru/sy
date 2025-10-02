@@ -22,7 +22,8 @@ impl Scanner {
     }
 
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
+        // Pre-allocate with reasonable capacity to reduce allocations
+        let mut entries = Vec::with_capacity(256);
 
         let walker = WalkBuilder::new(&self.root)
             .hidden(false) // Don't skip hidden files by default

@@ -48,7 +48,7 @@ impl SyncEngine {
 
         // Plan sync operations
         let planner = StrategyPlanner::new();
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::with_capacity(source_files.len());
 
         for file in &source_files {
             let task = planner.plan_file(file, destination);
@@ -86,15 +86,20 @@ impl SyncEngine {
             pb
         };
 
+        let mut task_count = 0;
         for task in tasks {
-            // Update progress message
-            let msg = match &task.action {
-                SyncAction::Create => format!("Creating {}", task.dest_path.display()),
-                SyncAction::Update => format!("Updating {}", task.dest_path.display()),
-                SyncAction::Skip => format!("Skipping {}", task.dest_path.display()),
-                SyncAction::Delete => format!("Deleting {}", task.dest_path.display()),
-            };
-            pb.set_message(msg);
+            // Only update progress bar for actual actions or every 10 files
+            let should_update = !matches!(task.action, SyncAction::Skip) || task_count % 10 == 0;
+
+            if should_update {
+                let msg = match &task.action {
+                    SyncAction::Create => format!("Creating {}", task.dest_path.display()),
+                    SyncAction::Update => format!("Updating {}", task.dest_path.display()),
+                    SyncAction::Skip => format!("Skipping {}", task.dest_path.display()),
+                    SyncAction::Delete => format!("Deleting {}", task.dest_path.display()),
+                };
+                pb.set_message(msg);
+            }
 
             match task.action {
                 SyncAction::Create => {
@@ -125,6 +130,7 @@ impl SyncEngine {
             }
 
             pb.inc(1);
+            task_count += 1;
         }
 
         pb.finish_with_message("Sync complete");
