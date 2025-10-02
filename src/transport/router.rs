@@ -108,6 +108,13 @@ impl Transport for TransportRouter {
         }
     }
 
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.sync_file_with_delta(source, dest).await,
+            TransportRouter::Dual(t) => t.sync_file_with_delta(source, dest).await,
+        }
+    }
+
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
         match self {
             TransportRouter::Local(t) => t.remove(path, is_dir).await,

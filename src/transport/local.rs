@@ -1,12 +1,10 @@
 use super::Transport;
+use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
 use std::fs;
 use std::path::Path;
-
-// TODO: Re-enable delta sync for local transport after fixing cargo build issue
-// use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta};
 
 /// Local filesystem transport
 ///
@@ -133,12 +131,87 @@ impl Transport for LocalTransport {
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
-        // TODO: Delta sync for local transport disabled due to cargo build issue
-        // The delta module works but cargo has module resolution issues when
-        // building the binary. Will fix in separate commit.
-        // For now, local transport falls back to full copy (still uses streaming).
-        tracing::debug!("Local transport using full copy (delta sync TODO)");
-        self.copy_file(source, dest).await
+        // Check if destination exists
+        if !self.exists(dest).await? {
+            tracing::debug!("Destination doesn't exist, using full copy");
+            return self.copy_file(source, dest).await;
+        }
+
+        // Get file sizes
+        let source_meta = self.metadata(source).await?;
+        let dest_meta = self.metadata(dest).await?;
+        let source_size = source_meta.len();
+        let dest_size = dest_meta.len();
+
+        // Skip delta if destination is empty or very small (full copy is faster)
+        if dest_size < 4096 {
+            tracing::debug!("Destination too small for delta sync, using full copy");
+            return self.copy_file(source, dest).await;
+        }
+
+        // Run delta sync in blocking task
+        let source = source.to_path_buf();
+        let dest = dest.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            // Calculate block size
+            let block_size = calculate_block_size(dest_size);
+
+            // Compute checksums of destination file
+            let dest_checksums = compute_checksums(&dest, block_size)
+                .map_err(|e| SyncError::CopyError {
+                    path: dest.clone(),
+                    source: e,
+                })?;
+
+            // Generate delta
+            let delta = generate_delta(&source, &dest_checksums, block_size)
+                .map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+            // Calculate compression ratio
+            let literal_bytes: u64 = delta.ops.iter()
+                .filter_map(|op| {
+                    if let DeltaOp::Data(data) = op {
+                        Some(data.len() as u64)
+                    } else {
+                        None
+                    }
+                })
+                .sum();
+
+            let compression_ratio = if source_size > 0 {
+                (literal_bytes as f64 / source_size as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            // Apply delta to create temporary file
+            let temp_dest = dest.with_extension("sy.tmp");
+            apply_delta(&dest, &delta, &temp_dest)
+                .map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?;
+
+            // Atomic rename
+            fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+
+            tracing::info!(
+                "Delta sync: {} ops, {:.1}% literal data",
+                delta.ops.len(),
+                compression_ratio
+            );
+
+            Ok::<(), SyncError>(())
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
