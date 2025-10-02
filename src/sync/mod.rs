@@ -6,7 +6,9 @@ use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
+use std::sync::Arc;
 use strategy::{StrategyPlanner, SyncAction};
+use tokio::sync::Semaphore;
 use transfer::Transferrer;
 
 pub struct SyncStats {
