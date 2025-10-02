@@ -33,6 +33,10 @@ pub struct Cli {
     /// Quiet mode (only show errors)
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Number of parallel file transfers (default: 10)
+    #[arg(short = 'j', long, default_value = "10")]
+    pub parallel: usize,
 }
 
 impl Cli {
@@ -82,6 +86,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: false,
+            parallel: 10,
         };
         assert!(cli.validate().is_ok());
     }
@@ -95,6 +100,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: false,
+            parallel: 10,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -114,6 +120,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: false,
+            parallel: 10,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -137,6 +144,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: false,
+            parallel: 10,
         };
         assert!(cli.validate().is_ok());
     }
@@ -150,6 +158,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: true,
+            parallel: 10,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -163,6 +172,7 @@ mod tests {
             delete: false,
             verbose: 0,
             quiet: false,
+            parallel: 10,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -176,6 +186,7 @@ mod tests {
             delete: false,
             verbose: 1,
             quiet: false,
+            parallel: 10,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -189,6 +200,7 @@ mod tests {
             delete: false,
             verbose: 2,
             quiet: false,
+            parallel: 10,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }

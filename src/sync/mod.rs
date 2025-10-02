@@ -26,15 +26,17 @@ pub struct SyncEngine<T: Transport> {
     dry_run: bool,
     delete: bool,
     quiet: bool,
+    max_concurrent: usize,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
-    pub fn new(transport: T, dry_run: bool, delete: bool, quiet: bool) -> Self {
+    pub fn new(transport: T, dry_run: bool, delete: bool, quiet: bool, max_concurrent: usize) -> Self {
         Self {
             transport: Arc::new(transport),
             dry_run,
             delete,
             quiet,
+            max_concurrent,
         }
     }
 
@@ -94,8 +96,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         };
 
         // Parallel execution with semaphore for concurrency control
-        const MAX_CONCURRENT: usize = 10;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let mut handles = Vec::with_capacity(tasks.len());
 
         for task in tasks {
