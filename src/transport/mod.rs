@@ -10,6 +10,7 @@ use std::path::Path;
 /// This trait provides a unified interface for file operations that works
 /// across both local filesystems and remote systems (SSH, SFTP, etc.)
 #[async_trait]
+#[allow(dead_code)] // Methods will be used when we implement SSH transport
 pub trait Transport: Send + Sync {
     /// Scan a directory and return all entries
     ///
