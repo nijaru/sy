@@ -2233,6 +2233,12 @@ fn validate_path(path: &Path) -> Result<()> {
 - [ ] Network detection (LAN vs WAN)
 - [ ] Progress UI at scale
 
+**Implementation techniques**:
+- [ ] Parallel scanning with rayon (scan source and destination concurrently)
+- [ ] Parallel file operations with rayon (concurrent file copies)
+- [ ] Memory-mapped I/O for very large files (>100MB)
+- [ ] Async I/O with tokio for network operations
+
 **Deliverable**: Fast sync for various scenarios
 
 ---

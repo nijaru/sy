@@ -355,12 +355,27 @@ Real-world benchmarks vs. rsync and cp (local sync, macOS):
 - **Batched progress updates**: Reduces overhead during sync operations
 - **No network overhead**: Phase 1 is local-only, no protocol overhead
 
-### Performance Optimizations Applied
+### Performance Optimizations Applied (Phase 1)
 
 1. **Pre-allocated vectors** - Scanner and task planner pre-allocate with capacity hints
 2. **Skip directory metadata** - Directory existence checks don't read full metadata
 3. **Batched progress updates** - Progress bar updates only on actions, not every skip
 4. **Memory efficiency** - Reduced allocations in hot paths
+
+### Future Optimization Roadmap
+
+**Phase 3 (Performance)** - See [DESIGN.md](../DESIGN.md) Phase 3 for details:
+- Parallel file transfers with rayon (concurrent file copies)
+- Parallel scanning (scan source and destination concurrently)
+- Parallel chunk transfers for large files
+- Memory-mapped I/O for very large files (>100MB)
+- Async I/O with tokio for network operations
+- Adaptive compression based on network/CPU metrics
+
+**Expected improvements**:
+- 2-4x speedup on multi-core systems
+- Better network bandwidth utilization
+- Reduced memory footprint for large file sets
 
 ### Future Comparisons
 
