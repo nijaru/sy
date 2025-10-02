@@ -212,7 +212,7 @@ enum NetworkType {
 - [ ] Bandwidth display
 - [ ] User-friendly error messages
 
-### Task 9: Integration & Testing (Week 5) 🚧 **IN PROGRESS**
+### Task 9: Integration & Testing (Week 5) ✅ **COMPLETE**
 
 **Goal**: End-to-end testing and polish
 
@@ -220,30 +220,32 @@ enum NetworkType {
 - [x] TransportRouter implementation
 - [x] Remote path parsing with Windows drive letter support
 - [x] Update CHANGELOG
-- [ ] Integration tests with SSH localhost
-- [ ] Test with real remote hosts (LAN and WAN)
-- [ ] Performance comparison: sy vs rsync vs scp
-- [ ] Update benchmarks
-- [ ] Update documentation (README, DESIGN, CONTRIBUTING)
-- [ ] Fix any bugs found in testing
+- [x] DualTransport implementation for mixed operations
+- [x] Test with real remote host (Fedora via Tailscale)
+- [x] Fix architectural issue with single-transport model
+- [ ] Integration tests with SSH localhost (deferred to v0.2.1)
+- [ ] Performance comparison: sy vs rsync vs scp (deferred to v0.2.1)
+- [ ] Update benchmarks (deferred to v0.2.1)
+- [ ] Update documentation (README, DESIGN, CONTRIBUTING) (deferred to Task 10)
 
-**Status**: CLI integration complete, end-to-end testing revealed architectural issue
+**Status**: Core functionality working, end-to-end tests successful
 
 **Testing Results (2025-10-02)**:
 - ✅ SSH connection to Fedora via Tailscale successful
 - ✅ sy-remote binary works on remote host
 - ✅ SSH command execution works
-- ❌ Local→remote sync fails: single-transport model insufficient
+- ✅ Local→remote sync works correctly
+- ✅ Remote→local sync works correctly
+- ✅ All 77 tests pass
+- ✅ Update detection works for existing files
 
-**Architectural Issue Discovered**:
-Current design uses single Transport for both source and destination. This doesn't work for mixed local/remote operations:
-- Local→Remote: needs LocalTransport for source scan, SshTransport for destination
-- Remote→Local: needs SshTransport for source scan, LocalTransport for destination
+**Architectural Issue Resolved**:
+Initial single-transport model couldn't handle mixed local/remote operations.
+**Solution**: Implemented DualTransport with separate source/dest transports that routes operations correctly.
 
-**Required Fix**:
-- SyncEngine needs separate source_transport and dest_transport
-- Or create HybridTransport that routes operations correctly
-- Affects: SyncEngine constructor, strategy planning, transfer operations
+**Commit**: cd55c61
+
+**Completed**: 2025-10-02
 
 ### Task 10: Documentation & Release (Week 5)
 
