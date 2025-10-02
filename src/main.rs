@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     // Create transport router based on source and destination
     let transport = TransportRouter::new(&cli.source, &cli.destination).await?;
-    let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet);
+    let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet, cli.parallel);
 
     // Run sync
     let stats = engine
