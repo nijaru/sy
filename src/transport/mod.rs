@@ -1,4 +1,5 @@
 pub mod local;
+pub mod router;
 pub mod ssh;
 
 use crate::error::Result;

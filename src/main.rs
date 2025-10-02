@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod path;
 mod ssh;
 mod sync;
 mod transport;
@@ -8,7 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
 use sync::SyncEngine;
-use transport::local::LocalTransport;
+use transport::router::TransportRouter;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
@@ -34,23 +35,21 @@ async fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
-        println!(
-            "Syncing {} → {}",
-            cli.source.display(),
-            cli.destination.display()
-        );
+        println!("Syncing {} → {}", cli.source, cli.destination);
 
         if cli.dry_run {
             println!("Mode: Dry-run (no changes will be made)\n");
         }
     }
 
-    // Create transport and sync engine
-    let transport = LocalTransport::new();
+    // Create transport router based on source and destination
+    let transport = TransportRouter::new(&cli.source, &cli.destination).await?;
     let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet);
 
     // Run sync
-    let stats = engine.sync(&cli.source, &cli.destination).await?;
+    let stats = engine
+        .sync(cli.source.path(), cli.destination.path())
+        .await?;
 
     // Print summary
     if !cli.quiet {

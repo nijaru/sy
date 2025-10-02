@@ -18,6 +18,22 @@ pub struct SshConfig {
     pub compression: bool,
 }
 
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            hostname: String::new(),
+            port: 22,
+            user: whoami::username(),
+            identity_file: Vec::new(),
+            proxy_jump: None,
+            control_master: false,
+            control_path: None,
+            control_persist: None,
+            compression: false,
+        }
+    }
+}
+
 impl SshConfig {
     /// Create a new SSH config with defaults
     pub fn new(host: &str) -> Self {
