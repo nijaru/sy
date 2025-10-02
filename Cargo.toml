@@ -44,3 +44,11 @@ lz4_flex = "0.11"
 criterion = "0.5"
 tempfile = "3"
 proptest = "1"
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "comparative_bench"
+harness = false
