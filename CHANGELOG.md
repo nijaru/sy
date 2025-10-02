@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2025-10-02
+
+### Added
+- Streaming file transfers with fixed memory usage (128KB chunks)
+- xxHash3 checksum calculation for all file transfers
+- Checksum logging in debug mode for verification
+
+### Changed
+- LocalTransport now uses buffered streaming instead of `fs::copy()`
+- SshTransport now streams files in chunks instead of loading entire file
+- Memory usage is now constant regardless of file size
+
+### Fixed
+- OOM issues with large files (>1GB) resolved
+- All file transfers now verifiable via checksums
+
+## [0.0.1] - 2025-10-02
+
 ### Added
 - Transport abstraction layer for local and remote operations
 - LocalTransport implementation wrapping Phase 1 functionality

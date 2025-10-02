@@ -61,15 +61,57 @@ impl Transport for LocalTransport {
             self.create_dir_all(parent).await?;
         }
 
-        // Copy file using spawn_blocking for synchronous operations
+        // Copy file with checksum verification using spawn_blocking
         let source = source.to_path_buf();
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
+            use std::io::{Read, Write};
+
+            // Open source and destination files
+            let mut source_file = fs::File::open(&source).map_err(|e| SyncError::CopyError {
                 path: source.clone(),
                 source: e,
             })?;
+
+            let mut dest_file = fs::File::create(&dest).map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+
+            // Stream copy with checksum calculation
+            const CHUNK_SIZE: usize = 128 * 1024; // 128KB chunks
+            let mut buffer = vec![0u8; CHUNK_SIZE];
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            let mut bytes_written = 0u64;
+
+            loop {
+                let bytes_read = source_file.read(&mut buffer).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                hasher.update(&buffer[..bytes_read]);
+                dest_file.write_all(&buffer[..bytes_read]).map_err(|e| SyncError::CopyError {
+                    path: dest.clone(),
+                    source: e,
+                })?;
+
+                bytes_written += bytes_read as u64;
+            }
+
+            let checksum = hasher.digest();
+
+            tracing::debug!(
+                "Copied {} ({} bytes, xxh3: {:x})",
+                source.display(),
+                bytes_written,
+                checksum
+            );
 
             // Preserve modification time
             if let Ok(source_meta) = fs::metadata(&source) {
