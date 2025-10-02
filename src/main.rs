@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod ssh;
 mod sync;
 mod transport;
 

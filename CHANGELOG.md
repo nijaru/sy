@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transport abstraction layer for local and remote operations
 - LocalTransport implementation wrapping Phase 1 functionality
 - Async Transport trait for future SSH/SFTP support
+- SSH config parser (~/.ssh/config support)
+- SSH config struct with all major directives
+- 11 comprehensive SSH config unit tests
 - 6 comprehensive LocalTransport unit tests
 - Performance regression tests (7 tests) with conservative baselines
 - Comparative benchmarks against rsync and cp
@@ -30,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Technical
 - Added async-trait dependency
 - Added tokio rt-multi-thread feature
-- All 55 tests passing (21 unit + 6 transport + 28 others)
+- Added whoami, dirs, regex dependencies for SSH config
+- All 66 tests passing (32 unit + 34 integration/property/perf/edge)
 - No performance regression
 
 ### Performance
