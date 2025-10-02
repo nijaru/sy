@@ -1,4 +1,5 @@
 mod cli;
+mod delta;
 mod error;
 mod path;
 mod ssh;

@@ -61,7 +61,7 @@ impl Adler32 {
     ///
     /// Note: Currently recalculates from scratch for correctness.
     /// Can be optimized with incremental update later.
-    pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
+    pub fn roll(&mut self, _old_byte: u8, new_byte: u8) {
         // Update window
         if self.window.len() >= self.block_size {
             self.window.remove(0);
