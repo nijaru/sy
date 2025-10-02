@@ -1,4 +1,4 @@
-use super::Transport;
+use super::{Transport, TransferResult};
 use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
@@ -7,7 +7,7 @@ use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -165,7 +165,7 @@ impl Transport for SshTransport {
         Ok(())
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Use SFTP for file transfer with streaming and checksum verification
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
@@ -268,16 +268,16 @@ impl Transport for SshTransport {
                     }
                 }
 
-                Ok::<(), crate::error::SyncError>(())
+                Ok::<u64, crate::error::SyncError>(bytes_written)
             }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
-
-        Ok(())
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
+        .and_then(|r| r)
+        .map(TransferResult::new)
     }
 
-    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Check if remote destination exists
         if !self.exists(dest).await? {
             tracing::debug!("Remote destination doesn't exist, using full copy");
@@ -423,13 +423,13 @@ impl Transport for SshTransport {
                     bytes_written
                 );
 
-                Ok::<(), SyncError>(())
+                Ok::<u64, SyncError>(bytes_written)
             }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
-
-        Ok(())
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+        .and_then(|r| Ok(r))
+        .map(TransferResult::new)
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {

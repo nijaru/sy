@@ -1,4 +1,4 @@
-use super::{dual::DualTransport, local::LocalTransport, ssh::SshTransport, Transport};
+use super::{dual::DualTransport, local::LocalTransport, ssh::SshTransport, Transport, TransferResult};
 use crate::error::Result;
 use crate::path::SyncPath;
 use crate::ssh::config::{parse_ssh_config, SshConfig};
@@ -101,14 +101,14 @@ impl Transport for TransportRouter {
         }
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         match self {
             TransportRouter::Local(t) => t.copy_file(source, dest).await,
             TransportRouter::Dual(t) => t.copy_file(source, dest).await,
         }
     }
 
-    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         match self {
             TransportRouter::Local(t) => t.sync_file_with_delta(source, dest).await,
             TransportRouter::Dual(t) => t.sync_file_with_delta(source, dest).await,
