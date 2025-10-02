@@ -51,6 +51,12 @@ impl Transport for DualTransport {
         self.dest.copy_file(source, dest).await
     }
 
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Delegate delta sync to destination transport
+        // Assumes source is accessible by dest transport (e.g., local source, remote dest)
+        self.dest.sync_file_with_delta(source, dest).await
+    }
+
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
         // Remove from destination
         self.dest.remove(path, is_dir).await
