@@ -227,7 +227,23 @@ enum NetworkType {
 - [ ] Update documentation (README, DESIGN, CONTRIBUTING)
 - [ ] Fix any bugs found in testing
 
-**Status**: CLI integration complete, end-to-end testing pending
+**Status**: CLI integration complete, end-to-end testing revealed architectural issue
+
+**Testing Results (2025-10-02)**:
+- ✅ SSH connection to Fedora via Tailscale successful
+- ✅ sy-remote binary works on remote host
+- ✅ SSH command execution works
+- ❌ Local→remote sync fails: single-transport model insufficient
+
+**Architectural Issue Discovered**:
+Current design uses single Transport for both source and destination. This doesn't work for mixed local/remote operations:
+- Local→Remote: needs LocalTransport for source scan, SshTransport for destination
+- Remote→Local: needs SshTransport for source scan, LocalTransport for destination
+
+**Required Fix**:
+- SyncEngine needs separate source_transport and dest_transport
+- Or create HybridTransport that routes operations correctly
+- Affects: SyncEngine constructor, strategy planning, transfer operations
 
 ### Task 10: Documentation & Release (Week 5)
 
