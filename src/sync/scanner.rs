@@ -25,10 +25,10 @@ impl Scanner {
         let mut entries = Vec::new();
 
         let walker = WalkBuilder::new(&self.root)
-            .hidden(false)          // Don't skip hidden files by default
-            .git_ignore(true)       // Respect .gitignore
-            .git_global(true)       // Respect global gitignore
-            .git_exclude(true)      // Respect .git/info/exclude
+            .hidden(false) // Don't skip hidden files by default
+            .git_ignore(true) // Respect .gitignore
+            .git_global(true) // Respect global gitignore
+            .git_exclude(true) // Respect .git/info/exclude
             .filter_entry(|entry| {
                 // Skip .git directories
                 entry.file_name() != ".git"
@@ -36,9 +36,7 @@ impl Scanner {
             .build();
 
         for result in walker {
-            let entry = result.map_err(|e| {
-                SyncError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            let entry = result.map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
             let path = entry.path().to_path_buf();
             let metadata = entry.metadata().map_err(|e| SyncError::ReadDirError {
@@ -92,7 +90,9 @@ mod tests {
         let entries = scanner.scan().unwrap();
 
         assert!(entries.len() >= 3); // dir1, file1.txt, dir1/file2.txt
-        assert!(entries.iter().any(|e| e.relative_path == PathBuf::from("file1.txt")));
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path == PathBuf::from("file1.txt")));
     }
 
     #[test]
@@ -116,8 +116,12 @@ mod tests {
         let entries = scanner.scan().unwrap();
 
         // ignored.txt should not appear
-        assert!(!entries.iter().any(|e| e.relative_path.to_str() == Some("ignored.txt")));
+        assert!(!entries
+            .iter()
+            .any(|e| e.relative_path.to_str() == Some("ignored.txt")));
         // included.txt should appear
-        assert!(entries.iter().any(|e| e.relative_path.to_str() == Some("included.txt")));
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path.to_str() == Some("included.txt")));
     }
 }

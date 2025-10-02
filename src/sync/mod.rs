@@ -26,11 +26,19 @@ pub struct SyncEngine {
 
 impl SyncEngine {
     pub fn new(dry_run: bool, delete: bool, quiet: bool) -> Self {
-        Self { dry_run, delete, quiet }
+        Self {
+            dry_run,
+            delete,
+            quiet,
+        }
     }
 
     pub fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
-        tracing::info!("Starting sync: {} → {}", source.display(), destination.display());
+        tracing::info!(
+            "Starting sync: {} → {}",
+            source.display(),
+            destination.display()
+        );
 
         // Scan source directory
         tracing::debug!("Scanning source directory...");
@@ -121,8 +129,13 @@ impl SyncEngine {
 
         pb.finish_with_message("Sync complete");
 
-        tracing::info!("Sync complete: {} created, {} updated, {} skipped, {} deleted",
-            stats.files_created, stats.files_updated, stats.files_skipped, stats.files_deleted);
+        tracing::info!(
+            "Sync complete: {} created, {} updated, {} skipped, {} deleted",
+            stats.files_created,
+            stats.files_updated,
+            stats.files_skipped,
+            stats.files_deleted
+        );
 
         Ok(stats)
     }

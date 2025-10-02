@@ -8,17 +8,78 @@
 
 ✅ **Phase 1 MVP Complete** - Basic local sync working!
 
-```bash
-# Install (from source)
-cargo install --path .
-
-# Basic usage
-sy /source /destination           # Sync directories
-sy /source /destination --dry-run # Preview changes
-sy /source /destination --delete  # Mirror mode
-```
+[![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 See [DESIGN.md](DESIGN.md) for comprehensive technical design (2,400+ lines of detailed specifications).
+
+## Installation
+
+### From Source (Recommended for now)
+
+```bash
+# Clone the repository
+git clone https://github.com/nijaru/sy.git
+cd sy
+
+# Build and install
+cargo install --path .
+
+# Verify installation
+sy --version
+```
+
+### Requirements
+
+- Rust 1.70+ (for development)
+- Git (for .gitignore support)
+
+## Quick Start
+
+```bash
+# Basic sync
+sy /source /destination
+
+# Preview changes (dry-run)
+sy /source /destination --dry-run
+
+# Mirror mode (delete extra files in destination)
+sy /source /destination --delete
+
+# Quiet mode (only show errors)
+sy /source /destination --quiet
+
+# Verbose logging
+sy /source /destination -v      # Debug level
+sy /source /destination -vv     # Trace level
+```
+
+## Features (Phase 1)
+
+### ✅ What Works Now
+
+- **Smart File Sync**: Compares size + modification time (1s tolerance)
+- **Git-Aware**: Automatically respects `.gitignore` patterns
+- **Safe by Default**: Preview changes with `--dry-run`
+- **Progress Display**: Beautiful progress bars with indicatif
+- **Flexible Logging**: From quiet to trace level
+- **Edge Cases**: Handles unicode, deep nesting, large files, empty dirs
+
+### 📋 Common Use Cases
+
+```bash
+# Backup your project
+sy ~/my-project ~/backups/my-project
+
+# Sync to external drive
+sy ~/Documents /Volumes/Backup/Documents --delete
+
+# Preview what would change
+sy ~/src ~/dest --dry-run
+
+# Sync with detailed logging
+sy ~/src ~/dest -vv
+```
 
 ## Vision
 

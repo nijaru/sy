@@ -155,7 +155,10 @@ fn test_update_existing_files() {
         .output()
         .unwrap();
 
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "v1");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "v1"
+    );
 
     // Wait to ensure mtime changes (mtime has 1s tolerance)
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -173,7 +176,10 @@ fn test_update_existing_files() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "v2");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "v2"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Files updated:    1"));

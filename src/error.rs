@@ -19,10 +19,16 @@ pub enum SyncError {
     Io(#[from] std::io::Error),
 
     #[error("Failed to read directory: {path}")]
-    ReadDirError { path: PathBuf, source: std::io::Error },
+    ReadDirError {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("Failed to copy file: {path}")]
-    CopyError { path: PathBuf, source: std::io::Error },
+    CopyError {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("Invalid path: {path}")]
     InvalidPath { path: PathBuf },
