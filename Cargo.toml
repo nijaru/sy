@@ -17,7 +17,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Async runtime (Phase 2: used for transport abstraction)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
 async-trait = "0.1"
 
 # Filesystem
