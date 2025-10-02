@@ -217,11 +217,13 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 - ✅ Performance optimizations (10% faster than initial implementation)
 - ✅ Comparative benchmarks (vs rsync and cp)
 
-### Phase 2: Network Sync (v0.2.0)
+### Phase 2: Network Sync (v0.2.0) - **Next Phase**
 - SSH transport
 - SFTP fallback
 - Network detection
 - SSH config integration
+
+See [docs/PHASE2_PLAN.md](docs/PHASE2_PLAN.md) for detailed implementation plan.
 
 ### Phase 3: Performance (v0.3.0)
 - Parallel file transfers

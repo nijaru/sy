@@ -150,13 +150,19 @@ See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
 ### Phase 2: Network Sync (v0.2.0) - **Next Phase**
 **Goal**: Remote sync via SSH
 
-- [ ] SSH transport layer
-- [ ] SFTP fallback
-- [ ] Network bandwidth detection
-- [ ] SSH config parsing
-- [ ] Basic error handling
+- [ ] Transport abstraction layer
+- [ ] SSH transport with custom protocol
+- [ ] SFTP fallback for compatibility
+- [ ] Network detection (Local/LAN/WAN)
+- [ ] SSH config parsing (~/.ssh/config)
+- [ ] Remote scanner (sy-remote helper)
+- [ ] Error handling and UX
 
 **Deliverable**: `sy /src remote:/dst` works
+
+**Timeline**: 5 weeks, 10 tasks
+
+See [docs/PHASE2_PLAN.md](docs/PHASE2_PLAN.md) for detailed implementation plan.
 
 ### Phase 3: Performance (v0.3.0)
 **Goal**: Parallel transfers
