@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remote file/directory deletion (remove)
 - Modification time preservation for remote files
 - Remote path parsing (user@host:/path format)
+- DualTransport for mixed local/remote operations
 - TransportRouter for automatic local/SSH transport selection
 - CLI integration for remote sync (sy /local user@host:/remote)
 - Windows drive letter support in path parsing
@@ -42,10 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SyncEngine now generic over Transport trait
 - sync() method is now async
 - main() uses tokio runtime (#[tokio::main])
+- Transferrer refactored to be generic over Transport and fully async
+- StrategyPlanner.plan_file_async now checks metadata for update detection
+- TransportRouter uses DualTransport for mixed local/remote operations
 - Pre-allocated vectors to reduce allocations
 - Skip metadata reads for directory existence checks
 - Batched progress bar updates to reduce overhead
 - Use enumerate() instead of explicit counter loops (clippy)
+
+### Fixed
+- SSH session blocking mode issue (handshake failures)
+- Update action now properly detected for existing files
+- Local→remote and remote→local sync now work correctly
 
 ### Technical
 - Added async-trait dependency
