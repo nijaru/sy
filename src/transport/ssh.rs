@@ -1,4 +1,5 @@
 use super::Transport;
+use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
@@ -6,7 +7,7 @@ use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -268,6 +269,161 @@ impl Transport for SshTransport {
                 }
 
                 Ok::<(), crate::error::SyncError>(())
+            }
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        Ok(())
+    }
+
+    async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Check if remote destination exists
+        if !self.exists(dest).await? {
+            tracing::debug!("Remote destination doesn't exist, using full copy");
+            return self.copy_file(source, dest).await;
+        }
+
+        // Get source size
+        let source_meta = std::fs::metadata(source).map_err(|e| {
+            SyncError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to get source metadata: {}", e),
+            ))
+        })?;
+        let source_size = source_meta.len();
+
+        let source_path = source.to_path_buf();
+        let dest_path = dest.to_path_buf();
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            move || {
+                let session = session.lock().map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                })?;
+
+                let sftp = session.sftp().map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                })?;
+
+                // Get remote file size
+                let remote_stat = sftp.stat(&dest_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to stat remote file {}: {}",
+                        dest_path.display(),
+                        e
+                    )))
+                })?;
+
+                let dest_size = remote_stat.size.unwrap_or(0);
+
+                // Skip delta if destination is too small
+                if dest_size < 4096 {
+                    tracing::debug!("Remote destination too small for delta sync, using full copy");
+                    drop(session);
+                    return Err(SyncError::Io(std::io::Error::other(
+                        "Destination too small, caller should use copy_file"
+                    )));
+                }
+
+                // Download remote file to temp location for checksum computation
+                let temp_dir = tempfile::tempdir().map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to create temp dir: {}", e)))
+                })?;
+                let temp_dest = temp_dir.path().join("remote_dest");
+
+                tracing::debug!("Downloading remote file for delta computation...");
+                let mut remote_file = sftp.open(&dest_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to open remote file {}: {}",
+                        dest_path.display(),
+                        e
+                    )))
+                })?;
+
+                let mut temp_file = std::fs::File::create(&temp_dest).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to create temp file: {}", e)))
+                })?;
+
+                std::io::copy(&mut remote_file, &mut temp_file).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to download remote file: {}", e)))
+                })?;
+
+                drop(temp_file);
+                drop(remote_file);
+
+                // Calculate block size
+                let block_size = calculate_block_size(dest_size);
+
+                // Compute checksums of downloaded destination file
+                tracing::debug!("Computing checksums...");
+                let dest_checksums = compute_checksums(&temp_dest, block_size)
+                    .map_err(|e| SyncError::CopyError {
+                        path: temp_dest.clone(),
+                        source: e,
+                    })?;
+
+                // Generate delta
+                tracing::debug!("Generating delta...");
+                let delta = generate_delta(&source_path, &dest_checksums, block_size)
+                    .map_err(|e| SyncError::CopyError {
+                        path: source_path.clone(),
+                        source: e,
+                    })?;
+
+                // Calculate compression ratio
+                let literal_bytes: u64 = delta.ops.iter()
+                    .filter_map(|op| {
+                        if let DeltaOp::Data(data) = op {
+                            Some(data.len() as u64)
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+
+                let compression_ratio = if source_size > 0 {
+                    (literal_bytes as f64 / source_size as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                // Apply delta to create updated file
+                tracing::debug!("Applying delta...");
+                let temp_updated = temp_dir.path().join("updated");
+                apply_delta(&temp_dest, &delta, &temp_updated)
+                    .map_err(|e| SyncError::CopyError {
+                        path: temp_updated.clone(),
+                        source: e,
+                    })?;
+
+                // Upload updated file to remote
+                tracing::debug!("Uploading updated file...");
+                let mut updated_file = std::fs::File::open(&temp_updated).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to open updated file: {}", e)))
+                })?;
+
+                let mut remote_file = sftp.create(&dest_path).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to create remote file {}: {}",
+                        dest_path.display(),
+                        e
+                    )))
+                })?;
+
+                let bytes_written = std::io::copy(&mut updated_file, &mut remote_file).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("Failed to upload file: {}", e)))
+                })?;
+
+                tracing::info!(
+                    "Delta sync: {} ops, {:.1}% literal data, uploaded {} bytes",
+                    delta.ops.len(),
+                    compression_ratio,
+                    bytes_written
+                );
+
+                Ok::<(), SyncError>(())
             }
         })
         .await
