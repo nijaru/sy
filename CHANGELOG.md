@@ -24,8 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remote directory creation (create_dir_all)
 - Remote file/directory deletion (remove)
 - Modification time preservation for remote files
+- Remote path parsing (user@host:/path format)
+- TransportRouter for automatic local/SSH transport selection
+- CLI integration for remote sync (sy /local user@host:/remote)
+- Windows drive letter support in path parsing
+- SshConfig Default implementation
 - 11 comprehensive SSH config unit tests
 - 6 comprehensive LocalTransport unit tests
+- 9 path parsing unit tests
 - Performance regression tests (7 tests) with conservative baselines
 - Comparative benchmarks against rsync and cp
 - Performance optimizations (10% improvement in idempotent sync)
@@ -49,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added serde_json for JSON remote protocol
 - Created sy-remote binary target for remote execution
 - Arc<Mutex<Session>> for thread-safe SSH session sharing
-- All 67 tests passing (33 unit + 34 integration/property/perf/edge)
+- All 77 tests passing (43 unit + 34 integration/property/perf/edge)
 - No performance regression
 
 ### Performance

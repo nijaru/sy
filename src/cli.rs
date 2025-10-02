@@ -1,16 +1,22 @@
+use crate::path::SyncPath;
 use clap::Parser;
-use std::path::PathBuf;
+
+fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
+    Ok(SyncPath::parse(s))
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "sy")]
 #[command(about = "Modern file synchronization tool", long_about = None)]
 #[command(version)]
 pub struct Cli {
-    /// Source path
-    pub source: PathBuf,
+    /// Source path (local: /path or remote: user@host:/path)
+    #[arg(value_parser = parse_sync_path)]
+    pub source: SyncPath,
 
-    /// Destination path
-    pub destination: PathBuf,
+    /// Destination path (local: /path or remote: user@host:/path)
+    #[arg(value_parser = parse_sync_path)]
+    pub destination: SyncPath,
 
     /// Show changes without applying them (dry-run)
     #[arg(short = 'n', long)]
@@ -31,12 +37,16 @@ pub struct Cli {
 
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.source.exists() {
-            anyhow::bail!("Source path does not exist: {}", self.source.display());
-        }
+        // Only validate local source paths (remote paths are validated during connection)
+        if self.source.is_local() {
+            let path = self.source.path();
+            if !path.exists() {
+                anyhow::bail!("Source path does not exist: {}", self.source);
+            }
 
-        if !self.source.is_dir() {
-            anyhow::bail!("Source must be a directory: {}", self.source.display());
+            if !path.is_dir() {
+                anyhow::bail!("Source must be a directory: {}", self.source);
+            }
         }
 
         Ok(())
@@ -59,14 +69,15 @@ impl Cli {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
     fn test_validate_source_exists() {
         let temp = TempDir::new().unwrap();
         let cli = Cli {
-            source: temp.path().to_path_buf(),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(temp.path().to_path_buf()),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -78,8 +89,8 @@ mod tests {
     #[test]
     fn test_validate_source_not_exists() {
         let cli = Cli {
-            source: PathBuf::from("/nonexistent/path"),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(PathBuf::from("/nonexistent/path")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -97,8 +108,8 @@ mod tests {
         fs::write(&file_path, "content").unwrap();
 
         let cli = Cli {
-            source: file_path,
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(file_path),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -113,10 +124,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_remote_source() {
+        // Remote sources should not be validated locally
+        let cli = Cli {
+            source: SyncPath::Remote {
+                host: "server".to_string(),
+                user: Some("user".to_string()),
+                path: PathBuf::from("/remote/path"),
+            },
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+        };
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
     fn test_log_level_quiet() {
         let cli = Cli {
-            source: PathBuf::from("/tmp/src"),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(PathBuf::from("/tmp/src")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -128,8 +157,8 @@ mod tests {
     #[test]
     fn test_log_level_default() {
         let cli = Cli {
-            source: PathBuf::from("/tmp/src"),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(PathBuf::from("/tmp/src")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -141,8 +170,8 @@ mod tests {
     #[test]
     fn test_log_level_verbose() {
         let cli = Cli {
-            source: PathBuf::from("/tmp/src"),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(PathBuf::from("/tmp/src")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 1,
@@ -154,8 +183,8 @@ mod tests {
     #[test]
     fn test_log_level_very_verbose() {
         let cli = Cli {
-            source: PathBuf::from("/tmp/src"),
-            destination: PathBuf::from("/tmp/dest"),
+            source: SyncPath::Local(PathBuf::from("/tmp/src")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
             verbose: 2,
