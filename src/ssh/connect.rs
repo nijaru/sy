@@ -79,11 +79,11 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
                 ];
 
                 for key_path in &default_keys {
-                    if key_path.exists() {
-                        if session.userauth_pubkey_file(&username, None, key_path, None).is_ok() {
-                            tracing::debug!("Authenticated using key: {}", key_path.display());
-                            return Ok(session);
-                        }
+                    if key_path.exists()
+                        && session.userauth_pubkey_file(&username, None, key_path, None).is_ok()
+                    {
+                        tracing::debug!("Authenticated using key: {}", key_path.display());
+                        return Ok(session);
                     }
                 }
             }

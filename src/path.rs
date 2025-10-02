@@ -65,6 +65,7 @@ impl SyncPath {
     }
 
     /// Check if this is a remote path
+    #[allow(dead_code)] // Used in tests
     pub fn is_remote(&self) -> bool {
         matches!(self, SyncPath::Remote { .. })
     }
