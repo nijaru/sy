@@ -32,11 +32,11 @@ Network: Single connection bandwidth
 
 ## High-Impact Optimizations (Phase 3)
 
-### 1. Parallel File Transfers 🚀 **TOP PRIORITY**
+### 1. Parallel File Transfers 🚀 **COMPLETED**
 
 **Impact**: 5-10x speedup for multiple files
 **Effort**: Medium (2-3 hours)
-**Status**: Infrastructure ready (tokio sync features added)
+**Status**: ✅ Implemented (v0.0.4)
 
 #### Design
 
@@ -89,11 +89,11 @@ After (parallel, 10 workers):
 - Network: Saturate bandwidth, amortize latency
 ```
 
-### 2. Bytes Transferred Accounting 📊
+### 2. Bytes Transferred Accounting 📊 **COMPLETED**
 
 **Impact**: Correctness (users see accurate statistics)
 **Effort**: Medium (requires Transport trait changes)
-**Status**: Documented TODO
+**Status**: ✅ Implemented (v0.0.4)
 
 #### Current Issue
 
@@ -266,5 +266,6 @@ benchmark local vs LAN vs WAN profiles
 ---
 
 **Last Updated**: 2025-10-02
-**Current Version**: v0.0.3
-**Next Target**: v0.0.4 (Parallel transfers)
+**Current Version**: v0.0.4
+**Completed**: Parallel transfers + bytes_transferred accounting
+**Next Target**: v0.0.5 (O(1) rolling hash)

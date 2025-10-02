@@ -6,9 +6,12 @@ use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use strategy::{StrategyPlanner, SyncAction};
+use tokio::sync::Semaphore;
 use transfer::Transferrer;
 
+#[derive(Debug)]
 pub struct SyncStats {
     pub files_scanned: usize,
     pub files_created: usize,
@@ -19,16 +22,16 @@ pub struct SyncStats {
 }
 
 pub struct SyncEngine<T: Transport> {
-    transport: T,
+    transport: Arc<T>,
     dry_run: bool,
     delete: bool,
     quiet: bool,
 }
 
-impl<T: Transport> SyncEngine<T> {
+impl<T: Transport + 'static> SyncEngine<T> {
     pub fn new(transport: T, dry_run: bool, delete: bool, quiet: bool) -> Self {
         Self {
-            transport,
+            transport: Arc::new(transport),
             dry_run,
             delete,
             quiet,
@@ -64,16 +67,16 @@ impl<T: Transport> SyncEngine<T> {
             tasks.extend(deletions);
         }
 
-        // Execute sync operations
-        let transferrer = Transferrer::new(&self.transport, self.dry_run);
-        let mut stats = SyncStats {
+        // Execute sync operations in parallel
+        // Thread-safe stats tracking
+        let stats = Arc::new(Mutex::new(SyncStats {
             files_scanned: source_files.len(),
             files_created: 0,
             files_updated: 0,
             files_skipped: 0,
             files_deleted: 0,
             bytes_transferred: 0,
-        };
+        }));
 
         // Create progress bar (only if not quiet)
         let pb = if self.quiet {
@@ -90,63 +93,136 @@ impl<T: Transport> SyncEngine<T> {
             pb
         };
 
-        // TODO: Parallel execution with tokio::spawn and semaphore for concurrency control
-        // Current: Sequential execution (simple, correct)
-        // Future: Parallel with Arc<Semaphore> to limit concurrent operations
-        for (task_count, task) in tasks.into_iter().enumerate() {
-            // Only update progress bar for actual actions or every 10 files
-            let should_update = !matches!(task.action, SyncAction::Skip) || task_count % 10 == 0;
+        // Parallel execution with semaphore for concurrency control
+        const MAX_CONCURRENT: usize = 10;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let mut handles = Vec::with_capacity(tasks.len());
 
-            if should_update {
+        for task in tasks {
+            let transport = Arc::clone(&self.transport);
+            let dry_run = self.dry_run;
+            let stats = Arc::clone(&stats);
+            let pb = pb.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            let handle = tokio::spawn(async move {
+                let transferrer = Transferrer::new(transport.as_ref(), dry_run);
+
+                // Update progress message
                 let msg = match &task.action {
                     SyncAction::Create => format!("Creating {}", task.dest_path.display()),
                     SyncAction::Update => format!("Updating {}", task.dest_path.display()),
                     SyncAction::Skip => format!("Skipping {}", task.dest_path.display()),
                     SyncAction::Delete => format!("Deleting {}", task.dest_path.display()),
                 };
-                pb.set_message(msg);
-            }
 
-            match task.action {
-                SyncAction::Create => {
-                    if let Some(source) = &task.source {
-                        if let Some(result) = transferrer.create(source, &task.dest_path).await? {
-                            stats.bytes_transferred += result.bytes_written;
+                if !matches!(task.action, SyncAction::Skip) {
+                    pb.set_message(msg);
+                }
+
+                // Execute task
+                let result = match task.action {
+                    SyncAction::Create => {
+                        if let Some(source) = &task.source {
+                            match transferrer.create(source, &task.dest_path).await {
+                                Ok(transfer_result) => {
+                                    let mut stats = stats.lock().unwrap();
+                                    if let Some(result) = transfer_result {
+                                        stats.bytes_transferred += result.bytes_written;
+                                    }
+                                    stats.files_created += 1;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Ok(())
                         }
-                        stats.files_created += 1;
+                    }
+                    SyncAction::Update => {
+                        if let Some(source) = &task.source {
+                            match transferrer.update(source, &task.dest_path).await {
+                                Ok(transfer_result) => {
+                                    let mut stats = stats.lock().unwrap();
+                                    if let Some(result) = transfer_result {
+                                        stats.bytes_transferred += result.bytes_written;
+                                    }
+                                    stats.files_updated += 1;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    SyncAction::Skip => {
+                        let mut stats = stats.lock().unwrap();
+                        stats.files_skipped += 1;
+                        Ok(())
+                    }
+                    SyncAction::Delete => {
+                        let is_dir = task.dest_path.is_dir();
+                        match transferrer.delete(&task.dest_path, is_dir).await {
+                            Ok(_) => {
+                                let mut stats = stats.lock().unwrap();
+                                stats.files_deleted += 1;
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+
+                pb.inc(1);
+                drop(permit);
+                result
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all results
+        let results = futures::future::join_all(handles).await;
+
+        // Check for errors
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(Ok(())) => {} // Success
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
-                SyncAction::Update => {
-                    if let Some(source) = &task.source {
-                        if let Some(result) = transferrer.update(source, &task.dest_path).await? {
-                            stats.bytes_transferred += result.bytes_written;
-                        }
-                        stats.files_updated += 1;
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(crate::error::SyncError::Io(std::io::Error::other(
+                            format!("Task panicked: {}", e),
+                        )));
                     }
                 }
-                SyncAction::Skip => {
-                    stats.files_skipped += 1;
-                }
-                SyncAction::Delete => {
-                    let is_dir = task.dest_path.is_dir();
-                    transferrer.delete(&task.dest_path, is_dir).await?;
-                    stats.files_deleted += 1;
-                }
             }
-
-            pb.inc(1);
         }
 
         pb.finish_with_message("Sync complete");
 
+        // Extract final stats
+        let final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+
         tracing::info!(
             "Sync complete: {} created, {} updated, {} skipped, {} deleted",
-            stats.files_created,
-            stats.files_updated,
-            stats.files_skipped,
-            stats.files_deleted
+            final_stats.files_created,
+            final_stats.files_updated,
+            final_stats.files_skipped,
+            final_stats.files_deleted
         );
 
-        Ok(stats)
+        // Return first error if any occurred
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        Ok(final_stats)
     }
 }
