@@ -1,75 +1,76 @@
+mod cli;
+mod error;
+mod sync;
+
+use anyhow::Result;
 use clap::Parser;
+use cli::Cli;
+use sync::SyncEngine;
+use tracing_subscriber::{fmt, EnvFilter};
 
-#[derive(Parser)]
-#[command(name = "sy")]
-#[command(about = "Modern rsync alternative - Fast, parallel file synchronization", long_about = None)]
-#[command(version)]
-struct Cli {
-    /// Source path
-    source: String,
-
-    /// Destination path (can be remote: user@host:/path)
-    destination: String,
-
-    /// Show changes without applying them
-    #[arg(short, long)]
-    preview: bool,
-
-    /// Delete files in destination not present in source
-    #[arg(short, long)]
-    delete: bool,
-
-    /// Verify integrity with cryptographic checksums (BLAKE3)
-    #[arg(short, long)]
-    verify: bool,
-
-    /// Number of parallel workers (default: CPU cores)
-    #[arg(short, long)]
-    workers: Option<usize>,
-
-    /// Compression: auto, zstd, lz4, none
-    #[arg(short, long, default_value = "auto")]
-    compress: String,
-
-    /// Fast mode (lz4 compression)
-    #[arg(long)]
-    fast: bool,
-
-    /// Maximum compression (zstd level 11)
-    #[arg(long)]
-    max_compression: bool,
-
-    /// Disable parallel transfers
-    #[arg(long)]
-    no_parallel: bool,
-
-    /// Bandwidth limit (e.g., 10M, 1G)
-    #[arg(long)]
-    bandwidth: Option<String>,
-
-    /// Use config file
-    #[arg(long)]
-    config: Option<String>,
-}
-
-fn main() {
+fn main() -> Result<()> {
+    // Parse CLI arguments
     let cli = Cli::parse();
 
-    println!("sy v{}", env!("CARGO_PKG_VERSION"));
-    println!("Syncing {} → {}", cli.source, cli.destination);
+    // Setup logging
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cli.log_level().as_str()));
 
-    if cli.preview {
-        println!("Mode: Preview (no changes will be made)");
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .compact()
+        .init();
+
+    // Validate arguments
+    cli.validate()?;
+
+    if !cli.quiet {
+        println!("sy v{}", env!("CARGO_PKG_VERSION"));
+        println!("Syncing {} → {}", cli.source.display(), cli.destination.display());
+
+        if cli.dry_run {
+            println!("Mode: Dry-run (no changes will be made)\n");
+        }
     }
 
-    println!("\nNOTE: This is a skeleton. Implementation coming soon!");
-    println!("\nPlanned features:");
-    println!("  ✓ Parallel file transfers");
-    println!("  ✓ Parallel chunk transfers for large files");
-    println!("  ✓ Adaptive compression (zstd/lz4)");
-    println!("  ✓ xxHash3 for fast integrity checks");
-    println!("  ✓ BLAKE3 for cryptographic verification");
-    println!("  ✓ gitignore/syncignore support");
-    println!("  ✓ Beautiful progress bars");
-    println!("\nSee DESIGN.md for architecture details.");
+    // Create sync engine
+    let engine = SyncEngine::new(cli.dry_run, cli.delete, cli.quiet);
+
+    // Run sync
+    let stats = engine.sync(&cli.source, &cli.destination)?;
+
+    // Print summary
+    if !cli.quiet {
+        println!("\n✓ Sync complete");
+        println!("  Files scanned:    {}", stats.files_scanned);
+        println!("  Files created:    {}", stats.files_created);
+        println!("  Files updated:    {}", stats.files_updated);
+        println!("  Files skipped:    {}", stats.files_skipped);
+        if cli.delete {
+            println!("  Files deleted:    {}", stats.files_deleted);
+        }
+        println!("  Bytes transferred: {}", format_bytes(stats.bytes_transferred));
+    }
+
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }

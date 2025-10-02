@@ -129,21 +129,25 @@ sy/
 
 See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
 
-### Phase 1: MVP (v0.1.0) - **Current Phase**
+### ✅ Phase 1: MVP (v0.1.0) - **COMPLETE**
 **Goal**: Basic local sync working
 
 - [x] Project structure
 - [x] Documentation (README, DESIGN, CONTRIBUTING, CLAUDE.md)
-- [ ] CLI argument parsing (clap)
-- [ ] Local filesystem traversal (walkdir + ignore)
-- [ ] File comparison (size + mtime)
-- [ ] Full file copy (no delta)
-- [ ] Basic progress display (indicatif)
-- [ ] Unit tests
+- [x] CLI argument parsing (clap)
+- [x] Local filesystem traversal (walkdir + ignore)
+- [x] File comparison (size + mtime)
+- [x] Full file copy (no delta)
+- [x] Basic progress display (indicatif)
+- [x] Unit tests
+- [x] .gitignore support
+- [x] .git directory exclusion
+- [x] Dry-run and delete modes
+- [x] End-to-end testing
 
 **Deliverable**: `sy /src /dst` works locally
 
-### Phase 2: Network Sync (v0.2.0)
+### Phase 2: Network Sync (v0.2.0) - **Next Phase**
 **Goal**: Remote sync via SSH
 
 - [ ] SSH transport layer
