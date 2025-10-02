@@ -117,7 +117,7 @@ src/
 **Completed**: 2025-10-01
 **Commits**: TBD
 
-### Task 4: Remote Scanner (Week 2-3)
+### Task 4: Remote Scanner (Week 2-3) 🚧 **IN PROGRESS**
 
 **Goal**: Scan remote directory over SSH
 
@@ -125,7 +125,7 @@ src/
 
 ```bash
 # Remote helper: sy-remote (statically linked binary)
-sy-remote scan /path/to/dir --format json
+sy-remote scan /path/to/dir
 
 # Returns JSON:
 {
@@ -136,15 +136,20 @@ sy-remote scan /path/to/dir --format json
 }
 ```
 
-- [ ] Create `sy-remote` binary (minimal, statically linked)
-- [ ] Implement remote scanning via SSH exec
-- [ ] Transfer `sy-remote` binary if not present
-- [ ] Parse JSON output from remote
+- [x] Create `sy-remote` binary (minimal, linked)
+- [x] Implement remote scanning via SSH exec
+- [x] Parse JSON output from remote
+- [x] SshTransport implementation with scan() and exists()
+- [ ] Transfer `sy-remote` binary if not present (deferred)
 - [ ] Handle errors (permission denied, path not found, etc.)
-- [ ] Test with various directory structures
-- [ ] Handle large directory listings efficiently
+- [ ] Test with real SSH connection (deferred to Task 9)
+- [ ] Test with various directory structures (deferred to Task 9)
+- [ ] Handle large directory listings efficiently (deferred to optimization)
+- [ ] Static linking for sy-remote (deferred to Task 9)
 
-**Alternative**: Use SFTP readdir (slower but no binary transfer needed)
+**Alternative**: Use SFTP readdir (slower but no binary transfer needed) - Task 5
+
+**Status**: Core implementation complete, integration testing deferred to Task 9
 
 ### Task 5: SFTP Fallback (Week 3)
 

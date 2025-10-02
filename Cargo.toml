@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 # CLI & Config
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 # Async runtime (Phase 2: used for transport abstraction)
@@ -59,3 +60,7 @@ harness = false
 [[bench]]
 name = "comparative_bench"
 harness = false
+
+[[bin]]
+name = "sy-remote"
+path = "src/bin/sy-remote.rs"

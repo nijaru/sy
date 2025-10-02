@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SSH connection establishment module (connect.rs)
 - SSH authentication (agent, identity files, default keys)
 - TCP connection with timeout handling
+- SshTransport implementation with remote command execution
+- sy-remote helper binary for efficient remote directory scanning
+- JSON-based remote protocol for file metadata transfer
+- Remote scanning via SSH exec
 - 11 comprehensive SSH config unit tests
 - 6 comprehensive LocalTransport unit tests
 - Performance regression tests (7 tests) with conservative baselines
@@ -38,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added tokio rt-multi-thread and time features
 - Added whoami, dirs, regex dependencies for SSH config
 - Added ssh2 dependency for SSH connectivity
+- Added serde_json for JSON remote protocol
+- Created sy-remote binary target for remote execution
+- Arc<Mutex<Session>> for thread-safe SSH session sharing
 - All 67 tests passing (33 unit + 34 integration/property/perf/edge)
 - No performance regression
 
