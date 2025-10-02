@@ -59,10 +59,9 @@ impl Adler32 {
     /// Roll the hash: remove old byte, add new byte
     /// This is the key operation for rsync algorithm
     ///
-    /// Note: Currently recalculates from scratch for correctness.
-    /// The incremental formula for Adler-32 is complex and error-prone.
-    /// For local operations, delta sync is disabled anyway.
-    /// For remote operations, network cost >> computation cost.
+    /// O(1) incremental update using Adler-32 rolling formula:
+    /// - A_new = (A_old - old_byte + new_byte) mod M
+    /// - B_new = (B_old - block_size * old_byte + A_new - 1) mod M
     pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
         // Update window
         if self.window.len() >= self.block_size {
@@ -70,15 +69,18 @@ impl Adler32 {
         }
         self.window.push(new_byte);
 
-        // Recalculate from scratch
-        // This is O(block_size) but simpler and correct
-        // Future optimization: implement true O(1) rolling if needed
-        self.a = 1;
-        self.b = 0;
-        for &byte in &self.window {
-            self.a = (self.a + byte as u32) % MOD_ADLER;
-            self.b = (self.b + self.a) % MOD_ADLER;
-        }
+        let old = old_byte as u32;
+        let new = new_byte as u32;
+        let n = self.block_size as u32;
+
+        // Update A: remove old byte, add new byte
+        // Add MOD_ADLER*2 to avoid underflow in modular arithmetic
+        self.a = (self.a + MOD_ADLER * 2 - old + new) % MOD_ADLER;
+
+        // Update B: remove contribution of old byte across all positions
+        // Add MOD_ADLER*3 to handle larger potential underflow from n*old
+        let n_old = (n * old) % MOD_ADLER;
+        self.b = (self.b + MOD_ADLER * 3 - n_old + self.a - 1) % MOD_ADLER;
     }
 
     /// Get the current hash value
@@ -168,5 +170,102 @@ mod tests {
     fn test_adler32_empty() {
         let hash = Adler32::hash(b"");
         assert_eq!(hash, 1); // Adler-32 of empty data is 1
+    }
+
+    #[test]
+    fn test_adler32_rolling_large_block() {
+        // Test with large block size (128KB)
+        let block_size = 128 * 1024;
+        let mut data = vec![0u8; block_size * 2];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+
+        let mut hasher = Adler32::new(block_size);
+        hasher.update_block(&data[0..block_size]);
+
+        // Roll forward
+        hasher.roll(data[0], data[block_size]);
+        let expected = Adler32::hash(&data[1..block_size + 1]);
+        assert_eq!(hasher.digest(), expected);
+    }
+
+    #[test]
+    fn test_adler32_rolling_all_zeros() {
+        // Edge case: all zeros
+        let data = vec![0u8; 100];
+        let block_size = 10;
+
+        let mut hasher = Adler32::new(block_size);
+        hasher.update_block(&data[0..block_size]);
+
+        for i in 1..=(data.len() - block_size) {
+            hasher.roll(data[i - 1], data[i + block_size - 1]);
+            let expected = Adler32::hash(&data[i..i + block_size]);
+            assert_eq!(hasher.digest(), expected);
+        }
+    }
+
+    #[test]
+    fn test_adler32_rolling_all_ones() {
+        // Edge case: all 0xFF
+        let data = vec![0xFF; 100];
+        let block_size = 16;
+
+        let mut hasher = Adler32::new(block_size);
+        hasher.update_block(&data[0..block_size]);
+
+        for i in 1..=(data.len() - block_size) {
+            hasher.roll(data[i - 1], data[i + block_size - 1]);
+            let expected = Adler32::hash(&data[i..i + block_size]);
+            assert_eq!(hasher.digest(), expected);
+        }
+    }
+
+    #[test]
+    fn test_adler32_rolling_repeating_pattern() {
+        // Test with repeating pattern
+        let pattern = b"ABCD";
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(pattern);
+        }
+        let block_size = 32;
+
+        let mut hasher = Adler32::new(block_size);
+        hasher.update_block(&data[0..block_size]);
+
+        for i in 1..=(data.len() - block_size) {
+            hasher.roll(data[i - 1], data[i + block_size - 1]);
+            let expected = Adler32::hash(&data[i..i + block_size]);
+            assert_eq!(
+                hasher.digest(),
+                expected,
+                "Mismatch at position {} with repeating pattern",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_adler32_rolling_modulo_boundary() {
+        // Test near MOD_ADLER boundary
+        // Create data that will push checksums close to MOD_ADLER
+        let block_size = 256;
+        let mut data = vec![0xFF; block_size * 3];
+
+        let mut hasher = Adler32::new(block_size);
+        hasher.update_block(&data[0..block_size]);
+
+        for i in 1..block_size {
+            hasher.roll(data[i - 1], data[i + block_size - 1]);
+            let expected = Adler32::hash(&data[i..i + block_size]);
+            assert_eq!(
+                hasher.digest(),
+                expected,
+                "Modulo boundary test failed at position {}",
+                i
+            );
+        }
     }
 }
