@@ -86,8 +86,7 @@ impl SyncEngine {
             pb
         };
 
-        let mut task_count = 0;
-        for task in tasks {
+        for (task_count, task) in tasks.into_iter().enumerate() {
             // Only update progress bar for actual actions or every 10 files
             let should_update = !matches!(task.action, SyncAction::Skip) || task_count % 10 == 0;
 
@@ -130,7 +129,6 @@ impl SyncEngine {
             }
 
             pb.inc(1);
-            task_count += 1;
         }
 
         pb.finish_with_message("Sync complete");

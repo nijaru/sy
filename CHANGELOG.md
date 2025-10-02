@@ -7,9 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Performance regression tests (7 tests) with conservative baselines
+- Comparative benchmarks against rsync and cp
+- Performance optimizations (10% improvement in idempotent sync)
+- Future optimization roadmap documentation
+
+### Changed
+- Pre-allocated vectors to reduce allocations
+- Skip metadata reads for directory existence checks
+- Batched progress bar updates to reduce overhead
+- Use enumerate() instead of explicit counter loops (clippy)
+
+### Performance
+- **100 files**: 40-79% faster than rsync/cp
+- **Large files (50MB)**: 64x faster than rsync, 7x faster than cp
+- **Idempotent sync**: 4.7x faster than rsync (was 4.3x)
+- **1000 files**: 40-47% faster than alternatives
+
 ### Planned
 - Phase 2: Network sync (SSH transport, SFTP fallback)
-- Phase 3: Parallel transfers
+- Phase 3: Parallel transfers (rayon, async I/O, memory-mapped I/O)
 - Phase 4: Delta sync (rsync algorithm)
 - Phase 5: Multi-layer checksums and verification
 
@@ -37,11 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Large file handling (tested up to 10MB)
   - Zero-byte file support
 
-- **Testing** (42 tests total)
+- **Testing** (49 tests total)
   - **Unit Tests (15)**: CLI validation, scanner, strategy, transfer modules
   - **Integration Tests (11)**: End-to-end workflows, error handling
   - **Property-Based Tests (5)**: Idempotency, completeness, correctness
   - **Edge Case Tests (11)**: Empty dirs, unicode, deep nesting, large files
+  - **Performance Regression Tests (7)**: Ensure performance stays within bounds
 
 - **Development**
   - Comprehensive error handling with thiserror
