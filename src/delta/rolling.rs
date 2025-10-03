@@ -247,7 +247,7 @@ mod tests {
         // Test near MOD_ADLER boundary
         // Create data that will push checksums close to MOD_ADLER
         let block_size = 256;
-        let mut data = vec![0xFF; block_size * 3];
+        let data = vec![0xFF; block_size * 3];
 
         let mut hasher = Adler32::new(block_size);
         hasher.update_block(&data[0..block_size]);

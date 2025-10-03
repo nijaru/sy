@@ -5,7 +5,7 @@ pub mod applier;
 
 pub use rolling::Adler32;
 pub use checksum::{BlockChecksum, compute_checksums};
-pub use generator::{Delta, DeltaOp, generate_delta};
+pub use generator::{Delta, DeltaOp, generate_delta, generate_delta_streaming};
 pub use applier::apply_delta;
 
 /// Default block size calculation: sqrt(filesize)
