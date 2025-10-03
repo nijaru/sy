@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -7,15 +8,20 @@ pub enum Compression {
     Zstd,
 }
 
-impl Compression {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for Compression {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "none" => Some(Self::None),
-            "lz4" => Some(Self::Lz4),
-            "zstd" => Some(Self::Zstd),
-            _ => None,
+            "none" => Ok(Self::None),
+            "lz4" => Ok(Self::Lz4),
+            "zstd" => Ok(Self::Zstd),
+            _ => Err(format!("Unknown compression type: {}", s)),
         }
     }
+}
+
+impl Compression {
 
     pub fn as_str(&self) -> &'static str {
         match self {

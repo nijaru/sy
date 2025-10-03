@@ -74,7 +74,7 @@ pub fn generate_delta_streaming(
     for checksum in dest_checksums {
         checksum_map
             .entry(checksum.weak)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(checksum);
     }
 
@@ -235,6 +235,10 @@ pub fn generate_delta_streaming(
 /// 2. Slide window through source file using rolling hash
 /// 3. When weak hash matches, verify with strong hash
 /// 4. Generate Copy ops for matches, Data ops for literals
+///
+/// Note: This loads entire source file into memory. For large files, use
+/// `generate_delta_streaming` instead.
+#[allow(dead_code)]
 pub fn generate_delta(
     source_path: &Path,
     dest_checksums: &[BlockChecksum],
@@ -245,7 +249,7 @@ pub fn generate_delta(
     for checksum in dest_checksums {
         checksum_map
             .entry(checksum.weak)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(checksum);
     }
 
