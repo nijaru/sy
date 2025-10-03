@@ -249,22 +249,24 @@ fn test_error_source_not_exists() {
     assert!(stderr.contains("does not exist"));
 }
 
-#[test]
-fn test_error_source_is_file() {
+#[tokio::test]
+async fn test_single_file_sync() {
     let temp = TempDir::new().unwrap();
     let file_path = temp.path().join("file.txt");
-    fs::write(&file_path, "content").unwrap();
+    fs::write(&file_path, "test content for single file").unwrap();
 
-    let dest = TempDir::new().unwrap();
+    let dest_file = temp.path().join("dest.txt");
 
     let output = Command::new(sy_bin())
-        .args([file_path.to_str().unwrap(), dest.path().to_str().unwrap()])
+        .args([file_path.to_str().unwrap(), dest_file.to_str().unwrap()])
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("must be a directory"));
+    assert!(output.status.success(), "stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    assert!(dest_file.exists());
+    assert_eq!(fs::read_to_string(&dest_file).unwrap(), "test content for single file");
 }
 
 #[test]

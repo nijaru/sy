@@ -5,7 +5,8 @@ pub mod transfer;
 use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::Path;
+use scanner::FileEntry;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use strategy::{StrategyPlanner, SyncAction};
 use tokio::sync::Semaphore;
@@ -225,5 +226,61 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         Ok(final_stats)
+    }
+
+    /// Sync a single file (source is a file, not a directory)
+    pub async fn sync_single_file(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
+        tracing::info!(
+            "Starting single file sync: {} → {}",
+            source.display(),
+            destination.display()
+        );
+
+        let mut stats = SyncStats {
+            files_scanned: 1,
+            files_created: 0,
+            files_updated: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+        };
+
+        // Check if destination exists
+        let dest_exists = self.transport.exists(destination).await?;
+        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run);
+
+        if !dest_exists {
+            // Create new file
+            tracing::info!("Creating {}", destination.display());
+            let metadata = source.metadata()?;
+            let filename = source.file_name().unwrap().to_owned();
+            if let Some(result) = transferrer.create(&FileEntry {
+                path: source.to_path_buf(),
+                relative_path: PathBuf::from(filename),
+                size: metadata.len(),
+                modified: metadata.modified()?,
+                is_dir: false,
+            }, destination).await? {
+                stats.bytes_transferred = result.bytes_written;
+            }
+            stats.files_created = 1;
+        } else {
+            // Update existing file
+            tracing::info!("Updating {}", destination.display());
+            let metadata = source.metadata()?;
+            let filename = source.file_name().unwrap().to_owned();
+            if let Some(result) = transferrer.update(&FileEntry {
+                path: source.to_path_buf(),
+                relative_path: PathBuf::from(filename),
+                size: metadata.len(),
+                modified: metadata.modified()?,
+                is_dir: false,
+            }, destination).await? {
+                stats.bytes_transferred = result.bytes_written;
+            }
+            stats.files_updated = 1;
+        }
+
+        Ok(stats)
     }
 }

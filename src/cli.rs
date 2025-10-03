@@ -47,13 +47,14 @@ impl Cli {
             if !path.exists() {
                 anyhow::bail!("Source path does not exist: {}", self.source);
             }
-
-            if !path.is_dir() {
-                anyhow::bail!("Source must be a directory: {}", self.source);
-            }
         }
 
         Ok(())
+    }
+
+    /// Check if source is a file (not a directory)
+    pub fn is_single_file(&self) -> bool {
+        self.source.is_local() && self.source.path().is_file()
     }
 
     pub fn log_level(&self) -> tracing::Level {
@@ -114,7 +115,7 @@ mod tests {
         fs::write(&file_path, "content").unwrap();
 
         let cli = Cli {
-            source: SyncPath::Local(file_path),
+            source: SyncPath::Local(file_path.clone()),
             destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
             dry_run: false,
             delete: false,
@@ -122,12 +123,9 @@ mod tests {
             quiet: false,
             parallel: 10,
         };
-        let result = cli.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a directory"));
+        // Single file sync is now supported
+        assert!(cli.validate().is_ok());
+        assert!(cli.is_single_file());
     }
 
     #[test]
