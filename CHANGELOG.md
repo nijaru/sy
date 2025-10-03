@@ -7,16 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned for v0.1.0
+- Network speed detection
+- Adaptive compression integration
+- Parallel chunk transfers (within single files)
+- Resume support for interrupted transfers
+
+### Planned for v0.5.0
+- Multi-layer checksums (BLAKE3 end-to-end)
+- Verification modes (fast, standard, paranoid)
+- Atomic operations
+- Crash recovery
+
+## [0.0.8] - 2025-10-02
+
+### Added
+- Single file sync support (not just directories)
+- Configurable parallel workers via `-j` flag (default 10)
+- Size-based local delta heuristic (>1GB files automatically use delta sync)
+
 ### Changed
-- Delta sync disabled for local-to-local operations (191x performance improvement)
-- LocalTransport now uses direct copy instead of delta sync
+- Implemented `FromStr` trait for `Compression` enum (more idiomatic)
+- Replaced `or_insert_with(Vec::new)` with `or_default()` (more idiomatic)
+- Removed redundant closures in transport layer
+- Delta sync now activates automatically for large local files (>1GB threshold)
+
+### Fixed
+- All clippy warnings resolved (7 warnings → 0)
+- Code is now fully idiomatic Rust
 
 ### Performance
-- **Local sync improvement**: 26.9s → 0.14s (191x faster)
-- Root cause: Rolling hash O(n*block_size) overhead exceeds local copy benefit
-- Decision: Keep delta sync for remote operations where network cost dominates
+- Local delta sync enabled for large files where benefit outweighs overhead
 
-## [0.0.3] - 2025-10-02
+### Testing
+- Updated integration test to validate single file sync
+- All 193 tests passing
+- Zero compiler and clippy warnings
+
+## [0.0.7] - 2025-10-01
+
+### Added
+- Comprehensive compression module (LZ4 + Zstd, ready for integration)
+- Smart compression heuristics (skips small files <1MB and pre-compressed formats)
+- Extension detection for 30+ pre-compressed formats (jpg, mp4, zip, pdf, etc.)
+
+### Testing
+- 11 compression tests added (roundtrip validation, ratio verification)
+- Total test count: 182 tests
+
+### Technical
+- LZ4 compression: ~400-500 MB/s throughput
+- Zstd compression: Better ratio (level 3, balanced)
+- Format detection prevents double-compression
+
+## [0.0.6] - 2025-10-01
+
+### Added
+- Streaming delta generation with constant ~256KB memory usage
+- Delta sync now works with files of any size without memory constraints
+- Integration with SSH transport for remote delta sync
+
+### Performance
+- **Memory improvement**: 10GB file uses 256KB instead of 10GB RAM (39,000x reduction)
+- Constant memory usage regardless of file size
+
+### Testing
+- Streaming delta generation validated
+- Total test count: 171 tests
+
+## [0.0.5] - 2025-09-30
+
+### Fixed
+- **CRITICAL**: Fixed O(n) rolling hash bug
+  - Root cause: Using `Vec::remove(0)` which is O(n), not O(1)
+  - Solution: Removed unnecessary `window` field from `RollingHash` struct
+  - Impact: 6124x performance improvement in rolling hash operations
+
+### Performance
+- Verified true O(1) performance: 2ns per operation across all block sizes
+- Rolling hash now truly constant time (not dependent on block size)
+- Benchmarks confirm consistent 2ns for 4KB, 64KB, and 1MB blocks
+
+### Documentation
+- Added detailed optimization history in `docs/OPTIMIZATIONS.md`
+- Documented the O(n) bug and its fix with benchmarks
+
+## [0.0.4] - 2025-09-30
+
+### Added
+- Parallel file transfers (5-10x speedup for multiple files)
+- Thread-safe statistics tracking with `Arc<Mutex<>>`
+- Semaphore-based concurrency control
+- Error collection and reporting for parallel operations
+- `--parallel` / `-j` flag to control worker count (default: 10)
+
+### Changed
+- SyncEngine now executes file operations in parallel
+- Progress bar updates from multiple threads safely
+- Statistics accumulated across parallel workers
+
+### Performance
+- 5-10x speedup for syncing multiple files
+- Semaphore prevents resource exhaustion
+- Configurable parallelism for different workloads
+
+### Testing
+- Validated parallel execution correctness
+- Thread-safe statistics verified
+- Total test count: 160 tests
+
+## [0.0.3] - 2025-09-29
 
 ### Added
 - **Delta Sync Implementation** - Full rsync algorithm for efficient file updates
@@ -25,141 +125,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Adaptive block size calculation (√filesize, capped 512B-128KB)
   - Partial block matching for file-end edge cases
   - Compression ratio reporting (% literal data transferred)
-- Delta sync support for LocalTransport (local-to-local sync)
-- Delta sync support for SshTransport (local-to-remote sync via SFTP)
-- Delta sync support for DualTransport (automatic routing)
+- SSH transport implementation (SFTP-based)
+- SSH config integration (~/.ssh/config support)
+- SSH authentication (agent, identity files, default keys)
+- Remote path parsing (user@host:/path format)
+- DualTransport for mixed local/remote operations
+- TransportRouter for automatic local/SSH transport selection
 - Atomic file updates via temp file + rename pattern
 - `sync_file_with_delta()` method in Transport trait
 
 ### Changed
 - File updates now use delta sync instead of full copy when beneficial
 - Transferrer now calls `sync_file_with_delta()` for file updates
-- Added `tempfile` as regular dependency (was dev-only)
-- Module structure: added `mod delta;` to binary crate for proper resolution
+- SyncEngine now generic over Transport trait
+- sync() method is now async
+- main() uses tokio runtime (#[tokio::main])
+- Module structure: added `mod delta;` to binary crate
 
 ### Fixed
-- Cargo module resolution issue preventing delta module access from binary
-- Edge case: Block count calculation for partial blocks (test expectation fix)
-- Edge case: Partial block matching at file end now works correctly
+- SSH session blocking mode issue (handshake failures)
+- Cargo module resolution issue preventing delta module access
+- Edge case: Block count calculation for partial blocks
+- Edge case: Partial block matching at file end
+- Update action now properly detected for existing files
 
 ### Performance
 - **50MB file with 1KB change**: Delta sync transfers only changed blocks (0.0% literal data)
 - **Bandwidth savings**: Dramatically reduced for incremental updates
-- Downloads remote file for checksum computation (future: compute checksums remotely)
+- Delta sync enabled for all remote operations by default
 
 ### Testing
-- Added 21 delta sync tests (total: 64 tests, all passing)
-- Tests cover: block size calculation, rolling hash, checksum computation, delta generation, delta application
-- End-to-end validation of delta sync for both local and remote scenarios
-
-### Documentation
-- Updated README with delta sync features and benefits
-- Updated comparison table showing delta sync implemented
-- Updated roadmap to show Phase 2 progress (SSH + Delta)
-- Added delta sync usage examples
+- Added 21 delta sync tests
+- Tests cover: block size, rolling hash, checksums, delta generation, delta application
+- End-to-end validation for local and remote scenarios
+- Total test count: 64 tests
 
 ### Technical
 - **Delta Module Structure**:
   - `delta/mod.rs` - Block size calculation
-  - `delta/rolling.rs` - Adler-32 rolling hash (156 test iterations)
+  - `delta/rolling.rs` - Adler-32 rolling hash
   - `delta/checksum.rs` - xxHash3 strong checksums + block metadata
   - `delta/generator.rs` - Delta operation generation (Copy/Data ops)
   - `delta/applier.rs` - Delta application with temp file atomicity
 - **Algorithm**: Classic rsync (Andrew Tridgell 1996) with modern hashes
-- **Block Operations**: Copy {offset, size} for matches, Data(Vec<u8>) for literals
 - **Hash Map Lookup**: O(1) weak hash lookup, strong hash verification on collision
 
-## [0.0.2] - 2025-10-02
+### Dependencies
+- Added async-trait, tokio, ssh2, serde_json, tempfile
+- Added whoami, dirs, regex for SSH config parsing
+
+## [0.0.2] - 2025-09-28
 
 ### Added
 - Streaming file transfers with fixed memory usage (128KB chunks)
 - xxHash3 checksum calculation for all file transfers
 - Checksum logging in debug mode for verification
+- Transport abstraction layer for local and remote operations
+- LocalTransport implementation wrapping Phase 1 functionality
+- Async Transport trait for future SSH/SFTP support
 
 ### Changed
 - LocalTransport now uses buffered streaming instead of `fs::copy()`
-- SshTransport now streams files in chunks instead of loading entire file
 - Memory usage is now constant regardless of file size
 
 ### Fixed
 - OOM issues with large files (>1GB) resolved
 - All file transfers now verifiable via checksums
 
-## [0.0.1] - 2025-10-02
-
-### Added
-- Transport abstraction layer for local and remote operations
-- LocalTransport implementation wrapping Phase 1 functionality
-- Async Transport trait for future SSH/SFTP support
-- SSH config parser (~/.ssh/config support)
-- SSH config struct with all major directives
-- SSH connection establishment module (connect.rs)
-- SSH authentication (agent, identity files, default keys)
-- TCP connection with timeout handling
-- SshTransport implementation with remote command execution
-- sy-remote helper binary for efficient remote directory scanning
-- JSON-based remote protocol for file metadata transfer
-- Remote scanning via SSH exec
-- SFTP-based file transfer (copy_file method)
-- Remote directory creation (create_dir_all)
-- Remote file/directory deletion (remove)
-- Modification time preservation for remote files
-- Remote path parsing (user@host:/path format)
-- DualTransport for mixed local/remote operations
-- TransportRouter for automatic local/SSH transport selection
-- CLI integration for remote sync (sy /local user@host:/remote)
-- Windows drive letter support in path parsing
-- SshConfig Default implementation
-- 11 comprehensive SSH config unit tests
-- 6 comprehensive LocalTransport unit tests
-- 9 path parsing unit tests
-- Performance regression tests (7 tests) with conservative baselines
-- Comparative benchmarks against rsync and cp
-- Performance optimizations (10% improvement in idempotent sync)
-- Future optimization roadmap documentation
-- Phase 2 implementation plan (docs/PHASE2_PLAN.md)
-
-### Changed
-- SyncEngine now generic over Transport trait
-- sync() method is now async
-- main() uses tokio runtime (#[tokio::main])
-- Transferrer refactored to be generic over Transport and fully async
-- StrategyPlanner.plan_file_async now checks metadata for update detection
-- TransportRouter uses DualTransport for mixed local/remote operations
-- Pre-allocated vectors to reduce allocations
-- Skip metadata reads for directory existence checks
-- Batched progress bar updates to reduce overhead
-- Use enumerate() instead of explicit counter loops (clippy)
-
-### Fixed
-- SSH session blocking mode issue (handshake failures)
-- Update action now properly detected for existing files
-- Local→remote and remote→local sync now work correctly
-
-### Technical
-- Added async-trait dependency
-- Added tokio rt-multi-thread and time features
-- Added whoami, dirs, regex dependencies for SSH config
-- Added ssh2 dependency for SSH connectivity
-- Added serde_json for JSON remote protocol
-- Created sy-remote binary target for remote execution
-- Arc<Mutex<Session>> for thread-safe SSH session sharing
-- All 77 tests passing (43 unit + 34 integration/property/perf/edge)
-- No performance regression
-
 ### Performance
-- **100 files**: 40-79% faster than rsync/cp
-- **Large files (50MB)**: 64x faster than rsync, 7x faster than cp
-- **Idempotent sync**: 4.7x faster than rsync (was 4.3x)
-- **1000 files**: 40-47% faster than alternatives
+- Constant memory usage for files of any size
+- Efficient streaming with 128KB buffer
 
-### Planned
-- Phase 2: Network sync (SSH transport, SFTP fallback)
-- Phase 3: Parallel transfers (rayon, async I/O, memory-mapped I/O)
-- Phase 4: Delta sync (rsync algorithm)
-- Phase 5: Multi-layer checksums and verification
-
-## [0.1.0] - 2025-10-01
+## [0.0.1] - 2025-09-27
 
 ### Added
 - **Core Functionality**
@@ -183,6 +220,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Large file handling (tested up to 10MB)
   - Zero-byte file support
 
+- **Platform Optimizations**
+  - macOS: `clonefile()` for fast local copies
+  - Linux: `copy_file_range()` for efficient transfers
+  - Fallback: standard buffered copy
+
 - **Testing** (49 tests total)
   - **Unit Tests (15)**: CLI validation, scanner, strategy, transfer modules
   - **Integration Tests (11)**: End-to-end workflows, error handling
@@ -205,10 +247,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - AI development context (.claude/CLAUDE.md)
   - Inline code documentation
 
+### Performance
+- **100 files**: 40-79% faster than rsync/cp
+- **Large files (50MB)**: 64x faster than rsync, 7x faster than cp
+- **Idempotent sync**: 4.7x faster than rsync
+- **1000 files**: 40-47% faster than alternatives
+
 ### Technical Details
 - **Architecture**: Scanner → Strategy → Transfer → Engine
 - **Dependencies**: walkdir, ignore, clap, indicatif, tracing, thiserror, anyhow
-- **Performance**: Handles 1,000+ files efficiently
 - **Code Quality**: All clippy warnings fixed, formatted with rustfmt
 
 ### Known Limitations
@@ -219,14 +266,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Permissions not fully preserved (future enhancement)
 - No symlink support (planned for Phase 6)
 
-## [0.0.1] - 2025-09-30
+---
 
-### Added
-- Initial project setup
-- Comprehensive design documentation
-- Project structure
-- Basic module scaffolding
+**Key Milestones:**
+- ✅ Phase 1: MVP (v0.0.1) - Basic local sync
+- ✅ Phase 2: Network + Delta (v0.0.2-v0.0.3) - SSH transport + rsync algorithm
+- ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.8) - Parallel transfers + optimizations
+- 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/nijaru/sy/releases/tag/v0.1.0
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/nijaru/sy/releases/tag/v0.0.8
+[0.0.7]: https://github.com/nijaru/sy/releases/tag/v0.0.7
+[0.0.6]: https://github.com/nijaru/sy/releases/tag/v0.0.6
+[0.0.5]: https://github.com/nijaru/sy/releases/tag/v0.0.5
+[0.0.4]: https://github.com/nijaru/sy/releases/tag/v0.0.4
+[0.0.3]: https://github.com/nijaru/sy/releases/tag/v0.0.3
+[0.0.2]: https://github.com/nijaru/sy/releases/tag/v0.0.2
 [0.0.1]: https://github.com/nijaru/sy/releases/tag/v0.0.1
