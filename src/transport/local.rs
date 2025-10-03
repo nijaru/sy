@@ -1,4 +1,5 @@
 use super::{Transport, TransferResult};
+use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
@@ -132,24 +133,6 @@ impl Transport for LocalTransport {
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // For local-to-local operations, delta sync overhead exceeds benefit
-        // Even with O(1) rolling hash, the overhead of:
-        // - Computing checksums for destination file
-        // - Generating delta operations
-        // - Applying delta (random seeks + writes)
-        // exceeds the cost of a simple sequential copy for local files.
-        //
-        // Delta sync is beneficial for:
-        // - Remote transfers (network bandwidth limited)
-        // - Very large files (>1GB) with small changes
-        //
-        // TODO: Add size-based heuristic (e.g., enable for files >1GB)
-        // TODO: Benchmark on SSDs vs HDDs
-        tracing::debug!("Local transport: using full copy (delta sync disabled for local-to-local)");
-        return self.copy_file(source, dest).await;
-
-        // Original delta sync code (disabled for performance reasons)
-        /*
         // Check if destination exists
         if !self.exists(dest).await? {
             tracing::debug!("Destination doesn't exist, using full copy");
@@ -162,11 +145,30 @@ impl Transport for LocalTransport {
         let source_size = source_meta.len();
         let dest_size = dest_meta.len();
 
-        // Skip delta if destination is empty or very small (full copy is faster)
+        // Size-based heuristic: only use delta sync for large files (>1GB)
+        // For smaller files, the overhead of checksumming + delta + random I/O
+        // exceeds the cost of a simple sequential copy, even with O(1) rolling hash.
+        const DELTA_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
+
+        if dest_size < DELTA_THRESHOLD {
+            tracing::debug!(
+                "File size ({} MB) below delta threshold ({}MB), using full copy",
+                dest_size / 1024 / 1024,
+                DELTA_THRESHOLD / 1024 / 1024
+            );
+            return self.copy_file(source, dest).await;
+        }
+
+        // Skip delta if destination is very small (full copy is faster)
         if dest_size < 4096 {
             tracing::debug!("Destination too small for delta sync, using full copy");
             return self.copy_file(source, dest).await;
         }
+
+        tracing::info!(
+            "Large file detected ({} GB), attempting delta sync",
+            dest_size / 1024 / 1024 / 1024
+        );
 
         // Run delta sync in blocking task
         let source = source.to_path_buf();
@@ -177,14 +179,16 @@ impl Transport for LocalTransport {
             let block_size = calculate_block_size(dest_size);
 
             // Compute checksums of destination file
+            tracing::debug!("Computing checksums for {} MB file...", dest_size / 1024 / 1024);
             let dest_checksums = compute_checksums(&dest, block_size)
                 .map_err(|e| SyncError::CopyError {
                     path: dest.clone(),
                     source: e,
                 })?;
 
-            // Generate delta
-            let delta = generate_delta(&source, &dest_checksums, block_size)
+            // Generate delta with streaming (constant memory)
+            tracing::debug!("Generating delta with streaming...");
+            let delta = generate_delta_streaming(&source, &dest_checksums, block_size)
                 .map_err(|e| SyncError::CopyError {
                     path: source.clone(),
                     source: e,
@@ -208,6 +212,7 @@ impl Transport for LocalTransport {
             };
 
             // Apply delta to create temporary file
+            tracing::debug!("Applying delta...");
             let temp_dest = dest.with_extension("sy.tmp");
             apply_delta(&dest, &delta, &temp_dest)
                 .map_err(|e| SyncError::CopyError {
@@ -222,16 +227,17 @@ impl Transport for LocalTransport {
             })?;
 
             tracing::info!(
-                "Delta sync: {} ops, {:.1}% literal data",
+                "Delta sync complete: {} ops, {:.1}% literal data",
                 delta.ops.len(),
                 compression_ratio
             );
 
-            Ok::<(), SyncError>(())
+            Ok::<u64, SyncError>(source_size)
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
-        */
+        .and_then(|r| Ok(r))
+        .map(TransferResult::new)
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
