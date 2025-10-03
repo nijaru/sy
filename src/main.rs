@@ -75,6 +75,13 @@ async fn main() -> Result<()> {
             "  Bytes transferred: {}",
             format_bytes(stats.bytes_transferred)
         );
+        if stats.files_delta_synced > 0 {
+            println!(
+                "  Delta sync:       {} files, {} saved",
+                stats.files_delta_synced,
+                format_bytes(stats.delta_bytes_saved)
+            );
+        }
     }
 
     Ok(())

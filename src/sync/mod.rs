@@ -20,6 +20,8 @@ pub struct SyncStats {
     pub files_skipped: usize,
     pub files_deleted: usize,
     pub bytes_transferred: u64,
+    pub files_delta_synced: usize,
+    pub delta_bytes_saved: u64,
 }
 
 pub struct SyncEngine<T: Transport> {
@@ -79,6 +81,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             files_skipped: 0,
             files_deleted: 0,
             bytes_transferred: 0,
+            files_delta_synced: 0,
+            delta_bytes_saved: 0,
         }));
 
         // Create progress bar (only if not quiet)
@@ -149,8 +153,16 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     if let Some(result) = transfer_result {
                                         stats.bytes_transferred += result.bytes_written;
 
-                                        // Show delta sync info if used
+                                        // Track delta sync usage and savings
                                         if result.used_delta() {
+                                            stats.files_delta_synced += 1;
+
+                                            // Calculate bytes saved (full file size - literal bytes)
+                                            if let Some(literal_bytes) = result.literal_bytes {
+                                                let bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                                                stats.delta_bytes_saved += bytes_saved;
+                                            }
+
                                             if let Some(ratio) = result.compression_ratio() {
                                                 pb.set_message(format!(
                                                     "Updated {} (delta: {:.1}% literal)",
@@ -254,6 +266,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             files_skipped: 0,
             files_deleted: 0,
             bytes_transferred: 0,
+            files_delta_synced: 0,
+            delta_bytes_saved: 0,
         };
 
         // Check if destination exists
@@ -288,6 +302,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 is_dir: false,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
+
+                // Track delta sync if used
+                if result.used_delta() {
+                    stats.files_delta_synced = 1;
+                    if let Some(literal_bytes) = result.literal_bytes {
+                        stats.delta_bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                    }
+                }
             }
             stats.files_updated = 1;
         }
