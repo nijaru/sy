@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Sync duration displayed in summary (auto-formats: ms, seconds, minutes, hours)
   - Transfer rate calculation and display (bytes/sec)
   - Users can see sync speed and duration
+- Enhanced dry-run mode output
+  - Summary shows "Dry-run complete (no changes made)"
+  - File operations use "Would" prefix (e.g., "Would create: 5")
+  - Clear visual confirmation that nothing was modified
 
 ### Changed
 - Error messages now include helpful context and resolution steps
