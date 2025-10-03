@@ -1,5 +1,5 @@
 use super::{Transport, TransferResult};
-use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta, DeltaOp};
+use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
@@ -364,9 +364,9 @@ impl Transport for SshTransport {
                         source: e,
                     })?;
 
-                // Generate delta
-                tracing::debug!("Generating delta...");
-                let delta = generate_delta(&source_path, &dest_checksums, block_size)
+                // Generate delta with streaming (constant memory)
+                tracing::debug!("Generating delta with streaming...");
+                let delta = generate_delta_streaming(&source_path, &dest_checksums, block_size)
                     .map_err(|e| SyncError::CopyError {
                         path: source_path.clone(),
                         source: e,
