@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI help improvements
   - Added EXAMPLES section with common usage patterns
   - Shows basic, dry-run, delete, parallel, single file, and remote sync examples
+- Timing and performance metrics
+  - Sync duration displayed in summary (auto-formats: ms, seconds, minutes, hours)
+  - Transfer rate calculation and display (bytes/sec)
+  - Users can see sync speed and duration
 
 ### Changed
 - Error messages now include helpful context and resolution steps
