@@ -75,6 +75,16 @@ async fn main() -> Result<()> {
             "  Bytes transferred: {}",
             format_bytes(stats.bytes_transferred)
         );
+
+        // Calculate and display transfer rate
+        let duration_secs = stats.duration.as_secs_f64();
+        if duration_secs > 0.0 && stats.bytes_transferred > 0 {
+            let bytes_per_sec = stats.bytes_transferred as f64 / duration_secs;
+            println!("  Transfer rate:    {}/s", format_bytes(bytes_per_sec as u64));
+        }
+
+        println!("  Duration:         {}", format_duration(stats.duration));
+
         if stats.files_delta_synced > 0 {
             println!(
                 "  Delta sync:       {} files, {} saved",
@@ -100,5 +110,26 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+
+    if secs >= 60 {
+        let mins = secs / 60;
+        let secs = secs % 60;
+        if mins >= 60 {
+            let hours = mins / 60;
+            let mins = mins % 60;
+            format!("{}h {}m {}s", hours, mins, secs)
+        } else {
+            format!("{}m {}s", mins, secs)
+        }
+    } else if secs > 0 {
+        format!("{}.{:03}s", secs, millis)
+    } else {
+        format!("{}ms", millis)
     }
 }
