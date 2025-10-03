@@ -63,15 +63,28 @@ async fn main() -> Result<()> {
 
     // Print summary
     if !cli.quiet {
-        println!("\n✓ Sync complete\n");
+        if cli.dry_run {
+            println!("\n✓ Dry-run complete (no changes made)\n");
+        } else {
+            println!("\n✓ Sync complete\n");
+        }
 
         // File operations
         println!("  Files scanned:     {}", stats.files_scanned);
-        println!("  Files created:     {}", stats.files_created);
-        println!("  Files updated:     {}", stats.files_updated);
-        println!("  Files skipped:     {}", stats.files_skipped);
-        if cli.delete {
-            println!("  Files deleted:     {}", stats.files_deleted);
+        if cli.dry_run {
+            println!("  Would create:      {}", stats.files_created);
+            println!("  Would update:      {}", stats.files_updated);
+            println!("  Would skip:        {}", stats.files_skipped);
+            if cli.delete {
+                println!("  Would delete:      {}", stats.files_deleted);
+            }
+        } else {
+            println!("  Files created:     {}", stats.files_created);
+            println!("  Files updated:     {}", stats.files_updated);
+            println!("  Files skipped:     {}", stats.files_skipped);
+            if cli.delete {
+                println!("  Files deleted:     {}", stats.files_deleted);
+            }
         }
 
         // Transfer stats
