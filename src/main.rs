@@ -47,10 +47,19 @@ async fn main() -> Result<()> {
     let transport = TransportRouter::new(&cli.source, &cli.destination).await?;
     let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet, cli.parallel);
 
-    // Run sync
-    let stats = engine
-        .sync(cli.source.path(), cli.destination.path())
-        .await?;
+    // Run sync (single file or directory)
+    let stats = if cli.is_single_file() {
+        if !cli.quiet {
+            println!("Mode: Single file sync\n");
+        }
+        engine
+            .sync_single_file(cli.source.path(), cli.destination.path())
+            .await?
+    } else {
+        engine
+            .sync(cli.source.path(), cli.destination.path())
+            .await?
+    };
 
     // Print summary
     if !cli.quiet {
