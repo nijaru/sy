@@ -3,13 +3,26 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// Statistics about delta application
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaStats {
+    pub operations_count: usize,
+    pub literal_bytes: u64,
+    pub bytes_written: u64,
+}
+
 /// Apply delta operations to reconstruct a file
 ///
 /// Reads from old_file (using Copy ops) and delta data (using Data ops)
 /// to create new_file.
-pub fn apply_delta(old_file: &Path, delta: &Delta, new_file: &Path) -> io::Result<()> {
+///
+/// Returns statistics about the delta application.
+pub fn apply_delta(old_file: &Path, delta: &Delta, new_file: &Path) -> io::Result<DeltaStats> {
     let mut old = File::open(old_file)?;
     let mut new = File::create(new_file)?;
+
+    let mut literal_bytes = 0u64;
+    let mut bytes_written = 0u64;
 
     for op in &delta.ops {
         match op {
@@ -21,16 +34,23 @@ pub fn apply_delta(old_file: &Path, delta: &Delta, new_file: &Path) -> io::Resul
                 let mut buffer = vec![0u8; *size];
                 old.read_exact(&mut buffer)?;
                 new.write_all(&buffer)?;
+                bytes_written += *size as u64;
             }
             DeltaOp::Data(data) => {
                 // Write literal data
                 new.write_all(data)?;
+                literal_bytes += data.len() as u64;
+                bytes_written += data.len() as u64;
             }
         }
     }
 
     new.flush()?;
-    Ok(())
+    Ok(DeltaStats {
+        operations_count: delta.ops.len(),
+        literal_bytes,
+        bytes_written,
+    })
 }
 
 /// Apply delta when there's no old file (full reconstruction from literals)
@@ -82,7 +102,7 @@ mod tests {
         // Apply delta
         let temp_dir = TempDir::new().unwrap();
         let reconstructed = temp_dir.path().join("reconstructed");
-        apply_delta(original.path(), &delta, &reconstructed).unwrap();
+        let _stats = apply_delta(original.path(), &delta, &reconstructed).unwrap();
 
         // Verify reconstructed file matches modified
         let original_data = std::fs::read(modified.path()).unwrap();
@@ -110,12 +130,16 @@ mod tests {
         // Apply delta
         let temp_dir = TempDir::new().unwrap();
         let reconstructed = temp_dir.path().join("reconstructed");
-        apply_delta(original.path(), &delta, &reconstructed).unwrap();
+        let stats = apply_delta(original.path(), &delta, &reconstructed).unwrap();
 
         // Verify
         let expected = std::fs::read(modified.path()).unwrap();
         let actual = std::fs::read(&reconstructed).unwrap();
         assert_eq!(expected, actual);
+
+        // Verify delta stats
+        assert_eq!(stats.bytes_written, 16); // Total file size
+        assert_eq!(stats.literal_bytes, 8); // XXXX + YYYY
     }
 
     #[test]
@@ -137,7 +161,7 @@ mod tests {
         // Apply delta
         let temp_dir = TempDir::new().unwrap();
         let reconstructed = temp_dir.path().join("reconstructed");
-        apply_delta(original.path(), &delta, &reconstructed).unwrap();
+        let _stats = apply_delta(original.path(), &delta, &reconstructed).unwrap();
 
         // Verify
         let expected = std::fs::read(modified.path()).unwrap();
@@ -190,7 +214,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let reconstructed = temp_dir.path().join("reconstructed");
-        apply_delta(original.path(), &delta, &reconstructed).unwrap();
+        let stats = apply_delta(original.path(), &delta, &reconstructed).unwrap();
 
         // Verify
         let reconstructed_data = std::fs::read(&reconstructed).unwrap();
@@ -200,5 +224,10 @@ mod tests {
         let ratio = delta.compression_ratio();
         println!("Compression ratio: {:.2}%", ratio * 100.0);
         assert!(ratio < 0.2); // Should transfer less than 20% (1000 bytes out of 10000)
+
+        // Verify stats match
+        assert_eq!(stats.bytes_written, 10000);
+        let stats_ratio = stats.literal_bytes as f64 / stats.bytes_written as f64;
+        assert!(stats_ratio < 0.2);
     }
 }

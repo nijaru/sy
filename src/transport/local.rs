@@ -214,7 +214,7 @@ impl Transport for LocalTransport {
             // Apply delta to create temporary file
             tracing::debug!("Applying delta...");
             let temp_dest = dest.with_extension("sy.tmp");
-            apply_delta(&dest, &delta, &temp_dest)
+            let delta_stats = apply_delta(&dest, &delta, &temp_dest)
                 .map_err(|e| SyncError::CopyError {
                     path: temp_dest.clone(),
                     source: e,
@@ -227,16 +227,19 @@ impl Transport for LocalTransport {
             })?;
 
             tracing::info!(
-                "Delta sync complete: {} ops, {:.1}% literal data",
-                delta.ops.len(),
+                "Delta sync: {} ops, {:.1}% literal data",
+                delta_stats.operations_count,
                 compression_ratio
             );
 
-            Ok::<u64, SyncError>(source_size)
+            Ok::<TransferResult, SyncError>(TransferResult::with_delta(
+                delta_stats.bytes_written,
+                delta_stats.operations_count,
+                delta_stats.literal_bytes,
+            ))
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
-        .map(TransferResult::new)
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {

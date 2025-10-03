@@ -148,6 +148,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     let mut stats = stats.lock().unwrap();
                                     if let Some(result) = transfer_result {
                                         stats.bytes_transferred += result.bytes_written;
+
+                                        // Show delta sync info if used
+                                        if result.used_delta() {
+                                            if let Some(ratio) = result.compression_ratio() {
+                                                pb.set_message(format!(
+                                                    "Updated {} (delta: {:.1}% literal)",
+                                                    task.dest_path.display(),
+                                                    ratio
+                                                ));
+                                            }
+                                        }
                                     }
                                     stats.files_updated += 1;
                                     Ok(())

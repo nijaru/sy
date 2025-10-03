@@ -392,7 +392,7 @@ impl Transport for SshTransport {
                 // Apply delta to create updated file
                 tracing::debug!("Applying delta...");
                 let temp_updated = temp_dir.path().join("updated");
-                apply_delta(&temp_dest, &delta, &temp_updated)
+                let delta_stats = apply_delta(&temp_dest, &delta, &temp_updated)
                     .map_err(|e| SyncError::CopyError {
                         path: temp_updated.clone(),
                         source: e,
@@ -418,17 +418,20 @@ impl Transport for SshTransport {
 
                 tracing::info!(
                     "Delta sync: {} ops, {:.1}% literal data, uploaded {} bytes",
-                    delta.ops.len(),
+                    delta_stats.operations_count,
                     compression_ratio,
                     bytes_written
                 );
 
-                Ok::<u64, SyncError>(bytes_written)
+                Ok::<TransferResult, SyncError>(TransferResult::with_delta(
+                    bytes_written,
+                    delta_stats.operations_count,
+                    delta_stats.literal_bytes,
+                ))
             }
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
-        .map(TransferResult::new)
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
