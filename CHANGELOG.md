@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Delta sync metrics and progress visibility
+  - Progress messages now show compression ratio (e.g., "delta: 2.4% literal")
+  - TransferResult includes delta operations count and literal bytes transferred
+  - Users can see bandwidth savings in real-time
+
 ### Planned for v0.1.0
 - Network speed detection
 - Adaptive compression integration

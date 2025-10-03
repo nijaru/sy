@@ -85,6 +85,7 @@ sy /path/to/file.txt /dest/file.txt
 - **Remote Operations**: Enabled for all SSH/SFTP transfers
 - **Local Operations**: Enabled for large files (>1GB threshold)
 - **Smart Heuristics**: Automatic activation based on file size and transport type
+- **Progress Visibility**: Shows compression ratio in real-time (e.g., "delta: 2.4% literal")
 
 **Parallel Execution (Phase 3 - Complete)**:
 - **Parallel File Transfers**: 5-10x faster for multiple files
