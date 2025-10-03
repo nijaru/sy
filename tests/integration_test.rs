@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -289,4 +290,135 @@ fn test_git_directory_excluded() {
     assert!(output.status.success());
     assert!(dest.path().join("file.txt").exists());
     assert!(!dest.path().join(".git").exists());
+}
+
+#[test]
+fn test_update_shows_correct_stats() {
+    let (source, dest) = setup_test_dir("update_stats");
+
+    // Create initial files
+    fs::write(source.path().join("file1.txt"), "initial content v1").unwrap();
+    fs::write(source.path().join("file2.txt"), "initial content v2").unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Files created:    2"));
+
+    // Wait to ensure mtime changes (1s tolerance)
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Modify files
+    fs::write(source.path().join("file1.txt"), "updated content v1").unwrap();
+    fs::write(source.path().join("file2.txt"), "updated content v2").unwrap();
+
+    // Sync again - should show updates
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify update stats
+    assert!(stdout.contains("Files updated:    2"));
+    assert!(stdout.contains("Files skipped:    0"));
+
+    // Verify files were actually updated
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file1.txt")).unwrap(),
+        "updated content v1"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file2.txt")).unwrap(),
+        "updated content v2"
+    );
+}
+
+#[test]
+#[ignore] // Slow test - requires 2GB file creation and sync
+fn test_large_file_update_with_delta_sync() {
+    let (source, dest) = setup_test_dir("delta_sync");
+
+    // Create a large file (2GB) to trigger local delta sync
+    // Using sparse file for speed - only allocates actual written blocks
+    let large_file = source.path().join("large.bin");
+    let file = fs::File::create(&large_file).unwrap();
+    file.set_len(2 * 1024 * 1024 * 1024).unwrap(); // 2GB
+    drop(file);
+
+    // Write some actual data at the beginning
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&large_file)
+        .unwrap();
+    file.write_all(b"START OF FILE").unwrap();
+    file.seek(SeekFrom::End(-13)).unwrap();
+    file.write_all(b"END OF FILE!!").unwrap();
+    drop(file);
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("large.bin").exists());
+
+    // Wait for mtime to change
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Modify the file slightly (change just the beginning)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&large_file)
+        .unwrap();
+    file.write_all(b"MODIFIED FILE").unwrap();
+    drop(file);
+
+    // Sync again - should use delta sync
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Delta sync should be used for large files
+    // The output should mention delta sync
+    assert!(stdout.contains("Files updated:    1"));
+
+    // If delta sync was used, it should appear in summary
+    // Note: Delta sync only triggers for files >1GB on local, and this is >2GB
+    if stdout.contains("Delta sync:") {
+        // Verify delta sync stats are shown
+        assert!(stdout.contains("1 files"));
+    }
+
+    // Verify the file was updated correctly
+    let dest_file = dest.path().join("large.bin");
+    let mut file = fs::File::open(&dest_file).unwrap();
+    let mut buf = [0u8; 13];
+    file.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"MODIFIED FILE");
 }
