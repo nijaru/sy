@@ -8,6 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use strategy::{StrategyPlanner, SyncAction};
 use tokio::sync::Semaphore;
 use transfer::Transferrer;
@@ -22,6 +23,7 @@ pub struct SyncStats {
     pub bytes_transferred: u64,
     pub files_delta_synced: usize,
     pub delta_bytes_saved: u64,
+    pub duration: Duration,
 }
 
 pub struct SyncEngine<T: Transport> {
@@ -44,6 +46,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
     }
 
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
+        let start_time = std::time::Instant::now();
+
         tracing::info!(
             "Starting sync: {} → {}",
             source.display(),
@@ -83,6 +87,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_transferred: 0,
             files_delta_synced: 0,
             delta_bytes_saved: 0,
+            duration: Duration::ZERO,
         }));
 
         // Create progress bar (only if not quiet)
@@ -232,15 +237,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         pb.finish_with_message("Sync complete");
 
-        // Extract final stats
-        let final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+        // Extract final stats and add duration
+        let mut final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+        final_stats.duration = start_time.elapsed();
 
         tracing::info!(
-            "Sync complete: {} created, {} updated, {} skipped, {} deleted",
+            "Sync complete: {} created, {} updated, {} skipped, {} deleted, took {:.2}s",
             final_stats.files_created,
             final_stats.files_updated,
             final_stats.files_skipped,
-            final_stats.files_deleted
+            final_stats.files_deleted,
+            final_stats.duration.as_secs_f64()
         );
 
         // Return first error if any occurred
@@ -253,6 +260,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
     /// Sync a single file (source is a file, not a directory)
     pub async fn sync_single_file(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
+        let start_time = std::time::Instant::now();
+
         tracing::info!(
             "Starting single file sync: {} → {}",
             source.display(),
@@ -268,6 +277,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_transferred: 0,
             files_delta_synced: 0,
             delta_bytes_saved: 0,
+            duration: Duration::ZERO,
         };
 
         // Check if destination exists
@@ -314,6 +324,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             stats.files_updated = 1;
         }
 
+        stats.duration = start_time.elapsed();
         Ok(stats)
     }
 }
