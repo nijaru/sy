@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned for v0.1.0
+- Network speed detection
+- Adaptive compression integration
+- Parallel chunk transfers (within single files)
+- Resume support for interrupted transfers
+
+### Planned for v0.5.0
+- Multi-layer checksums (BLAKE3 end-to-end)
+- Verification modes (fast, standard, paranoid)
+- Atomic operations
+- Crash recovery
+
+## [0.0.9] - 2025-10-02
+
 ### Added
 - Delta sync metrics and progress visibility
   - Progress messages now show compression ratio (e.g., "delta: 2.4% literal")
@@ -43,18 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Small change benchmarks (10MB, 50MB, 100MB files)
   - Delta sync vs full copy comparison
   - Large file (1GB) delta sync performance
-
-### Planned for v0.1.0
-- Network speed detection
-- Adaptive compression integration
-- Parallel chunk transfers (within single files)
-- Resume support for interrupted transfers
-
-### Planned for v0.5.0
-- Multi-layer checksums (BLAKE3 end-to-end)
-- Verification modes (fast, standard, paranoid)
-- Atomic operations
-- Crash recovery
 
 ## [0.0.8] - 2025-10-02
 
@@ -308,10 +310,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Key Milestones:**
 - ✅ Phase 1: MVP (v0.0.1) - Basic local sync
 - ✅ Phase 2: Network + Delta (v0.0.2-v0.0.3) - SSH transport + rsync algorithm
-- ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.8) - Parallel transfers + optimizations
+- ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/nijaru/sy/releases/tag/v0.0.9
 [0.0.8]: https://github.com/nijaru/sy/releases/tag/v0.0.8
 [0.0.7]: https://github.com/nijaru/sy/releases/tag/v0.0.7
 [0.0.6]: https://github.com/nijaru/sy/releases/tag/v0.0.6
