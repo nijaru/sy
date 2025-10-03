@@ -10,11 +10,19 @@
 - **Decision**: Disabled for local operations (overhead > benefit)
 - **Impact**: Dramatic bandwidth savings for remote updates
 
-#### 2. Local Sync Performance (v0.0.3)
+#### 2. Local Sync Performance (v0.0.3 → v0.0.8)
 - **Problem**: Delta sync was 191x slower than direct copy locally
 - **Root Cause**: Rolling hash O(n*block_size) overhead
-- **Solution**: Disabled delta sync for LocalTransport
+- **Solution (v0.0.3)**: Disabled delta sync for LocalTransport
 - **Result**: 26.93s → 0.14s (191x faster)
+
+**Update (v0.0.8)**: Size-based heuristic re-enabled delta for large files
+- **After O(1) fix**: True constant-time rolling hash (2ns/op)
+- **After streaming**: Constant memory regardless of file size
+- **Decision**: Enable delta for files >1GB only
+- **Rationale**: For large files with small changes, I/O savings > overhead
+- **Files <1GB**: Still use full copy (overhead > benefit)
+- **Files >1GB**: Use delta sync (beneficial for partial updates)
 
 #### 3. Progress Bar Improvements (v0.0.3)
 - **Added**: ETA calculation
@@ -376,18 +384,19 @@ benchmark local vs LAN vs WAN profiles
 ---
 
 **Last Updated**: 2025-10-02
-**Current Version**: v0.0.7 (compression module!)
+**Current Version**: v0.0.8 (size-based local delta!)
 **Completed**:
 - ✅ Parallel transfers (5-10x faster)
 - ✅ Bytes transferred accounting (correctness)
 - ✅ O(1) rolling hash (TRUE O(1): 2ns constant time)
 - ✅ Streaming delta generation (O(1) memory, 39,000x reduction for 10GB files)
 - ✅ Compression module (LZ4 + Zstd, transport integration deferred)
+- ✅ Size-based local delta (>1GB files use delta sync)
 
 **Recent Achievements**:
-- Compression module: LZ4 and Zstd with smart heuristics
-- 11 comprehensive tests (roundtrip, ratios, edge cases)
-- Extension detection for pre-compressed files
-- Foundation for future WAN optimization
+- Local delta sync re-enabled for large files (>1GB)
+- Size-based heuristic leverages O(1) hash + streaming
+- Atomic file updates (temp + rename)
+- All 85 tests passing
 
-**Next Target**: Phase 6 - Remote delta sync (send delta ops, not full files)
+**Next Target**: Benchmarking and performance validation
