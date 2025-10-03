@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Error messages now include helpful context and resolution steps
+- Summary output formatting improved with better alignment and visual sections
 
 ### Planned for v0.1.0
 - Network speed detection
