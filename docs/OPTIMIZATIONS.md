@@ -236,9 +236,55 @@ self.b = (self.b + MOD_ADLER * 3 - n_old + self.a - 1) % MOD_ADLER;
 
 ## Long-Term Optimizations
 
-### Compression (Phase 5)
+### 5. Compression Module **COMPLETED (Foundation)**
 
-**Adaptive compression based on network speed**:
+**Impact**: Network bandwidth savings for WAN transfers
+**Effort**: Medium (module complete, transport integration deferred)
+**Status**: ✅ Module implemented (v0.0.7), transport integration pending
+
+#### Implementation
+
+Compression module with LZ4 and Zstd support:
+- `compress()` and `decompress()` functions
+- Smart heuristics (file size, extension-based)
+- List of pre-compressed extensions (jpg, mp4, zip, etc.)
+- 11 comprehensive tests
+
+```rust
+pub enum Compression {
+    None,
+    Lz4,    // Fast: ~400-500 MB/s compression speed
+    Zstd,   // Better ratio: level 3 (balanced)
+}
+
+// Automatic decision logic
+pub fn should_compress(filename: &str, file_size: u64) -> Compression {
+    if file_size < 1MB { return Compression::None; }
+    if is_compressed_extension(filename) { return Compression::None; }
+    Compression::Lz4  // Default for >1MB uncompressed files
+}
+```
+
+#### Test Results (11 tests passing)
+
+- ✅ LZ4 roundtrip correctness
+- ✅ Zstd roundtrip correctness
+- ✅ Compression ratio verification (repetitive data <10%)
+- ✅ Zstd better compression than LZ4
+- ✅ Extension detection (jpg, mp4, pdf, etc.)
+- ✅ Size-based heuristics
+- ✅ Empty data and large data (1MB) handling
+
+#### Transport Integration (Deferred)
+
+**Reason for deferral**: SSH transport integration requires:
+1. Remote helper binary to decompress
+2. Bidirectional delta sync optimization
+3. Network speed detection for adaptive compression
+
+**Current state**: Module complete and ready for use. Integration will come in Phase 6 when implementing proper remote delta sync (send delta ops, not full file).
+
+**Planned approach**:
 - Local: No compression (disk I/O bottleneck)
 - LAN (>500 MB/s): No compression (CPU bottleneck)
 - LAN (100-500 MB/s): LZ4 only
@@ -330,16 +376,18 @@ benchmark local vs LAN vs WAN profiles
 ---
 
 **Last Updated**: 2025-10-02
-**Current Version**: v0.0.6 (streaming delta generation!)
+**Current Version**: v0.0.7 (compression module!)
 **Completed**:
 - ✅ Parallel transfers (5-10x faster)
 - ✅ Bytes transferred accounting (correctness)
 - ✅ O(1) rolling hash (TRUE O(1): 2ns constant time)
 - ✅ Streaming delta generation (O(1) memory, 39,000x reduction for 10GB files)
+- ✅ Compression module (LZ4 + Zstd, transport integration deferred)
 
 **Recent Achievements**:
-- Streaming implementation: 256KB constant memory vs O(file_size)
-- 5 comprehensive tests verify correctness
-- Enables safe processing of multi-GB files
+- Compression module: LZ4 and Zstd with smart heuristics
+- 11 comprehensive tests (roundtrip, ratios, edge cases)
+- Extension detection for pre-compressed files
+- Foundation for future WAN optimization
 
-**Next Target**: v0.0.7 (Integrate streaming into SSH transport)
+**Next Target**: Phase 6 - Remote delta sync (send delta ops, not full files)
