@@ -63,14 +63,19 @@ async fn main() -> Result<()> {
 
     // Print summary
     if !cli.quiet {
-        println!("\n✓ Sync complete");
-        println!("  Files scanned:    {}", stats.files_scanned);
-        println!("  Files created:    {}", stats.files_created);
-        println!("  Files updated:    {}", stats.files_updated);
-        println!("  Files skipped:    {}", stats.files_skipped);
+        println!("\n✓ Sync complete\n");
+
+        // File operations
+        println!("  Files scanned:     {}", stats.files_scanned);
+        println!("  Files created:     {}", stats.files_created);
+        println!("  Files updated:     {}", stats.files_updated);
+        println!("  Files skipped:     {}", stats.files_skipped);
         if cli.delete {
-            println!("  Files deleted:    {}", stats.files_deleted);
+            println!("  Files deleted:     {}", stats.files_deleted);
         }
+
+        // Transfer stats
+        println!();
         println!(
             "  Bytes transferred: {}",
             format_bytes(stats.bytes_transferred)
@@ -80,14 +85,16 @@ async fn main() -> Result<()> {
         let duration_secs = stats.duration.as_secs_f64();
         if duration_secs > 0.0 && stats.bytes_transferred > 0 {
             let bytes_per_sec = stats.bytes_transferred as f64 / duration_secs;
-            println!("  Transfer rate:    {}/s", format_bytes(bytes_per_sec as u64));
+            println!("  Transfer rate:     {}/s", format_bytes(bytes_per_sec as u64));
         }
 
-        println!("  Duration:         {}", format_duration(stats.duration));
+        println!("  Duration:          {}", format_duration(stats.duration));
 
+        // Delta sync stats (if used)
         if stats.files_delta_synced > 0 {
+            println!();
             println!(
-                "  Delta sync:       {} files, {} saved",
+                "  Delta sync:        {} files, {} saved",
                 stats.files_delta_synced,
                 format_bytes(stats.delta_bytes_saved)
             );

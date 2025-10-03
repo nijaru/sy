@@ -183,7 +183,7 @@ fn test_update_existing_files() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files updated:    1"));
+    assert!(stdout.contains("Files updated:     1"));
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn test_skip_unchanged_files() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files skipped:    1"));
+    assert!(stdout.contains("Files skipped:     1"));
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn test_update_shows_correct_stats() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files created:    2"));
+    assert!(stdout.contains("Files created:     2"));
 
     // Wait to ensure mtime changes (1s tolerance)
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -333,8 +333,8 @@ fn test_update_shows_correct_stats() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify update stats
-    assert!(stdout.contains("Files updated:    2"));
-    assert!(stdout.contains("Files skipped:    0"));
+    assert!(stdout.contains("Files updated:     2"));
+    assert!(stdout.contains("Files skipped:     0"));
 
     // Verify files were actually updated
     assert_eq!(
@@ -406,7 +406,7 @@ fn test_large_file_update_with_delta_sync() {
 
     // Delta sync should be used for large files
     // The output should mention delta sync
-    assert!(stdout.contains("Files updated:    1"));
+    assert!(stdout.contains("Files updated:     1"));
 
     // If delta sync was used, it should appear in summary
     // Note: Delta sync only triggers for files >1GB on local, and this is >2GB
