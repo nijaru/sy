@@ -60,7 +60,6 @@ pub fn apply_delta_no_base(delta: &Delta, new_file: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::delta::{compute_checksums, generate_delta};
-    use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
     #[test]

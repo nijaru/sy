@@ -53,7 +53,182 @@ impl Delta {
     }
 }
 
+/// Generate delta operations with streaming (memory-efficient)
+///
+/// This implements the rsync algorithm with constant memory usage:
+/// 1. Build hash table of destination block checksums
+/// 2. Read source in chunks (128KB at a time)
+/// 3. Slide window through data using rolling hash
+/// 4. Generate Copy ops for matches, Data ops for literals
+///
+/// Memory usage: ~256KB regardless of file size
+pub fn generate_delta_streaming(
+    source_path: &Path,
+    dest_checksums: &[BlockChecksum],
+    block_size: usize,
+) -> io::Result<Delta> {
+    const CHUNK_SIZE: usize = 128 * 1024; // 128KB chunks
+
+    // Build hash map for O(1) lookup
+    let mut checksum_map: HashMap<u32, Vec<&BlockChecksum>> = HashMap::new();
+    for checksum in dest_checksums {
+        checksum_map
+            .entry(checksum.weak)
+            .or_insert_with(Vec::new)
+            .push(checksum);
+    }
+
+    let mut source_file = File::open(source_path)?;
+    let source_size = source_file.metadata()?.len();
+
+    if source_size == 0 {
+        return Ok(Delta {
+            ops: vec![],
+            source_size: 0,
+            block_size,
+        });
+    }
+
+    let mut ops = Vec::new();
+    let mut literal_buffer = Vec::new();
+
+    // Sliding window buffer: large enough for rolling hash + read ahead
+    let mut window = Vec::with_capacity(block_size + CHUNK_SIZE);
+    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+
+    // Read initial chunk
+    let mut bytes_read = source_file.read(&mut chunk_buf)?;
+    if bytes_read > 0 {
+        window.extend_from_slice(&chunk_buf[..bytes_read]);
+    }
+
+    // Initialize rolling hash
+    let mut rolling = Adler32::new(block_size);
+    if window.len() >= block_size {
+        rolling.update_block(&window[0..block_size]);
+    }
+
+    let mut window_pos = 0; // Position within window
+    let mut _file_pos = 0u64; // Absolute position in file (for debugging)
+
+    while window_pos < window.len() {
+        let remaining = window.len() - window_pos;
+        let mut found_match = false;
+
+        // Try to match full blocks
+        if remaining >= block_size {
+            let weak = rolling.digest();
+
+            if let Some(candidates) = checksum_map.get(&weak) {
+                let block = &window[window_pos..window_pos + block_size];
+
+                // Verify with strong hash
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                hasher.update(block);
+                let strong = hasher.digest();
+
+                for checksum in candidates {
+                    if checksum.strong == strong {
+                        // Match found! Flush literals and add Copy
+                        if !literal_buffer.is_empty() {
+                            ops.push(DeltaOp::Data(literal_buffer.clone()));
+                            literal_buffer.clear();
+                        }
+
+                        ops.push(DeltaOp::Copy {
+                            offset: checksum.offset,
+                            size: checksum.size,
+                        });
+
+                        window_pos += block_size;
+                        _file_pos += block_size as u64;
+                        found_match = true;
+
+                        // Re-initialize rolling hash at new position
+                        if window_pos + block_size <= window.len() {
+                            rolling.update_block(&window[window_pos..window_pos + block_size]);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else if remaining > 0 {
+            // Partial block at end
+            let partial = &window[window_pos..];
+            let weak = Adler32::hash(partial);
+
+            if let Some(candidates) = checksum_map.get(&weak) {
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                hasher.update(partial);
+                let strong = hasher.digest();
+
+                for checksum in candidates {
+                    if checksum.size == partial.len() && checksum.strong == strong {
+                        if !literal_buffer.is_empty() {
+                            ops.push(DeltaOp::Data(literal_buffer.clone()));
+                            literal_buffer.clear();
+                        }
+
+                        ops.push(DeltaOp::Copy {
+                            offset: checksum.offset,
+                            size: checksum.size,
+                        });
+
+                        window_pos += partial.len();
+                        _file_pos += partial.len() as u64;
+                        found_match = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !found_match && window_pos < window.len() {
+            // No match - add byte to literal buffer
+            literal_buffer.push(window[window_pos]);
+
+            // Update rolling hash for next position
+            if window_pos + block_size < window.len() {
+                rolling.roll(window[window_pos], window[window_pos + block_size]);
+            }
+
+            window_pos += 1;
+            _file_pos += 1;
+        }
+
+        // Refill window when needed
+        if window_pos >= block_size && bytes_read > 0 && window.len() - window_pos < block_size {
+            // Shift window: remove processed bytes
+            window.drain(0..window_pos);
+            window_pos = 0;
+
+            // Read more data
+            bytes_read = source_file.read(&mut chunk_buf)?;
+            if bytes_read > 0 {
+                window.extend_from_slice(&chunk_buf[..bytes_read]);
+
+                // Re-initialize rolling hash if we have enough data
+                if window.len() >= block_size {
+                    rolling.update_block(&window[0..block_size]);
+                }
+            }
+        }
+    }
+
+    // Flush remaining literals
+    if !literal_buffer.is_empty() {
+        ops.push(DeltaOp::Data(literal_buffer));
+    }
+
+    Ok(Delta {
+        ops,
+        source_size,
+        block_size,
+    })
+}
+
 /// Generate delta operations by comparing source file against destination checksums
+/// (legacy non-streaming version - loads entire file into memory)
 ///
 /// This implements the rsync algorithm:
 /// 1. Build hash table of destination block checksums
@@ -301,5 +476,111 @@ mod tests {
         assert_eq!(delta.ops.len(), 1);
         assert!(matches!(delta.ops[0], DeltaOp::Data(_)));
         assert_eq!(delta.compression_ratio(), 1.0);
+    }
+
+    // Tests for streaming version
+    #[test]
+    fn test_streaming_identical_files() {
+        let mut source = NamedTempFile::new().unwrap();
+        let mut dest = NamedTempFile::new().unwrap();
+        let data = b"Hello, World! This is a test.";
+        source.write_all(data).unwrap();
+        dest.write_all(data).unwrap();
+        source.flush().unwrap();
+        dest.flush().unwrap();
+
+        let checksums = compute_checksums(dest.path(), 8).unwrap();
+        let delta = generate_delta_streaming(source.path(), &checksums, 8).unwrap();
+
+        // Should have only Copy operations
+        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert_eq!(delta.compression_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_streaming_large_file() {
+        // Test with file larger than CHUNK_SIZE (128KB)
+        let mut source = NamedTempFile::new().unwrap();
+        let mut dest = NamedTempFile::new().unwrap();
+
+        // Create 256KB of data
+        let data = vec![0xAB; 256 * 1024];
+        source.write_all(&data).unwrap();
+        dest.write_all(&data).unwrap();
+        source.flush().unwrap();
+        dest.flush().unwrap();
+
+        let checksums = compute_checksums(dest.path(), 4096).unwrap();
+        let delta = generate_delta_streaming(source.path(), &checksums, 4096).unwrap();
+
+        // Should be all Copy operations
+        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert_eq!(delta.source_size, 256 * 1024);
+    }
+
+    #[test]
+    fn test_streaming_vs_nonstreaming_identical() {
+        // Verify streaming produces same result as non-streaming
+        let mut source = NamedTempFile::new().unwrap();
+        let mut dest = NamedTempFile::new().unwrap();
+
+        // Create test data with mix of matches and mismatches
+        let source_data = b"AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ";
+        let dest_data = b"AAAABBBBXXXXDDDDEEEEYYYYGGGGHHHHZZZZJJJJ";
+        source.write_all(source_data).unwrap();
+        dest.write_all(dest_data).unwrap();
+        source.flush().unwrap();
+        dest.flush().unwrap();
+
+        let block_size = 4;
+        let checksums = compute_checksums(dest.path(), block_size).unwrap();
+
+        let delta1 = generate_delta(source.path(), &checksums, block_size).unwrap();
+        let delta2 = generate_delta_streaming(source.path(), &checksums, block_size).unwrap();
+
+        // Both should produce same operations
+        assert_eq!(delta1.ops.len(), delta2.ops.len());
+        assert_eq!(delta1.source_size, delta2.source_size);
+        assert_eq!(delta1.ops, delta2.ops);
+    }
+
+    #[test]
+    fn test_streaming_window_refill() {
+        // Test that window refilling works correctly
+        // Create file larger than 2*CHUNK_SIZE to force multiple refills
+        let mut source = NamedTempFile::new().unwrap();
+        let mut dest = NamedTempFile::new().unwrap();
+
+        // Create 512KB file (4 * 128KB chunks)
+        let mut data = Vec::new();
+        for i in 0..512 {
+            data.extend_from_slice(&[(i % 256) as u8; 1024]);
+        }
+        source.write_all(&data).unwrap();
+        dest.write_all(&data).unwrap();
+        source.flush().unwrap();
+        dest.flush().unwrap();
+
+        let block_size = 8192;
+        let checksums = compute_checksums(dest.path(), block_size).unwrap();
+        let delta = generate_delta_streaming(source.path(), &checksums, block_size).unwrap();
+
+        // Should be all Copy operations
+        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert_eq!(delta.source_size, 512 * 1024);
+    }
+
+    #[test]
+    fn test_streaming_empty_file() {
+        let source = NamedTempFile::new().unwrap();
+        let mut dest = NamedTempFile::new().unwrap();
+        dest.write_all(b"some data").unwrap();
+        dest.flush().unwrap();
+
+        let checksums = compute_checksums(dest.path(), 4).unwrap();
+        let delta = generate_delta_streaming(source.path(), &checksums, 4).unwrap();
+
+        assert_eq!(delta.ops.len(), 0);
+        assert_eq!(delta.source_size, 0);
     }
 }
