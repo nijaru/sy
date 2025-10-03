@@ -9,6 +9,30 @@ fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
 #[command(name = "sy")]
 #[command(about = "Modern file synchronization tool", long_about = None)]
 #[command(version)]
+#[command(after_help = "EXAMPLES:
+    # Basic sync
+    sy /source /destination
+
+    # Preview changes without applying
+    sy /source /destination --dry-run
+
+    # Mirror mode (delete extra files in destination)
+    sy /source /destination --delete
+
+    # Parallel transfers (20 workers)
+    sy /source /destination -j 20
+
+    # Sync single file
+    sy /path/to/file.txt /dest/file.txt
+
+    # Remote sync (SSH)
+    sy /local user@host:/remote
+    sy user@host:/remote /local
+
+    # Quiet mode (only errors)
+    sy /source /destination --quiet
+
+For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
     #[arg(value_parser = parse_sync_path)]

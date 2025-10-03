@@ -33,9 +33,11 @@ pub enum SyncError {
     #[error("Invalid path: {path}\nPaths must be valid UTF-8 and not contain invalid characters.")]
     InvalidPath { path: PathBuf },
 
+    #[allow(dead_code)] // Used in future phases (disk space checking)
     #[error("Insufficient disk space\nThe destination drive does not have enough free space for this operation.")]
     InsufficientDiskSpace,
 
+    #[allow(dead_code)] // Used in future phases (network sync)
     #[error("Network error: {message}\nCheck your network connection and try again.")]
     NetworkError { message: String },
 }
