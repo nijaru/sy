@@ -428,7 +428,6 @@ impl Transport for SshTransport {
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
-        .and_then(|r| Ok(r))
         .map(TransferResult::new)
     }
 

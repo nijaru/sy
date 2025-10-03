@@ -5,6 +5,7 @@ pub mod applier;
 
 pub use rolling::Adler32;
 pub use checksum::{BlockChecksum, compute_checksums};
+#[allow(unused_imports)]
 pub use generator::{Delta, DeltaOp, generate_delta, generate_delta_streaming};
 pub use applier::apply_delta;
 
