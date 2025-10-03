@@ -9,6 +9,7 @@ mod transport;
 use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
+use colored::Colorize;
 use sync::SyncEngine;
 use transport::router::TransportRouter;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -64,26 +65,40 @@ async fn main() -> Result<()> {
     // Print summary
     if !cli.quiet {
         if cli.dry_run {
-            println!("\n✓ Dry-run complete (no changes made)\n");
+            println!("\n{}\n", "✓ Dry-run complete (no changes made)".green().bold());
         } else {
-            println!("\n✓ Sync complete\n");
+            println!("\n{}\n", "✓ Sync complete".green().bold());
         }
 
         // File operations
-        println!("  Files scanned:     {}", stats.files_scanned);
+        println!("  Files scanned:     {}", stats.files_scanned.to_string().blue());
         if cli.dry_run {
-            println!("  Would create:      {}", stats.files_created);
-            println!("  Would update:      {}", stats.files_updated);
-            println!("  Would skip:        {}", stats.files_skipped);
+            println!("  Would create:      {}", stats.files_created.to_string().yellow());
+            println!("  Would update:      {}", stats.files_updated.to_string().yellow());
+            println!("  Would skip:        {}", stats.files_skipped.to_string().bright_black());
             if cli.delete {
-                println!("  Would delete:      {}", stats.files_deleted);
+                println!("  Would delete:      {}", stats.files_deleted.to_string().red());
             }
         } else {
-            println!("  Files created:     {}", stats.files_created);
-            println!("  Files updated:     {}", stats.files_updated);
-            println!("  Files skipped:     {}", stats.files_skipped);
-            if cli.delete {
-                println!("  Files deleted:     {}", stats.files_deleted);
+            if stats.files_created > 0 {
+                println!("  Files created:     {}", stats.files_created.to_string().green());
+            } else {
+                println!("  Files created:     {}", stats.files_created.to_string().bright_black());
+            }
+            if stats.files_updated > 0 {
+                println!("  Files updated:     {}", stats.files_updated.to_string().yellow());
+            } else {
+                println!("  Files updated:     {}", stats.files_updated.to_string().bright_black());
+            }
+            if stats.files_skipped > 0 {
+                println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
+            } else {
+                println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
+            }
+            if cli.delete && stats.files_deleted > 0 {
+                println!("  Files deleted:     {}", stats.files_deleted.to_string().red());
+            } else if cli.delete {
+                println!("  Files deleted:     {}", stats.files_deleted.to_string().bright_black());
             }
         }
 
@@ -91,25 +106,26 @@ async fn main() -> Result<()> {
         println!();
         println!(
             "  Bytes transferred: {}",
-            format_bytes(stats.bytes_transferred)
+            format_bytes(stats.bytes_transferred).cyan()
         );
 
         // Calculate and display transfer rate
         let duration_secs = stats.duration.as_secs_f64();
         if duration_secs > 0.0 && stats.bytes_transferred > 0 {
             let bytes_per_sec = stats.bytes_transferred as f64 / duration_secs;
-            println!("  Transfer rate:     {}/s", format_bytes(bytes_per_sec as u64));
+            println!("  Transfer rate:     {}", format!("{}/s", format_bytes(bytes_per_sec as u64)).cyan());
         }
 
-        println!("  Duration:          {}", format_duration(stats.duration));
+        println!("  Duration:          {}", format_duration(stats.duration).cyan());
 
         // Delta sync stats (if used)
         if stats.files_delta_synced > 0 {
             println!();
             println!(
-                "  Delta sync:        {} files, {} saved",
-                stats.files_delta_synced,
-                format_bytes(stats.delta_bytes_saved)
+                "  {}        {} files, {} saved",
+                "Delta sync:".bright_magenta(),
+                stats.files_delta_synced.to_string().bright_magenta(),
+                format_bytes(stats.delta_bytes_saved).bright_magenta()
             );
         }
     }
