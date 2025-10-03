@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Color-coded summary output for better visual clarity
+  - Success messages in bold green
+  - File operations color-coded (green for created, yellow for updated, red for deleted)
+  - Transfer stats in cyan, delta sync in magenta
+  - Colors automatically disable in non-TTY environments
+
 ### Planned for v0.1.0
 - Network speed detection
 - Adaptive compression integration
