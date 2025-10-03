@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Delta sync summary statistics
   - Final summary shows total files using delta sync
   - Displays total bandwidth saved (e.g., "Delta sync: 3 files, 45.2 MB saved")
+- Integration tests for file updates and delta sync
+  - Verify update statistics accuracy
+  - End-to-end delta sync validation (ignored by default - slow)
+- Enhanced error messages with actionable suggestions
+  - Permission denied: suggests checking ownership
+  - Copy failed: suggests checking disk space
+  - Directory read failed: suggests verifying path exists
+- CLI help improvements
+  - Added EXAMPLES section with common usage patterns
+  - Shows basic, dry-run, delete, parallel, single file, and remote sync examples
+
+### Changed
+- Error messages now include helpful context and resolution steps
 
 ### Planned for v0.1.0
 - Network speed detection
