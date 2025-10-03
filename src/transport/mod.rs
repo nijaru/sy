@@ -13,11 +13,42 @@ use std::path::Path;
 pub struct TransferResult {
     /// Actual bytes written (may differ from file size for delta sync)
     pub bytes_written: u64,
+    /// Number of delta operations (None if full file copy)
+    pub delta_operations: Option<usize>,
+    /// Bytes of literal data transferred via delta (None if full file copy)
+    pub literal_bytes: Option<u64>,
 }
 
 impl TransferResult {
     pub fn new(bytes_written: u64) -> Self {
-        Self { bytes_written }
+        Self {
+            bytes_written,
+            delta_operations: None,
+            literal_bytes: None,
+        }
+    }
+
+    pub fn with_delta(bytes_written: u64, delta_operations: usize, literal_bytes: u64) -> Self {
+        Self {
+            bytes_written,
+            delta_operations: Some(delta_operations),
+            literal_bytes: Some(literal_bytes),
+        }
+    }
+
+    /// Returns true if this transfer used delta sync
+    pub fn used_delta(&self) -> bool {
+        self.delta_operations.is_some()
+    }
+
+    /// Calculate compression ratio (percentage of file that was literal data)
+    /// Returns None if full file copy
+    pub fn compression_ratio(&self) -> Option<f64> {
+        if let (Some(literal), true) = (self.literal_bytes, self.bytes_written > 0) {
+            Some((literal as f64 / self.bytes_written as f64) * 100.0)
+        } else {
+            None
+        }
     }
 }
 
