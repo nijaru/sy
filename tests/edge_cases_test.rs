@@ -227,7 +227,7 @@ fn test_many_small_files() {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files created:    1000"));
+    assert!(stdout.contains("Files created:     1000"));
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn test_same_source_and_dest() {
     // This is acceptable behavior - skip all files
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files skipped:    1"));
+    assert!(stdout.contains("Files skipped:     1"));
 }
 
 #[test]
