@@ -32,17 +32,43 @@ pub struct SyncEngine<T: Transport> {
     delete: bool,
     quiet: bool,
     max_concurrent: usize,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
-    pub fn new(transport: T, dry_run: bool, delete: bool, quiet: bool, max_concurrent: usize) -> Self {
+    pub fn new(
+        transport: T,
+        dry_run: bool,
+        delete: bool,
+        quiet: bool,
+        max_concurrent: usize,
+        min_size: Option<u64>,
+        max_size: Option<u64>,
+    ) -> Self {
         Self {
             transport: Arc::new(transport),
             dry_run,
             delete,
             quiet,
             max_concurrent,
+            min_size,
+            max_size,
         }
+    }
+
+    fn should_filter_by_size(&self, file_size: u64) -> bool {
+        if let Some(min) = self.min_size {
+            if file_size < min {
+                return true;
+            }
+        }
+        if let Some(max) = self.max_size {
+            if file_size > max {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
@@ -56,8 +82,27 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Scan source directory
         tracing::debug!("Scanning source directory...");
-        let source_files = self.transport.scan(source).await?;
-        tracing::info!("Found {} items in source", source_files.len());
+        let all_files = self.transport.scan(source).await?;
+        let total_scanned = all_files.len();
+        tracing::info!("Found {} items in source", total_scanned);
+
+        // Filter files by size if filters are set
+        let source_files: Vec<_> = all_files
+            .into_iter()
+            .filter(|file| {
+                // Don't filter directories
+                if file.is_dir {
+                    return true;
+                }
+                // Apply size filter
+                !self.should_filter_by_size(file.size)
+            })
+            .collect();
+
+        if source_files.len() < total_scanned {
+            let filtered_count = total_scanned - source_files.len();
+            tracing::info!("Filtered out {} files by size", filtered_count);
+        }
 
         // Plan sync operations
         let planner = StrategyPlanner::new();

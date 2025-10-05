@@ -5,6 +5,32 @@ fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
 
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim().to_uppercase();
+
+    // Try to extract number and unit
+    let (num_str, unit) = if let Some(pos) = s.find(|c: char| c.is_alphabetic()) {
+        (&s[..pos], &s[pos..])
+    } else {
+        // No unit, assume bytes
+        return s.parse::<u64>().map_err(|e| format!("Invalid size: {}", e));
+    };
+
+    let num: f64 = num_str.trim().parse()
+        .map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
+
+    let multiplier: u64 = match unit.trim() {
+        "B" => 1,
+        "KB" | "K" => 1024,
+        "MB" | "M" => 1024 * 1024,
+        "GB" | "G" => 1024 * 1024 * 1024,
+        "TB" | "T" => 1024 * 1024 * 1024 * 1024,
+        _ => return Err(format!("Unknown unit '{}'. Use B, KB, MB, GB, or TB", unit)),
+    };
+
+    Ok((num * multiplier as f64) as u64)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "sy")]
 #[command(about = "Modern file synchronization tool", long_about = None)]
@@ -61,10 +87,25 @@ pub struct Cli {
     /// Number of parallel file transfers (default: 10)
     #[arg(short = 'j', long, default_value = "10")]
     pub parallel: usize,
+
+    /// Minimum file size to sync (e.g., "1MB", "500KB")
+    #[arg(long, value_parser = parse_size)]
+    pub min_size: Option<u64>,
+
+    /// Maximum file size to sync (e.g., "100MB", "1GB")
+    #[arg(long, value_parser = parse_size)]
+    pub max_size: Option<u64>,
 }
 
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Validate size filters first (independent of source path)
+        if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
+            if min > max {
+                anyhow::bail!("--min-size ({}) cannot be greater than --max-size ({})", min, max);
+            }
+        }
+
         // Only validate local source paths (remote paths are validated during connection)
         if self.source.is_local() {
             let path = self.source.path();
@@ -112,6 +153,8 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert!(cli.validate().is_ok());
     }
@@ -126,6 +169,8 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -146,6 +191,8 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -167,6 +214,8 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert!(cli.validate().is_ok());
     }
@@ -181,6 +230,8 @@ mod tests {
             verbose: 0,
             quiet: true,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -195,6 +246,8 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -209,6 +262,8 @@ mod tests {
             verbose: 1,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -223,7 +278,47 @@ mod tests {
             verbose: 2,
             quiet: false,
             parallel: 10,
+            min_size: None,
+            max_size: None,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
+    }
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1.5MB").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
+        assert_eq!(parse_size("500KB").unwrap(), 500 * 1024);
+
+        // Test case insensitivity
+        assert_eq!(parse_size("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1Mb").unwrap(), 1024 * 1024);
+
+        // Test short forms
+        assert_eq!(parse_size("1K").unwrap(), 1024);
+        assert_eq!(parse_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_size_filter_validation() {
+        let cli = Cli {
+            source: SyncPath::Local(PathBuf::from("/tmp/src")),
+            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            min_size: Some(1024 * 1024),  // 1MB
+            max_size: Some(500 * 1024),    // 500KB (smaller than min)
+        };
+
+        let result = cli.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min-size"));
     }
 }
