@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- File size filtering options
+  - `--min-size` and `--max-size` flags with human-readable sizes (e.g., "1MB", "500KB")
+  - Supports units: B, KB, MB, GB, TB (case-insensitive, with short forms K/M/G/T)
+  - Filters during sync (e.g., `sy /src /dst --min-size 1KB --max-size 10MB`)
+  - Common use cases: skip tiny files, exclude large videos, sync specific size ranges
 - Color-coded summary output for better visual clarity
   - Success messages in bold green
   - File operations color-coded (green for created, yellow for updated, red for deleted)
