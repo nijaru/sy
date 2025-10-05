@@ -46,7 +46,15 @@ async fn main() -> Result<()> {
 
     // Create transport router based on source and destination
     let transport = TransportRouter::new(&cli.source, &cli.destination).await?;
-    let engine = SyncEngine::new(transport, cli.dry_run, cli.delete, cli.quiet, cli.parallel);
+    let engine = SyncEngine::new(
+        transport,
+        cli.dry_run,
+        cli.delete,
+        cli.quiet,
+        cli.parallel,
+        cli.min_size,
+        cli.max_size,
+    );
 
     // Run sync (single file or directory)
     let stats = if cli.is_single_file() {
