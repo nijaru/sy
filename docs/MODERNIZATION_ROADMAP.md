@@ -20,7 +20,7 @@
 1. **Watch mode** - Continuous sync (modern dev workflow)
 2. **JSON output** - Scriptability (standard in modern tools)
 3. **Config profiles** - Reusable configurations
-4. **TUI mode** - Full-screen interface (optional eye candy)
+4. **Hooks** - Pre/post sync extensibility
 5. **Cloud backends** - S3/R2/Backblaze (rclone territory)
 
 ---
@@ -193,10 +193,10 @@ Looking at successful modern CLI tools:
 
 ---
 
-### Phase 7 (v0.4.0) - Modern Features
-**Goal**: Developer experience & extensibility
+### Phase 7 (v0.4.0) - Developer Experience
+**Goal**: Extensibility & improved workflows
 
-**Timeline**: 2 weeks
+**Timeline**: 1.5 weeks
 
 **Features**:
 1. **Hooks** (pre/post sync)
@@ -211,20 +211,15 @@ Looking at successful modern CLI tools:
    - Stored in `~/.config/sy/templates/`
    - Users can add custom templates
 
-3. **TUI mode** (full-screen interface)
-   - `sy /src /dst --tui` - Full-screen progress
-   - Live file tree view (like htop)
-   - Keyboard navigation (j/k, q to quit)
-   - Real-time transfer stats
-   - Uses ratatui (formerly tui-rs)
-
-4. **Improved dry-run**
+3. **Improved dry-run**
    - Colored diff-style output (like git diff)
    - `--dry-run --diff` shows content changes
    - Side-by-side comparison for modified files
    - Summary: bytes added/removed/changed
 
 **Deliverable**: Great developer experience
+
+**Note**: TUI mode deferred to Phase 9+ (optional feature, not critical for v1.0)
 
 ---
 
@@ -354,7 +349,6 @@ Looking at successful modern CLI tools:
 | **Watch mode** | ❌ | ❌ | ✅ (Phase 4) |
 | **JSON output** | ❌ | ✅ | ✅ (Phase 4) |
 | **Config profiles** | ❌ | ✅ | ✅ (Phase 4) |
-| **TUI mode** | ❌ | ❌ | ✅ (Phase 7) |
 | **Verification** | checksum | hash | **Multi-layer** ✅ (Phase 5) |
 | **Beautiful output** | ❌ | ⚠️ | ✅ |
 
@@ -382,24 +376,32 @@ Looking at successful modern CLI tools:
    - Alternative: Rust is not dynamic, plugins would require embedding interpreter
 
 5. **GUI application**
-   - Reason: sy is a CLI-first tool (TUI is enough)
+   - Reason: sy is a CLI-first tool
    - Alternative: Third parties can build GUIs using `--json` output
+
+### ⏸️ Features Deferred (Post-v1.0)
+
+1. **TUI mode** (full-screen interface)
+   - Reason: Not critical for v1.0, nice-to-have
+   - Current output (colors + progress bars) is sufficient
+   - Defer to Phase 9+ or v1.1+ if users request
+   - Note: Would use ratatui if implemented
 
 ---
 
 ## Timeline to v1.0
 
-**Estimated**: 16-19 weeks (~4-5 months)
+**Estimated**: 15.5-18.5 weeks (~4 months)
 
 - Phase 4: 2-3 weeks (Critical)
 - Phase 5: 2 weeks
 - Phase 6: 3 weeks
-- Phase 7: 2 weeks
+- Phase 7: 1.5 weeks (TUI deferred)
 - Phase 8: 3-4 weeks
 - Phase 9: 2 weeks
 - Phase 10: 2 weeks
 
-**Target Release**: Q2 2026
+**Target Release**: Q1-Q2 2026
 
 **Beta Program**: Start after Phase 6 (v0.3.0) with symlink support
 
