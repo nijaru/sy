@@ -8,8 +8,8 @@
 
 ✅ **Phase 1 MVP Complete** - Basic local sync working!
 ✅ **Phase 2 Complete** - SSH transport + Delta sync implemented! (v0.0.3)
-✅ **Phase 3 Complete** - Parallel transfers + optimization! (v0.0.4-v0.0.8)
-🚀 **Current Version: v0.0.8** - 193 tests passing, zero warnings!
+✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
+🚀 **Current Version: v0.0.9** - 194+ tests passing, zero warnings!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -61,11 +61,16 @@ sy /source /destination -j 20   # Use 20 parallel workers
 
 # Single file sync
 sy /path/to/file.txt /dest/file.txt
+
+# File size filtering (new in v0.0.9+)
+sy /source /destination --min-size 1KB      # Skip files < 1KB
+sy /source /destination --max-size 100MB    # Skip files > 100MB
+sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
 ```
 
 ## Features
 
-### ✅ What Works Now (v0.0.8)
+### ✅ What Works Now (v0.0.9)
 
 **Local Sync (Phase 1 - Complete)**:
 - **Smart File Sync**: Compares size + modification time (1s tolerance)
@@ -75,6 +80,7 @@ sy /path/to/file.txt /dest/file.txt
 - **Flexible Logging**: From quiet to trace level
 - **Edge Cases**: Handles unicode, deep nesting, large files, empty dirs
 - **Single File Sync**: Sync individual files, not just directories
+- **File Size Filtering**: `--min-size` and `--max-size` with human-readable units (KB, MB, GB, TB)
 
 **Delta Sync (Phase 2 - Complete)**:
 - **Rsync Algorithm**: TRUE O(1) rolling hash (2ns per operation, verified constant time)
@@ -93,6 +99,14 @@ sy /path/to/file.txt /dest/file.txt
 - **Thread-Safe Stats**: Accurate progress tracking with Arc<Mutex<>>
 - **Semaphore Control**: Prevents resource exhaustion
 - **Error Handling**: Collects all errors, reports first failure
+
+**UX & Polish (v0.0.9)**:
+- **Color-Coded Output**: Green (created), yellow (updated), cyan (transfer stats), magenta (delta sync)
+- **Performance Metrics**: Duration and transfer rate displayed in summary
+- **Enhanced Dry-Run**: Clear "Would create/update/delete" messaging
+- **Better Errors**: Actionable suggestions (e.g., "check disk space", "verify permissions")
+- **CLI Examples**: Built-in help with common usage patterns
+- **Delta Sync Visibility**: Real-time compression ratio and bandwidth savings
 
 **Compression Module (Ready for Integration)**:
 - **LZ4**: Fast compression (~400-500 MB/s throughput)
