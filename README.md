@@ -9,7 +9,8 @@
 ✅ **Phase 1 MVP Complete** - Basic local sync working!
 ✅ **Phase 2 Complete** - SSH transport + Delta sync implemented! (v0.0.3)
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
-🚀 **Current Version: v0.0.9** - 194+ tests passing, zero warnings!
+✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
+🚀 **Current Version: v0.0.10** - 92 tests passing, zero warnings!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -79,7 +80,7 @@ sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 50
 
 ## Features
 
-### ✅ What Works Now (v0.0.9)
+### ✅ What Works Now (v0.0.10)
 
 **Local Sync (Phase 1 - Complete)**:
 - **Smart File Sync**: Compares size + modification time (1s tolerance)
@@ -106,27 +107,29 @@ sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 50
 
 **Parallel Execution (Phase 3 - Complete)**:
 - **Parallel File Transfers**: 5-10x faster for multiple files
+- **Parallel Checksums**: 2-4x faster block checksumming (v0.0.10)
 - **Configurable Workers**: Default 10, adjustable via `-j` flag
 - **Thread-Safe Stats**: Accurate progress tracking with Arc<Mutex<>>
 - **Semaphore Control**: Prevents resource exhaustion
 - **Error Handling**: Collects all errors, reports first failure
 
-**UX & Polish (v0.0.9)**:
+**UX & Polish (v0.0.10)**:
 - **Color-Coded Output**: Green (created), yellow (updated), cyan (transfer stats), magenta (delta sync)
 - **Performance Metrics**: Duration and transfer rate displayed in summary
 - **Enhanced Dry-Run**: Clear "Would create/update/delete" messaging
 - **Better Errors**: Actionable suggestions (e.g., "check disk space", "verify permissions")
 - **CLI Examples**: Built-in help with common usage patterns
 - **Delta Sync Visibility**: Real-time compression ratio and bandwidth savings
+- **Compression Stats**: Files compressed and bytes saved displayed in summary
 - **File Size Filtering**: `--min-size` and `--max-size` flags with human-readable units
 - **Exclude Patterns**: `--exclude` flag for flexible glob-based filtering
 - **Bandwidth Limiting**: `--bwlimit` flag for controlled transfer rates
 
-**Compression Module (Ready, Integration Pending)**:
+**Compression (Phase 3.5 - Complete)**:
 - **Performance** (benchmarked):
   - LZ4: 23 GB/s throughput
   - Zstd: 8 GB/s throughput (level 3)
-- **Smart Heuristics** (corrected based on benchmarks):
+- **Smart Heuristics**:
   - Local: never compress (disk I/O bottleneck)
   - Network: always Zstd (CPU never bottleneck, even on 100 Gbps)
   - Skip: files <1MB, pre-compressed formats (jpg, mp4, zip, pdf, etc.)
@@ -134,8 +137,9 @@ sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 50
   - ✅ Module implemented and tested (18 unit tests)
   - ✅ Integration tests pass (5 tests, proven end-to-end)
   - ✅ Benchmarks prove 50x faster than originally assumed
-  - ⏳ Production integration pending (protocol changes needed)
-  - ✅ CLI flag ready (`--compress`)
+  - ✅ Production integration complete (v0.0.10)
+  - ✅ Compression stats tracked and displayed
+  - ✅ 2-5x reduction on text/code files
 
 ### 📋 Common Use Cases
 
