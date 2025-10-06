@@ -1,10 +1,11 @@
 use super::Adler32;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
 /// Block checksum containing both weak and strong hashes
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockChecksum {
     /// Block index (0-based)
     pub index: u64,

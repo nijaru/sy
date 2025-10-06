@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use sy::delta::{apply_delta, compute_checksums, Delta};
 use sy::sync::scanner::Scanner;
 
 #[derive(Parser)]
@@ -17,6 +18,24 @@ enum Commands {
     Scan {
         /// Directory to scan
         path: PathBuf,
+    },
+    /// Compute block checksums for a file
+    Checksums {
+        /// File to compute checksums for
+        path: PathBuf,
+        /// Block size in bytes
+        #[arg(long)]
+        block_size: usize,
+    },
+    /// Apply delta operations to a file
+    ApplyDelta {
+        /// Existing file to apply delta to
+        base_file: PathBuf,
+        /// Output file path
+        output_file: PathBuf,
+        /// Delta operations (JSON from stdin)
+        #[arg(long)]
+        delta_json: String,
     },
 }
 
@@ -63,6 +82,22 @@ fn main() -> anyhow::Result<()> {
             };
 
             println!("{}", serde_json::to_string(&output)?);
+        }
+        Commands::Checksums { path, block_size } => {
+            let checksums = compute_checksums(&path, block_size)?;
+            println!("{}", serde_json::to_string(&checksums)?);
+        }
+        Commands::ApplyDelta {
+            base_file,
+            output_file,
+            delta_json,
+        } => {
+            let delta: Delta = serde_json::from_str(&delta_json)?;
+            let stats = apply_delta(&base_file, &delta, &output_file)?;
+            println!(
+                "{{\"operations_count\": {}, \"literal_bytes\": {}}}",
+                stats.operations_count, stats.literal_bytes
+            );
         }
     }
 
