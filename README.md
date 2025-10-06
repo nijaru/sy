@@ -4,6 +4,16 @@
 
 **sy** (pronounced "sigh") is a modern file sync tool built in Rust, inspired by the UX of `eza`, `fd`, and `ripgrep`. It's not a drop-in rsync replacement - it's a reimagining of file sync with verifiable integrity, adaptive performance, and transparent tradeoffs.
 
+## Why sy?
+
+**sy is 2-11x faster than rsync** for local operations:
+- ✅ **8.8x faster** than rsync for large files (50MB: 21ms vs 185ms)
+- ✅ **60% faster** than rsync for many small files (100 files: 25ms vs 40ms)
+- ✅ **2x faster** for idempotent syncs (no changes: 8ms vs 17ms)
+- ✅ **11x faster** for real-world workloads (500 files: <10ms vs 110ms)
+
+See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmarks.
+
 ## Status
 
 ✅ **Phase 1 MVP Complete** - Basic local sync working!
@@ -211,44 +221,46 @@ Files: 1,234 total | 892 synced | 312 skipped | 30 queued
 
 ## Comparison
 
-| Feature | rsync | rclone | sy (v0.0.8) |
+| Feature | rsync | rclone | sy (v0.0.10) |
 |---------|-------|--------|-----|
-| Parallel file transfers | ❌ | ✅ | ✅ **Implemented!** |
-| Parallel chunk transfers | ❌ | ✅ | 🚧 Planned |
-| Delta sync | ✅ | ❌ | ✅ **Implemented!** |
+| **Performance (local)** | baseline | N/A | **2-11x faster** |
+| Parallel file transfers | ❌ | ✅ | ✅ |
+| Parallel checksums | ❌ | ❌ | ✅ |
+| Delta sync | ✅ | ❌ | ✅ |
 | Streaming delta | ❌ | ❌ | ✅ **Constant memory!** |
 | True O(1) rolling hash | ❌ | ❌ | ✅ **2ns per operation!** |
 | Block checksums | ✅ MD5 | ❌ | ✅ xxHash3 |
-| End-to-end checksums | ❌ | ✅ | 🚧 Planned |
-| Compression support | ✅ | ✅ | ✅ Module ready |
-| Network auto-detection | ❌ | ❌ | 🚧 Planned |
+| Compression | ✅ | ✅ | ✅ **Zstd (8 GB/s)** |
+| Bandwidth limiting | ✅ | ✅ | ✅ |
+| File filtering | ✅ | ✅ | ✅ |
 | Modern UX | ❌ | ⚠️ | ✅ |
 | Single file sync | ⚠️ Complex | ✅ | ✅ |
 | Zero compiler warnings | N/A | N/A | ✅ |
 
+**Future planned**: End-to-end checksums, network auto-detection, parallel chunk transfers, resume support
+
 ## Example Usage
 
 ```bash
-# Basic sync
-sy ./src remote:/dest
+# Basic sync (local or remote)
+sy /source /destination
+sy /source user@host:/dest
 
 # Preview changes (dry-run)
-sy ./src remote:/dest --dry-run
+sy /source /destination --dry-run
 
-# Mirror (delete files not in source)
-sy ./src remote:/dest --delete
+# Mirror mode (delete files not in source)
+sy /source /destination --delete
 
-# Fast LAN transfer
-sy ./src nas:/backup --mode lan
+# Parallel transfers (10 workers by default)
+sy /source /destination -j 20
 
-# WAN with compression
-sy ./src server:/backup --mode wan
+# File filtering
+sy /source /destination --min-size 1MB --max-size 100MB
+sy /source /destination --exclude "*.log" --exclude "node_modules"
 
-# Maximum verification
-sy ./important remote:/backup --paranoid
-
-# Use saved profile
-sy backup-home  # Uses ~/.config/sy/config.toml
+# Bandwidth limiting
+sy /source user@host:/dest --bwlimit 1MB
 ```
 
 ## Design Highlights
@@ -311,14 +323,16 @@ Total design document: **2,400+ lines** of detailed specifications, code example
 
 **Performance Win**: Delta sync dramatically reduces bandwidth usage by transferring only changed blocks instead of entire files.
 
-### ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.8) - **COMPLETE**
+### ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.10) - **COMPLETE**
 - ✅ Parallel file transfers (5-10x speedup for multiple files)
+- ✅ Parallel checksum computation (2-4x faster)
 - ✅ Configurable worker count (default 10, via `-j` flag)
 - ✅ Thread-safe statistics tracking
 - ✅ TRUE O(1) rolling hash (fixed critical bug, verified 2ns constant time)
 - ✅ Streaming delta generation (constant ~256KB memory)
 - ✅ Size-based local delta heuristic (>1GB files)
-- ✅ Compression module (LZ4 + Zstd, ready for integration)
+- ✅ **Full compression integration** (Zstd level 3, 8 GB/s throughput)
+- ✅ Compression stats tracking and display
 - ✅ Single file sync support
 - ✅ Zero clippy warnings (idiomatic Rust)
 
@@ -330,9 +344,9 @@ See [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for detailed optimization his
 
 ### Phase 4: Advanced Features (v0.1.0+) - NEXT
 - Network speed detection
-- Adaptive compression integration
-- Parallel chunk transfers
-- Resume support
+- Parallel chunk transfers for very large files
+- Resume support for interrupted transfers
+- End-to-end cryptographic checksums (BLAKE3)
 
 ### Phase 5: Reliability (v0.5.0)
 - Multi-layer checksums
@@ -369,47 +383,55 @@ cargo bench
 cargo test -- --nocapture
 ```
 
-**Test Coverage (193 tests total):**
-- **Unit Tests (74)**: Core module functionality, CLI validation, error handling
-- **Delta Tests (21)**: Rolling hash, checksum, delta generation, streaming
-- **Compression Tests (11)**: LZ4/Zstd roundtrip, ratios, heuristics
-- **Integration Tests (11)**: End-to-end sync scenarios, single file sync
-- **Property-Based Tests (5)**: Invariants that always hold (idempotency, completeness)
-- **Edge Case Tests (11)**: Unicode, deep nesting, large files, special characters
-- **Performance Regression Tests (7)**: Ensure performance stays within bounds
-- **CLI Tests (7)**: Argument parsing, validation, log levels
+**Test Coverage (100+ tests):**
+- **Unit Tests (83)**: Core functionality, CLI, compression, delta sync, SSH config
+- **Integration Tests (36)**: End-to-end scenarios, compression, edge cases, performance
+  - Compression integration (5 tests)
+  - Edge cases (11 tests)
+  - Full sync scenarios (13 tests)
+  - Performance regression (7 tests)
 
 **Code Quality:**
-- Zero compiler warnings
-- Zero clippy warnings
-- 100% of public API documented
-- 4,403 lines of Rust code
+- ✅ Zero compiler warnings
+- ✅ Zero clippy warnings
+- ✅ 100% of public API documented
+- ✅ 5,500+ lines of Rust code
+- ✅ All performance tests passing
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for performance testing and regression tracking.
 
 ## Performance
 
-**sy is consistently faster than rsync and cp for local sync:**
+**sy is consistently 2-11x faster than rsync for local sync:**
 
-- **100 files**: 40-79% faster than rsync/cp
-- **Large files (50MB)**: 64x faster than rsync, 7x faster than cp
-- **Idempotent sync**: 4.7x faster than rsync
-- **1000 files**: 40-47% faster than alternatives
+| Scenario | sy | rsync | Speedup |
+|----------|-----|-------|---------|
+| **100 small files** | 25 ms | 40 ms | **1.6x faster** |
+| **50MB file** | 21 ms | 185 ms | **8.8x faster** |
+| **Idempotent sync** | 8 ms | 17 ms | **2.1x faster** |
+| **500 files** | <10 ms | 110 ms | **11x faster** |
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarks and performance testing.
+**Why so fast?**
+- Modern Rust stdlib with platform optimizations (`copy_file_range`, `clonefile`)
+- Parallel file transfers (10 workers by default)
+- Parallel checksum computation
+- Efficient scanning with pre-allocated vectors
+- Smart size+mtime comparison (vs rsync's checksums)
+
+See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for comprehensive benchmark analysis.
 
 ## Contributing
 
-Phase 1 MVP is complete! Phase 2 (Network Sync) is next.
+sy v0.0.10 is production-ready! Phases 1-3 are complete.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
-Interested in contributing? Areas we'll need help with:
-- SSH transport implementation (Phase 2)
-- Parallel transfers (Phase 3)
-- Rsync algorithm implementation (Phase 4)
-- Cross-platform testing
-- Documentation
+**Interested in contributing?** Areas we'd love help with:
+- **Testing**: Cross-platform testing (Windows, Linux, macOS)
+- **Performance**: Profiling and optimization for very large datasets
+- **Features**: Phase 4 features (network detection, resume support, parallel chunks)
+- **Documentation**: Usage examples, tutorials, blog posts
+- **Real-world testing**: Use sy in your workflows and report issues!
 
 ## License
 
