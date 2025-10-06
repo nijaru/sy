@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use sy::compress::{decompress, Compression};
 use sy::delta::{apply_delta, compute_checksums, Delta};
@@ -34,6 +35,14 @@ enum Commands {
         base_file: PathBuf,
         /// Output file path
         output_file: PathBuf,
+    },
+    /// Receive a file (potentially compressed) from stdin and write to disk
+    ReceiveFile {
+        /// Output file path
+        output_path: PathBuf,
+        /// Optional modification time (seconds since epoch)
+        #[arg(long)]
+        mtime: Option<u64>,
     },
 }
 
@@ -90,7 +99,6 @@ fn main() -> anyhow::Result<()> {
             output_file,
         } => {
             // Read delta data from stdin (may be compressed)
-            use std::io::Read;
             let mut stdin_data = Vec::new();
             std::io::stdin().read_to_end(&mut stdin_data)?;
 
@@ -114,6 +122,45 @@ fn main() -> anyhow::Result<()> {
                 "{{\"operations_count\": {}, \"literal_bytes\": {}}}",
                 stats.operations_count, stats.literal_bytes
             );
+        }
+        Commands::ReceiveFile { output_path, mtime } => {
+            // Read file data from stdin (may be compressed)
+            let mut stdin_data = Vec::new();
+            std::io::stdin().read_to_end(&mut stdin_data)?;
+
+            // Check if data is compressed (Zstd magic: 0x28, 0xB5, 0x2F, 0xFD)
+            let file_data = if stdin_data.len() >= 4 &&
+                stdin_data[0] == 0x28 && stdin_data[1] == 0xB5 &&
+                stdin_data[2] == 0x2F && stdin_data[3] == 0xFD {
+                // Decompress zstd data
+                decompress(&stdin_data, Compression::Zstd)?
+            } else {
+                // Uncompressed data
+                stdin_data
+            };
+
+            // Ensure parent directory exists
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Write file
+            let mut output_file = std::fs::File::create(&output_path)?;
+            output_file.write_all(&file_data)?;
+            output_file.flush()?;
+
+            // Set mtime if provided
+            if let Some(mtime_secs) = mtime {
+                use std::time::{Duration, UNIX_EPOCH};
+                let mtime = UNIX_EPOCH + Duration::from_secs(mtime_secs);
+                let _ = filetime::set_file_mtime(
+                    &output_path,
+                    filetime::FileTime::from_system_time(mtime),
+                );
+            }
+
+            // Report success with bytes written
+            println!("{{\"bytes_written\": {}}}", file_data.len());
         }
     }
 

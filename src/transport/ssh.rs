@@ -1,5 +1,5 @@
 use super::{Transport, TransferResult};
-use crate::compress::{compress, Compression};
+use crate::compress::{compress, should_compress, Compression};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
@@ -236,24 +236,44 @@ impl Transport for SshTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Use SFTP for file transfer with streaming and checksum verification
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
 
         tokio::task::spawn_blocking({
             let session = Arc::clone(&self.session);
+            let _remote_binary = self.remote_binary_path.clone();
+
             move || {
                 let session = session.lock().map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
                 })?;
 
-                // Get source metadata for mtime
+                // Get source metadata for mtime and size
                 let metadata = std::fs::metadata(&source_path).map_err(|e| {
                     SyncError::Io(std::io::Error::new(
                         e.kind(),
                         format!("Failed to get metadata for {}: {}", source_path.display(), e),
                     ))
                 })?;
+
+                let file_size = metadata.len();
+                let filename = source_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+
+                // Determine if compression would be beneficial
+                let compression_mode = should_compress(filename, file_size);
+
+                tracing::debug!(
+                    "File {}: {} bytes, compression: {}",
+                    filename,
+                    file_size,
+                    compression_mode.as_str()
+                );
+
+                // TODO: For files >100MB or incompressible, use SFTP streaming (current path)
+                // TODO: For smaller compressible files, use compressed receive-file command
+                // For now, use SFTP for all files (compression optimization pending)
 
                 // Open source file for streaming
                 let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
