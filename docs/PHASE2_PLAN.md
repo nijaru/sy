@@ -1,8 +1,13 @@
 # Phase 2: Network Sync - Implementation Plan
 
+> ✅ **Status: COMPLETE** - Phase 2 implemented in v0.0.2-v0.0.3
+>
+> This document remains as reference for the implementation approach.
+> Current status: SSH transport, delta sync, and remote operations all working.
+
 **Goal**: Enable remote sync via SSH with `sy /src remote:/dst`
 
-**Target**: v0.2.0
+**Target**: v0.2.0 *(completed)*
 
 ## Overview
 

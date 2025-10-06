@@ -1,6 +1,12 @@
 # Optimization Roadmap - sy
 
-## Current Status (v0.0.3)
+> **Note**: This document tracks optimization history. For current status, see:
+> - [README.md](../README.md) - Current features (v0.0.10)
+> - [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Performance data
+>
+> **Current version**: v0.0.10 (Phase 3.5 complete)
+
+## Optimization History
 
 ### Completed Optimizations ✅
 
