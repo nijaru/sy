@@ -41,6 +41,9 @@ pub struct SyncEngine<T: Transport> {
     max_size: Option<u64>,
     exclude_patterns: Vec<glob::Pattern>,
     bwlimit: Option<u64>,
+    resume: bool,
+    checkpoint_files: usize,
+    checkpoint_bytes: u64,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -55,6 +58,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         max_size: Option<u64>,
         exclude: Vec<String>,
         bwlimit: Option<u64>,
+        resume: bool,
+        checkpoint_files: usize,
+        checkpoint_bytes: u64,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -80,6 +86,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             max_size,
             exclude_patterns,
             bwlimit,
+            resume,
+            checkpoint_files,
+            checkpoint_bytes,
         }
     }
 
