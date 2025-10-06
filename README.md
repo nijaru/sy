@@ -71,6 +71,10 @@ sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
 sy /source /destination --exclude "*.log"              # Skip log files
 sy /source /destination --exclude "node_modules"       # Skip node_modules
 sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patterns
+
+# Bandwidth limiting (new in v0.0.9+)
+sy /source /destination --bwlimit 1MB                  # Limit to 1 MB/s
+sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 500 KB/s
 ```
 
 ## Features
@@ -87,6 +91,7 @@ sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patter
 - **Single File Sync**: Sync individual files, not just directories
 - **File Size Filtering**: `--min-size` and `--max-size` with human-readable units (KB, MB, GB, TB)
 - **Exclude Patterns**: `--exclude` flag with glob patterns (e.g., `*.log`, `node_modules`)
+- **Bandwidth Limiting**: `--bwlimit` flag to control transfer rate (e.g., `1MB`, `500KB`)
 
 **Delta Sync (Phase 2 - Complete)**:
 - **Rsync Algorithm**: TRUE O(1) rolling hash (2ns per operation, verified constant time)
@@ -115,6 +120,7 @@ sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patter
 - **Delta Sync Visibility**: Real-time compression ratio and bandwidth savings
 - **File Size Filtering**: `--min-size` and `--max-size` flags with human-readable units
 - **Exclude Patterns**: `--exclude` flag for flexible glob-based filtering
+- **Bandwidth Limiting**: `--bwlimit` flag for controlled transfer rates
 
 **Compression Module (Ready for Integration)**:
 - **LZ4**: Fast compression (~400-500 MB/s throughput)
