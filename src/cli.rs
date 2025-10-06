@@ -109,6 +109,18 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
+    /// Enable resume support (auto-resume if state file found, default: true)
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+    pub resume: bool,
+
+    /// Checkpoint every N files (default: 10)
+    #[arg(long, default_value = "10")]
+    pub checkpoint_files: usize,
+
+    /// Checkpoint every N bytes transferred (e.g., "100MB", default: 100MB)
+    #[arg(long, value_parser = parse_size, default_value = "104857600")]
+    pub checkpoint_bytes: u64,
+
     /// Enable compression for network transfers (auto-detects based on file type)
     #[arg(long)]
     pub compress: bool,

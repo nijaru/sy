@@ -57,6 +57,9 @@ async fn main() -> Result<()> {
         cli.max_size,
         cli.exclude.clone(),
         cli.bwlimit,
+        cli.resume,
+        cli.checkpoint_files,
+        cli.checkpoint_bytes,
     );
 
     // Run sync (single file or directory)
