@@ -65,12 +65,14 @@ fn parse_size(s: &str) -> Result<u64, String> {
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
+    /// Optional when using --profile
     #[arg(value_parser = parse_sync_path)]
-    pub source: SyncPath,
+    pub source: Option<SyncPath>,
 
     /// Destination path (local: /path or remote: user@host:/path)
+    /// Optional when using --profile
     #[arg(value_parser = parse_sync_path)]
-    pub destination: SyncPath,
+    pub destination: Option<SyncPath>,
 
     /// Show changes without applying them (dry-run)
     #[arg(short = 'n', long)]
@@ -128,6 +130,18 @@ pub struct Cli {
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
+
+    /// Use named profile from config file
+    #[arg(long)]
+    pub profile: Option<String>,
+
+    /// List all available profiles
+    #[arg(long)]
+    pub list_profiles: bool,
+
+    /// Show details of a specific profile
+    #[arg(long)]
+    pub show_profile: Option<String>,
 }
 
 impl Cli {
@@ -139,11 +153,26 @@ impl Cli {
             }
         }
 
+        // --list-profiles and --show-profile don't need source/destination
+        if self.list_profiles || self.show_profile.is_some() {
+            return Ok(());
+        }
+
+        // If using --profile, source/destination come from profile (validated later)
+        // Otherwise, source and destination must be provided
+        if self.profile.is_none() {
+            if self.source.is_none() || self.destination.is_none() {
+                anyhow::bail!("Source and destination are required (or use --profile)");
+            }
+        }
+
         // Only validate local source paths (remote paths are validated during connection)
-        if self.source.is_local() {
-            let path = self.source.path();
-            if !path.exists() {
-                anyhow::bail!("Source path does not exist: {}", self.source);
+        if let Some(source) = &self.source {
+            if source.is_local() {
+                let path = source.path();
+                if !path.exists() {
+                    anyhow::bail!("Source path does not exist: {}", source);
+                }
             }
         }
 
@@ -152,7 +181,7 @@ impl Cli {
 
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
-        self.source.is_local() && self.source.path().is_file()
+        self.source.as_ref().map_or(false, |s| s.is_local() && s.path().is_file())
     }
 
     pub fn log_level(&self) -> tracing::Level {
@@ -179,8 +208,8 @@ mod tests {
     fn test_validate_source_exists() {
         let temp = TempDir::new().unwrap();
         let cli = Cli {
-            source: SyncPath::Local(temp.path().to_path_buf()),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(temp.path().to_path_buf())),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -195,6 +224,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
         };
         assert!(cli.validate().is_ok());
     }
@@ -202,8 +234,8 @@ mod tests {
     #[test]
     fn test_validate_source_not_exists() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/nonexistent/path")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/nonexistent/path"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -218,6 +250,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -231,8 +266,8 @@ mod tests {
         fs::write(&file_path, "content").unwrap();
 
         let cli = Cli {
-            source: SyncPath::Local(file_path.clone()),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(file_path.clone())),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -245,6 +280,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -257,12 +295,12 @@ mod tests {
     fn test_validate_remote_source() {
         // Remote sources should not be validated locally
         let cli = Cli {
-            source: SyncPath::Remote {
+            source: Some(SyncPath::Remote {
                 host: "server".to_string(),
                 user: Some("user".to_string()),
                 path: PathBuf::from("/remote/path"),
-            },
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            }),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -275,6 +313,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -284,8 +325,8 @@ mod tests {
     #[test]
     fn test_log_level_quiet() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/tmp/src")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -298,6 +339,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -307,8 +351,8 @@ mod tests {
     #[test]
     fn test_log_level_default() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/tmp/src")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -321,6 +365,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -330,8 +377,8 @@ mod tests {
     #[test]
     fn test_log_level_verbose() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/tmp/src")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 1,
@@ -344,6 +391,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -353,8 +403,8 @@ mod tests {
     #[test]
     fn test_log_level_very_verbose() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/tmp/src")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 2,
@@ -367,6 +417,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: None,
             max_size: None,
         };
@@ -395,8 +448,8 @@ mod tests {
     #[test]
     fn test_size_filter_validation() {
         let cli = Cli {
-            source: SyncPath::Local(PathBuf::from("/tmp/src")),
-            destination: SyncPath::Local(PathBuf::from("/tmp/dest")),
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
             verbose: 0,
@@ -409,6 +462,9 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
             min_size: Some(1024 * 1024),  // 1MB
             max_size: Some(500 * 1024),    // 500KB (smaller than min)
         };
