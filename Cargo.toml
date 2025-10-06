@@ -44,6 +44,9 @@ blake3 = "1"
 # Compression (Zstd level 3 only - benchmarked optimal at 8.7 GB/s)
 zstd = "0.13"
 
+# Parallel processing
+rayon = "1.10"
+
 # SSH (Phase 2)
 ssh2 = "0.9"
 whoami = "1"
