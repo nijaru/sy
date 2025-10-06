@@ -81,7 +81,8 @@ impl Transport for LocalTransport {
             })?;
 
             // Stream copy with checksum calculation
-            const CHUNK_SIZE: usize = 128 * 1024; // 128KB chunks
+            // 256KB optimal for disk I/O and checksum performance
+            const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
             let mut buffer = vec![0u8; CHUNK_SIZE];
             let mut hasher = xxhash_rust::xxh3::Xxh3::new();
             let mut bytes_written = 0u64;

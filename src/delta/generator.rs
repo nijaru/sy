@@ -58,17 +58,17 @@ impl Delta {
 ///
 /// This implements the rsync algorithm with constant memory usage:
 /// 1. Build hash table of destination block checksums
-/// 2. Read source in chunks (128KB at a time)
+/// 2. Read source in chunks (256KB at a time)
 /// 3. Slide window through data using rolling hash
 /// 4. Generate Copy ops for matches, Data ops for literals
 ///
-/// Memory usage: ~256KB regardless of file size
+/// Memory usage: ~512KB regardless of file size
 pub fn generate_delta_streaming(
     source_path: &Path,
     dest_checksums: &[BlockChecksum],
     block_size: usize,
 ) -> io::Result<Delta> {
-    const CHUNK_SIZE: usize = 128 * 1024; // 128KB chunks
+    const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 
     // Build hash map for O(1) lookup
     let mut checksum_map: HashMap<u32, Vec<&BlockChecksum>> = HashMap::new();

@@ -42,6 +42,10 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
             std::io::Error::other(format!("SSH handshake failed: {}", e))
         ))?;
 
+        // Configure keepalive to prevent connection drops during long transfers
+        // Send keepalive every 60 seconds, disconnect after 3 missed responses
+        session.set_keepalive(true, 60);
+
         // Try authentication methods in order of preference:
         // 1. SSH agent (if available)
         // 2. Identity files (keys)
