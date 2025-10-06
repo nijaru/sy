@@ -1,11 +1,12 @@
 use super::{Adler32, BlockChecksum};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
 /// A single delta operation
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeltaOp {
     /// Copy block from existing file at given offset
     Copy {
@@ -17,7 +18,7 @@ pub enum DeltaOp {
 }
 
 /// Delta instructions for reconstructing a file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delta {
     pub ops: Vec<DeltaOp>,
     #[allow(dead_code)]

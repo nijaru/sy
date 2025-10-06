@@ -1,5 +1,5 @@
 use super::{Transport, TransferResult};
-use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp};
+use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
@@ -295,11 +295,13 @@ impl Transport for SshTransport {
 
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
+        let remote_binary = self.remote_binary_path.clone();
+        let session_clone = Arc::clone(&self.session);
 
         tokio::task::spawn_blocking({
-            let session = Arc::clone(&self.session);
+            let session_arc = session_clone;
             move || {
-                let session = session.lock().map_err(|e| {
+                let session = session_arc.lock().map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
                 })?;
 
@@ -327,41 +329,29 @@ impl Transport for SshTransport {
                     )));
                 }
 
-                // Download remote file to temp location for checksum computation
-                let temp_dir = tempfile::tempdir().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to create temp dir: {}", e)))
-                })?;
-                let temp_dest = temp_dir.path().join("remote_dest");
-
-                tracing::debug!("Downloading remote file for delta computation...");
-                let mut remote_file = sftp.open(&dest_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to open remote file {}: {}",
-                        dest_path.display(),
-                        e
-                    )))
-                })?;
-
-                let mut temp_file = std::fs::File::create(&temp_dest).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to create temp file: {}", e)))
-                })?;
-
-                std::io::copy(&mut remote_file, &mut temp_file).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to download remote file: {}", e)))
-                })?;
-
-                drop(temp_file);
-                drop(remote_file);
-
                 // Calculate block size
                 let block_size = calculate_block_size(dest_size);
 
-                // Compute checksums of downloaded destination file
-                tracing::debug!("Computing checksums...");
-                let dest_checksums = compute_checksums(&temp_dest, block_size)
-                    .map_err(|e| SyncError::CopyError {
-                        path: temp_dest.clone(),
-                        source: e,
+                // Compute checksums on remote side (avoid downloading entire file!)
+                tracing::debug!("Computing remote checksums via sy-remote...");
+                drop(session); // Unlock session before remote command
+
+                let dest_path_str = dest_path.to_string_lossy();
+                let command = format!(
+                    "{} checksums {} --block-size {}",
+                    remote_binary, dest_path_str, block_size
+                );
+
+                let output = tokio::task::block_in_place(|| {
+                    Self::execute_command(Arc::clone(&session_arc), &command)
+                })?;
+
+                let dest_checksums: Vec<BlockChecksum> = serde_json::from_str(&output)
+                    .map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to parse remote checksums: {}",
+                            e
+                        )))
                     })?;
 
                 // Generate delta with streaming (constant memory)
@@ -389,44 +379,59 @@ impl Transport for SshTransport {
                     0.0
                 };
 
-                // Apply delta to create updated file
-                tracing::debug!("Applying delta...");
-                let temp_updated = temp_dir.path().join("updated");
-                let delta_stats = apply_delta(&temp_dest, &delta, &temp_updated)
-                    .map_err(|e| SyncError::CopyError {
-                        path: temp_updated.clone(),
-                        source: e,
-                    })?;
-
-                // Upload updated file to remote
-                tracing::debug!("Uploading updated file...");
-                let mut updated_file = std::fs::File::open(&temp_updated).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to open updated file: {}", e)))
-                })?;
-
-                let mut remote_file = sftp.create(&dest_path).map_err(|e| {
+                // Serialize delta to JSON
+                let delta_json = serde_json::to_string(&delta).map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!(
-                        "Failed to create remote file {}: {}",
-                        dest_path.display(),
+                        "Failed to serialize delta: {}",
                         e
                     )))
                 })?;
 
-                let bytes_written = std::io::copy(&mut updated_file, &mut remote_file).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to upload file: {}", e)))
+                // Apply delta on remote side (avoids uploading full file!)
+                tracing::debug!("Sending delta to remote for application...");
+                let temp_remote_path = format!("{}.sy-tmp", dest_path.display());
+                let command = format!(
+                    "{} apply-delta {} {} --delta-json '{}'",
+                    remote_binary,
+                    dest_path_str,
+                    temp_remote_path,
+                    delta_json.replace('\'', "'\\''")  // Escape single quotes
+                );
+
+                let output = tokio::task::block_in_place(|| {
+                    Self::execute_command(Arc::clone(&session_arc), &command)
+                })?;
+
+                #[derive(Deserialize)]
+                struct ApplyStats {
+                    operations_count: usize,
+                    literal_bytes: u64,
+                }
+
+                let stats: ApplyStats = serde_json::from_str(&output).map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to parse apply-delta output: {}",
+                        e
+                    )))
+                })?;
+
+                // Rename temp file to final destination (atomic)
+                let rename_command = format!("mv '{}' '{}'", temp_remote_path, dest_path_str);
+                tokio::task::block_in_place(|| {
+                    Self::execute_command(Arc::clone(&session_arc), &rename_command)
                 })?;
 
                 tracing::info!(
-                    "Delta sync: {} ops, {:.1}% literal data, uploaded {} bytes",
-                    delta_stats.operations_count,
+                    "Delta sync: {} ops, {:.1}% literal data, transferred ~{} bytes (delta only)",
+                    stats.operations_count,
                     compression_ratio,
-                    bytes_written
+                    literal_bytes
                 );
 
                 Ok::<TransferResult, SyncError>(TransferResult::with_delta(
-                    bytes_written,
-                    delta_stats.operations_count,
-                    delta_stats.literal_bytes,
+                    source_size, // Full file size
+                    stats.operations_count,
+                    stats.literal_bytes,
                 ))
             }
         })
