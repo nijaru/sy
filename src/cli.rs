@@ -58,6 +58,10 @@ fn parse_size(s: &str) -> Result<u64, String> {
     # Quiet mode (only errors)
     sy /source /destination --quiet
 
+    # Bandwidth limiting
+    sy /source /destination --bwlimit 1MB     # Limit to 1 MB/s
+    sy /source user@host:/dest --bwlimit 500KB  # Limit to 500 KB/s
+
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
@@ -100,6 +104,10 @@ pub struct Cli {
     /// Examples: "*.log", "node_modules", "target/"
     #[arg(long)]
     pub exclude: Vec<String>,
+
+    /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
+    #[arg(long, value_parser = parse_size)]
+    pub bwlimit: Option<u64>,
 }
 
 impl Cli {
@@ -161,6 +169,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude: vec![],
+            bwlimit: None,
         };
         assert!(cli.validate().is_ok());
     }
@@ -178,6 +187,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude: vec![],
+            bwlimit: None,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -199,6 +209,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -223,6 +234,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -240,6 +252,7 @@ mod tests {
             quiet: true,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -257,6 +270,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -274,6 +288,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -291,6 +306,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: None,
             max_size: None,
         };
@@ -327,6 +343,7 @@ mod tests {
             quiet: false,
             parallel: 10,
             exclude: vec![],
+            bwlimit: None,
             min_size: Some(1024 * 1024),  // 1MB
             max_size: Some(500 * 1024),    // 500KB (smaller than min)
         };

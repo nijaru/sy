@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
         cli.min_size,
         cli.max_size,
         cli.exclude.clone(),
+        cli.bwlimit,
     );
 
     // Run sync (single file or directory)

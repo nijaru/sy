@@ -1,10 +1,12 @@
 pub mod scanner;
 pub mod strategy;
 pub mod transfer;
+mod ratelimit;
 
 use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
+use ratelimit::RateLimiter;
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ pub struct SyncEngine<T: Transport> {
     min_size: Option<u64>,
     max_size: Option<u64>,
     exclude_patterns: Vec<glob::Pattern>,
+    bwlimit: Option<u64>,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -47,6 +50,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         min_size: Option<u64>,
         max_size: Option<u64>,
         exclude: Vec<String>,
+        bwlimit: Option<u64>,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -71,6 +75,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             min_size,
             max_size,
             exclude_patterns,
+            bwlimit,
         }
     }
 
@@ -185,6 +190,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             pb
         };
 
+        // Create rate limiter if bandwidth limit is set
+        let rate_limiter = self.bwlimit.map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
+
         // Parallel execution with semaphore for concurrency control
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let mut handles = Vec::with_capacity(tasks.len());
@@ -195,6 +203,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let stats = Arc::clone(&stats);
             let pb = pb.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let rate_limiter = rate_limiter.clone();
 
             let handle = tokio::spawn(async move {
                 let transferrer = Transferrer::new(transport.as_ref(), dry_run);
@@ -217,11 +226,27 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         if let Some(source) = &task.source {
                             match transferrer.create(source, &task.dest_path).await {
                                 Ok(transfer_result) => {
-                                    let mut stats = stats.lock().unwrap();
-                                    if let Some(result) = transfer_result {
-                                        stats.bytes_transferred += result.bytes_written;
+                                    let bytes_written = if let Some(ref result) = transfer_result {
+                                        result.bytes_written
+                                    } else {
+                                        0
+                                    };
+
+                                    {
+                                        let mut stats = stats.lock().unwrap();
+                                        stats.bytes_transferred += bytes_written;
+                                        stats.files_created += 1;
                                     }
-                                    stats.files_created += 1;
+
+                                    // Apply rate limiting if enabled (outside stats lock)
+                                    if let Some(ref limiter) = rate_limiter {
+                                        if bytes_written > 0 {
+                                            let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
+                                            if sleep_duration > Duration::ZERO {
+                                                tokio::time::sleep(sleep_duration).await;
+                                            }
+                                        }
+                                    }
                                     Ok(())
                                 }
                                 Err(e) => Err(e),
@@ -234,30 +259,48 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         if let Some(source) = &task.source {
                             match transferrer.update(source, &task.dest_path).await {
                                 Ok(transfer_result) => {
-                                    let mut stats = stats.lock().unwrap();
-                                    if let Some(result) = transfer_result {
-                                        stats.bytes_transferred += result.bytes_written;
+                                    let bytes_written = if let Some(ref result) = transfer_result {
+                                        result.bytes_written
+                                    } else {
+                                        0
+                                    };
 
-                                        // Track delta sync usage and savings
-                                        if result.used_delta() {
-                                            stats.files_delta_synced += 1;
+                                    {
+                                        let mut stats = stats.lock().unwrap();
+                                        if let Some(ref result) = transfer_result {
+                                            stats.bytes_transferred += result.bytes_written;
 
-                                            // Calculate bytes saved (full file size - literal bytes)
-                                            if let Some(literal_bytes) = result.literal_bytes {
-                                                let bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
-                                                stats.delta_bytes_saved += bytes_saved;
+                                            // Track delta sync usage and savings
+                                            if result.used_delta() {
+                                                stats.files_delta_synced += 1;
+
+                                                // Calculate bytes saved (full file size - literal bytes)
+                                                if let Some(literal_bytes) = result.literal_bytes {
+                                                    let bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                                                    stats.delta_bytes_saved += bytes_saved;
+                                                }
+
+                                                if let Some(ratio) = result.compression_ratio() {
+                                                    pb.set_message(format!(
+                                                        "Updated {} (delta: {:.1}% literal)",
+                                                        task.dest_path.display(),
+                                                        ratio
+                                                    ));
+                                                }
                                             }
+                                        }
+                                        stats.files_updated += 1;
+                                    }
 
-                                            if let Some(ratio) = result.compression_ratio() {
-                                                pb.set_message(format!(
-                                                    "Updated {} (delta: {:.1}% literal)",
-                                                    task.dest_path.display(),
-                                                    ratio
-                                                ));
+                                    // Apply rate limiting if enabled (outside stats lock)
+                                    if let Some(ref limiter) = rate_limiter {
+                                        if bytes_written > 0 {
+                                            let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
+                                            if sleep_duration > Duration::ZERO {
+                                                tokio::time::sleep(sleep_duration).await;
                                             }
                                         }
                                     }
-                                    stats.files_updated += 1;
                                     Ok(())
                                 }
                                 Err(e) => Err(e),
