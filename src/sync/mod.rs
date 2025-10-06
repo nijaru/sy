@@ -25,6 +25,8 @@ pub struct SyncStats {
     pub bytes_transferred: u64,
     pub files_delta_synced: usize,
     pub delta_bytes_saved: u64,
+    pub files_compressed: usize,
+    pub compression_bytes_saved: u64,
     pub duration: Duration,
 }
 
@@ -172,6 +174,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_transferred: 0,
             files_delta_synced: 0,
             delta_bytes_saved: 0,
+            files_compressed: 0,
+            compression_bytes_saved: 0,
             duration: Duration::ZERO,
         }));
 
@@ -236,6 +240,19 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let mut stats = stats.lock().unwrap();
                                         stats.bytes_transferred += bytes_written;
                                         stats.files_created += 1;
+
+                                        // Track compression usage and savings
+                                        if let Some(ref result) = transfer_result {
+                                            if result.compression_used {
+                                                stats.files_compressed += 1;
+
+                                                // Calculate bytes saved (uncompressed - compressed)
+                                                if let Some(transferred) = result.transferred_bytes {
+                                                    let bytes_saved = result.bytes_written.saturating_sub(transferred);
+                                                    stats.compression_bytes_saved += bytes_saved;
+                                                }
+                                            }
+                                        }
                                     }
 
                                     // Apply rate limiting if enabled (outside stats lock)
@@ -286,6 +303,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                                         task.dest_path.display(),
                                                         ratio
                                                     ));
+                                                }
+                                            }
+
+                                            // Track compression usage and savings
+                                            if result.compression_used {
+                                                stats.files_compressed += 1;
+
+                                                // Calculate bytes saved (uncompressed - compressed)
+                                                if let Some(transferred) = result.transferred_bytes {
+                                                    let bytes_saved = result.bytes_written.saturating_sub(transferred);
+                                                    stats.compression_bytes_saved += bytes_saved;
                                                 }
                                             }
                                         }
@@ -400,6 +428,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_transferred: 0,
             files_delta_synced: 0,
             delta_bytes_saved: 0,
+            files_compressed: 0,
+            compression_bytes_saved: 0,
             duration: Duration::ZERO,
         };
 
@@ -420,6 +450,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 is_dir: false,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
+
+                // Track compression if used
+                if result.compression_used {
+                    stats.files_compressed = 1;
+                    if let Some(transferred) = result.transferred_bytes {
+                        stats.compression_bytes_saved = result.bytes_written.saturating_sub(transferred);
+                    }
+                }
             }
             stats.files_created = 1;
         } else {
@@ -441,6 +479,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     stats.files_delta_synced = 1;
                     if let Some(literal_bytes) = result.literal_bytes {
                         stats.delta_bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                    }
+                }
+
+                // Track compression if used
+                if result.compression_used {
+                    stats.files_compressed = 1;
+                    if let Some(transferred) = result.transferred_bytes {
+                        stats.compression_bytes_saved = result.bytes_written.saturating_sub(transferred);
                     }
                 }
             }
