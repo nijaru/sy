@@ -156,7 +156,7 @@ impl Cli {
     }
 
     pub fn log_level(&self) -> tracing::Level {
-        if self.quiet {
+        if self.quiet || self.json {
             return tracing::Level::ERROR;
         }
 

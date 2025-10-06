@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
     // Validate arguments
     cli.validate()?;
 
-    if !cli.quiet {
+    // Print header (skip if JSON mode)
+    if !cli.quiet && !cli.json {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
         println!("Syncing {} → {}", cli.source, cli.destination);
 
@@ -65,7 +66,7 @@ async fn main() -> Result<()> {
 
     // Run sync (single file or directory)
     let stats = if cli.is_single_file() {
-        if !cli.quiet {
+        if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
         }
         engine
@@ -77,8 +78,8 @@ async fn main() -> Result<()> {
             .await?
     };
 
-    // Print summary
-    if !cli.quiet {
+    // Print summary (skip if JSON mode - already emitted JSON summary)
+    if !cli.quiet && !cli.json {
         if cli.dry_run {
             println!("\n{}\n", "✓ Dry-run complete (no changes made)".green().bold());
         } else {
