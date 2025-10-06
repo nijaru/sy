@@ -2,6 +2,7 @@ pub mod scanner;
 pub mod strategy;
 pub mod transfer;
 pub mod resume;
+pub mod output;
 mod ratelimit;
 
 use crate::error::Result;
@@ -44,6 +45,7 @@ pub struct SyncEngine<T: Transport> {
     resume: bool,
     checkpoint_files: usize,
     checkpoint_bytes: u64,
+    json: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -61,6 +63,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         resume: bool,
         checkpoint_files: usize,
         checkpoint_bytes: u64,
+        json: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -89,6 +92,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             resume,
             checkpoint_files,
             checkpoint_bytes,
+            json,
         }
     }
 
