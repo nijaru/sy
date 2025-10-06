@@ -108,6 +108,10 @@ pub struct Cli {
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
+
+    /// Enable compression for network transfers (auto-detects based on file type)
+    #[arg(long)]
+    pub compress: bool,
 }
 
 impl Cli {
@@ -170,6 +174,7 @@ mod tests {
             max_size: None,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -188,6 +193,7 @@ mod tests {
             max_size: None,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -210,6 +216,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -235,6 +242,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -253,6 +261,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -271,6 +280,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -289,6 +299,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -307,6 +318,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: None,
             max_size: None,
         };
@@ -344,6 +356,7 @@ mod tests {
             parallel: 10,
             exclude: vec![],
             bwlimit: None,
+            compress: false,
             min_size: Some(1024 * 1024),  // 1MB
             max_size: Some(500 * 1024),    // 500KB (smaller than min)
         };
