@@ -11,7 +11,7 @@ cd sy
 
 # Build and run
 cargo build
-cargo run -- ./src ./dest --preview
+cargo run -- ./src ./dest --dry-run
 
 # Run tests
 cargo test
@@ -129,67 +129,59 @@ sy/
 
 See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
 
-### ✅ Phase 1: MVP (v0.1.0) - **COMPLETE**
+### ✅ Phase 1: MVP - **COMPLETE** (v0.0.1)
 **Goal**: Basic local sync working
 
-- [x] Project structure
-- [x] Documentation (README, DESIGN, CONTRIBUTING, CLAUDE.md)
+- [x] Project structure and documentation
 - [x] CLI argument parsing (clap)
-- [x] Local filesystem traversal (walkdir + ignore)
+- [x] Local filesystem traversal (ignore crate)
 - [x] File comparison (size + mtime)
-- [x] Full file copy (no delta)
-- [x] Basic progress display (indicatif)
-- [x] Unit tests
+- [x] Full file copy with platform optimizations
+- [x] Progress display (indicatif)
 - [x] .gitignore support
-- [x] .git directory exclusion
 - [x] Dry-run and delete modes
-- [x] End-to-end testing
+- [x] Comprehensive test suite
 
-**Deliverable**: `sy /src /dst` works locally
+**Deliverable**: ✅ `sy /src /dst` works locally
 
-### Phase 2: Network Sync (v0.2.0) - **Next Phase**
-**Goal**: Remote sync via SSH
+### ✅ Phase 2: Network Sync + Delta - **COMPLETE** (v0.0.2-v0.0.3)
+**Goal**: Remote sync with delta algorithm
 
-- [ ] Transport abstraction layer
-- [ ] SSH transport with custom protocol
-- [ ] SFTP fallback for compatibility
-- [ ] Network detection (Local/LAN/WAN)
-- [ ] SSH config parsing (~/.ssh/config)
-- [ ] Remote scanner (sy-remote helper)
-- [ ] Error handling and UX
+- [x] Transport abstraction layer
+- [x] SSH transport (SFTP-based)
+- [x] SSH config parsing (~/.ssh/config)
+- [x] Remote scanner (sy-remote binary)
+- [x] **Delta sync** (rsync algorithm)
+- [x] Adler-32 rolling hash + xxHash3 checksums
+- [x] Block-level updates
+- [x] Adaptive block size calculation
 
-**Deliverable**: `sy /src remote:/dst` works
+**Deliverable**: ✅ `sy /src user@host:/dst` works with delta sync
 
-**Timeline**: 5 weeks, 10 tasks
+### ✅ Phase 3: Parallelism + Optimization - **COMPLETE** (v0.0.4-v0.0.10)
+**Goal**: Parallel execution and compression
 
-See [docs/PHASE2_PLAN.md](docs/PHASE2_PLAN.md) for detailed implementation plan.
+- [x] Parallel file transfers (5-10x speedup)
+- [x] Parallel checksum computation (2-4x faster)
+- [x] Configurable worker count (` -j` flag)
+- [x] TRUE O(1) rolling hash (verified 2ns per operation)
+- [x] Streaming delta generation (constant memory)
+- [x] **Full compression integration** (Zstd level 3, 8 GB/s)
+- [x] Compression stats tracking
+- [x] Zero clippy warnings
 
-### Phase 3: Performance (v0.3.0)
-**Goal**: Parallel transfers
+**Deliverable**: ✅ Production-ready sync with 2-11x performance vs rsync
 
-- [ ] Parallel file transfers
-- [ ] Parallel chunk transfers
-- [ ] Adaptive compression
-- [ ] Network detection (LAN vs WAN)
-- [ ] Progress UI at scale
+### Phase 4: Advanced Features - **NEXT** (v0.1.0+)
+**Goal**: Network detection and resume support
 
-**Implementation techniques**:
-- [ ] Parallel scanning with rayon (scan source and destination concurrently)
-- [ ] Parallel file operations with rayon (concurrent file copies)
-- [ ] Memory-mapped I/O for very large files (>100MB)
-- [ ] Async I/O with tokio for network operations
+- [ ] Network speed detection (Local/LAN/WAN)
+- [ ] Parallel chunk transfers for very large files
+- [ ] Resume support for interrupted transfers
+- [ ] End-to-end cryptographic checksums (BLAKE3)
+- [ ] Config file support
 
-**Deliverable**: Fast sync for various scenarios
-
-### Phase 4: Delta Sync (v0.4.0)
-**Goal**: Rsync algorithm
-
-- [ ] Adler-32 rolling hash
-- [ ] Block signature generation
-- [ ] Delta computation
-- [ ] Resume support
-
-**Deliverable**: Efficient updates of changed files
+**Deliverable**: Adaptive performance and reliability features
 
 ### Phase 5: Reliability (v0.5.0)
 **Goal**: Multi-layer integrity
@@ -212,71 +204,61 @@ See [DESIGN.md](DESIGN.md) for:
 
 ## Testing Strategy
 
-**Current Status**: Phase 1 has 31 comprehensive tests across 3 categories.
+**Current Status**: 100+ tests across unit, integration, and performance categories.
 
-### Unit Tests (15 tests)
+### Unit Tests (83 tests)
 Located in `src/*/tests.rs` modules:
 ```bash
 cargo test --lib
 ```
 
 Tests include:
-- Scanner: file scanning, .gitignore support
-- Strategy: file comparison, sync planning
-- Transfer: file copy operations
-- CLI: argument validation, log levels
+- Core sync functionality
+- Delta sync (rolling hash, checksums, generation, applier)
+- Compression (Zstd roundtrip, heuristics, ratios)
+- SSH config parsing
+- CLI argument validation
+- Scanner and strategy modules
 
-Example:
-```rust
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_scanner_gitignore() {
-        // Verify .gitignore patterns work
-    }
-}
-```
-
-### Integration Tests (11 tests)
-Located in `tests/integration_test.rs`:
+### Integration Tests (36 tests)
+Located in `tests/*.rs`:
 ```bash
-cargo test --test integration_test
+cargo test --test integration_test    # Full sync scenarios
+cargo test --test edge_cases_test      # Unicode, nesting, special chars
+cargo test --test property_test        # Invariant testing
+cargo test --test compression_integration  # Compression end-to-end
 ```
 
 Tests include:
-- Basic sync workflows
-- Dry-run and delete modes
-- .gitignore support
-- Nested directories
-- Error handling
+- Full sync workflows (create, update, delete)
+- Compression integration
+- Edge cases (unicode, deep nesting, large files)
+- Property-based tests (idempotency, correctness)
+- Single file sync
 
-### Property-Based Tests (5 tests)
-Located in `tests/property_test.rs`:
+### Performance Regression Tests (7 tests)
 ```bash
-cargo test --test property_test
+cargo test --release --test performance_test
 ```
 
-Tests invariants that always hold:
-```rust
-use proptest::prelude::*;
+Tests ensure performance stays within bounds:
+- 100 files < 500ms
+- 1000 files < 3s
+- Large file (10MB) < 1s
+- Deep nesting < 500ms
+- Idempotent sync < 200ms
+- Gitignore filtering < 500ms
+- Memory bounded (5000 files) < 10s
 
-proptest! {
-    #[test]
-    fn prop_sync_idempotent(file_count in 1usize..10) {
-        // Syncing twice should give identical results
-    }
-}
+### Benchmarks (Criterion)
+```bash
+cargo bench                           # Run all benchmarks
+cargo bench --bench comparative_bench # Compare vs rsync/cp
+cargo bench --bench delta_bench       # Delta sync performance
+cargo bench --bench compress_bench    # Compression throughput
 ```
 
-### Benchmarks (Future)
-```rust
-// benches/hash_bench.rs
-fn criterion_benchmark(c: &mut Criterion) {
-    c.bench_function("xxhash3 1GB", |b| {
-        b.iter(|| xxh3::hash64(black_box(&data)))
-    });
-}
-```
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for benchmark usage and tracking.
 
 ## Coding Standards
 
