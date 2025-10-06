@@ -139,6 +139,17 @@ async fn main() -> Result<()> {
                 format_bytes(stats.delta_bytes_saved).bright_magenta()
             );
         }
+
+        // Compression stats (if used)
+        if stats.files_compressed > 0 {
+            println!();
+            println!(
+                "  {}     {} files, {} saved",
+                "Compression:".bright_cyan(),
+                stats.files_compressed.to_string().bright_cyan(),
+                format_bytes(stats.compression_bytes_saved).bright_cyan()
+            );
+        }
     }
 
     Ok(())
