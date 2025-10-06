@@ -34,6 +34,7 @@ pub struct SyncEngine<T: Transport> {
     max_concurrent: usize,
     min_size: Option<u64>,
     max_size: Option<u64>,
+    exclude_patterns: Vec<glob::Pattern>,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -45,7 +46,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
         max_concurrent: usize,
         min_size: Option<u64>,
         max_size: Option<u64>,
+        exclude: Vec<String>,
     ) -> Self {
+        // Compile exclude patterns once at creation
+        let exclude_patterns = exclude
+            .into_iter()
+            .filter_map(|pattern| {
+                match glob::Pattern::new(&pattern) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("Invalid exclude pattern '{}': {}", pattern, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
         Self {
             transport: Arc::new(transport),
             dry_run,
@@ -54,6 +70,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             max_concurrent,
             min_size,
             max_size,
+            exclude_patterns,
         }
     }
 
@@ -71,6 +88,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
         false
     }
 
+    fn should_exclude(&self, relative_path: &Path) -> bool {
+        if self.exclude_patterns.is_empty() {
+            return false;
+        }
+
+        let path_str = relative_path.to_string_lossy();
+        self.exclude_patterns.iter().any(|pattern| {
+            pattern.matches(&path_str) || pattern.matches(relative_path.to_str().unwrap_or(""))
+        })
+    }
+
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
         let start_time = std::time::Instant::now();
 
@@ -86,7 +114,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let total_scanned = all_files.len();
         tracing::info!("Found {} items in source", total_scanned);
 
-        // Filter files by size if filters are set
+        // Filter files by size and exclude patterns
         let source_files: Vec<_> = all_files
             .into_iter()
             .filter(|file| {
@@ -95,13 +123,20 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     return true;
                 }
                 // Apply size filter
-                !self.should_filter_by_size(file.size)
+                if self.should_filter_by_size(file.size) {
+                    return false;
+                }
+                // Apply exclude patterns
+                if self.should_exclude(&file.relative_path) {
+                    return false;
+                }
+                true
             })
             .collect();
 
         if source_files.len() < total_scanned {
             let filtered_count = total_scanned - source_files.len();
-            tracing::info!("Filtered out {} files by size", filtered_count);
+            tracing::info!("Filtered out {} files", filtered_count);
         }
 
         // Plan sync operations

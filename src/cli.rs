@@ -95,6 +95,11 @@ pub struct Cli {
     /// Maximum file size to sync (e.g., "100MB", "1GB")
     #[arg(long, value_parser = parse_size)]
     pub max_size: Option<u64>,
+
+    /// Exclude files matching pattern (can be repeated)
+    /// Examples: "*.log", "node_modules", "target/"
+    #[arg(long)]
+    pub exclude: Vec<String>,
 }
 
 impl Cli {
@@ -155,6 +160,7 @@ mod tests {
             parallel: 10,
             min_size: None,
             max_size: None,
+            exclude: vec![],
         };
         assert!(cli.validate().is_ok());
     }
@@ -171,6 +177,7 @@ mod tests {
             parallel: 10,
             min_size: None,
             max_size: None,
+            exclude: vec![],
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -191,6 +198,7 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -214,6 +222,7 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -230,6 +239,7 @@ mod tests {
             verbose: 0,
             quiet: true,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -246,6 +256,7 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -262,6 +273,7 @@ mod tests {
             verbose: 1,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -278,6 +290,7 @@ mod tests {
             verbose: 2,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: None,
             max_size: None,
         };
@@ -313,6 +326,7 @@ mod tests {
             verbose: 0,
             quiet: false,
             parallel: 10,
+            exclude: vec![],
             min_size: Some(1024 * 1024),  // 1MB
             max_size: Some(500 * 1024),    // 500KB (smaller than min)
         };
