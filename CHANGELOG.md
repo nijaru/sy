@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Exclude pattern support for flexible file filtering
+  - `--exclude` flag accepts glob patterns (can be repeated for multiple patterns)
+  - Examples: `--exclude "*.log"`, `--exclude "node_modules"`, `--exclude "target/"`
+  - Patterns compiled once at startup for performance
+  - Works alongside .gitignore (both are respected)
 - File size filtering options
   - `--min-size` and `--max-size` flags with human-readable sizes (e.g., "1MB", "500KB")
   - Supports units: B, KB, MB, GB, TB (case-insensitive, with short forms K/M/G/T)

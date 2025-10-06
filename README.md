@@ -66,6 +66,11 @@ sy /path/to/file.txt /dest/file.txt
 sy /source /destination --min-size 1KB      # Skip files < 1KB
 sy /source /destination --max-size 100MB    # Skip files > 100MB
 sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
+
+# Exclude patterns (new in v0.0.9+)
+sy /source /destination --exclude "*.log"              # Skip log files
+sy /source /destination --exclude "node_modules"       # Skip node_modules
+sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patterns
 ```
 
 ## Features
@@ -81,6 +86,7 @@ sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
 - **Edge Cases**: Handles unicode, deep nesting, large files, empty dirs
 - **Single File Sync**: Sync individual files, not just directories
 - **File Size Filtering**: `--min-size` and `--max-size` with human-readable units (KB, MB, GB, TB)
+- **Exclude Patterns**: `--exclude` flag with glob patterns (e.g., `*.log`, `node_modules`)
 
 **Delta Sync (Phase 2 - Complete)**:
 - **Rsync Algorithm**: TRUE O(1) rolling hash (2ns per operation, verified constant time)
@@ -107,6 +113,8 @@ sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
 - **Better Errors**: Actionable suggestions (e.g., "check disk space", "verify permissions")
 - **CLI Examples**: Built-in help with common usage patterns
 - **Delta Sync Visibility**: Real-time compression ratio and bandwidth savings
+- **File Size Filtering**: `--min-size` and `--max-size` flags with human-readable units
+- **Exclude Patterns**: `--exclude` flag for flexible glob-based filtering
 
 **Compression Module (Ready for Integration)**:
 - **LZ4**: Fast compression (~400-500 MB/s throughput)
