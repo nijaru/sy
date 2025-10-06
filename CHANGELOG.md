@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Network-adaptive compression heuristics
+  - `should_compress_adaptive()` function considers network speed, file size, and type
+  - Local transfers: never compress (disk I/O bottleneck)
+  - Very fast networks (>4Gbps): no compression (faster to send uncompressed)
+  - Fast LANs (1-4Gbps): LZ4 compression (400-500 MB/s, won't bottleneck)
+  - Slower networks (<1Gbps): Zstd compression (better ratio for constrained bandwidth)
+  - Automatically skips pre-compressed formats (jpg, mp4, zip, pdf, etc.)
+  - 18 compression tests covering all scenarios
 - Bandwidth limiting for controlled transfer rates
   - `--bwlimit` flag accepts human-readable rates (e.g., "1MB", "500KB")
   - Token bucket algorithm with burst support (up to 1 second of tokens)

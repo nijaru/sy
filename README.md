@@ -122,12 +122,16 @@ sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 50
 - **Exclude Patterns**: `--exclude` flag for flexible glob-based filtering
 - **Bandwidth Limiting**: `--bwlimit` flag for controlled transfer rates
 
-**Compression Module (Ready for Integration)**:
+**Compression Module (Implemented, Not Yet Integrated)**:
 - **LZ4**: Fast compression (~400-500 MB/s throughput)
 - **Zstd**: Better ratio (level 3, balanced)
-- **Smart Heuristics**: Skips small files (<1MB) and pre-compressed formats
-- **Extension Detection**: 30+ formats (jpg, mp4, zip, pdf, etc.)
-- **11 Tests**: Comprehensive roundtrip and ratio verification
+- **Network-Adaptive Heuristics**:
+  - Local: never compress (disk I/O bottleneck)
+  - >4Gbps: no compression (faster to send uncompressed)
+  - 1-4Gbps: LZ4 only (won't bottleneck)
+  - <1Gbps: Zstd (better ratio)
+- **Extension Detection**: 30+ pre-compressed formats (jpg, mp4, zip, pdf, etc.)
+- **18 Tests**: Comprehensive roundtrip, ratio, and adaptive selection verification
 
 ### 📋 Common Use Cases
 
