@@ -17,6 +17,10 @@ pub struct TransferResult {
     pub delta_operations: Option<usize>,
     /// Bytes of literal data transferred via delta (None if full file copy)
     pub literal_bytes: Option<u64>,
+    /// Bytes transferred over network (compressed size if compression used)
+    pub transferred_bytes: Option<u64>,
+    /// Whether compression was used
+    pub compression_used: bool,
 }
 
 impl TransferResult {
@@ -25,6 +29,8 @@ impl TransferResult {
             bytes_written,
             delta_operations: None,
             literal_bytes: None,
+            transferred_bytes: None,
+            compression_used: false,
         }
     }
 
@@ -33,6 +39,18 @@ impl TransferResult {
             bytes_written,
             delta_operations: Some(delta_operations),
             literal_bytes: Some(literal_bytes),
+            transferred_bytes: None,
+            compression_used: false,
+        }
+    }
+
+    pub fn with_compression(bytes_written: u64, transferred_bytes: u64) -> Self {
+        Self {
+            bytes_written,
+            delta_operations: None,
+            literal_bytes: None,
+            transferred_bytes: Some(transferred_bytes),
+            compression_used: true,
         }
     }
 

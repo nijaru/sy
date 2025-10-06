@@ -339,7 +339,7 @@ impl Transport for SshTransport {
                         ratio
                     );
 
-                    Ok(result.bytes_written)
+                    Ok(TransferResult::with_compression(result.bytes_written, compressed_size as u64))
                 }
                 Compression::None => {
                     tracing::debug!(
@@ -436,14 +436,12 @@ impl Transport for SshTransport {
                         }
                     }
 
-                    Ok(bytes_written)
+                    Ok(TransferResult::new(bytes_written))
                 }
             }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
-        .and_then(|r| r)
-        .map(TransferResult::new)
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
