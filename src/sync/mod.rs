@@ -8,6 +8,7 @@ mod ratelimit;
 use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
+use output::SyncEvent;
 use ratelimit::RateLimiter;
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
@@ -178,6 +179,15 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tasks.extend(deletions);
         }
 
+        // Emit start event if JSON mode
+        if self.json {
+            SyncEvent::Start {
+                source: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+                total_files: tasks.len(),
+            }.emit();
+        }
+
         // Execute sync operations in parallel
         // Thread-safe stats tracking
         let stats = Arc::new(Mutex::new(SyncStats {
@@ -219,6 +229,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         for task in tasks {
             let transport = Arc::clone(&self.transport);
             let dry_run = self.dry_run;
+            let json = self.json;
             let stats = Arc::clone(&stats);
             let pb = pb.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -279,6 +290,16 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
                                         }
                                     }
+
+                                    // Emit JSON event if enabled
+                                    if json {
+                                        SyncEvent::Create {
+                                            path: task.dest_path.clone(),
+                                            size: source.size,
+                                            bytes_transferred: bytes_written,
+                                        }.emit();
+                                    }
+
                                     Ok(())
                                 }
                                 Err(e) => Err(e),
@@ -344,6 +365,20 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
                                         }
                                     }
+
+                                    // Emit JSON event if enabled
+                                    if json {
+                                        let delta_used = transfer_result.as_ref()
+                                            .map(|r| r.used_delta())
+                                            .unwrap_or(false);
+                                        SyncEvent::Update {
+                                            path: task.dest_path.clone(),
+                                            size: source.size,
+                                            bytes_transferred: bytes_written,
+                                            delta_used,
+                                        }.emit();
+                                    }
+
                                     Ok(())
                                 }
                                 Err(e) => Err(e),
@@ -353,16 +388,37 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                     }
                     SyncAction::Skip => {
-                        let mut stats = stats.lock().unwrap();
-                        stats.files_skipped += 1;
+                        {
+                            let mut stats = stats.lock().unwrap();
+                            stats.files_skipped += 1;
+                        }
+
+                        // Emit JSON event if enabled
+                        if json {
+                            SyncEvent::Skip {
+                                path: task.dest_path.clone(),
+                                reason: "up_to_date".to_string(),
+                            }.emit();
+                        }
+
                         Ok(())
                     }
                     SyncAction::Delete => {
                         let is_dir = task.dest_path.is_dir();
                         match transferrer.delete(&task.dest_path, is_dir).await {
                             Ok(_) => {
-                                let mut stats = stats.lock().unwrap();
-                                stats.files_deleted += 1;
+                                {
+                                    let mut stats = stats.lock().unwrap();
+                                    stats.files_deleted += 1;
+                                }
+
+                                // Emit JSON event if enabled
+                                if json {
+                                    SyncEvent::Delete {
+                                        path: task.dest_path.clone(),
+                                    }.emit();
+                                }
+
                                 Ok(())
                             }
                             Err(e) => Err(e),
@@ -415,6 +471,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
             final_stats.files_deleted,
             final_stats.duration.as_secs_f64()
         );
+
+        // Emit summary event if JSON mode
+        if self.json {
+            SyncEvent::Summary {
+                files_created: final_stats.files_created,
+                files_updated: final_stats.files_updated,
+                files_skipped: final_stats.files_skipped,
+                files_deleted: final_stats.files_deleted,
+                bytes_transferred: final_stats.bytes_transferred,
+                duration_secs: final_stats.duration.as_secs_f64(),
+            }.emit();
+        }
 
         // Return first error if any occurred
         if let Some(e) = first_error {
