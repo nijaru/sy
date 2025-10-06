@@ -442,7 +442,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Create new file
             tracing::info!("Creating {}", destination.display());
             let metadata = source.metadata()?;
-            let filename = source.file_name().unwrap().to_owned();
+            let filename = source.file_name()
+                .ok_or_else(|| crate::error::SyncError::Io(std::io::Error::other(
+                    format!("Invalid source path: {}", source.display())
+                )))?
+                .to_owned();
             if let Some(result) = transferrer.create(&FileEntry {
                 path: source.to_path_buf(),
                 relative_path: PathBuf::from(filename),
@@ -465,7 +469,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Update existing file
             tracing::info!("Updating {}", destination.display());
             let metadata = source.metadata()?;
-            let filename = source.file_name().unwrap().to_owned();
+            let filename = source.file_name()
+                .ok_or_else(|| crate::error::SyncError::Io(std::io::Error::other(
+                    format!("Invalid source path: {}", source.display())
+                )))?
+                .to_owned();
             if let Some(result) = transferrer.update(&FileEntry {
                 path: source.to_path_buf(),
                 relative_path: PathBuf::from(filename),
