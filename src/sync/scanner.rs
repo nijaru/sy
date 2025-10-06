@@ -18,14 +18,17 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+        }
     }
 
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
         // Pre-allocate with reasonable capacity to reduce allocations
         let mut entries = Vec::with_capacity(256);
 
-        let walker = WalkBuilder::new(&self.root)
+        let mut walker = WalkBuilder::new(&self.root);
+        walker
             .hidden(false) // Don't skip hidden files by default
             .git_ignore(true) // Respect .gitignore
             .git_global(true) // Respect global gitignore
@@ -33,8 +36,9 @@ impl Scanner {
             .filter_entry(|entry| {
                 // Skip .git directories
                 entry.file_name() != ".git"
-            })
-            .build();
+            });
+
+        let walker = walker.build();
 
         for result in walker {
             let entry = result.map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
