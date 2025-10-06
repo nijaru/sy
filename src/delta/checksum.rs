@@ -37,7 +37,7 @@ pub fn compute_checksums(path: &Path, block_size: usize) -> io::Result<Vec<Block
     }
 
     // Calculate number of blocks
-    let num_blocks = (file_size + block_size as u64 - 1) / block_size as u64;
+    let num_blocks = file_size.div_ceil(block_size as u64);
 
     // Process blocks in parallel using rayon
     // Each thread gets its own file handle for independent I/O

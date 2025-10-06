@@ -43,6 +43,7 @@ pub struct SyncEngine<T: Transport> {
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport: T,
         dry_run: bool,

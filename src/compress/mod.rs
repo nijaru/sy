@@ -97,6 +97,7 @@ pub fn is_compressed_extension(filename: &str) -> bool {
 /// NOTE: Benchmarks show compression is MUCH faster than originally assumed:
 /// - LZ4: 23 GB/s (not 400-500 MB/s as originally thought)
 /// - Zstd: 8 GB/s (level 3)
+///
 /// CPU is NEVER the bottleneck - network always is, even on 100 Gbps!
 pub fn should_compress_adaptive(
     filename: &str,
