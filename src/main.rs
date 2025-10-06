@@ -101,11 +101,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("  Files updated:     {}", stats.files_updated.to_string().bright_black());
             }
-            if stats.files_skipped > 0 {
-                println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
-            } else {
-                println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
-            }
+            println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
             if cli.delete && stats.files_deleted > 0 {
                 println!("  Files deleted:     {}", stats.files_deleted.to_string().red());
             } else if cli.delete {
