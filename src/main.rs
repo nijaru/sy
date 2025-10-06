@@ -1,4 +1,5 @@
 mod cli;
+mod compress;
 mod delta;
 mod error;
 mod path;

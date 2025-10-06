@@ -98,8 +98,18 @@ pub fn is_compressed_extension(filename: &str) -> bool {
     }
 }
 
-/// Determine if we should compress based on file size and extension
-pub fn should_compress(filename: &str, file_size: u64) -> Compression {
+/// Determine if we should compress based on file size, extension, and network conditions
+pub fn should_compress_adaptive(
+    filename: &str,
+    file_size: u64,
+    is_local: bool,
+    network_speed_mbps: Option<u64>,
+) -> Compression {
+    // LOCAL: Never compress (disk I/O is bottleneck, not CPU)
+    if is_local {
+        return Compression::None;
+    }
+
     // Skip small files (overhead > benefit)
     if file_size < 1024 * 1024 {
         return Compression::None;
@@ -110,9 +120,33 @@ pub fn should_compress(filename: &str, file_size: u64) -> Compression {
         return Compression::None;
     }
 
-    // Default to LZ4 for now (fast, good compression ratio)
-    // TODO: Add network speed detection and adaptive compression
+    // If we have network speed info, use it
+    if let Some(speed_mbps) = network_speed_mbps {
+        let speed_bytes_per_sec = speed_mbps * 125_000; // Convert Mbps to bytes/sec
+
+        // Very fast networks (>500 MB/s = 4Gbps): Compression slower than transfer
+        if speed_bytes_per_sec > 500_000_000 {
+            return Compression::None;
+        }
+
+        // Fast LANs (100-500 MB/s = 1-4Gbps): Only ultra-fast compression
+        // LZ4 compresses at ~400-500 MB/s, won't bottleneck
+        if speed_bytes_per_sec > 100_000_000 {
+            return Compression::Lz4;
+        }
+
+        // Slower networks: Zstd (better ratio)
+        return Compression::Zstd;
+    }
+
+    // Default to LZ4 (fast, good compression ratio)
     Compression::Lz4
+}
+
+/// Determine if we should compress based on file size and extension
+/// (Legacy function for backward compatibility)
+pub fn should_compress(filename: &str, file_size: u64) -> Compression {
+    should_compress_adaptive(filename, file_size, false, None)
 }
 
 #[cfg(test)]
@@ -221,5 +255,59 @@ mod tests {
             let decompressed = decompress(&compressed, compression).unwrap();
             assert_eq!(decompressed, large);
         }
+    }
+
+    #[test]
+    fn test_adaptive_compression_local() {
+        // Local transfers should never compress
+        assert_eq!(
+            should_compress_adaptive("test.txt", 10_000_000, true, None),
+            Compression::None
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compression_very_fast_network() {
+        // 5 Gbps network -> no compression (faster to just send)
+        assert_eq!(
+            should_compress_adaptive("test.txt", 10_000_000, false, Some(5000)),
+            Compression::None
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compression_fast_lan() {
+        // 1 Gbps network -> LZ4 (fast, won't bottleneck)
+        assert_eq!(
+            should_compress_adaptive("test.txt", 10_000_000, false, Some(1000)),
+            Compression::Lz4
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compression_wan() {
+        // 100 Mbps network -> Zstd (better ratio for slow networks)
+        assert_eq!(
+            should_compress_adaptive("test.txt", 10_000_000, false, Some(100)),
+            Compression::Zstd
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compression_respects_precompressed() {
+        // Even on slow network, don't compress already-compressed files
+        assert_eq!(
+            should_compress_adaptive("video.mp4", 100_000_000, false, Some(10)),
+            Compression::None
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compression_small_files() {
+        // Small files should not be compressed regardless of network speed
+        assert_eq!(
+            should_compress_adaptive("test.txt", 512_000, false, Some(10)),
+            Compression::None
+        );
     }
 }
