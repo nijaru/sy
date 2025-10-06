@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use sy::compress::{decompress, Compression};
 use sy::delta::{apply_delta, compute_checksums, Delta};
 use sy::sync::scanner::Scanner;
 
@@ -27,15 +28,12 @@ enum Commands {
         #[arg(long)]
         block_size: usize,
     },
-    /// Apply delta operations to a file
+    /// Apply delta operations to a file (reads delta JSON from stdin)
     ApplyDelta {
         /// Existing file to apply delta to
         base_file: PathBuf,
         /// Output file path
         output_file: PathBuf,
-        /// Delta operations (JSON from stdin)
-        #[arg(long)]
-        delta_json: String,
     },
 }
 
@@ -90,8 +88,26 @@ fn main() -> anyhow::Result<()> {
         Commands::ApplyDelta {
             base_file,
             output_file,
-            delta_json,
         } => {
+            // Read delta data from stdin (may be compressed)
+            use std::io::Read;
+            let mut stdin_data = Vec::new();
+            std::io::stdin().read_to_end(&mut stdin_data)?;
+
+            // Check if data is compressed (Zstd magic: 0x28, 0xB5, 0x2F, 0xFD)
+            let delta_json = if stdin_data.len() >= 4 &&
+                stdin_data[0] == 0x28 && stdin_data[1] == 0xB5 &&
+                stdin_data[2] == 0x2F && stdin_data[3] == 0xFD {
+                // Decompress zstd data
+                let decompressed = decompress(&stdin_data, Compression::Zstd)?;
+                String::from_utf8(decompressed)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            } else {
+                // Uncompressed JSON
+                String::from_utf8(stdin_data)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            };
+
             let delta: Delta = serde_json::from_str(&delta_json)?;
             let stats = apply_delta(&base_file, &delta, &output_file)?;
             println!(

@@ -1,4 +1,5 @@
 use super::{Transport, TransferResult};
+use crate::compress::{compress, Compression};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
@@ -55,6 +56,75 @@ impl SshTransport {
             )))
         })?;
 
+        let mut output = String::new();
+        channel.read_to_string(&mut output).map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to read command output: {}",
+                e
+            )))
+        })?;
+
+        let mut stderr = String::new();
+        let _ = channel.stderr().read_to_string(&mut stderr);
+
+        channel.wait_close().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!("Failed to close channel: {}", e)))
+        })?;
+
+        let exit_status = channel.exit_status().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to get exit status: {}",
+                e
+            )))
+        })?;
+
+        if exit_status != 0 {
+            return Err(SyncError::Io(std::io::Error::other(format!(
+                "Command '{}' failed with exit code {}\nstdout: {}\nstderr: {}",
+                command, exit_status, output, stderr
+            ))));
+        }
+
+        Ok(output)
+    }
+
+    /// Execute a command with stdin data (binary-safe)
+    fn execute_command_with_stdin(
+        session: Arc<Mutex<Session>>,
+        command: &str,
+        stdin_data: &[u8],
+    ) -> Result<String> {
+        use std::io::Write;
+
+        let session = session.lock().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+        })?;
+
+        let mut channel = session.channel_session().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!("Failed to create channel: {}", e)))
+        })?;
+
+        channel.exec(command).map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to execute command: {}",
+                e
+            )))
+        })?;
+
+        // Write binary data to stdin
+        channel.write_all(stdin_data).map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to write to stdin: {}",
+                e
+            )))
+        })?;
+
+        // Send EOF to stdin
+        channel.send_eof().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!("Failed to send EOF: {}", e)))
+        })?;
+
+        // Read output
         let mut output = String::new();
         channel.read_to_string(&mut output).map_err(|e| {
             SyncError::Io(std::io::Error::other(format!(
@@ -388,19 +458,36 @@ impl Transport for SshTransport {
                     )))
                 })?;
 
+                // Compress delta JSON (typically 5-10x reduction for JSON data)
+                let uncompressed_size = delta_json.len();
+                let compressed_delta = compress(delta_json.as_bytes(), Compression::Zstd)
+                    .map_err(|e| SyncError::Io(std::io::Error::other(format!(
+                        "Failed to compress delta: {}",
+                        e
+                    ))))?;
+                let compressed_size = compressed_delta.len();
+
+                tracing::debug!(
+                    "Delta: {} ops, {} bytes JSON, {} bytes compressed ({:.1}x)",
+                    delta.ops.len(),
+                    uncompressed_size,
+                    compressed_size,
+                    uncompressed_size as f64 / compressed_size as f64
+                );
+
                 // Apply delta on remote side (avoids uploading full file!)
-                tracing::debug!("Sending delta to remote for application...");
+                // Send compressed delta via stdin to avoid command line length limits
+                tracing::debug!("Sending compressed delta to remote for application...");
                 let temp_remote_path = format!("{}.sy-tmp", dest_path.display());
                 let command = format!(
-                    "{} apply-delta {} {} --delta-json '{}'",
+                    "{} apply-delta {} {}",
                     remote_binary,
                     dest_path_str,
-                    temp_remote_path,
-                    delta_json.replace('\'', "'\\''")  // Escape single quotes
+                    temp_remote_path
                 );
 
                 let output = tokio::task::block_in_place(|| {
-                    Self::execute_command(Arc::clone(&session_arc), &command)
+                    Self::execute_command_with_stdin(Arc::clone(&session_arc), &command, &compressed_delta)
                 })?;
 
                 #[derive(Deserialize)]
