@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         transport,
         cli.dry_run,
         cli.delete,
-        cli.quiet,
+        cli.quiet || cli.json,  // JSON mode implies quiet
         cli.parallel,
         cli.min_size,
         cli.max_size,
@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         cli.resume,
         cli.checkpoint_files,
         cli.checkpoint_bytes,
+        cli.json,
     );
 
     // Run sync (single file or directory)

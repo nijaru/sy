@@ -124,6 +124,10 @@ pub struct Cli {
     /// Enable compression for network transfers (auto-detects based on file type)
     #[arg(long)]
     pub compress: bool,
+
+    /// Output JSON (newline-delimited JSON for scripting)
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Cli {
@@ -187,6 +191,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -206,6 +214,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -229,6 +241,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -255,6 +271,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -274,6 +294,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -293,6 +317,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -312,6 +340,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -331,6 +363,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: None,
             max_size: None,
         };
@@ -369,6 +405,10 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
             min_size: Some(1024 * 1024),  // 1MB
             max_size: Some(500 * 1024),    // 500KB (smaller than min)
         };
