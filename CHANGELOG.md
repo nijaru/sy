@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Bandwidth limiting for controlled transfer rates
+  - `--bwlimit` flag accepts human-readable rates (e.g., "1MB", "500KB")
+  - Token bucket algorithm with burst support (up to 1 second of tokens)
+  - Per-task rate limiting maintains global throughput limit
+  - Useful for syncing over shared networks or metered connections
 - Exclude pattern support for flexible file filtering
   - `--exclude` flag accepts glob patterns (can be repeated for multiple patterns)
   - Examples: `--exclude "*.log"`, `--exclude "node_modules"`, `--exclude "target/"`
