@@ -1,6 +1,7 @@
 pub mod scanner;
 pub mod strategy;
 pub mod transfer;
+pub mod resume;
 mod ratelimit;
 
 use crate::error::Result;
