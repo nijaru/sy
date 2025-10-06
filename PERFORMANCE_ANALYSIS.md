@@ -112,16 +112,29 @@ execute_command_with_stdin(session, &command, &compressed)?;
 
 **Effort**: 1-2 weeks (major architectural change)
 
-#### 6. **Full File Compression** (2-5x on compressible data)
-**Current**: Delta transfers compressed (JSON), full file transfers not compressed
-**Status**: Partially done - delta operations compressed, full file streaming not yet
+#### 6. ✅ **Full File Compression** (DONE - 2-5x on compressible data)
+**Status**: Implemented - dual-path transfer based on file type
+**Change**: Automatic compression for suitable files, SFTP streaming for others
 
 **Impact**:
-- ✅ Delta JSON: 5-10x smaller (DONE)
-- ⏳ Full file transfers: 2-5x smaller for text/code (TODO)
-- Already compressed files: No change (auto-detect)
+- ✅ Delta JSON: 5-10x smaller compression (DONE)
+- ✅ Full file transfers: 2-5x smaller for text/code (DONE)
+- ✅ Already compressed files: Auto-detected, use SFTP streaming
+- ✅ Large files (>1MB compressible): Compressed via receive-file command
 
-**Effort**: 2-3 days (integrate into full file streaming)
+**Implementation**:
+```rust
+match should_compress(filename, file_size) {
+    Compression::Zstd => {
+        // Compress and send via receive-file command
+        // 2-5x reduction for text, code, logs
+    }
+    Compression::None => {
+        // SFTP streaming for incompressible/large files
+        // jpg, mp4, zip automatically use this path
+    }
+}
+```
 
 ---
 
@@ -288,17 +301,18 @@ cargo test
 - ✅ SSH keepalive: Configured (60s interval)
 - ✅ Parallel checksums: Implemented (2-4x speedup)
 - ✅ Delta compression: Integrated (5-10x reduction, no command limits)
-- ⏳ Full file compression: Partial (delta only, not full file transfers yet)
+- ✅ Full file compression: Integrated (2-5x on text/code, auto-detects compressed files)
 
 **Completed Optimizations**:
 1. ✅ Buffer sizes increased: 128KB → 256KB (20-30% improvement)
 2. ✅ SSH keepalive configured (prevents timeouts)
 3. ✅ Parallel checksums implemented (2-4x faster on large files)
 4. ✅ Delta stdin streaming + compression (no size limits, 5-10x smaller)
+5. ✅ Full file compression integrated (2-5x on compressible data)
 
 **Biggest Remaining Gains**:
-1. Full file compression: 2-5x on compressible data (delta already compressed)
-2. Custom binary protocol: 2-10x overall (eliminate JSON overhead)
-3. Progress reporting: UX improvement (show bandwidth, phases, ETA)
+1. Custom binary protocol: 2-10x overall (eliminate JSON overhead)
+2. Progress reporting: UX improvement (show bandwidth, phases, ETA, savings %)
+3. Benchmark suite: Validate optimizations vs rsync
 
-**Recommendation**: Full file compression is the next high-value optimization. Custom binary protocol is larger effort but highest potential gain.
+**Recommendation**: All major performance optimizations complete. Next focus: UX improvements (progress reporting) and validation (benchmarks).

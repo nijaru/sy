@@ -238,128 +238,206 @@ impl Transport for SshTransport {
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
+        let session_arc = Arc::clone(&self.session);
+        let remote_binary = self.remote_binary_path.clone();
 
-        tokio::task::spawn_blocking({
-            let session = Arc::clone(&self.session);
-            let _remote_binary = self.remote_binary_path.clone();
+        tokio::task::spawn_blocking(move || {
+            // Get source metadata for mtime and size
+            let metadata = std::fs::metadata(&source_path).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to get metadata for {}: {}", source_path.display(), e),
+                ))
+            })?;
 
-            move || {
-                let session = session.lock().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
-                })?;
+            let file_size = metadata.len();
+            let filename = source_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
 
-                // Get source metadata for mtime and size
-                let metadata = std::fs::metadata(&source_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to get metadata for {}: {}", source_path.display(), e),
-                    ))
-                })?;
+            // Determine if compression would be beneficial
+            let compression_mode = should_compress(filename, file_size);
 
-                let file_size = metadata.len();
-                let filename = source_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+            // Use compressed transfer for compressible files, SFTP for others
+            match compression_mode {
+                Compression::Zstd => {
+                    tracing::debug!(
+                        "File {}: {} bytes, using compressed transfer",
+                        filename,
+                        file_size
+                    );
 
-                // Determine if compression would be beneficial
-                let compression_mode = should_compress(filename, file_size);
-
-                tracing::debug!(
-                    "File {}: {} bytes, compression: {}",
-                    filename,
-                    file_size,
-                    compression_mode.as_str()
-                );
-
-                // TODO: For files >100MB or incompressible, use SFTP streaming (current path)
-                // TODO: For smaller compressible files, use compressed receive-file command
-                // For now, use SFTP for all files (compression optimization pending)
-
-                // Open source file for streaming
-                let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to open source file {}: {}", source_path.display(), e),
-                    ))
-                })?;
-
-                // Get SFTP session
-                let sftp = session.sftp().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
-                })?;
-
-                // Write to remote file
-                let mut remote_file = sftp.create(&dest_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to create remote file {}: {}",
-                        dest_path.display(),
-                        e
-                    )))
-                })?;
-
-                // Stream file in chunks with checksum calculation
-                // 256KB optimal for modern networks (research: SFTP performance)
-                const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
-                let mut buffer = vec![0u8; CHUNK_SIZE];
-                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-                let mut bytes_written = 0u64;
-
-                loop {
-                    let bytes_read = std::io::Read::read(&mut source_file, &mut buffer).map_err(|e| {
+                    // Read entire file (compression only used for smaller files)
+                    let file_data = std::fs::read(&source_path).map_err(|e| {
                         SyncError::Io(std::io::Error::new(
                             e.kind(),
-                            format!("Failed to read from {}: {}", source_path.display(), e),
+                            format!("Failed to read {}: {}", source_path.display(), e),
                         ))
                     })?;
 
-                    if bytes_read == 0 {
-                        break; // EOF
+                    let uncompressed_size = file_data.len();
+
+                    // Compress the data
+                    let compressed_data = compress(&file_data, Compression::Zstd)
+                        .map_err(|e| SyncError::Io(std::io::Error::other(format!(
+                            "Failed to compress {}: {}",
+                            source_path.display(), e
+                        ))))?;
+
+                    let compressed_size = compressed_data.len();
+                    let ratio = uncompressed_size as f64 / compressed_size as f64;
+
+                    tracing::debug!(
+                        "Compressed {}: {} → {} bytes ({:.1}x)",
+                        filename,
+                        uncompressed_size,
+                        compressed_size,
+                        ratio
+                    );
+
+                    // Get mtime for receive-file command
+                    let mtime_secs = metadata.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs());
+
+                    // Send via receive-file command with stdin
+                    let dest_path_str = dest_path.to_string_lossy();
+                    let mtime_arg = mtime_secs
+                        .map(|s| format!("--mtime {}", s))
+                        .unwrap_or_default();
+
+                    let command = format!(
+                        "{} receive-file {} {}",
+                        remote_binary,
+                        dest_path_str,
+                        mtime_arg
+                    );
+
+                    let output = Self::execute_command_with_stdin(
+                        Arc::clone(&session_arc),
+                        &command,
+                        &compressed_data
+                    )?;
+
+                    // Parse response to verify
+                    #[derive(serde::Deserialize)]
+                    struct ReceiveResult {
+                        bytes_written: u64,
                     }
 
-                    // Update checksum
-                    hasher.update(&buffer[..bytes_read]);
+                    let result: ReceiveResult = serde_json::from_str(&output)
+                        .map_err(|e| SyncError::Io(std::io::Error::other(format!(
+                            "Failed to parse receive-file output: {}",
+                            e
+                        ))))?;
 
-                    // Write chunk to remote
-                    std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read]).map_err(|e| {
+                    tracing::info!(
+                        "Transferred {} ({} bytes compressed, {:.1}x reduction)",
+                        source_path.display(),
+                        compressed_size,
+                        ratio
+                    );
+
+                    Ok(result.bytes_written)
+                }
+                Compression::None => {
+                    tracing::debug!(
+                        "File {}: {} bytes, using SFTP streaming (incompressible or too large)",
+                        filename,
+                        file_size
+                    );
+
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                    })?;
+
+                    // Open source file for streaming
+                    let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to open source file {}: {}", source_path.display(), e),
+                        ))
+                    })?;
+
+                    // Get SFTP session
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                    })?;
+
+                    // Write to remote file
+                    let mut remote_file = sftp.create(&dest_path).map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
-                            "Failed to write to remote file {}: {}",
+                            "Failed to create remote file {}: {}",
                             dest_path.display(),
                             e
                         )))
                     })?;
 
-                    bytes_written += bytes_read as u64;
-                }
+                    // Stream file in chunks with checksum calculation
+                    // 256KB optimal for modern networks (research: SFTP performance)
+                    const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
+                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                    let mut bytes_written = 0u64;
 
-                let checksum = hasher.digest();
+                    loop {
+                        let bytes_read = std::io::Read::read(&mut source_file, &mut buffer).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!("Failed to read from {}: {}", source_path.display(), e),
+                            ))
+                        })?;
 
-                tracing::debug!(
-                    "Transferred {} ({} bytes, xxh3: {:x})",
-                    source_path.display(),
-                    bytes_written,
-                    checksum
-                );
+                        if bytes_read == 0 {
+                            break; // EOF
+                        }
 
-                // Set modification time
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                        let mtime = duration.as_secs();
-                        let atime = mtime;
-                        let _ = sftp.setstat(
-                            &dest_path,
-                            ssh2::FileStat {
-                                size: Some(bytes_written),
-                                uid: None,
-                                gid: None,
-                                perm: None,
-                                atime: Some(atime),
-                                mtime: Some(mtime),
-                            },
-                        );
+                        // Update checksum
+                        hasher.update(&buffer[..bytes_read]);
+
+                        // Write chunk to remote
+                        std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read]).map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to write to remote file {}: {}",
+                                dest_path.display(),
+                                e
+                            )))
+                        })?;
+
+                        bytes_written += bytes_read as u64;
                     }
-                }
 
-                Ok::<u64, crate::error::SyncError>(bytes_written)
+                    let checksum = hasher.digest();
+
+                    tracing::debug!(
+                        "Transferred {} ({} bytes, xxh3: {:x})",
+                        source_path.display(),
+                        bytes_written,
+                        checksum
+                    );
+
+                    // Set modification time
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                            let mtime = duration.as_secs();
+                            let atime = mtime;
+                            let _ = sftp.setstat(
+                                &dest_path,
+                                ssh2::FileStat {
+                                    size: Some(bytes_written),
+                                    uid: None,
+                                    gid: None,
+                                    perm: None,
+                                    atime: Some(atime),
+                                    mtime: Some(mtime),
+                                },
+                            );
+                        }
+                    }
+
+                    Ok(bytes_written)
+                }
             }
         })
         .await

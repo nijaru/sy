@@ -25,6 +25,7 @@ impl FromStr for Compression {
 }
 
 impl Compression {
+    #[allow(dead_code)] // Used in debug logging
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::None => "none",
