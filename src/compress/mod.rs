@@ -41,7 +41,8 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Decompress data
+/// Decompress data (used by sy-remote binary)
+#[allow(dead_code)] // Used by sy-remote binary, not library code
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
@@ -56,6 +57,7 @@ fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+#[allow(dead_code)] // Called by decompress() which is used by sy-remote
 fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decoder = zstd::Decoder::new(data)?;
     let mut result = Vec::new();
