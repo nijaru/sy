@@ -14,9 +14,10 @@ use cli::Cli;
 use colored::Colorize;
 use config::Config;
 use path::SyncPath;
-use sync::SyncEngine;
+use sync::{SyncEngine, watch::WatchMode};
 use transport::router::TransportRouter;
 use tracing_subscriber::{fmt, EnvFilter};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -152,6 +153,20 @@ async fn main() -> Result<()> {
         cli.checkpoint_bytes,
         cli.json,
     );
+
+    // Watch mode or regular sync
+    if cli.watch {
+        // Watch mode - continuous sync on file changes
+        let watch_mode = WatchMode::new(
+            engine,
+            source.path().to_path_buf(),
+            destination.path().to_path_buf(),
+            Duration::from_millis(500), // 500ms debounce
+        );
+
+        watch_mode.watch().await?;
+        return Ok(()); // Watch mode handles its own output
+    }
 
     // Run sync (single file or directory)
     let stats = if cli.is_single_file() {
