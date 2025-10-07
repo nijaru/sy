@@ -103,6 +103,8 @@ mod tests {
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let transport = LocalTransport::new();
@@ -128,6 +130,8 @@ mod tests {
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let transport = LocalTransport::new();
@@ -149,6 +153,8 @@ mod tests {
             size: 0,
             modified: SystemTime::now(),
             is_dir: true,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let transport = LocalTransport::new();

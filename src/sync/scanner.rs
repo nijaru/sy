@@ -10,6 +10,8 @@ pub struct FileEntry {
     pub size: u64,
     pub modified: SystemTime,
     pub is_dir: bool,
+    pub is_symlink: bool,
+    pub symlink_target: Option<PathBuf>,
 }
 
 pub struct Scanner {
@@ -59,6 +61,15 @@ impl Scanner {
                 .map_err(|_| SyncError::InvalidPath { path: path.clone() })?
                 .to_path_buf();
 
+            // Check if this is a symlink
+            let is_symlink = metadata.is_symlink();
+            let symlink_target = if is_symlink {
+                // Read the symlink target
+                std::fs::read_link(&path).ok()
+            } else {
+                None
+            };
+
             entries.push(FileEntry {
                 path: path.clone(),
                 relative_path,
@@ -68,6 +79,8 @@ impl Scanner {
                     source: e,
                 })?,
                 is_dir: metadata.is_dir(),
+                is_symlink,
+                symlink_target,
             });
         }
 
@@ -128,5 +141,43 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.relative_path.to_str() == Some("included.txt")));
+    }
+
+    #[test]
+    #[cfg(unix)]  // Symlinks work differently on Windows
+    fn test_scanner_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a regular file
+        fs::write(root.join("target.txt"), "target content").unwrap();
+
+        // Create a symlink to the file
+        std::os::unix::fs::symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Find the symlink entry
+        let link_entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("link.txt"))
+            .expect("Symlink should be in scan results");
+
+        assert!(link_entry.is_symlink, "Entry should be marked as symlink");
+        assert!(link_entry.symlink_target.is_some(), "Symlink should have a target");
+
+        // The target should be the absolute path to target.txt
+        let target = link_entry.symlink_target.as_ref().unwrap();
+        assert_eq!(target, &root.join("target.txt"));
+
+        // Find the regular file entry
+        let file_entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("target.txt"))
+            .expect("Target file should be in scan results");
+
+        assert!(!file_entry.is_symlink, "Regular file should not be marked as symlink");
+        assert!(file_entry.symlink_target.is_none(), "Regular file should have no target");
     }
 }

@@ -191,6 +191,8 @@ impl Transport for SshTransport {
                     size: e.size,
                     modified,
                     is_dir: e.is_dir,
+                    is_symlink: false,  // TODO: Add symlink detection for SSH
+                    symlink_target: None,
                 })
             })
             .collect();
