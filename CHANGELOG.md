@@ -11,7 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full file compression integration (infrastructure ready)
 - Network speed detection
 - Parallel chunk transfers (within single files)
-- Resume support for interrupted transfers (infrastructure ready)
+- Periodic checkpointing during sync (infrastructure ready)
+
+## [0.0.13] - 2025-10-06
+
+### Added
+- **Resume support** - Automatic recovery from interrupted syncs
+  - Loads `.sy-state.json` from destination on startup
+  - Checks flag compatibility (delete, exclude, size filters)
+  - Skips already-completed files
+  - Cleans up state file on successful completion
+  - User feedback showing resume progress
+  - Example: Interrupt sync with Ctrl+C, re-run same command to resume
+
+### Changed
+- `--resume` flag now functional (default: true)
+- Resume state tracks sync flags for compatibility checking
+
+### Technical
+- ResumeState integration in SyncEngine
+- Thread-safe state management with Arc<Mutex>
+- Completed file filtering before task planning
+- Automatic state cleanup on sync success
+- All 111 tests passing
+
+### Known Limitations
+- Periodic checkpointing (saving state during sync) not yet implemented
+- State only cleaned up on full sync completion
+- Resume infrastructure complete, periodic saves deferred to future release
 
 ## [0.0.12] - 2025-10-06
 
@@ -440,7 +467,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.12...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.13...HEAD
+[0.0.13]: https://github.com/nijaru/sy/releases/tag/v0.0.13
 [0.0.12]: https://github.com/nijaru/sy/releases/tag/v0.0.12
 [0.0.11]: https://github.com/nijaru/sy/releases/tag/v0.0.11
 [0.0.10]: https://github.com/nijaru/sy/releases/tag/v0.0.10
