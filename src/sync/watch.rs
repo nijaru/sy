@@ -1,3 +1,4 @@
+use crate::integrity::ChecksumType;
 use crate::sync::SyncEngine;
 use crate::transport::Transport;
 use anyhow::Result;
@@ -147,6 +148,8 @@ mod tests {
             10,    // checkpoint_files
             100,   // checkpoint_bytes
             false, // json
+            ChecksumType::None, // verification_mode
+            false, // verify_on_write
         );
 
         let watch_mode = WatchMode::new(
@@ -185,6 +188,8 @@ mod tests {
             false,
             10,
             100,
+            false,
+            ChecksumType::None,
             false,
         );
 

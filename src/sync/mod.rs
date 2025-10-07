@@ -7,6 +7,7 @@ pub mod watch;
 mod ratelimit;
 
 use crate::error::Result;
+use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
 use resume::{CompletedFile, ResumeState, SyncFlags};
@@ -32,6 +33,8 @@ pub struct SyncStats {
     pub delta_bytes_saved: u64,
     pub files_compressed: usize,
     pub compression_bytes_saved: u64,
+    pub files_verified: usize,
+    pub verification_failures: usize,
     pub duration: Duration,
 }
 
@@ -49,6 +52,8 @@ pub struct SyncEngine<T: Transport> {
     checkpoint_files: usize,
     checkpoint_bytes: u64,
     json: bool,
+    verification_mode: ChecksumType,
+    verify_on_write: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -67,6 +72,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
         checkpoint_files: usize,
         checkpoint_bytes: u64,
         json: bool,
+        verification_mode: ChecksumType,
+        verify_on_write: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -96,6 +103,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             checkpoint_files,
             checkpoint_bytes,
             json,
+            verification_mode,
+            verify_on_write,
         }
     }
 
@@ -266,6 +275,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             delta_bytes_saved: 0,
             files_compressed: 0,
             compression_bytes_saved: 0,
+            files_verified: 0,
+            verification_failures: 0,
             duration: Duration::ZERO,
         }));
 
@@ -596,6 +607,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             delta_bytes_saved: 0,
             files_compressed: 0,
             compression_bytes_saved: 0,
+            files_verified: 0,
+            verification_failures: 0,
             duration: Duration::ZERO,
         };
 
