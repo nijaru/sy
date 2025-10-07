@@ -3,6 +3,7 @@ pub mod compress;
 pub mod config;
 pub mod delta;
 pub mod error;
+pub mod integrity;
 pub mod path;
 pub mod ssh;
 pub mod sync;

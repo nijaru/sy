@@ -42,6 +42,7 @@ thiserror = "1"
 # Hash functions (for future phases, included now to avoid rebuild churn)
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 blake3 = "1"
+hex = "0.4"
 
 # Compression (Zstd level 3 only - benchmarked optimal at 8.7 GB/s)
 zstd = "0.13"
