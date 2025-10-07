@@ -62,24 +62,24 @@ Updated for 2024+ hardware:
 
 ## Implementation Roadmap
 
-### Current Phase: Not Started
-Design complete, ready to begin Phase 1
+### Current Status: Phase 4 Complete (v0.0.13)
 
-### Phase 1: MVP (v0.1.0)
-**Goal**: Basic local sync working
+**Implemented Features**:
+- ✅ Local and remote (SSH) sync
+- ✅ Delta sync (rsync algorithm)
+- ✅ Parallel file transfers
+- ✅ Compression (zstd)
+- ✅ Progress display with colors
+- ✅ Gitignore awareness
+- ✅ JSON output (v0.0.11)
+- ✅ Config profiles (v0.0.11)
+- ✅ Watch mode (v0.0.12)
+- ✅ Resume support (v0.0.13)
 
-Tasks:
-- [ ] CLI argument parsing (clap)
-- [ ] Local filesystem traversal (walkdir + ignore)
-- [ ] File comparison (size + mtime)
-- [ ] Full file copy (no delta yet)
-- [ ] Basic progress display (indicatif)
-- [ ] Unit tests
+**Note**: The project follows the MODERNIZATION_ROADMAP.md for implementation planning, which differs from the DESIGN.md phase numbering. DESIGN.md is a technical reference document, while MODERNIZATION_ROADMAP.md is the active implementation plan.
 
-**Deliverable**: `sy /src /dst` works locally
-
-### Future Phases (2-10)
-See DESIGN.md:2198-2330 for complete roadmap
+### Next Phase: Phase 5 (Verification & Reliability)
+See docs/MODERNIZATION_ROADMAP.md for detailed roadmap
 
 ## Code Organization
 
@@ -300,12 +300,14 @@ sy backup-home                           # Named config profile
 ## Notes for Future Sessions
 
 - Design is **complete** - don't redesign without good reason
-- Phase 1 is **next** - focus on MVP, not advanced features
+- Follow **MODERNIZATION_ROADMAP.md** for implementation priorities
 - Research is **done** - 2024/2025 data already incorporated
 - Tests are **required** - no merging without tests
+- Commit **frequently** - keep repo clean and well-documented
 
 ---
 
-**Last Updated**: October 2025 (Design phase complete)
-**Current Phase**: Ready to begin Phase 1 (MVP)
+**Last Updated**: 2025-10-06 (Phase 4 complete)
+**Current Version**: v0.0.13
+**Current Phase**: Phase 5 (Verification & Reliability) - Next
 **Total Design**: 2,400+ lines in DESIGN.md

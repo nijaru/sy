@@ -2387,4 +2387,6 @@ This design document now contains:
 9. **Security** - Threat model and safe defaults
 10. **Roadmap** - 10-phase implementation plan
 
-**Next steps**: Begin implementation starting with Phase 1 (MVP).
+**Status**: Implementation in progress (v0.0.13 - Phase 4 complete)
+
+**Note**: This document serves as a technical reference. For current implementation status and detailed feature roadmap, see `docs/MODERNIZATION_ROADMAP.md`.
