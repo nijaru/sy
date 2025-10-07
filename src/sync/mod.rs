@@ -3,6 +3,7 @@ pub mod strategy;
 pub mod transfer;
 pub mod resume;
 pub mod output;
+pub mod watch;
 mod ratelimit;
 
 use crate::error::Result;

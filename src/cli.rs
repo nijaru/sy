@@ -131,6 +131,10 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
 
+    /// Watch mode - continuously monitor source for changes
+    #[arg(long)]
+    pub watch: bool,
+
     /// Use named profile from config file
     #[arg(long)]
     pub profile: Option<String>,
@@ -224,6 +228,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -250,6 +255,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -280,6 +286,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -313,6 +320,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -339,6 +347,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -365,6 +374,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -391,6 +401,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -417,6 +428,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
@@ -462,6 +474,7 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             json: false,
+            watch: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
