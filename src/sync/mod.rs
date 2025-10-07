@@ -318,9 +318,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let dest_path_for_checkpoint = destination.to_path_buf();
             let verification_mode = self.verification_mode;
             let verify_on_write = self.verify_on_write;
+            let symlink_mode = self.symlink_mode;
 
             let handle = tokio::spawn(async move {
-                let transferrer = Transferrer::new(transport.as_ref(), dry_run);
+                let transferrer = Transferrer::new(transport.as_ref(), dry_run, symlink_mode);
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
                 // Update progress message
@@ -683,7 +684,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Check if destination exists
         let dest_exists = self.transport.exists(destination).await?;
-        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run);
+        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run, self.symlink_mode);
 
         if !dest_exists {
             // Create new file
