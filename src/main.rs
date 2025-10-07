@@ -264,6 +264,31 @@ async fn main() -> Result<()> {
                 format_bytes(stats.compression_bytes_saved).bright_cyan()
             );
         }
+
+        // Verification stats (if enabled)
+        if verification_mode != cli::VerificationMode::Fast {
+            println!();
+            if stats.verification_failures > 0 {
+                println!(
+                    "  {}    {} verified, {} failed",
+                    "Verification:".red(),
+                    stats.files_verified.to_string().red(),
+                    stats.verification_failures.to_string().red().bold()
+                );
+            } else if stats.files_verified > 0 {
+                println!(
+                    "  {}    {} files ({})",
+                    "Verification:".green(),
+                    stats.files_verified.to_string().green(),
+                    match verification_mode {
+                        cli::VerificationMode::Standard => "xxHash3",
+                        cli::VerificationMode::Verify => "BLAKE3",
+                        cli::VerificationMode::Paranoid => "BLAKE3+blocks",
+                        cli::VerificationMode::Fast => unreachable!(),
+                    }.bright_black()
+                );
+            }
+        }
     }
 
     Ok(())
