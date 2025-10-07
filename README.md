@@ -21,8 +21,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
-🔨 **Phase 5 In Progress** - BLAKE3 verification + reliability features
-🚀 **Current Version: v0.0.13+dev** - 131 tests passing, zero errors!
+🔨 **Phase 5 In Progress** - BLAKE3 verification modes implemented! Crash recovery next.
+🚀 **Current Version: v0.0.14-dev** - 131 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -105,7 +105,7 @@ sy --show-profile backup-home                          # Show profile details
 sy /large /destination                                 # Interrupt with Ctrl+C
 sy /large /destination                                 # Re-run to resume from checkpoint
 
-# Verification modes (Phase 5 - In Development)
+# Verification modes (new in v0.0.14+)
 sy /source /destination --verify                       # BLAKE3 cryptographic verification
 sy /source /destination --mode fast                    # Size + mtime only (fastest)
 sy /source /destination --mode standard                # + xxHash3 checksums (default)
@@ -198,6 +198,21 @@ sy /source /destination --mode paranoid                # BLAKE3 + verify every b
   - Flag compatibility checking
   - Skips already-completed files on resume
 
+**Verification & Reliability (Phase 5 - In Progress)**:
+- **Verification Modes** (v0.0.14):
+  - **Fast**: Size + mtime only (trust filesystem)
+  - **Standard** (default): + xxHash3 checksums
+  - **Verify**: + BLAKE3 cryptographic end-to-end verification
+  - **Paranoid**: BLAKE3 + verify every block written
+  - Flags: `--mode <mode>` or `--verify` (shortcut for verify mode)
+  - Shows verification stats in summary output
+  - JSON output includes verification counts and failures
+- **BLAKE3 Integration**:
+  - 32-byte cryptographic hashes for data integrity
+  - Verifies source and destination match after transfer
+  - Fast parallel hashing (multi-threaded by default)
+  - Detects silent corruption that TCP checksums miss
+
 ### 📋 Common Use Cases
 
 ```bash
@@ -239,12 +254,13 @@ sy ~/src server:/backup             # LAN: parallel + minimal delta
 sy ~/src remote:/backup             # WAN: compression + delta + BBR
 ```
 
-### Verifiable Integrity
+### Verifiable Integrity ✅ (Implemented in v0.0.14)
 ```bash
 # Multiple verification modes
-sy ~/src remote:/dst                # Fast: xxHash3 block checksums
-sy ~/src remote:/dst --verify       # Cryptographic: BLAKE3 end-to-end
-sy ~/src remote:/dst --paranoid     # Maximum: multiple passes + comparison reads
+sy ~/src remote:/dst --mode standard   # Default: xxHash3 checksums
+sy ~/src remote:/dst --mode verify     # Cryptographic: BLAKE3 end-to-end
+sy ~/src remote:/dst --mode paranoid   # Maximum: BLAKE3 + verify every block
+sy ~/src remote:/dst --mode fast       # Fastest: size + mtime only
 ```
 
 ### Beautiful UX
