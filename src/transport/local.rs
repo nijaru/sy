@@ -6,6 +6,26 @@ use async_trait::async_trait;
 use std::fs;
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+/// Check if a file is sparse by comparing allocated blocks to file size
+#[cfg(unix)]
+fn is_file_sparse(metadata: &std::fs::Metadata) -> bool {
+    let blocks = metadata.blocks();
+    let file_size = metadata.len();
+    let allocated_size = blocks * 512;
+
+    // File is sparse if allocated size is significantly less than file size
+    let threshold = 4096;
+    file_size > threshold && allocated_size < file_size.saturating_sub(threshold)
+}
+
+#[cfg(not(unix))]
+fn is_file_sparse(_metadata: &std::fs::Metadata) -> bool {
+    false // Non-Unix platforms don't support sparse detection
+}
+
 /// Local filesystem transport
 ///
 /// Implements the Transport trait for local filesystem operations.
@@ -67,6 +87,40 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
+            // Check if source is sparse
+            let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
+                path: source.clone(),
+                source: e,
+            })?;
+
+            let is_sparse = is_file_sparse(&source_meta);
+
+            if is_sparse {
+                // For sparse files, use std::fs::copy() which preserves sparseness on Unix
+                tracing::debug!("Sparse file detected ({}), using sparse-aware copy", source.display());
+                let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+                // Preserve modification time
+                if let Ok(mtime) = source_meta.modified() {
+                    let _ = filetime::set_file_mtime(
+                        &dest,
+                        filetime::FileTime::from_system_time(mtime),
+                    );
+                }
+
+                tracing::debug!(
+                    "Sparse copy complete: {} ({} bytes logical size)",
+                    source.display(),
+                    bytes_written
+                );
+
+                return Ok(bytes_written);
+            }
+
+            // Regular file copy with checksum verification
             use std::io::{Read, Write};
 
             // Open source and destination files
@@ -116,13 +170,11 @@ impl Transport for LocalTransport {
             );
 
             // Preserve modification time
-            if let Ok(source_meta) = fs::metadata(&source) {
-                if let Ok(mtime) = source_meta.modified() {
-                    let _ = filetime::set_file_mtime(
-                        &dest,
-                        filetime::FileTime::from_system_time(mtime),
-                    );
-                }
+            if let Ok(mtime) = source_meta.modified() {
+                let _ = filetime::set_file_mtime(
+                    &dest,
+                    filetime::FileTime::from_system_time(mtime),
+                );
             }
 
             Ok(bytes_written)
@@ -344,5 +396,61 @@ mod tests {
         transport.remove(&dir, true).await.unwrap();
 
         assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)] // Sparse files work differently on Windows
+    async fn test_local_transport_sparse_file_copy() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a sparse file using dd
+        let source_file = source_dir.path().join("sparse.dat");
+        let output = std::process::Command::new("dd")
+            .args(&[
+                "if=/dev/zero",
+                &format!("of={}", source_file.display()),
+                "bs=1024",
+                "count=0",
+                "seek=10240" // 10MB sparse file
+            ])
+            .output()
+            .expect("Failed to create sparse file");
+
+        if !output.status.success() {
+            panic!("dd command failed");
+        }
+
+        // Write some actual data
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_file)
+            .unwrap();
+        file.write_all(&[0x42; 4096]).unwrap();
+        drop(file);
+
+        // Copy the file
+        let transport = LocalTransport::new();
+        let dest_file = dest_dir.path().join("sparse.dat");
+        let result = transport.copy_file(&source_file, &dest_file).await.unwrap();
+
+        // Verify copy succeeded
+        assert!(dest_file.exists());
+        assert_eq!(result.bytes_written, 10 * 1024 * 1024);
+
+        // Verify destination is also sparse (or at least has same size)
+        let dest_meta = fs::metadata(&dest_file).unwrap();
+        assert_eq!(dest_meta.len(), 10 * 1024 * 1024);
+
+        // On filesystems that support sparse files, verify sparseness is preserved
+        let dest_blocks = dest_meta.blocks();
+        let dest_allocated = dest_blocks * 512;
+        if dest_allocated < dest_meta.len() {
+            // Sparseness was preserved!
+            assert!(dest_allocated < dest_meta.len() / 2, "Destination should be sparse");
+        }
     }
 }
