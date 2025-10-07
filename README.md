@@ -21,7 +21,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
-🚀 **Current Version: v0.0.13** - 111 tests passing, zero errors!
+🔨 **Phase 5 In Progress** - BLAKE3 verification + reliability features
+🚀 **Current Version: v0.0.13+dev** - 131 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -103,6 +104,13 @@ sy --show-profile backup-home                          # Show profile details
 # Resume support (new in v0.0.13+)
 sy /large /destination                                 # Interrupt with Ctrl+C
 sy /large /destination                                 # Re-run to resume from checkpoint
+
+# Verification modes (Phase 5 - In Development)
+sy /source /destination --verify                       # BLAKE3 cryptographic verification
+sy /source /destination --mode fast                    # Size + mtime only (fastest)
+sy /source /destination --mode standard                # + xxHash3 checksums (default)
+sy /source /destination --mode verify                  # + BLAKE3 end-to-end (cryptographic)
+sy /source /destination --mode paranoid                # BLAKE3 + verify every block (slowest)
 ```
 
 ## Features
