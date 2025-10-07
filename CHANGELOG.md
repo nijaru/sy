@@ -11,7 +11,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full file compression integration (infrastructure ready)
 - Network speed detection
 - Parallel chunk transfers (within single files)
-- Resume support for interrupted transfers
+- Resume support for interrupted transfers (infrastructure ready)
+- Watch mode for continuous sync
+
+## [0.0.11] - 2025-10-06
+
+### Added
+- **JSON output mode** - Machine-readable NDJSON format for scripting
+  - `--json` flag emits newline-delimited JSON events
+  - Events: start, create, update, skip, delete, summary
+  - Automatically suppresses normal output and logging (errors only)
+  - Example: `sy /src /dst --json | jq`
+- **Config profiles** - Save and reuse sync configurations
+  - Config file: `~/.config/sy/config.toml` (Linux) or `~/Library/Application Support/sy/config.toml` (macOS)
+  - `--profile <name>` to use saved profile
+  - `--list-profiles` to show available profiles
+  - `--show-profile <name>` to display profile details
+  - Profile settings merged with CLI args (CLI takes precedence)
+- **Resume infrastructure** - State file support (logic pending)
+  - ResumeState struct with JSON serialization
+  - Atomic state file saves (write temp, rename)
+  - CLI flags: `--resume`, `--checkpoint-files`, `--checkpoint-bytes`
+  - Implementation deferred to future release
+
+### Changed
+- Source and destination paths now optional when using `--profile`
+- Logging level ERROR when `--json` mode active
+- Enhanced CLI validation for profile-only modes
+
+### Technical
+- Added toml and chrono dependencies
+- Config loading with XDG Base Directory compliance
+- Profile merging logic in main.rs
+- All 109 tests passing
+
+### Documentation
+- Created PHASE4_DESIGN.md (644 lines) with complete Phase 4 spec
+- Updated MODERNIZATION_ROADMAP.md with v1.0 timeline
 
 ### Planned for v0.5.0
 - Multi-layer checksums (BLAKE3 end-to-end)
@@ -383,7 +419,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.11...HEAD
+[0.0.11]: https://github.com/nijaru/sy/releases/tag/v0.0.11
+[0.0.10]: https://github.com/nijaru/sy/releases/tag/v0.0.10
 [0.0.9]: https://github.com/nijaru/sy/releases/tag/v0.0.9
 [0.0.8]: https://github.com/nijaru/sy/releases/tag/v0.0.8
 [0.0.7]: https://github.com/nijaru/sy/releases/tag/v0.0.7
