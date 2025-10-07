@@ -1,3 +1,4 @@
+use crate::cli::SymlinkMode;
 use crate::integrity::ChecksumType;
 use crate::sync::SyncEngine;
 use crate::transport::Transport;
@@ -150,6 +151,7 @@ mod tests {
             false, // json
             ChecksumType::None, // verification_mode
             false, // verify_on_write
+            SymlinkMode::Preserve, // symlink_mode
         );
 
         let watch_mode = WatchMode::new(
@@ -191,6 +193,7 @@ mod tests {
             false,
             ChecksumType::None,
             false,
+            SymlinkMode::Preserve,
         );
 
         let watch_mode = WatchMode::new(

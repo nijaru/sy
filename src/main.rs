@@ -155,6 +155,9 @@ async fn main() -> Result<()> {
     let checksum_type = verification_mode.checksum_type();
     let verify_on_write = verification_mode.verify_blocks();
 
+    // Get symlink mode
+    let symlink_mode = cli.symlink_mode();
+
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,
@@ -171,6 +174,7 @@ async fn main() -> Result<()> {
         cli.json,
         checksum_type,
         verify_on_write,
+        symlink_mode,
     );
 
     // Watch mode or regular sync
