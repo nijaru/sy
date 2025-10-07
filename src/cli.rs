@@ -162,6 +162,10 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size, default_value = "104857600")]
     pub checkpoint_bytes: u64,
 
+    /// Delete any existing state files before starting (fresh sync)
+    #[arg(long)]
+    pub clean_state: bool,
+
     /// Verification mode (fast, standard, verify, paranoid)
     #[arg(long, value_enum, default_value = "standard")]
     pub mode: VerificationMode,
@@ -285,6 +289,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -314,6 +319,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -347,6 +353,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -383,6 +390,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -412,6 +420,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -441,6 +450,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -470,6 +480,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -499,6 +510,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -547,6 +559,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -579,6 +592,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,
@@ -608,6 +622,7 @@ mod tests {
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
+            clean_state: false,
             json: false,
             watch: false,
             profile: None,

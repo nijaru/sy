@@ -127,6 +127,16 @@ async fn main() -> Result<()> {
     let source = cli.source.as_ref().expect("source required after validation");
     let destination = cli.destination.as_ref().expect("destination required after validation");
 
+    // Clean state files if requested
+    if cli.clean_state {
+        use sync::resume::ResumeState;
+        if let Err(e) = ResumeState::delete(destination.path()) {
+            tracing::warn!("Failed to clean state file: {}", e);
+        } else if !cli.quiet && !cli.json {
+            tracing::info!("Cleaned existing state files");
+        }
+    }
+
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
