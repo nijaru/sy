@@ -12,6 +12,8 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
 use colored::Colorize;
+use config::Config;
+use path::SyncPath;
 use sync::SyncEngine;
 use transport::router::TransportRouter;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -19,7 +21,89 @@ use tracing_subscriber::{fmt, EnvFilter};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Load config file
+    let config = Config::load()?;
+
+    // Handle profile-only flags (print and exit)
+    if cli.list_profiles {
+        let profiles = config.list_profiles();
+        if profiles.is_empty() {
+            println!("No profiles configured");
+            println!("\nCreate profiles in: {}", Config::config_path()?.display());
+        } else {
+            println!("Available profiles:");
+            for name in profiles {
+                println!("  {}", name);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(ref profile_name) = cli.show_profile {
+        match config.show_profile(profile_name) {
+            Some(output) => {
+                println!("{}", output);
+                return Ok(());
+            }
+            None => {
+                anyhow::bail!("Profile '{}' not found", profile_name);
+            }
+        }
+    }
+
+    // Merge profile with CLI args if --profile is set
+    if let Some(ref profile_name) = cli.profile {
+        let profile = config.get_profile(profile_name)
+            .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", profile_name))?;
+
+        // Apply profile settings (CLI args take precedence)
+        if cli.source.is_none() {
+            if let Some(ref source_str) = profile.source {
+                cli.source = Some(SyncPath::parse(source_str));
+            }
+        }
+        if cli.destination.is_none() {
+            if let Some(ref dest_str) = profile.destination {
+                cli.destination = Some(SyncPath::parse(dest_str));
+            }
+        }
+
+        // Merge other profile settings
+        if profile.delete.is_some() && !cli.delete {
+            cli.delete = profile.delete.unwrap_or(false);
+        }
+        if profile.dry_run.is_some() && !cli.dry_run {
+            cli.dry_run = profile.dry_run.unwrap_or(false);
+        }
+        if profile.quiet.is_some() && !cli.quiet {
+            cli.quiet = profile.quiet.unwrap_or(false);
+        }
+        if let Some(verbose) = profile.verbose {
+            if cli.verbose == 0 {
+                cli.verbose = verbose;
+            }
+        }
+        if let Some(parallel) = profile.parallel {
+            if cli.parallel == 10 {  // Default value
+                cli.parallel = parallel;
+            }
+        }
+        if let Some(ref _bwlimit_str) = profile.bwlimit {
+            if cli.bwlimit.is_none() {
+                // TODO: Parse bwlimit from profile (needs parse_size exposed from cli module)
+            }
+        }
+        if let Some(ref excludes) = profile.exclude {
+            if cli.exclude.is_empty() {
+                cli.exclude = excludes.clone();
+            }
+        }
+        if let Some(resume) = profile.resume {
+            cli.resume = resume;
+        }
+    }
 
     // Setup logging
     let filter = EnvFilter::try_from_default_env()
@@ -37,10 +121,14 @@ async fn main() -> Result<()> {
     // Validate arguments
     cli.validate()?;
 
+    // After validation, source and destination must be present
+    let source = cli.source.as_ref().expect("source required after validation");
+    let destination = cli.destination.as_ref().expect("destination required after validation");
+
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
-        println!("Syncing {} → {}", cli.source, cli.destination);
+        println!("Syncing {} → {}", source, destination);
 
         if cli.dry_run {
             println!("Mode: Dry-run (no changes will be made)\n");
@@ -48,7 +136,7 @@ async fn main() -> Result<()> {
     }
 
     // Create transport router based on source and destination
-    let transport = TransportRouter::new(&cli.source, &cli.destination).await?;
+    let transport = TransportRouter::new(source, destination).await?;
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,
@@ -71,11 +159,11 @@ async fn main() -> Result<()> {
             println!("Mode: Single file sync\n");
         }
         engine
-            .sync_single_file(cli.source.path(), cli.destination.path())
+            .sync_single_file(source.path(), destination.path())
             .await?
     } else {
         engine
-            .sync(cli.source.path(), cli.destination.path())
+            .sync(source.path(), destination.path())
             .await?
     };
 
