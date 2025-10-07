@@ -20,7 +20,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 2 Complete** - SSH transport + Delta sync implemented! (v0.0.3)
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
-🚀 **Current Version: v0.0.10** - 92 tests passing, zero warnings!
+✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
+🚀 **Current Version: v0.0.13** - 111 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -86,11 +87,27 @@ sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patter
 # Bandwidth limiting (new in v0.0.9+)
 sy /source /destination --bwlimit 1MB                  # Limit to 1 MB/s
 sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 500 KB/s
+
+# Watch mode (new in v0.0.12+)
+sy /source /destination --watch                        # Continuous sync on file changes
+
+# JSON output (new in v0.0.11+)
+sy /source /destination --json                         # Machine-readable NDJSON output
+sy /source /destination --json | jq                    # Pipe to jq for processing
+
+# Config profiles (new in v0.0.11+)
+sy --profile backup-home                               # Use saved profile
+sy --list-profiles                                     # Show available profiles
+sy --show-profile backup-home                          # Show profile details
+
+# Resume support (new in v0.0.13+)
+sy /large /destination                                 # Interrupt with Ctrl+C
+sy /large /destination                                 # Re-run to resume from checkpoint
 ```
 
 ## Features
 
-### ✅ What Works Now (v0.0.10)
+### ✅ What Works Now (v0.0.13)
 
 **Local Sync (Phase 1 - Complete)**:
 - **Smart File Sync**: Compares size + modification time (1s tolerance)
@@ -150,6 +167,28 @@ sy /source user@host:/dest --bwlimit 500KB             # Limit remote sync to 50
   - ✅ Production integration complete (v0.0.10)
   - ✅ Compression stats tracked and displayed
   - ✅ 2-5x reduction on text/code files
+
+**Advanced Features (Phase 4 - Complete)**:
+- **JSON Output** (v0.0.11):
+  - Machine-readable NDJSON format for scripting
+  - Events: start, create, update, skip, delete, summary
+  - Auto-suppresses logging in JSON mode
+  - Example: `sy /src /dst --json | jq`
+- **Config Profiles** (v0.0.11):
+  - Save common sync configurations
+  - Config file: `~/.config/sy/config.toml`
+  - Commands: `--profile`, `--list-profiles`, `--show-profile`
+  - CLI args override profile settings
+- **Watch Mode** (v0.0.12):
+  - Continuous file monitoring for real-time sync
+  - 500ms debouncing to avoid excessive syncing
+  - Graceful Ctrl+C shutdown
+  - Cross-platform (Linux, macOS, Windows)
+- **Resume Support** (v0.0.13):
+  - Automatic recovery from interrupted syncs
+  - State file: `.sy-state.json` in destination
+  - Flag compatibility checking
+  - Skips already-completed files on resume
 
 ### 📋 Common Use Cases
 
