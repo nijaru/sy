@@ -1,27 +1,27 @@
 # Modernization Roadmap - sy v0.1.0 → v1.0
 
-**Status**: Planning (2025-10-06)
-**Current Version**: v0.0.10
+**Status**: In Progress - Phase 4 Complete! (2025-10-06)
+**Current Version**: v0.0.13
 **Goal**: Make sy a complete modern rsync replacement for 90%+ of use cases
 
 ---
 
 ## Executive Summary
 
-**sy is already production-ready for developers** (2-11x faster than rsync), but has critical gaps preventing it from being a complete replacement:
+**sy is already production-ready for developers** (2-11x faster than rsync), and Phase 4 has addressed major modern CLI gaps:
 
-### Critical Gaps for v1.0
-1. **Resume support** - Can't recover from interrupted transfers (BLOCKER)
-2. **Symlinks** - Very common in real-world usage (HIGH)
-3. **Sparse files** - VM images, databases (MEDIUM)
-4. **Extended attributes** - Full backup fidelity (MEDIUM)
+### ✅ Phase 4 Complete (v0.0.11-v0.0.13)
+1. ✅ **JSON output** - Machine-readable NDJSON format (v0.0.11)
+2. ✅ **Config profiles** - Reusable configurations (v0.0.11)
+3. ✅ **Watch mode** - Continuous sync (v0.0.12)
+4. ✅ **Resume support** - Automatic recovery from interrupts (v0.0.13)
 
-### Modern Features Missing
-1. **Watch mode** - Continuous sync (modern dev workflow)
-2. **JSON output** - Scriptability (standard in modern tools)
-3. **Config profiles** - Reusable configurations
-4. **Hooks** - Pre/post sync extensibility
-5. **Cloud backends** - S3/R2/Backblaze (rclone territory)
+### Critical Gaps Remaining for v1.0
+1. **Symlinks** - Very common in real-world usage (HIGH)
+2. **Sparse files** - VM images, databases (MEDIUM)
+3. **Extended attributes** - Full backup fidelity (MEDIUM)
+4. **Hooks** - Pre/post sync extensibility (LOW)
+5. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
 
 ---
 
@@ -43,10 +43,10 @@ Looking at successful modern CLI tools:
 ✅ **Speed** - sy wins (2-11x faster)
 ✅ **Beautiful output** - sy has colors + progress
 ✅ **Smart defaults** - sy has gitignore awareness
-❌ **JSON output** - Missing
-❌ **Watch mode** - Missing
-❌ **Config files** - Missing (designed but not implemented)
-❌ **Extensibility** - Missing (no hooks)
+✅ **JSON output** - Implemented (v0.0.11)
+✅ **Watch mode** - Implemented (v0.0.12)
+✅ **Config files** - Implemented (v0.0.11)
+❌ **Extensibility** - Missing (no hooks yet)
 
 ---
 
@@ -83,36 +83,38 @@ Looking at successful modern CLI tools:
 
 ## Revised Phase Plan
 
-### Phase 4 (v0.1.0) - Critical Reliability 🔴 **PRIORITY**
+### Phase 4 (v0.0.11-v0.0.13) - Critical Reliability ✅ **COMPLETE**
 **Goal**: Make sy safe for production use
 
-**Timeline**: 2-3 weeks
+**Status**: Complete (2025-10-06)
 
 **Features**:
-1. **Resume support** (CRITICAL)
+1. ✅ **Resume support** (v0.0.13)
    - State file: `.sy-state.json` in destination
-   - Checkpoint every N files
+   - Flag compatibility checking on resume
    - Resume from last checkpoint on interruption
-   - Verify partial files with checksums
-   - Tests: Interrupt at 25%, 50%, 75% and resume
+   - Filter completed files from sync tasks
+   - Automatic cleanup on successful completion
+   - **Note**: Periodic checkpointing deferred to Phase 5
 
-2. **Watch mode** (MODERN DEV WORKFLOW)
+2. ✅ **Watch mode** (v0.0.12)
    - `sy /src /dst --watch` - Continuous sync
-   - File system events (notify-rs)
-   - Debouncing (500ms default, configurable)
-   - Graceful shutdown on Ctrl+C
-   - Tests: Create/modify/delete detection
+   - File system events (notify 6.0)
+   - Debouncing (500ms default)
+   - Graceful shutdown on Ctrl+C (tokio::signal)
+   - Event filtering (Create/Modify/Remove only)
 
-3. **JSON output** (SCRIPTABILITY)
+3. ✅ **JSON output** (v0.0.11)
    - `sy /src /dst --json` - Machine-readable
    - One JSON object per line (NDJSON)
-   - Schema: `{"type": "create|update|delete", "path": "...", "size": 123, ...}`
-   - Tests: Parse and validate JSON
+   - Schema: `{"type": "start|create|update|skip|delete|summary", ...}`
+   - Auto-suppresses logging output
 
-4. **Config profiles** (DESIGNED BUT NOT IMPLEMENTED)
-   - `~/.config/sy/config.toml`
+4. ✅ **Config profiles** (v0.0.11)
+   - `~/.config/sy/config.toml` (XDG-compliant)
    - Named profiles: `sy --profile deploy-prod`
-   - Overridable with CLI flags
+   - CLI args override profile settings
+   - `--list-profiles` and `--show-profile` flags
    - Example:
      ```toml
      [profiles.deploy-prod]
@@ -122,7 +124,7 @@ Looking at successful modern CLI tools:
      delete = true
      ```
 
-**Deliverable**: sy is safe and convenient for daily use
+**Deliverable**: ✅ sy is safe and convenient for daily use (all 111 tests passing)
 
 ---
 
@@ -391,9 +393,9 @@ Looking at successful modern CLI tools:
 
 ## Timeline to v1.0
 
-**Estimated**: 15.5-18.5 weeks (~4 months)
+**Estimated**: 13.5-16.5 weeks remaining (~3.5 months)
 
-- Phase 4: 2-3 weeks (Critical)
+- ✅ Phase 4: Complete (v0.0.11-v0.0.13)
 - Phase 5: 2 weeks
 - Phase 6: 3 weeks
 - Phase 7: 1.5 weeks (TUI deferred)
@@ -448,13 +450,13 @@ cargo login <scoped-token>
 
 ## Next Steps
 
-1. **Review this plan** - Is the prioritization correct?
-2. **Phase 4 implementation** - Start with resume support
+1. ✅ **Phase 4 implementation** - Complete (v0.0.11-v0.0.13)
+2. **Phase 5 planning** - Design verification & reliability features
 3. **Community feedback** - Post roadmap, get input on priorities
-4. **Beta testing** - Find early adopters after Phase 4
+4. **Beta testing** - Find early adopters for Phase 5
 
 ---
 
 **Last Updated**: 2025-10-06
-**Status**: Planning complete, ready to begin Phase 4
-**Current Version**: v0.0.10 (Phases 1-3 complete)
+**Status**: Phase 4 complete, ready to begin Phase 5
+**Current Version**: v0.0.13 (Phases 1-4 complete)
