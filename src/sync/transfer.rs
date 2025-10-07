@@ -1,3 +1,4 @@
+use crate::cli::SymlinkMode;
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use crate::transport::{Transport, TransferResult};
@@ -6,11 +7,16 @@ use std::path::Path;
 pub struct Transferrer<'a, T: Transport> {
     transport: &'a T,
     dry_run: bool,
+    symlink_mode: SymlinkMode,
 }
 
 impl<'a, T: Transport> Transferrer<'a, T> {
-    pub fn new(transport: &'a T, dry_run: bool) -> Self {
-        Self { transport, dry_run }
+    pub fn new(transport: &'a T, dry_run: bool, symlink_mode: SymlinkMode) -> Self {
+        Self {
+            transport,
+            dry_run,
+            symlink_mode,
+        }
     }
 
     /// Create a new file or directory
@@ -19,6 +25,11 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         if self.dry_run {
             tracing::info!("Would create: {}", dest_path.display());
             return Ok(None);
+        }
+
+        // Handle symlinks based on mode
+        if source.is_symlink {
+            return self.handle_symlink(source, dest_path).await;
         }
 
         if source.is_dir {
@@ -78,6 +89,78 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         tracing::debug!("Copied: {} -> {}", source.display(), dest.display());
         Ok(result)
     }
+
+    async fn handle_symlink(&self, source: &FileEntry, dest_path: &Path) -> Result<Option<TransferResult>> {
+        match self.symlink_mode {
+            SymlinkMode::Skip => {
+                tracing::debug!("Skipping symlink: {}", source.path.display());
+                Ok(None)
+            }
+            SymlinkMode::Follow => {
+                // Follow the symlink and copy the target
+                if let Some(ref target) = source.symlink_target {
+                    // Check if target exists
+                    if !target.exists() {
+                        tracing::warn!(
+                            "Symlink target does not exist: {} -> {}",
+                            source.path.display(),
+                            target.display()
+                        );
+                        return Ok(None);
+                    }
+
+                    // Copy the target file/directory
+                    if target.is_dir() {
+                        tracing::warn!(
+                            "Skipping symlink to directory (not supported in follow mode): {}",
+                            source.path.display()
+                        );
+                        Ok(None)
+                    } else {
+                        let result = self.copy_file(target, dest_path).await?;
+                        tracing::debug!(
+                            "Followed symlink and copied target: {} -> {}",
+                            target.display(),
+                            dest_path.display()
+                        );
+                        Ok(Some(result))
+                    }
+                } else {
+                    tracing::warn!("Symlink has no target: {}", source.path.display());
+                    Ok(None)
+                }
+            }
+            SymlinkMode::Preserve => {
+                // Preserve the symlink as a symlink
+                if let Some(ref target) = source.symlink_target {
+                    // Ensure parent directory exists
+                    if let Some(parent) = dest_path.parent() {
+                        self.transport.create_dir_all(parent).await?;
+                    }
+
+                    // Create symlink (only works for local transport currently)
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(target, dest_path)?;
+                        tracing::debug!(
+                            "Created symlink: {} -> {}",
+                            dest_path.display(),
+                            target.display()
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        tracing::warn!("Symlink preservation not supported on this platform");
+                    }
+
+                    Ok(None)
+                } else {
+                    tracing::warn!("Symlink has no target: {}", source.path.display());
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,7 +191,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -135,7 +218,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, true); // dry_run = true
+        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve); // dry_run = true
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -158,11 +241,123 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
         let dest_path = dest_dir.path().join("subdir");
         transferrer.create(&dir_entry, &dest_path).await.unwrap();
 
         assert!(dest_path.exists());
         assert!(dest_path.is_dir());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]  // Symlinks work differently on Windows
+    async fn test_symlink_preserve() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a target file
+        let target_file = source_dir.path().join("target.txt");
+        fs::write(&target_file, "target content").unwrap();
+
+        // Create a symlink
+        let link_file = source_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target_file, &link_file).unwrap();
+
+        // Read link to get target
+        let link_target = std::fs::read_link(&link_file).unwrap();
+
+        let file_entry = FileEntry {
+            path: link_file.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            size: 0,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: true,
+            symlink_target: Some(link_target.clone()),
+        };
+
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
+        let dest_path = dest_dir.path().join("link.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Destination should be a symlink
+        assert!(dest_path.exists());
+        assert!(dest_path.is_symlink());
+
+        // Symlink target should match
+        let dest_target = std::fs::read_link(&dest_path).unwrap();
+        assert_eq!(dest_target, link_target);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_symlink_follow() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a target file
+        let target_file = source_dir.path().join("target.txt");
+        fs::write(&target_file, "target content").unwrap();
+
+        // Create a symlink
+        let link_file = source_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target_file, &link_file).unwrap();
+
+        let file_entry = FileEntry {
+            path: link_file.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            size: 0,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: true,
+            symlink_target: Some(target_file.clone()),
+        };
+
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow);
+        let dest_path = dest_dir.path().join("link.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Destination should be a regular file (not a symlink)
+        assert!(dest_path.exists());
+        assert!(!dest_path.is_symlink());
+
+        // Content should match the target
+        let content = fs::read_to_string(&dest_path).unwrap();
+        assert_eq!(content, "target content");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_symlink_skip() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a target file
+        let target_file = source_dir.path().join("target.txt");
+        fs::write(&target_file, "target content").unwrap();
+
+        // Create a symlink
+        let link_file = source_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target_file, &link_file).unwrap();
+
+        let file_entry = FileEntry {
+            path: link_file.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            size: 0,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: true,
+            symlink_target: Some(target_file),
+        };
+
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Skip);
+        let dest_path = dest_dir.path().join("link.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Destination should NOT exist
+        assert!(!dest_path.exists());
     }
 }
