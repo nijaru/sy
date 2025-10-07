@@ -21,10 +21,11 @@
 2. ✅ **BLAKE3 end-to-end** - Cryptographic integrity verification (v0.0.14)
 3. ✅ **State hardening** - Auto-delete corrupted state files (v0.0.14)
 4. ✅ **Symlink support** - Preserve/follow/skip modes (v0.0.15)
+5. ✅ **Sparse file support** - Detection and preservation (v0.0.15)
 
 ### Critical Gaps Remaining for v1.0
 1. ~~**Symlinks**~~ ✅ **DONE** (v0.0.15)
-2. **Sparse files** - VM images, databases (MEDIUM)
+2. ~~**Sparse files**~~ ✅ **DONE** (v0.0.15)
 3. **Extended attributes** - Full backup fidelity (MEDIUM)
 4. **Hooks** - Pre/post sync extensibility (LOW)
 5. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
@@ -165,50 +166,55 @@ Looking at successful modern CLI tools:
    - 8 new tests for corruption scenarios
    - `--clean-state` flag to force fresh sync
 
-4. ⏳ **Advanced crash recovery** (Deferred to v0.5.0+)
+4. ✅ **Symlink support** (v0.0.15)
+   - Three modes: preserve (default), follow, skip
+   - `--links` flag to set mode, `-L` shortcut for follow
+   - Detects and warns on broken symlinks
+   - Cross-platform (Unix/Linux/macOS)
+   - 3 comprehensive tests
+
+5. ✅ **Sparse file support** (v0.0.15)
+   - Automatic detection using st_blocks metadata
+   - Preserves sparseness during transfer
+   - Uses std::fs::copy() for sparse files (preserves holes)
+   - Critical for VM disk images, database files
+   - Zero configuration - works transparently
+   - 2 tests (detection and transfer)
+
+6. ⏳ **Advanced crash recovery** (Deferred to v0.5.0+)
    - Transaction log for file-level rollback
    - Per-operation tracking (start/write/commit/complete)
    - Automatic recovery on restart
    - **Note**: Current resume support already handles interrupted syncs well
 
-5. ⏳ **Atomic operations** (Deferred to v0.5.0+)
+7. ⏳ **Atomic operations** (Deferred to v0.5.0+)
    - Already implemented (write to temp, rename)
    - `--no-atomic` flag for special filesystems
    - **Note**: Current implementation is atomic by default
 
-**Deliverable**: ✅ Verifiable integrity for critical data (core features complete)
+**Deliverable**: ✅ Verifiable integrity + filesystem features (core features complete, including symlinks & sparse files)
 
 ---
 
-### Phase 6 (v0.3.0) - Filesystem Features
-**Goal**: Handle common filesystem edge cases
+### Phase 6 (v0.3.0) - Advanced Filesystem Features
+**Goal**: Handle remaining filesystem edge cases for full-fidelity backups
 
-**Timeline**: 3 weeks
+**Timeline**: 2 weeks
 
 **Features**:
-1. **Symlinks**
-   - Detect and handle symbolic links
-   - Modes: `--copy-links`, `--skip-links`, `--links` (preserve)
-   - Safety: Detect and prevent symlink loops
-   - Cross-platform: Handle Windows junctions/symlinks
-
-2. **Hardlinks**
+1. **Hardlinks**
    - Detect hardlinks via inode tracking
    - Preserve hardlink relationships
    - `--hard-links` flag to enable
    - Tests: Verify inode counts match
 
-3. **Sparse files**
-   - Detect sparse files (SEEK_DATA/SEEK_HOLE on Linux/macOS)
-   - Transfer only allocated blocks
-   - Preserve sparseness in destination
-   - Example: 10GB VM image with 2GB used → transfer 2GB
-
-4. **Extended attributes & ACLs**
+2. **Extended attributes & ACLs**
    - `-X` flag to preserve xattrs
    - `-A` flag to preserve ACLs (requires root)
    - Platform-specific: macOS resource forks, Windows alternate data streams
    - Tests: Verify xattrs/ACLs preserved
+
+**Note**: Symlinks and sparse files moved to Phase 5 (completed in v0.0.15)
 
 **Deliverable**: Full-fidelity backups (like rsync -a)
 

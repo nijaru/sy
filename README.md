@@ -224,6 +224,12 @@ sy /source /destination --links skip                   # Skip all symlinks
   - **Skip**: Ignore all symlinks
   - Detects broken symlinks and logs warnings
   - Cross-platform (Unix/Linux/macOS)
+- **Sparse File Support** (v0.0.15):
+  - Automatic detection of sparse files (files with "holes")
+  - Preserves sparseness during transfer (Unix/Linux/macOS)
+  - Efficient transfer - only allocated blocks are copied
+  - Critical for VM disk images, database files, etc.
+  - Zero configuration - works transparently
 
 ### 📋 Common Use Cases
 
