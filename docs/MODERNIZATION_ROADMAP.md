@@ -1,14 +1,14 @@
 # Modernization Roadmap - sy v0.1.0 → v1.0
 
-**Status**: In Progress - Phase 5 Started! (2025-10-07)
-**Current Version**: v0.0.14-dev
+**Status**: In Progress - Phase 5 Core Complete! (2025-10-07)
+**Current Version**: v0.0.15-dev
 **Goal**: Make sy a complete modern rsync replacement for 90%+ of use cases
 
 ---
 
 ## Executive Summary
 
-**sy is already production-ready for developers** (2-11x faster than rsync), and Phase 4 has addressed major modern CLI gaps:
+**sy is already production-ready for developers** (2-11x faster than rsync), and Phases 4-5 have addressed major modern CLI gaps:
 
 ### ✅ Phase 4 Complete (v0.0.11-v0.0.13)
 1. ✅ **JSON output** - Machine-readable NDJSON format (v0.0.11)
@@ -16,8 +16,14 @@
 3. ✅ **Watch mode** - Continuous sync (v0.0.12)
 4. ✅ **Resume support** - Automatic recovery from interrupts (v0.0.13)
 
+### ✅ Phase 5 Core Complete (v0.0.14-v0.0.15)
+1. ✅ **Verification modes** - fast/standard/verify/paranoid (v0.0.14)
+2. ✅ **BLAKE3 end-to-end** - Cryptographic integrity verification (v0.0.14)
+3. ✅ **State hardening** - Auto-delete corrupted state files (v0.0.14)
+4. ✅ **Symlink support** - Preserve/follow/skip modes (v0.0.15)
+
 ### Critical Gaps Remaining for v1.0
-1. **Symlinks** - Very common in real-world usage (HIGH)
+1. ~~**Symlinks**~~ ✅ **DONE** (v0.0.15)
 2. **Sparse files** - VM images, databases (MEDIUM)
 3. **Extended attributes** - Full backup fidelity (MEDIUM)
 4. **Hooks** - Pre/post sync extensibility (LOW)

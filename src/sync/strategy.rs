@@ -186,6 +186,8 @@ mod tests {
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 100,
         };
 
         let planner = StrategyPlanner::new();
@@ -210,6 +212,8 @@ mod tests {
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 7,
         };
 
         let planner = StrategyPlanner::new();
@@ -234,6 +238,8 @@ mod tests {
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 100,
         };
 
         let planner = StrategyPlanner::new();

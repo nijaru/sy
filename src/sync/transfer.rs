@@ -188,6 +188,8 @@ mod tests {
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
         };
 
         let transport = LocalTransport::new();
@@ -215,6 +217,8 @@ mod tests {
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
         };
 
         let transport = LocalTransport::new();
@@ -238,6 +242,8 @@ mod tests {
             is_dir: true,
             is_symlink: false,
             symlink_target: None,
+            is_sparse: false,
+            allocated_size: 0,
         };
 
         let transport = LocalTransport::new();
@@ -274,6 +280,8 @@ mod tests {
             is_dir: false,
             is_symlink: true,
             symlink_target: Some(link_target.clone()),
+            is_sparse: false,
+            allocated_size: 0,
         };
 
         let transport = LocalTransport::new();
@@ -312,6 +320,8 @@ mod tests {
             is_dir: false,
             is_symlink: true,
             symlink_target: Some(target_file.clone()),
+            is_sparse: false,
+            allocated_size: 0,
         };
 
         let transport = LocalTransport::new();
@@ -350,6 +360,8 @@ mod tests {
             is_dir: false,
             is_symlink: true,
             symlink_target: Some(target_file),
+            is_sparse: false,
+            allocated_size: 0,
         };
 
         let transport = LocalTransport::new();
