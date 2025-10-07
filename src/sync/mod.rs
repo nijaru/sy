@@ -6,6 +6,7 @@ pub mod output;
 pub mod watch;
 mod ratelimit;
 
+use crate::cli::SymlinkMode;
 use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::transport::Transport;
@@ -54,6 +55,7 @@ pub struct SyncEngine<T: Transport> {
     json: bool,
     verification_mode: ChecksumType,
     verify_on_write: bool,
+    symlink_mode: SymlinkMode,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -74,6 +76,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         json: bool,
         verification_mode: ChecksumType,
         verify_on_write: bool,
+        symlink_mode: SymlinkMode,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -105,6 +108,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             json,
             verification_mode,
             verify_on_write,
+            symlink_mode,
         }
     }
 
