@@ -1,5 +1,8 @@
 use crate::path::SyncPath;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+// Import integrity types for verification modes
+use crate::integrity::ChecksumType;
 
 fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
@@ -29,6 +32,38 @@ fn parse_size(s: &str) -> Result<u64, String> {
     };
 
     Ok((num * multiplier as f64) as u64)
+}
+
+/// Verification mode for file integrity
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum VerificationMode {
+    /// Size and mtime only (fastest, least reliable)
+    Fast,
+
+    /// Add xxHash3 checksums (default, good balance)
+    Standard,
+
+    /// BLAKE3 end-to-end verification (slower, cryptographic)
+    Verify,
+
+    /// BLAKE3 + verify every block during transfer (slowest, maximum reliability)
+    Paranoid,
+}
+
+impl VerificationMode {
+    /// Get the checksum type for this mode
+    pub fn checksum_type(&self) -> ChecksumType {
+        match self {
+            Self::Fast => ChecksumType::None,
+            Self::Standard => ChecksumType::Fast,
+            Self::Verify | Self::Paranoid => ChecksumType::Cryptographic,
+        }
+    }
+
+    /// Check if this mode requires block-level verification
+    pub fn verify_blocks(&self) -> bool {
+        matches!(self, Self::Paranoid)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -61,6 +96,10 @@ fn parse_size(s: &str) -> Result<u64, String> {
     # Bandwidth limiting
     sy /source /destination --bwlimit 1MB     # Limit to 1 MB/s
     sy /source user@host:/dest --bwlimit 500KB  # Limit to 500 KB/s
+
+    # Verification modes
+    sy /source /destination --verify            # BLAKE3 cryptographic verification
+    sy /source /destination --mode paranoid     # Maximum reliability
 
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
@@ -123,6 +162,14 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size, default_value = "104857600")]
     pub checkpoint_bytes: u64,
 
+    /// Verification mode (fast, standard, verify, paranoid)
+    #[arg(long, value_enum, default_value = "standard")]
+    pub mode: VerificationMode,
+
+    /// Enable BLAKE3 verification (shortcut for --mode verify)
+    #[arg(long)]
+    pub verify: bool,
+
     /// Enable compression for network transfers (auto-detects based on file type)
     #[arg(long)]
     pub compress: bool,
@@ -183,6 +230,15 @@ impl Cli {
         Ok(())
     }
 
+    /// Get the effective verification mode (applying --verify flag override)
+    pub fn verification_mode(&self) -> VerificationMode {
+        if self.verify {
+            VerificationMode::Verify
+        } else {
+            self.mode
+        }
+    }
+
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
         self.source.as_ref().map_or(false, |s| s.is_local() && s.path().is_file())
@@ -224,6 +280,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -251,6 +309,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -282,6 +342,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -316,6 +378,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -343,6 +407,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -370,6 +436,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -397,6 +465,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -424,6 +494,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -470,6 +542,8 @@ mod tests {
             exclude: vec![],
             bwlimit: None,
             compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -485,5 +559,80 @@ mod tests {
         let result = cli.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min-size"));
+    }
+
+    #[test]
+    fn test_verification_mode_default() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+        assert_eq!(cli.verification_mode(), VerificationMode::Standard);
+    }
+
+    #[test]
+    fn test_verification_mode_verify_flag_override() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Fast,  // Set to Fast
+            verify: true,                   // But --verify flag should override
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+        // verify flag should override mode to Verify
+        assert_eq!(cli.verification_mode(), VerificationMode::Verify);
+    }
+
+    #[test]
+    fn test_verification_mode_checksum_type_mapping() {
+        assert_eq!(VerificationMode::Fast.checksum_type(), ChecksumType::None);
+        assert_eq!(VerificationMode::Standard.checksum_type(), ChecksumType::Fast);
+        assert_eq!(VerificationMode::Verify.checksum_type(), ChecksumType::Cryptographic);
+        assert_eq!(VerificationMode::Paranoid.checksum_type(), ChecksumType::Cryptographic);
+    }
+
+    #[test]
+    fn test_verification_mode_verify_blocks() {
+        assert!(!VerificationMode::Fast.verify_blocks());
+        assert!(!VerificationMode::Standard.verify_blocks());
+        assert!(!VerificationMode::Verify.verify_blocks());
+        assert!(VerificationMode::Paranoid.verify_blocks());
     }
 }

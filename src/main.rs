@@ -3,6 +3,7 @@ mod compress;
 mod config;
 mod delta;
 mod error;
+mod integrity;
 mod path;
 mod ssh;
 mod sync;
