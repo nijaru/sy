@@ -139,6 +139,12 @@ async fn main() -> Result<()> {
 
     // Create transport router based on source and destination
     let transport = TransportRouter::new(source, destination).await?;
+
+    // Get verification mode
+    let verification_mode = cli.verification_mode();
+    let checksum_type = verification_mode.checksum_type();
+    let verify_on_write = verification_mode.verify_blocks();
+
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,
@@ -153,6 +159,8 @@ async fn main() -> Result<()> {
         cli.checkpoint_files,
         cli.checkpoint_bytes,
         cli.json,
+        checksum_type,
+        verify_on_write,
     );
 
     // Watch mode or regular sync
