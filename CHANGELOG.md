@@ -12,7 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Network speed detection
 - Parallel chunk transfers (within single files)
 - Resume support for interrupted transfers (infrastructure ready)
-- Watch mode for continuous sync
+
+## [0.0.12] - 2025-10-06
+
+### Added
+- **Watch mode** - Continuous file monitoring for real-time sync
+  - `--watch` flag enables watch mode
+  - Initial sync on startup, then monitors for changes
+  - 500ms debouncing to avoid syncing every keystroke
+  - Detects file create, modify, delete events
+  - Graceful Ctrl+C shutdown
+  - Cross-platform (Linux, macOS, Windows via notify crate)
+  - Example: `sy /src /dst --watch`
+
+### Technical
+- Added notify 6.0 dependency for file watching
+- Added tokio "signal" feature for Ctrl+C handling
+- WatchMode struct in src/sync/watch.rs
+- Event filtering (ignores metadata-only changes)
+- All 111 tests passing (+2 watch mode tests)
+
+### Documentation
+- PHASE4_DESIGN.md includes complete watch mode spec
 
 ## [0.0.11] - 2025-10-06
 
@@ -419,7 +440,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.11...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/nijaru/sy/releases/tag/v0.0.12
 [0.0.11]: https://github.com/nijaru/sy/releases/tag/v0.0.11
 [0.0.10]: https://github.com/nijaru/sy/releases/tag/v0.0.10
 [0.0.9]: https://github.com/nijaru/sy/releases/tag/v0.0.9
