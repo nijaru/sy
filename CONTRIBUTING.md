@@ -59,56 +59,55 @@ sy/
 ├── src/
 │   ├── main.rs                 # CLI entry point
 │   ├── cli.rs                  # Argument parsing (clap)
-│   ├── config.rs               # Config file parsing
+│   ├── config.rs               # Config file parsing ✅
 │   │
 │   ├── sync/
 │   │   ├── mod.rs              # Sync orchestration
-│   │   ├── scanner.rs          # Directory traversal
-│   │   ├── strategy.rs         # Transfer strategy selection
-│   │   ├── transfer.rs         # File transfer logic
-│   │   ├── delta.rs            # Rsync algorithm
-│   │   └── resume.rs           # Resume logic
+│   │   ├── scanner.rs          # Directory traversal ✅
+│   │   ├── strategy.rs         # Transfer strategy selection ✅
+│   │   ├── transfer.rs         # File transfer logic ✅
+│   │   ├── resume.rs           # Resume logic ✅
+│   │   ├── watch.rs            # Watch mode ✅
+│   │   ├── output.rs           # JSON output ✅
+│   │   └── ratelimit.rs        # Rate limiting ✅
 │   │
-│   ├── integrity/
+│   ├── delta/                  # Rsync algorithm ✅
 │   │   ├── mod.rs
-│   │   ├── hash.rs             # xxHash3, BLAKE3, Adler-32
-│   │   ├── checksum.rs         # Block-level checksums
-│   │   └── verify.rs           # Verification modes
+│   │   ├── rolling.rs          # Adler-32 rolling hash ✅
+│   │   ├── checksum.rs         # Block checksums ✅
+│   │   ├── generator.rs        # Delta generation ✅
+│   │   └── applier.rs          # Delta application ✅
 │   │
-│   ├── transport/
+│   ├── transport/              # ✅
 │   │   ├── mod.rs
-│   │   ├── local.rs            # Local filesystem
-│   │   ├── ssh.rs              # SSH custom protocol
-│   │   ├── sftp.rs             # SFTP fallback
-│   │   └── network.rs          # Network detection
+│   │   ├── local.rs            # Local filesystem ✅
+│   │   ├── ssh.rs              # SSH transport ✅
+│   │   ├── router.rs           # Path routing ✅
+│   │   └── dual.rs             # Dual transport ✅
 │   │
-│   ├── compress/
+│   ├── ssh/                    # ✅
 │   │   ├── mod.rs
-│   │   ├── zstd.rs             # Zstandard
-│   │   ├── lz4.rs              # LZ4
-│   │   └── adaptive.rs         # Compression selection
+│   │   ├── config.rs           # SSH config parsing ✅
+│   │   └── connect.rs          # Connection management ✅
 │   │
-│   ├── filter/
-│   │   ├── mod.rs
-│   │   ├── gitignore.rs        # Gitignore parser
-│   │   ├── rsync.rs            # Rsync filter rules
-│   │   └── engine.rs           # Filter matching engine
+│   ├── compress/               # ✅
+│   │   └── mod.rs              # Zstd compression ✅
 │   │
-│   ├── progress/
-│   │   ├── mod.rs
-│   │   ├── tracker.rs          # Progress tracking
-│   │   ├── display.rs          # Terminal UI
-│   │   └── eta.rs              # ETA calculation
+│   ├── filter/                 # Planned (Phase 6+)
+│   │   └── (gitignore support via ignore crate for now)
 │   │
-│   ├── metadata/
-│   │   ├── mod.rs
-│   │   ├── permissions.rs      # Unix permissions
-│   │   ├── xattr.rs            # Extended attributes
-│   │   └── acl.rs              # Access control lists
+│   ├── progress/               # Planned (Phase 5+)
+│   │   └── (indicatif for now)
 │   │
-│   ├── error.rs                # Error types
-│   ├── bandwidth.rs            # Token bucket rate limiting
-│   └── ssh_config.rs           # SSH config parsing
+│   ├── metadata/               # Planned (Phase 6+)
+│   │   └── (basic permissions only for now)
+│   │
+│   ├── bin/
+│   │   └── sy-remote.rs        # Remote helper binary ✅
+│   │
+│   ├── error.rs                # Error types ✅
+│   ├── path.rs                 # Path utilities ✅
+│   └── lib.rs                  # Library root ✅
 │
 ├── tests/
 │   ├── integration/            # Integration tests
@@ -127,7 +126,7 @@ sy/
 
 ## Implementation Roadmap
 
-See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
+**Note**: The project follows [docs/MODERNIZATION_ROADMAP.md](docs/MODERNIZATION_ROADMAP.md) for detailed implementation planning. See [DESIGN.md](DESIGN.md) sections 2198-2330 for technical design roadmap.
 
 ### ✅ Phase 1: MVP - **COMPLETE** (v0.0.1)
 **Goal**: Basic local sync working
@@ -172,16 +171,15 @@ See [DESIGN.md](DESIGN.md) sections 2198-2330 for complete roadmap details.
 
 **Deliverable**: ✅ Production-ready sync with 2-11x performance vs rsync
 
-### Phase 4: Advanced Features - **NEXT** (v0.1.0+)
-**Goal**: Network detection and resume support
+### ✅ Phase 4: Modern Features - **COMPLETE** (v0.0.11-v0.0.13)
+**Goal**: JSON output, config profiles, watch mode, and resume support
 
-- [ ] Network speed detection (Local/LAN/WAN)
-- [ ] Parallel chunk transfers for very large files
-- [ ] Resume support for interrupted transfers
-- [ ] End-to-end cryptographic checksums (BLAKE3)
-- [ ] Config file support
+- [x] JSON output (v0.0.11) - Machine-readable NDJSON format
+- [x] Config profiles (v0.0.11) - Reusable configurations
+- [x] Watch mode (v0.0.12) - Continuous sync with file watching
+- [x] Resume support (v0.0.13) - Automatic recovery from interrupts
 
-**Deliverable**: Adaptive performance and reliability features
+**Deliverable**: ✅ Modern CLI features for scripting and automation
 
 ### Phase 5: Reliability (v0.5.0)
 **Goal**: Multi-layer integrity
@@ -204,7 +202,7 @@ See [DESIGN.md](DESIGN.md) for:
 
 ## Testing Strategy
 
-**Current Status**: 100+ tests across unit, integration, and performance categories.
+**Current Status**: 111 tests across unit, integration, and performance categories.
 
 ### Unit Tests (83 tests)
 Located in `src/*/tests.rs` modules:
