@@ -40,6 +40,8 @@ pub enum SyncEvent {
         files_deleted: usize,
         bytes_transferred: u64,
         duration_secs: f64,
+        files_verified: usize,
+        verification_failures: usize,
     },
 }
 
@@ -105,11 +107,15 @@ mod tests {
             files_deleted: 2,
             bytes_transferred: 123456,
             duration_secs: 12.5,
+            files_verified: 15,
+            verification_failures: 0,
         };
 
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"summary"#));
         assert!(json.contains(r#""files_created":10"#));
         assert!(json.contains(r#""duration_secs":12.5"#));
+        assert!(json.contains(r#""files_verified":15"#));
+        assert!(json.contains(r#""verification_failures":0"#));
     }
 }

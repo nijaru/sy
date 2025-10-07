@@ -312,9 +312,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let rate_limiter = rate_limiter.clone();
             let resume_state = Arc::clone(&resume_state);
             let dest_path_for_checkpoint = destination.to_path_buf();
+            let verification_mode = self.verification_mode;
+            let verify_on_write = self.verify_on_write;
 
             let handle = tokio::spawn(async move {
                 let transferrer = Transferrer::new(transport.as_ref(), dry_run);
+                let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
                 // Update progress message
                 let msg = match &task.action {
@@ -365,6 +368,36 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
+                                            }
+                                        }
+                                    }
+
+                                    // Verify transfer if verification is enabled
+                                    if verification_mode != ChecksumType::None && !dry_run {
+                                        let source_path = &source.path;
+                                        let dest_path = &task.dest_path;
+
+                                        match verifier.verify_transfer(source_path, dest_path) {
+                                            Ok(verified) => {
+                                                let mut stats = stats.lock().unwrap();
+                                                if verified {
+                                                    stats.files_verified += 1;
+                                                } else {
+                                                    stats.verification_failures += 1;
+                                                    tracing::warn!(
+                                                        "Verification failed for {}: checksums do not match",
+                                                        dest_path.display()
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Verification error for {}: {}",
+                                                    dest_path.display(),
+                                                    e
+                                                );
+                                                let mut stats = stats.lock().unwrap();
+                                                stats.verification_failures += 1;
                                             }
                                         }
                                     }
@@ -440,6 +473,36 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
+                                            }
+                                        }
+                                    }
+
+                                    // Verify transfer if verification is enabled
+                                    if verification_mode != ChecksumType::None && !dry_run {
+                                        let source_path = &source.path;
+                                        let dest_path = &task.dest_path;
+
+                                        match verifier.verify_transfer(source_path, dest_path) {
+                                            Ok(verified) => {
+                                                let mut stats = stats.lock().unwrap();
+                                                if verified {
+                                                    stats.files_verified += 1;
+                                                } else {
+                                                    stats.verification_failures += 1;
+                                                    tracing::warn!(
+                                                        "Verification failed for {}: checksums do not match",
+                                                        dest_path.display()
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Verification error for {}: {}",
+                                                    dest_path.display(),
+                                                    e
+                                                );
+                                                let mut stats = stats.lock().unwrap();
+                                                stats.verification_failures += 1;
                                             }
                                         }
                                     }
@@ -559,6 +622,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 files_deleted: final_stats.files_deleted,
                 bytes_transferred: final_stats.bytes_transferred,
                 duration_secs: final_stats.duration.as_secs_f64(),
+                files_verified: final_stats.files_verified,
+                verification_failures: final_stats.verification_failures,
             }.emit();
         }
 
@@ -643,6 +708,32 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
             }
             stats.files_created = 1;
+
+            // Verify transfer if verification is enabled
+            if self.verification_mode != ChecksumType::None && !self.dry_run {
+                let verifier = IntegrityVerifier::new(self.verification_mode, self.verify_on_write);
+                match verifier.verify_transfer(source, destination) {
+                    Ok(verified) => {
+                        if verified {
+                            stats.files_verified = 1;
+                        } else {
+                            stats.verification_failures = 1;
+                            tracing::warn!(
+                                "Verification failed for {}: checksums do not match",
+                                destination.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Verification error for {}: {}",
+                            destination.display(),
+                            e
+                        );
+                        stats.verification_failures = 1;
+                    }
+                }
+            }
         } else {
             // Update existing file
             tracing::info!("Updating {}", destination.display());
@@ -678,6 +769,32 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
             }
             stats.files_updated = 1;
+
+            // Verify transfer if verification is enabled
+            if self.verification_mode != ChecksumType::None && !self.dry_run {
+                let verifier = IntegrityVerifier::new(self.verification_mode, self.verify_on_write);
+                match verifier.verify_transfer(source, destination) {
+                    Ok(verified) => {
+                        if verified {
+                            stats.files_verified = 1;
+                        } else {
+                            stats.verification_failures = 1;
+                            tracing::warn!(
+                                "Verification failed for {}: checksums do not match",
+                                destination.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Verification error for {}: {}",
+                            destination.display(),
+                            e
+                        );
+                        stats.verification_failures = 1;
+                    }
+                }
+            }
         }
 
         stats.duration = start_time.elapsed();
