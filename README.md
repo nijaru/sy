@@ -21,8 +21,9 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
-🔨 **Phase 5 In Progress** - BLAKE3 verification modes implemented! Crash recovery next.
-🚀 **Current Version: v0.0.14-dev** - 131 tests passing, zero errors!
+✅ **Phase 5 Core Complete** - BLAKE3 verification + symlink support! (v0.0.14-v0.0.15)
+🔨 **Phase 6 In Progress** - Sparse files and extended attributes next.
+🚀 **Current Version: v0.0.15-dev** - 146 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -111,6 +112,11 @@ sy /source /destination --mode fast                    # Size + mtime only (fast
 sy /source /destination --mode standard                # + xxHash3 checksums (default)
 sy /source /destination --mode verify                  # + BLAKE3 end-to-end (cryptographic)
 sy /source /destination --mode paranoid                # BLAKE3 + verify every block (slowest)
+
+# Symlink handling (new in v0.0.15+)
+sy /source /destination --links preserve               # Preserve symlinks as symlinks (default)
+sy /source /destination -L                             # Follow symlinks and copy targets
+sy /source /destination --links skip                   # Skip all symlinks
 ```
 
 ## Features
@@ -212,6 +218,12 @@ sy /source /destination --mode paranoid                # BLAKE3 + verify every b
   - Verifies source and destination match after transfer
   - Fast parallel hashing (multi-threaded by default)
   - Detects silent corruption that TCP checksums miss
+- **Symlink Support** (v0.0.15):
+  - **Preserve** (default): Copy symlinks as symlinks
+  - **Follow** (`-L`): Copy the symlink target file
+  - **Skip**: Ignore all symlinks
+  - Detects broken symlinks and logs warnings
+  - Cross-platform (Unix/Linux/macOS)
 
 ### 📋 Common Use Cases
 
