@@ -66,6 +66,25 @@ impl VerificationMode {
     }
 }
 
+/// Symlink handling mode
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SymlinkMode {
+    /// Preserve symlinks as symlinks (default)
+    Preserve,
+
+    /// Follow symlinks and copy targets
+    Follow,
+
+    /// Skip all symlinks
+    Skip,
+}
+
+impl Default for SymlinkMode {
+    fn default() -> Self {
+        Self::Preserve
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "sy")]
 #[command(about = "Modern file synchronization tool", long_about = None)]
@@ -178,6 +197,14 @@ pub struct Cli {
     #[arg(long)]
     pub compress: bool,
 
+    /// Symlink handling mode (preserve, follow, skip)
+    #[arg(long, value_enum, default_value = "preserve")]
+    pub links: SymlinkMode,
+
+    /// Follow symlinks and copy targets (shortcut for --links follow)
+    #[arg(short = 'L', long)]
+    pub copy_links: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -243,6 +270,15 @@ impl Cli {
         }
     }
 
+    /// Get the effective symlink mode (applying --copy-links flag override)
+    pub fn symlink_mode(&self) -> SymlinkMode {
+        if self.copy_links {
+            SymlinkMode::Follow
+        } else {
+            self.links
+        }
+    }
+
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
         self.source.as_ref().map_or(false, |s| s.is_local() && s.path().is_file())
@@ -290,6 +326,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -320,6 +358,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -354,6 +394,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -391,6 +433,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -421,6 +465,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -451,6 +497,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -481,6 +529,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -511,6 +561,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -560,6 +612,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -593,6 +647,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -623,6 +679,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
             json: false,
             watch: false,
             profile: None,
@@ -649,5 +707,101 @@ mod tests {
         assert!(!VerificationMode::Standard.verify_blocks());
         assert!(!VerificationMode::Verify.verify_blocks());
         assert!(VerificationMode::Paranoid.verify_blocks());
+    }
+
+    #[test]
+    fn test_symlink_mode_default() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+        assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
+    }
+
+    #[test]
+    fn test_symlink_mode_copy_links_override() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Skip,  // Should be overridden
+            copy_links: true,           // Override to Follow
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+        assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
+    }
+
+    #[test]
+    fn test_symlink_mode_skip() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Skip,
+            copy_links: false,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+        assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
 }
