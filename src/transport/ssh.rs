@@ -193,6 +193,8 @@ impl Transport for SshTransport {
                     is_dir: e.is_dir,
                     is_symlink: false,  // TODO: Add symlink detection for SSH
                     symlink_target: None,
+                    is_sparse: false,  // TODO: Add sparse detection for SSH
+                    allocated_size: e.size,
                 })
             })
             .collect();
