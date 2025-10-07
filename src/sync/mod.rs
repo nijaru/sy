@@ -9,6 +9,7 @@ mod ratelimit;
 use crate::error::Result;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
+use resume::{CompletedFile, ResumeState, SyncFlags};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
 use scanner::FileEntry;
@@ -163,11 +164,69 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tracing::info!("Filtered out {} files", filtered_count);
         }
 
+        // Load or create resume state
+        let current_flags = SyncFlags {
+            delete: self.delete,
+            exclude: self.exclude_patterns.iter().map(|p| p.as_str().to_string()).collect(),
+            min_size: self.min_size,
+            max_size: self.max_size,
+        };
+
+        let mut resume_state = if self.resume {
+            match ResumeState::load(destination)? {
+                Some(state) => {
+                    if state.is_compatible_with(&current_flags) {
+                        let (completed, total) = state.progress();
+                        tracing::info!("Resuming sync: {} of {} files already completed", completed, total);
+                        if !self.quiet {
+                            println!("📋 Resuming previous sync ({}/{} files completed)", completed, total);
+                        }
+                        Some(state)
+                    } else {
+                        tracing::warn!("Resume state incompatible (flags changed), starting fresh");
+                        if !self.quiet {
+                            println!("⚠️  Resume state incompatible, starting fresh sync");
+                        }
+                        ResumeState::delete(destination)?;
+                        Some(ResumeState::new(
+                            source.to_path_buf(),
+                            destination.to_path_buf(),
+                            current_flags,
+                            source_files.len(),
+                        ))
+                    }
+                }
+                None => {
+                    // No existing state, create new one
+                    Some(ResumeState::new(
+                        source.to_path_buf(),
+                        destination.to_path_buf(),
+                        current_flags,
+                        source_files.len(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
+        // Get set of completed files for filtering
+        let completed_paths = resume_state
+            .as_ref()
+            .map(|s| s.completed_paths())
+            .unwrap_or_default();
+
         // Plan sync operations
         let planner = StrategyPlanner::new();
         let mut tasks = Vec::with_capacity(source_files.len());
 
         for file in &source_files {
+            // Skip files that are already completed (if resuming)
+            if !completed_paths.is_empty() && completed_paths.contains(&file.relative_path) {
+                tracing::debug!("Skipping completed file: {}", file.relative_path.display());
+                continue;
+            }
+
             let task = planner
                 .plan_file_async(file, destination, &self.transport)
                 .await?;
@@ -188,6 +247,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 total_files: tasks.len(),
             }.emit();
         }
+
+        // Wrap resume state for thread-safe access
+        let resume_state = Arc::new(Mutex::new(resume_state));
+        let checkpoint_files = self.checkpoint_files;
+        let checkpoint_bytes = self.checkpoint_bytes;
 
         // Execute sync operations in parallel
         // Thread-safe stats tracking
@@ -235,6 +299,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let pb = pb.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let rate_limiter = rate_limiter.clone();
+            let resume_state = Arc::clone(&resume_state);
+            let dest_path_for_checkpoint = destination.to_path_buf();
 
             let handle = tokio::spawn(async move {
                 let transferrer = Transferrer::new(transport.as_ref(), dry_run);
@@ -483,6 +549,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 bytes_transferred: final_stats.bytes_transferred,
                 duration_secs: final_stats.duration.as_secs_f64(),
             }.emit();
+        }
+
+        // Clean up resume state on successful completion
+        if let Ok(mut state_guard) = resume_state.lock() {
+            if let Some(ref state) = *state_guard {
+                // Only clean up if this was an actual resume operation
+                // (Don't clean up if we just created a new state that was never saved)
+                if ResumeState::load(destination)?.is_some() {
+                    tracing::debug!("Cleaning up resume state file");
+                    if let Err(e) = ResumeState::delete(destination) {
+                        tracing::warn!("Failed to delete resume state: {}", e);
+                    }
+                }
+            }
+            // Drop the state
+            *state_guard = None;
         }
 
         // Return first error if any occurred
