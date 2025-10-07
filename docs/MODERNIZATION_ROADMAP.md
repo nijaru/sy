@@ -1,7 +1,7 @@
 # Modernization Roadmap - sy v0.1.0 → v1.0
 
-**Status**: In Progress - Phase 4 Complete! (2025-10-06)
-**Current Version**: v0.0.13
+**Status**: In Progress - Phase 5 Started! (2025-10-07)
+**Current Version**: v0.0.14-dev
 **Goal**: Make sy a complete modern rsync replacement for 90%+ of use cases
 
 ---
@@ -128,31 +128,37 @@ Looking at successful modern CLI tools:
 
 ---
 
-### Phase 5 (v0.2.0) - Verification & Reliability
+### Phase 5 (v0.0.14-v0.2.0) - Verification & Reliability 🔨 **IN PROGRESS**
 **Goal**: Multi-layer integrity verification
 
-**Timeline**: 2 weeks
+**Timeline**: 2 weeks (started 2025-10-07)
+
+**Status**: Verification modes implemented! Crash recovery next.
 
 **Features**:
-1. **BLAKE3 end-to-end verification**
+1. ✅ **BLAKE3 end-to-end verification** (v0.0.14)
    - Optional cryptographic checksums (slower but verifiable)
    - `--verify` flag enables BLAKE3
    - Per-file verification after transfer
    - Paranoid mode: verify every block
+   - Stats displayed in summary output
+   - JSON output includes verification counts
 
-2. **Verification modes**
-   - `--mode fast` - Size + mtime only (current default)
-   - `--mode standard` - + xxHash3 checksums
+2. ✅ **Verification modes** (v0.0.14)
+   - `--mode fast` - Size + mtime only
+   - `--mode standard` - + xxHash3 checksums (default)
    - `--mode verify` - + BLAKE3 end-to-end
    - `--mode paranoid` - BLAKE3 + verify on read/write
+   - Verification runs automatically after transfers
+   - Failures logged with clear warnings
 
-3. **Crash recovery**
+3. ⏳ **Crash recovery** (TODO)
    - Transaction log for multi-file operations
    - Rollback incomplete operations
    - Detect corrupted state files
    - Self-healing: re-verify checksums
 
-4. **Atomic operations**
+4. ⏳ **Atomic operations** (TODO)
    - Already implemented (write to temp, rename)
    - Document and test thoroughly
    - Add `--no-atomic` for filesystems without rename
