@@ -696,6 +696,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 size: metadata.len(),
                 modified: metadata.modified()?,
                 is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 
@@ -749,6 +751,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 size: metadata.len(),
                 modified: metadata.modified()?,
                 is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 

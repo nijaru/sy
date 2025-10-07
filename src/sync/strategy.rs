@@ -184,6 +184,8 @@ mod tests {
             size: 100,
             modified: SystemTime::now(),
             is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -206,6 +208,8 @@ mod tests {
             size: 7, // "content".len()
             modified: SystemTime::now(),
             is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -228,6 +232,8 @@ mod tests {
             size: 100, // Different size
             modified: SystemTime::now(),
             is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
         };
 
         let planner = StrategyPlanner::new();
