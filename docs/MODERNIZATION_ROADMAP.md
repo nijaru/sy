@@ -133,7 +133,7 @@ Looking at successful modern CLI tools:
 
 **Timeline**: 2 weeks (started 2025-10-07)
 
-**Status**: Verification modes implemented! Crash recovery next.
+**Status**: Core verification features complete! Transaction log deferred to later.
 
 **Features**:
 1. ✅ **BLAKE3 end-to-end verification** (v0.0.14)
@@ -152,18 +152,25 @@ Looking at successful modern CLI tools:
    - Verification runs automatically after transfers
    - Failures logged with clear warnings
 
-3. ⏳ **Crash recovery** (TODO)
-   - Transaction log for multi-file operations
-   - Rollback incomplete operations
-   - Detect corrupted state files
-   - Self-healing: re-verify checksums
+3. ✅ **State file hardening** (v0.0.14)
+   - Comprehensive integrity checks on resume state
+   - Auto-delete corrupted state files
+   - Version, path, timestamp, and count validation
+   - 8 new tests for corruption scenarios
+   - `--clean-state` flag to force fresh sync
 
-4. ⏳ **Atomic operations** (TODO)
+4. ⏳ **Advanced crash recovery** (Deferred to v0.5.0+)
+   - Transaction log for file-level rollback
+   - Per-operation tracking (start/write/commit/complete)
+   - Automatic recovery on restart
+   - **Note**: Current resume support already handles interrupted syncs well
+
+5. ⏳ **Atomic operations** (Deferred to v0.5.0+)
    - Already implemented (write to temp, rename)
-   - Document and test thoroughly
-   - Add `--no-atomic` for filesystems without rename
+   - `--no-atomic` flag for special filesystems
+   - **Note**: Current implementation is atomic by default
 
-**Deliverable**: Verifiable integrity for critical data
+**Deliverable**: ✅ Verifiable integrity for critical data (core features complete)
 
 ---
 
