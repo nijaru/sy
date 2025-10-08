@@ -333,6 +333,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let symlink_mode = self.symlink_mode;
             let preserve_xattrs = self.preserve_xattrs;
             let preserve_hardlinks = self.preserve_hardlinks;
+            let preserve_acls = self.preserve_acls;
             let hardlink_map = Arc::clone(&hardlink_map);
 
             let handle = tokio::spawn(async move {
@@ -342,6 +343,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     symlink_mode,
                     preserve_xattrs,
                     preserve_hardlinks,
+                    preserve_acls,
                     hardlink_map,
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -716,6 +718,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.symlink_mode,
             self.preserve_xattrs,
             self.preserve_hardlinks,
+            self.preserve_acls,
             hardlink_map,
         );
 
