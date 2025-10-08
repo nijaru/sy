@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
         symlink_mode,
         cli.preserve_xattrs,
         cli.preserve_hardlinks,
+        cli.preserve_acls,
     );
 
     // Watch mode or regular sync
