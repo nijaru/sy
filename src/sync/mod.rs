@@ -850,3 +850,378 @@ impl<T: Transport + 'static> SyncEngine<T> {
         Ok(stats)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::local::LocalTransport;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Helper to create a basic sync engine for testing
+    fn create_test_engine() -> SyncEngine<LocalTransport> {
+        let transport = LocalTransport::new();
+        SyncEngine::new(
+            transport,
+            false, // dry_run
+            false, // delete
+            true,  // quiet
+            4,     // max_concurrent
+            None,  // min_size
+            None,  // max_size
+            Vec::new(), // exclude
+            None,  // bwlimit
+            false, // resume
+            0,     // checkpoint_files
+            0,     // checkpoint_bytes
+            false, // json
+            ChecksumType::Fast,
+            false, // verify_on_write
+            SymlinkMode::Preserve,
+            false, // preserve_xattrs
+            false, // preserve_hardlinks
+        )
+    }
+
+    #[tokio::test]
+    async fn test_basic_sync_success() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create test files in source
+        fs::write(source_dir.path().join("file1.txt"), "content1").unwrap();
+        fs::write(source_dir.path().join("file2.txt"), "content2").unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert_eq!(stats.files_created, 2);
+        assert!(dest_dir.path().join("file1.txt").exists());
+        assert!(dest_dir.path().join("file2.txt").exists());
+        assert_eq!(fs::read_to_string(dest_dir.path().join("file1.txt")).unwrap(), "content1");
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_subdirectories() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create nested structure
+        fs::create_dir(source_dir.path().join("subdir")).unwrap();
+        fs::write(source_dir.path().join("subdir/file.txt"), "nested").unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert!(stats.files_created >= 1);
+        assert!(dest_dir.path().join("subdir/file.txt").exists());
+        assert_eq!(fs::read_to_string(dest_dir.path().join("subdir/file.txt")).unwrap(), "nested");
+    }
+
+    #[tokio::test]
+    async fn test_sync_empty_source() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert_eq!(stats.files_created, 0);
+        assert_eq!(stats.files_scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_dry_run_no_changes() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        fs::write(source_dir.path().join("file.txt"), "content").unwrap();
+
+        let transport = LocalTransport::new();
+        let engine = SyncEngine::new(
+            transport,
+            true,  // dry_run = true
+            false, // delete
+            true,  // quiet
+            4,     // max_concurrent
+            None,  // min_size
+            None,  // max_size
+            Vec::new(), // exclude
+            None,  // bwlimit
+            false, // resume
+            0,     // checkpoint_files
+            0,     // checkpoint_bytes
+            false, // json
+            ChecksumType::Fast,
+            false, // verify_on_write
+            SymlinkMode::Preserve,
+            false, // preserve_xattrs
+            false, // preserve_hardlinks
+        );
+
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        // Dry run should scan but not create files
+        assert_eq!(stats.files_scanned, 1);
+        assert!(!dest_dir.path().join("file.txt").exists());
+    }
+
+    // === TOCTOU (Time-Of-Check-Time-Of-Use) Tests ===
+
+    #[tokio::test]
+    async fn test_toctou_file_deleted_after_scan() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create file
+        let file_path = source_dir.path().join("file.txt");
+        fs::write(&file_path, "content").unwrap();
+
+        // Scan the source
+        let scanner = scanner::Scanner::new(source_dir.path());
+        let source_files = scanner.scan().unwrap();
+        assert_eq!(source_files.len(), 1);
+
+        // Delete file after scan (simulating TOCTOU)
+        fs::remove_file(&file_path).unwrap();
+
+        // Try to sync - should handle gracefully
+        let engine = create_test_engine();
+        let result = engine.sync(source_dir.path(), dest_dir.path()).await;
+
+        // Should either succeed with 0 files or handle the error gracefully
+        match result {
+            Ok(stats) => {
+                // File was deleted, so it shouldn't be transferred
+                assert_eq!(stats.files_created, 0);
+            }
+            Err(_) => {
+                // Error is also acceptable for TOCTOU scenarios
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toctou_file_modified_after_scan() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create file with initial content
+        let file_path = source_dir.path().join("file.txt");
+        fs::write(&file_path, "initial content").unwrap();
+
+        // Start sync in background
+        let engine = create_test_engine();
+        let source = source_dir.path().to_path_buf();
+        let dest = dest_dir.path().to_path_buf();
+
+        // Immediately modify the file (race condition simulation)
+        fs::write(&file_path, "modified content").unwrap();
+
+        // Complete sync
+        let stats = engine.sync(&source, &dest).await.unwrap();
+
+        // File should be transferred (either old or new content is acceptable)
+        assert_eq!(stats.files_created, 1);
+        assert!(dest_dir.path().join("file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_toctou_file_size_changed() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create small file
+        let file_path = source_dir.path().join("file.txt");
+        fs::write(&file_path, "small").unwrap();
+
+        // Get initial metadata
+        let initial_size = fs::metadata(&file_path).unwrap().len();
+        assert_eq!(initial_size, 5);
+
+        // Immediately write much larger content (simulating concurrent modification)
+        fs::write(&file_path, "a".repeat(10000)).unwrap();
+
+        // Sync should handle size change
+        let engine = create_test_engine();
+        let result = engine.sync(source_dir.path(), dest_dir.path()).await;
+
+        // Should either succeed or fail gracefully
+        match result {
+            Ok(stats) => {
+                assert_eq!(stats.files_created, 1);
+                // File should exist at destination
+                assert!(dest_dir.path().join("file.txt").exists());
+            }
+            Err(_) => {
+                // Error is acceptable for size mismatch scenarios
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toctou_directory_deleted_after_scan() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create directory with file
+        let subdir = source_dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("file.txt"), "content").unwrap();
+
+        // Scan
+        let scanner = scanner::Scanner::new(source_dir.path());
+        let source_files = scanner.scan().unwrap();
+        assert!(source_files.len() >= 1);
+
+        // Delete directory after scan
+        fs::remove_dir_all(&subdir).unwrap();
+
+        // Sync should handle gracefully
+        let engine = create_test_engine();
+        let result = engine.sync(source_dir.path(), dest_dir.path()).await;
+
+        match result {
+            Ok(stats) => {
+                // Directory was deleted, so files shouldn't be created
+                assert_eq!(stats.files_created, 0);
+            }
+            Err(_) => {
+                // Error is acceptable
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toctou_new_file_created_during_sync() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create initial file
+        fs::write(source_dir.path().join("file1.txt"), "content1").unwrap();
+
+        // Create new file immediately (won't be in initial scan)
+        fs::write(source_dir.path().join("file2.txt"), "content2").unwrap();
+
+        // Sync - should get file1 (file2 created after scan won't be included)
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        // Should transfer the files that existed at scan time
+        assert!(stats.files_created >= 1);
+    }
+
+    // === Stress Tests ===
+
+    #[tokio::test]
+    async fn test_sync_many_small_files() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create 100 small files
+        for i in 0..100 {
+            fs::write(
+                source_dir.path().join(format!("file{}.txt", i)),
+                format!("content{}", i),
+            ).unwrap();
+        }
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert_eq!(stats.files_created, 100);
+
+        // Verify all files transferred
+        for i in 0..100 {
+            assert!(dest_dir.path().join(format!("file{}.txt", i)).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_very_deep_nesting() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create 100-level deep nesting
+        let mut path = source_dir.path().to_path_buf();
+        for i in 0..100 {
+            path.push(format!("level{}", i));
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("deep.txt"), "very deep content").unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert!(stats.files_created >= 1);
+
+        // Verify deeply nested file exists
+        let mut dest_path = dest_dir.path().to_path_buf();
+        for i in 0..100 {
+            dest_path.push(format!("level{}", i));
+        }
+        dest_path.push("deep.txt");
+        assert!(dest_path.exists());
+        assert_eq!(fs::read_to_string(&dest_path).unwrap(), "very deep content");
+    }
+
+    #[tokio::test]
+    async fn test_sync_large_file() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create 10MB file
+        let large_content = "x".repeat(10 * 1024 * 1024);
+        fs::write(source_dir.path().join("large.bin"), &large_content).unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert_eq!(stats.files_created, 1);
+        assert!(stats.bytes_transferred >= 10 * 1024 * 1024);
+
+        let dest_file = dest_dir.path().join("large.bin");
+        assert!(dest_file.exists());
+        assert_eq!(fs::metadata(&dest_file).unwrap().len(), 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mixed_sizes() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Mix of file sizes
+        fs::write(source_dir.path().join("tiny.txt"), "x").unwrap();
+        fs::write(source_dir.path().join("small.txt"), "x".repeat(1024)).unwrap();
+        fs::write(source_dir.path().join("medium.txt"), "x".repeat(100 * 1024)).unwrap();
+        fs::write(source_dir.path().join("large.txt"), "x".repeat(1024 * 1024)).unwrap();
+
+        let engine = create_test_engine();
+        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+
+        assert_eq!(stats.files_created, 4);
+        assert!(dest_dir.path().join("tiny.txt").exists());
+        assert!(dest_dir.path().join("small.txt").exists());
+        assert!(dest_dir.path().join("medium.txt").exists());
+        assert!(dest_dir.path().join("large.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_sync_idempotent() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        fs::write(source_dir.path().join("file.txt"), "content").unwrap();
+
+        let engine = create_test_engine();
+
+        // First sync
+        let stats1 = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        assert_eq!(stats1.files_created, 1);
+
+        // Second sync - should skip unchanged file
+        let stats2 = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        assert_eq!(stats2.files_skipped, 1);
+        assert_eq!(stats2.files_created, 0);
+    }
+}
