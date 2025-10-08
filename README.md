@@ -22,9 +22,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
 ✅ **Phase 5 Complete** - BLAKE3 verification, symlinks, sparse files, xattrs! (v0.0.14-v0.0.16)
-✅ **Phase 6 Core Complete** - Hardlink preservation! (v0.0.17)
-🔨 **Phase 6 In Progress** - ACLs next.
-🚀 **Current Version: v0.0.17** - 156 tests passing, zero errors!
+✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17+)
+🚀 **Current Version: v0.0.17** - 208 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -122,6 +121,10 @@ sy /source /destination --links skip                   # Skip all symlinks
 # Hardlink preservation (new in v0.0.17+)
 sy /source /destination -H                             # Preserve hard links
 sy /source /destination --preserve-hardlinks           # Same as -H
+
+# ACL preservation (new in v0.0.17+)
+sy /source /destination -A                             # Preserve ACLs (Unix/Linux/macOS)
+sy /source /destination --preserve-acls                # Same as -A
 ```
 
 ## Features
@@ -248,6 +251,13 @@ sy /source /destination --preserve-hardlinks           # Same as -H
   - Preserves disk space savings from source to destination
   - Critical for backup systems, package managers, etc.
   - Cross-platform (Unix/Linux/macOS)
+- **ACL Preservation** (v0.0.17+):
+  - `-A` flag to preserve POSIX Access Control Lists
+  - Always scanned, conditionally preserved (minimal overhead)
+  - Preserves fine-grained permissions beyond owner/group/other
+  - Essential for enterprise systems with complex permission models
+  - Cross-platform (Unix/Linux/macOS)
+  - Note: Full ACL writing pending (infrastructure complete)
 
 ### 📋 Common Use Cases
 
