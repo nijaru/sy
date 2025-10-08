@@ -365,10 +365,10 @@ Looking at successful modern CLI tools:
 
 ---
 
-## Feature Comparison: sy v1.0 vs Competition
+## Feature Comparison: sy v0.0.17 vs Competition
 
-| Feature | rsync | rclone | sy v0.0.16 | sy v1.0 (planned) |
-|---------|-------|--------|------------|-------------------|
+| Feature | rsync | rclone | **sy v0.0.17** | sy v1.0 (planned) |
+|---------|-------|--------|----------------|-------------------|
 | **Performance (local)** | baseline | N/A | **2-11x faster** ✅ | **2-11x faster** ✅ |
 | **Performance (network)** | baseline | 4x with --transfers | **5-10x faster** ✅ | **5-10x faster** ✅ |
 | **Delta sync** | ✅ | ❌ | ✅ v0.0.7 | ✅ |
@@ -378,8 +378,8 @@ Looking at successful modern CLI tools:
 | **Symlinks** | ✅ | ✅ | ✅ v0.0.15 | ✅ |
 | **Sparse files** | ✅ | ❌ | ✅ v0.0.15 | ✅ |
 | **Extended attributes** | ✅ | ❌ | ✅ v0.0.16 | ✅ |
-| **ACLs** | ✅ | ❌ | ⏳ | ✅ (Phase 6) |
-| **Hardlinks** | ✅ | ❌ | ⏳ | ✅ (Phase 6) |
+| **Hardlinks** | ✅ | ❌ | **✅ v0.0.17** | ✅ |
+| **ACLs** | ✅ | ❌ | ⏳ Next | ✅ (Phase 6) |
 | **Cloud storage** | ❌ | ✅ | ❌ | ✅ (Phase 8) |
 | **Watch mode** | ❌ | ❌ | ✅ v0.0.12 | ✅ |
 | **JSON output** | ❌ | ✅ | ✅ v0.0.11 | ✅ |
