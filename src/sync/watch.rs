@@ -1,5 +1,3 @@
-use crate::cli::SymlinkMode;
-use crate::integrity::ChecksumType;
 use crate::sync::SyncEngine;
 use crate::transport::Transport;
 use anyhow::Result;
@@ -8,6 +6,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tokio::signal;
+
+#[cfg(test)]
+use crate::cli::SymlinkMode;
+#[cfg(test)]
+use crate::integrity::ChecksumType;
 
 pub struct WatchMode<T: Transport> {
     engine: SyncEngine<T>,
