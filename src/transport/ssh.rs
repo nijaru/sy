@@ -198,6 +198,7 @@ impl Transport for SshTransport {
                     xattrs: None,  // TODO: Add xattr support for SSH
                     inode: None,  // TODO: Add hardlink detection for SSH
                     nlink: 1,
+                    acls: None,  // TODO: Add ACL support for SSH
                 })
             })
             .collect();
