@@ -12,6 +12,7 @@ pub struct Transferrer<'a, T: Transport> {
     symlink_mode: SymlinkMode,
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
+    preserve_acls: bool,
     hardlink_map: Arc<Mutex<HashMap<u64, PathBuf>>>, // inode -> first destination path
 }
 
@@ -22,6 +23,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         symlink_mode: SymlinkMode,
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
+        preserve_acls: bool,
         hardlink_map: Arc<Mutex<HashMap<u64, PathBuf>>>,
     ) -> Self {
         Self {
@@ -30,6 +32,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             symlink_mode,
             preserve_xattrs,
             preserve_hardlinks,
+            preserve_acls,
             hardlink_map,
         }
     }
@@ -91,6 +94,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                         // Write extended attributes if present
                         self.write_xattrs(source, dest_path).await?;
 
+                        // Write ACLs if present
+                        self.write_acls(source, dest_path).await?;
+
                         return Ok(Some(result));
                     }
                 }
@@ -101,6 +107,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
             // Write extended attributes if present
             self.write_xattrs(source, dest_path).await?;
+
+            // Write ACLs if present
+            self.write_acls(source, dest_path).await?;
 
             Ok(Some(result))
         }
@@ -120,6 +129,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
             // Write extended attributes if present
             self.write_xattrs(source, dest_path).await?;
+
+            // Write ACLs if present
+            self.write_acls(source, dest_path).await?;
 
             tracing::info!("Updated: {} -> {}", source.path.display(), dest_path.display());
             Ok(Some(result))
@@ -185,6 +197,58 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             .await
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
         }
+        Ok(())
+    }
+
+    async fn write_acls(&self, file_entry: &FileEntry, dest_path: &Path) -> Result<()> {
+        if !self.preserve_acls {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            if let Some(ref acls_bytes) = file_entry.acls {
+                if acls_bytes.is_empty() {
+                    return Ok(());
+                }
+
+                let dest_path = dest_path.to_path_buf();
+                let acls_bytes = acls_bytes.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    // Parse ACL text back to string
+                    let _acls_text = match String::from_utf8(acls_bytes) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            tracing::warn!("Failed to parse ACL text for {}: {}", dest_path.display(), e);
+                            return;
+                        }
+                    };
+
+                    // For now, we'll log that ACLs were detected but skip writing
+                    // A full implementation would parse the Debug format back to AclEntry
+                    //
+                    // The challenge is that we store ACLs as Debug format text,
+                    // but exacl doesn't provide a way to parse that back to AclEntry.
+                    // We would need to either:
+                    // 1. Store ACLs in a different format (e.g., text representation)
+                    // 2. Implement a parser for the Debug format
+                    // 3. Use getfacl/setfacl from the exacl crate more directly
+                    //
+                    // For now, this is a placeholder that detects ACLs but doesn't write them.
+                    tracing::debug!("ACLs detected for {} (preservation placeholder)", dest_path.display());
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            // ACLs not supported on non-Unix platforms
+            let _ = (file_entry, dest_path);
+        }
+
         Ok(())
     }
 
@@ -296,7 +360,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -330,7 +394,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false, false, hardlink_map); // dry_run = true
+        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false, false, false, hardlink_map); // dry_run = true
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -360,7 +424,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
         let dest_path = dest_dir.path().join("subdir");
         transferrer.create(&dir_entry, &dest_path).await.unwrap();
 
@@ -403,7 +467,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -448,7 +512,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false, false, false, hardlink_map);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -493,7 +557,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Skip, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Skip, false, false, false, hardlink_map);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -536,7 +600,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, true, false, hardlink_map); // preserve_xattrs = true
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, true, false, false, hardlink_map); // preserve_xattrs = true
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -580,7 +644,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map); // preserve_xattrs = false
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map); // preserve_xattrs = false
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -647,7 +711,7 @@ mod tests {
         // Transfer with preserve_hardlinks = true
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, true, Arc::clone(&hardlink_map));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, true, false, Arc::clone(&hardlink_map));
 
         // Transfer original first
         let dest_original = dest_dir.path().join("original.txt");
@@ -737,7 +801,7 @@ mod tests {
         // Transfer with preserve_hardlinks = false
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         // Transfer both files
         let dest_original = dest_dir.path().join("original.txt");
@@ -838,7 +902,7 @@ mod tests {
         // Transfer with preserve_hardlinks = true
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, true, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, true, false, hardlink_map);
 
         // Transfer all three
         let dest1 = dest_dir.path().join("file1.txt");
@@ -894,7 +958,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         let result = transferrer.create(&entry, &dest).await;
         assert!(result.is_err(), "Should fail when source file doesn't exist");
@@ -936,7 +1000,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         let result = transferrer.create(&entry, &dest).await;
 
@@ -955,7 +1019,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         let result = transferrer.delete(&nonexistent, false).await;
         assert!(result.is_err(), "Should fail when trying to delete nonexistent file");
@@ -992,7 +1056,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         transferrer.create(&entry, &dest).await.unwrap();
 
@@ -1032,7 +1096,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false, false, false, hardlink_map);
 
         transferrer.create(&entry, &dest).await.unwrap();
 
@@ -1068,7 +1132,7 @@ mod tests {
 
         let transport = LocalTransport::new();
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false, false, hardlink_map);
+        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false, false, false, hardlink_map);
 
         let result = transferrer.create(&entry, &dest).await.unwrap();
         assert!(result.is_none(), "Dry run should return None");
