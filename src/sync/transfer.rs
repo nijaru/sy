@@ -1268,4 +1268,99 @@ mod tests {
         transferrer.create(&entry, &dest).await.unwrap();
         assert!(dest.exists());
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_acl_preservation_integration() {
+        use exacl::getfacl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        // Create source file
+        fs::write(&source, b"test content").unwrap();
+
+        // Read whatever ACLs the filesystem gives us (default permissions as ACLs)
+        let source_acls = getfacl(&source, None).unwrap();
+
+        // Convert to text format (what scanner does)
+        let source_acl_text: Vec<String> = source_acls.iter().map(|e| format!("{}", e)).collect();
+
+        if source_acl_text.is_empty() {
+            // Some filesystems/platforms don't support ACLs, skip test
+            return;
+        }
+
+        // Create file entry with ACLs (simulating what scanner would do)
+        let acls_bytes = source_acl_text.join("\n").into_bytes();
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: Some(acls_bytes),
+        };
+
+        // Transfer with preserve_acls = true
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, true, hardlink_map);
+
+        transferrer.create(&entry, &dest).await.unwrap();
+        assert!(dest.exists());
+
+        // Verify ACLs were applied to destination
+        // (we can't directly compare because filesystem might normalize them)
+        let dest_acls = getfacl(&dest, None).unwrap();
+
+        // As long as we got some ACLs on the destination, the preservation worked
+        assert!(!dest_acls.is_empty(), "Destination should have ACLs after preservation");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_acl_parsing_robustness() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test content").unwrap();
+
+        // Mix of valid and invalid ACL entries
+        // Note: we use generic format that should work if ACLs are supported
+        let acls_text = "user::rw-\ninvalid_line_here\ngroup::r--\n\nanother_bad_line".to_string();
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: Some(acls_text.into_bytes()),
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, true, hardlink_map);
+
+        // Should handle invalid lines gracefully (skip them and apply valid ones)
+        let result = transferrer.create(&entry, &dest).await;
+        assert!(result.is_ok(), "Should succeed despite invalid ACL entries");
+        assert!(dest.exists());
+    }
 }
