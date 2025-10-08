@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn test_progress_tracking_accuracy() {
         let temp_dir = tempdir().unwrap();
-        let dest = temp_dir.path();
+        let _dest = temp_dir.path();
 
         let flags = SyncFlags {
             delete: false,
