@@ -58,6 +58,7 @@ pub struct SyncEngine<T: Transport> {
     symlink_mode: SymlinkMode,
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
+    preserve_acls: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -81,6 +82,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         symlink_mode: SymlinkMode,
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
+        preserve_acls: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -115,6 +117,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             symlink_mode,
             preserve_xattrs,
             preserve_hardlinks,
+            preserve_acls,
         }
     }
 
@@ -882,6 +885,7 @@ mod tests {
             SymlinkMode::Preserve,
             false, // preserve_xattrs
             false, // preserve_hardlinks
+            false, // preserve_acls
         )
     }
 
@@ -959,6 +963,7 @@ mod tests {
             SymlinkMode::Preserve,
             false, // preserve_xattrs
             false, // preserve_hardlinks
+            false, // preserve_acls
         );
 
         let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
