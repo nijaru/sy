@@ -191,6 +191,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -220,6 +221,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -249,6 +251,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let planner = StrategyPlanner::new();

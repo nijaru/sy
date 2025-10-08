@@ -21,6 +21,7 @@ pub struct FileEntry {
     pub xattrs: Option<HashMap<String, Vec<u8>>>, // Extended attributes (if enabled)
     pub inode: Option<u64>, // Inode number (Unix only)
     pub nlink: u64, // Number of hard links to this file
+    pub acls: Option<Vec<u8>>, // Serialized ACLs (if enabled)
 }
 
 /// Detect if a file is sparse and get its allocated size
@@ -89,6 +90,41 @@ fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     } else {
         Some(xattrs)
     }
+}
+
+/// Read ACLs from a file
+/// Returns None if ACLs are not supported or if reading fails
+/// The ACLs are stored as text representation for portability
+#[cfg(unix)]
+fn read_acls(path: &Path) -> Option<Vec<u8>> {
+    use exacl::getfacl;
+
+    // Read ACLs from file
+    match getfacl(path, None) {
+        Ok(acls) => {
+            let acl_vec: Vec<_> = acls.into_iter().collect();
+            if acl_vec.is_empty() {
+                return None;
+            }
+
+            // Convert ACLs to text format (portable representation)
+            let acl_text: Vec<String> = acl_vec.iter().map(|e| format!("{:?}", e)).collect();
+            let joined = acl_text.join("\n");
+
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined.into_bytes())
+            }
+        }
+        Err(_) => None, // No ACLs or not supported
+    }
+}
+
+/// Non-Unix platforms don't support ACLs
+#[cfg(not(unix))]
+fn read_acls(_path: &Path) -> Option<Vec<u8>> {
+    None
 }
 
 pub struct Scanner {
@@ -160,6 +196,9 @@ impl Scanner {
             // Read extended attributes (always scan them, writing is conditional)
             let xattrs = read_xattrs(&path);
 
+            // Read ACLs (always scan them, writing is conditional)
+            let acls = read_acls(&path);
+
             entries.push(FileEntry {
                 path: path.clone(),
                 relative_path,
@@ -176,6 +215,7 @@ impl Scanner {
                 xattrs,
                 inode,
                 nlink,
+                acls,
             });
         }
 

@@ -291,6 +291,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -324,6 +325,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -353,6 +355,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -395,6 +398,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -439,6 +443,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -483,6 +488,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -525,6 +531,7 @@ mod tests {
             ].iter().cloned().collect()),
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -568,6 +575,7 @@ mod tests {
             xattrs: Some([("user.test".to_string(), b"value1".to_vec())].iter().cloned().collect()),
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -617,6 +625,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 2,
+                acls: None,
         };
 
         let link_entry = FileEntry {
@@ -632,6 +641,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 2,
+                acls: None,
         };
 
         // Transfer with preserve_hardlinks = true
@@ -705,6 +715,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 2,
+                acls: None,
         };
 
         let link_entry = FileEntry {
@@ -720,6 +731,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 2,
+                acls: None,
         };
 
         // Transfer with preserve_hardlinks = false
@@ -788,6 +800,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 3,
+                acls: None,
         };
 
         let entry2 = FileEntry {
@@ -803,6 +816,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 3,
+                acls: None,
         };
 
         let entry3 = FileEntry {
@@ -818,6 +832,7 @@ mod tests {
             xattrs: None,
             inode: Some(inode),
             nlink: 3,
+                acls: None,
         };
 
         // Transfer with preserve_hardlinks = true
@@ -874,6 +889,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -915,6 +931,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -970,6 +987,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -1009,6 +1027,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();
@@ -1044,6 +1063,7 @@ mod tests {
             xattrs: None,
             inode: None,
             nlink: 1,
+                acls: None,
         };
 
         let transport = LocalTransport::new();

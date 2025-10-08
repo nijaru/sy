@@ -738,6 +738,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 xattrs: None,
                 inode: None,
                 nlink: 1,
+                acls: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 
@@ -798,6 +799,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 xattrs: None,
                 inode: None,
                 nlink: 1,
+                acls: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 
