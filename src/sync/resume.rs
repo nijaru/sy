@@ -709,4 +709,312 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.completed_files.len(), 1);
     }
+
+    // === Additional Edge Case Tests ===
+
+    #[test]
+    fn test_corrupted_json_deleted() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        // Create corrupted JSON file
+        let state_path = dest.join(".sy-state.json");
+        std::fs::write(&state_path, "{ corrupted json }}}}").unwrap();
+
+        // Should handle corruption gracefully
+        let loaded = ResumeState::load(dest).unwrap();
+        assert!(loaded.is_none(), "Corrupted state should be rejected");
+        assert!(!state_path.exists(), "Corrupted state should be deleted");
+    }
+
+    #[test]
+    fn test_empty_state_file() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        // Create empty state file
+        let state_path = dest.join(".sy-state.json");
+        std::fs::write(&state_path, "").unwrap();
+
+        // Should handle empty file gracefully
+        let loaded = ResumeState::load(dest).unwrap();
+        assert!(loaded.is_none(), "Empty state should be rejected");
+        assert!(!state_path.exists(), "Empty state should be deleted");
+    }
+
+    #[test]
+    fn test_state_with_missing_version() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let state_path = dest.join(".sy-state.json");
+
+        // Create state without version field
+        let invalid_state = serde_json::json!({
+            "source": "/src",
+            "destination": "/dst",
+            "started_at": format_timestamp(SystemTime::now()),
+            "flags": {
+                "delete": false,
+                "exclude": [],
+                "min_size": null,
+                "max_size": null
+            },
+            "completed_files": [],
+            "total_files": 0,
+            "total_bytes_transferred": 0
+        });
+        std::fs::write(&state_path, serde_json::to_string(&invalid_state).unwrap()).unwrap();
+
+        // Should fail to deserialize and delete
+        let loaded = ResumeState::load(dest).unwrap();
+        assert!(loaded.is_none());
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn test_flag_change_delete_added() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let original_flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            original_flags.clone(),
+            10,
+        );
+        state.save(dest).unwrap();
+
+        // Try to resume with delete flag changed
+        let new_flags = SyncFlags {
+            delete: true,  // Changed!
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let loaded = ResumeState::load(dest).unwrap().unwrap();
+        assert!(!loaded.is_compatible_with(&new_flags), "Should detect delete flag change");
+    }
+
+    #[test]
+    fn test_flag_change_exclude_added() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let original_flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            original_flags.clone(),
+            10,
+        );
+        state.save(dest).unwrap();
+
+        // Try to resume with exclude patterns added
+        let new_flags = SyncFlags {
+            delete: false,
+            exclude: vec!["*.tmp".to_string()],  // Added!
+            min_size: None,
+            max_size: None,
+        };
+
+        let loaded = ResumeState::load(dest).unwrap().unwrap();
+        assert!(!loaded.is_compatible_with(&new_flags), "Should detect exclude pattern change");
+    }
+
+    #[test]
+    fn test_flag_change_size_filters() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let original_flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            original_flags.clone(),
+            10,
+        );
+        state.save(dest).unwrap();
+
+        // Try to resume with size filters changed
+        let new_flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: Some(1024),  // Added!
+            max_size: Some(10485760),  // Added!
+        };
+
+        let loaded = ResumeState::load(dest).unwrap().unwrap();
+        assert!(!loaded.is_compatible_with(&new_flags), "Should detect size filter change");
+    }
+
+    #[test]
+    fn test_multiple_resume_cycles() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        // First cycle: save with 3 files
+        let mut state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            flags.clone(),
+            10,
+        );
+
+        for i in 0..3 {
+            state.add_completed_file(
+                CompletedFile {
+                    relative_path: PathBuf::from(format!("file{}.txt", i)),
+                    action: "create".to_string(),
+                    size: 100 * (i + 1) as u64,
+                    checksum: format!("xxhash3:abc{}", i),
+                    completed_at: format_timestamp(SystemTime::now()),
+                },
+                100 * (i + 1) as u64,
+            );
+        }
+        state.save(dest).unwrap();
+
+        // Second cycle: load and add more files
+        let mut state = ResumeState::load(dest).unwrap().unwrap();
+        assert_eq!(state.completed_files.len(), 3);
+
+        for i in 3..6 {
+            state.add_completed_file(
+                CompletedFile {
+                    relative_path: PathBuf::from(format!("file{}.txt", i)),
+                    action: "create".to_string(),
+                    size: 100 * (i + 1) as u64,
+                    checksum: format!("xxhash3:abc{}", i),
+                    completed_at: format_timestamp(SystemTime::now()),
+                },
+                100 * (i + 1) as u64,
+            );
+        }
+        state.save(dest).unwrap();
+
+        // Third cycle: verify all files preserved
+        let state = ResumeState::load(dest).unwrap().unwrap();
+        assert_eq!(state.completed_files.len(), 6);
+        assert_eq!(state.total_bytes_transferred, 2100); // 100+200+300+400+500+600
+    }
+
+    #[test]
+    fn test_progress_tracking_accuracy() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let mut state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            flags,
+            100,  // Total files
+        );
+
+        // Add 30 completed files
+        for i in 0..30 {
+            state.add_completed_file(
+                CompletedFile {
+                    relative_path: PathBuf::from(format!("file{}.txt", i)),
+                    action: "create".to_string(),
+                    size: 1000,
+                    checksum: format!("xxhash3:abc{}", i),
+                    completed_at: format_timestamp(SystemTime::now()),
+                },
+                1000,
+            );
+        }
+
+        let (completed, total) = state.progress();
+        assert_eq!(completed, 30);
+        assert_eq!(total, 100);
+        assert_eq!(state.total_bytes_transferred, 30000);
+    }
+
+    #[test]
+    fn test_state_with_large_number_of_files() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        let flags = SyncFlags {
+            delete: false,
+            exclude: Vec::new(),
+            min_size: None,
+            max_size: None,
+        };
+
+        let mut state = ResumeState::new(
+            PathBuf::from("/src"),
+            PathBuf::from("/dst"),
+            flags,
+            10000,
+        );
+
+        // Add 1000 completed files
+        for i in 0..1000 {
+            state.add_completed_file(
+                CompletedFile {
+                    relative_path: PathBuf::from(format!("file{:04}.txt", i)),
+                    action: "create".to_string(),
+                    size: 1024,
+                    checksum: format!("xxhash3:hash{}", i),
+                    completed_at: format_timestamp(SystemTime::now()),
+                },
+                1024,
+            );
+        }
+
+        // Save and reload
+        state.save(dest).unwrap();
+        let loaded = ResumeState::load(dest).unwrap().unwrap();
+
+        assert_eq!(loaded.completed_files.len(), 1000);
+        assert_eq!(loaded.total_bytes_transferred, 1024 * 1000);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_state() {
+        let temp_dir = tempdir().unwrap();
+        let dest = temp_dir.path();
+
+        // Try to delete state that doesn't exist
+        let result = ResumeState::delete(dest);
+
+        // Should succeed (idempotent)
+        assert!(result.is_ok(), "Deleting nonexistent state should succeed");
+    }
 }
