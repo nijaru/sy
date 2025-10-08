@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
-use resume::{CompletedFile, ResumeState, SyncFlags};
+use resume::{ResumeState, SyncFlags};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
 use scanner::FileEntry;
@@ -191,7 +191,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             max_size: self.max_size,
         };
 
-        let mut resume_state = if self.resume {
+        let resume_state = if self.resume {
             match ResumeState::load(destination)? {
                 Some(state) => {
                     if state.is_compatible_with(&current_flags) {
@@ -269,8 +269,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Wrap resume state for thread-safe access
         let resume_state = Arc::new(Mutex::new(resume_state));
-        let checkpoint_files = self.checkpoint_files;
-        let checkpoint_bytes = self.checkpoint_bytes;
+        let _checkpoint_files = self.checkpoint_files;
+        let _checkpoint_bytes = self.checkpoint_bytes;
 
         // Execute sync operations in parallel
         // Thread-safe stats tracking
@@ -323,8 +323,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let pb = pb.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let rate_limiter = rate_limiter.clone();
-            let resume_state = Arc::clone(&resume_state);
-            let dest_path_for_checkpoint = destination.to_path_buf();
+            let _resume_state = Arc::clone(&resume_state);
+            let _dest_path_for_checkpoint = destination.to_path_buf();
             let verification_mode = self.verification_mode;
             let verify_on_write = self.verify_on_write;
             let symlink_mode = self.symlink_mode;
@@ -653,7 +653,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Clean up resume state on successful completion
         if let Ok(mut state_guard) = resume_state.lock() {
-            if let Some(ref state) = *state_guard {
+            if let Some(_) = *state_guard {
                 // Only clean up if this was an actual resume operation
                 // (Don't clean up if we just created a new state that was never saved)
                 if ResumeState::load(destination)?.is_some() {
