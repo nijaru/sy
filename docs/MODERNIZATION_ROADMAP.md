@@ -362,23 +362,27 @@ Looking at successful modern CLI tools:
 
 ## Feature Comparison: sy v1.0 vs Competition
 
-| Feature | rsync | rclone | sy v1.0 (planned) |
-|---------|-------|--------|-------------------|
-| **Performance (local)** | baseline | N/A | **2-11x faster** ✅ |
-| **Performance (network)** | baseline | 4x with --transfers | **5-10x faster** ✅ |
-| **Delta sync** | ✅ | ❌ | ✅ |
-| **Parallel files** | ❌ | ✅ | ✅ |
-| **Parallel chunks** | ❌ | ✅ | ✅ (Phase 8) |
-| **Resume** | ✅ | ✅ | ✅ (Phase 4) |
-| **Symlinks** | ✅ | ✅ | ✅ (Phase 6) |
-| **Sparse files** | ✅ | ❌ | ✅ (Phase 6) |
-| **ACLs/xattrs** | ✅ | ❌ | ✅ (Phase 6) |
-| **Cloud storage** | ❌ | ✅ | ✅ (Phase 8) |
-| **Watch mode** | ❌ | ❌ | ✅ (Phase 4) |
-| **JSON output** | ❌ | ✅ | ✅ (Phase 4) |
-| **Config profiles** | ❌ | ✅ | ✅ (Phase 4) |
-| **Verification** | checksum | hash | **Multi-layer** ✅ (Phase 5) |
-| **Beautiful output** | ❌ | ⚠️ | ✅ |
+| Feature | rsync | rclone | sy v0.0.16 | sy v1.0 (planned) |
+|---------|-------|--------|------------|-------------------|
+| **Performance (local)** | baseline | N/A | **2-11x faster** ✅ | **2-11x faster** ✅ |
+| **Performance (network)** | baseline | 4x with --transfers | **5-10x faster** ✅ | **5-10x faster** ✅ |
+| **Delta sync** | ✅ | ❌ | ✅ v0.0.7 | ✅ |
+| **Parallel files** | ❌ | ✅ | ✅ v0.0.8 | ✅ |
+| **Parallel chunks** | ❌ | ✅ | ❌ | ✅ (Phase 8) |
+| **Resume** | ✅ | ✅ | ✅ v0.0.13 | ✅ |
+| **Symlinks** | ✅ | ✅ | ✅ v0.0.15 | ✅ |
+| **Sparse files** | ✅ | ❌ | ✅ v0.0.15 | ✅ |
+| **Extended attributes** | ✅ | ❌ | ✅ v0.0.16 | ✅ |
+| **ACLs** | ✅ | ❌ | ⏳ | ✅ (Phase 6) |
+| **Hardlinks** | ✅ | ❌ | ⏳ | ✅ (Phase 6) |
+| **Cloud storage** | ❌ | ✅ | ❌ | ✅ (Phase 8) |
+| **Watch mode** | ❌ | ❌ | ✅ v0.0.12 | ✅ |
+| **JSON output** | ❌ | ✅ | ✅ v0.0.11 | ✅ |
+| **Config profiles** | ❌ | ✅ | ✅ v0.0.11 | ✅ |
+| **Verification** | checksum | hash | **Multi-layer** ✅ v0.0.14 | **Multi-layer** ✅ |
+| **Beautiful output** | ❌ | ⚠️ | ✅ | ✅ |
+
+**Key**: ✅ Done | ⏳ In progress | ❌ Not supported
 
 ---
 
