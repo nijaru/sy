@@ -195,6 +195,7 @@ impl Transport for SshTransport {
                     symlink_target: None,
                     is_sparse: false,  // TODO: Add sparse detection for SSH
                     allocated_size: e.size,
+                    xattrs: None,  // TODO: Add xattr support for SSH
                 })
             })
             .collect();
