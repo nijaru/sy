@@ -205,6 +205,10 @@ pub struct Cli {
     #[arg(short = 'L', long)]
     pub copy_links: bool,
 
+    /// Preserve extended attributes (xattrs)
+    #[arg(short = 'X', long)]
+    pub preserve_xattrs: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -328,6 +332,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -360,6 +365,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -396,6 +402,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -435,6 +442,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -467,6 +475,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -499,6 +508,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -531,6 +541,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -563,6 +574,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -614,6 +626,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -649,6 +662,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -681,6 +695,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -730,6 +745,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Preserve,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -762,6 +778,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Skip,  // Should be overridden
             copy_links: true,           // Override to Follow
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,
@@ -794,6 +811,7 @@ mod tests {
             clean_state: false,
             links: SymlinkMode::Skip,
             copy_links: false,
+            preserve_xattrs: false,
             json: false,
             watch: false,
             profile: None,

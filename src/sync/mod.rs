@@ -705,6 +705,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 symlink_target: None,
                 is_sparse: false,
                 allocated_size: metadata.len(),
+                xattrs: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 
@@ -762,6 +763,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 symlink_target: None,
                 is_sparse: false,
                 allocated_size: metadata.len(),
+                xattrs: None,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 

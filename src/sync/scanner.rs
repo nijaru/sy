@@ -1,5 +1,6 @@
 use crate::error::{Result, SyncError};
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -17,6 +18,7 @@ pub struct FileEntry {
     pub symlink_target: Option<PathBuf>,
     pub is_sparse: bool,
     pub allocated_size: u64, // Actual bytes allocated on disk
+    pub xattrs: Option<HashMap<String, Vec<u8>>>, // Extended attributes (if enabled)
 }
 
 /// Detect if a file is sparse and get its allocated size
@@ -46,15 +48,48 @@ fn detect_sparse_file(_path: &Path, metadata: &std::fs::Metadata) -> (bool, u64)
     (false, file_size)
 }
 
+/// Read extended attributes from a file
+/// Returns None if xattrs are not supported or if reading fails
+fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
+    let mut xattrs = HashMap::new();
+
+    // List all xattr names
+    let names = match xattr::list(path) {
+        Ok(names) => names,
+        Err(_) => return None, // No xattrs or not supported
+    };
+
+    for name in names {
+        if let Ok(Some(value)) = xattr::get(path, &name) {
+            if let Some(name_str) = name.to_str() {
+                xattrs.insert(name_str.to_string(), value);
+            }
+        }
+    }
+
+    if xattrs.is_empty() {
+        None
+    } else {
+        Some(xattrs)
+    }
+}
+
 pub struct Scanner {
     root: PathBuf,
+    preserve_xattrs: bool,
 }
 
 impl Scanner {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            preserve_xattrs: false,
         }
+    }
+
+    pub fn with_xattrs(mut self, preserve_xattrs: bool) -> Self {
+        self.preserve_xattrs = preserve_xattrs;
+        self
     }
 
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
@@ -109,6 +144,13 @@ impl Scanner {
                 (false, 0)
             };
 
+            // Read extended attributes if enabled
+            let xattrs = if self.preserve_xattrs {
+                read_xattrs(&path)
+            } else {
+                None
+            };
+
             entries.push(FileEntry {
                 path: path.clone(),
                 relative_path,
@@ -122,6 +164,7 @@ impl Scanner {
                 symlink_target,
                 is_sparse,
                 allocated_size,
+                xattrs,
             });
         }
 
@@ -225,7 +268,7 @@ mod tests {
     #[test]
     #[cfg(unix)] // Sparse files work differently on Windows
     fn test_scanner_sparse_files() {
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::Write;
         use std::process::Command;
 
         let temp = TempDir::new().unwrap();
