@@ -189,6 +189,8 @@ mod tests {
             is_sparse: false,
             allocated_size: 100,
             xattrs: None,
+            inode: None,
+            nlink: 1,
         };
 
         let planner = StrategyPlanner::new();
@@ -216,6 +218,8 @@ mod tests {
             is_sparse: false,
             allocated_size: 7,
             xattrs: None,
+            inode: None,
+            nlink: 1,
         };
 
         let planner = StrategyPlanner::new();
@@ -243,6 +247,8 @@ mod tests {
             is_sparse: false,
             allocated_size: 100,
             xattrs: None,
+            inode: None,
+            nlink: 1,
         };
 
         let planner = StrategyPlanner::new();

@@ -153,6 +153,7 @@ mod tests {
             false, // verify_on_write
             SymlinkMode::Preserve, // symlink_mode
             false, // preserve_xattrs
+            false, // preserve_hardlinks
         );
 
         let watch_mode = WatchMode::new(
@@ -195,6 +196,7 @@ mod tests {
             ChecksumType::None,
             false,
             SymlinkMode::Preserve,
+            false,
             false,
         );
 
