@@ -57,6 +57,7 @@ pub struct SyncEngine<T: Transport> {
     verify_on_write: bool,
     symlink_mode: SymlinkMode,
     preserve_xattrs: bool,
+    preserve_hardlinks: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -79,6 +80,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         verify_on_write: bool,
         symlink_mode: SymlinkMode,
         preserve_xattrs: bool,
+        preserve_hardlinks: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -112,6 +114,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             verify_on_write,
             symlink_mode,
             preserve_xattrs,
+            preserve_hardlinks,
         }
     }
 
@@ -305,6 +308,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Create rate limiter if bandwidth limit is set
         let rate_limiter = self.bwlimit.map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
 
+        // Create hardlink map for tracking inodes (shared across all parallel transfers)
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
         // Parallel execution with semaphore for concurrency control
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let mut handles = Vec::with_capacity(tasks.len());
@@ -323,9 +329,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let verify_on_write = self.verify_on_write;
             let symlink_mode = self.symlink_mode;
             let preserve_xattrs = self.preserve_xattrs;
+            let preserve_hardlinks = self.preserve_hardlinks;
+            let hardlink_map = Arc::clone(&hardlink_map);
 
             let handle = tokio::spawn(async move {
-                let transferrer = Transferrer::new(transport.as_ref(), dry_run, symlink_mode, preserve_xattrs);
+                let transferrer = Transferrer::new(
+                    transport.as_ref(),
+                    dry_run,
+                    symlink_mode,
+                    preserve_xattrs,
+                    preserve_hardlinks,
+                    hardlink_map,
+                );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
                 // Update progress message
@@ -688,7 +703,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Check if destination exists
         let dest_exists = self.transport.exists(destination).await?;
-        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run, self.symlink_mode, self.preserve_xattrs);
+
+        // Create hardlink map (not used for single-file sync, but required by Transferrer)
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let transferrer = Transferrer::new(
+            self.transport.as_ref(),
+            self.dry_run,
+            self.symlink_mode,
+            self.preserve_xattrs,
+            self.preserve_hardlinks,
+            hardlink_map,
+        );
 
         if !dest_exists {
             // Create new file
@@ -710,6 +736,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 is_sparse: false,
                 allocated_size: metadata.len(),
                 xattrs: None,
+                inode: None,
+                nlink: 1,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 
@@ -768,6 +796,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 is_sparse: false,
                 allocated_size: metadata.len(),
                 xattrs: None,
+                inode: None,
+                nlink: 1,
             }, destination).await? {
                 stats.bytes_transferred = result.bytes_written;
 

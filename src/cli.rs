@@ -209,6 +209,10 @@ pub struct Cli {
     #[arg(short = 'X', long)]
     pub preserve_xattrs: bool,
 
+    /// Preserve hard links (treat multiple links to the same file as one copy)
+    #[arg(short = 'H', long)]
+    pub preserve_hardlinks: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -333,6 +337,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -366,6 +371,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -403,6 +409,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -443,6 +450,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -476,6 +484,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -509,6 +518,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -542,6 +552,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -575,6 +586,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -627,6 +639,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -663,6 +676,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -696,6 +710,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -746,6 +761,7 @@ mod tests {
             links: SymlinkMode::Preserve,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -779,6 +795,7 @@ mod tests {
             links: SymlinkMode::Skip,  // Should be overridden
             copy_links: true,           // Override to Follow
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,
@@ -812,6 +829,7 @@ mod tests {
             links: SymlinkMode::Skip,
             copy_links: false,
             preserve_xattrs: false,
+            preserve_hardlinks: false,
             json: false,
             watch: false,
             profile: None,

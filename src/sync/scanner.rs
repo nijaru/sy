@@ -19,6 +19,8 @@ pub struct FileEntry {
     pub is_sparse: bool,
     pub allocated_size: u64, // Actual bytes allocated on disk
     pub xattrs: Option<HashMap<String, Vec<u8>>>, // Extended attributes (if enabled)
+    pub inode: Option<u64>, // Inode number (Unix only)
+    pub nlink: u64, // Number of hard links to this file
 }
 
 /// Detect if a file is sparse and get its allocated size
@@ -46,6 +48,21 @@ fn detect_sparse_file(_path: &Path, metadata: &std::fs::Metadata) -> (bool, u64)
     // On non-Unix platforms, assume not sparse and allocated size equals file size
     let file_size = metadata.len();
     (false, file_size)
+}
+
+/// Detect hardlink information (inode number and link count)
+/// Returns (inode, nlink)
+#[cfg(unix)]
+fn detect_hardlink_info(metadata: &std::fs::Metadata) -> (Option<u64>, u64) {
+    let inode = metadata.ino();
+    let nlink = metadata.nlink();
+    (Some(inode), nlink)
+}
+
+/// Non-Unix platforms don't support inode-based hardlink detection
+#[cfg(not(unix))]
+fn detect_hardlink_info(_metadata: &std::fs::Metadata) -> (Option<u64>, u64) {
+    (None, 1)
 }
 
 /// Read extended attributes from a file
@@ -137,6 +154,9 @@ impl Scanner {
                 (false, 0)
             };
 
+            // Detect hardlink information (inode and link count)
+            let (inode, nlink) = detect_hardlink_info(&metadata);
+
             // Read extended attributes (always scan them, writing is conditional)
             let xattrs = read_xattrs(&path);
 
@@ -154,6 +174,8 @@ impl Scanner {
                 is_sparse,
                 allocated_size,
                 xattrs,
+                inode,
+                nlink,
             });
         }
 
@@ -341,5 +363,83 @@ mod tests {
         // Regular file should not be marked as sparse
         assert!(!regular_entry.is_sparse, "Regular file should not be detected as sparse");
         assert_eq!(regular_entry.size, 10 * 1024, "File size should be 10KB");
+    }
+
+    #[test]
+    #[cfg(unix)]  // Hardlinks work differently on Windows
+    fn test_scanner_hardlinks() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a regular file
+        let file_path = root.join("original.txt");
+        fs::write(&file_path, "content").unwrap();
+
+        // Create hardlink to the file
+        let link1_path = root.join("link1.txt");
+        fs::hard_link(&file_path, &link1_path).unwrap();
+
+        // Create another hardlink
+        let link2_path = root.join("link2.txt");
+        fs::hard_link(&file_path, &link2_path).unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Find all three entries
+        let original_entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("original.txt"))
+            .expect("Original file should be in scan results");
+
+        let link1_entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("link1.txt"))
+            .expect("Hardlink 1 should be in scan results");
+
+        let link2_entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("link2.txt"))
+            .expect("Hardlink 2 should be in scan results");
+
+        // All three should have nlink = 3
+        assert_eq!(original_entry.nlink, 3, "Original should have 3 links");
+        assert_eq!(link1_entry.nlink, 3, "Link1 should have 3 links");
+        assert_eq!(link2_entry.nlink, 3, "Link2 should have 3 links");
+
+        // All three should have the same inode
+        assert!(original_entry.inode.is_some(), "Original should have inode");
+        assert!(link1_entry.inode.is_some(), "Link1 should have inode");
+        assert!(link2_entry.inode.is_some(), "Link2 should have inode");
+
+        assert_eq!(
+            original_entry.inode, link1_entry.inode,
+            "Original and link1 should have same inode"
+        );
+        assert_eq!(
+            original_entry.inode, link2_entry.inode,
+            "Original and link2 should have same inode"
+        );
+    }
+
+    #[test]
+    fn test_scanner_regular_file_no_hardlinks() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a regular file with no hardlinks
+        let file_path = root.join("single.txt");
+        fs::write(&file_path, "content").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        let entry = entries
+            .iter()
+            .find(|e| e.relative_path == PathBuf::from("single.txt"))
+            .expect("File should be in scan results");
+
+        // Should have nlink = 1 (only itself)
+        assert_eq!(entry.nlink, 1, "Single file should have nlink = 1");
     }
 }
