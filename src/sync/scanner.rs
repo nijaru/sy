@@ -76,20 +76,13 @@ fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
 
 pub struct Scanner {
     root: PathBuf,
-    preserve_xattrs: bool,
 }
 
 impl Scanner {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            preserve_xattrs: false,
         }
-    }
-
-    pub fn with_xattrs(mut self, preserve_xattrs: bool) -> Self {
-        self.preserve_xattrs = preserve_xattrs;
-        self
     }
 
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
@@ -144,12 +137,8 @@ impl Scanner {
                 (false, 0)
             };
 
-            // Read extended attributes if enabled
-            let xattrs = if self.preserve_xattrs {
-                read_xattrs(&path)
-            } else {
-                None
-            };
+            // Read extended attributes (always scan them, writing is conditional)
+            let xattrs = read_xattrs(&path);
 
             entries.push(FileEntry {
                 path: path.clone(),

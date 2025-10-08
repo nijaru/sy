@@ -56,6 +56,7 @@ pub struct SyncEngine<T: Transport> {
     verification_mode: ChecksumType,
     verify_on_write: bool,
     symlink_mode: SymlinkMode,
+    preserve_xattrs: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -77,6 +78,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         verification_mode: ChecksumType,
         verify_on_write: bool,
         symlink_mode: SymlinkMode,
+        preserve_xattrs: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -109,6 +111,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             verification_mode,
             verify_on_write,
             symlink_mode,
+            preserve_xattrs,
         }
     }
 
@@ -319,9 +322,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let verification_mode = self.verification_mode;
             let verify_on_write = self.verify_on_write;
             let symlink_mode = self.symlink_mode;
+            let preserve_xattrs = self.preserve_xattrs;
 
             let handle = tokio::spawn(async move {
-                let transferrer = Transferrer::new(transport.as_ref(), dry_run, symlink_mode);
+                let transferrer = Transferrer::new(transport.as_ref(), dry_run, symlink_mode, preserve_xattrs);
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
                 // Update progress message
@@ -684,7 +688,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Check if destination exists
         let dest_exists = self.transport.exists(destination).await?;
-        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run, self.symlink_mode);
+        let transferrer = Transferrer::new(self.transport.as_ref(), self.dry_run, self.symlink_mode, self.preserve_xattrs);
 
         if !dest_exists {
             // Create new file

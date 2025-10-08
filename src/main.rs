@@ -175,6 +175,7 @@ async fn main() -> Result<()> {
         checksum_type,
         verify_on_write,
         symlink_mode,
+        cli.preserve_xattrs,
     );
 
     // Watch mode or regular sync

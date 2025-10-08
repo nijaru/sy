@@ -1,5 +1,5 @@
 use crate::cli::SymlinkMode;
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 use crate::sync::scanner::FileEntry;
 use crate::transport::{Transport, TransferResult};
 use std::path::Path;
@@ -8,14 +8,16 @@ pub struct Transferrer<'a, T: Transport> {
     transport: &'a T,
     dry_run: bool,
     symlink_mode: SymlinkMode,
+    preserve_xattrs: bool,
 }
 
 impl<'a, T: Transport> Transferrer<'a, T> {
-    pub fn new(transport: &'a T, dry_run: bool, symlink_mode: SymlinkMode) -> Self {
+    pub fn new(transport: &'a T, dry_run: bool, symlink_mode: SymlinkMode, preserve_xattrs: bool) -> Self {
         Self {
             transport,
             dry_run,
             symlink_mode,
+            preserve_xattrs,
         }
     }
 
@@ -37,6 +39,10 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             Ok(None)
         } else {
             let result = self.copy_file(&source.path, dest_path).await?;
+
+            // Write extended attributes if present
+            self.write_xattrs(source, dest_path).await?;
+
             Ok(Some(result))
         }
     }
@@ -52,6 +58,10 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         if !source.is_dir {
             // Use delta sync for updates
             let result = self.transport.sync_file_with_delta(&source.path, dest_path).await?;
+
+            // Write extended attributes if present
+            self.write_xattrs(source, dest_path).await?;
+
             tracing::info!("Updated: {} -> {}", source.path.display(), dest_path.display());
             Ok(Some(result))
         } else {
@@ -88,6 +98,35 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
         tracing::debug!("Copied: {} -> {}", source.display(), dest.display());
         Ok(result)
+    }
+
+    /// Write extended attributes to a file
+    async fn write_xattrs(&self, file_entry: &FileEntry, dest_path: &Path) -> Result<()> {
+        if !self.preserve_xattrs {
+            return Ok(());
+        }
+
+        if let Some(ref xattrs) = file_entry.xattrs {
+            if xattrs.is_empty() {
+                return Ok(());
+            }
+
+            let dest_path = dest_path.to_path_buf();
+            let xattrs_clone = xattrs.clone();
+
+            tokio::task::spawn_blocking(move || {
+                for (name, value) in xattrs_clone {
+                    if let Err(e) = xattr::set(&dest_path, &name, &value) {
+                        tracing::warn!("Failed to set xattr {} on {}: {}", name, dest_path.display(), e);
+                    } else {
+                        tracing::debug!("Set xattr {} on {}", name, dest_path.display());
+                    }
+                }
+            })
+            .await
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        Ok(())
     }
 
     async fn handle_symlink(&self, source: &FileEntry, dest_path: &Path) -> Result<Option<TransferResult>> {
@@ -194,7 +233,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false);
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -224,7 +263,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve); // dry_run = true
+        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false); // dry_run = true
         let dest_path = dest_dir.path().join("test.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -250,7 +289,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false);
         let dest_path = dest_dir.path().join("subdir");
         transferrer.create(&dir_entry, &dest_path).await.unwrap();
 
@@ -289,7 +328,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -330,7 +369,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
@@ -371,7 +410,7 @@ mod tests {
         };
 
         let transport = LocalTransport::new();
-        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Skip);
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Skip, false);
         let dest_path = dest_dir.path().join("link.txt");
         transferrer.create(&file_entry, &dest_path).await.unwrap();
 
