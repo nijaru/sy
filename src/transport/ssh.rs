@@ -196,6 +196,8 @@ impl Transport for SshTransport {
                     is_sparse: false,  // TODO: Add sparse detection for SSH
                     allocated_size: e.size,
                     xattrs: None,  // TODO: Add xattr support for SSH
+                    inode: None,  // TODO: Add hardlink detection for SSH
+                    nlink: 1,
                 })
             })
             .collect();
@@ -644,6 +646,37 @@ impl Transport for SshTransport {
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
 
+        Ok(())
+    }
+
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+        let source_str = source.to_string_lossy();
+        let dest_str = dest.to_string_lossy();
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest.parent() {
+            let parent_str = parent.to_string_lossy();
+            let mkdir_cmd = format!("mkdir -p '{}'", parent_str);
+            tokio::task::spawn_blocking({
+                let session = Arc::clone(&self.session);
+                move || Self::execute_command(session, &mkdir_cmd)
+            })
+            .await
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        }
+
+        // Create hardlink using ln command
+        let command = format!("ln '{}' '{}'", source_str, dest_str);
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            let cmd = command.clone();
+            move || Self::execute_command(session, &cmd)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        tracing::debug!("Created hardlink: {} -> {}", dest_str, source_str);
         Ok(())
     }
 }

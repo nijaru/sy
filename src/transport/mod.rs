@@ -111,6 +111,12 @@ pub trait Transport: Send + Sync {
 
     /// Remove a file or directory
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()>;
+
+    /// Create a hard link
+    ///
+    /// Creates a hard link at `dest` pointing to `source`.
+    /// Both paths must be on the same filesystem.
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()>;
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -143,5 +149,9 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
         (**self).remove(path, is_dir).await
+    }
+
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+        (**self).create_hardlink(source, dest).await
     }
 }

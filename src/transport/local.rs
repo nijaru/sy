@@ -306,6 +306,23 @@ impl Transport for LocalTransport {
         tracing::info!("Removed: {}", path.display());
         Ok(())
     }
+
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Ensure parent directory exists
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(SyncError::Io)?;
+        }
+
+        // Create the hard link
+        tokio::fs::hard_link(source, dest)
+            .await
+            .map_err(SyncError::Io)?;
+
+        tracing::debug!("Created hardlink: {} -> {}", dest.display(), source.display());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

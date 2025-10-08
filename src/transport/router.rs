@@ -121,4 +121,11 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.remove(path, is_dir).await,
         }
     }
+
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.create_hardlink(source, dest).await,
+            TransportRouter::Dual(t) => t.create_hardlink(source, dest).await,
+        }
+    }
 }

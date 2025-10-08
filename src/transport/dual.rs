@@ -61,4 +61,9 @@ impl Transport for DualTransport {
         // Remove from destination
         self.dest.remove(path, is_dir).await
     }
+
+    async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+        // Create hardlink on destination
+        self.dest.create_hardlink(source, dest).await
+    }
 }
