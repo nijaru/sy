@@ -1138,4 +1138,111 @@ mod tests {
         assert!(result.is_none(), "Dry run should return None");
         assert!(!dest.exists(), "Dry run should not create files");
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_acl_detection() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test content").unwrap();
+
+        // Create a file entry with ACLs present
+        let acls_text = "user::rw-\ngroup::r--\nother::r--".to_string();
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: Some(acls_text.into_bytes()),
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, true, hardlink_map);
+
+        // This should succeed and log ACL detection
+        transferrer.create(&entry, &dest).await.unwrap();
+        assert!(dest.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_acl_not_preserved_without_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test content").unwrap();
+
+        // Create a file entry with ACLs present
+        let acls_text = "user::rw-\ngroup::r--\nother::r--".to_string();
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: Some(acls_text.into_bytes()),
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, false, hardlink_map);
+
+        // ACLs should be silently skipped when preserve_acls = false
+        transferrer.create(&entry, &dest).await.unwrap();
+        assert!(dest.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_acl_empty_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test content").unwrap();
+
+        // Create a file entry with empty ACLs
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: Some(Vec::new()), // Empty ACLs
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, true, hardlink_map);
+
+        // Should handle empty ACLs gracefully
+        transferrer.create(&entry, &dest).await.unwrap();
+        assert!(dest.exists());
+    }
 }
