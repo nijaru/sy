@@ -1,7 +1,7 @@
 # Modernization Roadmap - sy v0.1.0 → v1.0
 
-**Status**: In Progress - Phase 5 Core Complete! (2025-10-07)
-**Current Version**: v0.0.15-dev
+**Status**: In Progress - Phase 6 Core Complete! (2025-10-08)
+**Current Version**: v0.0.17
 **Goal**: Make sy a complete modern rsync replacement for 90%+ of use cases
 
 ---
@@ -24,12 +24,17 @@
 5. ✅ **Sparse file support** - Detection and preservation (v0.0.15)
 6. ✅ **Extended attributes** - -X flag for full-fidelity backups (v0.0.16)
 
+### ✅ Phase 6 Core Complete (v0.0.17)
+1. ✅ **Hardlink preservation** - -H flag preserves hard links (v0.0.17)
+
 ### Critical Gaps Remaining for v1.0
 1. ~~**Symlinks**~~ ✅ **DONE** (v0.0.15)
 2. ~~**Sparse files**~~ ✅ **DONE** (v0.0.15)
 3. ~~**Extended attributes**~~ ✅ **DONE** (v0.0.16)
-4. **Hooks** - Pre/post sync extensibility (LOW)
-5. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
+4. ~~**Hardlinks**~~ ✅ **DONE** (v0.0.17)
+5. **ACLs** - Advanced access control lists (MEDIUM)
+6. **Hooks** - Pre/post sync extensibility (LOW)
+7. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
 
 ---
 

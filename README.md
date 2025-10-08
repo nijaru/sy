@@ -21,9 +21,10 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3 Complete** - Parallel transfers + UX polish! (v0.0.4-v0.0.9)
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
-✅ **Phase 5 Core Complete** - BLAKE3 verification + symlink support! (v0.0.14-v0.0.15)
-🔨 **Phase 6 In Progress** - Sparse files and extended attributes next.
-🚀 **Current Version: v0.0.15-dev** - 146 tests passing, zero errors!
+✅ **Phase 5 Complete** - BLAKE3 verification, symlinks, sparse files, xattrs! (v0.0.14-v0.0.16)
+✅ **Phase 6 Core Complete** - Hardlink preservation! (v0.0.17)
+🔨 **Phase 6 In Progress** - ACLs next.
+🚀 **Current Version: v0.0.17** - 156 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -117,6 +118,10 @@ sy /source /destination --mode paranoid                # BLAKE3 + verify every b
 sy /source /destination --links preserve               # Preserve symlinks as symlinks (default)
 sy /source /destination -L                             # Follow symlinks and copy targets
 sy /source /destination --links skip                   # Skip all symlinks
+
+# Hardlink preservation (new in v0.0.17+)
+sy /source /destination -H                             # Preserve hard links
+sy /source /destination --preserve-hardlinks           # Same as -H
 ```
 
 ## Features
@@ -235,6 +240,13 @@ sy /source /destination --links skip                   # Skip all symlinks
   - Preserves metadata like macOS Finder info, security contexts
   - Always scanned, conditionally preserved (minimal overhead)
   - Full-fidelity backups when combined with other features
+  - Cross-platform (Unix/Linux/macOS)
+- **Hardlink Preservation** (v0.0.17):
+  - `-H` flag to preserve hard links between files
+  - Tracks inode numbers during scan
+  - Creates hardlinks instead of copying duplicate data
+  - Preserves disk space savings from source to destination
+  - Critical for backup systems, package managers, etc.
   - Cross-platform (Unix/Linux/macOS)
 
 ### 📋 Common Use Cases
