@@ -94,7 +94,7 @@ fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
 
 /// Read ACLs from a file
 /// Returns None if ACLs are not supported or if reading fails
-/// The ACLs are stored as text representation for portability
+/// The ACLs are stored as text representation (Display format) for portability
 #[cfg(unix)]
 fn read_acls(path: &Path) -> Option<Vec<u8>> {
     use exacl::getfacl;
@@ -107,8 +107,9 @@ fn read_acls(path: &Path) -> Option<Vec<u8>> {
                 return None;
             }
 
-            // Convert ACLs to text format (portable representation)
-            let acl_text: Vec<String> = acl_vec.iter().map(|e| format!("{:?}", e)).collect();
+            // Convert ACLs to standard text format using Display trait
+            // This produces parseable text like "user::rwx", "group::r-x", etc.
+            let acl_text: Vec<String> = acl_vec.iter().map(|e| format!("{}", e)).collect();
             let joined = acl_text.join("\n");
 
             if joined.is_empty() {
