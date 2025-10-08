@@ -230,6 +230,12 @@ sy /source /destination --links skip                   # Skip all symlinks
   - Efficient transfer - only allocated blocks are copied
   - Critical for VM disk images, database files, etc.
   - Zero configuration - works transparently
+- **Extended Attributes Support** (v0.0.16):
+  - `-X` flag to preserve extended attributes (xattrs)
+  - Preserves metadata like macOS Finder info, security contexts
+  - Always scanned, conditionally preserved (minimal overhead)
+  - Full-fidelity backups when combined with other features
+  - Cross-platform (Unix/Linux/macOS)
 
 ### 📋 Common Use Cases
 

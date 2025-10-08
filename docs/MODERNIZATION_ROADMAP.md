@@ -16,17 +16,18 @@
 3. ✅ **Watch mode** - Continuous sync (v0.0.12)
 4. ✅ **Resume support** - Automatic recovery from interrupts (v0.0.13)
 
-### ✅ Phase 5 Core Complete (v0.0.14-v0.0.15)
+### ✅ Phase 5 Core Complete (v0.0.14-v0.0.16)
 1. ✅ **Verification modes** - fast/standard/verify/paranoid (v0.0.14)
 2. ✅ **BLAKE3 end-to-end** - Cryptographic integrity verification (v0.0.14)
 3. ✅ **State hardening** - Auto-delete corrupted state files (v0.0.14)
 4. ✅ **Symlink support** - Preserve/follow/skip modes (v0.0.15)
 5. ✅ **Sparse file support** - Detection and preservation (v0.0.15)
+6. ✅ **Extended attributes** - -X flag for full-fidelity backups (v0.0.16)
 
 ### Critical Gaps Remaining for v1.0
 1. ~~**Symlinks**~~ ✅ **DONE** (v0.0.15)
 2. ~~**Sparse files**~~ ✅ **DONE** (v0.0.15)
-3. **Extended attributes** - Full backup fidelity (MEDIUM)
+3. ~~**Extended attributes**~~ ✅ **DONE** (v0.0.16)
 4. **Hooks** - Pre/post sync extensibility (LOW)
 5. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
 
