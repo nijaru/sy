@@ -852,4 +852,206 @@ mod tests {
         assert_eq!(meta2.nlink(), 3);
         assert_eq!(meta3.nlink(), 3);
     }
+
+    // === Error Handling Tests ===
+
+    #[tokio::test]
+    async fn test_create_file_nonexistent_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("nonexistent.txt");
+        let dest = temp.path().join("dest.txt");
+
+        let entry = FileEntry {
+            path: nonexistent.clone(),
+            relative_path: PathBuf::from("nonexistent.txt"),
+            size: 100,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 100,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+
+        let result = transferrer.create(&entry, &dest).await;
+        assert!(result.is_err(), "Should fail when source file doesn't exist");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_create_file_permission_denied_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        fs::write(&source, b"test").unwrap();
+
+        // Create read-only destination directory
+        let dest_dir = temp.path().join("readonly");
+        fs::create_dir(&dest_dir).unwrap();
+        let mut perms = fs::metadata(&dest_dir).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&dest_dir, perms).unwrap();
+
+        let dest = dest_dir.join("dest.txt");
+
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 4,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 4,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+
+        let result = transferrer.create(&entry, &dest).await;
+
+        // Restore permissions for cleanup
+        let mut perms = fs::metadata(&dest_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest_dir, perms).unwrap();
+
+        assert!(result.is_err(), "Should fail when destination directory is read-only");
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("nonexistent.txt");
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+
+        let result = transferrer.delete(&nonexistent, false).await;
+        assert!(result.is_err(), "Should fail when trying to delete nonexistent file");
+    }
+
+    #[tokio::test]
+    async fn test_symlink_preserve_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let link = temp.path().join("link.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&source, &link).unwrap();
+
+        let entry = FileEntry {
+            path: link.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            size: 4,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: true,
+            symlink_target: Some(source.clone()),
+            is_sparse: false,
+            allocated_size: 4,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false, false, hardlink_map);
+
+        transferrer.create(&entry, &dest).await.unwrap();
+
+        // Verify symlink was preserved
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.is_symlink(), "Destination should be a symlink");
+    }
+
+    #[tokio::test]
+    async fn test_symlink_follow_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let link = temp.path().join("link.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&source, &link).unwrap();
+
+        let entry = FileEntry {
+            path: link.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: true,
+            symlink_target: Some(source.clone()),
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Follow, false, false, hardlink_map);
+
+        transferrer.create(&entry, &dest).await.unwrap();
+
+        // Verify regular file was created (not symlink)
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert!(!meta.is_symlink(), "Destination should be a regular file");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "test content");
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_no_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let dest = temp.path().join("dest.txt");
+
+        fs::write(&source, b"test").unwrap();
+
+        let entry = FileEntry {
+            path: source.clone(),
+            relative_path: PathBuf::from("source.txt"),
+            size: 4,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 4,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(&transport, true, SymlinkMode::Preserve, false, false, hardlink_map);
+
+        let result = transferrer.create(&entry, &dest).await.unwrap();
+        assert!(result.is_none(), "Dry run should return None");
+        assert!(!dest.exists(), "Dry run should not create files");
+    }
 }

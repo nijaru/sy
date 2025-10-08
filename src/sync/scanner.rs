@@ -442,4 +442,231 @@ mod tests {
         // Should have nlink = 1 (only itself)
         assert_eq!(entry.nlink, 1, "Single file should have nlink = 1");
     }
+
+    // === Error Handling and Edge Case Tests ===
+
+    #[test]
+    fn test_scanner_empty_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 0, "Empty directory should return no entries");
+    }
+
+    #[test]
+    fn test_scanner_nested_empty_directories() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create nested empty directories
+        fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Should find only directories, no files
+        assert!(entries.iter().all(|e| e.is_dir), "All entries should be directories");
+    }
+
+    #[test]
+    fn test_scanner_very_long_filename() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create file with very long name (close to 255 byte limit)
+        let long_name = "a".repeat(250) + ".txt";
+        let file_path = root.join(&long_name);
+        fs::write(&file_path, "content").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, PathBuf::from(&long_name));
+    }
+
+    #[test]
+    fn test_scanner_unicode_filenames() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create files with various Unicode characters
+        let unicode_names = vec![
+            "测试.txt",      // Chinese
+            "テスト.txt",    // Japanese
+            "тест.txt",      // Russian
+            "🦀.txt",        // Emoji
+            "café.txt",      // Accented Latin
+        ];
+
+        for name in &unicode_names {
+            fs::write(root.join(name), "content").unwrap();
+        }
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), unicode_names.len());
+        for name in unicode_names {
+            assert!(
+                entries.iter().any(|e| e.relative_path == PathBuf::from(name)),
+                "Should find file: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanner_special_characters() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create files with special characters (that are valid in filenames)
+        let special_names = vec![
+            "file with spaces.txt",
+            "file-with-dashes.txt",
+            "file_with_underscores.txt",
+            "file.multiple.dots.txt",
+            "file(with)parens.txt",
+            "file[with]brackets.txt",
+        ];
+
+        for name in &special_names {
+            fs::write(root.join(name), "content").unwrap();
+        }
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), special_names.len());
+        for name in special_names {
+            assert!(
+                entries.iter().any(|e| e.relative_path == PathBuf::from(name)),
+                "Should find file: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanner_deep_nesting() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create deeply nested structure (50 levels)
+        let mut path = root.to_path_buf();
+        for i in 0..50 {
+            path.push(format!("level{}", i));
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("deep.txt"), "content").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Should find all directories + the file
+        assert!(entries.len() >= 51, "Should find deeply nested file and directories");
+
+        // Find the deeply nested file
+        let deep_file = entries.iter().find(|e| e.relative_path.ends_with("deep.txt"));
+        assert!(deep_file.is_some(), "Should find deeply nested file");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scanner_permission_denied_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a directory and a file inside
+        let protected_dir = root.join("protected");
+        fs::create_dir(&protected_dir).unwrap();
+        fs::write(protected_dir.join("secret.txt"), "secret").unwrap();
+
+        // Make directory unreadable
+        let mut perms = fs::metadata(&protected_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&protected_dir, perms.clone()).unwrap();
+
+        let scanner = Scanner::new(root);
+        let result = scanner.scan();
+
+        // Restore permissions for cleanup
+        perms.set_mode(0o755);
+        fs::set_permissions(&protected_dir, perms).unwrap();
+
+        // Scanner should either error or skip the unreadable directory
+        // Both behaviors are acceptable
+        match result {
+            Ok(entries) => {
+                // If it succeeds, it should have skipped the protected directory
+                assert!(
+                    !entries.iter().any(|e| e.path.starts_with(&protected_dir)),
+                    "Should not include files from unreadable directory"
+                );
+            }
+            Err(_) => {
+                // Error is also acceptable
+            }
+        }
+    }
+
+    #[test]
+    fn test_scanner_zero_byte_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let file_path = root.join("empty.txt");
+        fs::write(&file_path, "").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 0);
+        assert_eq!(entries[0].relative_path, PathBuf::from("empty.txt"));
+    }
+
+    #[test]
+    fn test_scanner_large_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create 1000 files
+        for i in 0..1000 {
+            fs::write(root.join(format!("file{:04}.txt", i)), format!("content{}", i)).unwrap();
+        }
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1000, "Should find all 1000 files");
+    }
+
+    #[test]
+    fn test_scanner_mixed_file_types() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create mix of files and directories
+        fs::write(root.join("file1.txt"), "content1").unwrap();
+        fs::create_dir(root.join("dir1")).unwrap();
+        fs::write(root.join("dir1/file2.txt"), "content2").unwrap();
+        fs::create_dir(root.join("dir2")).unwrap();
+        fs::write(root.join("file3.txt"), "content3").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+        let dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).collect();
+
+        assert_eq!(files.len(), 3, "Should find 3 files");
+        assert_eq!(dirs.len(), 2, "Should find 2 directories");
+    }
 }
