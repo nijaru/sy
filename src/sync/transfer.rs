@@ -216,8 +216,11 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                 let acls_bytes = acls_bytes.clone();
 
                 tokio::task::spawn_blocking(move || {
+                    use exacl::{setfacl, AclEntry};
+                    use std::str::FromStr;
+
                     // Parse ACL text back to string
-                    let _acls_text = match String::from_utf8(acls_bytes) {
+                    let acls_text = match String::from_utf8(acls_bytes) {
                         Ok(text) => text,
                         Err(e) => {
                             tracing::warn!("Failed to parse ACL text for {}: {}", dest_path.display(), e);
@@ -225,18 +228,38 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                         }
                     };
 
-                    // For now, we'll log that ACLs were detected but skip writing
-                    // A full implementation would parse the Debug format back to AclEntry
-                    //
-                    // The challenge is that we store ACLs as Debug format text,
-                    // but exacl doesn't provide a way to parse that back to AclEntry.
-                    // We would need to either:
-                    // 1. Store ACLs in a different format (e.g., text representation)
-                    // 2. Implement a parser for the Debug format
-                    // 3. Use getfacl/setfacl from the exacl crate more directly
-                    //
-                    // For now, this is a placeholder that detects ACLs but doesn't write them.
-                    tracing::debug!("ACLs detected for {} (preservation placeholder)", dest_path.display());
+                    // Parse each line as an ACL entry
+                    let mut acl_entries = Vec::new();
+                    for line in acls_text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        // Parse ACL entry from standard text format
+                        match AclEntry::from_str(line) {
+                            Ok(entry) => acl_entries.push(entry),
+                            Err(e) => {
+                                tracing::warn!("Failed to parse ACL entry '{}' for {}: {}", line, dest_path.display(), e);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if acl_entries.is_empty() {
+                        tracing::debug!("No valid ACL entries to write for {}", dest_path.display());
+                        return;
+                    }
+
+                    // Apply ACLs to destination file
+                    match setfacl(&[&dest_path], &acl_entries, None) {
+                        Ok(_) => {
+                            tracing::debug!("Successfully applied {} ACL entries to {}", acl_entries.len(), dest_path.display());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to apply ACLs to {}: {}", dest_path.display(), e);
+                        }
+                    }
                 })
                 .await
                 .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
