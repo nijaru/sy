@@ -23,7 +23,7 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
 ✅ **Phase 5 Complete** - BLAKE3 verification, symlinks, sparse files, xattrs! (v0.0.14-v0.0.16)
 ✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17+)
-🚀 **Current Version: v0.0.17** - 208 tests passing, zero errors!
+🚀 **Current Version: v0.0.17+** - 210 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -255,9 +255,10 @@ sy /source /destination --preserve-acls                # Same as -A
   - `-A` flag to preserve POSIX Access Control Lists
   - Always scanned, conditionally preserved (minimal overhead)
   - Preserves fine-grained permissions beyond owner/group/other
+  - Parses and applies ACLs using standard text format
   - Essential for enterprise systems with complex permission models
   - Cross-platform (Unix/Linux/macOS)
-  - Note: Full ACL writing pending (infrastructure complete)
+  - Fully implemented and tested
 
 ### 📋 Common Use Cases
 
