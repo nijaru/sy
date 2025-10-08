@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 6 Complete)
+- **ACL preservation** - POSIX Access Control Lists support
+  - `-A / --preserve-acls` flag to preserve ACLs
+  - ACL detection during file scanning (always scanned)
+  - Infrastructure complete: scanner, CLI flag, engine wiring
+  - Placeholder implementation (full ACL writing pending)
+  - Cross-platform (Unix/Linux/macOS)
+  - 3 new tests (test_acl_detection, test_acl_not_preserved_without_flag, test_acl_empty_bytes)
+  - Total tests: 208 (all passing)
+
 ### Planned for v0.1.0
-- Full file compression integration (infrastructure ready)
+- Full ACL writing implementation (parse and apply ACLs)
 - Network speed detection
 - Parallel chunk transfers (within single files)
 - Periodic checkpointing during sync (infrastructure ready)
