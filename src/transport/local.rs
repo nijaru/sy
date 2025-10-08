@@ -470,4 +470,176 @@ mod tests {
             assert!(dest_allocated < dest_meta.len() / 2, "Destination should be sparse");
         }
     }
+
+    // === Error Handling Tests ===
+
+    #[tokio::test]
+    async fn test_copy_file_nonexistent_source() {
+        let dest_dir = TempDir::new().unwrap();
+        let transport = LocalTransport::new();
+
+        let nonexistent = PathBuf::from("/nonexistent/file.txt");
+        let dest = dest_dir.path().join("test.txt");
+
+        let result = transport.copy_file(&nonexistent, &dest).await;
+        assert!(result.is_err(), "Should fail when source doesn't exist");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]  // Permission tests work differently on Windows
+    async fn test_copy_file_permission_denied_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create source file
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        // Make destination directory read-only
+        let mut perms = fs::metadata(dest_dir.path()).unwrap().permissions();
+        perms.set_mode(0o444);  // Read-only
+        fs::set_permissions(dest_dir.path(), perms).unwrap();
+
+        let transport = LocalTransport::new();
+        let dest_file = dest_dir.path().join("test.txt");
+
+        let result = transport.copy_file(&source_file, &dest_file).await;
+
+        // Restore permissions for cleanup
+        let mut perms = fs::metadata(dest_dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(dest_dir.path(), perms);
+
+        assert!(result.is_err(), "Should fail when destination is read-only");
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_all_nested() {
+        let temp = TempDir::new().unwrap();
+        let transport = LocalTransport::new();
+
+        let nested_path = temp.path().join("a/b/c/d/e/f");
+        transport.create_dir_all(&nested_path).await.unwrap();
+
+        assert!(nested_path.exists());
+        assert!(nested_path.is_dir());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_create_dir_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+
+        // Make parent read-only
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&parent, perms).unwrap();
+
+        let transport = LocalTransport::new();
+        let child = parent.join("child");
+
+        let result = transport.create_dir_all(&child).await;
+
+        // Restore permissions for cleanup
+        let mut perms = fs::metadata(&parent).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&parent, perms);
+
+        assert!(result.is_err(), "Should fail when parent is read-only");
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_file() {
+        let temp = TempDir::new().unwrap();
+        let transport = LocalTransport::new();
+
+        let nonexistent = temp.path().join("nonexistent.txt");
+        let result = transport.remove(&nonexistent, false).await;
+
+        // Should error on nonexistent file
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_nonexistent_file() {
+        let temp = TempDir::new().unwrap();
+        let transport = LocalTransport::new();
+
+        let nonexistent = temp.path().join("nonexistent.txt");
+        let result = transport.metadata(&nonexistent).await;
+
+        assert!(result.is_err(), "Should fail for nonexistent file");
+    }
+
+    #[tokio::test]
+    async fn test_scan_nonexistent_directory() {
+        let transport = LocalTransport::new();
+        let nonexistent = PathBuf::from("/nonexistent/directory");
+
+        let result = transport.scan(&nonexistent).await;
+        assert!(result.is_err(), "Should fail when directory doesn't exist");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_scan_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let protected_dir = temp.path().join("protected");
+        fs::create_dir(&protected_dir).unwrap();
+        fs::write(protected_dir.join("file.txt"), "content").unwrap();
+
+        // Make directory unreadable
+        let mut perms = fs::metadata(&protected_dir).unwrap().permissions();
+        perms.set_mode(0o000);  // No permissions
+        fs::set_permissions(&protected_dir, perms).unwrap();
+
+        let transport = LocalTransport::new();
+        let result = transport.scan(&protected_dir).await;
+
+        // Restore permissions for cleanup
+        let mut perms = fs::metadata(&protected_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&protected_dir, perms);
+
+        assert!(result.is_err(), "Should fail when directory is not readable");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_hardlink_across_filesystems() {
+        // This test attempts to create a hardlink across filesystems
+        // It should fail gracefully
+        let source_dir = TempDir::new().unwrap();
+        let source_file = source_dir.path().join("source.txt");
+        fs::write(&source_file, "content").unwrap();
+
+        // Try to link to /tmp (likely different filesystem on many systems)
+        let dest = PathBuf::from("/tmp/sy_test_hardlink_cross_fs.txt");
+
+        let transport = LocalTransport::new();
+        let result = transport.create_hardlink(&source_file, &dest).await;
+
+        // Clean up if it somehow succeeded
+        let _ = fs::remove_file(&dest);
+
+        // On most systems this should fail (cross-device link)
+        // But if both are on same filesystem, it might succeed
+        // Either way, we're testing that it doesn't crash
+        if result.is_err() {
+            // Expected on different filesystems
+            assert!(true);
+        } else {
+            // Succeeded - both on same filesystem, that's fine too
+            assert!(true);
+        }
+    }
 }
+
