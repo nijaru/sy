@@ -417,4 +417,86 @@ mod tests {
         // Destination should NOT exist
         assert!(!dest_path.exists());
     }
+
+    #[tokio::test]
+    #[cfg(unix)] // xattrs work differently on different platforms
+    async fn test_xattr_preservation() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a file and set xattrs
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        // Set some xattrs
+        xattr::set(&source_file, "user.test", b"value1").unwrap();
+        xattr::set(&source_file, "user.another", b"value2").unwrap();
+
+        let file_entry = FileEntry {
+            path: source_file.clone(),
+            relative_path: PathBuf::from("test.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: Some([
+                ("user.test".to_string(), b"value1".to_vec()),
+                ("user.another".to_string(), b"value2".to_vec()),
+            ].iter().cloned().collect()),
+        };
+
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, true); // preserve_xattrs = true
+        let dest_path = dest_dir.path().join("test.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Verify file exists
+        assert!(dest_path.exists());
+
+        // Verify xattrs were preserved
+        let xattr1 = xattr::get(&dest_path, "user.test").unwrap().unwrap();
+        assert_eq!(xattr1, b"value1");
+
+        let xattr2 = xattr::get(&dest_path, "user.another").unwrap().unwrap();
+        assert_eq!(xattr2, b"value2");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_xattr_not_preserved_without_flag() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        xattr::set(&source_file, "user.test", b"value1").unwrap();
+
+        let file_entry = FileEntry {
+            path: source_file.clone(),
+            relative_path: PathBuf::from("test.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: Some([("user.test".to_string(), b"value1".to_vec())].iter().cloned().collect()),
+        };
+
+        let transport = LocalTransport::new();
+        let transferrer = Transferrer::new(&transport, false, SymlinkMode::Preserve, false); // preserve_xattrs = false
+        let dest_path = dest_dir.path().join("test.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        assert!(dest_path.exists());
+
+        // Verify xattrs were NOT preserved
+        let xattr = xattr::get(&dest_path, "user.test").unwrap();
+        assert!(xattr.is_none(), "Xattr should not be preserved when flag is false");
+    }
 }
