@@ -128,4 +128,11 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.create_hardlink(source, dest).await,
         }
     }
+
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.create_symlink(target, dest).await,
+            TransportRouter::Dual(t) => t.create_symlink(target, dest).await,
+        }
+    }
 }

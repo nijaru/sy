@@ -323,6 +323,40 @@ impl Transport for LocalTransport {
         tracing::debug!("Created hardlink: {} -> {}", dest.display(), source.display());
         Ok(())
     }
+
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        // Ensure parent directory exists
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(SyncError::Io)?;
+        }
+
+        // Create the symbolic link
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(target, dest)
+                .await
+                .map_err(SyncError::Io)?;
+        }
+
+        #[cfg(windows)]
+        {
+            // Windows requires different symlink APIs for files vs directories
+            if tokio::fs::metadata(target).await.ok().map(|m| m.is_dir()).unwrap_or(false) {
+                tokio::fs::symlink_dir(target, dest)
+                    .await
+                    .map_err(SyncError::Io)?;
+            } else {
+                tokio::fs::symlink_file(target, dest)
+                    .await
+                    .map_err(SyncError::Io)?;
+            }
+        }
+
+        tracing::debug!("Created symlink: {} -> {}", dest.display(), target.display());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
