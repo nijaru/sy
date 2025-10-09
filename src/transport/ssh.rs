@@ -698,18 +698,41 @@ impl Transport for SshTransport {
         }
 
         // Create hardlink using ln command
+        // Retry if source doesn't exist yet (can happen in parallel execution)
         let command = format!("ln '{}' '{}'", source_str, dest_str);
+        let max_retries = 10;
+        let mut last_error = None;
 
-        tokio::task::spawn_blocking({
-            let session = Arc::clone(&self.session);
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        for attempt in 0..max_retries {
+            match tokio::task::spawn_blocking({
+                let session = Arc::clone(&self.session);
+                let cmd = command.clone();
+                move || Self::execute_command(session, &cmd)
+            })
+            .await
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            {
+                Ok(_) => {
+                    tracing::debug!("Created hardlink: {} -> {}", dest_str, source_str);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("No such file or directory") && attempt < max_retries - 1 {
+                        // Source file not ready yet, wait and retry
+                        tracing::debug!("Hardlink source not ready (attempt {}), waiting...", attempt + 1);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
-        tracing::debug!("Created hardlink: {} -> {}", dest_str, source_str);
-        Ok(())
+        Err(last_error.unwrap_or_else(|| {
+            SyncError::Io(std::io::Error::other("Failed to create hardlink after retries"))
+        }))
     }
 
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
