@@ -55,6 +55,13 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             Ok(None)
         } else {
             // Check if this is a hardlink we should preserve
+            tracing::debug!(
+                "Checking hardlink for {}: preserve_hardlinks={}, nlink={}, inode={:?}",
+                source.path.display(),
+                self.preserve_hardlinks,
+                source.nlink,
+                source.inode
+            );
             if self.preserve_hardlinks && source.nlink > 1 {
                 if let Some(inode) = source.inode {
                     // Check if we've seen this inode before
@@ -318,25 +325,13 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             SymlinkMode::Preserve => {
                 // Preserve the symlink as a symlink
                 if let Some(ref target) = source.symlink_target {
-                    // Ensure parent directory exists
-                    if let Some(parent) = dest_path.parent() {
-                        self.transport.create_dir_all(parent).await?;
-                    }
-
-                    // Create symlink (only works for local transport currently)
-                    #[cfg(unix)]
-                    {
-                        std::os::unix::fs::symlink(target, dest_path)?;
-                        tracing::debug!(
-                            "Created symlink: {} -> {}",
-                            dest_path.display(),
-                            target.display()
-                        );
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        tracing::warn!("Symlink preservation not supported on this platform");
-                    }
+                    // Create symlink using transport (works for both local and SSH)
+                    self.transport.create_symlink(target, dest_path).await?;
+                    tracing::debug!(
+                        "Created symlink: {} -> {}",
+                        dest_path.display(),
+                        target.display()
+                    );
 
                     Ok(None)
                 } else {

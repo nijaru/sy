@@ -117,6 +117,11 @@ pub trait Transport: Send + Sync {
     /// Creates a hard link at `dest` pointing to `source`.
     /// Both paths must be on the same filesystem.
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()>;
+
+    /// Create a symbolic link
+    ///
+    /// Creates a symbolic link at `dest` pointing to `target`.
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -153,5 +158,9 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
         (**self).create_hardlink(source, dest).await
+    }
+
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        (**self).create_symlink(target, dest).await
     }
 }

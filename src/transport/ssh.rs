@@ -711,4 +711,35 @@ impl Transport for SshTransport {
         tracing::debug!("Created hardlink: {} -> {}", dest_str, source_str);
         Ok(())
     }
+
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        let target_str = target.to_string_lossy();
+        let dest_str = dest.to_string_lossy();
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest.parent() {
+            let parent_str = parent.to_string_lossy();
+            let mkdir_cmd = format!("mkdir -p '{}'", parent_str);
+            tokio::task::spawn_blocking({
+                let session = Arc::clone(&self.session);
+                move || Self::execute_command(session, &mkdir_cmd)
+            })
+            .await
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        }
+
+        // Create symlink using ln -s command
+        let command = format!("ln -s '{}' '{}'", target_str, dest_str);
+
+        tokio::task::spawn_blocking({
+            let session = Arc::clone(&self.session);
+            let cmd = command.clone();
+            move || Self::execute_command(session, &cmd)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+
+        tracing::debug!("Created symlink: {} -> {}", dest_str, target_str);
+        Ok(())
+    }
 }

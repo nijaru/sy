@@ -66,4 +66,9 @@ impl Transport for DualTransport {
         // Create hardlink on destination
         self.dest.create_hardlink(source, dest).await
     }
+
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        // Create symlink on destination
+        self.dest.create_symlink(target, dest).await
+    }
 }
