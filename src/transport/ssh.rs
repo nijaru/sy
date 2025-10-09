@@ -24,6 +24,17 @@ struct FileEntryJson {
     size: u64,
     mtime: i64,
     is_dir: bool,
+    // Extended metadata for full preservation
+    is_symlink: bool,
+    symlink_target: Option<String>,
+    is_sparse: bool,
+    allocated_size: u64,
+    #[serde(default)]
+    xattrs: Option<Vec<(String, String)>>, // (key, base64-encoded value)
+    inode: Option<u64>,
+    nlink: u64,
+    #[serde(default)]
+    acls: Option<String>, // ACL text format (one per line)
 }
 
 pub struct SshTransport {
@@ -182,6 +193,26 @@ impl Transport for SshTransport {
             .map(|e| {
                 let modified =
                     UNIX_EPOCH + Duration::from_secs(e.mtime.max(0) as u64);
+
+                // Decode xattrs from base64 if present
+                let xattrs = e.xattrs.map(|xattr_vec| {
+                    xattr_vec.into_iter()
+                        .filter_map(|(key, base64_val)| {
+                            use base64::{Engine as _, engine::general_purpose};
+                            match general_purpose::STANDARD.decode(base64_val) {
+                                Ok(decoded) => Some((key, decoded)),
+                                Err(e) => {
+                                    tracing::warn!("Failed to decode xattr {}: {}", key, e);
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                });
+
+                // Decode ACLs from text format
+                let acls = e.acls.map(|acl_text| acl_text.into_bytes());
+
                 Ok(FileEntry {
                     path: PathBuf::from(&e.path),
                     relative_path: PathBuf::from(&e.path)
@@ -191,14 +222,14 @@ impl Transport for SshTransport {
                     size: e.size,
                     modified,
                     is_dir: e.is_dir,
-                    is_symlink: false,  // TODO: Add symlink detection for SSH
-                    symlink_target: None,
-                    is_sparse: false,  // TODO: Add sparse detection for SSH
-                    allocated_size: e.size,
-                    xattrs: None,  // TODO: Add xattr support for SSH
-                    inode: None,  // TODO: Add hardlink detection for SSH
-                    nlink: 1,
-                    acls: None,  // TODO: Add ACL support for SSH
+                    is_symlink: e.is_symlink,
+                    symlink_target: e.symlink_target.map(PathBuf::from),
+                    is_sparse: e.is_sparse,
+                    allocated_size: e.allocated_size,
+                    xattrs,
+                    inode: e.inode,
+                    nlink: e.nlink,
+                    acls,
                 })
             })
             .collect();
