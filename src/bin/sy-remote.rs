@@ -57,6 +57,17 @@ struct FileEntryJson {
     size: u64,
     mtime: i64,
     is_dir: bool,
+    // Extended metadata for full preservation
+    is_symlink: bool,
+    symlink_target: Option<String>,
+    is_sparse: bool,
+    allocated_size: u64,
+    #[serde(default)]
+    xattrs: Option<Vec<(String, String)>>, // (key, base64-encoded value)
+    inode: Option<u64>,
+    nlink: u64,
+    #[serde(default)]
+    acls: Option<String>, // ACL text format (one per line)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,11 +86,37 @@ fn main() -> anyhow::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
+
+                    // Encode xattrs to base64 for transport
+                    let xattrs = e.xattrs.map(|xattrs_map| {
+                        use base64::{Engine as _, engine::general_purpose};
+                        xattrs_map
+                            .into_iter()
+                            .map(|(key, value)| {
+                                let encoded = general_purpose::STANDARD.encode(&value);
+                                (key, encoded)
+                            })
+                            .collect()
+                    });
+
+                    // Convert ACLs from bytes to string
+                    let acls = e.acls.and_then(|acl_bytes| {
+                        String::from_utf8(acl_bytes).ok()
+                    });
+
                     FileEntryJson {
                         path: e.path.to_string_lossy().to_string(),
                         size: e.size,
                         mtime,
                         is_dir: e.is_dir,
+                        is_symlink: e.is_symlink,
+                        symlink_target: e.symlink_target.map(|p| p.to_string_lossy().to_string()),
+                        is_sparse: e.is_sparse,
+                        allocated_size: e.allocated_size,
+                        xattrs,
+                        inode: e.inode,
+                        nlink: e.nlink,
+                        acls,
                     }
                 })
                 .collect();
