@@ -119,8 +119,8 @@ sy /source /destination -L                             # Follow symlinks and cop
 sy /source /destination --links skip                   # Skip all symlinks
 
 # Hardlink preservation (new in v0.0.17+)
-sy /source /destination -H -j 1                        # Preserve hard links (use single worker)
-sy /source /destination --preserve-hardlinks -j 1      # Recommended: avoid parallel race condition
+sy /source /destination -H                             # Preserve hard links
+sy /source /destination --preserve-hardlinks           # Same as -H
 
 # ACL preservation (new in v0.0.17+)
 sy /source /destination -A                             # Preserve ACLs (Unix/Linux/macOS)
@@ -249,8 +249,7 @@ sy /source /destination --preserve-acls                # Same as -A
   - Tracks inode numbers during scan
   - Creates hardlinks instead of copying duplicate data
   - Preserves disk space savings from source to destination
-  - **Works with single worker**: Use `-H -j 1` for reliable hardlink preservation
-  - **Known limitation**: Parallel transfers have race condition (use `-j 1` as workaround)
+  - **Full parallel support**: Async coordination ensures correct hardlink creation with multiple workers
   - Critical for backup systems, package managers, etc.
   - Cross-platform (Unix/Linux/macOS)
 - **ACL Preservation** (v0.0.17+):

@@ -5,6 +5,16 @@ use crate::transport::{Transport, TransferResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+
+/// State of an inode during hardlink processing
+#[derive(Clone, Debug)]
+pub(crate) enum InodeState {
+    /// File is being copied, contains notify for waiters
+    InProgress(Arc<Notify>),
+    /// File copy complete, contains destination path for hardlinking
+    Completed(PathBuf),
+}
 
 pub struct Transferrer<'a, T: Transport> {
     transport: &'a T,
@@ -13,7 +23,7 @@ pub struct Transferrer<'a, T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    hardlink_map: Arc<Mutex<HashMap<u64, PathBuf>>>, // inode -> first destination path
+    hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>, // inode -> state
 }
 
 impl<'a, T: Transport> Transferrer<'a, T> {
@@ -24,7 +34,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
-        hardlink_map: Arc<Mutex<HashMap<u64, PathBuf>>>,
+        hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>,
     ) -> Self {
         Self {
             transport,
@@ -55,56 +65,83 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             Ok(None)
         } else {
             // Check if this is a hardlink we should preserve
-            tracing::debug!(
-                "Checking hardlink for {}: preserve_hardlinks={}, nlink={}, inode={:?}",
-                source.path.display(),
-                self.preserve_hardlinks,
-                source.nlink,
-                source.inode
-            );
             if self.preserve_hardlinks && source.nlink > 1 {
                 if let Some(inode) = source.inode {
-                    // Check if we've seen this inode before
-                    let first_path_opt = {
-                        let map = self.hardlink_map.lock().unwrap();
-                        map.get(&inode).cloned()
-                    }; // Lock is dropped here
+                    // Loop until we either create a hardlink or copy the file
+                    loop {
+                        let state = {
+                            let map = self.hardlink_map.lock().unwrap();
+                            map.get(&inode).cloned()
+                        }; // Lock dropped
 
-                    if let Some(first_path) = first_path_opt {
-                        // Create hardlink to the first occurrence
-                        tracing::debug!(
-                            "Creating hardlink: {} -> {} (inode: {})",
-                            dest_path.display(),
-                            first_path.display(),
-                            inode
-                        );
-                        self.transport.create_hardlink(&first_path, dest_path).await?;
+                        match state {
+                            Some(InodeState::Completed(first_path)) => {
+                                // Another task already copied this file, create hardlink
+                                tracing::debug!(
+                                    "Creating hardlink: {} -> {} (inode: {})",
+                                    dest_path.display(),
+                                    first_path.display(),
+                                    inode
+                                );
+                                self.transport.create_hardlink(&first_path, dest_path).await?;
 
-                        // Return a result indicating no bytes were transferred (hardlink created)
-                        return Ok(Some(TransferResult {
-                            bytes_written: 0,
-                            compression_used: false,
-                            transferred_bytes: Some(0),
-                            delta_operations: None,
-                            literal_bytes: None,
-                        }));
-                    } else {
-                        // First time seeing this inode - copy file and record it
-                        let result = self.copy_file(&source.path, dest_path).await?;
+                                return Ok(Some(TransferResult {
+                                    bytes_written: 0,
+                                    compression_used: false,
+                                    transferred_bytes: Some(0),
+                                    delta_operations: None,
+                                    literal_bytes: None,
+                                }));
+                            }
+                            Some(InodeState::InProgress(notify)) => {
+                                // Another task is copying, wait for it to complete
+                                tracing::debug!(
+                                    "Waiting for inode {} to complete ({})",
+                                    inode,
+                                    source.path.display()
+                                );
+                                notify.notified().await;
+                                // Loop back to check if it's now Completed
+                                continue;
+                            }
+                            None => {
+                                // First task to encounter this inode, claim it
+                                let notify = Arc::new(Notify::new());
+                                {
+                                    let mut map = self.hardlink_map.lock().unwrap();
+                                    // Double-check another task didn't claim it while we released the lock
+                                    if map.contains_key(&inode) {
+                                        continue; // Loop back to check state again
+                                    }
+                                    map.insert(inode, InodeState::InProgress(Arc::clone(&notify)));
+                                } // Lock dropped
 
-                        // Record this as the first path for this inode
-                        {
-                            let mut map = self.hardlink_map.lock().unwrap();
-                            map.insert(inode, dest_path.to_path_buf());
-                        } // Lock is dropped here
+                                tracing::debug!(
+                                    "First occurrence of inode {}, copying {} to {}",
+                                    inode,
+                                    source.path.display(),
+                                    dest_path.display()
+                                );
 
-                        // Write extended attributes if present
-                        self.write_xattrs(source, dest_path).await?;
+                                // Copy the file
+                                let result = self.copy_file(&source.path, dest_path).await?;
 
-                        // Write ACLs if present
-                        self.write_acls(source, dest_path).await?;
+                                // Write extended attributes if present
+                                self.write_xattrs(source, dest_path).await?;
 
-                        return Ok(Some(result));
+                                // Write ACLs if present
+                                self.write_acls(source, dest_path).await?;
+
+                                // Mark as completed and notify waiters
+                                {
+                                    let mut map = self.hardlink_map.lock().unwrap();
+                                    map.insert(inode, InodeState::Completed(dest_path.to_path_buf()));
+                                }
+                                notify.notify_waiters();
+
+                                return Ok(Some(result));
+                            }
+                        }
                     }
                 }
             }
@@ -760,7 +797,10 @@ mod tests {
         // Verify hardlink_map was updated
         let map = hardlink_map.lock().unwrap();
         assert!(map.contains_key(&inode), "Inode should be in hardlink map");
-        assert_eq!(map.get(&inode).unwrap(), &dest_original);
+        match map.get(&inode).unwrap() {
+            InodeState::Completed(path) => assert_eq!(path, &dest_original),
+            InodeState::InProgress(_) => panic!("Expected Completed state, got InProgress"),
+        }
     }
 
     #[tokio::test]
