@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added (Phase 6 Complete)
+- **Full metadata preservation over SSH** - Extended transport protocol
+  - FileEntryJson now includes: symlinks, hardlinks, sparse files, xattrs, ACLs
+  - sy-remote serializes complete metadata with base64 encoding for xattrs
+  - SSH transport deserializes and uses all metadata fields
+  - Enables rsync-like metadata preservation over network
+- **Symlink preservation over SSH** - Fully implemented
+  - Added create_symlink() to Transport trait
+  - Implementations for Local, SSH, Dual, and Router transports
+  - Uses `ln -s` command over SSH for remote symlink creation
+  - Tested and working: both relative and absolute symlinks transfer correctly
+- **Hardlink preservation** - Partial implementation
+  - `-H / --preserve-hardlinks` flag to preserve hard links
+  - Tracks inode numbers and link counts during scan
+  - **Local sync**: ✅ Fully working and tested
+  - **SSH sync**: ⚠️ Partial - works for sequential files, known race condition with parallel transfers
+  - Added retry logic (10 attempts, 50ms delay) for SSH hardlink creation
+  - Future improvement: track in-progress inodes separately from completed ones
 - **ACL preservation** - POSIX Access Control Lists support (FULLY IMPLEMENTED)
   - `-A / --preserve-acls` flag to preserve ACLs
   - ACL detection during file scanning (always scanned)
