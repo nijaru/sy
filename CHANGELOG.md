@@ -18,13 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implementations for Local, SSH, Dual, and Router transports
   - Uses `ln -s` command over SSH for remote symlink creation
   - Tested and working: both relative and absolute symlinks transfer correctly
-- **Hardlink preservation** - Partial implementation
+- **Hardlink preservation** - FULLY IMPLEMENTED
   - `-H / --preserve-hardlinks` flag to preserve hard links
   - Tracks inode numbers and link counts during scan
   - **Local sync**: ✅ Fully working and tested
-  - **SSH sync**: ⚠️ Partial - works for sequential files, known race condition with parallel transfers
-  - Added retry logic (10 attempts, 50ms delay) for SSH hardlink creation
-  - Future improvement: track in-progress inodes separately from completed ones
+  - **SSH sync**: ✅ FIXED - Race condition resolved with async coordination
+  - InodeState enum with tokio::sync::Notify for proper task coordination
+  - Works correctly with parallel execution (no `-j 1` workaround needed)
 - **ACL preservation** - POSIX Access Control Lists support (FULLY IMPLEMENTED)
   - `-A / --preserve-acls` flag to preserve ACLs
   - ACL detection during file scanning (always scanned)
