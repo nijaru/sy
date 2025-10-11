@@ -249,6 +249,8 @@ sy /source /destination --preserve-acls                # Same as -A
   - Tracks inode numbers during scan
   - Creates hardlinks instead of copying duplicate data
   - Preserves disk space savings from source to destination
+  - **Local sync**: ✅ Fully working and tested
+  - **SSH sync**: ⚠️ Partial - works for sequential files, known race condition with parallel transfers
   - Critical for backup systems, package managers, etc.
   - Cross-platform (Unix/Linux/macOS)
 - **ACL Preservation** (v0.0.17+):
