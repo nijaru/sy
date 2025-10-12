@@ -5,6 +5,7 @@ pub mod delta;
 pub mod error;
 pub mod integrity;
 pub mod path;
+pub mod resource;
 pub mod ssh;
 pub mod sync;
 pub mod transport;

@@ -195,6 +195,24 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tracing::info!("Filtered out {} files", filtered_count);
         }
 
+        // Check resources before starting sync
+        if !self.dry_run {
+            // Calculate estimated bytes needed
+            let bytes_needed: u64 = source_files
+                .iter()
+                .filter(|f| !f.is_dir)
+                .map(|f| f.size)
+                .sum();
+
+            // Check disk space
+            if let Err(e) = crate::resource::check_disk_space(destination, bytes_needed) {
+                return Err(e);
+            }
+
+            // Check FD limits
+            crate::resource::check_fd_limits(self.max_concurrent)?;
+        }
+
         // Load or create resume state
         let current_flags = SyncFlags {
             delete: self.delete,

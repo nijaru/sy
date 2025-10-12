@@ -62,6 +62,10 @@ dirs = "5"
 regex = "1"
 futures = "0.3.31"
 
+# Platform-specific dependencies
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"

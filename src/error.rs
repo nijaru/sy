@@ -33,9 +33,14 @@ pub enum SyncError {
     #[error("Invalid path: {path}\nPaths must be valid UTF-8 and not contain invalid characters.")]
     InvalidPath { path: PathBuf },
 
-    #[allow(dead_code)] // Used in future phases (disk space checking)
-    #[error("Insufficient disk space\nThe destination drive does not have enough free space for this operation.")]
-    InsufficientDiskSpace,
+    #[error("Insufficient disk space: {path}\nRequired: {required} bytes ({required_fmt})\nAvailable: {available} bytes ({available_fmt})\nFree up space or reduce the amount of data to sync.",
+        required_fmt = format_bytes(*required),
+        available_fmt = format_bytes(*available))]
+    InsufficientDiskSpace {
+        path: PathBuf,
+        required: u64,
+        available: u64,
+    },
 
     #[allow(dead_code)] // Used in future phases (network sync)
     #[error("Network error: {message}\nCheck your network connection and try again.")]
@@ -43,3 +48,23 @@ pub enum SyncError {
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+/// Format bytes for human-readable display in error messages
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
