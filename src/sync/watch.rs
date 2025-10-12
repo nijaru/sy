@@ -158,6 +158,9 @@ mod tests {
             false, // preserve_xattrs
             false, // preserve_hardlinks
             false, // preserve_acls
+            false, // ignore_times
+            false, // size_only
+            false, // checksum
         );
 
         let watch_mode = WatchMode::new(
@@ -203,6 +206,9 @@ mod tests {
             false,
             false,
             false,
+            false, // ignore_times
+            false, // size_only
+            false, // checksum
         );
 
         let watch_mode = WatchMode::new(

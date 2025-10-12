@@ -26,12 +26,31 @@ pub struct SyncTask {
 pub struct StrategyPlanner {
     /// mtime tolerance in seconds (to handle filesystem granularity)
     mtime_tolerance: u64,
+    /// Ignore modification times, always compare checksums
+    ignore_times: bool,
+    /// Only compare file size, skip mtime checks
+    size_only: bool,
+    /// Always compare checksums instead of size+mtime
+    checksum: bool,
 }
 
 impl StrategyPlanner {
     pub fn new() -> Self {
         Self {
             mtime_tolerance: 1, // 1 second tolerance for mtime comparison
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
+        }
+    }
+
+    /// Create a new planner with custom comparison flags
+    pub fn with_comparison_flags(ignore_times: bool, size_only: bool, checksum: bool) -> Self {
+        Self {
+            mtime_tolerance: 1,
+            ignore_times,
+            size_only,
+            checksum,
         }
     }
 
@@ -110,6 +129,30 @@ impl StrategyPlanner {
 
     /// Check if file needs update based on size and mtime
     fn needs_update(&self, source: &FileEntry, dest_meta: &std::fs::Metadata) -> bool {
+        // Handle comparison flags
+
+        // --checksum: Always return true to force checksum comparison
+        // (actual checksum verification happens during transfer)
+        if self.checksum {
+            return true;
+        }
+
+        // --ignore-times: Skip mtime checks, only compare size
+        // (if sizes match, still force transfer to compare checksums)
+        if self.ignore_times {
+            if source.size != dest_meta.len() {
+                return true;  // Different size = definitely needs update
+            }
+            return true;  // Same size but ignore mtime = force checksum comparison
+        }
+
+        // --size-only: Only compare file size, skip mtime checks
+        if self.size_only {
+            return source.size != dest_meta.len();
+        }
+
+        // Default behavior: compare size + mtime
+
         // Different size = needs update
         if source.size != dest_meta.len() {
             return true;

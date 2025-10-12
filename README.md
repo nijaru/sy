@@ -138,6 +138,12 @@ sy /source /destination -g                             # Preserve group (require
 sy /source /destination -o                             # Preserve owner (requires root)
 sy /source /destination -D                             # Preserve device files (requires root)
 sy /source /destination -ptg                           # Combine flags (perms + times + group)
+
+# File comparison modes (new in v0.0.18+)
+sy /source /destination --ignore-times                 # Always compare checksums (ignore mtime)
+sy /source /destination --size-only                    # Only compare file size (skip mtime checks)
+sy /source /destination -c                             # Always use checksums instead of size+mtime
+sy /source /destination --checksum                     # Same as -c (rsync compatibility)
 ```
 
 ## Features

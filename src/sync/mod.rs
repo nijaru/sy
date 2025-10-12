@@ -59,6 +59,9 @@ pub struct SyncEngine<T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
+    ignore_times: bool,
+    size_only: bool,
+    checksum: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -83,6 +86,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
+        ignore_times: bool,
+        size_only: bool,
+        checksum: bool,
     ) -> Self {
         // Compile exclude patterns once at creation
         let exclude_patterns = exclude
@@ -118,6 +124,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             preserve_xattrs,
             preserve_hardlinks,
             preserve_acls,
+            ignore_times,
+            size_only,
+            checksum,
         }
     }
 
@@ -239,7 +248,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .unwrap_or_default();
 
         // Plan sync operations
-        let planner = StrategyPlanner::new();
+        let planner = StrategyPlanner::with_comparison_flags(
+            self.ignore_times,
+            self.size_only,
+            self.checksum,
+        );
         let mut tasks = Vec::with_capacity(source_files.len());
 
         for file in &source_files {
@@ -889,6 +902,9 @@ mod tests {
             false, // preserve_xattrs
             false, // preserve_hardlinks
             false, // preserve_acls
+            false, // ignore_times
+            false, // size_only
+            false, // checksum
         )
     }
 
@@ -967,6 +983,9 @@ mod tests {
             false, // preserve_xattrs
             false, // preserve_hardlinks
             false, // preserve_acls
+            false, // ignore_times
+            false, // size_only
+            false, // checksum
         );
 
         let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
