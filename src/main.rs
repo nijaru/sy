@@ -178,6 +178,9 @@ async fn main() -> Result<()> {
         cli.preserve_xattrs,
         cli.preserve_hardlinks,
         cli.preserve_acls,
+        cli.ignore_times,
+        cli.size_only,
+        cli.checksum,
     );
 
     // Watch mode or regular sync
