@@ -144,6 +144,11 @@ sy /source /destination --ignore-times                 # Always compare checksum
 sy /source /destination --size-only                    # Only compare file size (skip mtime checks)
 sy /source /destination -c                             # Always use checksums instead of size+mtime
 sy /source /destination --checksum                     # Same as -c (rsync compatibility)
+
+# Deletion safety (new in v0.0.18+)
+sy /source /destination --delete --delete-threshold 75  # Allow up to 75% of files to be deleted
+sy /source /destination --delete --force-delete         # Skip safety checks (dangerous!)
+# Note: Default threshold is 50%, prompts for confirmation if >1000 files
 ```
 
 ## Features
