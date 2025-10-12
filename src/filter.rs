@@ -21,12 +21,15 @@ pub struct FilterRule {
     pub pattern: glob::Pattern,
     /// Original pattern string (for debugging)
     pub pattern_str: String,
+    /// Whether pattern contains '/' (affects matching behavior)
+    pub has_slash: bool,
 }
 
 impl FilterRule {
     /// Create a new filter rule from a pattern string
     pub fn new(action: FilterAction, pattern: &str) -> Result<Self> {
         let pattern_str = pattern.to_string();
+        let has_slash = pattern.contains('/');
         let pattern = glob::Pattern::new(pattern)
             .with_context(|| format!("Invalid filter pattern: {}", pattern))?;
 
@@ -34,16 +37,30 @@ impl FilterRule {
             action,
             pattern,
             pattern_str,
+            has_slash,
         })
     }
 
     /// Check if this rule matches the given path
+    ///
+    /// Implements rsync-style matching:
+    /// - If pattern contains '/', match against full relative path
+    /// - Otherwise, match against basename only
     pub fn matches(&self, path: &Path) -> bool {
-        // Convert path to string for pattern matching
-        if let Some(path_str) = path.to_str() {
-            self.pattern.matches(path_str)
+        if self.has_slash {
+            // Pattern has '/' - match against full path
+            if let Some(path_str) = path.to_str() {
+                self.pattern.matches(path_str)
+            } else {
+                false
+            }
         } else {
-            false
+            // No '/' in pattern - match against basename only (rsync behavior)
+            if let Some(basename) = path.file_name().and_then(|n| n.to_str()) {
+                self.pattern.matches(basename)
+            } else {
+                false
+            }
         }
     }
 }
@@ -290,5 +307,38 @@ mod tests {
         assert!(!filter.should_include(Path::new("foo/bar/test.log")));
         assert!(!filter.should_include(Path::new("temp/foo/bar")));
         assert!(filter.should_include(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_rsync_basename_matching() {
+        let mut filter = FilterEngine::new();
+        // Pattern without '/' should match basename only (rsync behavior)
+        filter.add_include("important.rs").unwrap();
+        filter.add_exclude("*.rs").unwrap();
+
+        // Should include important.rs even in subdirectory
+        assert!(filter.should_include(Path::new("dir/important.rs")));
+        assert!(filter.should_include(Path::new("deep/nested/important.rs")));
+
+        // Should exclude other .rs files
+        assert!(!filter.should_include(Path::new("code.rs")));
+        assert!(!filter.should_include(Path::new("dir/code.rs")));
+    }
+
+    #[test]
+    fn test_rsync_path_matching() {
+        let mut filter = FilterEngine::new();
+        // Pattern with '/' should match full path
+        filter.add_exclude("dir1/*.rs").unwrap();
+        filter.add_exclude("**/temp/*.log").unwrap();
+
+        // Should exclude .rs files in dir1/ only
+        assert!(!filter.should_include(Path::new("dir1/code.rs")));
+        assert!(filter.should_include(Path::new("dir2/code.rs"))); // different dir
+
+        // Should exclude .log files in any temp/ directory
+        assert!(!filter.should_include(Path::new("temp/test.log")));
+        assert!(!filter.should_include(Path::new("foo/temp/test.log")));
+        assert!(filter.should_include(Path::new("temp/test.txt"))); // not .log
     }
 }
