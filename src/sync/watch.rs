@@ -147,6 +147,7 @@ mod tests {
             false, // force_delete
             true,  // quiet
             10,    // parallel
+            100,   // max_errors
             None,  // min_size
             None,  // max_size
             vec![], // exclude
@@ -198,6 +199,7 @@ mod tests {
             false, // force_delete
             true,
             10,
+            100, // max_errors
             None,
             None,
             vec![],
