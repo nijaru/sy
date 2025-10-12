@@ -182,6 +182,25 @@ pub struct Cli {
     #[arg(long)]
     pub exclude: Vec<String>,
 
+    /// Include files matching pattern (can be repeated, processed in order with --exclude)
+    /// Examples: "*.rs", "important.log"
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    /// Filter rules in rsync syntax: "+ pattern" (include) or "- pattern" (exclude)
+    /// Can be repeated. Rules processed in order, first match wins.
+    /// Examples: "+ *.rs", "- *.log", "- target/*"
+    #[arg(long)]
+    pub filter: Vec<String>,
+
+    /// Read exclude patterns from file (one pattern per line)
+    #[arg(long)]
+    pub exclude_from: Option<std::path::PathBuf>,
+
+    /// Read include patterns from file (one pattern per line)
+    #[arg(long)]
+    pub include_from: Option<std::path::PathBuf>,
+
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
@@ -436,6 +455,10 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude: vec![],
+            include: vec![],
+            filter: vec![],
+            exclude_from: None,
+            include_from: None,
             bwlimit: None,
             compress: false,
             mode: VerificationMode::Standard,
@@ -484,6 +507,10 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude: vec![],
+            include: vec![],
+            filter: vec![],
+            exclude_from: None,
+            include_from: None,
             bwlimit: None,
             compress: false,
             mode: VerificationMode::Standard,
