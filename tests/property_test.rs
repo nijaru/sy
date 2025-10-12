@@ -109,12 +109,13 @@ proptest! {
             fs::write(dest.path().join(format!("extra_{}.txt", i)), "extra").unwrap();
         }
 
-        // Sync with --delete
+        // Sync with --delete and --force-delete to bypass safety thresholds
         let output = Command::new(sy_bin())
             .args([
                 source.path().to_str().unwrap(),
                 dest.path().to_str().unwrap(),
                 "--delete",
+                "--force-delete",
             ])
             .output()
             .unwrap();
