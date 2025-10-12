@@ -6,6 +6,7 @@ mod error;
 mod filter;
 mod integrity;
 mod path;
+mod resource;
 mod ssh;
 mod sync;
 mod transport;

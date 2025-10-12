@@ -10,6 +10,7 @@ use crate::cli::SymlinkMode;
 use crate::error::Result;
 use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
+use crate::resource;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
 use resume::{ResumeState, SyncFlags};
@@ -197,12 +198,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 .sum();
 
             // Check disk space
-            if let Err(e) = crate::resource::check_disk_space(destination, bytes_needed) {
+            if let Err(e) = resource::check_disk_space(destination, bytes_needed) {
                 return Err(e);
             }
 
             // Check FD limits
-            crate::resource::check_fd_limits(self.max_concurrent)?;
+            resource::check_fd_limits(self.max_concurrent)?;
         }
 
         // Load or create resume state
