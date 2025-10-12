@@ -162,6 +162,9 @@ async fn main() -> Result<()> {
         transport,
         cli.dry_run,
         cli.delete,
+        cli.delete_threshold,
+        cli.trash,
+        cli.force_delete,
         cli.quiet || cli.json,  // JSON mode implies quiet
         cli.parallel,
         cli.min_size,
