@@ -48,6 +48,7 @@ pub struct SyncEngine<T: Transport> {
     force_delete: bool,
     quiet: bool,
     max_concurrent: usize,
+    max_errors: usize,
     min_size: Option<u64>,
     max_size: Option<u64>,
     exclude_patterns: Vec<glob::Pattern>,
@@ -78,6 +79,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         force_delete: bool,
         quiet: bool,
         max_concurrent: usize,
+        max_errors: usize,
         min_size: Option<u64>,
         max_size: Option<u64>,
         exclude: Vec<String>,
@@ -119,6 +121,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             force_delete,
             quiet,
             max_concurrent,
+            max_errors,
             min_size,
             max_size,
             exclude_patterns,
@@ -701,23 +704,97 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Collect all results
         let results = futures::future::join_all(handles).await;
 
-        // Check for errors
+        // Check for errors and count them
+        let mut error_count = 0;
         let mut first_error = None;
+        let mut all_errors = Vec::new();
+
         for result in results {
             match result {
                 Ok(Ok(())) => {} // Success
                 Ok(Err(e)) => {
+                    error_count += 1;
                     if first_error.is_none() {
-                        first_error = Some(e);
+                        first_error = Some(e.to_string());
                     }
-                }
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(crate::error::SyncError::Io(std::io::Error::other(
-                            format!("Task panicked: {}", e),
+                    all_errors.push(format!("{}", e));
+
+                    tracing::error!("Sync error: {}", e);
+
+                    // Check if we've exceeded the error threshold
+                    if self.max_errors > 0 && error_count >= self.max_errors {
+                        tracing::error!(
+                            "Error threshold exceeded: {} errors (max: {})",
+                            error_count,
+                            self.max_errors
+                        );
+
+                        if !self.quiet {
+                            eprintln!(
+                                "⚠️  ERROR: {} errors occurred (threshold: {}). Aborting sync.",
+                                error_count,
+                                self.max_errors
+                            );
+                        }
+
+                        pb.finish_with_message("Sync aborted due to errors");
+
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            format!(
+                                "Error threshold exceeded: {} errors (max: {}). First error: {}",
+                                error_count,
+                                self.max_errors,
+                                first_error.unwrap_or_else(|| "Unknown".to_string())
+                            )
                         )));
                     }
                 }
+                Err(e) => {
+                    error_count += 1;
+                    let error_msg = format!("Task panicked: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(error_msg.clone());
+                    }
+                    all_errors.push(error_msg.clone());
+
+                    tracing::error!("{}", error_msg);
+
+                    // Check if we've exceeded the error threshold
+                    if self.max_errors > 0 && error_count >= self.max_errors {
+                        tracing::error!(
+                            "Error threshold exceeded: {} errors (max: {})",
+                            error_count,
+                            self.max_errors
+                        );
+
+                        if !self.quiet {
+                            eprintln!(
+                                "⚠️  ERROR: {} errors occurred (threshold: {}). Aborting sync.",
+                                error_count,
+                                self.max_errors
+                            );
+                        }
+
+                        pb.finish_with_message("Sync aborted due to errors");
+
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            format!(
+                                "Error threshold exceeded: {} errors (max: {}). First error: {}",
+                                error_count,
+                                self.max_errors,
+                                first_error.unwrap_or_else(|| "Unknown".to_string())
+                            )
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Log summary of errors if any occurred but we didn't abort
+        if error_count > 0 {
+            tracing::warn!("Sync completed with {} errors", error_count);
+            if !self.quiet && !self.json {
+                eprintln!("⚠️  Warning: {} errors occurred during sync", error_count);
             }
         }
 
@@ -766,11 +843,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             *state_guard = None;
         }
 
-        // Return first error if any occurred
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-
+        // If we got here, either no errors occurred or errors were within the threshold
         Ok(final_stats)
     }
 
@@ -972,6 +1045,7 @@ mod tests {
             false, // force_delete
             true,  // quiet
             4,     // max_concurrent
+            100,   // max_errors
             None,  // min_size
             None,  // max_size
             Vec::new(), // exclude
@@ -1056,6 +1130,7 @@ mod tests {
             false, // force_delete
             true,  // quiet
             4,     // max_concurrent
+            100,   // max_errors
             None,  // min_size
             None,  // max_size
             Vec::new(), // exclude

@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         cli.force_delete,
         cli.quiet || cli.json,  // JSON mode implies quiet
         cli.parallel,
+        cli.max_errors,
         cli.min_size,
         cli.max_size,
         cli.exclude.clone(),
