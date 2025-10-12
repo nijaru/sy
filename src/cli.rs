@@ -217,6 +217,31 @@ pub struct Cli {
     #[arg(short = 'A', long)]
     pub preserve_acls: bool,
 
+    /// Preserve permissions
+    #[arg(short = 'p', long)]
+    pub preserve_permissions: bool,
+
+    /// Preserve modification times
+    #[arg(short = 't', long)]
+    pub preserve_times: bool,
+
+    /// Preserve group (requires appropriate permissions)
+    #[arg(short = 'g', long)]
+    pub preserve_group: bool,
+
+    /// Preserve owner (requires root)
+    #[arg(short = 'o', long)]
+    pub preserve_owner: bool,
+
+    /// Preserve device files and special files (requires root)
+    #[arg(short = 'D', long)]
+    pub preserve_devices: bool,
+
+    /// Archive mode (equivalent to -rlptgoD: recursive, links, perms, times, group, owner, devices)
+    /// Note: Does NOT include -X (xattrs), -A (ACLs), or -H (hardlinks) - use those flags separately
+    #[arg(short = 'a', long)]
+    pub archive: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -307,6 +332,42 @@ impl Cli {
             _ => tracing::Level::TRACE,
         }
     }
+
+    /// Check if permissions should be preserved (archive mode or explicit flag)
+    pub fn should_preserve_permissions(&self) -> bool {
+        self.archive || self.preserve_permissions
+    }
+
+    /// Check if modification times should be preserved (archive mode or explicit flag)
+    pub fn should_preserve_times(&self) -> bool {
+        self.archive || self.preserve_times
+    }
+
+    /// Check if group should be preserved (archive mode or explicit flag)
+    pub fn should_preserve_group(&self) -> bool {
+        self.archive || self.preserve_group
+    }
+
+    /// Check if owner should be preserved (archive mode or explicit flag)
+    pub fn should_preserve_owner(&self) -> bool {
+        self.archive || self.preserve_owner
+    }
+
+    /// Check if device files should be preserved (archive mode or explicit flag)
+    pub fn should_preserve_devices(&self) -> bool {
+        self.archive || self.preserve_devices
+    }
+
+    /// Check if symlinks should be preserved (archive mode enables by default)
+    pub fn should_preserve_symlinks(&self) -> bool {
+        // Archive mode implies -l (preserve symlinks)
+        // Unless user explicitly set --links to something else or used -L
+        if self.archive && !self.copy_links {
+            true
+        } else {
+            self.symlink_mode() == SymlinkMode::Preserve
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +404,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -378,6 +445,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -417,6 +490,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -459,6 +538,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -494,6 +579,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -529,6 +620,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -564,6 +661,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -599,6 +702,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -653,6 +762,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -691,6 +806,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -726,6 +847,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -778,6 +905,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -813,6 +946,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -848,6 +987,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
             json: false,
             watch: false,
             profile: None,
@@ -857,5 +1002,147 @@ mod tests {
             max_size: None,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
+    }
+
+    #[test]
+    fn test_archive_mode_enables_all_flags() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: true,  // Archive mode enabled
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        // Archive mode should enable all these flags
+        assert!(cli.should_preserve_permissions());
+        assert!(cli.should_preserve_times());
+        assert!(cli.should_preserve_group());
+        assert!(cli.should_preserve_owner());
+        assert!(cli.should_preserve_devices());
+        assert!(cli.should_preserve_symlinks());
+    }
+
+    #[test]
+    fn test_individual_preserve_flags() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: true,  // Only permissions enabled
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        // Only permissions should be enabled
+        assert!(cli.should_preserve_permissions());
+        assert!(!cli.should_preserve_times());
+        assert!(!cli.should_preserve_group());
+        assert!(!cli.should_preserve_owner());
+        assert!(!cli.should_preserve_devices());
+    }
+
+    #[test]
+    fn test_explicit_flag_overrides_with_archive() {
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: true,  // Explicit flag also enabled
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: true,  // Archive mode also enabled
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        // All should be enabled (archive mode OR individual flags)
+        assert!(cli.should_preserve_permissions());
+        assert!(cli.should_preserve_times());
+        assert!(cli.should_preserve_group());
+        assert!(cli.should_preserve_owner());
+        assert!(cli.should_preserve_devices());
     }
 }

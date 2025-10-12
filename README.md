@@ -125,6 +125,19 @@ sy /source /destination --preserve-hardlinks           # Same as -H
 # ACL preservation (new in v0.0.17+)
 sy /source /destination -A                             # Preserve ACLs (Unix/Linux/macOS)
 sy /source /destination --preserve-acls                # Same as -A
+
+# Archive mode (new in v0.0.18+) - equivalent to -rlptgoD
+sy /source /destination -a                             # Archive mode: recursive, links, perms, times, group, owner, devices
+sy /source /destination --archive                      # Same as -a (rsync compatibility)
+sy /source /destination -a -X -A -H                    # Full-fidelity backup (archive + xattrs + ACLs + hardlinks)
+
+# Individual metadata flags (new in v0.0.18+)
+sy /source /destination -p                             # Preserve permissions only
+sy /source /destination -t                             # Preserve modification times only
+sy /source /destination -g                             # Preserve group (requires permissions)
+sy /source /destination -o                             # Preserve owner (requires root)
+sy /source /destination -D                             # Preserve device files (requires root)
+sy /source /destination -ptg                           # Combine flags (perms + times + group)
 ```
 
 ## Features
