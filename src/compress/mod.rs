@@ -2,13 +2,12 @@ use std::io::{self, Read, Write};
 use std::str::FromStr;
 
 /// Compression algorithm
-/// Only Zstd level 3 is supported based on benchmarks showing it's optimal:
-/// - 8.7 GB/s throughput (faster than any network)
-/// - Better compression ratio than LZ4
-/// - Higher levels (6+) are 2.4x slower for minimal gains
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
+    /// LZ4: 23 GB/s, lower compression ratio (good for low-CPU scenarios)
+    Lz4,
+    /// Zstd level 3: 8.7 GB/s, better compression ratio (default)
     Zstd,
 }
 
@@ -18,6 +17,7 @@ impl FromStr for Compression {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "none" => Ok(Self::None),
+            "lz4" => Ok(Self::Lz4),
             "zstd" => Ok(Self::Zstd),
             _ => Err(format!("Unknown compression type: {}", s)),
         }
@@ -29,15 +29,17 @@ impl Compression {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Lz4 => "lz4",
             Self::Zstd => "zstd",
         }
     }
 }
 
-/// Compress data using Zstd level 3
+/// Compress data
 pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
+        Compression::Lz4 => compress_lz4(data),
         Compression::Zstd => compress_zstd(data),
     }
 }
@@ -47,8 +49,20 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
+        Compression::Lz4 => decompress_lz4(data),
         Compression::Zstd => decompress_zstd(data),
     }
+}
+
+fn compress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
+    // LZ4: 23 GB/s throughput (benchmarked), lower CPU usage
+    Ok(lz4_flex::compress_prepend_size(data))
+}
+
+#[allow(dead_code)] // Called by decompress() which is used by sy-remote
+fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
+    lz4_flex::decompress_size_prepended(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
@@ -141,6 +155,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_compress_decompress_lz4() {
+        let original = b"Hello, world! This is a test of LZ4 compression. ".repeat(100);
+        let compressed = compress(&original, Compression::Lz4).unwrap();
+        let decompressed = decompress(&compressed, Compression::Lz4).unwrap();
+
+        assert_eq!(original.as_slice(), decompressed.as_slice());
+        assert!(compressed.len() < original.len());
+    }
+
+    #[test]
     fn test_compress_decompress_zstd() {
         let original = b"Hello, world! This is a test of Zstd compression. ".repeat(100);
         let compressed = compress(&original, Compression::Zstd).unwrap();
@@ -205,7 +229,7 @@ mod tests {
     #[test]
     fn test_roundtrip_empty_data() {
         let empty: &[u8] = &[];
-        for compression in [Compression::None, Compression::Zstd] {
+        for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
             let compressed = compress(empty, compression).unwrap();
             let decompressed = decompress(&compressed, compression).unwrap();
             assert_eq!(decompressed.as_slice(), empty);
@@ -217,11 +241,21 @@ mod tests {
         // 1MB of data
         let large: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
 
-        for compression in [Compression::None, Compression::Zstd] {
+        for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
             let compressed = compress(&large, compression).unwrap();
             let decompressed = decompress(&compressed, compression).unwrap();
             assert_eq!(decompressed, large);
         }
+    }
+
+    #[test]
+    fn test_lz4_compression_ratio() {
+        let repetitive = b"AAAA".repeat(1000);
+        let compressed = compress(&repetitive, Compression::Lz4).unwrap();
+
+        // LZ4 should compress repetitive data well
+        let ratio = compressed.len() as f64 / repetitive.len() as f64;
+        assert!(ratio < 0.1); // Less than 10% of original
     }
 
     #[test]
