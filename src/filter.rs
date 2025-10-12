@@ -23,14 +23,25 @@ pub struct FilterRule {
     pub pattern_str: String,
     /// Whether pattern contains '/' (affects matching behavior)
     pub has_slash: bool,
+    /// Whether pattern ends with '/' (directory-only pattern)
+    pub is_dir_only: bool,
 }
 
 impl FilterRule {
     /// Create a new filter rule from a pattern string
     pub fn new(action: FilterAction, pattern: &str) -> Result<Self> {
         let pattern_str = pattern.to_string();
-        let has_slash = pattern.contains('/');
-        let pattern = glob::Pattern::new(pattern)
+        let is_dir_only = pattern.ends_with('/');
+
+        // Strip trailing slash for glob matching (we'll handle directory logic separately)
+        let pattern_for_glob = if is_dir_only {
+            pattern.trim_end_matches('/')
+        } else {
+            pattern
+        };
+
+        let has_slash = pattern_for_glob.contains('/');
+        let pattern = glob::Pattern::new(pattern_for_glob)
             .with_context(|| format!("Invalid filter pattern: {}", pattern))?;
 
         Ok(Self {
@@ -38,16 +49,29 @@ impl FilterRule {
             pattern,
             pattern_str,
             has_slash,
+            is_dir_only,
         })
     }
 
     /// Check if this rule matches the given path
     ///
     /// Implements rsync-style matching:
+    /// - If pattern ends with '/', it's a directory pattern - match directory and all contents
     /// - If pattern contains '/', match against full relative path
     /// - Otherwise, match against basename only
     pub fn matches(&self, path: &Path) -> bool {
-        if self.has_slash {
+        if self.is_dir_only {
+            // Pattern ends with '/' - directory pattern
+            // Match if path is the directory itself or any file/subdir within it
+            if let Some(path_str) = path.to_str() {
+                let pattern_str = self.pattern.as_str();
+                // Check if path is the directory itself or starts with "dir/"
+                if path_str == pattern_str || path_str.starts_with(&format!("{}/", pattern_str)) {
+                    return true;
+                }
+            }
+            false
+        } else if self.has_slash {
             // Pattern has '/' - match against full path
             if let Some(path_str) = path.to_str() {
                 self.pattern.matches(path_str)
@@ -340,5 +364,63 @@ mod tests {
         assert!(!filter.should_include(Path::new("temp/test.log")));
         assert!(!filter.should_include(Path::new("foo/temp/test.log")));
         assert!(filter.should_include(Path::new("temp/test.txt"))); // not .log
+    }
+
+    #[test]
+    fn test_directory_only_patterns() {
+        let mut filter = FilterEngine::new();
+        // Pattern ending with '/' matches directory and all contents
+        filter.add_exclude("dir1/").unwrap();
+        filter.add_include("*.txt").unwrap();
+        filter.add_exclude("*").unwrap();
+
+        // dir1/ should be excluded along with all its contents
+        assert!(!filter.should_include(Path::new("dir1/keep.txt")));
+        assert!(!filter.should_include(Path::new("dir1/subdir/file.rs")));
+
+        // *.txt in root or other directories should be included
+        assert!(filter.should_include(Path::new("keep.txt")));
+        assert!(filter.should_include(Path::new("dir2/keep.txt")));
+
+        // Non-.txt files should be excluded by the wildcard
+        assert!(!filter.should_include(Path::new("exclude.log")));
+    }
+
+    #[test]
+    fn test_rsync_exact_scenario() {
+        // Test the exact rsync scenario: --exclude="dir1/" --include="*.txt" --exclude="*"
+        let mut filter = FilterEngine::new();
+        filter.add_exclude("dir1/").unwrap();
+        filter.add_include("*.txt").unwrap();
+        filter.add_exclude("*").unwrap();
+
+        // These should match rsync behavior
+        assert!(filter.should_include(Path::new("keep.txt")), "keep.txt should be included");
+        assert!(!filter.should_include(Path::new("dir1")), "dir1 should be excluded");
+        assert!(!filter.should_include(Path::new("dir1/keep.txt")), "dir1/keep.txt should be excluded");
+        assert!(!filter.should_include(Path::new("dir1/subdir/file.txt")), "dir1/subdir/file.txt should be excluded");
+        assert!(filter.should_include(Path::new("dir2/keep.txt")), "dir2/keep.txt should be included");
+        assert!(!filter.should_include(Path::new("exclude.log")), "exclude.log should be excluded");
+    }
+
+    #[test]
+    fn test_directory_pattern_vs_file_pattern() {
+        let mut filter = FilterEngine::new();
+        // Pattern WITH trailing slash - directory only
+        filter.add_exclude("build/").unwrap();
+
+        // Should exclude the directory and everything in it
+        assert!(!filter.should_include(Path::new("build/output.txt")));
+        assert!(!filter.should_include(Path::new("build/nested/file.rs")));
+
+        // Pattern WITHOUT trailing slash - matches file or directory basename
+        let mut filter2 = FilterEngine::new();
+        filter2.add_exclude("build").unwrap();
+
+        // Should exclude anything named "build" (file or dir) - basename matching
+        assert!(!filter2.should_include(Path::new("build")));
+        assert!(!filter2.should_include(Path::new("other/build"))); // basename is "build"
+        assert!(filter2.should_include(Path::new("build/output.txt"))); // basename is "output.txt", not "build"
+        assert!(filter2.should_include(Path::new("building"))); // basename is "building", not "build"
     }
 }

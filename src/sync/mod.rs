@@ -164,19 +164,39 @@ impl<T: Transport + 'static> SyncEngine<T> {
         tracing::info!("Found {} items in source", total_scanned);
 
         // Filter files by size and exclude patterns
+        // Also track excluded directories to filter their children (rsync behavior)
+        let mut excluded_dirs: Vec<PathBuf> = Vec::new();
+
         let source_files: Vec<_> = all_files
             .into_iter()
             .filter(|file| {
-                // Don't filter directories
+                // Check if this file is inside an excluded directory
+                for excluded_dir in &excluded_dirs {
+                    if file.relative_path.starts_with(excluded_dir) {
+                        tracing::debug!("Filtering out (parent excluded): {}", file.relative_path.display());
+                        return false;
+                    }
+                }
+
+                // Apply exclude patterns
+                if self.should_exclude(&file.relative_path) {
+                    tracing::debug!("Filtering out (excluded): {}", file.relative_path.display());
+
+                    // If this is a directory, track it to exclude its children
+                    if file.is_dir {
+                        excluded_dirs.push(file.relative_path.clone());
+                    }
+
+                    return false;
+                }
+
+                // Don't filter directories (but only after checking exclude patterns)
                 if file.is_dir {
                     return true;
                 }
                 // Apply size filter
                 if self.should_filter_by_size(file.size) {
-                    return false;
-                }
-                // Apply exclude patterns
-                if self.should_exclude(&file.relative_path) {
+                    tracing::debug!("Filtering out (size): {}", file.relative_path.display());
                     return false;
                 }
                 true
