@@ -242,6 +242,18 @@ pub struct Cli {
     #[arg(short = 'a', long)]
     pub archive: bool,
 
+    /// Ignore modification times, always compare checksums (rsync --ignore-times)
+    #[arg(long)]
+    pub ignore_times: bool,
+
+    /// Only compare file size, skip mtime checks (rsync --size-only)
+    #[arg(long)]
+    pub size_only: bool,
+
+    /// Always compare checksums instead of size+mtime (slow but thorough, rsync --checksum)
+    #[arg(short = 'c', long)]
+    pub checksum: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -270,6 +282,13 @@ impl Cli {
             if min > max {
                 anyhow::bail!("--min-size ({}) cannot be greater than --max-size ({})", min, max);
             }
+        }
+
+        // Validate comparison flags (mutually exclusive)
+        let comparison_flags = [self.ignore_times, self.size_only, self.checksum];
+        let enabled_count = comparison_flags.iter().filter(|&&x| x).count();
+        if enabled_count > 1 {
+            anyhow::bail!("--ignore-times, --size-only, and --checksum are mutually exclusive");
         }
 
         // --list-profiles and --show-profile don't need source/destination
@@ -410,6 +429,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -451,6 +473,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -496,6 +521,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -544,6 +572,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -585,6 +616,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -626,6 +660,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -667,6 +704,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -708,6 +748,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -768,6 +811,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -812,6 +858,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -853,6 +902,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -911,6 +963,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -952,6 +1007,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -993,6 +1051,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -1034,6 +1095,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true,  // Archive mode enabled
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -1082,6 +1146,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -1129,6 +1196,9 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true,  // Archive mode also enabled
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
             json: false,
             watch: false,
             profile: None,
@@ -1144,5 +1214,149 @@ mod tests {
         assert!(cli.should_preserve_group());
         assert!(cli.should_preserve_owner());
         assert!(cli.should_preserve_devices());
+    }
+
+    #[test]
+    fn test_comparison_flags_mutually_exclusive() {
+        // Test that --ignore-times and --size-only are mutually exclusive
+        let cli = Cli {
+            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
+            ignore_times: true,  // Both enabled - should fail
+            size_only: true,
+            checksum: false,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        let result = cli.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_ignore_times_flag_alone() {
+        let temp = TempDir::new().unwrap();
+        let cli = Cli {
+            source: Some(SyncPath::Local(temp.path().to_path_buf())),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
+            ignore_times: true,  // Only this flag enabled
+            size_only: false,
+            checksum: false,
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        // Should be valid - only one comparison flag
+        assert!(cli.validate().is_ok());
+        assert!(cli.ignore_times);
+    }
+
+    #[test]
+    fn test_checksum_flag_alone() {
+        let temp = TempDir::new().unwrap();
+        let cli = Cli {
+            source: Some(SyncPath::Local(temp.path().to_path_buf())),
+            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            dry_run: false,
+            delete: false,
+            verbose: 0,
+            quiet: false,
+            parallel: 10,
+            exclude: vec![],
+            bwlimit: None,
+            compress: false,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: true,  // Only this flag enabled
+            json: false,
+            watch: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            min_size: None,
+            max_size: None,
+        };
+
+        // Should be valid - only one comparison flag
+        assert!(cli.validate().is_ok());
+        assert!(cli.checksum);
     }
 }
