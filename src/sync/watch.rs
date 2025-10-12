@@ -150,7 +150,7 @@ mod tests {
             100,   // max_errors
             None,  // min_size
             None,  // max_size
-            vec![], // exclude
+            crate::filter::FilterEngine::new(), // filter_engine
             None,  // bwlimit
             false, // resume
             10,    // checkpoint_files
@@ -202,7 +202,7 @@ mod tests {
             100, // max_errors
             None,
             None,
-            vec![],
+            crate::filter::FilterEngine::new(),
             None,
             false,
             10,

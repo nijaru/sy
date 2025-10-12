@@ -8,6 +8,7 @@ mod ratelimit;
 
 use crate::cli::SymlinkMode;
 use crate::error::Result;
+use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -51,7 +52,7 @@ pub struct SyncEngine<T: Transport> {
     max_errors: usize,
     min_size: Option<u64>,
     max_size: Option<u64>,
-    exclude_patterns: Vec<glob::Pattern>,
+    filter_engine: FilterEngine,
     bwlimit: Option<u64>,
     resume: bool,
     checkpoint_files: usize,
@@ -82,7 +83,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         max_errors: usize,
         min_size: Option<u64>,
         max_size: Option<u64>,
-        exclude: Vec<String>,
+        filter_engine: FilterEngine,
         bwlimit: Option<u64>,
         resume: bool,
         checkpoint_files: usize,
@@ -98,20 +99,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         size_only: bool,
         checksum: bool,
     ) -> Self {
-        // Compile exclude patterns once at creation
-        let exclude_patterns = exclude
-            .into_iter()
-            .filter_map(|pattern| {
-                match glob::Pattern::new(&pattern) {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        tracing::warn!("Invalid exclude pattern '{}': {}", pattern, e);
-                        None
-                    }
-                }
-            })
-            .collect();
-
         Self {
             transport: Arc::new(transport),
             dry_run,
@@ -124,7 +111,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             max_errors,
             min_size,
             max_size,
-            exclude_patterns,
+            filter_engine,
             bwlimit,
             resume,
             checkpoint_files,
@@ -157,14 +144,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
     }
 
     fn should_exclude(&self, relative_path: &Path) -> bool {
-        if self.exclude_patterns.is_empty() {
-            return false;
-        }
-
-        let path_str = relative_path.to_string_lossy();
-        self.exclude_patterns.iter().any(|pattern| {
-            pattern.matches(&path_str) || pattern.matches(relative_path.to_str().unwrap_or(""))
-        })
+        self.filter_engine.should_exclude(relative_path)
     }
 
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
@@ -228,7 +208,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Load or create resume state
         let current_flags = SyncFlags {
             delete: self.delete,
-            exclude: self.exclude_patterns.iter().map(|p| p.as_str().to_string()).collect(),
+            exclude: vec![], // Filter rules handled by FilterEngine
             min_size: self.min_size,
             max_size: self.max_size,
         };
@@ -1048,7 +1028,7 @@ mod tests {
             100,   // max_errors
             None,  // min_size
             None,  // max_size
-            Vec::new(), // exclude
+            FilterEngine::new(), // filter_engine
             None,  // bwlimit
             false, // resume
             0,     // checkpoint_files
@@ -1133,7 +1113,7 @@ mod tests {
             100,   // max_errors
             None,  // min_size
             None,  // max_size
-            Vec::new(), // exclude
+            FilterEngine::new(), // filter_engine
             None,  // bwlimit
             false, // resume
             0,     // checkpoint_files

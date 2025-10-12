@@ -3,17 +3,19 @@ mod compress;
 mod config;
 mod delta;
 mod error;
+mod filter;
 mod integrity;
 mod path;
 mod ssh;
 mod sync;
 mod transport;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::Cli;
 use colored::Colorize;
 use config::Config;
+use filter::FilterEngine;
 use path::SyncPath;
 use sync::{SyncEngine, watch::WatchMode};
 use transport::router::TransportRouter;
@@ -158,6 +160,80 @@ async fn main() -> Result<()> {
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();
 
+    // Build filter engine from CLI arguments
+    let mut filter_engine = FilterEngine::new();
+
+    // Process --filter rules first (explicit order matters)
+    for rule in &cli.filter {
+        if let Err(e) = filter_engine.add_rule(rule) {
+            anyhow::bail!("Invalid filter rule '{}': {}", rule, e);
+        }
+    }
+
+    // Process --include patterns
+    for pattern in &cli.include {
+        if let Err(e) = filter_engine.add_include(pattern) {
+            anyhow::bail!("Invalid include pattern '{}': {}", pattern, e);
+        }
+    }
+
+    // Process --exclude patterns
+    for pattern in &cli.exclude {
+        if let Err(e) = filter_engine.add_exclude(pattern) {
+            anyhow::bail!("Invalid exclude pattern '{}': {}", pattern, e);
+        }
+    }
+
+    // Load --include-from file
+    if let Some(ref include_from) = cli.include_from {
+        // Read as include patterns (not rsync rules)
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+
+        let file = File::open(include_from)
+            .with_context(|| format!("Failed to open include file: {}", include_from.display()))?;
+        let reader = BufReader::new(file);
+
+        for (line_num, line) in reader.lines().enumerate() {
+            let line = line
+                .with_context(|| format!("Failed to read line {} from {}", line_num + 1, include_from.display()))?;
+            let line = line.trim();
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Err(e) = filter_engine.add_include(line) {
+                anyhow::bail!("Invalid include pattern at line {} in {}: {}", line_num + 1, include_from.display(), e);
+            }
+        }
+    }
+
+    // Load --exclude-from file
+    if let Some(ref exclude_from) = cli.exclude_from {
+        // Read as exclude patterns (not rsync rules)
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+
+        let file = File::open(exclude_from)
+            .with_context(|| format!("Failed to open exclude file: {}", exclude_from.display()))?;
+        let reader = BufReader::new(file);
+
+        for (line_num, line) in reader.lines().enumerate() {
+            let line = line
+                .with_context(|| format!("Failed to read line {} from {}", line_num + 1, exclude_from.display()))?;
+            let line = line.trim();
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Err(e) = filter_engine.add_exclude(line) {
+                anyhow::bail!("Invalid exclude pattern at line {} in {}: {}", line_num + 1, exclude_from.display(), e);
+            }
+        }
+    }
+
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,
@@ -170,7 +246,7 @@ async fn main() -> Result<()> {
         cli.max_errors,
         cli.min_size,
         cli.max_size,
-        cli.exclude.clone(),
+        filter_engine,
         cli.bwlimit,
         cli.resume,
         cli.checkpoint_files,
