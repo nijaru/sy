@@ -142,6 +142,9 @@ mod tests {
             transport,
             false, // dry_run
             false, // delete
+            50, // delete_threshold
+            false, // trash
+            false, // force_delete
             true,  // quiet
             10,    // parallel
             None,  // min_size
@@ -190,6 +193,9 @@ mod tests {
             transport,
             false,
             false,
+            50, // delete_threshold
+            false, // trash
+            false, // force_delete
             true,
             10,
             None,

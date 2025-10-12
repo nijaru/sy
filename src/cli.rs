@@ -140,6 +140,19 @@ pub struct Cli {
     #[arg(short, long)]
     pub delete: bool,
 
+    /// Maximum percentage of files that can be deleted (0-100, default: 50)
+    /// Prevents accidental mass deletion
+    #[arg(long, default_value = "50")]
+    pub delete_threshold: u8,
+
+    /// Move deleted files to trash instead of permanent deletion
+    #[arg(long)]
+    pub trash: bool,
+
+    /// Skip deletion safety checks (dangerous - use with caution)
+    #[arg(long)]
+    pub force_delete: bool,
+
     /// Verbosity level (can be repeated: -v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -291,6 +304,11 @@ impl Cli {
             anyhow::bail!("--ignore-times, --size-only, and --checksum are mutually exclusive");
         }
 
+        // Validate deletion threshold (0-100)
+        if self.delete_threshold > 100 {
+            anyhow::bail!("--delete-threshold must be between 0 and 100 (got: {})", self.delete_threshold);
+        }
+
         // --list-profiles and --show-profile don't need source/destination
         if self.list_profiles || self.show_profile.is_some() {
             return Ok(());
@@ -404,6 +422,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -448,6 +469,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -498,6 +522,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -549,6 +576,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -593,6 +623,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: true,
             parallel: 10,
@@ -637,6 +670,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -681,6 +717,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 1,
             quiet: false,
             parallel: 10,
@@ -725,6 +764,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 2,
             quiet: false,
             parallel: 10,
@@ -788,6 +830,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -835,6 +880,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -879,6 +927,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -940,6 +991,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -984,6 +1038,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1028,6 +1085,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1072,6 +1132,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1123,6 +1186,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1173,6 +1239,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1224,6 +1293,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1272,6 +1344,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
@@ -1320,6 +1395,9 @@ mod tests {
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
             delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
             verbose: 0,
             quiet: false,
             parallel: 10,
