@@ -299,11 +299,12 @@ impl Transport for SshTransport {
 
             // Use compressed transfer for compressible files, SFTP for others
             match compression_mode {
-                Compression::Zstd => {
+                Compression::Lz4 | Compression::Zstd => {
                     tracing::debug!(
-                        "File {}: {} bytes, using compressed transfer",
+                        "File {}: {} bytes, using compressed transfer ({})",
                         filename,
-                        file_size
+                        file_size,
+                        compression_mode.as_str()
                     );
 
                     // Read entire file (compression only used for smaller files)
@@ -317,7 +318,7 @@ impl Transport for SshTransport {
                     let uncompressed_size = file_data.len();
 
                     // Compress the data
-                    let compressed_data = compress(&file_data, Compression::Zstd)
+                    let compressed_data = compress(&file_data, compression_mode)
                         .map_err(|e| SyncError::Io(std::io::Error::other(format!(
                             "Failed to compress {}: {}",
                             source_path.display(), e
