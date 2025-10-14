@@ -8,7 +8,7 @@ fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
 
-fn parse_size(s: &str) -> Result<u64, String> {
+pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim().to_uppercase();
 
     // Try to extract number and unit

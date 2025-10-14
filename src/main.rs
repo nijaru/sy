@@ -95,9 +95,10 @@ async fn main() -> Result<()> {
                 cli.parallel = parallel;
             }
         }
-        if let Some(ref _bwlimit_str) = profile.bwlimit {
+        if let Some(ref bwlimit_str) = profile.bwlimit {
             if cli.bwlimit.is_none() {
-                // TODO: Parse bwlimit from profile (needs parse_size exposed from cli module)
+                cli.bwlimit = Some(cli::parse_size(bwlimit_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid bwlimit in profile '{}': {}", profile_name, e))?);
             }
         }
         if let Some(ref excludes) = profile.exclude {
