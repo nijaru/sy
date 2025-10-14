@@ -173,6 +173,34 @@ pub trait Transport: Send + Sync {
             ))
         })
     }
+
+    /// Copy file using streaming (for large files)
+    ///
+    /// Reads and writes in chunks to avoid loading entire file into memory.
+    /// Calls progress_callback with (bytes_transferred, total_bytes) after each chunk.
+    /// Returns total bytes transferred.
+    async fn copy_file_streaming(
+        &self,
+        source: &Path,
+        dest: &Path,
+        progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<TransferResult> {
+        // Default implementation: fall back to read_file/write_file for simplicity
+        // Implementations can override for true streaming
+        let data = self.read_file(source).await?;
+        let total_size = data.len() as u64;
+        let mtime = self.get_mtime(source).await?;
+
+        if let Some(callback) = &progress_callback {
+            callback(0, total_size);
+        }
+        self.write_file(dest, &data, mtime).await?;
+        if let Some(callback) = &progress_callback {
+            callback(total_size, total_size);
+        }
+
+        Ok(TransferResult::new(total_size))
+    }
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -225,5 +253,14 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
         (**self).get_mtime(path).await
+    }
+
+    async fn copy_file_streaming(
+        &self,
+        source: &Path,
+        dest: &Path,
+        progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<TransferResult> {
+        (**self).copy_file_streaming(source, dest, progress_callback).await
     }
 }
