@@ -844,6 +844,46 @@ impl Transport for SshTransport {
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
+    async fn file_info(&self, path: &Path) -> Result<super::FileInfo> {
+        let path_buf = path.to_path_buf();
+        let session_arc = Arc::clone(&self.session);
+
+        tokio::task::spawn_blocking(move || {
+            let session = session_arc.lock().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            })?;
+
+            let sftp = session.sftp().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+            })?;
+
+            // Get file stats from remote
+            let stat = sftp.stat(&path_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to stat remote file {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            // Extract size and mtime
+            let size = stat.size.unwrap_or(0);
+            let mtime = stat.mtime.ok_or_else(|| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Remote file {} has no mtime", path_buf.display()),
+                ))
+            })?;
+
+            let modified = UNIX_EPOCH + Duration::from_secs(mtime);
+
+            tracing::debug!("Got file info for remote file {}: {} bytes, {:?}", path_buf.display(), size, modified);
+
+            Ok(super::FileInfo { size, modified })
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
+
     async fn copy_file_streaming(
         &self,
         source: &Path,

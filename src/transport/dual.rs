@@ -40,6 +40,11 @@ impl Transport for DualTransport {
         self.dest.metadata(path).await
     }
 
+    async fn file_info(&self, path: &Path) -> Result<super::FileInfo> {
+        // Get file info from destination
+        self.dest.file_info(path).await
+    }
+
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
         // Create on destination
         self.dest.create_dir_all(path).await

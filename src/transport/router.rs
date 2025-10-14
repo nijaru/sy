@@ -94,6 +94,13 @@ impl Transport for TransportRouter {
         }
     }
 
+    async fn file_info(&self, path: &Path) -> Result<super::FileInfo> {
+        match self {
+            TransportRouter::Local(t) => t.file_info(path).await,
+            TransportRouter::Dual(t) => t.file_info(path).await,
+        }
+    }
+
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
         match self {
             TransportRouter::Local(t) => t.create_dir_all(path).await,

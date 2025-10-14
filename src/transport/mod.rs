@@ -7,6 +7,16 @@ use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use std::path::Path;
+use std::time::SystemTime;
+
+/// Transport-agnostic file information
+///
+/// Unlike std::fs::Metadata, this works for both local and remote files
+#[derive(Debug, Clone, Copy)]
+pub struct FileInfo {
+    pub size: u64,
+    pub modified: SystemTime,
+}
 
 /// Result of a file transfer operation
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +98,25 @@ pub trait Transport: Send + Sync {
 
     /// Get metadata for a path (for comparison during sync)
     async fn metadata(&self, path: &Path) -> Result<std::fs::Metadata>;
+
+    /// Get file information (size and mtime) in a transport-agnostic way
+    ///
+    /// This works for both local and remote files, unlike metadata() which returns
+    /// std::fs::Metadata that can't be constructed for remote files.
+    async fn file_info(&self, path: &Path) -> Result<FileInfo> {
+        // Default implementation uses metadata()
+        let meta = self.metadata(path).await?;
+        let modified = meta.modified().map_err(|e| {
+            crate::error::SyncError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to get mtime for {}: {}", path.display(), e),
+            ))
+        })?;
+        Ok(FileInfo {
+            size: meta.len(),
+            modified,
+        })
+    }
 
     /// Create all parent directories for a path
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
@@ -217,6 +246,10 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn metadata(&self, path: &Path) -> Result<std::fs::Metadata> {
         (**self).metadata(path).await
+    }
+
+    async fn file_info(&self, path: &Path) -> Result<FileInfo> {
+        (**self).file_info(path).await
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {

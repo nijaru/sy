@@ -1,5 +1,5 @@
 use super::scanner::FileEntry;
-use crate::transport::Transport;
+use crate::transport::{Transport, FileInfo};
 use crate::error::Result;
 use std::path::Path;
 use std::time::SystemTime;
@@ -72,10 +72,10 @@ impl StrategyPlanner {
                 SyncAction::Create
             }
         } else {
-            // For files, check existence and metadata
-            match transport.metadata(&dest_path).await {
-                Ok(dest_meta) => {
-                    let needs_update = self.needs_update(source, &dest_meta);
+            // For files, check existence and file info
+            match transport.file_info(&dest_path).await {
+                Ok(dest_info) => {
+                    let needs_update = self.needs_update(source, &dest_info);
                     if needs_update {
                         SyncAction::Update
                     } else {
@@ -109,7 +109,12 @@ impl StrategyPlanner {
             // For files, check existence and metadata
             match std::fs::metadata(&dest_path) {
                 Ok(dest_meta) => {
-                    let needs_update = self.needs_update(source, &dest_meta);
+                    // Convert Metadata to FileInfo for comparison
+                    let dest_info = FileInfo {
+                        size: dest_meta.len(),
+                        modified: dest_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    };
+                    let needs_update = self.needs_update(source, &dest_info);
                     if needs_update {
                         SyncAction::Update
                     } else {
@@ -128,7 +133,7 @@ impl StrategyPlanner {
     }
 
     /// Check if file needs update based on size and mtime
-    fn needs_update(&self, source: &FileEntry, dest_meta: &std::fs::Metadata) -> bool {
+    fn needs_update(&self, source: &FileEntry, dest_info: &FileInfo) -> bool {
         // Handle comparison flags
 
         // --checksum: Always return true to force checksum comparison
@@ -140,7 +145,7 @@ impl StrategyPlanner {
         // --ignore-times: Skip mtime checks, only compare size
         // (if sizes match, still force transfer to compare checksums)
         if self.ignore_times {
-            if source.size != dest_meta.len() {
+            if source.size != dest_info.size {
                 return true;  // Different size = definitely needs update
             }
             return true;  // Same size but ignore mtime = force checksum comparison
@@ -148,21 +153,19 @@ impl StrategyPlanner {
 
         // --size-only: Only compare file size, skip mtime checks
         if self.size_only {
-            return source.size != dest_meta.len();
+            return source.size != dest_info.size;
         }
 
         // Default behavior: compare size + mtime
 
         // Different size = needs update
-        if source.size != dest_meta.len() {
+        if source.size != dest_info.size {
             return true;
         }
 
         // Check mtime with tolerance
-        if let Ok(dest_mtime) = dest_meta.modified() {
-            if !self.mtime_matches(&source.modified, &dest_mtime) {
-                return true;
-            }
+        if !self.mtime_matches(&source.modified, &dest_info.modified) {
+            return true;
         }
 
         false
