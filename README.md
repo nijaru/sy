@@ -25,7 +25,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17)
 ✅ **Phase 7 Complete** - Rsync-style filters & remote→local sync! (v0.0.18)
 ✅ **Phase 8 Complete** - Cross-transport delta sync & xxHash3! (v0.0.19-v0.0.21)
-🚀 **Current Version: v0.0.21** - 251 tests passing, zero errors!
+🚧 **Phase 9 In Progress** - Developer Experience (Hooks ✅, Ignore templates, Improved dry-run)
+🚀 **Current Version: v0.0.21** - 255 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -157,6 +158,12 @@ sy /source /destination --checksum                     # Same as -c (rsync compa
 sy /source /destination --delete --delete-threshold 75  # Allow up to 75% of files to be deleted
 sy /source /destination --delete --force-delete         # Skip safety checks (dangerous!)
 # Note: Default threshold is 50%, prompts for confirmation if >1000 files
+
+# Hooks (new in Phase 9)
+sy /source /destination                                 # Automatically runs hooks from ~/.config/sy/hooks/
+sy /source /destination --no-hooks                      # Disable hook execution
+sy /source /destination --abort-on-hook-failure         # Abort sync if hooks fail (default: warn)
+# Hooks: pre-sync.sh runs before sync, post-sync.sh runs after with stats
 ```
 
 ## Features
@@ -244,7 +251,17 @@ sy /source /destination --delete --force-delete         # Skip safety checks (da
   - Flag compatibility checking
   - Skips already-completed files on resume
 
-**Verification & Reliability (Phase 5 - In Progress)**:
+**Developer Experience (Phase 9 - In Progress)**:
+- **Hooks** (Phase 9):
+  - Pre-sync and post-sync hook execution
+  - Auto-discovered from `~/.config/sy/hooks/`
+  - Environment variables for sync context (SY_SOURCE, SY_DESTINATION, SY_FILES_*, etc.)
+  - Cross-platform support (Unix: .sh/.bash/.zsh/.fish, Windows: .bat/.cmd/.ps1/.exe)
+  - Configurable failure handling: `--abort-on-hook-failure` or warn and continue (default)
+  - Example use cases: Notifications, backups, Slack alerts, custom validation
+  - Fully tested (4 unit tests)
+
+**Verification & Reliability (Phase 5 - Complete)**:
 - **Verification Modes** (v0.0.14):
   - **Fast**: Size + mtime only (trust filesystem)
   - **Standard** (default): + xxHash3 checksums
@@ -403,6 +420,7 @@ Files: 1,234 total | 892 synced | 312 skipped | 30 queued
 | Resume support | ❌ | ✅ | ✅ |
 | Watch mode | ❌ | ✅ | ✅ |
 | JSON output | ❌ | ✅ | ✅ |
+| Hooks | ❌ | ❌ | ✅ |
 | Modern UX | ❌ | ⚠️ | ✅ |
 | Single file sync | ⚠️ Complex | ✅ | ✅ |
 | Zero compiler warnings | N/A | N/A | ✅ |
