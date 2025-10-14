@@ -46,96 +46,64 @@ impl Transport for DualTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Cross-transport copy: read from source, write to dest
-        // Use streaming for files > 10MB to avoid memory issues
-        const STREAMING_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+        // Cross-transport copy: delegate to destination transport
+        // The destination transport (e.g., SshTransport) knows how to copy
+        // from a local source path to its destination (local or remote)
 
         tracing::debug!("DualTransport: copying {} to {}", source.display(), dest.display());
 
-        // Check file size to decide streaming vs buffered
-        // Note: metadata() may fail for remote sources, so we default to streaming
-        // for safety (better to use more memory-efficient approach than OOM)
-        let file_size = match self.source.metadata(source).await {
-            Ok(meta) => meta.len(),
-            Err(_) => {
-                // metadata() not available (e.g., remote source) - use streaming to be safe
-                tracing::debug!("Metadata not available, using streaming with progress");
-
-                // Create progress callback for remote sources
-                let progress_callback = {
-                    let source_display = source.display().to_string();
-                    std::sync::Arc::new(move |transferred: u64, total: u64| {
-                        if total > 0 {
-                            let percent = (transferred as f64 / total as f64 * 100.0) as u64;
-                            // Log every 10MB transferred
-                            if transferred > 0 && transferred % (10 * 1_048_576) < 65536 {
-                                tracing::info!(
-                                    "Streaming {}: {}% ({:.1} / {:.1} MB)",
-                                    source_display,
-                                    percent,
-                                    transferred as f64 / 1_048_576.0,
-                                    total as f64 / 1_048_576.0
-                                );
-                            }
-                        }
-                    })
-                };
-
-                return self.source.copy_file_streaming(source, dest, Some(progress_callback)).await;
-            }
-        };
-
-        if file_size > STREAMING_THRESHOLD {
-            tracing::debug!("Using streaming for large file ({} bytes)", file_size);
-
-            // Create progress callback that logs periodically
-            let progress_callback = {
-                let source_display = source.display().to_string();
-                std::sync::Arc::new(move |transferred: u64, total: u64| {
-                    if total > 0 {
-                        let percent = (transferred as f64 / total as f64 * 100.0) as u64;
-                        // Log every 10MB transferred
-                        if transferred > 0 && transferred % (10 * 1_048_576) < 65536 {
-                            tracing::info!(
-                                "Streaming {}: {}% ({:.1} / {:.1} MB)",
-                                source_display,
-                                percent,
-                                transferred as f64 / 1_048_576.0,
-                                total as f64 / 1_048_576.0
-                            );
-                        }
-                    }
-                })
-            };
-
-            // Use streaming for large files with progress logging
-            return self.source.copy_file_streaming(source, dest, Some(progress_callback)).await;
-        }
-
-        // For small files, use buffered approach
-        tracing::debug!("Using buffered copy for small file ({} bytes)", file_size);
-
-        // Read file data from source
-        let data = self.source.read_file(source).await?;
-        let bytes_written = data.len() as u64;
-
-        // Get source mtime
-        let mtime = self.source.get_mtime(source).await?;
-
-        // Write to destination
-        self.dest.write_file(dest, &data, mtime).await?;
-
-        tracing::debug!("DualTransport: copied {} bytes", bytes_written);
-
-        Ok(TransferResult::new(bytes_written))
+        // Delegate to destination transport which handles the cross-transport copy
+        // For local→remote: dest is SshTransport which reads from local source and writes remote
+        // For remote→local: dest is LocalTransport but source should be readable
+        self.dest.copy_file(source, dest).await
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Cross-transport delta sync would require rsync protocol over network
-        // For now, fall back to full file copy
-        // TODO: Implement proper delta sync for cross-transport operations
-        tracing::debug!("DualTransport: delta sync not yet implemented for cross-transport, using full copy");
-        self.copy_file(source, dest).await
+        // Check if destination exists - delta sync requires existing dest
+        if !self.dest.exists(dest).await? {
+            tracing::debug!("Destination doesn't exist, using full copy");
+            return self.copy_file(source, dest).await;
+        }
+
+        // Try to use destination transport's delta sync capability
+        // This works for local→remote (SshTransport.sync_file_with_delta)
+        // where source path is readable from local filesystem
+        match self.dest.sync_file_with_delta(source, dest).await {
+            Ok(result) => {
+                tracing::debug!(
+                    "DualTransport: delta sync succeeded via destination transport (likely local→remote)"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                // Destination transport doesn't support delta sync for this case
+                // This happens for:
+                // 1. Remote→local (would need reverse protocol)
+                // 2. Any transport that doesn't implement delta sync
+                tracing::debug!(
+                    "DualTransport: destination transport delta sync failed ({}), trying source transport",
+                    e
+                );
+
+                // Try source transport's delta sync as fallback
+                match self.source.sync_file_with_delta(source, dest).await {
+                    Ok(result) => {
+                        tracing::debug!(
+                            "DualTransport: delta sync succeeded via source transport"
+                        );
+                        Ok(result)
+                    }
+                    Err(e2) => {
+                        // Neither transport supports delta sync for this configuration
+                        tracing::debug!(
+                            "DualTransport: both transports failed delta sync ({}, {}), falling back to full copy",
+                            e, e2
+                        );
+                        self.copy_file(source, dest).await
+                    }
+                }
+            }
+        }
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
