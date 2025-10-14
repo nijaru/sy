@@ -1,0 +1,43 @@
+# Node.js ignore template for sy
+# Copy to ~/.config/sy/templates/node.syignore or use with --ignore-template node
+
+# Dependencies
+node_modules/
+bower_components/
+jspm_packages/
+
+# Build output
+dist/
+build/
+out/
+.next/
+.nuxt/
+.cache/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

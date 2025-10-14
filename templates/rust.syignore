@@ -1,0 +1,22 @@
+# Rust ignore template for sy
+# Copy to ~/.config/sy/templates/rust.syignore or use with --ignore-template rust
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Debug and profiling
+*.pdb
+*.prof
+flamegraph.svg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

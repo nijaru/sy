@@ -247,6 +247,38 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load ignore templates
+    for template_name in &cli.ignore_template {
+        if let Err(e) = filter_engine.add_template(template_name) {
+            tracing::warn!("Failed to load template '{}': {}", template_name, e);
+        } else if !cli.quiet && !cli.json {
+            tracing::info!("Loaded ignore template: {}", template_name);
+        }
+    }
+
+    // Load .syignore from source directory (if local)
+    if source.is_local() {
+        let source_dir = if source.path().is_file() {
+            source.path().parent().unwrap_or(source.path())
+        } else {
+            source.path()
+        };
+
+        match filter_engine.add_syignore_if_exists(source_dir) {
+            Ok(true) => {
+                if !cli.quiet && !cli.json {
+                    tracing::info!("Loaded .syignore from {}", source_dir.display());
+                }
+            }
+            Ok(false) => {
+                // No .syignore file, that's fine
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load .syignore: {}", e);
+            }
+        }
+    }
+
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,

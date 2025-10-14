@@ -1,0 +1,56 @@
+# Python ignore template for sy
+# Copy to ~/.config/sy/templates/python.syignore or use with --ignore-template python
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# Testing
+.pytest_cache/
+.coverage
+.tox/
+htmlcov/
+.hypothesis/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
