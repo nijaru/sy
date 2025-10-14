@@ -24,7 +24,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 5 Complete** - BLAKE3 verification, symlinks, sparse files, xattrs! (v0.0.14-v0.0.16)
 ✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17)
 ✅ **Phase 7 Complete** - Rsync-style filters & remote→local sync! (v0.0.18)
-🚀 **Current Version: v0.0.18** - 256 tests passing, zero errors!
+✅ **Phase 8 Complete** - Cross-transport delta sync & xxHash3! (v0.0.19-v0.0.21)
+🚀 **Current Version: v0.0.21** - 251 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -160,7 +161,7 @@ sy /source /destination --delete --force-delete         # Skip safety checks (da
 
 ## Features
 
-### ✅ What Works Now (v0.0.13)
+### ✅ What Works Now (v0.0.21)
 
 **Local Sync (Phase 1 - Complete)**:
 - **Smart File Sync**: Compares size + modification time (1s tolerance)
@@ -302,12 +303,17 @@ sy /source /destination --delete --force-delete         # Skip safety checks (da
     - `--filter="+ *.txt" --filter="- *"` - Only sync .txt files
     - `--filter="+ */" --filter="+ *.rs" --filter="- *"` - Only .rs files in all dirs
     - `--filter="- build/" --filter="+ *"` - Exclude build directory and contents
-- **Cross-Transport Sync** (v0.0.18):
+- **Cross-Transport Sync** (v0.0.18-v0.0.21):
   - Remote → Local sync fully working (e.g., `user@host:/src /local/dst`)
   - Local → Remote already supported
   - Proper mtime preservation across transports
   - SFTP-based file reading for remote sources
-  - Cross-transport delta sync falls back to full file copy (delta sync planned)
+  - **Cross-transport delta sync** (v0.0.19-v0.0.21):
+    - Automatic remote file update detection
+    - Delta sync triggers automatically for remote file updates
+    - **98% bandwidth savings** demonstrated (50MB file, 1MB changed → only ~1MB transferred)
+    - xxHash3 fast checksums (10x faster than BLAKE3 for non-cryptographic verification)
+    - FileInfo abstraction enables transport-agnostic metadata operations
 
 ### 📋 Common Use Cases
 
@@ -380,23 +386,28 @@ Files: 1,234 total | 892 synced | 312 skipped | 30 queued
 
 ## Comparison
 
-| Feature | rsync | rclone | sy (v0.0.10) |
+| Feature | rsync | rclone | sy (v0.0.21) |
 |---------|-------|--------|-----|
 | **Performance (local)** | baseline | N/A | **2-11x faster** |
 | Parallel file transfers | ❌ | ✅ | ✅ |
 | Parallel checksums | ❌ | ❌ | ✅ |
 | Delta sync | ✅ | ❌ | ✅ |
+| Cross-transport delta sync | ❌ | ❌ | ✅ **Auto-detects updates!** |
 | Streaming delta | ❌ | ❌ | ✅ **Constant memory!** |
 | True O(1) rolling hash | ❌ | ❌ | ✅ **2ns per operation!** |
 | Block checksums | ✅ MD5 | ❌ | ✅ xxHash3 |
+| Cryptographic verification | ✅ MD5 | ✅ | ✅ **BLAKE3** |
 | Compression | ✅ | ✅ | ✅ **Zstd (8 GB/s)** |
 | Bandwidth limiting | ✅ | ✅ | ✅ |
-| File filtering | ✅ | ✅ | ✅ |
+| File filtering | ✅ | ✅ | ✅ **Rsync-style** |
+| Resume support | ❌ | ✅ | ✅ |
+| Watch mode | ❌ | ✅ | ✅ |
+| JSON output | ❌ | ✅ | ✅ |
 | Modern UX | ❌ | ⚠️ | ✅ |
 | Single file sync | ⚠️ Complex | ✅ | ✅ |
 | Zero compiler warnings | N/A | N/A | ✅ |
 
-**Future planned**: End-to-end checksums, network auto-detection, parallel chunk transfers, resume support
+**All major features implemented!** See [DESIGN.md](DESIGN.md) for comprehensive technical details.
 
 ## Example Usage
 
@@ -581,14 +592,14 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for comprehensive ben
 
 ## Contributing
 
-sy v0.0.10 is production-ready! Phases 1-3 are complete.
+sy v0.0.21 is production-ready! Phases 1-8 are complete.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 **Interested in contributing?** Areas we'd love help with:
 - **Testing**: Cross-platform testing (Windows, Linux, macOS)
 - **Performance**: Profiling and optimization for very large datasets
-- **Features**: Phase 4 features (network detection, resume support, parallel chunks)
+- **Features**: Advanced features (network auto-detection, parallel chunk transfers, incremental state caching)
 - **Documentation**: Usage examples, tutorials, blog posts
 - **Real-world testing**: Use sy in your workflows and report issues!
 

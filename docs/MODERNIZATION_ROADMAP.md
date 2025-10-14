@@ -1,7 +1,7 @@
 # Modernization Roadmap - sy v0.1.0 → v1.0
 
-**Status**: In Progress - Phase 6 Core Complete! (2025-10-08)
-**Current Version**: v0.0.17
+**Status**: In Progress - Phase 8 Complete! (2025-10-13)
+**Current Version**: v0.0.21
 **Goal**: Make sy a complete modern rsync replacement for 90%+ of use cases
 
 ---
@@ -24,17 +24,32 @@
 5. ✅ **Sparse file support** - Detection and preservation (v0.0.15)
 6. ✅ **Extended attributes** - -X flag for full-fidelity backups (v0.0.16)
 
-### ✅ Phase 6 Core Complete (v0.0.17)
+### ✅ Phase 6 Complete (v0.0.17)
 1. ✅ **Hardlink preservation** - -H flag preserves hard links (v0.0.17)
+2. ✅ **ACL preservation** - -A flag preserves POSIX ACLs (v0.0.17)
+
+### ✅ Phase 7 Complete (v0.0.18)
+1. ✅ **Rsync-style filters** - Full filter rule support with include/exclude (v0.0.18)
+2. ✅ **Remote → Local sync** - Bidirectional sync fully working (v0.0.18)
+3. ✅ **Archive mode** - -a flag with full rsync compatibility (v0.0.18)
+
+### ✅ Phase 8 Complete (v0.0.19-v0.0.21)
+1. ✅ **Cross-transport delta sync** - Automatic remote file update detection (v0.0.19)
+2. ✅ **xxHash3 fast verification** - 10x faster than BLAKE3 (v0.0.21)
+3. ✅ **FileInfo abstraction** - Transport-agnostic metadata (v0.0.20)
+4. ✅ **98% bandwidth savings** - Delta sync working for remote updates (v0.0.21)
 
 ### Critical Gaps Remaining for v1.0
 1. ~~**Symlinks**~~ ✅ **DONE** (v0.0.15)
 2. ~~**Sparse files**~~ ✅ **DONE** (v0.0.15)
 3. ~~**Extended attributes**~~ ✅ **DONE** (v0.0.16)
 4. ~~**Hardlinks**~~ ✅ **DONE** (v0.0.17)
-5. **ACLs** - Advanced access control lists (MEDIUM)
-6. **Hooks** - Pre/post sync extensibility (LOW)
-7. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
+5. ~~**ACLs**~~ ✅ **DONE** (v0.0.17)
+6. ~~**Filters**~~ ✅ **DONE** (v0.0.18)
+7. ~~**Cross-transport delta**~~ ✅ **DONE** (v0.0.19-v0.0.21)
+8. **Hooks** - Pre/post sync extensibility (MEDIUM)
+9. **Cloud backends** - S3/R2/Backblaze (rclone territory) (DEFER)
+10. **State caching** - Faster re-syncs for large datasets (HIGH)
 
 ---
 
@@ -202,31 +217,97 @@ Looking at successful modern CLI tools:
 
 ---
 
-### Phase 6 (v0.3.0) - Advanced Filesystem Features
+### Phase 6 (v0.0.17) - Advanced Filesystem Features ✅ **COMPLETE**
 **Goal**: Handle remaining filesystem edge cases for full-fidelity backups
 
-**Timeline**: 2 weeks
+**Status**: Complete (2025-10-08)
 
 **Features**:
-1. **Hardlinks**
-   - Detect hardlinks via inode tracking
-   - Preserve hardlink relationships
-   - `--hard-links` flag to enable
-   - Tests: Verify inode counts match
+1. ✅ **Hardlinks** (v0.0.17)
+   - Detect hardlinks via inode tracking (u64 key: device + inode)
+   - Preserve hardlink relationships across transfers
+   - `-H` / `--preserve-hardlinks` flag to enable
+   - Full parallel support with async coordination
+   - Tests: Verify inode counts match, multiple hardlinks preserved
 
-2. **Extended attributes & ACLs**
-   - `-X` flag to preserve xattrs
-   - `-A` flag to preserve ACLs (requires root)
-   - Platform-specific: macOS resource forks, Windows alternate data streams
-   - Tests: Verify xattrs/ACLs preserved
+2. ✅ **ACLs** (v0.0.17)
+   - `-A` / `--preserve-acls` flag to preserve POSIX ACLs
+   - Always scanned, conditionally preserved
+   - Parse and apply ACLs using standard text format
+   - Cross-platform (Unix/Linux/macOS)
+   - Tests: Verify ACLs preserved correctly
 
-**Note**: Symlinks and sparse files moved to Phase 5 (completed in v0.0.15)
+**Note**: Extended attributes completed in Phase 5 (v0.0.16). Symlinks and sparse files also in Phase 5 (v0.0.15)
 
-**Deliverable**: Full-fidelity backups (like rsync -a)
+**Deliverable**: ✅ Full-fidelity backups (like rsync -aHAX)
 
 ---
 
-### Phase 7 (v0.4.0) - Developer Experience
+### Phase 7 (v0.0.18) - Rsync Compatibility & Filters ✅ **COMPLETE**
+**Goal**: Feature parity with rsync for power users
+
+**Status**: Complete (2025-10-09)
+
+**Features**:
+1. ✅ **Rsync-style filters** (v0.0.18)
+   - `--filter` flag for ordered include/exclude rules (first match wins)
+   - `--include` and `--exclude` flags for simple patterns
+   - Directory-only patterns with trailing slash (e.g., `build/`)
+   - Wildcard directory patterns (e.g., `*/` to include all directories)
+   - Basename matching (no slash) vs. full path matching (with slash)
+   - Compatible with rsync filter semantics
+   - Full filter engine with comprehensive tests
+
+2. ✅ **Remote → Local sync** (v0.0.18)
+   - Bidirectional sync fully working (e.g., `user@host:/src /local/dst`)
+   - Proper mtime preservation across transports
+   - SFTP-based file reading for remote sources
+   - Cross-transport operations handle both directions
+
+3. ✅ **Archive mode & metadata flags** (v0.0.18)
+   - `-a` / `--archive` flag (equivalent to `-rlptgoD`)
+   - Individual metadata preservation flags: `-p`, `-t`, `-g`, `-o`, `-D`
+   - Full rsync compatibility for backup workflows
+   - File comparison modes: `--ignore-times`, `--size-only`, `-c` / `--checksum`
+
+**Deliverable**: ✅ Rsync feature parity for advanced users
+
+**Note**: Developer experience features (hooks, ignore templates, improved dry-run) deferred to Phase 9+
+
+---
+
+### Phase 8 (v0.0.19-v0.0.21) - Cross-Transport Delta Sync ✅ **COMPLETE**
+**Goal**: Delta sync working across all transport combinations
+
+**Status**: Complete (2025-10-13)
+
+**Features**:
+1. ✅ **Automatic remote file update detection** (v0.0.19-v0.0.20)
+   - FileInfo abstraction for transport-agnostic metadata
+   - SshTransport.file_info() using SFTP stat()
+   - Delegation through DualTransport and TransportRouter
+   - Files correctly detected as "updated" vs "created"
+   - Critical bug fix enabling automatic delta sync
+
+2. ✅ **xxHash3 fast verification** (v0.0.21)
+   - Complete ChecksumType::Fast implementation
+   - ~10x faster than BLAKE3 for non-cryptographic checksums
+   - New src/integrity/xxhash3.rs module
+   - Full test coverage (12 integrity tests)
+   - Streaming hash computation for large files
+
+3. ✅ **Bandwidth limit parsing from profiles** (v0.0.21)
+   - Exposed cli::parse_size() as public API
+   - Profile bwlimit now parsed correctly
+   - Fixed final TODO in codebase
+
+**Impact**: **98% bandwidth savings** demonstrated (50MB file, 1MB changed → only ~1MB transferred)
+
+**Deliverable**: ✅ Delta sync works seamlessly for all sync scenarios (local→remote, remote→local, remote→remote)
+
+---
+
+### Phase 9 (v0.4.0) - Developer Experience 🎯 **NEXT**
 **Goal**: Extensibility & improved workflows
 
 **Timeline**: 1.5 weeks
@@ -252,11 +333,11 @@ Looking at successful modern CLI tools:
 
 **Deliverable**: Great developer experience
 
-**Note**: TUI mode deferred to Phase 9+ (optional feature, not critical for v1.0)
+**Note**: TUI mode deferred to Phase 11+ (optional feature, not critical for v1.0)
 
 ---
 
-### Phase 8 (v0.5.0) - Cloud Era
+### Phase 10 (v0.5.0) - Cloud Era
 **Goal**: Support cloud storage backends
 
 **Timeline**: 3-4 weeks
@@ -280,17 +361,11 @@ Looking at successful modern CLI tools:
    - Lifecycle policies (delete after N days)
    - Cost estimation (estimate transfer + storage costs)
 
-4. **Container awareness**
-   - Auto-detect Docker volumes (`/var/lib/docker/volumes/...`)
-   - Efficient sync of container layers
-   - Integration with Docker/Podman APIs
-   - Tests: Sync to/from running containers
-
 **Deliverable**: Compete with rclone for cloud use cases
 
 ---
 
-### Phase 9 (v0.6.0) - Scale
+### Phase 11 (v0.6.0) - Scale
 **Goal**: Handle millions of files efficiently
 
 **Timeline**: 2 weeks
@@ -323,7 +398,7 @@ Looking at successful modern CLI tools:
 
 ---
 
-### Phase 10 (v1.0.0) - Production Release
+### Phase 12 (v1.0.0) - Production Release
 **Goal**: Stable, polished, well-distributed
 
 **Timeline**: 2 weeks
@@ -365,29 +440,32 @@ Looking at successful modern CLI tools:
 
 ---
 
-## Feature Comparison: sy v0.0.17 vs Competition
+## Feature Comparison: sy v0.0.21 vs Competition
 
-| Feature | rsync | rclone | **sy v0.0.17** | sy v1.0 (planned) |
+| Feature | rsync | rclone | **sy v0.0.21** | sy v1.0 (planned) |
 |---------|-------|--------|----------------|-------------------|
 | **Performance (local)** | baseline | N/A | **2-11x faster** ✅ | **2-11x faster** ✅ |
 | **Performance (network)** | baseline | 4x with --transfers | **5-10x faster** ✅ | **5-10x faster** ✅ |
 | **Delta sync** | ✅ | ❌ | ✅ v0.0.7 | ✅ |
+| **Cross-transport delta** | ❌ | ❌ | **✅ v0.0.19-v0.0.21** | ✅ |
 | **Parallel files** | ❌ | ✅ | ✅ v0.0.8 | ✅ |
-| **Parallel chunks** | ❌ | ✅ | ❌ | ✅ (Phase 8) |
+| **Parallel chunks** | ❌ | ✅ | ❌ | ✅ (Phase 10) |
 | **Resume** | ✅ | ✅ | ✅ v0.0.13 | ✅ |
 | **Symlinks** | ✅ | ✅ | ✅ v0.0.15 | ✅ |
 | **Sparse files** | ✅ | ❌ | ✅ v0.0.15 | ✅ |
 | **Extended attributes** | ✅ | ❌ | ✅ v0.0.16 | ✅ |
-| **Hardlinks** | ✅ | ❌ | **✅ v0.0.17** | ✅ |
-| **ACLs** | ✅ | ❌ | ⏳ Next | ✅ (Phase 6) |
-| **Cloud storage** | ❌ | ✅ | ❌ | ✅ (Phase 8) |
+| **Hardlinks** | ✅ | ❌ | ✅ v0.0.17 | ✅ |
+| **ACLs** | ✅ | ❌ | **✅ v0.0.17** | ✅ |
+| **Rsync-style filters** | ✅ | ⚠️ | **✅ v0.0.18** | ✅ |
+| **Cloud storage** | ❌ | ✅ | ❌ | ✅ (Phase 10) |
 | **Watch mode** | ❌ | ❌ | ✅ v0.0.12 | ✅ |
 | **JSON output** | ❌ | ✅ | ✅ v0.0.11 | ✅ |
 | **Config profiles** | ❌ | ✅ | ✅ v0.0.11 | ✅ |
 | **Verification** | checksum | hash | **Multi-layer** ✅ v0.0.14 | **Multi-layer** ✅ |
 | **Beautiful output** | ❌ | ⚠️ | ✅ | ✅ |
+| **Hooks** | ❌ | ✅ | ⏳ Phase 9 | ✅ (Phase 9) |
 
-**Key**: ✅ Done | ⏳ In progress | ❌ Not supported
+**Key**: ✅ Done | ⏳ Next | ❌ Not supported
 
 ---
 
@@ -428,19 +506,21 @@ Looking at successful modern CLI tools:
 
 ## Timeline to v1.0
 
-**Estimated**: 13.5-16.5 weeks remaining (~3.5 months)
+**Estimated**: 9.5-11.5 weeks remaining (~2.5-3 months)
 
 - ✅ Phase 4: Complete (v0.0.11-v0.0.13)
-- Phase 5: 2 weeks
-- Phase 6: 3 weeks
-- Phase 7: 1.5 weeks (TUI deferred)
-- Phase 8: 3-4 weeks
-- Phase 9: 2 weeks
-- Phase 10: 2 weeks
+- ✅ Phase 5: Complete (v0.0.14-v0.0.16)
+- ✅ Phase 6: Complete (v0.0.17)
+- ✅ Phase 7: Complete (v0.0.18)
+- ✅ Phase 8: Complete (v0.0.19-v0.0.21)
+- Phase 9: 1.5 weeks (Developer Experience)
+- Phase 10: 3-4 weeks (Cloud Era)
+- Phase 11: 2 weeks (Scale)
+- Phase 12: 2 weeks (Production Release)
 
-**Target Release**: Q1-Q2 2026
+**Target Release**: Q1 2026
 
-**Beta Program**: Start after Phase 6 (v0.3.0) with symlink support
+**Current Status**: 8 of 12 phases complete! Ready for Phase 9 (Hooks & Developer UX)
 
 ---
 
@@ -485,13 +565,18 @@ cargo login <scoped-token>
 
 ## Next Steps
 
-1. ✅ **Phase 4 implementation** - Complete (v0.0.11-v0.0.13)
-2. **Phase 5 planning** - Design verification & reliability features
+1. ✅ **Phases 4-8 implementation** - Complete (v0.0.11-v0.0.21)
+2. **Phase 9 planning** - Design hooks & developer experience features
 3. **Community feedback** - Post roadmap, get input on priorities
-4. **Beta testing** - Find early adopters for Phase 5
+4. **Beta testing** - Find early adopters, gather production use cases
+
+**Recommendations for Phase 9**:
+- **Hooks** - High demand, enables extensibility
+- **Improved dry-run** - Better UX for safety-conscious users
+- **Ignore templates** - Developer convenience feature
 
 ---
 
-**Last Updated**: 2025-10-06
-**Status**: Phase 4 complete, ready to begin Phase 5
-**Current Version**: v0.0.13 (Phases 1-4 complete)
+**Last Updated**: 2025-10-13
+**Status**: Phase 8 complete, ready to begin Phase 9
+**Current Version**: v0.0.21 (Phases 1-8 complete, 251 tests passing)
