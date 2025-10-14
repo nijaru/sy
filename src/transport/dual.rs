@@ -47,7 +47,31 @@ impl Transport for DualTransport {
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Cross-transport copy: read from source, write to dest
+        // Use streaming for files > 10MB to avoid memory issues
+        const STREAMING_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+
         tracing::debug!("DualTransport: copying {} to {}", source.display(), dest.display());
+
+        // Check file size to decide streaming vs buffered
+        // Note: metadata() may fail for remote sources, so we default to streaming
+        // for safety (better to use more memory-efficient approach than OOM)
+        let file_size = match self.source.metadata(source).await {
+            Ok(meta) => meta.len(),
+            Err(_) => {
+                // metadata() not available (e.g., remote source) - use streaming to be safe
+                tracing::debug!("Metadata not available, using streaming");
+                return self.source.copy_file_streaming(source, dest, None).await;
+            }
+        };
+
+        if file_size > STREAMING_THRESHOLD {
+            tracing::debug!("Using streaming for large file ({} bytes)", file_size);
+            // Use streaming for large files (no progress callback for now)
+            return self.source.copy_file_streaming(source, dest, None).await;
+        }
+
+        // For small files, use buffered approach
+        tracing::debug!("Using buffered copy for small file ({} bytes)", file_size);
 
         // Read file data from source
         let data = self.source.read_file(source).await?;

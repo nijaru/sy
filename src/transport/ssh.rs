@@ -843,4 +843,120 @@ impl Transport for SshTransport {
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
+
+    async fn copy_file_streaming(
+        &self,
+        source: &Path,
+        dest: &Path,
+        progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<TransferResult> {
+        let source_buf = source.to_path_buf();
+        let dest_buf = dest.to_path_buf();
+        let session_arc = Arc::clone(&self.session);
+
+        tokio::task::spawn_blocking(move || {
+            let session = session_arc.lock().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            })?;
+
+            let sftp = session.sftp().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+            })?;
+
+            // Get file stats for mtime and size
+            let stat = sftp.stat(&source_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to stat remote file {}: {}", source_buf.display(), e),
+                ))
+            })?;
+
+            let file_size = stat.size.unwrap_or(0);
+            let mtime = stat.mtime.ok_or_else(|| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Remote file {} has no mtime", source_buf.display()),
+                ))
+            })?;
+
+            // Open remote file for streaming read
+            let mut remote_file = sftp.open(&source_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to open remote file {}: {}", source_buf.display(), e),
+                ))
+            })?;
+
+            // Create parent directories if needed
+            if let Some(parent) = dest_buf.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to create parent directory {}: {}", parent.display(), e),
+                    ))
+                })?;
+            }
+
+            // Create local destination file
+            let mut dest_file = std::fs::File::create(&dest_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to create file {}: {}", dest_buf.display(), e),
+                ))
+            })?;
+
+            // Stream in 64KB chunks
+            const CHUNK_SIZE: usize = 64 * 1024;
+            let mut buffer = vec![0u8; CHUNK_SIZE];
+            let mut total_bytes = 0u64;
+
+            if let Some(ref callback) = progress_callback {
+                callback(0, file_size);
+            }
+
+            loop {
+                let bytes_read = std::io::Read::read(&mut remote_file, &mut buffer).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read from remote {}: {}", source_buf.display(), e),
+                    ))
+                })?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                std::io::Write::write_all(&mut dest_file, &buffer[..bytes_read]).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to write to {}: {}", dest_buf.display(), e),
+                    ))
+                })?;
+
+                total_bytes += bytes_read as u64;
+                if let Some(ref callback) = progress_callback {
+                    callback(total_bytes, file_size);
+                }
+            }
+
+            std::io::Write::flush(&mut dest_file).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to flush {}: {}", dest_buf.display(), e),
+                ))
+            })?;
+
+            drop(dest_file);
+
+            // Set mtime
+            let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
+            filetime::set_file_mtime(&dest_buf, filetime::FileTime::from_system_time(mtime_systime))?;
+
+            tracing::debug!("Streamed {} bytes from {} to {}", total_bytes, source_buf.display(), dest_buf.display());
+
+            Ok(TransferResult::new(total_bytes))
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
 }
