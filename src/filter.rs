@@ -59,18 +59,63 @@ impl FilterRule {
     /// - If pattern ends with '/', it's a directory pattern - match directory and all contents
     /// - If pattern contains '/', match against full relative path
     /// - Otherwise, match against basename only
-    pub fn matches(&self, path: &Path) -> bool {
+    pub fn matches(&self, path: &Path, is_dir: bool) -> bool {
         if self.is_dir_only {
-            // Pattern ends with '/' - directory pattern
-            // Match if path is the directory itself or any file/subdir within it
-            if let Some(path_str) = path.to_str() {
+            // Pattern ends with '/' - directory-only pattern
+            // Matches the directory itself AND everything inside it
+
+            if self.has_slash {
+                // Pattern with slash like "foo/bar/" - match against full path
+                if let Some(path_str) = path.to_str() {
+                    // Check if path itself matches (if it's a directory)
+                    if is_dir && self.pattern.matches(path_str) {
+                        return true;
+                    }
+                    // Check if path is inside a matching directory
+                    for ancestor in path.ancestors().skip(1) {
+                        if let Some(ancestor_str) = ancestor.to_str() {
+                            if !ancestor_str.is_empty() && self.pattern.matches(ancestor_str) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            } else {
+                // Pattern like "*/" or "build/" - match against basename
+                // Special case: "*/" only matches directories, not their contents
+                // But "build/" matches the directory AND its contents
                 let pattern_str = self.pattern.as_str();
-                // Check if path is the directory itself or starts with "dir/"
-                if path_str == pattern_str || path_str.starts_with(&format!("{}/", pattern_str)) {
-                    return true;
+                let is_wildcard_only = pattern_str == "*";
+
+                if is_wildcard_only {
+                    // "*/" pattern - only match directories, not their contents
+                    if !is_dir {
+                        return false;
+                    }
+                    if let Some(basename) = path.file_name().and_then(|n| n.to_str()) {
+                        return self.pattern.matches(basename);
+                    }
+                    false
+                } else {
+                    // Specific directory name like "build/" - match directory and its contents
+                    if let Some(basename) = path.file_name().and_then(|n| n.to_str()) {
+                        // Check if path itself is the matching directory
+                        if is_dir && self.pattern.matches(basename) {
+                            return true;
+                        }
+                    }
+                    // Check if any parent directory basename matches
+                    for ancestor in path.ancestors().skip(1) {
+                        if let Some(ancestor_basename) = ancestor.file_name().and_then(|n| n.to_str()) {
+                            if self.pattern.matches(ancestor_basename) {
+                                return true;
+                            }
+                        }
+                    }
+                    false
                 }
             }
-            false
         } else if self.has_slash {
             // Pattern has '/' - match against full path
             if let Some(path_str) = path.to_str() {
@@ -174,7 +219,7 @@ impl FilterEngine {
     ///
     /// Returns true if the file should be synced, false if it should be excluded.
     /// First matching rule wins. If no rules match, default is to include.
-    pub fn should_include(&self, path: &Path) -> bool {
+    pub fn should_include(&self, path: &Path, is_dir: bool) -> bool {
         if self.rules.is_empty() {
             // No rules = include everything
             return true;
@@ -182,7 +227,7 @@ impl FilterEngine {
 
         // Find first matching rule
         for rule in &self.rules {
-            if rule.matches(path) {
+            if rule.matches(path, is_dir) {
                 return rule.action == FilterAction::Include;
             }
         }
@@ -192,8 +237,8 @@ impl FilterEngine {
     }
 
     /// Check if a path should be excluded
-    pub fn should_exclude(&self, path: &Path) -> bool {
-        !self.should_include(path)
+    pub fn should_exclude(&self, path: &Path, is_dir: bool) -> bool {
+        !self.should_include(path, is_dir)
     }
 
     /// Get number of rules
@@ -220,8 +265,8 @@ mod tests {
     #[test]
     fn test_empty_filter_includes_all() {
         let filter = FilterEngine::new();
-        assert!(filter.should_include(Path::new("foo.txt")));
-        assert!(filter.should_include(Path::new("bar/baz.rs")));
+        assert!(filter.should_include(Path::new("foo.txt"), false));
+        assert!(filter.should_include(Path::new("bar/baz.rs"), false));
     }
 
     #[test]
@@ -229,8 +274,8 @@ mod tests {
         let mut filter = FilterEngine::new();
         filter.add_exclude("*.log").unwrap();
 
-        assert!(!filter.should_include(Path::new("test.log")));
-        assert!(filter.should_include(Path::new("test.txt")));
+        assert!(!filter.should_include(Path::new("test.log"), false));
+        assert!(filter.should_include(Path::new("test.txt"), false));
     }
 
     #[test]
@@ -242,12 +287,12 @@ mod tests {
         filter.add_include("important.log").unwrap();
 
         // First rule matches (exclude)
-        assert!(!filter.should_include(Path::new("test.log")));
+        assert!(!filter.should_include(Path::new("test.log"), false));
         // No rules match (default include)
-        assert!(filter.should_include(Path::new("test.txt")));
+        assert!(filter.should_include(Path::new("test.txt"), false));
         // Second rule matches (include) - but first rule already matched!
         // This shows order matters
-        assert!(!filter.should_include(Path::new("important.log")));
+        assert!(!filter.should_include(Path::new("important.log"), false));
     }
 
     #[test]
@@ -259,11 +304,11 @@ mod tests {
         filter.add_exclude("*.log").unwrap();
 
         // First rule matches (include)
-        assert!(filter.should_include(Path::new("important.log")));
+        assert!(filter.should_include(Path::new("important.log"), false));
         // Second rule matches (exclude)
-        assert!(!filter.should_include(Path::new("test.log")));
+        assert!(!filter.should_include(Path::new("test.log"), false));
         // No rules match (default include)
-        assert!(filter.should_include(Path::new("test.txt")));
+        assert!(filter.should_include(Path::new("test.txt"), false));
     }
 
     #[test]
@@ -274,10 +319,10 @@ mod tests {
         filter.add_rule("- *.log").unwrap();
         filter.add_rule("*.tmp").unwrap(); // No prefix = exclude
 
-        assert!(filter.should_include(Path::new("foo.rs")));
-        assert!(!filter.should_include(Path::new("bar.log")));
-        assert!(!filter.should_include(Path::new("baz.tmp")));
-        assert!(filter.should_include(Path::new("qux.txt")));
+        assert!(filter.should_include(Path::new("foo.rs"), false));
+        assert!(!filter.should_include(Path::new("bar.log"), false));
+        assert!(!filter.should_include(Path::new("baz.tmp"), false));
+        assert!(filter.should_include(Path::new("qux.txt"), false));
     }
 
     #[test]
@@ -286,9 +331,9 @@ mod tests {
         filter.add_exclude("target/*").unwrap();
         filter.add_exclude("node_modules/*").unwrap();
 
-        assert!(!filter.should_include(Path::new("target/debug")));
-        assert!(!filter.should_include(Path::new("node_modules/foo")));
-        assert!(filter.should_include(Path::new("src/main.rs")));
+        assert!(!filter.should_include(Path::new("target/debug"), false));
+        assert!(!filter.should_include(Path::new("node_modules/foo"), false));
+        assert!(filter.should_include(Path::new("src/main.rs"), false));
     }
 
     #[test]
@@ -301,7 +346,7 @@ mod tests {
 
         // Should only have one rule (the *.log pattern)
         assert_eq!(filter.rule_count(), 1);
-        assert!(!filter.should_include(Path::new("test.log")));
+        assert!(!filter.should_include(Path::new("test.log"), false));
     }
 
     #[test]
@@ -318,8 +363,8 @@ mod tests {
         // Pattern without prefix defaults to exclude
         filter.add_rule("*.log").unwrap();
 
-        assert!(!filter.should_include(Path::new("test.log")));
-        assert!(filter.should_include(Path::new("test.txt")));
+        assert!(!filter.should_include(Path::new("test.log"), false));
+        assert!(filter.should_include(Path::new("test.txt"), false));
     }
 
     #[test]
@@ -328,9 +373,9 @@ mod tests {
         filter.add_exclude("**/*.log").unwrap();
         filter.add_exclude("temp/**").unwrap();
 
-        assert!(!filter.should_include(Path::new("foo/bar/test.log")));
-        assert!(!filter.should_include(Path::new("temp/foo/bar")));
-        assert!(filter.should_include(Path::new("src/main.rs")));
+        assert!(!filter.should_include(Path::new("foo/bar/test.log"), false));
+        assert!(!filter.should_include(Path::new("temp/foo/bar"), false));
+        assert!(filter.should_include(Path::new("src/main.rs"), false));
     }
 
     #[test]
@@ -341,12 +386,12 @@ mod tests {
         filter.add_exclude("*.rs").unwrap();
 
         // Should include important.rs even in subdirectory
-        assert!(filter.should_include(Path::new("dir/important.rs")));
-        assert!(filter.should_include(Path::new("deep/nested/important.rs")));
+        assert!(filter.should_include(Path::new("dir/important.rs"), false));
+        assert!(filter.should_include(Path::new("deep/nested/important.rs"), false));
 
         // Should exclude other .rs files
-        assert!(!filter.should_include(Path::new("code.rs")));
-        assert!(!filter.should_include(Path::new("dir/code.rs")));
+        assert!(!filter.should_include(Path::new("code.rs"), false));
+        assert!(!filter.should_include(Path::new("dir/code.rs"), false));
     }
 
     #[test]
@@ -357,13 +402,13 @@ mod tests {
         filter.add_exclude("**/temp/*.log").unwrap();
 
         // Should exclude .rs files in dir1/ only
-        assert!(!filter.should_include(Path::new("dir1/code.rs")));
-        assert!(filter.should_include(Path::new("dir2/code.rs"))); // different dir
+        assert!(!filter.should_include(Path::new("dir1/code.rs"), false));
+        assert!(filter.should_include(Path::new("dir2/code.rs"), false)); // different dir
 
         // Should exclude .log files in any temp/ directory
-        assert!(!filter.should_include(Path::new("temp/test.log")));
-        assert!(!filter.should_include(Path::new("foo/temp/test.log")));
-        assert!(filter.should_include(Path::new("temp/test.txt"))); // not .log
+        assert!(!filter.should_include(Path::new("temp/test.log"), false));
+        assert!(!filter.should_include(Path::new("foo/temp/test.log"), false));
+        assert!(filter.should_include(Path::new("temp/test.txt"), false)); // not .log
     }
 
     #[test]
@@ -375,15 +420,15 @@ mod tests {
         filter.add_exclude("*").unwrap();
 
         // dir1/ should be excluded along with all its contents
-        assert!(!filter.should_include(Path::new("dir1/keep.txt")));
-        assert!(!filter.should_include(Path::new("dir1/subdir/file.rs")));
+        assert!(!filter.should_include(Path::new("dir1/keep.txt"), false));
+        assert!(!filter.should_include(Path::new("dir1/subdir/file.rs"), false));
 
         // *.txt in root or other directories should be included
-        assert!(filter.should_include(Path::new("keep.txt")));
-        assert!(filter.should_include(Path::new("dir2/keep.txt")));
+        assert!(filter.should_include(Path::new("keep.txt"), false));
+        assert!(filter.should_include(Path::new("dir2/keep.txt"), false));
 
         // Non-.txt files should be excluded by the wildcard
-        assert!(!filter.should_include(Path::new("exclude.log")));
+        assert!(!filter.should_include(Path::new("exclude.log"), false));
     }
 
     #[test]
@@ -395,12 +440,12 @@ mod tests {
         filter.add_exclude("*").unwrap();
 
         // These should match rsync behavior
-        assert!(filter.should_include(Path::new("keep.txt")), "keep.txt should be included");
-        assert!(!filter.should_include(Path::new("dir1")), "dir1 should be excluded");
-        assert!(!filter.should_include(Path::new("dir1/keep.txt")), "dir1/keep.txt should be excluded");
-        assert!(!filter.should_include(Path::new("dir1/subdir/file.txt")), "dir1/subdir/file.txt should be excluded");
-        assert!(filter.should_include(Path::new("dir2/keep.txt")), "dir2/keep.txt should be included");
-        assert!(!filter.should_include(Path::new("exclude.log")), "exclude.log should be excluded");
+        assert!(filter.should_include(Path::new("keep.txt"), false), "keep.txt should be included");
+        assert!(!filter.should_include(Path::new("dir1"), true), "dir1 directory should be excluded");
+        assert!(!filter.should_include(Path::new("dir1/keep.txt"), false), "dir1/keep.txt should be excluded");
+        assert!(!filter.should_include(Path::new("dir1/subdir/file.txt"), false), "dir1/subdir/file.txt should be excluded");
+        assert!(filter.should_include(Path::new("dir2/keep.txt"), false), "dir2/keep.txt should be included");
+        assert!(!filter.should_include(Path::new("exclude.log"), false), "exclude.log should be excluded");
     }
 
     #[test]
@@ -410,17 +455,18 @@ mod tests {
         filter.add_exclude("build/").unwrap();
 
         // Should exclude the directory and everything in it
-        assert!(!filter.should_include(Path::new("build/output.txt")));
-        assert!(!filter.should_include(Path::new("build/nested/file.rs")));
+        assert!(!filter.should_include(Path::new("build/output.txt"), false));
+        assert!(!filter.should_include(Path::new("build/nested/file.rs"), false));
 
         // Pattern WITHOUT trailing slash - matches file or directory basename
         let mut filter2 = FilterEngine::new();
         filter2.add_exclude("build").unwrap();
 
         // Should exclude anything named "build" (file or dir) - basename matching
-        assert!(!filter2.should_include(Path::new("build")));
-        assert!(!filter2.should_include(Path::new("other/build"))); // basename is "build"
-        assert!(filter2.should_include(Path::new("build/output.txt"))); // basename is "output.txt", not "build"
-        assert!(filter2.should_include(Path::new("building"))); // basename is "building", not "build"
+        assert!(!filter2.should_include(Path::new("build"), false)); // file named "build"
+        assert!(!filter2.should_include(Path::new("build"), true)); // directory named "build"
+        assert!(!filter2.should_include(Path::new("other/build"), false)); // basename is "build"
+        assert!(filter2.should_include(Path::new("build/output.txt"), false)); // basename is "output.txt", not "build"
+        assert!(filter2.should_include(Path::new("building"), false)); // basename is "building", not "build"
     }
 }

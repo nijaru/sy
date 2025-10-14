@@ -46,15 +46,30 @@ impl Transport for DualTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Special handling: need to read from source, write to dest
-        // For now, assume source is local (will need enhancement for remote→remote)
-        self.dest.copy_file(source, dest).await
+        // Cross-transport copy: read from source, write to dest
+        tracing::debug!("DualTransport: copying {} to {}", source.display(), dest.display());
+
+        // Read file data from source
+        let data = self.source.read_file(source).await?;
+        let bytes_written = data.len() as u64;
+
+        // Get source mtime
+        let mtime = self.source.get_mtime(source).await?;
+
+        // Write to destination
+        self.dest.write_file(dest, &data, mtime).await?;
+
+        tracing::debug!("DualTransport: copied {} bytes", bytes_written);
+
+        Ok(TransferResult::new(bytes_written))
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Delegate delta sync to destination transport
-        // Assumes source is accessible by dest transport (e.g., local source, remote dest)
-        self.dest.sync_file_with_delta(source, dest).await
+        // Cross-transport delta sync would require rsync protocol over network
+        // For now, fall back to full file copy
+        // TODO: Implement proper delta sync for cross-transport operations
+        tracing::debug!("DualTransport: delta sync not yet implemented for cross-transport, using full copy");
+        self.copy_file(source, dest).await
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
