@@ -4,6 +4,7 @@ pub mod config;
 pub mod delta;
 pub mod error;
 pub mod filter;
+pub mod hooks;
 pub mod integrity;
 pub mod path;
 pub mod resource;

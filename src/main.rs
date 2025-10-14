@@ -4,6 +4,7 @@ mod config;
 mod delta;
 mod error;
 mod filter;
+mod hooks;
 mod integrity;
 mod path;
 mod resource;
@@ -17,6 +18,7 @@ use cli::Cli;
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
+use hooks::{HookExecutor, HookContext, HookType};
 use path::SyncPath;
 use sync::{SyncEngine, watch::WatchMode};
 use transport::router::TransportRouter;
@@ -130,6 +132,9 @@ async fn main() -> Result<()> {
     // After validation, source and destination must be present
     let source = cli.source.as_ref().expect("source required after validation");
     let destination = cli.destination.as_ref().expect("destination required after validation");
+
+    // Create hook executor
+    let hook_executor = HookExecutor::new().ok();  // Gracefully handle config dir errors
 
     // Clean state files if requested
     if cli.clean_state {
@@ -265,6 +270,27 @@ async fn main() -> Result<()> {
         cli.checksum,
     );
 
+    // Execute pre-sync hook
+    if let Some(ref executor) = hook_executor {
+        let pre_context = HookContext {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            files_scanned: 0,
+            files_created: 0,
+            files_updated: 0,
+            files_deleted: 0,
+            files_skipped: 0,
+            bytes_transferred: 0,
+            duration_secs: 0,
+            dry_run: cli.dry_run,
+        };
+
+        if let Err(e) = executor.execute(HookType::PreSync, &pre_context) {
+            tracing::error!("Pre-sync hook failed: {}", e);
+            return Err(e.into());
+        }
+    }
+
     // Watch mode or regular sync
     if cli.watch {
         // Watch mode - continuous sync on file changes
@@ -292,6 +318,27 @@ async fn main() -> Result<()> {
             .sync(source.path(), destination.path())
             .await?
     };
+
+    // Execute post-sync hook
+    if let Some(ref executor) = hook_executor {
+        let post_context = HookContext {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            files_scanned: stats.files_scanned,
+            files_created: stats.files_created,
+            files_updated: stats.files_updated,
+            files_deleted: stats.files_deleted,
+            files_skipped: stats.files_skipped,
+            bytes_transferred: stats.bytes_transferred,
+            duration_secs: stats.duration.as_secs(),
+            dry_run: cli.dry_run,
+        };
+
+        if let Err(e) = executor.execute(HookType::PostSync, &post_context) {
+            tracing::error!("Post-sync hook failed: {}", e);
+            // Don't abort after successful sync, just warn
+        }
+    }
 
     // Print summary (skip if JSON mode - already emitted JSON summary)
     if !cli.quiet && !cli.json {

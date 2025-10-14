@@ -45,6 +45,12 @@ pub enum SyncError {
     #[allow(dead_code)] // Used in future phases (network sync)
     #[error("Network error: {message}\nCheck your network connection and try again.")]
     NetworkError { message: String },
+
+    #[error("Hook execution failed: {0}\nCheck your hook script for errors or use --no-hooks to disable.")]
+    Hook(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
