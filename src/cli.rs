@@ -339,10 +339,8 @@ impl Cli {
 
         // If using --profile, source/destination come from profile (validated later)
         // Otherwise, source and destination must be provided
-        if self.profile.is_none() {
-            if self.source.is_none() || self.destination.is_none() {
-                anyhow::bail!("Source and destination are required (or use --profile)");
-            }
+        if self.profile.is_none() && (self.source.is_none() || self.destination.is_none()) {
+            anyhow::bail!("Source and destination are required (or use --profile)");
         }
 
         // Only validate local source paths (remote paths are validated during connection)
