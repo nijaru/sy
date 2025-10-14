@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21] - 2025-10-13
+
+### Added
+- **xxHash3 wrapper for fast file verification** - Complete ChecksumType::Fast implementation
+  - XxHash3Hasher module with hash_file(), hash_data(), new_hasher() methods
+  - ~10x faster than BLAKE3 for non-cryptographic checksums
+  - Ideal for detecting accidental corruption without cryptographic overhead
+  - Full test coverage (12 new tests including known hash regression test)
+
+### Fixed
+- **Remote file update detection** - CRITICAL bug fix enabling automatic delta sync
+  - Problem: Remote files always treated as "create" instead of "update"
+  - Root cause: SshTransport.metadata() couldn't return std::fs::Metadata for remote files
+  - Solution: Transport-agnostic FileInfo struct (size + mtime)
+  - Implemented SshTransport.file_info() using SFTP stat()
+  - Added delegation through DualTransport, TransportRouter, Arc<T>
+  - Updated StrategyPlanner to use file_info() instead of metadata()
+  - **Impact: 98% bandwidth savings** (50MB file, 1MB modified → only ~1MB transferred)
+
+### Performance
+- Delta sync now automatically triggers for remote file updates
+- Test results: 50MB file with 1MB change transferred only 1MB (49MB saved)
+- xxHash3 checksums: 10x faster than BLAKE3 for fast verification mode
+
+### Technical
+- Added src/integrity/xxhash3.rs module
+- FileInfo struct in transport::mod (transport-agnostic metadata)
+- SshTransport.file_info() uses SFTP stat() for remote file metadata
+- All transports now support file_info() method
+- Test count: 251 passing (+12 integrity tests)
+
 ### Added (Phase 6 Complete)
 - **Full metadata preservation over SSH** - Extended transport protocol
   - FileEntryJson now includes: symlinks, hardlinks, sparse files, xattrs, ACLs
@@ -495,7 +526,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.13...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.21...HEAD
+[0.0.21]: https://github.com/nijaru/sy/compare/v0.0.13...v0.0.21
 [0.0.13]: https://github.com/nijaru/sy/releases/tag/v0.0.13
 [0.0.12]: https://github.com/nijaru/sy/releases/tag/v0.0.12
 [0.0.11]: https://github.com/nijaru/sy/releases/tag/v0.0.11
