@@ -2,8 +2,10 @@ use crate::error::Result;
 use std::path::Path;
 
 mod blake3;
+mod xxhash3;
 
 pub use self::blake3::Blake3Hasher;
+pub use self::xxhash3::XxHash3Hasher;
 
 /// Type of checksum to compute
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,9 +98,8 @@ impl IntegrityVerifier {
         match self.checksum_type {
             ChecksumType::None => Ok(Checksum::None),
             ChecksumType::Fast => {
-                // TODO: Implement xxHash3 wrapper
-                // For now, return None
-                Ok(Checksum::None)
+                let hash = XxHash3Hasher::hash_file(path)?;
+                Ok(Checksum::Fast(hash.to_le_bytes().to_vec()))
             }
             ChecksumType::Cryptographic => {
                 let hash = Blake3Hasher::hash_file(path)?;
@@ -112,8 +113,8 @@ impl IntegrityVerifier {
         match self.checksum_type {
             ChecksumType::None => Ok(Checksum::None),
             ChecksumType::Fast => {
-                // TODO: Implement xxHash3 wrapper
-                Ok(Checksum::None)
+                let hash = XxHash3Hasher::hash_data(data);
+                Ok(Checksum::Fast(hash.to_le_bytes().to_vec()))
             }
             ChecksumType::Cryptographic => {
                 let hash = Blake3Hasher::hash_data(data);
@@ -219,6 +220,56 @@ mod tests {
         fs::write(&dest_path, b"File content").unwrap();
 
         let verifier = IntegrityVerifier::new(ChecksumType::Cryptographic, false);
+        assert!(verifier.verify_transfer(&source_path, &dest_path).unwrap());
+
+        // Change destination content
+        fs::write(&dest_path, b"Different content").unwrap();
+        assert!(!verifier.verify_transfer(&source_path, &dest_path).unwrap());
+    }
+
+    #[test]
+    fn test_verifier_fast() {
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
+        assert_eq!(verifier.checksum_type(), ChecksumType::Fast);
+
+        let data = b"Hello, xxHash3!";
+        let checksum = verifier.compute_data_checksum(data).unwrap();
+        assert!(!checksum.is_none());
+
+        // Same data should produce same checksum
+        let checksum2 = verifier.compute_data_checksum(data).unwrap();
+        assert_eq!(checksum, checksum2);
+
+        // Different data should produce different checksum
+        let checksum3 = verifier.compute_data_checksum(b"Different data").unwrap();
+        assert_ne!(checksum, checksum3);
+    }
+
+    #[test]
+    fn test_verifier_fast_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, b"Test file content").unwrap();
+
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
+        let checksum = verifier.compute_file_checksum(&file_path).unwrap();
+        assert!(!checksum.is_none());
+
+        // Same file should produce same checksum
+        let checksum2 = verifier.compute_file_checksum(&file_path).unwrap();
+        assert_eq!(checksum, checksum2);
+    }
+
+    #[test]
+    fn test_verify_transfer_fast() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("source.txt");
+        let dest_path = temp_dir.path().join("dest.txt");
+
+        fs::write(&source_path, b"File content").unwrap();
+        fs::write(&dest_path, b"File content").unwrap();
+
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
         assert!(verifier.verify_transfer(&source_path, &dest_path).unwrap());
 
         // Change destination content
