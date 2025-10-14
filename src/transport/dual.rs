@@ -59,15 +59,57 @@ impl Transport for DualTransport {
             Ok(meta) => meta.len(),
             Err(_) => {
                 // metadata() not available (e.g., remote source) - use streaming to be safe
-                tracing::debug!("Metadata not available, using streaming");
-                return self.source.copy_file_streaming(source, dest, None).await;
+                tracing::debug!("Metadata not available, using streaming with progress");
+
+                // Create progress callback for remote sources
+                let progress_callback = {
+                    let source_display = source.display().to_string();
+                    std::sync::Arc::new(move |transferred: u64, total: u64| {
+                        if total > 0 {
+                            let percent = (transferred as f64 / total as f64 * 100.0) as u64;
+                            // Log every 10MB transferred
+                            if transferred > 0 && transferred % (10 * 1_048_576) < 65536 {
+                                tracing::info!(
+                                    "Streaming {}: {}% ({:.1} / {:.1} MB)",
+                                    source_display,
+                                    percent,
+                                    transferred as f64 / 1_048_576.0,
+                                    total as f64 / 1_048_576.0
+                                );
+                            }
+                        }
+                    })
+                };
+
+                return self.source.copy_file_streaming(source, dest, Some(progress_callback)).await;
             }
         };
 
         if file_size > STREAMING_THRESHOLD {
             tracing::debug!("Using streaming for large file ({} bytes)", file_size);
-            // Use streaming for large files (no progress callback for now)
-            return self.source.copy_file_streaming(source, dest, None).await;
+
+            // Create progress callback that logs periodically
+            let progress_callback = {
+                let source_display = source.display().to_string();
+                std::sync::Arc::new(move |transferred: u64, total: u64| {
+                    if total > 0 {
+                        let percent = (transferred as f64 / total as f64 * 100.0) as u64;
+                        // Log every 10MB transferred
+                        if transferred > 0 && transferred % (10 * 1_048_576) < 65536 {
+                            tracing::info!(
+                                "Streaming {}: {}% ({:.1} / {:.1} MB)",
+                                source_display,
+                                percent,
+                                transferred as f64 / 1_048_576.0,
+                                total as f64 / 1_048_576.0
+                            );
+                        }
+                    }
+                })
+            };
+
+            // Use streaming for large files with progress logging
+            return self.source.copy_file_streaming(source, dest, Some(progress_callback)).await;
         }
 
         // For small files, use buffered approach
