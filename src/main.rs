@@ -133,8 +133,14 @@ async fn main() -> Result<()> {
     let source = cli.source.as_ref().expect("source required after validation");
     let destination = cli.destination.as_ref().expect("destination required after validation");
 
-    // Create hook executor
-    let hook_executor = HookExecutor::new().ok();  // Gracefully handle config dir errors
+    // Create hook executor (unless disabled)
+    let hook_executor = if cli.no_hooks {
+        None
+    } else {
+        HookExecutor::new()
+            .ok()
+            .map(|e| e.with_abort_on_failure(cli.abort_on_hook_failure))
+    };
 
     // Clean state files if requested
     if cli.clean_state {
