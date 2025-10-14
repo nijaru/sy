@@ -215,6 +215,39 @@ impl FilterEngine {
         Ok(())
     }
 
+    /// Load ignore template from ~/.config/sy/templates/
+    ///
+    /// Template names are resolved to ~/.config/sy/templates/{name}.syignore
+    /// Example: "rust" -> ~/.config/sy/templates/rust.syignore
+    pub fn add_template(&mut self, template_name: &str) -> Result<()> {
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+
+        let template_dir = config_dir.join("sy").join("templates");
+        let template_file = template_dir.join(format!("{}.syignore", template_name));
+
+        if !template_file.exists() {
+            anyhow::bail!("Template '{}' not found at {}", template_name, template_file.display());
+        }
+
+        self.add_rules_from_file(&template_file)
+            .with_context(|| format!("Failed to load template '{}'", template_name))
+    }
+
+    /// Load .syignore file if it exists in the given directory
+    ///
+    /// Returns Ok(true) if file was loaded, Ok(false) if file doesn't exist
+    pub fn add_syignore_if_exists(&mut self, directory: &Path) -> Result<bool> {
+        let syignore_path = directory.join(".syignore");
+
+        if !syignore_path.exists() {
+            return Ok(false);
+        }
+
+        self.add_rules_from_file(&syignore_path)?;
+        Ok(true)
+    }
+
     /// Check if a path should be included (not excluded)
     ///
     /// Returns true if the file should be synced, false if it should be excluded.
