@@ -144,8 +144,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
         false
     }
 
-    fn should_exclude(&self, relative_path: &Path) -> bool {
-        self.filter_engine.should_exclude(relative_path)
+    fn should_exclude(&self, relative_path: &Path, is_dir: bool) -> bool {
+        self.filter_engine.should_exclude(relative_path, is_dir)
     }
 
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
@@ -179,7 +179,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
 
                 // Apply exclude patterns
-                if self.should_exclude(&file.relative_path) {
+                if self.should_exclude(&file.relative_path, file.is_dir) {
                     tracing::debug!("Filtering out (excluded): {}", file.relative_path.display());
 
                     // If this is a directory, track it to exclude its children

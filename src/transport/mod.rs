@@ -122,6 +122,57 @@ pub trait Transport: Send + Sync {
     ///
     /// Creates a symbolic link at `dest` pointing to `target`.
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
+
+    /// Read file contents into a vector
+    ///
+    /// This is used for cross-transport operations (e.g., remote→local).
+    /// Default implementation reads from local filesystem.
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        tokio::fs::read(path).await.map_err(|e| {
+            crate::error::SyncError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read file {}: {}", path.display(), e),
+            ))
+        })
+    }
+
+    /// Write file contents from a vector
+    ///
+    /// This is used for cross-transport operations (e.g., remote→local).
+    /// Default implementation writes to local filesystem.
+    async fn write_file(&self, path: &Path, data: &[u8], mtime: std::time::SystemTime) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Create parent directories
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Write file
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        drop(file);
+
+        // Set mtime
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(mtime))?;
+
+        Ok(())
+    }
+
+    /// Get modification time for a file
+    ///
+    /// This is used for cross-transport operations where metadata() doesn't work.
+    /// Default implementation uses local filesystem.
+    async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
+        let metadata = tokio::fs::metadata(path).await?;
+        metadata.modified().map_err(|e| {
+            crate::error::SyncError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to get mtime for {}: {}", path.display(), e),
+            ))
+        })
+    }
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -162,5 +213,17 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
         (**self).create_symlink(target, dest).await
+    }
+
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        (**self).read_file(path).await
+    }
+
+    async fn write_file(&self, path: &Path, data: &[u8], mtime: std::time::SystemTime) -> Result<()> {
+        (**self).write_file(path, data, mtime).await
+    }
+
+    async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
+        (**self).get_mtime(path).await
     }
 }

@@ -22,8 +22,9 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 3.5 Complete** - Full compression + parallel checksums! (v0.0.10)
 ✅ **Phase 4 Complete** - JSON output, config profiles, watch mode, resume support! (v0.0.11-v0.0.13)
 ✅ **Phase 5 Complete** - BLAKE3 verification, symlinks, sparse files, xattrs! (v0.0.14-v0.0.16)
-✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17+)
-🚀 **Current Version: v0.0.17+** - 210 tests passing, zero errors!
+✅ **Phase 6 Complete** - Hardlink & ACL preservation! (v0.0.17)
+✅ **Phase 7 Complete** - Rsync-style filters & remote→local sync! (v0.0.18)
+🚀 **Current Version: v0.0.18** - 256 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -81,10 +82,16 @@ sy /source /destination --min-size 1KB      # Skip files < 1KB
 sy /source /destination --max-size 100MB    # Skip files > 100MB
 sy /source /destination --min-size 1MB --max-size 50MB  # Only 1-50MB files
 
-# Exclude patterns (new in v0.0.9+)
-sy /source /destination --exclude "*.log"              # Skip log files
-sy /source /destination --exclude "node_modules"       # Skip node_modules
-sy /source /destination --exclude "*.tmp" --exclude "*.cache"  # Multiple patterns
+# Rsync-style filters (new in v0.0.18+)
+sy /source /destination --filter="+ *.txt" --filter="- *"       # Include only .txt files
+sy /source /destination --filter="- dir1/" --filter="+ *"       # Exclude dir1 and its contents
+sy /source /destination --filter="+ */" --filter="+ *.rs" --filter="- *"  # Only .rs files in all directories
+
+# Include/Exclude patterns (new in v0.0.9+)
+sy /source /destination --exclude "*.log"                       # Skip log files
+sy /source /destination --exclude "node_modules"                # Skip node_modules
+sy /source /destination --include "*.txt" --exclude "*"         # Include only .txt files
+sy /source /destination --exclude "*.tmp" --exclude "*.cache"   # Multiple patterns
 
 # Bandwidth limiting (new in v0.0.9+)
 sy /source /destination --bwlimit 1MB                  # Limit to 1 MB/s
@@ -276,7 +283,7 @@ sy /source /destination --delete --force-delete         # Skip safety checks (da
   - **Full parallel support**: Async coordination ensures correct hardlink creation with multiple workers
   - Critical for backup systems, package managers, etc.
   - Cross-platform (Unix/Linux/macOS)
-- **ACL Preservation** (v0.0.17+):
+- **ACL Preservation** (v0.0.17):
   - `-A` flag to preserve POSIX Access Control Lists
   - Always scanned, conditionally preserved (minimal overhead)
   - Preserves fine-grained permissions beyond owner/group/other
@@ -284,6 +291,23 @@ sy /source /destination --delete --force-delete         # Skip safety checks (da
   - Essential for enterprise systems with complex permission models
   - Cross-platform (Unix/Linux/macOS)
   - Fully implemented and tested
+- **Rsync-Style Filters** (v0.0.18):
+  - `--filter` flag for ordered include/exclude rules (first match wins)
+  - `--include` and `--exclude` flags for simple patterns
+  - Directory-only patterns with trailing slash (e.g., `build/`)
+  - Wildcard directory patterns (e.g., `*/` to include all directories)
+  - Basename matching (no slash) vs. full path matching (with slash)
+  - Compatible with rsync filter semantics
+  - Examples:
+    - `--filter="+ *.txt" --filter="- *"` - Only sync .txt files
+    - `--filter="+ */" --filter="+ *.rs" --filter="- *"` - Only .rs files in all dirs
+    - `--filter="- build/" --filter="+ *"` - Exclude build directory and contents
+- **Cross-Transport Sync** (v0.0.18):
+  - Remote → Local sync fully working (e.g., `user@host:/src /local/dst`)
+  - Local → Remote already supported
+  - Proper mtime preservation across transports
+  - SFTP-based file reading for remote sources
+  - Cross-transport delta sync falls back to full file copy (delta sync planned)
 
 ### 📋 Common Use Cases
 

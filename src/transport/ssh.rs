@@ -766,4 +766,81 @@ impl Transport for SshTransport {
         tracing::debug!("Created symlink: {} -> {}", dest_str, target_str);
         Ok(())
     }
+
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let path_buf = path.to_path_buf();
+        let session_arc = Arc::clone(&self.session);
+
+        tokio::task::spawn_blocking(move || {
+            let session = session_arc.lock().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            })?;
+
+            let sftp = session.sftp().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+            })?;
+
+            // Open remote file for reading
+            let mut remote_file = sftp.open(&path_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to open remote file {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            // Read entire file into memory
+            let mut buffer = Vec::new();
+            std::io::Read::read_to_end(&mut remote_file, &mut buffer).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read from {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            tracing::debug!("Read {} bytes from remote file {}", buffer.len(), path_buf.display());
+
+            Ok(buffer)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
+        let path_buf = path.to_path_buf();
+        let session_arc = Arc::clone(&self.session);
+
+        tokio::task::spawn_blocking(move || {
+            let session = session_arc.lock().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            })?;
+
+            let sftp = session.sftp().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+            })?;
+
+            // Get file stats from remote
+            let stat = sftp.stat(&path_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to stat remote file {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            // Extract mtime
+            let mtime = stat.mtime.ok_or_else(|| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Remote file {} has no mtime", path_buf.display()),
+                ))
+            })?;
+
+            let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
+
+            tracing::debug!("Got mtime for remote file {}: {:?}", path_buf.display(), mtime_systime);
+
+            Ok(mtime_systime)
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
 }
