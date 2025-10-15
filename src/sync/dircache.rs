@@ -238,6 +238,7 @@ impl DirectoryCache {
     }
 
     /// Remove a directory from cache (e.g., after deletion)
+    #[allow(dead_code)] // Used in tests
     pub fn remove(&mut self, dir_path: &Path) -> bool {
         let dir_removed = self.dir_entries.remove(dir_path).is_some();
         let files_removed = self.file_entries.remove(dir_path).is_some();
@@ -245,6 +246,7 @@ impl DirectoryCache {
     }
 
     /// Clear all cache entries
+    #[allow(dead_code)] // Used in tests
     pub fn clear(&mut self) {
         self.dir_entries.clear();
         self.file_entries.clear();
@@ -257,6 +259,7 @@ impl DirectoryCache {
     }
 
     /// Check if cache is empty
+    #[allow(dead_code)] // Used in tests
     pub fn is_empty(&self) -> bool {
         self.dir_entries.is_empty() && self.file_entries.is_empty()
     }
@@ -335,7 +338,9 @@ mod tests {
         // Verify entries
         assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir1")));
         assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir2")));
-        assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir3/subdir")));
+        assert!(loaded
+            .dir_entries
+            .contains_key(&PathBuf::from("dir3/subdir")));
     }
 
     #[test]
@@ -432,9 +437,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cache_path = DirectoryCache::cache_path(temp.path());
 
-        assert_eq!(
-            cache_path,
-            temp.path().join(DirectoryCache::CACHE_FILENAME)
-        );
+        assert_eq!(cache_path, temp.path().join(DirectoryCache::CACHE_FILENAME));
     }
 }

@@ -238,50 +238,46 @@ fn bench_cache_nested_directories(c: &mut Criterion) {
 
     for depth in [10, 20, 50].iter() {
         // Without cache
-        group.bench_with_input(
-            BenchmarkId::new("full_scan", depth),
-            depth,
-            |b, &depth| {
-                let source = TempDir::new().unwrap();
-                let dest = TempDir::new().unwrap();
+        group.bench_with_input(BenchmarkId::new("full_scan", depth), depth, |b, &depth| {
+            let source = TempDir::new().unwrap();
+            let dest = TempDir::new().unwrap();
 
-                Command::new("git")
-                    .args(["init"])
-                    .current_dir(source.path())
-                    .output()
-                    .unwrap();
+            Command::new("git")
+                .args(["init"])
+                .current_dir(source.path())
+                .output()
+                .unwrap();
 
-                let mut path = source.path().to_path_buf();
-                for i in 0..depth {
-                    path = path.join(format!("level_{}", i));
-                }
-                fs::create_dir_all(&path).unwrap();
-                fs::write(path.join("file.txt"), "content").unwrap();
+            let mut path = source.path().to_path_buf();
+            for i in 0..depth {
+                path = path.join(format!("level_{}", i));
+            }
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("file.txt"), "content").unwrap();
 
-                // First sync
-                Command::new(env!("CARGO_BIN_EXE_sy"))
+            // First sync
+            Command::new(env!("CARGO_BIN_EXE_sy"))
+                .args([
+                    source.path().to_str().unwrap(),
+                    dest.path().to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+
+            b.iter(|| {
+                let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
                         source.path().to_str().unwrap(),
                         dest.path().to_str().unwrap(),
+                        "--use-cache=false",
                     ])
                     .output()
                     .unwrap();
 
-                b.iter(|| {
-                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                        .args([
-                            source.path().to_str().unwrap(),
-                            dest.path().to_str().unwrap(),
-                            "--use-cache=false",
-                        ])
-                        .output()
-                        .unwrap();
-
-                    assert!(output.status.success());
-                    black_box(output);
-                });
-            },
-        );
+                assert!(output.status.success());
+                black_box(output);
+            });
+        });
 
         // With cache
         group.bench_with_input(
