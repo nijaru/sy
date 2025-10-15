@@ -6,7 +6,7 @@
 ///
 /// Adler-32 computes two 16-bit sums:
 /// - A: sum of all bytes
-/// - B: sum of (n-i+1) * byte[i] for each byte
+/// - B: sum of (n-i+1) * byte\[i\] for each byte
 ///
 /// The final checksum is (B << 16) | A
 ///
