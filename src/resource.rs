@@ -141,7 +141,11 @@ fn get_available_space(path: &Path) -> Result<u64> {
         path
     };
 
-    let wide_path: Vec<u16> = check_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide_path: Vec<u16> = check_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
 
     let mut free_bytes: u64 = 0;
     let mut total_bytes: u64 = 0;
