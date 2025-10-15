@@ -29,6 +29,7 @@ pub enum SyncEvent {
     Delete {
         path: PathBuf,
     },
+    #[allow(dead_code)] // Event for error reporting
     Error {
         path: PathBuf,
         error: String,

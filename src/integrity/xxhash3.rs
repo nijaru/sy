@@ -1,3 +1,4 @@
+#[allow(dead_code)] // Public API and hasher infrastructure
 use crate::error::Result;
 use std::fs::File;
 use std::io::Read;
@@ -7,6 +8,7 @@ use xxhash_rust::xxh3::Xxh3;
 /// Wrapper around xxHash3 hasher
 pub struct XxHash3Hasher;
 
+#[allow(dead_code)] // Public API with tested methods
 impl XxHash3Hasher {
     /// Compute xxHash3 hash of a file
     ///

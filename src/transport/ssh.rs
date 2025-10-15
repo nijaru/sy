@@ -1,4 +1,4 @@
-use super::{Transport, TransferResult};
+use super::{TransferResult, Transport};
 use crate::compress::{compress, should_compress, Compression};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
@@ -53,11 +53,17 @@ impl SshTransport {
 
     fn execute_command(session: Arc<Mutex<Session>>, command: &str) -> Result<String> {
         let session = session.lock().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to lock session: {}",
+                e
+            )))
         })?;
 
         let mut channel = session.channel_session().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to create channel: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to create channel: {}",
+                e
+            )))
         })?;
 
         channel.exec(command).map_err(|e| {
@@ -79,7 +85,10 @@ impl SshTransport {
         let _ = channel.stderr().read_to_string(&mut stderr);
 
         channel.wait_close().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to close channel: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to close channel: {}",
+                e
+            )))
         })?;
 
         let exit_status = channel.exit_status().map_err(|e| {
@@ -108,11 +117,17 @@ impl SshTransport {
         use std::io::Write;
 
         let session = session.lock().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to lock session: {}",
+                e
+            )))
         })?;
 
         let mut channel = session.channel_session().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to create channel: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to create channel: {}",
+                e
+            )))
         })?;
 
         channel.exec(command).map_err(|e| {
@@ -148,7 +163,10 @@ impl SshTransport {
         let _ = channel.stderr().read_to_string(&mut stderr);
 
         channel.wait_close().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to close channel: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to close channel: {}",
+                e
+            )))
         })?;
 
         let exit_status = channel.exit_status().map_err(|e| {
@@ -184,21 +202,24 @@ impl Transport for SshTransport {
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
 
         let scan_output: ScanOutput = serde_json::from_str(&output).map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!("Failed to parse JSON: {}", e)))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to parse JSON: {}",
+                e
+            )))
         })?;
 
         let entries: Result<Vec<FileEntry>> = scan_output
             .entries
             .into_iter()
             .map(|e| {
-                let modified =
-                    UNIX_EPOCH + Duration::from_secs(e.mtime.max(0) as u64);
+                let modified = UNIX_EPOCH + Duration::from_secs(e.mtime.max(0) as u64);
 
                 // Decode xattrs from base64 if present
                 let xattrs = e.xattrs.map(|xattr_vec| {
-                    xattr_vec.into_iter()
+                    xattr_vec
+                        .into_iter()
                         .filter_map(|(key, base64_val)| {
-                            use base64::{Engine as _, engine::general_purpose};
+                            use base64::{engine::general_purpose, Engine as _};
                             match general_purpose::STANDARD.decode(base64_val) {
                                 Ok(decoded) => Some((key, decoded)),
                                 Err(e) => {
@@ -285,12 +306,17 @@ impl Transport for SshTransport {
             let metadata = std::fs::metadata(&source_path).map_err(|e| {
                 SyncError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("Failed to get metadata for {}: {}", source_path.display(), e),
+                    format!(
+                        "Failed to get metadata for {}: {}",
+                        source_path.display(),
+                        e
+                    ),
                 ))
             })?;
 
             let file_size = metadata.len();
-            let filename = source_path.file_name()
+            let filename = source_path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
 
@@ -318,11 +344,13 @@ impl Transport for SshTransport {
                     let uncompressed_size = file_data.len();
 
                     // Compress the data
-                    let compressed_data = compress(&file_data, compression_mode)
-                        .map_err(|e| SyncError::Io(std::io::Error::other(format!(
+                    let compressed_data = compress(&file_data, compression_mode).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
                             "Failed to compress {}: {}",
-                            source_path.display(), e
-                        ))))?;
+                            source_path.display(),
+                            e
+                        )))
+                    })?;
 
                     let compressed_size = compressed_data.len();
                     let ratio = uncompressed_size as f64 / compressed_size as f64;
@@ -336,7 +364,8 @@ impl Transport for SshTransport {
                     );
 
                     // Get mtime for receive-file command
-                    let mtime_secs = metadata.modified()
+                    let mtime_secs = metadata
+                        .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs());
@@ -349,15 +378,13 @@ impl Transport for SshTransport {
 
                     let command = format!(
                         "{} receive-file {} {}",
-                        remote_binary,
-                        dest_path_str,
-                        mtime_arg
+                        remote_binary, dest_path_str, mtime_arg
                     );
 
                     let output = Self::execute_command_with_stdin(
                         Arc::clone(&session_arc),
                         &command,
-                        &compressed_data
+                        &compressed_data,
                     )?;
 
                     // Parse response to verify
@@ -366,11 +393,12 @@ impl Transport for SshTransport {
                         bytes_written: u64,
                     }
 
-                    let result: ReceiveResult = serde_json::from_str(&output)
-                        .map_err(|e| SyncError::Io(std::io::Error::other(format!(
+                    let result: ReceiveResult = serde_json::from_str(&output).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
                             "Failed to parse receive-file output: {}",
                             e
-                        ))))?;
+                        )))
+                    })?;
 
                     tracing::info!(
                         "Transferred {} ({} bytes compressed, {:.1}x reduction)",
@@ -379,7 +407,10 @@ impl Transport for SshTransport {
                         ratio
                     );
 
-                    Ok(TransferResult::with_compression(result.bytes_written, compressed_size as u64))
+                    Ok(TransferResult::with_compression(
+                        result.bytes_written,
+                        compressed_size as u64,
+                    ))
                 }
                 Compression::None => {
                     tracing::debug!(
@@ -389,20 +420,30 @@ impl Transport for SshTransport {
                     );
 
                     let session = session_arc.lock().map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
                     })?;
 
                     // Open source file for streaming
                     let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
                         SyncError::Io(std::io::Error::new(
                             e.kind(),
-                            format!("Failed to open source file {}: {}", source_path.display(), e),
+                            format!(
+                                "Failed to open source file {}: {}",
+                                source_path.display(),
+                                e
+                            ),
                         ))
                     })?;
 
                     // Get SFTP session
                     let sftp = session.sftp().map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
                     })?;
 
                     // Write to remote file
@@ -422,12 +463,13 @@ impl Transport for SshTransport {
                     let mut bytes_written = 0u64;
 
                     loop {
-                        let bytes_read = std::io::Read::read(&mut source_file, &mut buffer).map_err(|e| {
-                            SyncError::Io(std::io::Error::new(
-                                e.kind(),
-                                format!("Failed to read from {}: {}", source_path.display(), e),
-                            ))
-                        })?;
+                        let bytes_read = std::io::Read::read(&mut source_file, &mut buffer)
+                            .map_err(|e| {
+                                SyncError::Io(std::io::Error::new(
+                                    e.kind(),
+                                    format!("Failed to read from {}: {}", source_path.display(), e),
+                                ))
+                            })?;
 
                         if bytes_read == 0 {
                             break; // EOF
@@ -437,13 +479,14 @@ impl Transport for SshTransport {
                         hasher.update(&buffer[..bytes_read]);
 
                         // Write chunk to remote
-                        std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read]).map_err(|e| {
-                            SyncError::Io(std::io::Error::other(format!(
-                                "Failed to write to remote file {}: {}",
-                                dest_path.display(),
-                                e
-                            )))
-                        })?;
+                        std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read])
+                            .map_err(|e| {
+                                SyncError::Io(std::io::Error::other(format!(
+                                    "Failed to write to remote file {}: {}",
+                                    dest_path.display(),
+                                    e
+                                )))
+                            })?;
 
                         bytes_written += bytes_read as u64;
                     }
@@ -509,11 +552,17 @@ impl Transport for SshTransport {
             let session_arc = session_clone;
             move || {
                 let session = session_arc.lock().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to lock session: {}",
+                        e
+                    )))
                 })?;
 
                 let sftp = session.sftp().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to create SFTP session: {}",
+                        e
+                    )))
                 })?;
 
                 // Get remote file size
@@ -532,7 +581,7 @@ impl Transport for SshTransport {
                     tracing::debug!("Remote destination too small for delta sync, using full copy");
                     drop(session);
                     return Err(SyncError::Io(std::io::Error::other(
-                        "Destination too small, caller should use copy_file"
+                        "Destination too small, caller should use copy_file",
                     )));
                 }
 
@@ -553,8 +602,8 @@ impl Transport for SshTransport {
                     Self::execute_command(Arc::clone(&session_arc), &command)
                 })?;
 
-                let dest_checksums: Vec<BlockChecksum> = serde_json::from_str(&output)
-                    .map_err(|e| {
+                let dest_checksums: Vec<BlockChecksum> =
+                    serde_json::from_str(&output).map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
                             "Failed to parse remote checksums: {}",
                             e
@@ -570,7 +619,9 @@ impl Transport for SshTransport {
                     })?;
 
                 // Calculate compression ratio
-                let literal_bytes: u64 = delta.ops.iter()
+                let literal_bytes: u64 = delta
+                    .ops
+                    .iter()
                     .filter_map(|op| {
                         if let DeltaOp::Data(data) = op {
                             Some(data.len() as u64)
@@ -596,11 +647,13 @@ impl Transport for SshTransport {
 
                 // Compress delta JSON (typically 5-10x reduction for JSON data)
                 let uncompressed_size = delta_json.len();
-                let compressed_delta = compress(delta_json.as_bytes(), Compression::Zstd)
-                    .map_err(|e| SyncError::Io(std::io::Error::other(format!(
-                        "Failed to compress delta: {}",
-                        e
-                    ))))?;
+                let compressed_delta =
+                    compress(delta_json.as_bytes(), Compression::Zstd).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to compress delta: {}",
+                            e
+                        )))
+                    })?;
                 let compressed_size = compressed_delta.len();
 
                 tracing::debug!(
@@ -617,13 +670,15 @@ impl Transport for SshTransport {
                 let temp_remote_path = format!("{}.sy-tmp", dest_path.display());
                 let command = format!(
                     "{} apply-delta {} {}",
-                    remote_binary,
-                    dest_path_str,
-                    temp_remote_path
+                    remote_binary, dest_path_str, temp_remote_path
                 );
 
                 let output = tokio::task::block_in_place(|| {
-                    Self::execute_command_with_stdin(Arc::clone(&session_arc), &command, &compressed_delta)
+                    Self::execute_command_with_stdin(
+                        Arc::clone(&session_arc),
+                        &command,
+                        &compressed_delta,
+                    )
                 })?;
 
                 #[derive(Deserialize)]
@@ -721,7 +776,10 @@ impl Transport for SshTransport {
                     let err_msg = e.to_string();
                     if err_msg.contains("No such file or directory") && attempt < max_retries - 1 {
                         // Source file not ready yet, wait and retry
-                        tracing::debug!("Hardlink source not ready (attempt {}), waiting...", attempt + 1);
+                        tracing::debug!(
+                            "Hardlink source not ready (attempt {}), waiting...",
+                            attempt + 1
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         last_error = Some(e);
                         continue;
@@ -732,7 +790,9 @@ impl Transport for SshTransport {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            SyncError::Io(std::io::Error::other("Failed to create hardlink after retries"))
+            SyncError::Io(std::io::Error::other(
+                "Failed to create hardlink after retries",
+            ))
         }))
     }
 
@@ -773,11 +833,17 @@ impl Transport for SshTransport {
 
         tokio::task::spawn_blocking(move || {
             let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to lock session: {}",
+                    e
+                )))
             })?;
 
             let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create SFTP session: {}",
+                    e
+                )))
             })?;
 
             // Open remote file for reading
@@ -797,7 +863,11 @@ impl Transport for SshTransport {
                 ))
             })?;
 
-            tracing::debug!("Read {} bytes from remote file {}", buffer.len(), path_buf.display());
+            tracing::debug!(
+                "Read {} bytes from remote file {}",
+                buffer.len(),
+                path_buf.display()
+            );
 
             Ok(buffer)
         })
@@ -811,11 +881,17 @@ impl Transport for SshTransport {
 
         tokio::task::spawn_blocking(move || {
             let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to lock session: {}",
+                    e
+                )))
             })?;
 
             let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create SFTP session: {}",
+                    e
+                )))
             })?;
 
             // Get file stats from remote
@@ -828,15 +904,19 @@ impl Transport for SshTransport {
 
             // Extract mtime
             let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Remote file {} has no mtime", path_buf.display()),
-                ))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Remote file {} has no mtime",
+                    path_buf.display()
+                )))
             })?;
 
             let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
 
-            tracing::debug!("Got mtime for remote file {}: {:?}", path_buf.display(), mtime_systime);
+            tracing::debug!(
+                "Got mtime for remote file {}: {:?}",
+                path_buf.display(),
+                mtime_systime
+            );
 
             Ok(mtime_systime)
         })
@@ -850,11 +930,17 @@ impl Transport for SshTransport {
 
         tokio::task::spawn_blocking(move || {
             let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to lock session: {}",
+                    e
+                )))
             })?;
 
             let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create SFTP session: {}",
+                    e
+                )))
             })?;
 
             // Get file stats from remote
@@ -868,15 +954,20 @@ impl Transport for SshTransport {
             // Extract size and mtime
             let size = stat.size.unwrap_or(0);
             let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Remote file {} has no mtime", path_buf.display()),
-                ))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Remote file {} has no mtime",
+                    path_buf.display()
+                )))
             })?;
 
             let modified = UNIX_EPOCH + Duration::from_secs(mtime);
 
-            tracing::debug!("Got file info for remote file {}: {} bytes, {:?}", path_buf.display(), size, modified);
+            tracing::debug!(
+                "Got file info for remote file {}: {} bytes, {:?}",
+                path_buf.display(),
+                size,
+                modified
+            );
 
             Ok(super::FileInfo { size, modified })
         })
@@ -896,11 +987,17 @@ impl Transport for SshTransport {
 
         tokio::task::spawn_blocking(move || {
             let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to lock session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to lock session: {}",
+                    e
+                )))
             })?;
 
             let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!("Failed to create SFTP session: {}", e)))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create SFTP session: {}",
+                    e
+                )))
             })?;
 
             // Get file stats for mtime and size
@@ -913,10 +1010,10 @@ impl Transport for SshTransport {
 
             let file_size = stat.size.unwrap_or(0);
             let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Remote file {} has no mtime", source_buf.display()),
-                ))
+                SyncError::Io(std::io::Error::other(format!(
+                    "Remote file {} has no mtime",
+                    source_buf.display()
+                )))
             })?;
 
             // Open remote file for streaming read
@@ -932,7 +1029,11 @@ impl Transport for SshTransport {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     SyncError::Io(std::io::Error::new(
                         e.kind(),
-                        format!("Failed to create parent directory {}: {}", parent.display(), e),
+                        format!(
+                            "Failed to create parent directory {}: {}",
+                            parent.display(),
+                            e
+                        ),
                     ))
                 })?;
             }
@@ -955,12 +1056,13 @@ impl Transport for SshTransport {
             }
 
             loop {
-                let bytes_read = std::io::Read::read(&mut remote_file, &mut buffer).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to read from remote {}: {}", source_buf.display(), e),
-                    ))
-                })?;
+                let bytes_read =
+                    std::io::Read::read(&mut remote_file, &mut buffer).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to read from remote {}: {}", source_buf.display(), e),
+                        ))
+                    })?;
 
                 if bytes_read == 0 {
                     break;
@@ -990,9 +1092,17 @@ impl Transport for SshTransport {
 
             // Set mtime
             let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
-            filetime::set_file_mtime(&dest_buf, filetime::FileTime::from_system_time(mtime_systime))?;
+            filetime::set_file_mtime(
+                &dest_buf,
+                filetime::FileTime::from_system_time(mtime_systime),
+            )?;
 
-            tracing::debug!("Streamed {} bytes from {} to {}", total_bytes, source_buf.display(), dest_buf.display());
+            tracing::debug!(
+                "Streamed {} bytes from {} to {}",
+                total_bytes,
+                source_buf.display(),
+                dest_buf.display()
+            );
 
             Ok(TransferResult::new(total_bytes))
         })

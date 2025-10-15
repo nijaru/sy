@@ -1,3 +1,4 @@
+#[allow(dead_code)] // Public API and hasher infrastructure
 use crate::error::Result;
 use std::fs::File;
 use std::io::Read;
@@ -6,6 +7,7 @@ use std::path::Path;
 /// Wrapper around BLAKE3 hasher
 pub struct Blake3Hasher;
 
+#[allow(dead_code)] // Public API with tested methods
 impl Blake3Hasher {
     /// Compute BLAKE3 hash of a file
     ///

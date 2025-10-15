@@ -120,7 +120,7 @@ fn get_available_space(path: &Path) -> Result<u64> {
     }
 
     // Available space = available blocks * block size
-    let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+    let available = stat.f_bavail as u64 * stat.f_frsize;
     Ok(available)
 }
 
@@ -193,7 +193,12 @@ mod tests {
         let result = check_disk_space(temp.path(), 1024 * 1024 * 1024 * 1024 * 1024);
         assert!(result.is_err());
 
-        if let Err(SyncError::InsufficientDiskSpace { path: _, required, available }) = result {
+        if let Err(SyncError::InsufficientDiskSpace {
+            path: _,
+            required,
+            available,
+        }) = result
+        {
             assert!(required > available);
         } else {
             panic!("Expected InsufficientDiskSpace error");
@@ -206,7 +211,11 @@ mod tests {
         let available = get_available_space(temp.path()).unwrap();
 
         // Should have at least 1MB free (conservative check)
-        assert!(available > 1024 * 1024, "Expected at least 1MB free, got {}", available);
+        assert!(
+            available > 1024 * 1024,
+            "Expected at least 1MB free, got {}",
+            available
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
 
                     // Encode xattrs to base64 for transport
                     let xattrs = e.xattrs.map(|xattrs_map| {
-                        use base64::{Engine as _, engine::general_purpose};
+                        use base64::{engine::general_purpose, Engine as _};
                         xattrs_map
                             .into_iter()
                             .map(|(key, value)| {
@@ -100,9 +100,9 @@ fn main() -> anyhow::Result<()> {
                     });
 
                     // Convert ACLs from bytes to string
-                    let acls = e.acls.and_then(|acl_bytes| {
-                        String::from_utf8(acl_bytes).ok()
-                    });
+                    let acls = e
+                        .acls
+                        .and_then(|acl_bytes| String::from_utf8(acl_bytes).ok());
 
                     FileEntryJson {
                         path: e.path.to_string_lossy().to_string(),
@@ -140,9 +140,12 @@ fn main() -> anyhow::Result<()> {
             std::io::stdin().read_to_end(&mut stdin_data)?;
 
             // Check if data is compressed (Zstd magic: 0x28, 0xB5, 0x2F, 0xFD)
-            let delta_json = if stdin_data.len() >= 4 &&
-                stdin_data[0] == 0x28 && stdin_data[1] == 0xB5 &&
-                stdin_data[2] == 0x2F && stdin_data[3] == 0xFD {
+            let delta_json = if stdin_data.len() >= 4
+                && stdin_data[0] == 0x28
+                && stdin_data[1] == 0xB5
+                && stdin_data[2] == 0x2F
+                && stdin_data[3] == 0xFD
+            {
                 // Decompress zstd data
                 let decompressed = decompress(&stdin_data, Compression::Zstd)?;
                 String::from_utf8(decompressed)
@@ -166,9 +169,12 @@ fn main() -> anyhow::Result<()> {
             std::io::stdin().read_to_end(&mut stdin_data)?;
 
             // Check if data is compressed (Zstd magic: 0x28, 0xB5, 0x2F, 0xFD)
-            let file_data = if stdin_data.len() >= 4 &&
-                stdin_data[0] == 0x28 && stdin_data[1] == 0xB5 &&
-                stdin_data[2] == 0x2F && stdin_data[3] == 0xFD {
+            let file_data = if stdin_data.len() >= 4
+                && stdin_data[0] == 0x28
+                && stdin_data[1] == 0xB5
+                && stdin_data[2] == 0x2F
+                && stdin_data[3] == 0xFD
+            {
                 // Decompress zstd data
                 decompress(&stdin_data, Compression::Zstd)?
             } else {

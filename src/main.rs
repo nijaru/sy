@@ -18,12 +18,12 @@ use cli::Cli;
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
-use hooks::{HookExecutor, HookContext, HookType};
+use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
-use sync::{SyncEngine, watch::WatchMode};
-use transport::router::TransportRouter;
-use tracing_subscriber::{fmt, EnvFilter};
 use std::time::Duration;
+use sync::{watch::WatchMode, SyncEngine};
+use tracing_subscriber::{fmt, EnvFilter};
+use transport::router::TransportRouter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,7 +62,8 @@ async fn main() -> Result<()> {
 
     // Merge profile with CLI args if --profile is set
     if let Some(ref profile_name) = cli.profile {
-        let profile = config.get_profile(profile_name)
+        let profile = config
+            .get_profile(profile_name)
             .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", profile_name))?;
 
         // Apply profile settings (CLI args take precedence)
@@ -93,14 +94,16 @@ async fn main() -> Result<()> {
             }
         }
         if let Some(parallel) = profile.parallel {
-            if cli.parallel == 10 {  // Default value
+            if cli.parallel == 10 {
+                // Default value
                 cli.parallel = parallel;
             }
         }
         if let Some(ref bwlimit_str) = profile.bwlimit {
             if cli.bwlimit.is_none() {
-                cli.bwlimit = Some(cli::parse_size(bwlimit_str)
-                    .map_err(|e| anyhow::anyhow!("Invalid bwlimit in profile '{}': {}", profile_name, e))?);
+                cli.bwlimit = Some(cli::parse_size(bwlimit_str).map_err(|e| {
+                    anyhow::anyhow!("Invalid bwlimit in profile '{}': {}", profile_name, e)
+                })?);
             }
         }
         if let Some(ref excludes) = profile.exclude {
@@ -130,8 +133,14 @@ async fn main() -> Result<()> {
     cli.validate()?;
 
     // After validation, source and destination must be present
-    let source = cli.source.as_ref().expect("source required after validation");
-    let destination = cli.destination.as_ref().expect("destination required after validation");
+    let source = cli
+        .source
+        .as_ref()
+        .expect("source required after validation");
+    let destination = cli
+        .destination
+        .as_ref()
+        .expect("destination required after validation");
 
     // Create hook executor (unless disabled)
     let hook_executor = if cli.no_hooks {
@@ -208,8 +217,13 @@ async fn main() -> Result<()> {
         let reader = BufReader::new(file);
 
         for (line_num, line) in reader.lines().enumerate() {
-            let line = line
-                .with_context(|| format!("Failed to read line {} from {}", line_num + 1, include_from.display()))?;
+            let line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from {}",
+                    line_num + 1,
+                    include_from.display()
+                )
+            })?;
             let line = line.trim();
 
             if line.is_empty() || line.starts_with('#') {
@@ -217,7 +231,12 @@ async fn main() -> Result<()> {
             }
 
             if let Err(e) = filter_engine.add_include(line) {
-                anyhow::bail!("Invalid include pattern at line {} in {}: {}", line_num + 1, include_from.display(), e);
+                anyhow::bail!(
+                    "Invalid include pattern at line {} in {}: {}",
+                    line_num + 1,
+                    include_from.display(),
+                    e
+                );
             }
         }
     }
@@ -233,8 +252,13 @@ async fn main() -> Result<()> {
         let reader = BufReader::new(file);
 
         for (line_num, line) in reader.lines().enumerate() {
-            let line = line
-                .with_context(|| format!("Failed to read line {} from {}", line_num + 1, exclude_from.display()))?;
+            let line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from {}",
+                    line_num + 1,
+                    exclude_from.display()
+                )
+            })?;
             let line = line.trim();
 
             if line.is_empty() || line.starts_with('#') {
@@ -242,7 +266,12 @@ async fn main() -> Result<()> {
             }
 
             if let Err(e) = filter_engine.add_exclude(line) {
-                anyhow::bail!("Invalid exclude pattern at line {} in {}: {}", line_num + 1, exclude_from.display(), e);
+                anyhow::bail!(
+                    "Invalid exclude pattern at line {} in {}: {}",
+                    line_num + 1,
+                    exclude_from.display(),
+                    e
+                );
             }
         }
     }
@@ -282,11 +311,12 @@ async fn main() -> Result<()> {
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,
+        cli.diff,
         cli.delete,
         cli.delete_threshold,
         cli.trash,
         cli.force_delete,
-        cli.quiet || cli.json,  // JSON mode implies quiet
+        cli.quiet || cli.json, // JSON mode implies quiet
         cli.parallel,
         cli.max_errors,
         cli.min_size,
@@ -352,9 +382,7 @@ async fn main() -> Result<()> {
             .sync_single_file(source.path(), destination.path())
             .await?
     } else {
-        engine
-            .sync(source.path(), destination.path())
-            .await?
+        engine.sync(source.path(), destination.path()).await?
     };
 
     // Execute post-sync hook
@@ -381,36 +409,101 @@ async fn main() -> Result<()> {
     // Print summary (skip if JSON mode - already emitted JSON summary)
     if !cli.quiet && !cli.json {
         if cli.dry_run {
-            println!("\n{}\n", "✓ Dry-run complete (no changes made)".green().bold());
+            println!(
+                "\n{}\n",
+                "✓ Dry-run complete (no changes made)".green().bold()
+            );
         } else {
             println!("\n{}\n", "✓ Sync complete".green().bold());
         }
 
         // File operations
-        println!("  Files scanned:     {}", stats.files_scanned.to_string().blue());
+        println!(
+            "  Files scanned:     {}",
+            stats.files_scanned.to_string().blue()
+        );
         if cli.dry_run {
-            println!("  Would create:      {}", stats.files_created.to_string().yellow());
-            println!("  Would update:      {}", stats.files_updated.to_string().yellow());
-            println!("  Would skip:        {}", stats.files_skipped.to_string().bright_black());
+            println!(
+                "  Would create:      {}",
+                stats.files_created.to_string().yellow()
+            );
+            println!(
+                "  Would update:      {}",
+                stats.files_updated.to_string().yellow()
+            );
+            println!(
+                "  Would skip:        {}",
+                stats.files_skipped.to_string().bright_black()
+            );
             if cli.delete {
-                println!("  Would delete:      {}", stats.files_deleted.to_string().red());
+                println!(
+                    "  Would delete:      {}",
+                    stats.files_deleted.to_string().red()
+                );
+            }
+
+            // Dry-run byte statistics
+            if stats.bytes_would_add > 0
+                || stats.bytes_would_change > 0
+                || stats.bytes_would_delete > 0
+            {
+                println!();
+                if stats.bytes_would_add > 0 {
+                    println!(
+                        "  Bytes to add:      {}",
+                        format_bytes(stats.bytes_would_add).yellow()
+                    );
+                }
+                if stats.bytes_would_change > 0 {
+                    println!(
+                        "  Bytes to change:   {}",
+                        format_bytes(stats.bytes_would_change).yellow()
+                    );
+                }
+                if stats.bytes_would_delete > 0 && cli.delete {
+                    println!(
+                        "  Bytes to delete:   {}",
+                        format_bytes(stats.bytes_would_delete).red()
+                    );
+                }
             }
         } else {
             if stats.files_created > 0 {
-                println!("  Files created:     {}", stats.files_created.to_string().green());
+                println!(
+                    "  Files created:     {}",
+                    stats.files_created.to_string().green()
+                );
             } else {
-                println!("  Files created:     {}", stats.files_created.to_string().bright_black());
+                println!(
+                    "  Files created:     {}",
+                    stats.files_created.to_string().bright_black()
+                );
             }
             if stats.files_updated > 0 {
-                println!("  Files updated:     {}", stats.files_updated.to_string().yellow());
+                println!(
+                    "  Files updated:     {}",
+                    stats.files_updated.to_string().yellow()
+                );
             } else {
-                println!("  Files updated:     {}", stats.files_updated.to_string().bright_black());
+                println!(
+                    "  Files updated:     {}",
+                    stats.files_updated.to_string().bright_black()
+                );
             }
-            println!("  Files skipped:     {}", stats.files_skipped.to_string().bright_black());
+            println!(
+                "  Files skipped:     {}",
+                stats.files_skipped.to_string().bright_black()
+            );
             if cli.delete && stats.files_deleted > 0 {
-                println!("  Files deleted:     {}", stats.files_deleted.to_string().red());
+                println!(
+                    "  Files deleted:     {}",
+                    stats.files_deleted.to_string().red()
+                );
             } else if cli.delete {
-                println!("  Files deleted:     {}", stats.files_deleted.to_string().bright_black());
+                println!(
+                    "  Files deleted:     {}",
+                    stats.files_deleted.to_string().bright_black()
+                );
             }
         }
 
@@ -425,10 +518,16 @@ async fn main() -> Result<()> {
         let duration_secs = stats.duration.as_secs_f64();
         if duration_secs > 0.0 && stats.bytes_transferred > 0 {
             let bytes_per_sec = stats.bytes_transferred as f64 / duration_secs;
-            println!("  Transfer rate:     {}", format!("{}/s", format_bytes(bytes_per_sec as u64)).cyan());
+            println!(
+                "  Transfer rate:     {}",
+                format!("{}/s", format_bytes(bytes_per_sec as u64)).cyan()
+            );
         }
 
-        println!("  Duration:          {}", format_duration(stats.duration).cyan());
+        println!(
+            "  Duration:          {}",
+            format_duration(stats.duration).cyan()
+        );
 
         // Delta sync stats (if used)
         if stats.files_delta_synced > 0 {
@@ -472,7 +571,8 @@ async fn main() -> Result<()> {
                         cli::VerificationMode::Verify => "BLAKE3",
                         cli::VerificationMode::Paranoid => "BLAKE3+blocks",
                         cli::VerificationMode::Fast => unreachable!(),
-                    }.bright_black()
+                    }
+                    .bright_black()
                 );
             }
         }

@@ -342,7 +342,10 @@ Host example
         assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(parse_duration("10m"), Some(Duration::from_secs(600)));
         assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_duration("yes"), Some(Duration::from_secs(365 * 24 * 60 * 60)));
+        assert_eq!(
+            parse_duration("yes"),
+            Some(Duration::from_secs(365 * 24 * 60 * 60))
+        );
         assert_eq!(parse_duration("no"), None);
     }
 

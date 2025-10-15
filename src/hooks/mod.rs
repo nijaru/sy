@@ -40,20 +40,45 @@ impl HookContext {
         let mut vars = HashMap::new();
         vars.insert("SY_SOURCE".to_string(), self.source.clone());
         vars.insert("SY_DESTINATION".to_string(), self.destination.clone());
-        vars.insert("SY_FILES_SCANNED".to_string(), self.files_scanned.to_string());
-        vars.insert("SY_FILES_CREATED".to_string(), self.files_created.to_string());
-        vars.insert("SY_FILES_UPDATED".to_string(), self.files_updated.to_string());
-        vars.insert("SY_FILES_DELETED".to_string(), self.files_deleted.to_string());
-        vars.insert("SY_FILES_SKIPPED".to_string(), self.files_skipped.to_string());
-        vars.insert("SY_BYTES_TRANSFERRED".to_string(), self.bytes_transferred.to_string());
-        vars.insert("SY_DURATION_SECS".to_string(), self.duration_secs.to_string());
-        vars.insert("SY_DRY_RUN".to_string(), if self.dry_run { "1" } else { "0" }.to_string());
+        vars.insert(
+            "SY_FILES_SCANNED".to_string(),
+            self.files_scanned.to_string(),
+        );
+        vars.insert(
+            "SY_FILES_CREATED".to_string(),
+            self.files_created.to_string(),
+        );
+        vars.insert(
+            "SY_FILES_UPDATED".to_string(),
+            self.files_updated.to_string(),
+        );
+        vars.insert(
+            "SY_FILES_DELETED".to_string(),
+            self.files_deleted.to_string(),
+        );
+        vars.insert(
+            "SY_FILES_SKIPPED".to_string(),
+            self.files_skipped.to_string(),
+        );
+        vars.insert(
+            "SY_BYTES_TRANSFERRED".to_string(),
+            self.bytes_transferred.to_string(),
+        );
+        vars.insert(
+            "SY_DURATION_SECS".to_string(),
+            self.duration_secs.to_string(),
+        );
+        vars.insert(
+            "SY_DRY_RUN".to_string(),
+            if self.dry_run { "1" } else { "0" }.to_string(),
+        );
         vars
     }
 }
 
 /// Hook execution result
 #[derive(Debug)]
+#[allow(dead_code)] // Public API for hook execution results
 pub struct HookResult {
     pub hook_type: HookType,
     pub path: PathBuf,
@@ -86,8 +111,9 @@ impl HookExecutor {
 
     fn default_hooks_dir() -> Result<PathBuf> {
         // Use XDG_CONFIG_HOME or fallback to ~/.config
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| crate::error::SyncError::Config("Could not determine config directory".to_string()))?;
+        let config_dir = dirs::config_dir().ok_or_else(|| {
+            crate::error::SyncError::Config("Could not determine config directory".to_string())
+        })?;
         Ok(config_dir.join("sy").join("hooks"))
     }
 
@@ -132,11 +158,19 @@ impl HookExecutor {
     }
 
     /// Execute a hook with given context
-    pub fn execute(&self, hook_type: HookType, context: &HookContext) -> Result<Option<HookResult>> {
+    pub fn execute(
+        &self,
+        hook_type: HookType,
+        context: &HookContext,
+    ) -> Result<Option<HookResult>> {
         let hook_path = match self.find_hook(hook_type) {
             Some(path) => path,
             None => {
-                tracing::debug!("No {:?} hook found in {}", hook_type, self.hooks_dir.display());
+                tracing::debug!(
+                    "No {:?} hook found in {}",
+                    hook_type,
+                    self.hooks_dir.display()
+                );
                 return Ok(None);
             }
         };
@@ -201,7 +235,11 @@ impl HookExecutor {
                 )));
             }
         } else {
-            tracing::info!("Hook {:?} completed successfully in {:?}", hook_type, duration);
+            tracing::info!(
+                "Hook {:?} completed successfully in {:?}",
+                hook_type,
+                duration
+            );
 
             if !stdout.is_empty() {
                 tracing::debug!("Hook stdout: {}", stdout);
@@ -232,8 +270,8 @@ impl Default for HookExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_hook_context_env_vars() {

@@ -30,6 +30,7 @@ pub enum Checksum {
     Cryptographic(Vec<u8>),
 }
 
+#[allow(dead_code)] // Public API for checksum operations
 impl Checksum {
     /// Create a None checksum
     pub fn none() -> Self {
@@ -71,9 +72,11 @@ impl Checksum {
 /// Integrity verifier for file transfers
 pub struct IntegrityVerifier {
     checksum_type: ChecksumType,
+    #[allow(dead_code)] // Field for future paranoid mode implementation
     verify_on_write: bool,
 }
 
+#[allow(dead_code)] // Public API for integrity verification
 impl IntegrityVerifier {
     /// Create a new integrity verifier
     pub fn new(checksum_type: ChecksumType, verify_on_write: bool) -> Self {

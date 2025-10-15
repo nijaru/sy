@@ -1,10 +1,11 @@
+pub mod output;
+mod ratelimit;
+pub mod resume;
+pub mod scale;
 pub mod scanner;
 pub mod strategy;
 pub mod transfer;
-pub mod resume;
-pub mod output;
 pub mod watch;
-mod ratelimit;
 
 use crate::cli::SymlinkMode;
 use crate::error::Result;
@@ -13,9 +14,9 @@ use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::resource;
 use crate::transport::Transport;
 use indicatif::{ProgressBar, ProgressStyle};
-use resume::{ResumeState, SyncFlags};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
+use resume::{ResumeState, SyncFlags};
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,13 +40,19 @@ pub struct SyncStats {
     pub files_verified: usize,
     pub verification_failures: usize,
     pub duration: Duration,
+    // Dry-run statistics
+    pub bytes_would_add: u64,
+    pub bytes_would_change: u64,
+    pub bytes_would_delete: u64,
 }
 
 pub struct SyncEngine<T: Transport> {
     transport: Arc<T>,
     dry_run: bool,
+    diff_mode: bool,
     delete: bool,
     delete_threshold: u8,
+    #[allow(dead_code)] // Planned feature: trash/recycle bin support
     trash: bool,
     force_delete: bool,
     quiet: bool,
@@ -75,6 +82,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
     pub fn new(
         transport: T,
         dry_run: bool,
+        diff_mode: bool,
         delete: bool,
         delete_threshold: u8,
         trash: bool,
@@ -103,6 +111,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         Self {
             transport: Arc::new(transport),
             dry_run,
+            diff_mode,
             delete,
             delete_threshold,
             trash,
@@ -173,7 +182,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 // Check if this file is inside an excluded directory
                 for excluded_dir in &excluded_dirs {
                     if file.relative_path.starts_with(excluded_dir) {
-                        tracing::debug!("Filtering out (parent excluded): {}", file.relative_path.display());
+                        tracing::debug!(
+                            "Filtering out (parent excluded): {}",
+                            file.relative_path.display()
+                        );
                         return false;
                     }
                 }
@@ -218,9 +230,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 .sum();
 
             // Check disk space
-            if let Err(e) = resource::check_disk_space(destination, bytes_needed) {
-                return Err(e);
-            }
+            resource::check_disk_space(destination, bytes_needed)?;
 
             // Check FD limits
             resource::check_fd_limits(self.max_concurrent)?;
@@ -239,9 +249,16 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 Some(state) => {
                     if state.is_compatible_with(&current_flags) {
                         let (completed, total) = state.progress();
-                        tracing::info!("Resuming sync: {} of {} files already completed", completed, total);
+                        tracing::info!(
+                            "Resuming sync: {} of {} files already completed",
+                            completed,
+                            total
+                        );
                         if !self.quiet {
-                            println!("📋 Resuming previous sync ({}/{} files completed)", completed, total);
+                            println!(
+                                "📋 Resuming previous sync ({}/{} files completed)",
+                                completed, total
+                            );
                         }
                         Some(state)
                     } else {
@@ -312,7 +329,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                 // Check threshold: prevent mass deletion
                 if dest_file_count > 0 {
-                    let delete_percentage = (deletions.len() as f64 / dest_file_count as f64) * 100.0;
+                    let delete_percentage =
+                        (deletions.len() as f64 / dest_file_count as f64) * 100.0;
 
                     if delete_percentage > self.delete_threshold as f64 {
                         tracing::error!(
@@ -333,9 +351,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             eprintln!("Use --force-delete to skip safety checks (dangerous!)");
                         }
 
-                        return Err(crate::error::SyncError::Io(std::io::Error::other(
-                            format!("Deletion threshold exceeded: {:.1}% > {}%", delete_percentage, self.delete_threshold)
-                        )));
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                            "Deletion threshold exceeded: {:.1}% > {}%",
+                            delete_percentage, self.delete_threshold
+                        ))));
                     }
                 }
 
@@ -351,7 +370,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                     if !input.trim().eq_ignore_ascii_case("y") {
                         tracing::info!("Deletion cancelled by user");
-                        return Err(crate::error::SyncError::Io(std::io::Error::other("Deletion cancelled by user")));
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Deletion cancelled by user",
+                        )));
                     }
                 }
             }
@@ -365,7 +386,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 source: source.to_path_buf(),
                 destination: destination.to_path_buf(),
                 total_files: tasks.len(),
-            }.emit();
+            }
+            .emit();
         }
 
         // Wrap resume state for thread-safe access
@@ -389,6 +411,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             files_verified: 0,
             verification_failures: 0,
             duration: Duration::ZERO,
+            bytes_would_add: 0,
+            bytes_would_change: 0,
+            bytes_would_delete: 0,
         }));
 
         // Create progress bar (only if not quiet)
@@ -407,7 +432,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         };
 
         // Create rate limiter if bandwidth limit is set
-        let rate_limiter = self.bwlimit.map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
+        let rate_limiter = self
+            .bwlimit
+            .map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
 
         // Create hardlink map for tracking inodes (shared across all parallel transfers)
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -419,6 +446,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         for task in tasks {
             let transport = Arc::clone(&self.transport);
             let dry_run = self.dry_run;
+            let diff_mode = self.diff_mode;
             let json = self.json;
             let stats = Arc::clone(&stats);
             let pb = pb.clone();
@@ -438,6 +466,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let transferrer = Transferrer::new(
                     transport.as_ref(),
                     dry_run,
+                    diff_mode,
                     symlink_mode,
                     preserve_xattrs,
                     preserve_hardlinks,
@@ -475,14 +504,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         stats.bytes_transferred += bytes_written;
                                         stats.files_created += 1;
 
+                                        // In dry-run mode, track bytes that would be added
+                                        if dry_run && !source.is_dir {
+                                            stats.bytes_would_add += source.size;
+                                        }
+
                                         // Track compression usage and savings
                                         if let Some(ref result) = transfer_result {
                                             if result.compression_used {
                                                 stats.files_compressed += 1;
 
                                                 // Calculate bytes saved (uncompressed - compressed)
-                                                if let Some(transferred) = result.transferred_bytes {
-                                                    let bytes_saved = result.bytes_written.saturating_sub(transferred);
+                                                if let Some(transferred) = result.transferred_bytes
+                                                {
+                                                    let bytes_saved = result
+                                                        .bytes_written
+                                                        .saturating_sub(transferred);
                                                     stats.compression_bytes_saved += bytes_saved;
                                                 }
                                             }
@@ -492,7 +529,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     // Apply rate limiting if enabled (outside stats lock)
                                     if let Some(ref limiter) = rate_limiter {
                                         if bytes_written > 0 {
-                                            let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
+                                            let sleep_duration =
+                                                limiter.lock().unwrap().consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
                                             }
@@ -535,7 +573,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             path: task.dest_path.clone(),
                                             size: source.size,
                                             bytes_transferred: bytes_written,
-                                        }.emit();
+                                        }
+                                        .emit();
                                     }
 
                                     Ok(())
@@ -567,7 +606,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                                 // Calculate bytes saved (full file size - literal bytes)
                                                 if let Some(literal_bytes) = result.literal_bytes {
-                                                    let bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                                                    let bytes_saved = result
+                                                        .bytes_written
+                                                        .saturating_sub(literal_bytes);
                                                     stats.delta_bytes_saved += bytes_saved;
                                                 }
 
@@ -585,19 +626,28 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                                 stats.files_compressed += 1;
 
                                                 // Calculate bytes saved (uncompressed - compressed)
-                                                if let Some(transferred) = result.transferred_bytes {
-                                                    let bytes_saved = result.bytes_written.saturating_sub(transferred);
+                                                if let Some(transferred) = result.transferred_bytes
+                                                {
+                                                    let bytes_saved = result
+                                                        .bytes_written
+                                                        .saturating_sub(transferred);
                                                     stats.compression_bytes_saved += bytes_saved;
                                                 }
                                             }
                                         }
                                         stats.files_updated += 1;
+
+                                        // In dry-run mode, track bytes that would be changed
+                                        if dry_run && !source.is_dir {
+                                            stats.bytes_would_change += source.size;
+                                        }
                                     }
 
                                     // Apply rate limiting if enabled (outside stats lock)
                                     if let Some(ref limiter) = rate_limiter {
                                         if bytes_written > 0 {
-                                            let sleep_duration = limiter.lock().unwrap().consume(bytes_written);
+                                            let sleep_duration =
+                                                limiter.lock().unwrap().consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
                                             }
@@ -636,7 +686,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                     // Emit JSON event if enabled
                                     if json {
-                                        let delta_used = transfer_result.as_ref()
+                                        let delta_used = transfer_result
+                                            .as_ref()
                                             .map(|r| r.used_delta())
                                             .unwrap_or(false);
                                         SyncEvent::Update {
@@ -644,7 +695,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             size: source.size,
                                             bytes_transferred: bytes_written,
                                             delta_used,
-                                        }.emit();
+                                        }
+                                        .emit();
                                     }
 
                                     Ok(())
@@ -666,13 +718,23 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             SyncEvent::Skip {
                                 path: task.dest_path.clone(),
                                 reason: "up_to_date".to_string(),
-                            }.emit();
+                            }
+                            .emit();
                         }
 
                         Ok(())
                     }
                     SyncAction::Delete => {
                         let is_dir = task.dest_path.is_dir();
+
+                        // In dry-run mode, track bytes that would be deleted
+                        if dry_run && !is_dir {
+                            if let Ok(metadata) = std::fs::metadata(&task.dest_path) {
+                                let mut stats = stats.lock().unwrap();
+                                stats.bytes_would_delete += metadata.len();
+                            }
+                        }
+
                         match transferrer.delete(&task.dest_path, is_dir).await {
                             Ok(_) => {
                                 {
@@ -684,7 +746,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                 if json {
                                     SyncEvent::Delete {
                                         path: task.dest_path.clone(),
-                                    }.emit();
+                                    }
+                                    .emit();
                                 }
 
                                 Ok(())
@@ -733,21 +796,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         if !self.quiet {
                             eprintln!(
                                 "⚠️  ERROR: {} errors occurred (threshold: {}). Aborting sync.",
-                                error_count,
-                                self.max_errors
+                                error_count, self.max_errors
                             );
                         }
 
                         pb.finish_with_message("Sync aborted due to errors");
 
-                        return Err(crate::error::SyncError::Io(std::io::Error::other(
-                            format!(
-                                "Error threshold exceeded: {} errors (max: {}). First error: {}",
-                                error_count,
-                                self.max_errors,
-                                first_error.unwrap_or_else(|| "Unknown".to_string())
-                            )
-                        )));
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                            "Error threshold exceeded: {} errors (max: {}). First error: {}",
+                            error_count,
+                            self.max_errors,
+                            first_error.unwrap_or_else(|| "Unknown".to_string())
+                        ))));
                     }
                 }
                 Err(e) => {
@@ -771,21 +831,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         if !self.quiet {
                             eprintln!(
                                 "⚠️  ERROR: {} errors occurred (threshold: {}). Aborting sync.",
-                                error_count,
-                                self.max_errors
+                                error_count, self.max_errors
                             );
                         }
 
                         pb.finish_with_message("Sync aborted due to errors");
 
-                        return Err(crate::error::SyncError::Io(std::io::Error::other(
-                            format!(
-                                "Error threshold exceeded: {} errors (max: {}). First error: {}",
-                                error_count,
-                                self.max_errors,
-                                first_error.unwrap_or_else(|| "Unknown".to_string())
-                            )
-                        )));
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                            "Error threshold exceeded: {} errors (max: {}). First error: {}",
+                            error_count,
+                            self.max_errors,
+                            first_error.unwrap_or_else(|| "Unknown".to_string())
+                        ))));
                     }
                 }
             }
@@ -825,12 +882,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 duration_secs: final_stats.duration.as_secs_f64(),
                 files_verified: final_stats.files_verified,
                 verification_failures: final_stats.verification_failures,
-            }.emit();
+            }
+            .emit();
         }
 
         // Clean up resume state on successful completion
         if let Ok(mut state_guard) = resume_state.lock() {
-            if let Some(_) = *state_guard {
+            if state_guard.is_some() {
                 // Only clean up if this was an actual resume operation
                 // (Don't clean up if we just created a new state that was never saved)
                 if ResumeState::load(destination)?.is_some() {
@@ -872,6 +930,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             files_verified: 0,
             verification_failures: 0,
             duration: Duration::ZERO,
+            bytes_would_add: 0,
+            bytes_would_change: 0,
+            bytes_would_delete: 0,
         };
 
         // Check if destination exists
@@ -883,6 +944,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let transferrer = Transferrer::new(
             self.transport.as_ref(),
             self.dry_run,
+            self.diff_mode,
             self.symlink_mode,
             self.preserve_xattrs,
             self.preserve_hardlinks,
@@ -894,33 +956,44 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Create new file
             tracing::info!("Creating {}", destination.display());
             let metadata = source.metadata()?;
-            let filename = source.file_name()
-                .ok_or_else(|| crate::error::SyncError::Io(std::io::Error::other(
-                    format!("Invalid source path: {}", source.display())
-                )))?
+            let filename = source
+                .file_name()
+                .ok_or_else(|| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid source path: {}",
+                        source.display()
+                    )))
+                })?
                 .to_owned();
-            if let Some(result) = transferrer.create(&FileEntry {
-                path: source.to_path_buf(),
-                relative_path: PathBuf::from(filename),
-                size: metadata.len(),
-                modified: metadata.modified()?,
-                is_dir: false,
-                is_symlink: false,
-                symlink_target: None,
-                is_sparse: false,
-                allocated_size: metadata.len(),
-                xattrs: None,
-                inode: None,
-                nlink: 1,
-                acls: None,
-            }, destination).await? {
+            if let Some(result) = transferrer
+                .create(
+                    &FileEntry {
+                        path: source.to_path_buf(),
+                        relative_path: PathBuf::from(filename),
+                        size: metadata.len(),
+                        modified: metadata.modified()?,
+                        is_dir: false,
+                        is_symlink: false,
+                        symlink_target: None,
+                        is_sparse: false,
+                        allocated_size: metadata.len(),
+                        xattrs: None,
+                        inode: None,
+                        nlink: 1,
+                        acls: None,
+                    },
+                    destination,
+                )
+                .await?
+            {
                 stats.bytes_transferred = result.bytes_written;
 
                 // Track compression if used
                 if result.compression_used {
                     stats.files_compressed = 1;
                     if let Some(transferred) = result.transferred_bytes {
-                        stats.compression_bytes_saved = result.bytes_written.saturating_sub(transferred);
+                        stats.compression_bytes_saved =
+                            result.bytes_written.saturating_sub(transferred);
                     }
                 }
             }
@@ -942,11 +1015,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Verification error for {}: {}",
-                            destination.display(),
-                            e
-                        );
+                        tracing::warn!("Verification error for {}: {}", destination.display(), e);
                         stats.verification_failures = 1;
                     }
                 }
@@ -955,33 +1024,44 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Update existing file
             tracing::info!("Updating {}", destination.display());
             let metadata = source.metadata()?;
-            let filename = source.file_name()
-                .ok_or_else(|| crate::error::SyncError::Io(std::io::Error::other(
-                    format!("Invalid source path: {}", source.display())
-                )))?
+            let filename = source
+                .file_name()
+                .ok_or_else(|| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid source path: {}",
+                        source.display()
+                    )))
+                })?
                 .to_owned();
-            if let Some(result) = transferrer.update(&FileEntry {
-                path: source.to_path_buf(),
-                relative_path: PathBuf::from(filename),
-                size: metadata.len(),
-                modified: metadata.modified()?,
-                is_dir: false,
-                is_symlink: false,
-                symlink_target: None,
-                is_sparse: false,
-                allocated_size: metadata.len(),
-                xattrs: None,
-                inode: None,
-                nlink: 1,
-                acls: None,
-            }, destination).await? {
+            if let Some(result) = transferrer
+                .update(
+                    &FileEntry {
+                        path: source.to_path_buf(),
+                        relative_path: PathBuf::from(filename),
+                        size: metadata.len(),
+                        modified: metadata.modified()?,
+                        is_dir: false,
+                        is_symlink: false,
+                        symlink_target: None,
+                        is_sparse: false,
+                        allocated_size: metadata.len(),
+                        xattrs: None,
+                        inode: None,
+                        nlink: 1,
+                        acls: None,
+                    },
+                    destination,
+                )
+                .await?
+            {
                 stats.bytes_transferred = result.bytes_written;
 
                 // Track delta sync if used
                 if result.used_delta() {
                     stats.files_delta_synced = 1;
                     if let Some(literal_bytes) = result.literal_bytes {
-                        stats.delta_bytes_saved = result.bytes_written.saturating_sub(literal_bytes);
+                        stats.delta_bytes_saved =
+                            result.bytes_written.saturating_sub(literal_bytes);
                     }
                 }
 
@@ -989,7 +1069,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 if result.compression_used {
                     stats.files_compressed = 1;
                     if let Some(transferred) = result.transferred_bytes {
-                        stats.compression_bytes_saved = result.bytes_written.saturating_sub(transferred);
+                        stats.compression_bytes_saved =
+                            result.bytes_written.saturating_sub(transferred);
                     }
                 }
             }
@@ -1011,11 +1092,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Verification error for {}: {}",
-                            destination.display(),
-                            e
-                        );
+                        tracing::warn!("Verification error for {}: {}", destination.display(), e);
                         stats.verification_failures = 1;
                     }
                 }
@@ -1039,22 +1116,23 @@ mod tests {
         let transport = LocalTransport::new();
         SyncEngine::new(
             transport,
-            false, // dry_run
-            false, // delete
-            50, // delete_threshold
-            false, // trash
-            false, // force_delete
-            true,  // quiet
-            4,     // max_concurrent
-            100,   // max_errors
-            None,  // min_size
-            None,  // max_size
+            false,               // dry_run
+            false,               // diff_mode
+            false,               // delete
+            50,                  // delete_threshold
+            false,               // trash
+            false,               // force_delete
+            true,                // quiet
+            4,                   // max_concurrent
+            100,                 // max_errors
+            None,                // min_size
+            None,                // max_size
             FilterEngine::new(), // filter_engine
-            None,  // bwlimit
-            false, // resume
-            0,     // checkpoint_files
-            0,     // checkpoint_bytes
-            false, // json
+            None,                // bwlimit
+            false,               // resume
+            0,                   // checkpoint_files
+            0,                   // checkpoint_bytes
+            false,               // json
             ChecksumType::Fast,
             false, // verify_on_write
             SymlinkMode::Preserve,
@@ -1077,12 +1155,18 @@ mod tests {
         fs::write(source_dir.path().join("file2.txt"), "content2").unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_created, 2);
         assert!(dest_dir.path().join("file1.txt").exists());
         assert!(dest_dir.path().join("file2.txt").exists());
-        assert_eq!(fs::read_to_string(dest_dir.path().join("file1.txt")).unwrap(), "content1");
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("file1.txt")).unwrap(),
+            "content1"
+        );
     }
 
     #[tokio::test]
@@ -1095,11 +1179,17 @@ mod tests {
         fs::write(source_dir.path().join("subdir/file.txt"), "nested").unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert!(stats.files_created >= 1);
         assert!(dest_dir.path().join("subdir/file.txt").exists());
-        assert_eq!(fs::read_to_string(dest_dir.path().join("subdir/file.txt")).unwrap(), "nested");
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("subdir/file.txt")).unwrap(),
+            "nested"
+        );
     }
 
     #[tokio::test]
@@ -1108,7 +1198,10 @@ mod tests {
         let dest_dir = TempDir::new().unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_created, 0);
         assert_eq!(stats.files_scanned, 0);
@@ -1124,22 +1217,23 @@ mod tests {
         let transport = LocalTransport::new();
         let engine = SyncEngine::new(
             transport,
-            true,  // dry_run = true
-            false, // delete
-            50, // delete_threshold
-            false, // trash
-            false, // force_delete
-            true,  // quiet
-            4,     // max_concurrent
-            100,   // max_errors
-            None,  // min_size
-            None,  // max_size
+            true,                // dry_run = true
+            false,               // diff_mode
+            false,               // delete
+            50,                  // delete_threshold
+            false,               // trash
+            false,               // force_delete
+            true,                // quiet
+            4,                   // max_concurrent
+            100,                 // max_errors
+            None,                // min_size
+            None,                // max_size
             FilterEngine::new(), // filter_engine
-            None,  // bwlimit
-            false, // resume
-            0,     // checkpoint_files
-            0,     // checkpoint_bytes
-            false, // json
+            None,                // bwlimit
+            false,               // resume
+            0,                   // checkpoint_files
+            0,                   // checkpoint_bytes
+            false,               // json
             ChecksumType::Fast,
             false, // verify_on_write
             SymlinkMode::Preserve,
@@ -1151,7 +1245,10 @@ mod tests {
             false, // checksum
         );
 
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         // Dry run should scan but not create files
         assert_eq!(stats.files_scanned, 1);
@@ -1264,7 +1361,7 @@ mod tests {
         // Scan
         let scanner = scanner::Scanner::new(source_dir.path());
         let source_files = scanner.scan().unwrap();
-        assert!(source_files.len() >= 1);
+        assert!(!source_files.is_empty());
 
         // Delete directory after scan
         fs::remove_dir_all(&subdir).unwrap();
@@ -1297,7 +1394,10 @@ mod tests {
 
         // Sync - should get file1 (file2 created after scan won't be included)
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         // Should transfer the files that existed at scan time
         assert!(stats.files_created >= 1);
@@ -1315,11 +1415,15 @@ mod tests {
             fs::write(
                 source_dir.path().join(format!("file{}.txt", i)),
                 format!("content{}", i),
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_created, 100);
 
@@ -1343,7 +1447,10 @@ mod tests {
         fs::write(path.join("deep.txt"), "very deep content").unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert!(stats.files_created >= 1);
 
@@ -1367,7 +1474,10 @@ mod tests {
         fs::write(source_dir.path().join("large.bin"), &large_content).unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_created, 1);
         assert!(stats.bytes_transferred >= 10 * 1024 * 1024);
@@ -1389,7 +1499,10 @@ mod tests {
         fs::write(source_dir.path().join("large.txt"), "x".repeat(1024 * 1024)).unwrap();
 
         let engine = create_test_engine();
-        let stats = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_created, 4);
         assert!(dest_dir.path().join("tiny.txt").exists());
@@ -1408,11 +1521,17 @@ mod tests {
         let engine = create_test_engine();
 
         // First sync
-        let stats1 = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats1 = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
         assert_eq!(stats1.files_created, 1);
 
         // Second sync - should skip unchanged file
-        let stats2 = engine.sync(source_dir.path(), dest_dir.path()).await.unwrap();
+        let stats2 = engine
+            .sync(source_dir.path(), dest_dir.path())
+            .await
+            .unwrap();
         assert_eq!(stats2.files_skipped, 1);
         assert_eq!(stats2.files_created, 0);
     }

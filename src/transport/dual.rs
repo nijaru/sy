@@ -1,4 +1,4 @@
-use super::{Transport, TransferResult};
+use super::{TransferResult, Transport};
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
@@ -55,7 +55,11 @@ impl Transport for DualTransport {
         // The destination transport (e.g., SshTransport) knows how to copy
         // from a local source path to its destination (local or remote)
 
-        tracing::debug!("DualTransport: copying {} to {}", source.display(), dest.display());
+        tracing::debug!(
+            "DualTransport: copying {} to {}",
+            source.display(),
+            dest.display()
+        );
 
         // Delegate to destination transport which handles the cross-transport copy
         // For local→remote: dest is SshTransport which reads from local source and writes remote
@@ -93,9 +97,7 @@ impl Transport for DualTransport {
                 // Try source transport's delta sync as fallback
                 match self.source.sync_file_with_delta(source, dest).await {
                     Ok(result) => {
-                        tracing::debug!(
-                            "DualTransport: delta sync succeeded via source transport"
-                        );
+                        tracing::debug!("DualTransport: delta sync succeeded via source transport");
                         Ok(result)
                     }
                     Err(e2) => {

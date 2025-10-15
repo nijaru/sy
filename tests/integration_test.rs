@@ -263,11 +263,17 @@ async fn test_single_file_sync() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stdout: {}, stderr: {}",
+    assert!(
+        output.status.success(),
+        "stdout: {}, stderr: {}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(dest_file.exists());
-    assert_eq!(fs::read_to_string(&dest_file).unwrap(), "test content for single file");
+    assert_eq!(
+        fs::read_to_string(&dest_file).unwrap(),
+        "test content for single file"
+    );
 }
 
 #[test]

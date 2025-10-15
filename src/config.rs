@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    #[allow(dead_code)] // Config infrastructure for future use
     pub defaults: Defaults,
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
@@ -13,7 +14,9 @@ pub struct Config {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Defaults {
+    #[allow(dead_code)] // Global default for future use
     pub parallel: Option<usize>,
+    #[allow(dead_code)] // Global default for future use
     pub exclude: Option<Vec<String>>,
 }
 
@@ -72,7 +75,8 @@ impl Config {
     /// Show profile details in human-readable format
     pub fn show_profile(&self, name: &str) -> Option<String> {
         self.get_profile(name).map(|profile| {
-            let toml = toml::to_string_pretty(profile).unwrap_or_else(|_| "Error serializing profile".to_string());
+            let toml = toml::to_string_pretty(profile)
+                .unwrap_or_else(|_| "Error serializing profile".to_string());
             format!("[profiles.{}]\n{}", name, toml)
         })
     }
@@ -108,7 +112,10 @@ resume = true
         let config: Config = toml::from_str(toml).unwrap();
 
         assert_eq!(config.defaults.parallel, Some(20));
-        assert_eq!(config.defaults.exclude, Some(vec!["*.tmp".to_string(), ".DS_Store".to_string()]));
+        assert_eq!(
+            config.defaults.exclude,
+            Some(vec!["*.tmp".to_string(), ".DS_Store".to_string()])
+        );
 
         let profile = config.get_profile("test-profile").unwrap();
         assert_eq!(profile.source, Some("~/src".to_string()));
@@ -213,7 +220,10 @@ verbose = 2
         assert_eq!(profile.source, Some("~/src".to_string()));
         assert_eq!(profile.destination, Some("~/dst".to_string()));
         assert_eq!(profile.delete, Some(true));
-        assert_eq!(profile.exclude, Some(vec!["*.log".to_string(), "*.tmp".to_string()]));
+        assert_eq!(
+            profile.exclude,
+            Some(vec!["*.log".to_string(), "*.tmp".to_string()])
+        );
         assert_eq!(profile.bwlimit, Some("10MB".to_string()));
         assert_eq!(profile.resume, Some(false));
         assert_eq!(profile.min_size, Some("1KB".to_string()));

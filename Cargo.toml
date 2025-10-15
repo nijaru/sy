@@ -55,6 +55,10 @@ lz4_flex = "0.11"  # 23 GB/s, faster but lower ratio
 
 # Parallel processing
 rayon = "1.10"
+num_cpus = "1.16"  # CPU count detection for parallel scanning
+
+# Scale (Phase 11)
+fastbloom = "0.7"  # Bloom filters for efficient deletion checks
 
 # SSH (Phase 2)
 ssh2 = "0.9"
@@ -62,6 +66,11 @@ whoami = "1"
 dirs = "5"
 regex = "1"
 futures = "0.3.31"
+
+# S3 / Cloud Storage (Phase 10)
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.52"
+aws-smithy-types = "1.2"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

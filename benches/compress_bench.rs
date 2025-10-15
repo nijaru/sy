@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sy::compress::{compress, decompress, Compression};
 use std::io::Write;
+use sy::compress::{compress, decompress, Compression};
 
 fn generate_test_data(size: usize, pattern: &str) -> Vec<u8> {
     match pattern {
@@ -114,18 +114,14 @@ fn bench_zstd_levels(c: &mut Criterion) {
     // Level 15: Maximum practical
     // Level 19: Maximum (slow)
     for level in [1, 3, 6, 9, 11, 15, 19] {
-        group.bench_with_input(
-            BenchmarkId::new("zstd", level),
-            &level,
-            |b, &level| {
-                b.iter(|| {
-                    let compressed = compress_zstd_level(black_box(&text_data), level).unwrap();
-                    // Also return ratio for comparison
-                    let ratio = compressed.len() as f64 / text_data.len() as f64;
-                    black_box((compressed, ratio))
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("zstd", level), &level, |b, &level| {
+            b.iter(|| {
+                let compressed = compress_zstd_level(black_box(&text_data), level).unwrap();
+                // Also return ratio for comparison
+                let ratio = compressed.len() as f64 / text_data.len() as f64;
+                black_box((compressed, ratio))
+            });
+        });
     }
 
     group.finish();

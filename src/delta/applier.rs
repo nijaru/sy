@@ -200,8 +200,8 @@ mod tests {
 
         // Modify some blocks
         let mut modified_data = original_data.clone();
-        for i in 2000..3000 {
-            modified_data[i] = 0xFF;
+        for byte in &mut modified_data[2000..3000] {
+            *byte = 0xFF;
         }
         let mut modified = NamedTempFile::new().unwrap();
         modified.write_all(&modified_data).unwrap();

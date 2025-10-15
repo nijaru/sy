@@ -19,7 +19,9 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         return s.parse::<u64>().map_err(|e| format!("Invalid size: {}", e));
     };
 
-    let num: f64 = num_str.trim().parse()
+    let num: f64 = num_str
+        .trim()
+        .parse()
         .map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
 
     let multiplier: u64 = match unit.trim() {
@@ -135,6 +137,11 @@ pub struct Cli {
     /// Show changes without applying them (dry-run)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
+
+    /// Show detailed changes in dry-run mode (file sizes, byte changes)
+    /// Requires --dry-run to be effective
+    #[arg(long)]
+    pub diff: bool,
 
     /// Delete files in destination not present in source
     #[arg(short, long)]
@@ -329,7 +336,11 @@ impl Cli {
         // Validate size filters first (independent of source path)
         if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
             if min > max {
-                anyhow::bail!("--min-size ({}) cannot be greater than --max-size ({})", min, max);
+                anyhow::bail!(
+                    "--min-size ({}) cannot be greater than --max-size ({})",
+                    min,
+                    max
+                );
             }
         }
 
@@ -342,7 +353,10 @@ impl Cli {
 
         // Validate deletion threshold (0-100)
         if self.delete_threshold > 100 {
-            anyhow::bail!("--delete-threshold must be between 0 and 100 (got: {})", self.delete_threshold);
+            anyhow::bail!(
+                "--delete-threshold must be between 0 and 100 (got: {})",
+                self.delete_threshold
+            );
         }
 
         // --list-profiles and --show-profile don't need source/destination
@@ -389,7 +403,9 @@ impl Cli {
 
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
-        self.source.as_ref().map_or(false, |s| s.is_local() && s.path().is_file())
+        self.source
+            .as_ref()
+            .is_some_and(|s| s.is_local() && s.path().is_file())
     }
 
     pub fn log_level(&self) -> tracing::Level {
@@ -405,31 +421,37 @@ impl Cli {
     }
 
     /// Check if permissions should be preserved (archive mode or explicit flag)
+    #[allow(dead_code)] // Public API for permission preservation (planned feature)
     pub fn should_preserve_permissions(&self) -> bool {
         self.archive || self.preserve_permissions
     }
 
     /// Check if modification times should be preserved (archive mode or explicit flag)
+    #[allow(dead_code)] // Public API for time preservation (planned feature)
     pub fn should_preserve_times(&self) -> bool {
         self.archive || self.preserve_times
     }
 
     /// Check if group should be preserved (archive mode or explicit flag)
+    #[allow(dead_code)] // Public API for group preservation (planned feature)
     pub fn should_preserve_group(&self) -> bool {
         self.archive || self.preserve_group
     }
 
     /// Check if owner should be preserved (archive mode or explicit flag)
+    #[allow(dead_code)] // Public API for owner preservation (planned feature)
     pub fn should_preserve_owner(&self) -> bool {
         self.archive || self.preserve_owner
     }
 
     /// Check if device files should be preserved (archive mode or explicit flag)
+    #[allow(dead_code)] // Public API for device preservation (planned feature)
     pub fn should_preserve_devices(&self) -> bool {
         self.archive || self.preserve_devices
     }
 
     /// Check if symlinks should be preserved (archive mode enables by default)
+    #[allow(dead_code)] // Public API for symlink preservation (planned feature)
     pub fn should_preserve_symlinks(&self) -> bool {
         // Archive mode implies -l (preserve symlinks)
         // Unless user explicitly set --links to something else or used -L
@@ -455,6 +477,7 @@ mod tests {
             source: Some(SyncPath::Local(temp.path().to_path_buf())),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -510,6 +533,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/nonexistent/path"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -571,6 +595,7 @@ mod tests {
             source: Some(SyncPath::Local(file_path.clone())),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -633,6 +658,7 @@ mod tests {
             }),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -688,6 +714,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -743,6 +770,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -798,6 +826,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -853,6 +882,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -927,6 +957,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -970,8 +1001,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
-            min_size: Some(1024 * 1024),  // 1MB
-            max_size: Some(500 * 1024),    // 500KB (smaller than min)
+            min_size: Some(1024 * 1024), // 1MB
+            max_size: Some(500 * 1024),  // 500KB (smaller than min)
         };
 
         let result = cli.validate();
@@ -985,6 +1016,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1040,6 +1072,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1056,8 +1089,8 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
-            mode: VerificationMode::Fast,  // Set to Fast
-            verify: true,                   // But --verify flag should override
+            mode: VerificationMode::Fast, // Set to Fast
+            verify: true,                 // But --verify flag should override
             resume: true,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
@@ -1093,9 +1126,18 @@ mod tests {
     #[test]
     fn test_verification_mode_checksum_type_mapping() {
         assert_eq!(VerificationMode::Fast.checksum_type(), ChecksumType::None);
-        assert_eq!(VerificationMode::Standard.checksum_type(), ChecksumType::Fast);
-        assert_eq!(VerificationMode::Verify.checksum_type(), ChecksumType::Cryptographic);
-        assert_eq!(VerificationMode::Paranoid.checksum_type(), ChecksumType::Cryptographic);
+        assert_eq!(
+            VerificationMode::Standard.checksum_type(),
+            ChecksumType::Fast
+        );
+        assert_eq!(
+            VerificationMode::Verify.checksum_type(),
+            ChecksumType::Cryptographic
+        );
+        assert_eq!(
+            VerificationMode::Paranoid.checksum_type(),
+            ChecksumType::Cryptographic
+        );
     }
 
     #[test]
@@ -1112,6 +1154,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1167,6 +1210,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1189,8 +1233,8 @@ mod tests {
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
-            links: SymlinkMode::Skip,  // Should be overridden
-            copy_links: true,           // Override to Follow
+            links: SymlinkMode::Skip, // Should be overridden
+            copy_links: true,         // Override to Follow
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
@@ -1222,6 +1266,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1277,6 +1322,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1309,7 +1355,7 @@ mod tests {
             preserve_group: false,
             preserve_owner: false,
             preserve_devices: false,
-            archive: true,  // Archive mode enabled
+            archive: true, // Archive mode enabled
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1339,6 +1385,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1366,7 +1413,7 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            preserve_permissions: true,  // Only permissions enabled
+            preserve_permissions: true, // Only permissions enabled
             preserve_times: false,
             preserve_group: false,
             preserve_owner: false,
@@ -1400,6 +1447,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1427,12 +1475,12 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            preserve_permissions: true,  // Explicit flag also enabled
+            preserve_permissions: true, // Explicit flag also enabled
             preserve_times: false,
             preserve_group: false,
             preserve_owner: false,
             preserve_devices: false,
-            archive: true,  // Archive mode also enabled
+            archive: true, // Archive mode also enabled
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1462,6 +1510,7 @@ mod tests {
             source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1495,7 +1544,7 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            ignore_times: true,  // Both enabled - should fail
+            ignore_times: true, // Both enabled - should fail
             size_only: true,
             checksum: false,
             json: false,
@@ -1511,7 +1560,10 @@ mod tests {
 
         let result = cli.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("mutually exclusive"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive"));
     }
 
     #[test]
@@ -1521,6 +1573,7 @@ mod tests {
             source: Some(SyncPath::Local(temp.path().to_path_buf())),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1554,7 +1607,7 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            ignore_times: true,  // Only this flag enabled
+            ignore_times: true, // Only this flag enabled
             size_only: false,
             checksum: false,
             json: false,
@@ -1580,6 +1633,7 @@ mod tests {
             source: Some(SyncPath::Local(temp.path().to_path_buf())),
             destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
             dry_run: false,
+            diff: false,
             delete: false,
             delete_threshold: 50,
             trash: false,
@@ -1615,7 +1669,7 @@ mod tests {
             archive: false,
             ignore_times: false,
             size_only: false,
-            checksum: true,  // Only this flag enabled
+            checksum: true, // Only this flag enabled
             json: false,
             watch: false,
             no_hooks: false,

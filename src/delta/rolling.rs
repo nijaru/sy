@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_adler32_rolling_all_zeros() {
         // Edge case: all zeros
-        let data = vec![0u8; 100];
+        let data = [0u8; 100];
         let block_size = 10;
 
         let mut hasher = Adler32::new(block_size);
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn test_adler32_rolling_all_ones() {
         // Edge case: all 0xFF
-        let data = vec![0xFF; 100];
+        let data = [0xFF; 100];
         let block_size = 16;
 
         let mut hasher = Adler32::new(block_size);
