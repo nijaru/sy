@@ -1,3 +1,4 @@
+pub mod dircache;
 pub mod output;
 mod ratelimit;
 pub mod resume;
