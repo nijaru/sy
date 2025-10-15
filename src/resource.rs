@@ -120,7 +120,9 @@ fn get_available_space(path: &Path) -> Result<u64> {
     }
 
     // Available space = available blocks * block size
-    let available = stat.f_bavail as u64 * stat.f_frsize;
+    // Note: f_bavail and f_frsize types vary by platform (u32 on macOS, u64 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    let available = stat.f_bavail as u64 * stat.f_frsize as u64;
     Ok(available)
 }
 
