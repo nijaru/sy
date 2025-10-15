@@ -120,11 +120,11 @@ fn perf_regression_large_file() {
 
     assert!(output.status.success());
 
-    // Performance baseline: 10MB file should sync in < 1s
-    // This is conservative - typically takes ~100-300ms
+    // Performance baseline: 10MB file should sync in < 3s
+    // Relaxed threshold for CI environments (typically 100-300ms locally, 1-2s on CI)
     assert!(
-        elapsed < Duration::from_secs(1),
-        "Performance regression: 10MB file took {:?}, expected < 1s",
+        elapsed < Duration::from_secs(3),
+        "Performance regression: 10MB file took {:?}, expected < 3s",
         elapsed
     );
 

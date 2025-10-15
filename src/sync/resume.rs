@@ -322,12 +322,7 @@ mod tests {
             max_size: None,
         };
 
-        let mut state = ResumeState::new(
-            src,
-            dst,
-            flags.clone(),
-            100,
-        );
+        let mut state = ResumeState::new(src, dst, flags.clone(), 100);
 
         state.add_completed_file(
             CompletedFile {
@@ -790,12 +785,7 @@ mod tests {
             max_size: None,
         };
 
-        let state = ResumeState::new(
-            src,
-            dst,
-            original_flags.clone(),
-            10,
-        );
+        let state = ResumeState::new(src, dst, original_flags.clone(), 10);
         state.save(dest).unwrap();
 
         // Try to resume with delete flag changed
@@ -826,12 +816,7 @@ mod tests {
             max_size: None,
         };
 
-        let state = ResumeState::new(
-            src,
-            dst,
-            original_flags.clone(),
-            10,
-        );
+        let state = ResumeState::new(src, dst, original_flags.clone(), 10);
         state.save(dest).unwrap();
 
         // Try to resume with exclude patterns added
@@ -862,12 +847,7 @@ mod tests {
             max_size: None,
         };
 
-        let state = ResumeState::new(
-            src,
-            dst,
-            original_flags.clone(),
-            10,
-        );
+        let state = ResumeState::new(src, dst, original_flags.clone(), 10);
         state.save(dest).unwrap();
 
         // Try to resume with size filters changed
@@ -899,12 +879,7 @@ mod tests {
         };
 
         // First cycle: save with 3 files
-        let mut state = ResumeState::new(
-            src,
-            dst,
-            flags.clone(),
-            10,
-        );
+        let mut state = ResumeState::new(src, dst, flags.clone(), 10);
 
         for i in 0..3 {
             state.add_completed_file(
@@ -996,8 +971,7 @@ mod tests {
             max_size: None,
         };
 
-        let mut state =
-            ResumeState::new(src, dst, flags, 10000);
+        let mut state = ResumeState::new(src, dst, flags, 10000);
 
         // Add 1000 completed files
         for i in 0..1000 {
