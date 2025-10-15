@@ -537,8 +537,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         }
                                     }
 
-                                    // Verify transfer if verification is enabled
-                                    if verification_mode != ChecksumType::None && !dry_run {
+                                    // Verify transfer if verification is enabled (skip directories)
+                                    if verification_mode != ChecksumType::None && !dry_run && !source.is_dir {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
@@ -654,8 +654,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         }
                                     }
 
-                                    // Verify transfer if verification is enabled
-                                    if verification_mode != ChecksumType::None && !dry_run {
+                                    // Verify transfer if verification is enabled (skip directories)
+                                    if verification_mode != ChecksumType::None && !dry_run && !source.is_dir {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
