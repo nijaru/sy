@@ -132,7 +132,16 @@ fn get_available_space(path: &Path) -> Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Check parent directory if path doesn't exist (same as Unix behavior)
+    let check_path = if path.exists() {
+        path
+    } else if let Some(parent) = path.parent() {
+        parent
+    } else {
+        path
+    };
+
+    let wide_path: Vec<u16> = check_path.as_os_str().encode_wide().chain(Some(0)).collect();
 
     let mut free_bytes: u64 = 0;
     let mut total_bytes: u64 = 0;
