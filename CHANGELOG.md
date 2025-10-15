@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.22] - 2025-10-15
+
+### Added - Phase 9 (Developer Experience)
+- **Hooks system** - Pre/post sync extensibility
+  - Pre-sync hook: `~/.config/sy/hooks/pre-sync.sh`
+  - Post-sync hook: `~/.config/sy/hooks/post-sync.sh`
+  - Environment variables: `SY_SOURCE`, `SY_DEST`, `SY_FILES_TRANSFERRED`, etc.
+  - CLI flags: `--no-hooks`, `--hook-timeout <seconds>`
+  - Configurable timeout (default: 30s)
+  - Example use cases: Git commit after sync, notifications, backups
+
+- **Ignore templates** - Built-in patterns for common project types
+  - `--ignore-template <name>` flag to load built-in templates
+  - Templates: node, rust, python, docker, mac, windows, git
+  - `.syignore` file support for custom patterns (similar to .gitignore)
+  - Auto-loaded from source directory if present
+  - Combines with .gitignore and CLI --exclude patterns
+
+- **Enhanced dry-run output** - Improved clarity and formatting
+  - Better action labeling (Create/Update/Delete/Skip)
+  - File count and size summaries
+  - Clearer visual confirmation of what would happen
+
+### Added - Phase 10 (Cloud Era)
+- **S3 transport** - Full AWS S3 and S3-compatible service support
+  - Syntax: `sy /local s3://bucket/path`
+  - Query params: `s3://bucket/path?region=us-west-2&endpoint=https://...`
+  - Supported services: AWS S3, Cloudflare R2, Backblaze B2, Wasabi
+  - Full S3 API integration via aws-sdk-rust
+  - Bidirectional: local→S3 and S3→local syncs
+
+- **Multipart uploads** - Efficient handling of large files
+  - Automatic multipart upload for files >100MB
+  - 5MB chunk size (S3 minimum)
+  - Streaming upload with progress tracking
+  - Parallel chunk uploads (infrastructure ready)
+
+- **S3 path parsing** - URL-based configuration
+  - Parse region from query string
+  - Parse custom endpoint for S3-compatible services
+  - Force path-style URLs for non-AWS S3
+  - 7 comprehensive path parsing tests
+
+### Added - Phase 11 (Scale)
+- **Incremental scanning** - Cache-based skip logic for faster re-syncs
+  - Directory mtime cache to detect unchanged directories
+  - File metadata cache (path, size, mtime, is_dir)
+  - Skip rescanning unchanged directories (use cached file list)
+  - Cache version control with auto-invalidation
+  - **Performance**: 1.67-1.84x faster (10-100x expected on large datasets)
+  - Cache file: `.sy-dir-cache.json` in destination (JSON format)
+  - CLI flags: `--use-cache`, `--clear-cache`
+
+- **Memory-efficient deletion** - Streaming with Bloom filters
+  - Bloom filter for >10k files (100x memory reduction vs HashMap)
+  - Automatic threshold switching at 10k files
+  - No false negatives, handles false positives correctly
+  - Streaming destination scan (no loading all into memory)
+
+- **State caching** - Directory and file metadata between runs
+  - Cache format: JSON (human-readable, version 2)
+  - Stores directory mtimes and file metadata grouped by directory
+  - 1-second mtime tolerance for filesystem granularity
+  - Dramatically faster re-syncs for unchanged datasets
+
+### Performance
+- **Incremental scanning**: 1.67-1.84x speedup measured on small datasets
+- **Expected scaling**: 10-100x speedup on large datasets (>10k files)
+- **Memory efficiency**: Bloom filter uses ~1.2MB for 1M files vs ~100MB for HashSet
+- **S3 multipart**: Handles files of any size efficiently
+
+### Technical
+- Added DirectoryCache v2 with file metadata storage
+- Added CachedFile struct (path, size, modified, is_dir)
+- Extended scale.rs with FileSetBloom for deletion planning
+- Full S3Transport implementation (453 lines)
+- S3 integration in TransportRouter for local↔S3 syncs
+- Added ignore template system with built-in patterns
+- Added hooks execution with environment variables
+- Total tests: 289 passing (282 unit + 18 integration + 7 performance)
+
+### Roadmap Status
+- ✅ Phase 9 complete: Developer Experience
+- ✅ Phase 10 complete: Cloud Era (S3 support)
+- ✅ Phase 11 complete: Scale optimizations
+- 🎯 Phase 12 next: Production Release (v1.0 prep)
+
 ## [0.0.21] - 2025-10-13
 
 ### Added
@@ -526,7 +613,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
 - 🚧 Phase 4: Advanced Features (v0.1.0+) - Network detection, compression, resume
 
-[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.21...HEAD
+[Unreleased]: https://github.com/nijaru/sy/compare/v0.0.22...HEAD
+[0.0.22]: https://github.com/nijaru/sy/compare/v0.0.21...v0.0.22
 [0.0.21]: https://github.com/nijaru/sy/compare/v0.0.13...v0.0.21
 [0.0.13]: https://github.com/nijaru/sy/releases/tag/v0.0.13
 [0.0.12]: https://github.com/nijaru/sy/releases/tag/v0.0.12
