@@ -248,8 +248,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Update cache with scanned directory mtimes and file entries (for future incremental scans)
         if let Some(ref mut cache) = dir_cache {
-            use std::collections::HashMap;
             use crate::sync::dircache::CachedFile;
+            use std::collections::HashMap;
 
             // Group files by their parent directory
             let mut files_by_dir: HashMap<PathBuf, Vec<CachedFile>> = HashMap::new();
@@ -272,7 +272,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                 files_by_dir
                     .entry(dir_path)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(CachedFile::from_file_entry(file));
             }
 
@@ -655,7 +655,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     }
 
                                     // Verify transfer if verification is enabled (skip directories)
-                                    if verification_mode != ChecksumType::None && !dry_run && !source.is_dir {
+                                    if verification_mode != ChecksumType::None
+                                        && !dry_run
+                                        && !source.is_dir
+                                    {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
@@ -772,7 +775,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     }
 
                                     // Verify transfer if verification is enabled (skip directories)
-                                    if verification_mode != ChecksumType::None && !dry_run && !source.is_dir {
+                                    if verification_mode != ChecksumType::None
+                                        && !dry_run
+                                        && !source.is_dir
+                                    {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 

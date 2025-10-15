@@ -18,11 +18,7 @@ fn bench_deletion_planning(c: &mut Criterion) {
                 // Setup: Create temp dest with 100 files to delete
                 let temp_dest = TempDir::new().unwrap();
                 for i in 0..100 {
-                    fs::write(
-                        temp_dest.path().join(format!("delete{}.txt", i)),
-                        "delete",
-                    )
-                    .unwrap();
+                    fs::write(temp_dest.path().join(format!("delete{}.txt", i)), "delete").unwrap();
                 }
 
                 // Create source file list (doesn't include delete*.txt files)
