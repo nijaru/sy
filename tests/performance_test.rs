@@ -260,7 +260,8 @@ fn perf_regression_gitignore_filtering() {
 
     assert!(output.status.success());
 
-    // Verify only 51 files were synced (50 included + .gitignore itself)
+    // Verify only 51 files were synced (50 included + .gitignore)
+    // Note: .sy-dir-cache.json is not created by default (requires --use-cache=true)
     let synced_files = fs::read_dir(dest.path())
         .unwrap()
         .filter(|e| e.as_ref().unwrap().path().is_file())

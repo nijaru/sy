@@ -157,11 +157,189 @@ fn bench_sync_idempotent(c: &mut Criterion) {
     });
 }
 
+fn bench_cache_full_vs_incremental(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cache_comparison");
+
+    for file_count in [100, 500, 1000].iter() {
+        // Benchmark without cache (full scan every time)
+        group.bench_with_input(
+            BenchmarkId::new("full_scan", file_count),
+            file_count,
+            |b, &count| {
+                let source = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+                setup_files(&source, count);
+
+                // First sync to set up dest
+                Command::new(env!("CARGO_BIN_EXE_sy"))
+                    .args([
+                        source.path().to_str().unwrap(),
+                        dest.path().to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+
+                b.iter(|| {
+                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+                        .args([
+                            source.path().to_str().unwrap(),
+                            dest.path().to_str().unwrap(),
+                            "--use-cache=false",
+                        ])
+                        .output()
+                        .unwrap();
+
+                    assert!(output.status.success());
+                    black_box(output);
+                });
+            },
+        );
+
+        // Benchmark with cache (incremental scan)
+        group.bench_with_input(
+            BenchmarkId::new("incremental_scan", file_count),
+            file_count,
+            |b, &count| {
+                let source = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+                setup_files(&source, count);
+
+                // First sync with cache enabled
+                Command::new(env!("CARGO_BIN_EXE_sy"))
+                    .args([
+                        source.path().to_str().unwrap(),
+                        dest.path().to_str().unwrap(),
+                        "--use-cache=true",
+                    ])
+                    .output()
+                    .unwrap();
+
+                b.iter(|| {
+                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+                        .args([
+                            source.path().to_str().unwrap(),
+                            dest.path().to_str().unwrap(),
+                            "--use-cache=true",
+                        ])
+                        .output()
+                        .unwrap();
+
+                    assert!(output.status.success());
+                    black_box(output);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_cache_nested_directories(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cache_nested_dirs");
+
+    for depth in [10, 20, 50].iter() {
+        // Without cache
+        group.bench_with_input(
+            BenchmarkId::new("full_scan", depth),
+            depth,
+            |b, &depth| {
+                let source = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+
+                Command::new("git")
+                    .args(["init"])
+                    .current_dir(source.path())
+                    .output()
+                    .unwrap();
+
+                let mut path = source.path().to_path_buf();
+                for i in 0..depth {
+                    path = path.join(format!("level_{}", i));
+                }
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("file.txt"), "content").unwrap();
+
+                // First sync
+                Command::new(env!("CARGO_BIN_EXE_sy"))
+                    .args([
+                        source.path().to_str().unwrap(),
+                        dest.path().to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+
+                b.iter(|| {
+                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+                        .args([
+                            source.path().to_str().unwrap(),
+                            dest.path().to_str().unwrap(),
+                            "--use-cache=false",
+                        ])
+                        .output()
+                        .unwrap();
+
+                    assert!(output.status.success());
+                    black_box(output);
+                });
+            },
+        );
+
+        // With cache
+        group.bench_with_input(
+            BenchmarkId::new("incremental_scan", depth),
+            depth,
+            |b, &depth| {
+                let source = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+
+                Command::new("git")
+                    .args(["init"])
+                    .current_dir(source.path())
+                    .output()
+                    .unwrap();
+
+                let mut path = source.path().to_path_buf();
+                for i in 0..depth {
+                    path = path.join(format!("level_{}", i));
+                }
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("file.txt"), "content").unwrap();
+
+                // First sync with cache
+                Command::new(env!("CARGO_BIN_EXE_sy"))
+                    .args([
+                        source.path().to_str().unwrap(),
+                        dest.path().to_str().unwrap(),
+                        "--use-cache=true",
+                    ])
+                    .output()
+                    .unwrap();
+
+                b.iter(|| {
+                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+                        .args([
+                            source.path().to_str().unwrap(),
+                            dest.path().to_str().unwrap(),
+                            "--use-cache=true",
+                        ])
+                        .output()
+                        .unwrap();
+
+                    assert!(output.status.success());
+                    black_box(output);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sync_small_files,
     bench_sync_nested_dirs,
     bench_sync_large_files,
-    bench_sync_idempotent
+    bench_sync_idempotent,
+    bench_cache_full_vs_incremental,
+    bench_cache_nested_directories
 );
 criterion_main!(benches);

@@ -233,6 +233,15 @@ pub struct Cli {
     #[arg(long)]
     pub clean_state: bool,
 
+    /// Use directory cache for faster re-syncs (default: false)
+    /// The cache stores directory mtimes to skip unchanged directories
+    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
+    pub use_cache: bool,
+
+    /// Delete any existing cache files before starting
+    #[arg(long)]
+    pub clear_cache: bool,
+
     /// Verification mode (fast, standard, verify, paranoid)
     #[arg(long, value_enum, default_value = "standard")]
     pub mode: VerificationMode,
@@ -523,6 +532,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -579,6 +590,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -639,6 +652,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -702,6 +717,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -758,6 +775,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -814,6 +833,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -870,6 +891,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -926,6 +949,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1001,6 +1026,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
         };
@@ -1060,6 +1087,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1116,6 +1145,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1198,6 +1229,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1254,6 +1287,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1310,6 +1345,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1366,6 +1403,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1429,6 +1468,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1491,6 +1532,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1554,6 +1597,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1617,6 +1662,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };
@@ -1677,6 +1724,8 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            use_cache: false,
+            clear_cache: false,
             min_size: None,
             max_size: None,
         };

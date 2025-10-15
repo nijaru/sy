@@ -428,3 +428,247 @@ fn test_large_file_update_with_delta_sync() {
     file.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"MODIFIED FILE");
 }
+
+#[test]
+fn test_directory_cache_created() {
+    let (source, dest) = setup_test_dir("cache_created");
+
+    // Create test structure
+    fs::create_dir_all(source.path().join("dir1/dir2")).unwrap();
+    fs::write(source.path().join("file1.txt"), "content1").unwrap();
+    fs::write(source.path().join("dir1/file2.txt"), "content2").unwrap();
+    fs::write(source.path().join("dir1/dir2/file3.txt"), "content3").unwrap();
+
+    // Run sync with --use-cache
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Verify cache file was created
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    assert!(
+        cache_file.exists(),
+        "Directory cache file should be created at {}",
+        cache_file.display()
+    );
+
+    // Verify cache contains valid JSON
+    let cache_content = fs::read_to_string(&cache_file).unwrap();
+    let cache_json: serde_json::Value = serde_json::from_str(&cache_content).unwrap();
+
+    // Verify cache has expected structure
+    assert!(cache_json.get("directories").is_some());
+    assert!(cache_json.get("version").is_some());
+    assert!(cache_json.get("last_updated").is_some());
+}
+
+#[test]
+fn test_directory_cache_not_created_by_default() {
+    let (source, dest) = setup_test_dir("cache_default");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Run sync WITHOUT --use-cache
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Verify cache file was NOT created
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    assert!(
+        !cache_file.exists(),
+        "Directory cache should not be created without --use-cache flag"
+    );
+}
+
+#[test]
+fn test_directory_cache_persists() {
+    let (source, dest) = setup_test_dir("cache_persist");
+
+    // Create nested directory structure
+    fs::create_dir_all(source.path().join("a/b/c")).unwrap();
+    fs::write(source.path().join("a/file1.txt"), "content1").unwrap();
+    fs::write(source.path().join("a/b/file2.txt"), "content2").unwrap();
+    fs::write(source.path().join("a/b/c/file3.txt"), "content3").unwrap();
+
+    // First sync with cache
+    Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    assert!(cache_file.exists());
+
+    // Read initial cache
+    let initial_cache = fs::read_to_string(&cache_file).unwrap();
+    let initial_json: serde_json::Value = serde_json::from_str(&initial_cache).unwrap();
+    let initial_dirs = initial_json["directories"].as_object().unwrap();
+
+    // Should have cached root + 3 subdirectories (a, a/b, a/b/c)
+    assert!(
+        initial_dirs.len() >= 3,
+        "Cache should contain at least 3 directories, found {}",
+        initial_dirs.len()
+    );
+
+    // Wait to ensure mtime would change if directories were rescanned
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Second sync with cache (no changes)
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Cache should still exist and be valid
+    assert!(cache_file.exists());
+    let second_cache = fs::read_to_string(&cache_file).unwrap();
+    let second_json: serde_json::Value = serde_json::from_str(&second_cache).unwrap();
+
+    // Verify cache still has expected structure
+    assert!(second_json.get("directories").is_some());
+    assert!(second_json.get("version").is_some());
+}
+
+#[test]
+fn test_directory_cache_clear() {
+    let (source, dest) = setup_test_dir("cache_clear");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // First sync with cache
+    Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    assert!(cache_file.exists(), "Cache should be created");
+
+    // Sync with --clear-cache
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--clear-cache",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Cache should be deleted
+    assert!(
+        !cache_file.exists(),
+        "Cache should be deleted after --clear-cache"
+    );
+}
+
+#[test]
+fn test_directory_cache_dry_run() {
+    let (source, dest) = setup_test_dir("cache_dry_run");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Dry run with --use-cache should not save cache
+    let output = Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    assert!(
+        !cache_file.exists(),
+        "Cache should not be saved during dry-run"
+    );
+}
+
+#[test]
+fn test_directory_cache_updates_on_new_directories() {
+    let (source, dest) = setup_test_dir("cache_updates");
+
+    // Initial sync with one directory
+    fs::create_dir_all(source.path().join("dir1")).unwrap();
+    fs::write(source.path().join("dir1/file1.txt"), "content1").unwrap();
+
+    Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    let cache_file = dest.path().join(".sy-dir-cache.json");
+    let initial_cache = fs::read_to_string(&cache_file).unwrap();
+    let initial_json: serde_json::Value = serde_json::from_str(&initial_cache).unwrap();
+    let initial_count = initial_json["directories"].as_object().unwrap().len();
+
+    // Wait to ensure mtime changes
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Add new directories
+    fs::create_dir_all(source.path().join("dir2")).unwrap();
+    fs::create_dir_all(source.path().join("dir3/subdir")).unwrap();
+    fs::write(source.path().join("dir2/file2.txt"), "content2").unwrap();
+    fs::write(source.path().join("dir3/subdir/file3.txt"), "content3").unwrap();
+
+    // Sync again
+    Command::new(sy_bin())
+        .args([
+            source.path().to_str().unwrap(),
+            dest.path().to_str().unwrap(),
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    // Cache should be updated with new directories
+    let updated_cache = fs::read_to_string(&cache_file).unwrap();
+    let updated_json: serde_json::Value = serde_json::from_str(&updated_cache).unwrap();
+    let updated_count = updated_json["directories"].as_object().unwrap().len();
+
+    // Should have more directories now (added dir2, dir3, dir3/subdir)
+    assert!(
+        updated_count > initial_count,
+        "Cache should be updated with new directories. Initial: {}, Updated: {}",
+        initial_count,
+        updated_count
+    );
+}

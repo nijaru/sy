@@ -161,6 +161,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Clear cache if requested (before creating engine)
+    if cli.clear_cache {
+        use sync::dircache::DirectoryCache;
+        if let Err(e) = DirectoryCache::delete(destination.path()) {
+            tracing::warn!("Failed to clear directory cache: {}", e);
+        } else if !cli.quiet && !cli.json {
+            tracing::info!("Cleared directory cache");
+        }
+    }
+
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
         println!("sy v{}", env!("CARGO_PKG_VERSION"));
@@ -336,6 +346,8 @@ async fn main() -> Result<()> {
         cli.ignore_times,
         cli.size_only,
         cli.checksum,
+        cli.use_cache,
+        cli.clear_cache,
     );
 
     // Execute pre-sync hook

@@ -164,6 +164,8 @@ mod tests {
             false,                              // ignore_times
             false,                              // size_only
             false,                              // checksum
+            false,                              // use_cache
+            false,                              // clear_cache
         );
 
         let watch_mode = WatchMode::new(
@@ -217,6 +219,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // use_cache
+            false, // clear_cache
         );
 
         let watch_mode = WatchMode::new(engine, source, destination, Duration::from_millis(500));

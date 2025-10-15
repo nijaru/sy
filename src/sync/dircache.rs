@@ -1,14 +1,60 @@
 use crate::error::{Result, SyncError};
+use crate::sync::scanner::FileEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Cached file metadata for incremental scanning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedFile {
+    /// File path relative to sync root
+    pub path: PathBuf,
+    /// File size in bytes
+    pub size: u64,
+    /// Last modification time
+    pub modified: SystemTime,
+    /// Whether this is a directory
+    pub is_dir: bool,
+}
+
+impl CachedFile {
+    /// Create from FileEntry
+    pub fn from_file_entry(file: &FileEntry) -> Self {
+        Self {
+            path: file.relative_path.clone(),
+            size: file.size,
+            modified: file.modified,
+            is_dir: file.is_dir,
+        }
+    }
+
+    /// Convert back to FileEntry
+    /// Note: Some fields have default values for simplicity
+    pub fn to_file_entry(&self, source_root: &Path) -> FileEntry {
+        FileEntry {
+            path: source_root.join(&self.path),
+            relative_path: self.path.clone(),
+            size: self.size,
+            modified: self.modified,
+            is_dir: self.is_dir,
+            is_symlink: false, // Not cached
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: self.size,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+        }
+    }
+}
+
 /// Directory modification time cache for incremental scanning
 ///
-/// Stores the last known mtime of directories to enable incremental scanning.
-/// When a directory's mtime hasn't changed, we can skip re-scanning it,
-/// dramatically speeding up re-syncs of large datasets.
+/// Stores the last known mtime of directories and cached file metadata to enable
+/// incremental scanning. When a directory's mtime hasn't changed, we can use the
+/// cached file list instead of re-scanning, dramatically speeding up re-syncs.
 ///
 /// # Performance Impact
 /// - Initial sync: No overhead (cache is empty)
@@ -18,7 +64,7 @@ use std::time::SystemTime;
 /// # Cache File Format
 /// - Location: `<dest>/.sy-dir-cache.json`
 /// - Format: JSON (human-readable, debuggable)
-/// - Size: ~100 bytes per directory (minimal overhead)
+/// - Size: ~200 bytes per file (includes full metadata)
 ///
 /// # Invalidation
 /// - Directory mtime changed → re-scan that directory
@@ -28,7 +74,12 @@ use std::time::SystemTime;
 pub struct DirectoryCache {
     /// Map of directory path (relative to sync root) to last known mtime
     #[serde(rename = "directories")]
-    entries: HashMap<PathBuf, SystemTime>,
+    dir_entries: HashMap<PathBuf, SystemTime>,
+
+    /// Cached file metadata keyed by directory path
+    /// Maps directory -> list of files in that directory
+    #[serde(rename = "files", default)]
+    file_entries: HashMap<PathBuf, Vec<CachedFile>>,
 
     /// Version number for cache format changes
     #[serde(default = "default_version")]
@@ -44,13 +95,14 @@ fn default_version() -> u32 {
 }
 
 impl DirectoryCache {
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2; // Bumped for new cache format
     const CACHE_FILENAME: &'static str = ".sy-dir-cache.json";
 
     /// Create a new empty cache
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            dir_entries: HashMap::new(),
+            file_entries: HashMap::new(),
             version: Self::CURRENT_VERSION,
             last_updated: SystemTime::now(),
         }
@@ -77,8 +129,9 @@ impl DirectoryCache {
 
                     cache.last_updated = SystemTime::now();
                     tracing::debug!(
-                        "Loaded directory cache: {} entries",
-                        cache.entries.len()
+                        "Loaded directory cache: {} directories, {} file entries",
+                        cache.dir_entries.len(),
+                        cache.file_entries.values().map(|v| v.len()).sum::<usize>()
                     );
                     cache
                 }
@@ -118,8 +171,9 @@ impl DirectoryCache {
         })?;
 
         tracing::debug!(
-            "Saved directory cache: {} entries to {}",
-            self.entries.len(),
+            "Saved directory cache: {} directories, {} files to {}",
+            self.dir_entries.len(),
+            self.file_entries.values().map(|v| v.len()).sum::<usize>(),
             cache_path.display()
         );
 
@@ -152,7 +206,7 @@ impl DirectoryCache {
     ///
     /// Returns false if directory mtime matches cache (can skip scan)
     pub fn needs_rescan(&self, dir_path: &Path, current_mtime: SystemTime) -> bool {
-        match self.entries.get(dir_path) {
+        match self.dir_entries.get(dir_path) {
             Some(&cached_mtime) => {
                 // Compare mtimes (with 1-second tolerance for filesystem granularity)
                 match current_mtime.duration_since(cached_mtime) {
@@ -169,31 +223,46 @@ impl DirectoryCache {
 
     /// Update cache entry for a directory
     pub fn update(&mut self, dir_path: PathBuf, mtime: SystemTime) {
-        self.entries.insert(dir_path, mtime);
+        self.dir_entries.insert(dir_path, mtime);
+    }
+
+    /// Get cached files for a directory
+    /// Returns None if directory not in cache or needs rescan
+    pub fn get_cached_files(&self, dir_path: &Path) -> Option<&Vec<CachedFile>> {
+        self.file_entries.get(dir_path)
+    }
+
+    /// Store cached files for a directory
+    pub fn cache_files(&mut self, dir_path: PathBuf, files: Vec<CachedFile>) {
+        self.file_entries.insert(dir_path, files);
     }
 
     /// Remove a directory from cache (e.g., after deletion)
     pub fn remove(&mut self, dir_path: &Path) -> bool {
-        self.entries.remove(dir_path).is_some()
+        let dir_removed = self.dir_entries.remove(dir_path).is_some();
+        let files_removed = self.file_entries.remove(dir_path).is_some();
+        dir_removed || files_removed
     }
 
     /// Clear all cache entries
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.dir_entries.clear();
+        self.file_entries.clear();
         self.last_updated = SystemTime::now();
     }
 
     /// Get number of cached directories
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.dir_entries.len()
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.dir_entries.is_empty() && self.file_entries.is_empty()
     }
 
     /// Get cache file path for a destination
+    #[allow(dead_code)] // Will be used for incremental scanning
     pub fn cache_path(dest_root: &Path) -> PathBuf {
         dest_root.join(Self::CACHE_FILENAME)
     }
@@ -264,9 +333,9 @@ mod tests {
         assert_eq!(loaded.version, DirectoryCache::CURRENT_VERSION);
 
         // Verify entries
-        assert!(loaded.entries.contains_key(&PathBuf::from("dir1")));
-        assert!(loaded.entries.contains_key(&PathBuf::from("dir2")));
-        assert!(loaded.entries.contains_key(&PathBuf::from("dir3/subdir")));
+        assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir1")));
+        assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir2")));
+        assert!(loaded.dir_entries.contains_key(&PathBuf::from("dir3/subdir")));
     }
 
     #[test]
