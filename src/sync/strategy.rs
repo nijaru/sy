@@ -358,4 +358,166 @@ mod tests {
 
         assert_eq!(task.action, SyncAction::Update);
     }
+
+    #[test]
+    fn test_plan_deletions_small_set() {
+        let temp_dest = TempDir::new().unwrap();
+        let dest_root = temp_dest.path();
+
+        // Create some files in destination
+        fs::write(dest_root.join("keep.txt"), "keep").unwrap();
+        fs::write(dest_root.join("delete1.txt"), "delete").unwrap();
+        fs::write(dest_root.join("delete2.txt"), "delete").unwrap();
+
+        // Source only has keep.txt
+        let source_files = vec![FileEntry {
+            path: PathBuf::from("/source/keep.txt"),
+            relative_path: PathBuf::from("keep.txt"),
+            size: 4,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 4,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+        }];
+
+        let planner = StrategyPlanner::new();
+        let deletions = planner.plan_deletions(&source_files, dest_root);
+
+        // Should plan to delete 2 files (delete1.txt, delete2.txt)
+        assert_eq!(deletions.len(), 2);
+        assert!(deletions.iter().all(|t| t.action == SyncAction::Delete));
+
+        let deletion_names: Vec<_> = deletions
+            .iter()
+            .map(|t| t.dest_path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(deletion_names.contains(&"delete1.txt"));
+        assert!(deletion_names.contains(&"delete2.txt"));
+    }
+
+    #[test]
+    fn test_plan_deletions_large_set_with_bloom() {
+        let temp_dest = TempDir::new().unwrap();
+        let dest_root = temp_dest.path();
+
+        // Create 100 files in destination (simulating a larger set)
+        for i in 0..100 {
+            fs::write(dest_root.join(format!("file{}.txt", i)), "content").unwrap();
+        }
+
+        // Create extra files to delete
+        fs::write(dest_root.join("delete1.txt"), "delete").unwrap();
+        fs::write(dest_root.join("delete2.txt"), "delete").unwrap();
+
+        // Source has 11,000 files (triggers Bloom filter path)
+        // We'll create dummy entries without actual files
+        let mut source_files = Vec::new();
+        for i in 0..11_000 {
+            source_files.push(FileEntry {
+                path: PathBuf::from(format!("/source/file{}.txt", i)),
+                relative_path: PathBuf::from(format!("file{}.txt", i)),
+                size: 7,
+                modified: SystemTime::now(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                is_sparse: false,
+                allocated_size: 7,
+                xattrs: None,
+                inode: None,
+                nlink: 1,
+                acls: None,
+            });
+        }
+
+        let planner = StrategyPlanner::new();
+        let deletions = planner.plan_deletions(&source_files, dest_root);
+
+        // Should find delete1.txt and delete2.txt (files not in source)
+        assert_eq!(deletions.len(), 2);
+        assert!(deletions.iter().all(|t| t.action == SyncAction::Delete));
+
+        let deletion_names: Vec<_> = deletions
+            .iter()
+            .map(|t| t.dest_path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(deletion_names.contains(&"delete1.txt"));
+        assert!(deletion_names.contains(&"delete2.txt"));
+    }
+
+    #[test]
+    fn test_plan_deletions_empty_source() {
+        let temp_dest = TempDir::new().unwrap();
+        let dest_root = temp_dest.path();
+
+        // Create files in destination
+        fs::write(dest_root.join("file1.txt"), "content").unwrap();
+        fs::write(dest_root.join("file2.txt"), "content").unwrap();
+
+        // Empty source
+        let source_files: Vec<FileEntry> = vec![];
+
+        let planner = StrategyPlanner::new();
+        let deletions = planner.plan_deletions(&source_files, dest_root);
+
+        // Should delete all files in destination
+        assert_eq!(deletions.len(), 2);
+        assert!(deletions.iter().all(|t| t.action == SyncAction::Delete));
+    }
+
+    #[test]
+    fn test_plan_deletions_no_deletions_needed() {
+        let temp_dest = TempDir::new().unwrap();
+        let dest_root = temp_dest.path();
+
+        // Create files in destination
+        fs::write(dest_root.join("file1.txt"), "content").unwrap();
+        fs::write(dest_root.join("file2.txt"), "content").unwrap();
+
+        // Source has the same files
+        let source_files = vec![
+            FileEntry {
+                path: PathBuf::from("/source/file1.txt"),
+                relative_path: PathBuf::from("file1.txt"),
+                size: 7,
+                modified: SystemTime::now(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                is_sparse: false,
+                allocated_size: 7,
+                xattrs: None,
+                inode: None,
+                nlink: 1,
+                acls: None,
+            },
+            FileEntry {
+                path: PathBuf::from("/source/file2.txt"),
+                relative_path: PathBuf::from("file2.txt"),
+                size: 7,
+                modified: SystemTime::now(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                is_sparse: false,
+                allocated_size: 7,
+                xattrs: None,
+                inode: None,
+                nlink: 1,
+                acls: None,
+            },
+        ];
+
+        let planner = StrategyPlanner::new();
+        let deletions = planner.plan_deletions(&source_files, dest_root);
+
+        // No deletions needed
+        assert_eq!(deletions.len(), 0);
+    }
 }

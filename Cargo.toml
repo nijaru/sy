@@ -97,6 +97,10 @@ harness = false
 name = "compress_bench"
 harness = false
 
+[[bench]]
+name = "scale_bench"
+harness = false
+
 [[bin]]
 name = "sy-remote"
 path = "src/bin/sy-remote.rs"
