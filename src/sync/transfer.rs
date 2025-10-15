@@ -261,31 +261,41 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             return Ok(());
         }
 
-        if let Some(ref xattrs) = file_entry.xattrs {
-            if xattrs.is_empty() {
-                return Ok(());
-            }
-
-            let dest_path = dest_path.to_path_buf();
-            let xattrs_clone = xattrs.clone();
-
-            tokio::task::spawn_blocking(move || {
-                for (name, value) in xattrs_clone {
-                    if let Err(e) = xattr::set(&dest_path, &name, &value) {
-                        tracing::warn!(
-                            "Failed to set xattr {} on {}: {}",
-                            name,
-                            dest_path.display(),
-                            e
-                        );
-                    } else {
-                        tracing::debug!("Set xattr {} on {}", name, dest_path.display());
-                    }
+        #[cfg(unix)]
+        {
+            if let Some(ref xattrs) = file_entry.xattrs {
+                if xattrs.is_empty() {
+                    return Ok(());
                 }
-            })
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+
+                let dest_path = dest_path.to_path_buf();
+                let xattrs_clone = xattrs.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    for (name, value) in xattrs_clone {
+                        if let Err(e) = xattr::set(&dest_path, &name, &value) {
+                            tracing::warn!(
+                                "Failed to set xattr {} on {}: {}",
+                                name,
+                                dest_path.display(),
+                                e
+                            );
+                        } else {
+                            tracing::debug!("Set xattr {} on {}", name, dest_path.display());
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            }
         }
+
+        #[cfg(not(unix))]
+        {
+            // xattrs not supported on non-Unix platforms
+            let _ = (file_entry, dest_path);
+        }
+
         Ok(())
     }
 
