@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// Memory-efficient file set using Bloom filter
 ///
 /// Uses ~10 bits per item with 1% false positive rate.
-/// For 1M files: ~1.2MB vs ~100MB for HashSet<PathBuf>
+/// For 1M files: ~1.2MB vs ~100MB for `HashSet<PathBuf>`
 ///
 /// False positives mean we might check a file that doesn't exist,
 /// but we'll never miss a file that does exist (no false negatives).
