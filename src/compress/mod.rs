@@ -84,16 +84,11 @@ fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
 /// Compressing these files provides minimal benefit
 const COMPRESSED_EXTENSIONS: &[&str] = &[
     // Images
-    "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif",
-    // Video
-    "mp4", "mkv", "avi", "mov", "webm", "m4v", "flv", "wmv",
-    // Audio
-    "mp3", "m4a", "aac", "ogg", "opus", "flac", "wma",
-    // Archives
-    "zip", "gz", "bz2", "xz", "7z", "rar", "tar.gz", "tgz", "tar.bz2",
-    // Documents
-    "pdf", "docx", "xlsx", "pptx",
-    // Other
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", // Video
+    "mp4", "mkv", "avi", "mov", "webm", "m4v", "flv", "wmv", // Audio
+    "mp3", "m4a", "aac", "ogg", "opus", "flac", "wma", // Archives
+    "zip", "gz", "bz2", "xz", "7z", "rar", "tar.gz", "tgz", "tar.bz2", // Documents
+    "pdf", "docx", "xlsx", "pptx", // Other
     "wasm", "br", "zst",
 ];
 
@@ -117,7 +112,7 @@ pub fn should_compress_adaptive(
     filename: &str,
     file_size: u64,
     is_local: bool,
-    _network_speed_mbps: Option<u64>,  // Kept for API compatibility, but unused
+    _network_speed_mbps: Option<u64>, // Kept for API compatibility, but unused
 ) -> Compression {
     // LOCAL: Never compress (disk I/O is bottleneck, not network/CPU)
     if is_local {
@@ -274,7 +269,7 @@ mod tests {
 
         // Even 100 Gbps (12.5 GB/s) is slower than Zstd (8 GB/s won't bottleneck due to I/O)
         assert_eq!(
-            should_compress_adaptive("test.txt", 10_000_000, false, Some(100_000)),  // 100 Gbps
+            should_compress_adaptive("test.txt", 10_000_000, false, Some(100_000)), // 100 Gbps
             Compression::Zstd
         );
 

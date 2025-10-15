@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -18,3 +17,10 @@ Thumbs.db
 # Testing
 /test-files/
 /benchmark-results/
+
+# Temporary session files
+ANALYSIS.md
+FINAL_STATUS.md
+REVIEW.md
+SESSION_SUMMARY.md
+PERFORMANCE_ANALYSIS.md

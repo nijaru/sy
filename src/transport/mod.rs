@@ -1,6 +1,7 @@
 pub mod dual;
 pub mod local;
 pub mod router;
+pub mod s3;
 pub mod ssh;
 
 use crate::error::Result;
@@ -169,7 +170,12 @@ pub trait Transport: Send + Sync {
     ///
     /// This is used for cross-transport operations (e.g., remote→local).
     /// Default implementation writes to local filesystem.
-    async fn write_file(&self, path: &Path, data: &[u8], mtime: std::time::SystemTime) -> Result<()> {
+    async fn write_file(
+        &self,
+        path: &Path,
+        data: &[u8],
+        mtime: std::time::SystemTime,
+    ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
         // Create parent directories
@@ -280,7 +286,12 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
         (**self).read_file(path).await
     }
 
-    async fn write_file(&self, path: &Path, data: &[u8], mtime: std::time::SystemTime) -> Result<()> {
+    async fn write_file(
+        &self,
+        path: &Path,
+        data: &[u8],
+        mtime: std::time::SystemTime,
+    ) -> Result<()> {
         (**self).write_file(path, data, mtime).await
     }
 
@@ -294,6 +305,8 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
         dest: &Path,
         progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<TransferResult> {
-        (**self).copy_file_streaming(source, dest, progress_callback).await
+        (**self)
+            .copy_file_streaming(source, dest, progress_callback)
+            .await
     }
 }

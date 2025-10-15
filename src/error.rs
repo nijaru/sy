@@ -4,7 +4,9 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum SyncError {
     #[allow(dead_code)] // Used in future phases (network sync)
-    #[error("Source path not found: {path}\nMake sure the path exists and you have read permissions.")]
+    #[error(
+        "Source path not found: {path}\nMake sure the path exists and you have read permissions."
+    )]
     SourceNotFound { path: PathBuf },
 
     #[allow(dead_code)] // Used in future phases (network sync)

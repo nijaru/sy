@@ -26,9 +26,12 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
     // Wrap all sync operations (session creation, handshake, auth) in spawn_blocking
     let session = tokio::task::spawn_blocking(move || {
         // Create SSH session
-        let mut session = Session::new().map_err(|e| SyncError::Io(
-            std::io::Error::other(format!("Failed to create SSH session: {}", e))
-        ))?;
+        let mut session = Session::new().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to create SSH session: {}",
+                e
+            )))
+        })?;
 
         // Keep session blocking for handshake and authentication
         // (we're already in spawn_blocking context)
@@ -38,9 +41,12 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
         session.set_tcp_stream(tcp);
 
         // Perform SSH handshake
-        session.handshake().map_err(|e| SyncError::Io(
-            std::io::Error::other(format!("SSH handshake failed: {}", e))
-        ))?;
+        session.handshake().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "SSH handshake failed: {}",
+                e
+            )))
+        })?;
 
         // Configure keepalive to prevent connection drops during long transfers
         // Send keepalive every 60 seconds, disconnect after 3 missed responses
@@ -67,7 +73,10 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
 
         // Try each identity file
         for identity_file in &identity_files {
-            if session.userauth_pubkey_file(&username, None, identity_file, None).is_ok() {
+            if session
+                .userauth_pubkey_file(&username, None, identity_file, None)
+                .is_ok()
+            {
                 tracing::debug!("Authenticated using key: {}", identity_file.display());
                 return Ok(session);
             }
@@ -84,7 +93,9 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
 
                 for key_path in &default_keys {
                     if key_path.exists()
-                        && session.userauth_pubkey_file(&username, None, key_path, None).is_ok()
+                        && session
+                            .userauth_pubkey_file(&username, None, key_path, None)
+                            .is_ok()
                     {
                         tracing::debug!("Authenticated using key: {}", key_path.display());
                         return Ok(session);
@@ -117,11 +128,13 @@ async fn connect_tcp(hostname: &str, port: u16) -> Result<TcpStream> {
         })
     })
     .await
-    .map_err(|_| SyncError::Io(
-        std::io::Error::new(ErrorKind::TimedOut, format!("Connection to {} timed out", addr))
-    ))?
+    .map_err(|_| {
+        SyncError::Io(std::io::Error::new(
+            ErrorKind::TimedOut,
+            format!("Connection to {} timed out", addr),
+        ))
+    })?
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -88,7 +88,9 @@ mod tests {
     fn test_compute_checksums() {
         // Create test file (51 bytes)
         let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"Hello, World! This is a test file for checksumming.").unwrap();
+        temp_file
+            .write_all(b"Hello, World! This is a test file for checksumming.")
+            .unwrap();
         temp_file.flush().unwrap();
 
         // Compute checksums

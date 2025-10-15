@@ -1,5 +1,7 @@
-use super::{Transport, TransferResult};
-use crate::delta::{apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp};
+use super::{TransferResult, Transport};
+use crate::delta::{
+    apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp,
+};
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
@@ -71,9 +73,7 @@ impl Transport for LocalTransport {
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
-        tokio::fs::create_dir_all(path)
-            .await
-            .map_err(SyncError::Io)
+        tokio::fs::create_dir_all(path).await.map_err(SyncError::Io)
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
@@ -97,7 +97,10 @@ impl Transport for LocalTransport {
 
             if is_sparse {
                 // For sparse files, use std::fs::copy() which preserves sparseness on Unix
-                tracing::debug!("Sparse file detected ({}), using sparse-aware copy", source.display());
+                tracing::debug!(
+                    "Sparse file detected ({}), using sparse-aware copy",
+                    source.display()
+                );
                 let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
                     path: source.clone(),
                     source: e,
@@ -142,20 +145,25 @@ impl Transport for LocalTransport {
             let mut bytes_written = 0u64;
 
             loop {
-                let bytes_read = source_file.read(&mut buffer).map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
-                    source: e,
-                })?;
+                let bytes_read =
+                    source_file
+                        .read(&mut buffer)
+                        .map_err(|e| SyncError::CopyError {
+                            path: source.clone(),
+                            source: e,
+                        })?;
 
                 if bytes_read == 0 {
                     break;
                 }
 
                 hasher.update(&buffer[..bytes_read]);
-                dest_file.write_all(&buffer[..bytes_read]).map_err(|e| SyncError::CopyError {
-                    path: dest.clone(),
-                    source: e,
-                })?;
+                dest_file
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?;
 
                 bytes_written += bytes_read as u64;
             }
@@ -171,10 +179,8 @@ impl Transport for LocalTransport {
 
             // Preserve modification time
             if let Ok(mtime) = source_meta.modified() {
-                let _ = filetime::set_file_mtime(
-                    &dest,
-                    filetime::FileTime::from_system_time(mtime),
-                );
+                let _ =
+                    filetime::set_file_mtime(&dest, filetime::FileTime::from_system_time(mtime));
             }
 
             Ok(bytes_written)
@@ -232,23 +238,30 @@ impl Transport for LocalTransport {
             let block_size = calculate_block_size(dest_size);
 
             // Compute checksums of destination file
-            tracing::debug!("Computing checksums for {} MB file...", dest_size / 1024 / 1024);
-            let dest_checksums = compute_checksums(&dest, block_size)
-                .map_err(|e| SyncError::CopyError {
+            tracing::debug!(
+                "Computing checksums for {} MB file...",
+                dest_size / 1024 / 1024
+            );
+            let dest_checksums =
+                compute_checksums(&dest, block_size).map_err(|e| SyncError::CopyError {
                     path: dest.clone(),
                     source: e,
                 })?;
 
             // Generate delta with streaming (constant memory)
             tracing::debug!("Generating delta with streaming...");
-            let delta = generate_delta_streaming(&source, &dest_checksums, block_size)
-                .map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
-                    source: e,
+            let delta =
+                generate_delta_streaming(&source, &dest_checksums, block_size).map_err(|e| {
+                    SyncError::CopyError {
+                        path: source.clone(),
+                        source: e,
+                    }
                 })?;
 
             // Calculate compression ratio
-            let literal_bytes: u64 = delta.ops.iter()
+            let literal_bytes: u64 = delta
+                .ops
+                .iter()
                 .filter_map(|op| {
                     if let DeltaOp::Data(data) = op {
                         Some(data.len() as u64)
@@ -267,8 +280,8 @@ impl Transport for LocalTransport {
             // Apply delta to create temporary file
             tracing::debug!("Applying delta...");
             let temp_dest = dest.with_extension("sy.tmp");
-            let delta_stats = apply_delta(&dest, &delta, &temp_dest)
-                .map_err(|e| SyncError::CopyError {
+            let delta_stats =
+                apply_delta(&dest, &delta, &temp_dest).map_err(|e| SyncError::CopyError {
                     path: temp_dest.clone(),
                     source: e,
                 })?;
@@ -320,7 +333,11 @@ impl Transport for LocalTransport {
             .await
             .map_err(SyncError::Io)?;
 
-        tracing::debug!("Created hardlink: {} -> {}", dest.display(), source.display());
+        tracing::debug!(
+            "Created hardlink: {} -> {}",
+            dest.display(),
+            source.display()
+        );
         Ok(())
     }
 
@@ -343,7 +360,12 @@ impl Transport for LocalTransport {
         #[cfg(windows)]
         {
             // Windows requires different symlink APIs for files vs directories
-            if tokio::fs::metadata(target).await.ok().map(|m| m.is_dir()).unwrap_or(false) {
+            if tokio::fs::metadata(target)
+                .await
+                .ok()
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 tokio::fs::symlink_dir(target, dest)
                     .await
                     .map_err(SyncError::Io)?;
@@ -354,7 +376,11 @@ impl Transport for LocalTransport {
             }
         }
 
-        tracing::debug!("Created symlink: {} -> {}", dest.display(), target.display());
+        tracing::debug!(
+            "Created symlink: {} -> {}",
+            dest.display(),
+            target.display()
+        );
         Ok(())
     }
 }
@@ -393,7 +419,10 @@ mod tests {
 
         let transport = LocalTransport::new();
         assert!(transport.exists(&root.join("exists.txt")).await.unwrap());
-        assert!(!transport.exists(&root.join("not_exists.txt")).await.unwrap());
+        assert!(!transport
+            .exists(&root.join("not_exists.txt"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -461,12 +490,12 @@ mod tests {
         // Create a sparse file using dd
         let source_file = source_dir.path().join("sparse.dat");
         let output = std::process::Command::new("dd")
-            .args(&[
+            .args([
                 "if=/dev/zero",
                 &format!("of={}", source_file.display()),
                 "bs=1024",
                 "count=0",
-                "seek=10240" // 10MB sparse file
+                "seek=10240", // 10MB sparse file
             ])
             .output()
             .expect("Failed to create sparse file");
@@ -501,7 +530,10 @@ mod tests {
         let dest_allocated = dest_blocks * 512;
         if dest_allocated < dest_meta.len() {
             // Sparseness was preserved!
-            assert!(dest_allocated < dest_meta.len() / 2, "Destination should be sparse");
+            assert!(
+                dest_allocated < dest_meta.len() / 2,
+                "Destination should be sparse"
+            );
         }
     }
 
@@ -520,7 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]  // Permission tests work differently on Windows
+    #[cfg(unix)] // Permission tests work differently on Windows
     async fn test_copy_file_permission_denied_destination() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -533,7 +565,7 @@ mod tests {
 
         // Make destination directory read-only
         let mut perms = fs::metadata(dest_dir.path()).unwrap().permissions();
-        perms.set_mode(0o444);  // Read-only
+        perms.set_mode(0o444); // Read-only
         fs::set_permissions(dest_dir.path(), perms).unwrap();
 
         let transport = LocalTransport::new();
@@ -632,7 +664,7 @@ mod tests {
 
         // Make directory unreadable
         let mut perms = fs::metadata(&protected_dir).unwrap().permissions();
-        perms.set_mode(0o000);  // No permissions
+        perms.set_mode(0o000); // No permissions
         fs::set_permissions(&protected_dir, perms).unwrap();
 
         let transport = LocalTransport::new();
@@ -643,7 +675,10 @@ mod tests {
         perms.set_mode(0o755);
         let _ = fs::set_permissions(&protected_dir, perms);
 
-        assert!(result.is_err(), "Should fail when directory is not readable");
+        assert!(
+            result.is_err(),
+            "Should fail when directory is not readable"
+        );
     }
 
     #[tokio::test]
@@ -667,13 +702,7 @@ mod tests {
         // On most systems this should fail (cross-device link)
         // But if both are on same filesystem, it might succeed
         // Either way, we're testing that it doesn't crash
-        if result.is_err() {
-            // Expected on different filesystems
-            assert!(true);
-        } else {
-            // Succeeded - both on same filesystem, that's fine too
-            assert!(true);
-        }
+        // Both outcomes are acceptable - we just verify no panic
+        let _ = result;
     }
 }
-

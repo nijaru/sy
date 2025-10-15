@@ -20,6 +20,7 @@ pub struct FilterRule {
     /// Compiled glob pattern
     pub pattern: glob::Pattern,
     /// Original pattern string (for debugging)
+    #[allow(dead_code)] // Used for debugging and error messages
     pub pattern_str: String,
     /// Whether pattern contains '/' (affects matching behavior)
     pub has_slash: bool,
@@ -107,7 +108,9 @@ impl FilterRule {
                     }
                     // Check if any parent directory basename matches
                     for ancestor in path.ancestors().skip(1) {
-                        if let Some(ancestor_basename) = ancestor.file_name().and_then(|n| n.to_str()) {
+                        if let Some(ancestor_basename) =
+                            ancestor.file_name().and_then(|n| n.to_str())
+                        {
                             if self.pattern.matches(ancestor_basename) {
                                 return true;
                             }
@@ -205,11 +208,21 @@ impl FilterEngine {
         let reader = BufReader::new(file);
 
         for (line_num, line) in reader.lines().enumerate() {
-            let line = line
-                .with_context(|| format!("Failed to read line {} from {}", line_num + 1, file_path.display()))?;
+            let line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from {}",
+                    line_num + 1,
+                    file_path.display()
+                )
+            })?;
 
-            self.add_rule(&line)
-                .with_context(|| format!("Invalid rule at line {} in {}", line_num + 1, file_path.display()))?;
+            self.add_rule(&line).with_context(|| {
+                format!(
+                    "Invalid rule at line {} in {}",
+                    line_num + 1,
+                    file_path.display()
+                )
+            })?;
         }
 
         Ok(())
@@ -227,7 +240,11 @@ impl FilterEngine {
         let template_file = template_dir.join(format!("{}.syignore", template_name));
 
         if !template_file.exists() {
-            anyhow::bail!("Template '{}' not found at {}", template_name, template_file.display());
+            anyhow::bail!(
+                "Template '{}' not found at {}",
+                template_name,
+                template_file.display()
+            );
         }
 
         self.add_rules_from_file(&template_file)
@@ -275,11 +292,13 @@ impl FilterEngine {
     }
 
     /// Get number of rules
+    #[allow(dead_code)] // Public API for filter introspection
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
 
     /// Check if filter has any rules
+    #[allow(dead_code)] // Public API for filter introspection
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
@@ -473,12 +492,30 @@ mod tests {
         filter.add_exclude("*").unwrap();
 
         // These should match rsync behavior
-        assert!(filter.should_include(Path::new("keep.txt"), false), "keep.txt should be included");
-        assert!(!filter.should_include(Path::new("dir1"), true), "dir1 directory should be excluded");
-        assert!(!filter.should_include(Path::new("dir1/keep.txt"), false), "dir1/keep.txt should be excluded");
-        assert!(!filter.should_include(Path::new("dir1/subdir/file.txt"), false), "dir1/subdir/file.txt should be excluded");
-        assert!(filter.should_include(Path::new("dir2/keep.txt"), false), "dir2/keep.txt should be included");
-        assert!(!filter.should_include(Path::new("exclude.log"), false), "exclude.log should be excluded");
+        assert!(
+            filter.should_include(Path::new("keep.txt"), false),
+            "keep.txt should be included"
+        );
+        assert!(
+            !filter.should_include(Path::new("dir1"), true),
+            "dir1 directory should be excluded"
+        );
+        assert!(
+            !filter.should_include(Path::new("dir1/keep.txt"), false),
+            "dir1/keep.txt should be excluded"
+        );
+        assert!(
+            !filter.should_include(Path::new("dir1/subdir/file.txt"), false),
+            "dir1/subdir/file.txt should be excluded"
+        );
+        assert!(
+            filter.should_include(Path::new("dir2/keep.txt"), false),
+            "dir2/keep.txt should be included"
+        );
+        assert!(
+            !filter.should_include(Path::new("exclude.log"), false),
+            "exclude.log should be excluded"
+        );
     }
 
     #[test]

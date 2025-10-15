@@ -82,9 +82,7 @@ impl<T: Transport + 'static> WatchMode<T> {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Check if we should sync (debounce timeout reached)
-                    if !pending_changes.is_empty()
-                        && last_sync.elapsed() >= self.debounce
-                    {
+                    if !pending_changes.is_empty() && last_sync.elapsed() >= self.debounce {
                         tracing::info!("Detected {} changes, syncing...", pending_changes.len());
                         println!("📝 Changes detected, syncing...");
 
@@ -140,31 +138,32 @@ mod tests {
         let transport = LocalTransport::new();
         let engine = SyncEngine::new(
             transport,
-            false, // dry_run
-            false, // delete
-            50, // delete_threshold
-            false, // trash
-            false, // force_delete
-            true,  // quiet
-            10,    // parallel
-            100,   // max_errors
-            None,  // min_size
-            None,  // max_size
+            false,                              // dry_run
+            false,                              // diff_mode
+            false,                              // delete
+            50,                                 // delete_threshold
+            false,                              // trash
+            false,                              // force_delete
+            true,                               // quiet
+            10,                                 // parallel
+            100,                                // max_errors
+            None,                               // min_size
+            None,                               // max_size
             crate::filter::FilterEngine::new(), // filter_engine
-            None,  // bwlimit
-            false, // resume
-            10,    // checkpoint_files
-            100,   // checkpoint_bytes
-            false, // json
-            ChecksumType::None, // verification_mode
-            false, // verify_on_write
-            SymlinkMode::Preserve, // symlink_mode
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
+            None,                               // bwlimit
+            false,                              // resume
+            10,                                 // checkpoint_files
+            100,                                // checkpoint_bytes
+            false,                              // json
+            ChecksumType::None,                 // verification_mode
+            false,                              // verify_on_write
+            SymlinkMode::Preserve,              // symlink_mode
+            false,                              // preserve_xattrs
+            false,                              // preserve_hardlinks
+            false,                              // preserve_acls
+            false,                              // ignore_times
+            false,                              // size_only
+            false,                              // checksum
         );
 
         let watch_mode = WatchMode::new(
@@ -192,9 +191,10 @@ mod tests {
         let transport = LocalTransport::new();
         let engine = SyncEngine::new(
             transport,
-            false,
-            false,
-            50, // delete_threshold
+            false, // dry_run
+            false, // diff_mode
+            false, // delete
+            50,    // delete_threshold
             false, // trash
             false, // force_delete
             true,
@@ -219,12 +219,7 @@ mod tests {
             false, // checksum
         );
 
-        let watch_mode = WatchMode::new(
-            engine,
-            source,
-            destination,
-            Duration::from_millis(500),
-        );
+        let watch_mode = WatchMode::new(engine, source, destination, Duration::from_millis(500));
 
         // Should sync on create, modify, remove
         let create_event = Event::new(EventKind::Create(notify::event::CreateKind::File));

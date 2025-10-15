@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// Represents a sync path that can be either local or remote
+/// Represents a sync path that can be either local, remote (SSH), or S3
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncPath {
     Local(PathBuf),
@@ -8,6 +8,12 @@ pub enum SyncPath {
         host: String,
         user: Option<String>,
         path: PathBuf,
+    },
+    S3 {
+        bucket: String,
+        key: String,
+        region: Option<String>,
+        endpoint: Option<String>,
     },
 }
 
@@ -17,14 +23,63 @@ impl SyncPath {
     /// Supported formats:
     /// - Local: `/path/to/dir`, `./relative/path`, `relative/path`
     /// - Remote: `user@host:/path`, `host:/path`
+    /// - S3: `s3://bucket/key/path`, `s3://bucket/key?region=us-west-2`, `s3://bucket/key?endpoint=https://...`
     pub fn parse(s: &str) -> Self {
+        // Check for S3 URL format
+        if let Some(remainder) = s.strip_prefix("s3://") {
+            // Split on ? to separate path from query params
+            let (path_part, query_part) = if let Some(q_pos) = remainder.find('?') {
+                (&remainder[..q_pos], Some(&remainder[q_pos + 1..]))
+            } else {
+                (remainder, None)
+            };
+
+            // Split path into bucket and key
+            if let Some(slash_pos) = path_part.find('/') {
+                let bucket = path_part[..slash_pos].to_string();
+                let key = path_part[slash_pos + 1..].to_string();
+
+                // Parse query parameters (region, endpoint)
+                let mut region = None;
+                let mut endpoint = None;
+
+                if let Some(query) = query_part {
+                    for param in query.split('&') {
+                        if let Some((k, v)) = param.split_once('=') {
+                            match k {
+                                "region" => region = Some(v.to_string()),
+                                "endpoint" => endpoint = Some(v.to_string()),
+                                _ => {} // Ignore unknown params
+                            }
+                        }
+                    }
+                }
+
+                return SyncPath::S3 {
+                    bucket,
+                    key,
+                    region,
+                    endpoint,
+                };
+            } else {
+                // Just bucket, no key (treat as root)
+                return SyncPath::S3 {
+                    bucket: path_part.to_string(),
+                    key: String::new(),
+                    region: None,
+                    endpoint: None,
+                };
+            }
+        }
+
         // Check for remote path format (contains : before any /)
         if let Some(colon_pos) = s.find(':') {
             // Check if this is a remote path (no / before the :)
             let before_colon = &s[..colon_pos];
 
             // Check if this is a Windows drive letter (single letter followed by :)
-            if before_colon.len() == 1 && before_colon.chars().next().unwrap().is_ascii_alphabetic() {
+            if before_colon.len() == 1 && before_colon.chars().next().unwrap().is_ascii_alphabetic()
+            {
                 // Windows drive letter, treat as local
                 return SyncPath::Local(PathBuf::from(s));
             }
@@ -61,10 +116,11 @@ impl SyncPath {
         match self {
             SyncPath::Local(path) => path,
             SyncPath::Remote { path, .. } => path,
+            SyncPath::S3 { key, .. } => Path::new(key),
         }
     }
 
-    /// Check if this is a remote path
+    /// Check if this is a remote SSH path
     #[allow(dead_code)] // Used in tests
     pub fn is_remote(&self) -> bool {
         matches!(self, SyncPath::Remote { .. })
@@ -73,6 +129,12 @@ impl SyncPath {
     /// Check if this is a local path
     pub fn is_local(&self) -> bool {
         matches!(self, SyncPath::Local(_))
+    }
+
+    /// Check if this is an S3 path
+    #[allow(dead_code)] // Public API for S3 path detection
+    pub fn is_s3(&self) -> bool {
+        matches!(self, SyncPath::S3 { .. })
     }
 }
 
@@ -86,6 +148,25 @@ impl std::fmt::Display for SyncPath {
                 } else {
                     write!(f, "{}:{}", host, path.display())
                 }
+            }
+            SyncPath::S3 {
+                bucket,
+                key,
+                region,
+                endpoint,
+            } => {
+                write!(f, "s3://{}/{}", bucket, key)?;
+                let mut query_params = Vec::new();
+                if let Some(r) = region {
+                    query_params.push(format!("region={}", r));
+                }
+                if let Some(e) = endpoint {
+                    query_params.push(format!("endpoint={}", e));
+                }
+                if !query_params.is_empty() {
+                    write!(f, "?{}", query_params.join("&"))?;
+                }
+                Ok(())
             }
         }
     }
@@ -176,5 +257,115 @@ mod tests {
             path: PathBuf::from("/home/nick/docs"),
         };
         assert_eq!(path.to_string(), "server:/home/nick/docs");
+    }
+
+    #[test]
+    fn test_parse_s3_basic() {
+        let path = SyncPath::parse("s3://my-bucket/path/to/file.txt");
+        assert!(path.is_s3());
+        assert_eq!(path.path(), Path::new("path/to/file.txt"));
+        match path {
+            SyncPath::S3 {
+                bucket,
+                key,
+                region,
+                endpoint,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(key, "path/to/file.txt");
+                assert_eq!(region, None);
+                assert_eq!(endpoint, None);
+            }
+            _ => panic!("Expected S3 path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_s3_with_region() {
+        let path = SyncPath::parse("s3://my-bucket/file.txt?region=us-west-2");
+        assert!(path.is_s3());
+        match path {
+            SyncPath::S3 {
+                bucket,
+                key,
+                region,
+                endpoint,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(key, "file.txt");
+                assert_eq!(region, Some("us-west-2".to_string()));
+                assert_eq!(endpoint, None);
+            }
+            _ => panic!("Expected S3 path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_s3_with_endpoint() {
+        let path = SyncPath::parse("s3://my-bucket/file.txt?endpoint=https://s3.example.com");
+        assert!(path.is_s3());
+        match path {
+            SyncPath::S3 {
+                bucket,
+                key,
+                region,
+                endpoint,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(key, "file.txt");
+                assert_eq!(region, None);
+                assert_eq!(endpoint, Some("https://s3.example.com".to_string()));
+            }
+            _ => panic!("Expected S3 path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_s3_bucket_only() {
+        let path = SyncPath::parse("s3://my-bucket");
+        assert!(path.is_s3());
+        match path {
+            SyncPath::S3 { bucket, key, .. } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(key, "");
+            }
+            _ => panic!("Expected S3 path"),
+        }
+    }
+
+    #[test]
+    fn test_display_s3() {
+        let path = SyncPath::S3 {
+            bucket: "my-bucket".to_string(),
+            key: "path/to/file.txt".to_string(),
+            region: None,
+            endpoint: None,
+        };
+        assert_eq!(path.to_string(), "s3://my-bucket/path/to/file.txt");
+    }
+
+    #[test]
+    fn test_display_s3_with_region() {
+        let path = SyncPath::S3 {
+            bucket: "my-bucket".to_string(),
+            key: "file.txt".to_string(),
+            region: Some("us-west-2".to_string()),
+            endpoint: None,
+        };
+        assert_eq!(path.to_string(), "s3://my-bucket/file.txt?region=us-west-2");
+    }
+
+    #[test]
+    fn test_display_s3_with_endpoint() {
+        let path = SyncPath::S3 {
+            bucket: "my-bucket".to_string(),
+            key: "file.txt".to_string(),
+            region: None,
+            endpoint: Some("https://s3.example.com".to_string()),
+        };
+        assert_eq!(
+            path.to_string(),
+            "s3://my-bucket/file.txt?endpoint=https://s3.example.com"
+        );
     }
 }

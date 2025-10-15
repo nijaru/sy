@@ -211,6 +211,7 @@ impl ResumeState {
     }
 
     /// Save resume state to destination directory (atomic)
+    #[allow(dead_code)] // Public API for manual state saving
     pub fn save(&self, destination: &Path) -> Result<()> {
         let state_path = destination.join(STATE_FILE_NAME);
         let temp_path = destination.join(format!("{}.tmp", STATE_FILE_NAME));
@@ -227,10 +228,10 @@ impl ResumeState {
 
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, self).map_err(|e| {
-            SyncError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to write state file: {}", e),
-            ))
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to write state file: {}",
+                e
+            )))
         })?;
 
         // Atomic rename
@@ -268,6 +269,7 @@ impl ResumeState {
     }
 
     /// Add a completed file to the state
+    #[allow(dead_code)] // Public API for state management
     pub fn add_completed_file(&mut self, file: CompletedFile, bytes_transferred: u64) {
         self.completed_files.push(file);
         self.total_bytes_transferred += bytes_transferred;
@@ -383,12 +385,7 @@ mod tests {
             max_size: None,
         };
 
-        let state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
-            flags,
-            10,
-        );
+        let state = ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10);
 
         state.save(dest).unwrap();
         assert!(dest.join(STATE_FILE_NAME).exists());
@@ -406,12 +403,7 @@ mod tests {
             max_size: None,
         };
 
-        let mut state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
-            flags,
-            10,
-        );
+        let mut state = ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10);
 
         state.add_completed_file(
             CompletedFile {
@@ -682,12 +674,7 @@ mod tests {
             max_size: None,
         };
 
-        let mut state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
-            flags,
-            10,
-        );
+        let mut state = ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10);
 
         state.add_completed_file(
             CompletedFile {
@@ -794,14 +781,17 @@ mod tests {
 
         // Try to resume with delete flag changed
         let new_flags = SyncFlags {
-            delete: true,  // Changed!
+            delete: true, // Changed!
             exclude: Vec::new(),
             min_size: None,
             max_size: None,
         };
 
         let loaded = ResumeState::load(dest).unwrap().unwrap();
-        assert!(!loaded.is_compatible_with(&new_flags), "Should detect delete flag change");
+        assert!(
+            !loaded.is_compatible_with(&new_flags),
+            "Should detect delete flag change"
+        );
     }
 
     #[test]
@@ -827,13 +817,16 @@ mod tests {
         // Try to resume with exclude patterns added
         let new_flags = SyncFlags {
             delete: false,
-            exclude: vec!["*.tmp".to_string()],  // Added!
+            exclude: vec!["*.tmp".to_string()], // Added!
             min_size: None,
             max_size: None,
         };
 
         let loaded = ResumeState::load(dest).unwrap().unwrap();
-        assert!(!loaded.is_compatible_with(&new_flags), "Should detect exclude pattern change");
+        assert!(
+            !loaded.is_compatible_with(&new_flags),
+            "Should detect exclude pattern change"
+        );
     }
 
     #[test]
@@ -860,12 +853,15 @@ mod tests {
         let new_flags = SyncFlags {
             delete: false,
             exclude: Vec::new(),
-            min_size: Some(1024),  // Added!
-            max_size: Some(10485760),  // Added!
+            min_size: Some(1024),     // Added!
+            max_size: Some(10485760), // Added!
         };
 
         let loaded = ResumeState::load(dest).unwrap().unwrap();
-        assert!(!loaded.is_compatible_with(&new_flags), "Should detect size filter change");
+        assert!(
+            !loaded.is_compatible_with(&new_flags),
+            "Should detect size filter change"
+        );
     }
 
     #[test]
@@ -942,7 +938,7 @@ mod tests {
             PathBuf::from("/src"),
             PathBuf::from("/dst"),
             flags,
-            100,  // Total files
+            100, // Total files
         );
 
         // Add 30 completed files
@@ -977,12 +973,8 @@ mod tests {
             max_size: None,
         };
 
-        let mut state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
-            flags,
-            10000,
-        );
+        let mut state =
+            ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10000);
 
         // Add 1000 completed files
         for i in 0..1000 {

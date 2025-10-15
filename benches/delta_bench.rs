@@ -8,7 +8,8 @@ fn create_sparse_file(path: &std::path::Path, size_mb: usize, modification_offse
     let mut file = fs::File::create(path).unwrap();
 
     // Create sparse file by seeking
-    file.seek(SeekFrom::Start((size_mb * 1024 * 1024) as u64 - 1)).unwrap();
+    file.seek(SeekFrom::Start((size_mb * 1024 * 1024) as u64 - 1))
+        .unwrap();
     file.write_all(&[0]).unwrap();
     file.flush().unwrap();
 
@@ -17,7 +18,10 @@ fn create_sparse_file(path: &std::path::Path, size_mb: usize, modification_offse
     file.write_all(b"HEADER DATA AT START").unwrap();
 
     // Write modification at specific offset (this will trigger delta sync)
-    file.seek(SeekFrom::Start((modification_offset_mb * 1024 * 1024) as u64)).unwrap();
+    file.seek(SeekFrom::Start(
+        (modification_offset_mb * 1024 * 1024) as u64,
+    ))
+    .unwrap();
     file.write_all(b"MODIFIED DATA HERE").unwrap();
     file.flush().unwrap();
 }

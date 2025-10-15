@@ -9,10 +9,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeltaOp {
     /// Copy block from existing file at given offset
-    Copy {
-        offset: u64,
-        size: usize,
-    },
+    Copy { offset: u64, size: usize },
     /// Insert literal data
     Data(Vec<u8>),
 }
@@ -31,14 +28,18 @@ impl Delta {
     /// Calculate compression ratio
     #[allow(dead_code)]
     pub fn compression_ratio(&self) -> f64 {
-        let literal_bytes: usize = self.ops.iter()
+        let literal_bytes: usize = self
+            .ops
+            .iter()
             .filter_map(|op| match op {
                 DeltaOp::Data(data) => Some(data.len()),
                 _ => None,
             })
             .sum();
 
-        let copy_bytes: usize = self.ops.iter()
+        let copy_bytes: usize = self
+            .ops
+            .iter()
             .filter_map(|op| match op {
                 DeltaOp::Copy { size, .. } => Some(*size),
                 _ => None,
@@ -402,7 +403,10 @@ mod tests {
         let delta = generate_delta(source.path(), &checksums, 8).unwrap();
 
         // Should have only Copy operations
-        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert!(delta
+            .ops
+            .iter()
+            .all(|op| matches!(op, DeltaOp::Copy { .. })));
 
         // Compression ratio should be 0 (no literal data)
         assert_eq!(delta.compression_ratio(), 0.0);
@@ -446,7 +450,10 @@ mod tests {
         let delta = generate_delta(source.path(), &checksums, block_size).unwrap();
 
         // Should have mix of Copy and Data
-        let has_copy = delta.ops.iter().any(|op| matches!(op, DeltaOp::Copy { .. }));
+        let has_copy = delta
+            .ops
+            .iter()
+            .any(|op| matches!(op, DeltaOp::Copy { .. }));
         let has_data = delta.ops.iter().any(|op| matches!(op, DeltaOp::Data(_)));
         assert!(has_copy && has_data);
 
@@ -498,7 +505,10 @@ mod tests {
         let delta = generate_delta_streaming(source.path(), &checksums, 8).unwrap();
 
         // Should have only Copy operations
-        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert!(delta
+            .ops
+            .iter()
+            .all(|op| matches!(op, DeltaOp::Copy { .. })));
         assert_eq!(delta.compression_ratio(), 0.0);
     }
 
@@ -519,7 +529,10 @@ mod tests {
         let delta = generate_delta_streaming(source.path(), &checksums, 4096).unwrap();
 
         // Should be all Copy operations
-        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert!(delta
+            .ops
+            .iter()
+            .all(|op| matches!(op, DeltaOp::Copy { .. })));
         assert_eq!(delta.source_size, 256 * 1024);
     }
 
@@ -571,7 +584,10 @@ mod tests {
         let delta = generate_delta_streaming(source.path(), &checksums, block_size).unwrap();
 
         // Should be all Copy operations
-        assert!(delta.ops.iter().all(|op| matches!(op, DeltaOp::Copy { .. })));
+        assert!(delta
+            .ops
+            .iter()
+            .all(|op| matches!(op, DeltaOp::Copy { .. })));
         assert_eq!(delta.source_size, 512 * 1024);
     }
 

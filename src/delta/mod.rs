@@ -1,13 +1,13 @@
-pub mod rolling;
+pub mod applier;
 pub mod checksum;
 pub mod generator;
-pub mod applier;
+pub mod rolling;
 
-pub use rolling::Adler32;
-pub use checksum::{BlockChecksum, compute_checksums};
-#[allow(unused_imports)]
-pub use generator::{Delta, DeltaOp, generate_delta, generate_delta_streaming};
 pub use applier::apply_delta;
+pub use checksum::{compute_checksums, BlockChecksum};
+#[allow(unused_imports)]
+pub use generator::{generate_delta, generate_delta_streaming, Delta, DeltaOp};
+pub use rolling::Adler32;
 
 /// Default block size calculation: sqrt(filesize)
 /// Capped between 512 bytes and 128KB
