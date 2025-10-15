@@ -14,6 +14,7 @@ use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::resource;
 use crate::transport::Transport;
+use dircache::DirectoryCache;
 use indicatif::{ProgressBar, ProgressStyle};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
@@ -76,6 +77,8 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
+    use_cache: bool,
+    clear_cache: bool,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -108,6 +111,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
+        use_cache: bool,
+        clear_cache: bool,
     ) -> Self {
         Self {
             transport: Arc::new(transport),
@@ -137,6 +142,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             ignore_times,
             size_only,
             checksum,
+            use_cache,
+            clear_cache,
         }
     }
 
@@ -167,11 +174,120 @@ impl<T: Transport + 'static> SyncEngine<T> {
             destination.display()
         );
 
-        // Scan source directory
-        tracing::debug!("Scanning source directory...");
-        let all_files = self.transport.scan(source).await?;
+        // Handle directory cache
+        if self.clear_cache && !self.dry_run {
+            if let Err(e) = DirectoryCache::delete(destination) {
+                tracing::warn!("Failed to clear directory cache: {}", e);
+            } else {
+                tracing::debug!("Cleared directory cache");
+            }
+        }
+
+        // Load directory cache (if enabled)
+        let mut dir_cache = if self.use_cache {
+            let cache = DirectoryCache::load(destination);
+            tracing::debug!("Loaded directory cache with {} entries", cache.len());
+            Some(cache)
+        } else {
+            None
+        };
+
+        // Check if we can use cached scan results (incremental scanning)
+        let can_use_cache = if let Some(ref cache) = dir_cache {
+            // Check source directory mtime
+            if let Ok(source_meta) = std::fs::metadata(source) {
+                if let Ok(source_mtime) = source_meta.modified() {
+                    let source_path = PathBuf::from(".");
+                    !cache.needs_rescan(&source_path, source_mtime)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Scan source directory (or use cache)
+        let all_files = if can_use_cache {
+            // Use cached files for incremental scan
+            if let Some(ref cache) = dir_cache {
+                if let Some(cached_files) = cache.get_cached_files(&PathBuf::from(".")) {
+                    let file_count = cached_files.len();
+                    tracing::info!(
+                        "Using cached scan results ({} files) - source unchanged",
+                        file_count
+                    );
+
+                    // Convert cached files back to FileEntry
+                    cached_files
+                        .iter()
+                        .map(|cf| cf.to_file_entry(source))
+                        .collect()
+                } else {
+                    // Cache exists but no files cached for root directory
+                    tracing::debug!("No cached files found, performing full scan");
+                    self.transport.scan(source).await?
+                }
+            } else {
+                // This shouldn't happen, but fall back to full scan
+                self.transport.scan(source).await?
+            }
+        } else {
+            tracing::debug!("Scanning source directory (cache miss or disabled)...");
+            self.transport.scan(source).await?
+        };
+
         let total_scanned = all_files.len();
-        tracing::info!("Found {} items in source", total_scanned);
+        if can_use_cache {
+            tracing::info!("Retrieved {} items from cache", total_scanned);
+        } else {
+            tracing::info!("Found {} items in source", total_scanned);
+        }
+
+        // Update cache with scanned directory mtimes and file entries (for future incremental scans)
+        if let Some(ref mut cache) = dir_cache {
+            use std::collections::HashMap;
+            use crate::sync::dircache::CachedFile;
+
+            // Group files by their parent directory
+            let mut files_by_dir: HashMap<PathBuf, Vec<CachedFile>> = HashMap::new();
+
+            for file in &all_files {
+                // Update directory mtimes
+                if file.is_dir {
+                    cache.update(file.relative_path.clone(), file.modified);
+                }
+
+                // Group files by directory for caching
+                let dir_path = if file.is_dir {
+                    file.relative_path.clone()
+                } else {
+                    file.relative_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."))
+                };
+
+                files_by_dir
+                    .entry(dir_path)
+                    .or_insert_with(Vec::new)
+                    .push(CachedFile::from_file_entry(file));
+            }
+
+            // Cache files for each directory
+            let total_files: usize = files_by_dir.values().map(|v| v.len()).sum();
+            for (dir_path, files) in files_by_dir {
+                cache.cache_files(dir_path, files);
+            }
+
+            tracing::debug!(
+                "Updated directory cache with {} directories, {} files",
+                cache.len(),
+                total_files
+            );
+        }
 
         // Filter files by size and exclude patterns
         // Also track excluded directories to filter their children (rsync behavior)
@@ -903,6 +1019,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
             *state_guard = None;
         }
 
+        // Save directory cache if enabled
+        if self.use_cache && !self.dry_run {
+            if let Some(ref cache) = dir_cache {
+                // Ensure destination directory exists before saving cache
+                if destination.exists() {
+                    if let Err(e) = cache.save(destination) {
+                        tracing::warn!("Failed to save directory cache: {}", e);
+                    } else {
+                        tracing::debug!("Saved directory cache with {} entries", cache.len());
+                    }
+                } else {
+                    tracing::debug!("Skipping cache save - destination directory doesn't exist");
+                }
+            }
+        }
+
         // If we got here, either no errors occurred or errors were within the threshold
         Ok(final_stats)
     }
@@ -1143,6 +1275,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // use_cache (disabled in tests to avoid side effects)
+            false, // clear_cache
         )
     }
 
@@ -1244,6 +1378,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // use_cache
+            false, // clear_cache
         );
 
         let stats = engine
