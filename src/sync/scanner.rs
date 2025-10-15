@@ -70,6 +70,7 @@ fn detect_hardlink_info(_metadata: &std::fs::Metadata) -> (Option<u64>, u64) {
 
 /// Read extended attributes from a file
 /// Returns None if xattrs are not supported or if reading fails
+#[cfg(unix)]
 fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     let mut xattrs = HashMap::new();
 
@@ -92,6 +93,12 @@ fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     } else {
         Some(xattrs)
     }
+}
+
+/// Non-Unix platforms don't support extended attributes
+#[cfg(not(unix))]
+fn read_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>> {
+    None
 }
 
 /// Read ACLs from a file
