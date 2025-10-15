@@ -301,10 +301,19 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Create platform-appropriate absolute paths for testing
+    fn test_absolute_paths() -> (PathBuf, PathBuf) {
+        // Use temp directories which are guaranteed to be absolute on all platforms
+        let src_temp = tempdir().unwrap();
+        let dst_temp = tempdir().unwrap();
+        (src_temp.path().to_path_buf(), dst_temp.path().to_path_buf())
+    }
+
     #[test]
     fn test_resume_state_save_load() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let flags = SyncFlags {
             delete: true,
@@ -314,8 +323,8 @@ mod tests {
         };
 
         let mut state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
+            src,
+            dst,
             flags.clone(),
             100,
         );
@@ -377,6 +386,7 @@ mod tests {
     fn test_resume_state_delete() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let flags = SyncFlags {
             delete: false,
@@ -385,7 +395,7 @@ mod tests {
             max_size: None,
         };
 
-        let state = ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10);
+        let state = ResumeState::new(src, dst, flags, 10);
 
         state.save(dest).unwrap();
         assert!(dest.join(STATE_FILE_NAME).exists());
@@ -453,13 +463,14 @@ mod tests {
     fn test_invalid_version_auto_deleted() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         // Write state with invalid version
         let invalid_state = serde_json::json!({
             "version": 999,
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": "2025-01-01T00:00:00Z",
             "checkpoint_at": "2025-01-01T00:00:00Z",
             "flags": {
@@ -485,13 +496,14 @@ mod tests {
     fn test_relative_paths_rejected() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (_, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         // Write state with relative source path
         let invalid_state = serde_json::json!({
             "version": STATE_VERSION,
             "source": "relative/path",  // Relative!
-            "destination": "/dst",
+            "destination": dst,
             "started_at": "2025-01-01T00:00:00Z",
             "checkpoint_at": "2025-01-01T00:00:00Z",
             "flags": {
@@ -516,14 +528,15 @@ mod tests {
     fn test_future_timestamp_rejected() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         // Write state with future timestamp
         let future = chrono::Utc::now() + chrono::Duration::days(1);
         let invalid_state = serde_json::json!({
             "version": STATE_VERSION,
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": future.to_rfc3339(),  // Future!
             "checkpoint_at": future.to_rfc3339(),
             "flags": {
@@ -548,6 +561,7 @@ mod tests {
     fn test_checkpoint_before_start_rejected() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         let start = chrono::Utc::now();
@@ -555,8 +569,8 @@ mod tests {
 
         let invalid_state = serde_json::json!({
             "version": STATE_VERSION,
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": start.to_rfc3339(),
             "checkpoint_at": checkpoint.to_rfc3339(),
             "flags": {
@@ -581,13 +595,14 @@ mod tests {
     fn test_completed_exceeds_total_rejected() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         let now = chrono::Utc::now();
         let invalid_state = serde_json::json!({
             "version": STATE_VERSION,
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": now.to_rfc3339(),
             "checkpoint_at": now.to_rfc3339(),
             "flags": {
@@ -627,13 +642,14 @@ mod tests {
     fn test_invalid_file_action_rejected() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
         let state_path = dest.join(STATE_FILE_NAME);
 
         let now = chrono::Utc::now();
         let invalid_state = serde_json::json!({
             "version": STATE_VERSION,
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": now.to_rfc3339(),
             "checkpoint_at": now.to_rfc3339(),
             "flags": {
@@ -666,6 +682,7 @@ mod tests {
     fn test_valid_state_passes_integrity_check() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let flags = SyncFlags {
             delete: false,
@@ -674,7 +691,7 @@ mod tests {
             max_size: None,
         };
 
-        let mut state = ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10);
+        let mut state = ResumeState::new(src, dst, flags, 10);
 
         state.add_completed_file(
             CompletedFile {
@@ -733,13 +750,14 @@ mod tests {
     fn test_state_with_missing_version() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let state_path = dest.join(".sy-state.json");
 
         // Create state without version field
         let invalid_state = serde_json::json!({
-            "source": "/src",
-            "destination": "/dst",
+            "source": src,
+            "destination": dst,
             "started_at": format_timestamp(SystemTime::now()),
             "flags": {
                 "delete": false,
@@ -763,6 +781,7 @@ mod tests {
     fn test_flag_change_delete_added() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let original_flags = SyncFlags {
             delete: false,
@@ -772,8 +791,8 @@ mod tests {
         };
 
         let state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
+            src,
+            dst,
             original_flags.clone(),
             10,
         );
@@ -798,6 +817,7 @@ mod tests {
     fn test_flag_change_exclude_added() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let original_flags = SyncFlags {
             delete: false,
@@ -807,8 +827,8 @@ mod tests {
         };
 
         let state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
+            src,
+            dst,
             original_flags.clone(),
             10,
         );
@@ -833,6 +853,7 @@ mod tests {
     fn test_flag_change_size_filters() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let original_flags = SyncFlags {
             delete: false,
@@ -842,8 +863,8 @@ mod tests {
         };
 
         let state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
+            src,
+            dst,
             original_flags.clone(),
             10,
         );
@@ -868,6 +889,7 @@ mod tests {
     fn test_multiple_resume_cycles() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let flags = SyncFlags {
             delete: false,
@@ -878,8 +900,8 @@ mod tests {
 
         // First cycle: save with 3 files
         let mut state = ResumeState::new(
-            PathBuf::from("/src"),
-            PathBuf::from("/dst"),
+            src,
+            dst,
             flags.clone(),
             10,
         );
@@ -965,6 +987,7 @@ mod tests {
     fn test_state_with_large_number_of_files() {
         let temp_dir = tempdir().unwrap();
         let dest = temp_dir.path();
+        let (src, dst) = test_absolute_paths();
 
         let flags = SyncFlags {
             delete: false,
@@ -974,7 +997,7 @@ mod tests {
         };
 
         let mut state =
-            ResumeState::new(PathBuf::from("/src"), PathBuf::from("/dst"), flags, 10000);
+            ResumeState::new(src, dst, flags, 10000);
 
         // Add 1000 completed files
         for i in 0..1000 {

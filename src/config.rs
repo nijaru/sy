@@ -170,7 +170,9 @@ destination = "~/dst"
     #[test]
     fn test_config_path() {
         let path = Config::config_path().unwrap();
-        assert!(path.to_string_lossy().ends_with("sy/config.toml"));
+        // Check path components instead of string representation (cross-platform)
+        assert!(path.parent().unwrap().ends_with("sy"));
+        assert_eq!(path.file_name().unwrap(), "config.toml");
     }
 
     #[test]
