@@ -1,0 +1,360 @@
+.TH SY 1 "October 2025" "sy 0.0.22" "User Commands"
+.SH NAME
+sy \- modern file synchronization tool
+.SH SYNOPSIS
+.B sy
+[\fIOPTIONS\fR]
+.I SOURCE
+.I DESTINATION
+.br
+.B sy
+\fB\-\-profile\fR \fIPROFILE\fR
+.br
+.B sy
+\fB\-\-list\-profiles\fR
+.SH DESCRIPTION
+.B sy
+is a modern file synchronization tool written in Rust, designed as a faster and more
+reliable alternative to rsync. It provides parallel transfers, adaptive compression,
+multi-layer verification, and beautiful progress output.
+.PP
+.B sy
+supports both local and remote (SSH) synchronization with intelligent delta transfer,
+resume support, and extensive filtering options.
+.SH ARGUMENTS
+.TP
+.I SOURCE
+Source path. Can be local (/path) or remote (user@host:/path). Optional when using
+\fB\-\-profile\fR.
+.TP
+.I DESTINATION
+Destination path. Can be local (/path) or remote (user@host:/path). Optional when using
+\fB\-\-profile\fR.
+.SH OPTIONS
+.SS General Options
+.TP
+.BR \-n ", " \-\-dry\-run
+Show changes without applying them. Useful for previewing what would be synced.
+.TP
+.B \-\-diff
+Show detailed changes in dry-run mode (file sizes, byte changes). Requires
+\fB\-\-dry\-run\fR.
+.TP
+.BR \-v ", " \-\-verbose
+Increase verbosity level. Can be repeated (\fB\-v\fR, \fB\-vv\fR, \fB\-vvv\fR).
+.TP
+.BR \-q ", " \-\-quiet
+Quiet mode. Only show errors.
+.TP
+.B \-\-json
+Output newline-delimited JSON for scripting.
+.TP
+.BR \-h ", " \-\-help
+Print help information.
+.TP
+.BR \-V ", " \-\-version
+Print version information.
+.SS Deletion Options
+.TP
+.BR \-d ", " \-\-delete
+Delete files in destination not present in source. Use with caution.
+.TP
+.BI \-\-delete\-threshold " PERCENT"
+Maximum percentage of files that can be deleted (0-100). Prevents accidental mass
+deletion. Default: 50.
+.TP
+.B \-\-trash
+Move deleted files to trash instead of permanent deletion.
+.TP
+.B \-\-force\-delete
+Skip deletion safety checks. Dangerous \- use with caution.
+.SS Performance Options
+.TP
+.BI \-j ", " \-\-parallel " N"
+Number of parallel file transfers. Default: 10.
+.TP
+.BI \-\-max\-errors " N"
+Maximum number of errors before aborting. 0 = unlimited. Default: 100.
+.TP
+.BI \-\-bwlimit " LIMIT"
+Bandwidth limit in bytes per second. Examples: "1MB", "500KB".
+.TP
+.B \-\-compress
+Enable compression for network transfers. Auto-detects based on file type.
+.SS Filtering Options
+.TP
+.BI \-\-min\-size " SIZE"
+Minimum file size to sync. Examples: "1MB", "500KB".
+.TP
+.BI \-\-max\-size " SIZE"
+Maximum file size to sync. Examples: "100MB", "1GB".
+.TP
+.BI \-\-exclude " PATTERN"
+Exclude files matching pattern. Can be repeated. Examples: "*.log", "node_modules".
+.TP
+.BI \-\-include " PATTERN"
+Include files matching pattern. Can be repeated. Processed in order with
+\fB\-\-exclude\fR.
+.TP
+.BI \-\-filter " RULE"
+Filter rules in rsync syntax. "+ pattern" (include) or "- pattern" (exclude).
+Can be repeated. Rules processed in order, first match wins.
+.TP
+.BI \-\-exclude\-from " FILE"
+Read exclude patterns from file (one pattern per line).
+.TP
+.BI \-\-include\-from " FILE"
+Read include patterns from file (one pattern per line).
+.TP
+.BI \-\-ignore\-template " NAME"
+Apply ignore template from ~/.config/sy/templates/. Can be repeated.
+Examples: "rust", "node", "python".
+.SS Verification Options
+.TP
+.BI \-\-mode " MODE"
+Verification mode. Values: \fBfast\fR (size+mtime), \fBstandard\fR (xxHash3,
+default), \fBverify\fR (BLAKE3), \fBparanoid\fR (BLAKE3 + verify every block).
+.TP
+.B \-\-verify
+Enable BLAKE3 verification. Shortcut for \fB\-\-mode verify\fR.
+.TP
+.B \-\-ignore\-times
+Ignore modification times, always compare checksums.
+.TP
+.B \-\-size\-only
+Only compare file size, skip mtime checks.
+.TP
+.BR \-c ", " \-\-checksum
+Always compare checksums instead of size+mtime. Slow but thorough.
+.SS Resume Support
+.TP
+.BI \-\-resume " BOOL"
+Enable resume support. Auto-resume if state file found. Default: true.
+.TP
+.BI \-\-checkpoint\-files " N"
+Checkpoint every N files. Default: 10.
+.TP
+.BI \-\-checkpoint\-bytes " SIZE"
+Checkpoint every N bytes transferred. Default: "100MB".
+.TP
+.B \-\-clean\-state
+Delete any existing state files before starting (fresh sync).
+.SS Directory Cache
+.TP
+.BI \-\-use\-cache " BOOL"
+Use directory cache for faster re-syncs. Stores directory mtimes to skip unchanged
+directories. Default: false.
+.TP
+.B \-\-clear\-cache
+Delete any existing cache files before starting.
+.SS Symlink Handling
+.TP
+.BI \-\-links " MODE"
+Symlink handling mode. Values: \fBpreserve\fR (default), \fBfollow\fR, \fBskip\fR.
+.TP
+.BR \-L ", " \-\-copy\-links
+Follow symlinks and copy targets. Shortcut for \fB\-\-links follow\fR.
+.SS Preservation Options
+.TP
+.BR \-X ", " \-\-preserve\-xattrs
+Preserve extended attributes (xattrs).
+.TP
+.BR \-H ", " \-\-preserve\-hardlinks
+Preserve hard links.
+.TP
+.BR \-A ", " \-\-preserve\-acls
+Preserve access control lists (ACLs).
+.TP
+.BR \-p ", " \-\-preserve\-permissions
+Preserve permissions.
+.TP
+.BR \-t ", " \-\-preserve\-times
+Preserve modification times.
+.TP
+.BR \-g ", " \-\-preserve\-group
+Preserve group (requires appropriate permissions).
+.TP
+.BR \-o ", " \-\-preserve\-owner
+Preserve owner (requires root).
+.TP
+.BR \-D ", " \-\-preserve\-devices
+Preserve device files and special files (requires root).
+.TP
+.BR \-a ", " \-\-archive
+Archive mode. Equivalent to \fB\-rlptgoD\fR (recursive, links, perms, times, group,
+owner, devices). Does NOT include \fB\-X\fR (xattrs), \fB\-A\fR (ACLs), or
+\fB\-H\fR (hardlinks) \- use those flags separately if needed.
+.SS Watch Mode
+.TP
+.B \-\-watch
+Watch mode. Continuously monitor source for changes and sync automatically.
+.SS Hook Options
+.TP
+.B \-\-no\-hooks
+Disable hook execution (skip pre-sync and post-sync hooks).
+.TP
+.B \-\-abort\-on\-hook\-failure
+Abort sync if any hook fails. Default: warn and continue.
+.SS Profile Options
+.TP
+.BI \-\-profile " NAME"
+Use named profile from config file (~/.config/sy/config.toml).
+.TP
+.B \-\-list\-profiles
+List all available profiles.
+.TP
+.BI \-\-show\-profile " NAME"
+Show details of a specific profile.
+.SH EXAMPLES
+.TP
+.B Basic sync
+.nf
+sy /source /destination
+.fi
+.TP
+.B Preview changes without applying
+.nf
+sy /source /destination --dry-run
+.fi
+.TP
+.B Mirror mode (delete extra files in destination)
+.nf
+sy /source /destination --delete
+.fi
+.TP
+.B Parallel transfers (20 workers)
+.nf
+sy /source /destination -j 20
+.fi
+.TP
+.B Sync single file
+.nf
+sy /path/to/file.txt /dest/file.txt
+.fi
+.TP
+.B Remote sync via SSH
+.nf
+sy /local user@host:/remote
+sy user@host:/remote /local
+.fi
+.TP
+.B Archive mode with all attributes
+.nf
+sy /source /destination -aXAH
+.fi
+.TP
+.B Bandwidth limiting
+.nf
+sy /source /destination --bwlimit 1MB
+sy /source user@host:/dest --bwlimit 500KB
+.fi
+.TP
+.B Verification modes
+.nf
+sy /source /destination --verify
+sy /source /destination --mode paranoid
+.fi
+.TP
+.B Exclude patterns
+.nf
+sy /source /destination --exclude "*.log" --exclude "node_modules"
+sy /source /destination --exclude-from .gitignore
+.fi
+.TP
+.B Watch mode for continuous sync
+.nf
+sy /source /destination --watch
+.fi
+.TP
+.B Using config profiles
+.nf
+sy --profile backup-home
+sy --list-profiles
+.fi
+.SH CONFIGURATION
+.B sy
+reads configuration from \fB~/.config/sy/config.toml\fR. Configuration files support
+named profiles with predefined sync settings.
+.PP
+Example configuration:
+.PP
+.nf
+[profiles.backup-home]
+source = "~/"
+destination = "/mnt/backup"
+exclude = ["*.log", ".cache", "node_modules"]
+delete = false
+.fi
+.SH VERIFICATION MODES
+.TP
+.B fast
+Size and mtime only. Fastest, least reliable. Use for local syncs where corruption
+is unlikely.
+.TP
+.B standard
+Size, mtime, and xxHash3 checksums. Good balance of speed and reliability. Default
+mode.
+.TP
+.B verify
+BLAKE3 end-to-end verification. Cryptographic checksums, slower but highly reliable.
+Use for critical data.
+.TP
+.B paranoid
+BLAKE3 + verify every block during transfer. Maximum reliability, slowest. Use when
+data integrity is paramount.
+.SH FILES
+.TP
+.B ~/.config/sy/config.toml
+User configuration file containing named profiles.
+.TP
+.B ~/.config/sy/templates/
+Directory containing ignore templates (e.g., rust.syignore, node.syignore).
+.TP
+.B .syignore
+Per-directory ignore patterns (gitignore syntax).
+.TP
+.B .sy-state.json
+Resume state file created in destination directory.
+.TP
+.B .sy-dir-cache.json
+Directory cache file created in destination directory when \fB\-\-use\-cache\fR is enabled.
+.SH HOOKS
+.B sy
+supports pre-sync and post-sync hooks placed in:
+.TP
+.B ~/.config/sy/hooks/pre-sync.d/
+Scripts executed before sync begins.
+.TP
+.B ~/.config/sy/hooks/post-sync.d/
+Scripts executed after sync completes.
+.PP
+Hooks receive sync metadata as JSON on stdin and must be executable.
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+General error
+.TP
+.B 2
+Connection error (SSH/network)
+.TP
+.B 3
+Permission denied
+.TP
+.B 4
+File not found
+.TP
+.B 5
+Insufficient disk space
+.SH SEE ALSO
+.BR rsync (1),
+.BR ssh (1),
+.BR gitignore (5)
+.PP
+Project homepage: https://github.com/nijaru/sy
+.SH AUTHOR
+Nick Russo <nick@nijaru.dev>
+.SH COPYRIGHT
+Copyright \(co 2025 Nick Russo. Licensed under the MIT License.

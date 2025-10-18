@@ -1,0 +1,107 @@
+.TH SY-REMOTE 1 "October 2025" "sy 0.0.22" "User Commands"
+.SH NAME
+sy-remote \- remote helper for sy file synchronization
+.SH SYNOPSIS
+.B sy-remote
+.I COMMAND
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B sy-remote
+is a helper binary used by
+.BR sy (1)
+to perform operations on remote hosts via SSH. It is not typically invoked directly
+by users, but is executed automatically by
+.B sy
+during remote synchronization.
+.PP
+The
+.B sy-remote
+binary must be installed on remote hosts for SSH-based synchronization to work.
+It handles file scanning, checksum computation, delta application, and file reception
+on the remote side.
+.SH COMMANDS
+.TP
+.B scan
+Scan a directory and output file list as JSON. Used by
+.B sy
+to enumerate files on the remote host.
+.TP
+.B checksums
+Compute block checksums for a file. Used for delta synchronization to determine
+which blocks need to be transferred.
+.TP
+.B apply-delta
+Apply delta operations to a file. Reads delta JSON from stdin and applies the
+specified operations to update a file efficiently.
+.TP
+.B receive-file
+Receive a file (potentially compressed) from stdin and write to disk. Handles
+decompression if the file was compressed during transfer.
+.TP
+.B help
+Print help information for sy-remote or a specific subcommand.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print help information.
+.SH INSTALLATION
+To use
+.B sy
+for remote synchronization, install
+.B sy-remote
+on all remote hosts:
+.PP
+.nf
+cargo install sy
+.fi
+.PP
+The
+.B sy
+package includes both
+.B sy
+and
+.B sy-remote
+binaries.
+.SH COMMUNICATION PROTOCOL
+.B sy-remote
+communicates with the local
+.B sy
+instance using:
+.IP \(bu 2
+JSON-formatted messages over stdin/stdout
+.IP \(bu 2
+Binary file data over stdin/stdout
+.IP \(bu 2
+Structured error reporting
+.PP
+All communication is encrypted and authenticated by SSH when invoked remotely.
+.SH EXAMPLES
+These examples show how
+.B sy-remote
+is typically invoked by
+.BR sy .
+Users generally do not need to run these commands directly.
+.TP
+.B Scan remote directory
+.nf
+sy-remote scan /path/to/directory
+.fi
+.TP
+.B Compute checksums for file
+.nf
+sy-remote checksums /path/to/file
+.fi
+.TP
+.B Apply delta to file
+.nf
+echo '{"operations":[...]}' | sy-remote apply-delta /path/to/file
+.fi
+.SH SEE ALSO
+.BR sy (1),
+.BR ssh (1)
+.PP
+Project homepage: https://github.com/nijaru/sy
+.SH AUTHOR
+Nick Russo <nick@nijaru.dev>
+.SH COPYRIGHT
+Copyright \(co 2025 Nick Russo. Licensed under the MIT License.
