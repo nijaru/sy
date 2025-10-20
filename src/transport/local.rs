@@ -204,15 +204,17 @@ impl Transport for LocalTransport {
         let source_size = source_meta.len();
         let dest_size = dest_meta.len();
 
-        // Size-based heuristic: only use delta sync for large files (>1GB)
-        // For smaller files, the overhead of checksumming + delta + random I/O
-        // exceeds the cost of a simple sequential copy, even with O(1) rolling hash.
-        const DELTA_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
+        // Size-based heuristic: use delta sync for files >10MB
+        // Below this threshold, sequential copy is often faster than the overhead
+        // of checksumming + delta generation + random I/O, even with O(1) rolling hash.
+        // This threshold is tuned based on benchmarks showing delta sync is beneficial
+        // for files as small as 10MB when changes are localized (e.g., 1MB change in 100MB).
+        const DELTA_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 
         if dest_size < DELTA_THRESHOLD {
             tracing::debug!(
-                "File size ({} MB) below delta threshold ({}MB), using full copy",
-                dest_size / 1024 / 1024,
+                "File size ({:.1} MB) below delta threshold ({} MB), using full copy",
+                dest_size as f64 / 1024.0 / 1024.0,
                 DELTA_THRESHOLD / 1024 / 1024
             );
             return self.copy_file(source, dest).await;
@@ -225,8 +227,8 @@ impl Transport for LocalTransport {
         }
 
         tracing::info!(
-            "Large file detected ({} GB), attempting delta sync",
-            dest_size / 1024 / 1024 / 1024
+            "File size {:.1} MB, attempting delta sync",
+            dest_size as f64 / 1024.0 / 1024.0
         );
 
         // Run delta sync in blocking task

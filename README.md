@@ -37,7 +37,17 @@ See [DESIGN.md](DESIGN.md) for comprehensive technical design (2,400+ lines of d
 
 ## Installation
 
-### From Source (Recommended for now)
+### From crates.io (Recommended)
+
+```bash
+# Install sy and sy-remote
+cargo install sy
+
+# Verify installation
+sy --version
+```
+
+### From Source
 
 ```bash
 # Clone the repository
@@ -51,9 +61,27 @@ cargo install --path .
 sy --version
 ```
 
+### Man Pages (Optional)
+
+Man pages are included in the repository. To install them:
+
+```bash
+# Clone if not already done
+git clone https://github.com/nijaru/sy.git
+cd sy
+
+# Install man pages (Unix/Linux/macOS)
+sudo mkdir -p /usr/local/share/man/man1
+sudo cp man/*.1 /usr/local/share/man/man1/
+
+# Verify installation
+man sy
+man sy-remote
+```
+
 ### Requirements
 
-- Rust 1.70+ (for development)
+- Rust 1.70+ (for installation)
 - Git (for .gitignore support)
 
 ## Quick Start

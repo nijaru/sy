@@ -133,8 +133,7 @@ pub fn generate_delta_streaming(
                     if checksum.strong == strong {
                         // Match found! Flush literals and add Copy
                         if !literal_buffer.is_empty() {
-                            ops.push(DeltaOp::Data(literal_buffer.clone()));
-                            literal_buffer.clear();
+                            ops.push(DeltaOp::Data(std::mem::take(&mut literal_buffer)));
                         }
 
                         ops.push(DeltaOp::Copy {
@@ -167,8 +166,7 @@ pub fn generate_delta_streaming(
                 for checksum in candidates {
                     if checksum.size == partial.len() && checksum.strong == strong {
                         if !literal_buffer.is_empty() {
-                            ops.push(DeltaOp::Data(literal_buffer.clone()));
-                            literal_buffer.clear();
+                            ops.push(DeltaOp::Data(std::mem::take(&mut literal_buffer)));
                         }
 
                         ops.push(DeltaOp::Copy {
