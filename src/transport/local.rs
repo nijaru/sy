@@ -236,10 +236,13 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
+            use std::time::Instant;
+
             // Calculate block size
             let block_size = calculate_block_size(dest_size);
 
             // Compute checksums of destination file
+            let checksum_start = Instant::now();
             tracing::debug!(
                 "Computing checksums for {} MB file...",
                 dest_size / 1024 / 1024
@@ -249,8 +252,11 @@ impl Transport for LocalTransport {
                     path: dest.clone(),
                     source: e,
                 })?;
+            let checksum_elapsed = checksum_start.elapsed();
+            tracing::debug!("Checksums computed in {:?}", checksum_elapsed);
 
             // Generate delta with streaming (constant memory)
+            let delta_start = Instant::now();
             tracing::debug!("Generating delta with streaming...");
             let delta =
                 generate_delta_streaming(&source, &dest_checksums, block_size).map_err(|e| {
@@ -259,6 +265,8 @@ impl Transport for LocalTransport {
                         source: e,
                     }
                 })?;
+            let delta_elapsed = delta_start.elapsed();
+            tracing::debug!("Delta generated in {:?}", delta_elapsed);
 
             // Calculate compression ratio
             let literal_bytes: u64 = delta
@@ -280,6 +288,7 @@ impl Transport for LocalTransport {
             };
 
             // Apply delta to create temporary file
+            let apply_start = Instant::now();
             tracing::debug!("Applying delta...");
             let temp_dest = dest.with_extension("sy.tmp");
             let delta_stats =
@@ -287,6 +296,8 @@ impl Transport for LocalTransport {
                     path: temp_dest.clone(),
                     source: e,
                 })?;
+            let apply_elapsed = apply_start.elapsed();
+            tracing::debug!("Delta applied in {:?}", apply_elapsed);
 
             // Atomic rename
             fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
