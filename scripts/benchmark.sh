@@ -152,7 +152,7 @@ rsync_times=()
 for i in {1..3}; do
     cp "$BENCH_DIR/dst/rsync_large.bin" "$BENCH_DIR/dst/rsync_large_backup.bin"
     start=$(gdate +%s.%N)
-    rsync -a "$BENCH_DIR/src/large.bin" "$BENCH_DIR/dst/rsync_large_backup.bin"
+    rsync -a --ignore-times "$BENCH_DIR/src/large.bin" "$BENCH_DIR/dst/rsync_large_backup.bin"
     end=$(gdate +%s.%N)
     elapsed=$(echo "$end - $start" | bc)
     rsync_times+=("$elapsed")

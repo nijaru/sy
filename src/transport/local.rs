@@ -1,11 +1,8 @@
 use super::{TransferResult, Transport};
-use crate::delta::{
-    apply_delta, calculate_block_size, compute_checksums, generate_delta_streaming, DeltaOp,
-};
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -236,50 +233,99 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
+            use std::io::{BufReader, BufWriter, Read, Write};
             use std::time::Instant;
 
-            // Calculate block size
-            let block_size = calculate_block_size(dest_size);
+            // For local->local delta sync, we can do better than rsync algorithm:
+            // Just compare blocks directly since we have both files locally.
+            // This is MUCH faster: no checksumming, no hash lookups, sequential I/O only.
 
-            // Compute checksums of destination file
-            let checksum_start = Instant::now();
-            tracing::debug!(
-                "Computing checksums for {} MB file...",
-                dest_size / 1024 / 1024
+            let block_size = 64 * 1024; // 64KB blocks for good I/O performance
+            let total_start = Instant::now();
+
+            // Open both files
+            let mut source_file = BufReader::with_capacity(
+                256 * 1024,
+                File::open(&source).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?,
             );
-            let dest_checksums =
-                compute_checksums(&dest, block_size).map_err(|e| SyncError::CopyError {
+            let mut dest_file = BufReader::with_capacity(
+                256 * 1024,
+                File::open(&dest).map_err(|e| SyncError::CopyError {
                     path: dest.clone(),
                     source: e,
-                })?;
-            let checksum_elapsed = checksum_start.elapsed();
-            tracing::debug!("Checksums computed in {:?}", checksum_elapsed);
+                })?,
+            );
 
-            // Generate delta with streaming (constant memory)
-            let delta_start = Instant::now();
-            tracing::debug!("Generating delta with streaming...");
-            let delta =
-                generate_delta_streaming(&source, &dest_checksums, block_size).map_err(|e| {
+            // Create temp file for writing
+            let temp_dest = dest.with_extension("sy.tmp");
+            let mut temp_file = BufWriter::with_capacity(
+                256 * 1024,
+                File::create(&temp_dest).map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?,
+            );
+
+            let mut source_buf = vec![0u8; block_size];
+            let mut dest_buf = vec![0u8; block_size];
+            let mut bytes_written = 0u64;
+            let mut literal_bytes = 0u64;
+            let mut copy_ops = 0usize;
+
+            // Compare and copy block by block
+            loop {
+                let src_read = source_file.read(&mut source_buf).map_err(|e| {
                     SyncError::CopyError {
                         path: source.clone(),
                         source: e,
                     }
                 })?;
-            let delta_elapsed = delta_start.elapsed();
-            tracing::debug!("Delta generated in {:?}", delta_elapsed);
+                if src_read == 0 {
+                    break; // EOF
+                }
 
-            // Calculate compression ratio
-            let literal_bytes: u64 = delta
-                .ops
-                .iter()
-                .filter_map(|op| {
-                    if let DeltaOp::Data(data) = op {
-                        Some(data.len() as u64)
-                    } else {
-                        None
-                    }
-                })
-                .sum();
+                let dst_read = dest_file.read(&mut dest_buf).map_err(|e| SyncError::CopyError {
+                    path: dest.clone(),
+                    source: e,
+                })?;
+
+                // Compare blocks
+                let blocks_match = src_read == dst_read && source_buf[..src_read] == dest_buf[..dst_read];
+
+                if !blocks_match {
+                    // Block changed or sizes different - write new data
+                    temp_file
+                        .write_all(&source_buf[..src_read])
+                        .map_err(|e| SyncError::CopyError {
+                            path: temp_dest.clone(),
+                            source: e,
+                        })?;
+                    literal_bytes += src_read as u64;
+                } else {
+                    // Block unchanged - copy from destination
+                    temp_file
+                        .write_all(&dest_buf[..dst_read])
+                        .map_err(|e| SyncError::CopyError {
+                            path: temp_dest.clone(),
+                            source: e,
+                        })?;
+                    copy_ops += 1;
+                }
+                bytes_written += src_read as u64;
+            }
+
+            // Flush temp file
+            temp_file.flush().map_err(|e| SyncError::CopyError {
+                path: temp_dest.clone(),
+                source: e,
+            })?;
+            drop(temp_file);
+
+            let total_elapsed = total_start.elapsed();
+            tracing::debug!("Local delta sync completed in {:?}", total_elapsed);
 
             let compression_ratio = if source_size > 0 {
                 (literal_bytes as f64 / source_size as f64) * 100.0
@@ -287,34 +333,23 @@ impl Transport for LocalTransport {
                 0.0
             };
 
-            // Apply delta to create temporary file
-            let apply_start = Instant::now();
-            tracing::debug!("Applying delta...");
-            let temp_dest = dest.with_extension("sy.tmp");
-            let delta_stats =
-                apply_delta(&dest, &delta, &temp_dest).map_err(|e| SyncError::CopyError {
-                    path: temp_dest.clone(),
-                    source: e,
-                })?;
-            let apply_elapsed = apply_start.elapsed();
-            tracing::debug!("Delta applied in {:?}", apply_elapsed);
-
             // Atomic rename
             fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
                 path: dest.clone(),
                 source: e,
             })?;
 
+            let total_ops = copy_ops + if literal_bytes > 0 { 1 } else { 0 };
             tracing::info!(
-                "Delta sync: {} ops, {:.1}% literal data",
-                delta_stats.operations_count,
+                "Local delta sync: {} blocks compared, {:.1}% changed",
+                total_ops,
                 compression_ratio
             );
 
             Ok::<TransferResult, SyncError>(TransferResult::with_delta(
-                delta_stats.bytes_written,
-                delta_stats.operations_count,
-                delta_stats.literal_bytes,
+                bytes_written,
+                total_ops,
+                literal_bytes,
             ))
         })
         .await
