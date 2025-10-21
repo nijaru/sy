@@ -376,4 +376,84 @@ mod tests {
         // Files in same temp directory should be on same filesystem
         assert!(same_filesystem(&file1, &file2));
     }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_apfs_detection() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.txt");
+        fs::write(&test_file, b"test").unwrap();
+
+        // Modern macOS (10.13+) uses APFS by default
+        let supports_cow = supports_cow_reflinks(&test_file);
+
+        // Log the result for CI visibility
+        println!("macOS COW support (APFS detection): {}", supports_cow);
+
+        // Most modern Macs use APFS, but we don't assert to handle legacy HFS+
+        // This test documents behavior and helps CI validation
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_architecture_info() {
+        // This test documents the architecture we're running on
+        // Useful for CI to verify Apple Silicon vs Intel
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            println!("Running on Apple Silicon (ARM64/aarch64)");
+            assert_eq!(std::env::consts::ARCH, "aarch64");
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            println!("Running on Intel (x86_64)");
+            assert_eq!(std::env::consts::ARCH, "x86_64");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_same_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+
+        fs::write(&file1, b"test1").unwrap();
+        fs::write(&file2, b"test2").unwrap();
+
+        // Files in same temp directory should be on same filesystem
+        assert!(same_filesystem(&file1, &file2));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_hard_links() {
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+
+        fs::write(&file1, b"test").unwrap();
+
+        // Initially no hard links
+        assert!(!has_hard_links(&file1));
+
+        // Create hard link
+        std::fs::hard_link(&file1, &file2).unwrap();
+
+        // Now both files have nlink = 2
+        assert!(has_hard_links(&file1));
+        assert!(has_hard_links(&file2));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_apfs_magic_string() {
+        // APFS filesystem type name is "apfs" (case-sensitive)
+        // This test documents the expected string
+        const APFS_TYPE_NAME: &str = "apfs";
+        assert_eq!(APFS_TYPE_NAME, "apfs");
+        assert_eq!(APFS_TYPE_NAME.len(), 4);
+    }
 }

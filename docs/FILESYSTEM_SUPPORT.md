@@ -3,6 +3,7 @@
 This document details how `sy` behaves on different filesystems and operating systems, particularly for delta sync operations.
 
 **Platform-specific documentation**:
+- 🍎 [macOS Support (MACOS_SUPPORT.md)](MACOS_SUPPORT.md) - macOS versions (12-15), Apple Silicon optimization, APFS performance
 - 🐧 [Linux Support (LINUX_SUPPORT.md)](LINUX_SUPPORT.md) - Linux distributions, filesystem optimization, and package installation
 - 🪟 [Windows Support (WINDOWS_SUPPORT.md)](WINDOWS_SUPPORT.md) - Windows-specific behavior, installation, and troubleshooting
 
