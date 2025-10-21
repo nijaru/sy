@@ -28,88 +28,90 @@ fn is_file_sparse(_metadata: &std::fs::Metadata) -> bool {
     false // Non-Unix platforms don't support sparse detection
 }
 
-/// Copy a sparse file while preserving holes using SEEK_HOLE/SEEK_DATA
+/// Copy a sparse file while preserving holes
 ///
-/// This function uses lseek with SEEK_HOLE and SEEK_DATA to efficiently copy
-/// only the data regions of a sparse file, preserving the holes (unallocated regions).
-///
-/// # Implementation
-///
-/// 1. Remove destination file if it exists (to start fresh)
-/// 2. Use SEEK_DATA to find data regions, SEEK_HOLE to find holes
-/// 3. Copy data regions, seek past holes in destination
-/// 4. Truncate to final size to preserve trailing holes
-///
-/// This is much more efficient than fs::copy() which materializes all holes.
+/// Tries to use SEEK_HOLE/SEEK_DATA for efficiency, falls back to block-based
+/// zero detection if not supported.
 #[cfg(unix)]
 fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    // Try SEEK_HOLE/SEEK_DATA first (most efficient)
+    match copy_sparse_file_seek(source, dest) {
+        Ok(size) => Ok(size),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            // SEEK_DATA not supported, fall back to block-based approach
+            copy_sparse_file_blocks(source, dest)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Copy sparse file using SEEK_HOLE/SEEK_DATA (fast path)
+#[cfg(unix)]
+fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::io::AsRawFd;
 
     const SEEK_DATA: i32 = 3; // Find next data region
     const SEEK_HOLE: i32 = 4; // Find next hole
 
-    // Open source file
     let mut src_file = File::open(source)?;
     let src_meta = src_file.metadata()?;
     let file_size = src_meta.len();
 
-    // Remove destination if exists, create new file
     if dest.exists() {
         fs::remove_file(dest)?;
     }
     let mut dst_file = File::create(dest)?;
 
-    // Set destination file size (creates sparse file)
-    dst_file.set_len(file_size)?;
-
     let mut pos: i64 = 0;
     let file_size_i64 = file_size as i64;
     let src_fd = src_file.as_raw_fd();
 
-    // Copy data regions while preserving holes
+    // Try SEEK_DATA first to check if supported
+    let first_data = unsafe { libc::lseek(src_fd, 0, SEEK_DATA) };
+    if first_data < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            return Err(err); // Not supported, caller will fall back
+        }
+        // ENXIO means file is all holes - just set size and return
+        dst_file.set_len(file_size)?;
+        return Ok(file_size);
+    }
+
+    // Seek back to start
+    unsafe { libc::lseek(src_fd, 0, libc::SEEK_SET) };
+    src_file.seek(SeekFrom::Start(0))?;
+
     while pos < file_size_i64 {
-        // Find next data region
         let data_start = unsafe { libc::lseek(src_fd, pos, SEEK_DATA) };
-
         if data_start < 0 {
-            // No more data regions
-            break;
+            break; // No more data (ENXIO)
         }
-
         if data_start >= file_size_i64 {
-            // Past end of file
             break;
         }
 
-        // Find next hole after this data region
         let hole_start = unsafe { libc::lseek(src_fd, data_start, SEEK_HOLE) };
-
         let data_end = if hole_start < 0 || hole_start > file_size_i64 {
-            // No hole found, data extends to EOF
             file_size_i64
         } else {
             hole_start
         };
 
         let data_len = (data_end - data_start) as usize;
-
-        // Seek source to data start
         src_file.seek(SeekFrom::Start(data_start as u64))?;
         dst_file.seek(SeekFrom::Start(data_start as u64))?;
 
-        // Copy this data region in chunks
         let mut remaining = data_len;
-        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+        let mut buffer = vec![0u8; 1024 * 1024];
 
         while remaining > 0 {
             let chunk_size = remaining.min(buffer.len());
             let read = src_file.read(&mut buffer[..chunk_size])?;
-
             if read == 0 {
                 break;
             }
-
             dst_file.write_all(&buffer[..read])?;
             remaining = remaining.saturating_sub(read);
         }
@@ -117,9 +119,56 @@ fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
         pos = data_end;
     }
 
-    // Ensure all data is written
+    dst_file.set_len(file_size)?;
     dst_file.sync_all()?;
+    Ok(file_size)
+}
 
+/// Copy sparse file by reading blocks and detecting zeros (slow path, portable)
+#[cfg(unix)]
+fn copy_sparse_file_blocks(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut src_file = File::open(source)?;
+    let src_meta = src_file.metadata()?;
+    let file_size = src_meta.len();
+
+    if dest.exists() {
+        fs::remove_file(dest)?;
+    }
+    let mut dst_file = File::create(dest)?;
+
+    const BLOCK_SIZE: usize = 4096; // Typical filesystem block size
+    let mut buffer = vec![0u8; BLOCK_SIZE];
+    let mut pos = 0u64;
+
+    while pos < file_size {
+        let to_read = ((file_size - pos) as usize).min(BLOCK_SIZE);
+        let read = src_file.read(&mut buffer[..to_read])?;
+        if read == 0 {
+            break;
+        }
+
+        // Check if block is all zeros (sparse hole)
+        if buffer[..read].iter().all(|&b| b == 0) {
+            // Skip this block (create hole by seeking)
+            pos += read as u64;
+        } else {
+            // Write non-zero data
+            dst_file.seek(SeekFrom::Start(pos))?;
+            dst_file.write_all(&buffer[..read])?;
+            pos += read as u64;
+        }
+    }
+
+    // Ensure file has correct size by seeking to end
+    // This creates trailing holes without allocating space
+    if pos < file_size {
+        dst_file.seek(SeekFrom::Start(file_size - 1))?;
+        dst_file.write_all(&[0])?;
+    }
+
+    dst_file.sync_all()?;
     Ok(file_size)
 }
 
