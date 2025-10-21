@@ -3,6 +3,7 @@ use super::{
     Transport,
 };
 use crate::error::Result;
+use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::path::SyncPath;
 use crate::ssh::config::{parse_ssh_config, SshConfig};
 use async_trait::async_trait;
@@ -25,11 +26,20 @@ impl TransportRouter {
     /// - Remote → Local: Use DualTransport (SSH for source, Local for dest)
     /// - Local → Remote: Use DualTransport (Local for source, SSH for dest)
     /// - Remote → Remote: Not supported yet (would require two SSH connections)
-    pub async fn new(source: &SyncPath, destination: &SyncPath) -> Result<Self> {
+    pub async fn new(
+        source: &SyncPath,
+        destination: &SyncPath,
+        checksum_type: ChecksumType,
+        verify_on_write: bool,
+    ) -> Result<Self> {
+        let verifier = IntegrityVerifier::new(checksum_type, verify_on_write);
+
         match (source, destination) {
             (SyncPath::Local(_), SyncPath::Local(_)) => {
                 // Both local: use local transport
-                Ok(TransportRouter::Local(LocalTransport::new()))
+                Ok(TransportRouter::Local(LocalTransport::with_verifier(
+                    verifier,
+                )))
             }
             (SyncPath::Local(_), SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote: use DualTransport
@@ -43,7 +53,7 @@ impl TransportRouter {
                     parse_ssh_config(host)?
                 };
 
-                let source_transport = Box::new(LocalTransport::new());
+                let source_transport = Box::new(LocalTransport::with_verifier(verifier.clone()));
                 let dest_transport = Box::new(SshTransport::new(&config).await?);
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
@@ -61,7 +71,7 @@ impl TransportRouter {
                 };
 
                 let source_transport = Box::new(SshTransport::new(&config).await?);
-                let dest_transport = Box::new(LocalTransport::new());
+                let dest_transport = Box::new(LocalTransport::with_verifier(verifier));
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }

@@ -1,6 +1,7 @@
 use super::{TransferResult, Transport};
 use crate::error::{format_bytes, Result, SyncError};
 use crate::fs_util::{has_hard_links, same_filesystem, supports_cow_reflinks};
+use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::sync::scanner::{FileEntry, Scanner};
 use crate::temp_file::TempFileGuard;
 use async_trait::async_trait;
@@ -31,11 +32,20 @@ fn is_file_sparse(_metadata: &std::fs::Metadata) -> bool {
 ///
 /// Implements the Transport trait for local filesystem operations.
 /// This wraps the existing Phase 1 implementation in the async Transport interface.
-pub struct LocalTransport;
+pub struct LocalTransport {
+    verifier: IntegrityVerifier,
+}
 
 impl LocalTransport {
     pub fn new() -> Self {
-        Self
+        // Default: no verification
+        Self {
+            verifier: IntegrityVerifier::new(ChecksumType::None, false),
+        }
+    }
+
+    pub fn with_verifier(verifier: IntegrityVerifier) -> Self {
+        Self { verifier }
     }
 }
 
@@ -217,6 +227,7 @@ impl Transport for LocalTransport {
         // Run delta sync in blocking task
         let source = source.to_path_buf();
         let dest = dest.to_path_buf();
+        let verifier = self.verifier.clone();
 
         tokio::task::spawn_blocking(move || {
             use crate::delta::estimate_change_ratio;
@@ -422,6 +433,35 @@ impl Transport for LocalTransport {
                                 path: temp_dest.clone(),
                                 source: e,
                             })?;
+
+                        // Verify block if paranoid mode enabled
+                        if verifier.verify_on_write() {
+                            let mut verify_buf = vec![0u8; src_read];
+                            temp_file
+                                .seek(SeekFrom::Start(offset))
+                                .map_err(|e| SyncError::CopyError {
+                                    path: temp_dest.clone(),
+                                    source: e,
+                                })?;
+                            temp_file
+                                .read_exact(&mut verify_buf)
+                                .map_err(|e| SyncError::CopyError {
+                                    path: temp_dest.clone(),
+                                    source: e,
+                                })?;
+
+                            if !verifier.verify_block(&source_buf[..src_read], &verify_buf)? {
+                                let expected = verifier.compute_data_checksum(&source_buf[..src_read])?;
+                                let actual = verifier.compute_data_checksum(&verify_buf)?;
+                                return Err(SyncError::BlockCorruption {
+                                    path: temp_dest.clone(),
+                                    block_number: (offset / block_size as u64) as usize,
+                                    expected_checksum: expected.to_hex(),
+                                    actual_checksum: actual.to_hex(),
+                                });
+                            }
+                        }
+
                         literal_bytes += src_read as u64;
                         changed_blocks += 1;
                     }
@@ -534,6 +574,34 @@ impl Transport for LocalTransport {
                             path: temp_dest.clone(),
                             source: e,
                         })?;
+
+                    // Verify block if paranoid mode enabled
+                    if verifier.verify_on_write() {
+                        let mut verify_buf = vec![0u8; src_read];
+                        temp_file
+                            .seek(SeekFrom::Start(offset))
+                            .map_err(|e| SyncError::CopyError {
+                                path: temp_dest.clone(),
+                                source: e,
+                            })?;
+                        temp_file
+                            .read_exact(&mut verify_buf)
+                            .map_err(|e| SyncError::CopyError {
+                                path: temp_dest.clone(),
+                                source: e,
+                            })?;
+
+                        if !verifier.verify_block(&source_buf[..src_read], &verify_buf)? {
+                            let expected = verifier.compute_data_checksum(&source_buf[..src_read])?;
+                            let actual = verifier.compute_data_checksum(&verify_buf)?;
+                            return Err(SyncError::BlockCorruption {
+                                path: temp_dest.clone(),
+                                block_number: (offset / block_size as u64) as usize,
+                                expected_checksum: expected.to_hex(),
+                                actual_checksum: actual.to_hex(),
+                            });
+                        }
+                    }
 
                     if !blocks_match {
                         literal_bytes += src_read as u64;

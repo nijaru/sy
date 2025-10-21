@@ -62,6 +62,14 @@ pub enum SyncError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Data corruption detected: {path}\nBlock {block_number} checksum mismatch after write.\nExpected: {expected_checksum}\nActual: {actual_checksum}\nThis indicates storage or memory corruption. The transfer has been aborted.")]
+    BlockCorruption {
+        path: PathBuf,
+        block_number: usize,
+        expected_checksum: String,
+        actual_checksum: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;

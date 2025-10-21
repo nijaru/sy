@@ -70,9 +70,9 @@ impl Checksum {
 }
 
 /// Integrity verifier for file transfers
+#[derive(Clone)]
 pub struct IntegrityVerifier {
     checksum_type: ChecksumType,
-    #[allow(dead_code)] // Field for future paranoid mode implementation
     verify_on_write: bool,
 }
 
@@ -131,6 +131,21 @@ impl IntegrityVerifier {
         let source_sum = self.compute_file_checksum(source)?;
         let dest_sum = self.compute_file_checksum(dest)?;
         Ok(source_sum == dest_sum)
+    }
+
+    /// Verify that a written block matches expected data
+    ///
+    /// This is used in paranoid mode to verify each block immediately after writing.
+    /// Returns true if block matches, false if corrupted.
+    pub fn verify_block(&self, expected_data: &[u8], actual_data: &[u8]) -> Result<bool> {
+        if !self.verify_on_write {
+            // Not in paranoid mode, skip verification
+            return Ok(true);
+        }
+
+        let expected_sum = self.compute_data_checksum(expected_data)?;
+        let actual_sum = self.compute_data_checksum(actual_data)?;
+        Ok(expected_sum == actual_sum)
     }
 }
 
@@ -278,5 +293,46 @@ mod tests {
         // Change destination content
         fs::write(&dest_path, b"Different content").unwrap();
         assert!(!verifier.verify_transfer(&source_path, &dest_path).unwrap());
+    }
+
+    #[test]
+    fn test_verify_block_disabled() {
+        let verifier = IntegrityVerifier::new(ChecksumType::Cryptographic, false);
+        let data1 = b"Hello, world!";
+        let data2 = b"Goodbye, world!";
+
+        // With verify_on_write = false, should always return true
+        assert!(verifier.verify_block(data1, data2).unwrap());
+    }
+
+    #[test]
+    fn test_verify_block_matching() {
+        let verifier = IntegrityVerifier::new(ChecksumType::Cryptographic, true);
+        let data = b"Test data for block verification";
+
+        // Same data should verify successfully
+        assert!(verifier.verify_block(data, data).unwrap());
+    }
+
+    #[test]
+    fn test_verify_block_mismatched() {
+        let verifier = IntegrityVerifier::new(ChecksumType::Cryptographic, true);
+        let expected = b"Expected data";
+        let actual = b"Different data";
+
+        // Different data should fail verification
+        assert!(!verifier.verify_block(expected, actual).unwrap());
+    }
+
+    #[test]
+    fn test_verify_block_fast_checksum() {
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, true);
+        let data = b"Fast checksum test data";
+
+        // Should work with fast checksums too
+        assert!(verifier.verify_block(data, data).unwrap());
+
+        let corrupted = b"Corrupted checksum data";
+        assert!(!verifier.verify_block(data, corrupted).unwrap());
     }
 }
