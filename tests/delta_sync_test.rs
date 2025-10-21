@@ -28,10 +28,7 @@ fn test_delta_sync_file_shrinks() {
 
     // Sync (should use delta sync since files exist)
     let output = Command::new(sy_bin())
-        .args([
-            source_file.to_str().unwrap(),
-            dest_file.to_str().unwrap(),
-        ])
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -66,10 +63,7 @@ fn test_delta_sync_file_grows() {
 
     // Sync
     let output = Command::new(sy_bin())
-        .args([
-            source_file.to_str().unwrap(),
-            dest_file.to_str().unwrap(),
-        ])
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -97,7 +91,7 @@ fn test_delta_sync_correctness() {
     let dest_file = dest.path().join("test.dat");
     let mut initial_data = Vec::new();
     for i in 0..10_000 {
-        write!(&mut initial_data, "block {:04}\n", i).unwrap();
+        writeln!(&mut initial_data, "block {:04}", i).unwrap();
     }
     fs::write(&dest_file, &initial_data).unwrap();
 
@@ -114,10 +108,7 @@ fn test_delta_sync_correctness() {
 
     // Sync using delta sync
     let output = Command::new(sy_bin())
-        .args([
-            source_file.to_str().unwrap(),
-            dest_file.to_str().unwrap(),
-        ])
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -226,14 +217,8 @@ fn test_hard_link_update_both_files_same_content() {
     // Verify both dest files have new content
     let dest_file1 = dest.path().join("file1.txt");
     let dest_file2 = dest.path().join("file2.txt");
-    assert_eq!(
-        fs::read_to_string(&dest_file1).unwrap(),
-        "modified content"
-    );
-    assert_eq!(
-        fs::read_to_string(&dest_file2).unwrap(),
-        "modified content"
-    );
+    assert_eq!(fs::read_to_string(&dest_file1).unwrap(), "modified content");
+    assert_eq!(fs::read_to_string(&dest_file2).unwrap(), "modified content");
 
     // Verify hard link still preserved
     let dest_inode1 = fs::metadata(&dest_file1).unwrap().ino();
@@ -274,10 +259,11 @@ fn test_cow_strategy_used_on_apfs() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("COW (clone + selective writes)") ||
-        stdout.contains("COW (clone + selective writes)"),
+        stderr.contains("COW (clone + selective writes)")
+            || stdout.contains("COW (clone + selective writes)"),
         "Should use COW strategy on APFS. Stderr: {}\nStdout: {}",
-        stderr, stdout
+        stderr,
+        stdout
     );
 }
 
@@ -321,10 +307,11 @@ fn test_inplace_strategy_used_with_hard_links() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        (stderr.contains("in-place (full file rebuild)") && stderr.contains("hard links")) ||
-        (stdout.contains("in-place (full file rebuild)") && stdout.contains("hard links")),
+        (stderr.contains("in-place (full file rebuild)") && stderr.contains("hard links"))
+            || (stdout.contains("in-place (full file rebuild)") && stdout.contains("hard links")),
         "Should use in-place strategy for hard links. Stderr: {}\nStdout: {}",
-        stderr, stdout
+        stderr,
+        stdout
     );
 }
 
@@ -400,10 +387,10 @@ fn test_strategy_selection_correctness() {
     // regardless of which strategy is chosen
 
     let test_sizes = vec![
-        1_000,      // 1KB
-        10_000,     // 10KB
-        100_000,    // 100KB
-        1_000_000,  // 1MB
+        1_000,     // 1KB
+        10_000,    // 10KB
+        100_000,   // 100KB
+        1_000_000, // 1MB
     ];
 
     for size in test_sizes {
@@ -493,12 +480,13 @@ fn test_cross_filesystem_uses_inplace_strategy() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        (stderr.contains("in-place (full file rebuild)") &&
-         stderr.contains("different filesystems")) ||
-        (stdout.contains("in-place (full file rebuild)") &&
-         stdout.contains("different filesystems")),
+        (stderr.contains("in-place (full file rebuild)")
+            && stderr.contains("different filesystems"))
+            || (stdout.contains("in-place (full file rebuild)")
+                && stdout.contains("different filesystems")),
         "Should use in-place strategy for cross-filesystem. Stderr: {}\nStdout: {}",
-        stderr, stdout
+        stderr,
+        stdout
     );
 
     // Cleanup

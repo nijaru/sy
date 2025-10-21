@@ -33,6 +33,7 @@ pub enum SyncError {
     },
 
     #[error("Delta sync failed for {path}\nStrategy: {strategy}\nCause: {source}\n{hint}")]
+    #[allow(clippy::enum_variant_names)]
     DeltaSyncError {
         path: PathBuf,
         strategy: String,

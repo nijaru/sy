@@ -2,7 +2,6 @@
 ///
 /// This module provides platform-specific filesystem detection to enable intelligent
 /// strategy selection in delta sync operations.
-
 use std::path::Path;
 
 /// Check if a filesystem supports copy-on-write (COW) reflinks
