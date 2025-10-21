@@ -129,10 +129,6 @@ fn test_delta_sync_correctness() {
         result_data, modified_data,
         "Dest file should be bit-identical to source after delta sync"
     );
-
-    // Verify delta sync was actually used (check log output)
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Should see delta sync messages in logs if RUST_LOG=debug
 }
 
 #[test]
@@ -243,4 +239,295 @@ fn test_hard_link_update_both_files_same_content() {
     let dest_inode1 = fs::metadata(&dest_file1).unwrap().ino();
     let dest_inode2 = fs::metadata(&dest_file2).unwrap().ino();
     assert_eq!(dest_inode1, dest_inode2, "Hard link should be preserved");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_cow_strategy_used_on_apfs() {
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    // Create dest file (15MB - above 10MB delta threshold)
+    let dest_file = dest.path().join("test.dat");
+    fs::write(&dest_file, vec![0u8; 15_000_000]).unwrap();
+
+    // Create source file with small change
+    let source_file = source.path().join("test.dat");
+    let mut source_data = vec![0u8; 15_000_000];
+    source_data[5_000_000] = 1; // Change one byte
+    fs::write(&source_file, &source_data).unwrap();
+
+    // Sync with debug logging
+    let output = Command::new(sy_bin())
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+        .env("RUST_LOG", "sy=info")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Sync should succeed");
+
+    // Verify result is correct
+    let result_data = fs::read(&dest_file).unwrap();
+    assert_eq!(result_data, source_data, "Dest should match source");
+
+    // Verify COW strategy was used (check logs)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("COW (clone + selective writes)") ||
+        stdout.contains("COW (clone + selective writes)"),
+        "Should use COW strategy on APFS. Stderr: {}\nStdout: {}",
+        stderr, stdout
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_inplace_strategy_used_with_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    // Create dest file with hard link (15MB - above 10MB delta threshold)
+    let dest_file = dest.path().join("test.dat");
+    let dest_link = dest.path().join("test_link.dat");
+    fs::write(&dest_file, vec![0u8; 15_000_000]).unwrap();
+    fs::hard_link(&dest_file, &dest_link).unwrap();
+
+    // Verify hard link exists
+    let nlink = fs::metadata(&dest_file).unwrap().nlink();
+    assert_eq!(nlink, 2, "Dest file should have hard link");
+
+    // Create source file with changes
+    let source_file = source.path().join("test.dat");
+    let source_data = vec![1u8; 15_000_000];
+    fs::write(&source_file, &source_data).unwrap();
+
+    // Sync with debug logging
+    let output = Command::new(sy_bin())
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+        .env("RUST_LOG", "sy=info")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Sync should succeed");
+
+    // Verify result is correct
+    let result_data = fs::read(&dest_file).unwrap();
+    assert_eq!(result_data, source_data, "Dest should match source");
+
+    // Verify in-place strategy was used (check logs)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        (stderr.contains("in-place (full file rebuild)") && stderr.contains("hard links")) ||
+        (stdout.contains("in-place (full file rebuild)") && stdout.contains("hard links")),
+        "Should use in-place strategy for hard links. Stderr: {}\nStdout: {}",
+        stderr, stdout
+    );
+}
+
+#[test]
+fn test_both_strategies_produce_identical_results() {
+    // This test creates identical scenarios and verifies both strategies
+    // produce bit-identical output
+
+    // Test data: 100KB file with 10KB changed in middle
+    let initial_data = vec![0u8; 100_000];
+    let mut modified_data = initial_data.clone();
+    for byte in &mut modified_data[45_000..55_000] {
+        *byte = 0xFF;
+    }
+
+    // Scenario 1: COW strategy (normal case)
+    {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+
+        let dest_file = dest.path().join("test.dat");
+        fs::write(&dest_file, &initial_data).unwrap();
+
+        let source_file = source.path().join("test.dat");
+        fs::write(&source_file, &modified_data).unwrap();
+
+        let output = Command::new(sy_bin())
+            .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+
+        let result1 = fs::read(&dest_file).unwrap();
+        assert_eq!(
+            result1, modified_data,
+            "COW strategy should produce correct output"
+        );
+    }
+
+    // Scenario 2: In-place strategy (via hard link)
+    #[cfg(unix)]
+    {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+
+        let dest_file = dest.path().join("test.dat");
+        let dest_link = dest.path().join("link.dat");
+        fs::write(&dest_file, &initial_data).unwrap();
+        fs::hard_link(&dest_file, &dest_link).unwrap();
+
+        let source_file = source.path().join("test.dat");
+        fs::write(&source_file, &modified_data).unwrap();
+
+        let output = Command::new(sy_bin())
+            .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+
+        let result2 = fs::read(&dest_file).unwrap();
+        assert_eq!(
+            result2, modified_data,
+            "In-place strategy should produce correct output"
+        );
+    }
+}
+
+#[test]
+fn test_strategy_selection_correctness() {
+    // Verify that strategy selection produces correct results
+    // regardless of which strategy is chosen
+
+    let test_sizes = vec![
+        1_000,      // 1KB
+        10_000,     // 10KB
+        100_000,    // 100KB
+        1_000_000,  // 1MB
+    ];
+
+    for size in test_sizes {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+
+        // Create dest file
+        let dest_file = dest.path().join("test.dat");
+        fs::write(&dest_file, vec![0u8; size]).unwrap();
+
+        // Create source file with random changes
+        let source_file = source.path().join("test.dat");
+        let source_data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        fs::write(&source_file, &source_data).unwrap();
+
+        // Sync
+        let output = Command::new(sy_bin())
+            .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "Sync should succeed for size {}",
+            size
+        );
+
+        // Verify correctness
+        let result_data = fs::read(&dest_file).unwrap();
+        assert_eq!(
+            result_data, source_data,
+            "Dest should match source exactly for size {}",
+            size
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore] // Requires manual setup with multiple mounted filesystems
+fn test_cross_filesystem_uses_inplace_strategy() {
+    // This test verifies that cross-filesystem delta sync uses in-place strategy.
+    //
+    // To run this test manually:
+    // 1. Create a ramdisk or mount a different filesystem
+    // 2. Set CROSS_FS_PATH environment variable to a path on that filesystem
+    // 3. Run: cargo test test_cross_filesystem_uses_inplace_strategy -- --ignored --nocapture
+    //
+    // Example on macOS:
+    //   hdiutil attach -nomount ram://204800  # 100MB ramdisk
+    //   diskutil erasevolume APFS "TestFS" /dev/diskN
+    //   export CROSS_FS_PATH=/Volumes/TestFS
+    //   cargo test test_cross_filesystem_uses_inplace_strategy -- --ignored --nocapture
+    //   hdiutil detach /dev/diskN
+
+    use std::env;
+
+    let cross_fs_path = env::var("CROSS_FS_PATH")
+        .expect("CROSS_FS_PATH not set - see test comments for setup instructions");
+
+    let source = TempDir::new().unwrap();
+    let cross_fs_dest = std::path::PathBuf::from(&cross_fs_path);
+
+    // Create dest file on cross-filesystem (15MB - above delta threshold)
+    let dest_file = cross_fs_dest.join("test_cross_fs.dat");
+    fs::write(&dest_file, vec![0u8; 15_000_000]).unwrap();
+
+    // Create source file with changes
+    let source_file = source.path().join("test.dat");
+    let source_data = vec![1u8; 15_000_000];
+    fs::write(&source_file, &source_data).unwrap();
+
+    // Sync with debug logging
+    let output = Command::new(sy_bin())
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+        .env("RUST_LOG", "sy=info")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Sync should succeed");
+
+    // Verify result is correct
+    let result_data = fs::read(&dest_file).unwrap();
+    assert_eq!(result_data, source_data, "Dest should match source");
+
+    // Verify in-place strategy was used (check logs)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        (stderr.contains("in-place (full file rebuild)") &&
+         stderr.contains("different filesystems")) ||
+        (stdout.contains("in-place (full file rebuild)") &&
+         stdout.contains("different filesystems")),
+        "Should use in-place strategy for cross-filesystem. Stderr: {}\nStdout: {}",
+        stderr, stdout
+    );
+
+    // Cleanup
+    let _ = fs::remove_file(&dest_file);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_same_filesystem_detection() {
+    // Unit test for same_filesystem function using standard library metadata
+
+    use sy::fs_util::same_filesystem;
+
+    let temp = TempDir::new().unwrap();
+    let file1 = temp.path().join("file1.txt");
+    let file2 = temp.path().join("file2.txt");
+
+    fs::write(&file1, b"test1").unwrap();
+    fs::write(&file2, b"test2").unwrap();
+
+    // Files in same directory should be on same filesystem
+    assert!(
+        same_filesystem(&file1, &file2),
+        "Files in same directory should be on same filesystem"
+    );
+
+    // File and its parent directory should be on same filesystem
+    assert!(
+        same_filesystem(&file1, temp.path()),
+        "File and parent directory should be on same filesystem"
+    );
 }
