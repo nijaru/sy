@@ -522,3 +522,97 @@ fn test_same_filesystem_detection() {
         "File and parent directory should be on same filesystem"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn test_sparse_file_delta_sync_preserves_sparseness() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    // Create sparse destination file (10MB with hole in middle)
+    let dest_file = dest.path().join("sparse.dat");
+    {
+        let mut f = fs::File::create(&dest_file).unwrap();
+        f.write_all(&vec![0xAA; 1_000_000]).unwrap(); // 1MB data
+        f.seek(SeekFrom::Current(8_000_000)).unwrap(); // 8MB hole
+        f.write_all(&vec![0xBB; 1_000_000]).unwrap(); // 1MB data
+        f.sync_all().unwrap();
+    }
+
+    // Check if filesystem supports sparse files (ext4, XFS, btrfs do; APFS may not)
+    let dest_meta = fs::metadata(&dest_file).unwrap();
+    if dest_meta.blocks() * 512 >= dest_meta.len() {
+        eprintln!(
+            "Filesystem doesn't support sparse files (allocated {} >= logical {}), skipping test",
+            dest_meta.blocks() * 512,
+            dest_meta.len()
+        );
+        return;
+    }
+
+    assert_eq!(dest_meta.len(), 10_000_000, "Dest logical size should be 10MB");
+
+    // Create sparse source file (different content, still sparse)
+    let source_file = source.path().join("sparse.dat");
+    {
+        let mut f = fs::File::create(&source_file).unwrap();
+        f.write_all(&vec![0xCC; 1_000_000]).unwrap(); // 1MB different data
+        f.seek(SeekFrom::Current(8_000_000)).unwrap(); // 8MB hole
+        f.write_all(&vec![0xDD; 1_000_000]).unwrap(); // 1MB different data
+        f.sync_all().unwrap();
+    }
+
+    // Verify source is sparse
+    let source_meta = fs::metadata(&source_file).unwrap();
+    assert_eq!(
+        source_meta.len(),
+        10_000_000,
+        "Source logical size should be 10MB"
+    );
+    assert!(
+        source_meta.blocks() * 512 < source_meta.len(),
+        "Source should be sparse (allocated < logical)"
+    );
+
+    // Sync with info logging
+    let output = Command::new(sy_bin())
+        .args([source_file.to_str().unwrap(), dest_file.to_str().unwrap()])
+        .env("RUST_LOG", "sy=info")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Sync should succeed for sparse file");
+
+    // Verify sparseness is preserved in destination
+    let result_meta = fs::metadata(&dest_file).unwrap();
+    assert_eq!(
+        result_meta.len(),
+        10_000_000,
+        "Result logical size should be 10MB"
+    );
+    assert!(
+        result_meta.blocks() * 512 < result_meta.len(),
+        "Result should be sparse (allocated < logical)"
+    );
+
+    // Verify content matches (read full file to check data + holes)
+    let source_data = fs::read(&source_file).unwrap();
+    let dest_data = fs::read(&dest_file).unwrap();
+    assert_eq!(
+        dest_data, source_data,
+        "Dest content should match source exactly"
+    );
+
+    // Verify sparse-aware copy was used
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("sparse") || stdout.contains("sparse"),
+        "Should log sparse file detection. Stderr: {}\nStdout: {}",
+        stderr,
+        stdout
+    );
+}

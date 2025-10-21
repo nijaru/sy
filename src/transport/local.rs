@@ -274,6 +274,32 @@ impl Transport for LocalTransport {
                 }
             }
 
+            // Check if source file is sparse
+            // Sparse files should use full copy to preserve holes efficiently
+            let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
+                path: source.clone(),
+                source: e,
+            })?;
+
+            if is_file_sparse(&source_meta) {
+                tracing::info!(
+                    "Source file is sparse (allocated size < logical size), using sparse-aware copy"
+                );
+
+                // Use fs::copy which preserves sparseness on Unix
+                let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+                tracing::debug!(
+                    "Sparse file copy complete: {} bytes logical size",
+                    bytes_written
+                );
+
+                return Ok(TransferResult::new(bytes_written));
+            }
+
             // Choose delta sync strategy based on filesystem capabilities and file properties
             let supports_cow = supports_cow_reflinks(&dest);
             let same_fs = same_filesystem(&source, &dest);
