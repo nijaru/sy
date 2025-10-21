@@ -2,7 +2,7 @@
 
 > Modern file synchronization tool - rsync, reimagined
 
-**sy** (pronounced "sigh") is a modern file sync tool built in Rust, inspired by the UX of `eza`, `fd`, and `ripgrep`. It's not a drop-in rsync replacement - it's a reimagining of file sync with verifiable integrity, adaptive performance, and transparent tradeoffs.
+**sy** (pronounced "sigh") is a fast, modern file synchronization tool inspired by the UX of `eza`, `fd`, and `ripgrep`. It's not a drop-in rsync replacement - it's a reimagining of file sync with verifiable integrity, adaptive performance, and transparent tradeoffs.
 
 ## Why sy?
 
@@ -724,9 +724,9 @@ cargo test -- --nocapture
 
 **Code Quality:**
 - ✅ Zero compiler warnings
-- ✅ Zero clippy warnings
+- ✅ Zero linter warnings
 - ✅ 100% of public API documented
-- ✅ 5,500+ lines of Rust code
+- ✅ 5,500+ lines of code
 - ✅ All performance tests passing
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for performance testing and regression tracking.
@@ -743,7 +743,7 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for performance testing and regre
 | **500 files** | <10 ms | 110 ms | **11x faster** |
 
 **Why so fast?**
-- Modern Rust stdlib with platform optimizations (`copy_file_range`, `clonefile`)
+- Modern platform optimizations (`copy_file_range`, `clonefile`)
 - Parallel file transfers (10 workers by default)
 - Parallel checksum computation
 - Efficient scanning with pre-allocated vectors
@@ -773,7 +773,7 @@ MIT
 Inspired by:
 - **rsync** - The algorithm that started it all
 - **rclone** - Proof that parallel transfers work
-- **eza**, **fd**, **ripgrep** - Beautiful UX in Rust CLI tools
+- **eza**, **fd**, **ripgrep** - Beautiful UX in modern CLI tools
 - **Syncthing** - Block-based integrity model
 
 Research that informed the design:
