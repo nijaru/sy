@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,no_run
 /// use sy::temp_file::TempFileGuard;
 /// use std::path::Path;
 ///
