@@ -225,16 +225,29 @@ impl Transport for LocalTransport {
             let total_start = Instant::now();
 
             // Choose delta sync strategy based on filesystem capabilities and file properties
-            let use_cow_strategy = supports_cow_reflinks(&dest)
-                && same_filesystem(&source, &dest)
-                && !has_hard_links(&dest);
+            let supports_cow = supports_cow_reflinks(&dest);
+            let same_fs = same_filesystem(&source, &dest);
+            let has_hardlinks = has_hard_links(&dest);
 
-            if !use_cow_strategy {
-                tracing::debug!(
-                    "Using in-place delta sync (COW: {}, same FS: {}, hard links: {})",
-                    supports_cow_reflinks(&dest),
-                    same_filesystem(&source, &dest),
-                    has_hard_links(&dest)
+            let use_cow_strategy = supports_cow && same_fs && !has_hardlinks;
+
+            // Log strategy selection for debugging
+            if use_cow_strategy {
+                tracing::info!(
+                    "Delta sync strategy: COW (clone + selective writes) - filesystem supports COW reflinks"
+                );
+            } else {
+                let reason = if !supports_cow {
+                    "filesystem does not support COW reflinks"
+                } else if !same_fs {
+                    "source and dest on different filesystems"
+                } else {
+                    "destination has hard links (preserving link integrity)"
+                };
+
+                tracing::info!(
+                    "Delta sync strategy: in-place (full file rebuild) - {}",
+                    reason
                 );
             }
 

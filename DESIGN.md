@@ -61,18 +61,129 @@ if file.size > CHUNK_THRESHOLD {
 
 ### 2. Delta Sync Algorithm
 
-**Decision**: Use rsync's rolling hash algorithm, not reinvent.
+**Decision**: Different algorithms for local vs remote sync - simple comparison for local, rsync algorithm for remote.
+
+**Key Insight**: When both files are available locally (source and destination on same machine), rsync's rolling hash algorithm is unnecessary overhead. The algorithm was designed for the constraint that only ONE file is available locally.
+
+**Local Delta Sync** (v0.0.23+):
+```rust
+// Both files available locally - direct block comparison
+let mut source_file = File::open(&source)?;
+let mut dest_file = File::open(&dest)?;
+
+loop {
+    let src_bytes = source_file.read(&mut src_buf)?;
+    let dst_bytes = dest_file.read(&mut dst_buf)?;
+
+    if src_buf[..src_bytes] != dst_buf[..dst_bytes] {
+        // Blocks differ - need to write
+        write_block_to_temp(src_buf, src_bytes)?;
+    } else {
+        // Blocks match - skip write (if using COW strategy)
+    }
+}
+```
+
+**Performance**: 6x faster than rsync algorithm for local sync (no rolling hash computation, no signature generation/lookup).
+
+**Remote Delta Sync** (future):
+- Use rsync's rolling hash algorithm (Adler-32)
+- Generate signatures on destination, send to source
+- Source computes delta using rolling hash
+- Send delta operations (Copy/Data) to destination
 
 **Rationale**:
-- Research shows rsync is still state-of-the-art for single-round protocols
+- Research shows rsync is still state-of-the-art for single-round remote protocols
 - Multi-round protocols save bandwidth but add latency (not worth it)
-- rsync algorithm is battle-tested, well-understood
-- Focus innovation on parallel transfers, not delta algorithm
+- rsync algorithm is battle-tested, well-understood for remote sync
+- For local sync, both files available → simpler approach is faster
 
-**Enhancements over classic rsync**:
-- Parallel chunk processing where possible
-- Modern hash functions (xxHash3 instead of MD5)
-- Better progress reporting during block comparison
+#### COW-Aware Strategy Selection (v0.0.23+)
+
+**Decision**: Auto-detect filesystem capabilities and choose optimal delta sync strategy.
+
+**Two Strategies**:
+
+1. **COW Strategy** (Copy-on-Write filesystems):
+   ```rust
+   // Clone destination file (instant COW reflink - ~1ms for 100MB)
+   fs::copy(&dest, &temp)?;
+
+   // Only write changed blocks to clone
+   if src_block != dst_block {
+       temp_file.seek(offset)?;
+       temp_file.write_all(src_block)?;
+   }
+   // Unchanged blocks: skip write, clone already has correct data
+   ```
+
+   **Performance**: 33% faster (61ms vs 92ms for 1MB Δ in 100MB file)
+
+   **Used when**:
+   - Filesystem supports COW reflinks (APFS, BTRFS, XFS)
+   - Source and destination on same filesystem (same device ID)
+   - Destination has no hard links (preserves hard link integrity)
+
+2. **In-place Strategy** (non-COW filesystems):
+   ```rust
+   // Create temp file, allocate space
+   let temp = File::create(temp_path)?;
+   temp.set_len(source_size)?;
+
+   // Write ALL blocks (changed + unchanged) to build complete file
+   loop {
+       temp_file.seek(offset)?;
+       temp_file.write_all(src_block)?;
+   }
+   ```
+
+   **Performance**: Avoids 2x regression on ext4 (most common Linux filesystem)
+
+   **Used when**:
+   - Filesystem doesn't support COW (ext4, NTFS, HFS+)
+   - Cross-filesystem sync (different mount points)
+   - Destination has hard links (nlink > 1)
+
+**Filesystem Detection** (src/fs_util.rs):
+```rust
+// macOS: Check filesystem type name
+#[cfg(target_os = "macos")]
+pub fn supports_cow_reflinks(path: &Path) -> bool {
+    // Use statfs to get f_fstypename field
+    // Return true if filesystem is "apfs"
+}
+
+// Linux: Check filesystem magic numbers
+#[cfg(target_os = "linux")]
+pub fn supports_cow_reflinks(path: &Path) -> bool {
+    // Use statfs to get f_type field
+    // Return true if BTRFS (0x9123683E) or XFS (0x58465342)
+}
+
+// Cross-filesystem detection
+pub fn same_filesystem(path1: &Path, path2: &Path) -> bool {
+    // Compare dev_t device IDs from metadata
+    meta1.dev() == meta2.dev()
+}
+
+// Hard link detection
+pub fn has_hard_links(path: &Path) -> bool {
+    // Check nlink field from metadata
+    metadata.nlink() > 1
+}
+```
+
+**Critical for correctness**:
+- Hard links MUST use in-place strategy (COW clone creates new inode, breaking link)
+- File truncation when source < dest (both strategies use `set_len()`)
+- Platform-specific `fs::copy()` optimizations:
+  - macOS: `clonefile()` for instant COW reflinks
+  - Linux: `copy_file_range()` for zero-copy I/O
+
+**Performance data** (v0.0.23, macOS M3 Max, APFS):
+- Full file copy: 47% faster (39ms vs 73ms for 100MB) using `fs::copy()` vs manual loop
+- Delta sync (1MB Δ in 100MB): 5.7x faster than rsync (58ms vs 330ms)
+- Delta sync (identical files): 8.8x faster than rsync (36ms vs 320ms)
 
 ---
 

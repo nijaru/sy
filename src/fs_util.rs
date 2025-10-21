@@ -1,3 +1,8 @@
+/// Filesystem utility functions for detecting COW support, hard links, and cross-filesystem operations.
+///
+/// This module provides platform-specific filesystem detection to enable intelligent
+/// strategy selection in delta sync operations.
+
 use std::path::Path;
 
 /// Check if a filesystem supports copy-on-write (COW) reflinks
@@ -14,6 +19,26 @@ use std::path::Path;
 /// - Linux: ext4, ext3 (most common)
 /// - Windows: NTFS (most common)
 /// - macOS: HFS+ (legacy)
+///
+/// # Implementation Details
+///
+/// - **macOS**: Uses `statfs` to check filesystem type name against "apfs"
+/// - **Linux**: Uses `statfs` to check magic number (BTRFS=0x9123683E, XFS=0x58465342)
+/// - **Other platforms**: Returns false (conservative approach)
+///
+/// # Example
+///
+/// ```rust
+/// use sy::fs_util::supports_cow_reflinks;
+/// use std::path::Path;
+///
+/// let path = Path::new("/tmp/test.txt");
+/// if supports_cow_reflinks(path) {
+///     println!("Can use COW optimization");
+/// } else {
+///     println!("Using in-place strategy");
+/// }
+/// ```
 #[cfg(target_os = "macos")]
 pub fn supports_cow_reflinks(path: &Path) -> bool {
     use std::ffi::CString;
@@ -103,6 +128,30 @@ pub fn supports_cow_reflinks(_path: &Path) -> bool {
 ///
 /// COW reflinks only work within the same filesystem.
 /// This checks if source and dest are on the same device.
+///
+/// # Implementation
+///
+/// Compares the `dev_t` device ID from `stat()` metadata.
+/// Files on different devices (different partitions, mount points, etc.)
+/// will have different device IDs.
+///
+/// # Returns
+///
+/// - `true` if both paths are on the same filesystem device
+/// - `false` if on different devices or if metadata cannot be read
+///
+/// # Example
+///
+/// ```rust
+/// use sy::fs_util::same_filesystem;
+/// use std::path::Path;
+///
+/// let src = Path::new("/home/user/file1.txt");
+/// let dst = Path::new("/home/user/file2.txt");
+/// if same_filesystem(src, dst) {
+///     println!("Same filesystem - can use COW");
+/// }
+/// ```
 #[cfg(unix)]
 pub fn same_filesystem(path1: &Path, path2: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -129,6 +178,35 @@ pub fn same_filesystem(_path1: &Path, _path2: &Path) -> bool {
 ///
 /// If a file has hard links, COW cloning would break the link relationship.
 /// We need to use in-place updates to preserve hard links.
+///
+/// # How Hard Links Work
+///
+/// Multiple directory entries can point to the same inode. When `nlink > 1`,
+/// the file has multiple names (paths) pointing to the same data.
+///
+/// **Critical for correctness**: If we COW clone a hard-linked file, we create
+/// a new inode, breaking the link. Changes to one "link" won't appear in others.
+///
+/// # Implementation
+///
+/// Reads the `nlink` field from file metadata. Returns `true` if `nlink > 1`.
+///
+/// # Returns
+///
+/// - `true` if file has hard links (nlink > 1)
+/// - `false` if file is standalone (nlink == 1) or metadata cannot be read
+///
+/// # Example
+///
+/// ```rust
+/// use sy::fs_util::has_hard_links;
+/// use std::path::Path;
+///
+/// let path = Path::new("/tmp/file.txt");
+/// if has_hard_links(path) {
+///     println!("File has hard links - must use in-place strategy");
+/// }
+/// ```
 #[cfg(unix)]
 pub fn has_hard_links(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;

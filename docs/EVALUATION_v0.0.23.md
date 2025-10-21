@@ -164,10 +164,10 @@ warning: function `compute_checksums` is never used
 
 ### DESIGN.md Updates Needed
 
-1. Update delta sync section for local optimization
-2. Document COW reflink strategy
-3. Document in-place strategy for non-COW
-4. Update performance expectations
+1. ✅ Update delta sync section for local optimization
+2. ✅ Document COW reflink strategy
+3. ✅ Document in-place strategy for non-COW
+4. ✅ Update performance expectations
 
 ### New Documentation Needed
 
@@ -202,7 +202,7 @@ warning: function `compute_checksums` is never used
 2. ⏳ Add cross-filesystem tests
 3. ⏳ Improve error messages
 4. ⏳ Add temp file cleanup on drop
-5. ⏳ Update DESIGN.md
+5. ✅ Update DESIGN.md
 
 ### LOW PRIORITY (v0.1.0)
 
