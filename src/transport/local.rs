@@ -1,7 +1,8 @@
 use super::{TransferResult, Transport};
-use crate::error::{Result, SyncError};
+use crate::error::{format_bytes, Result, SyncError};
 use crate::fs_util::{has_hard_links, same_filesystem, supports_cow_reflinks};
 use crate::sync::scanner::{FileEntry, Scanner};
+use crate::temp_file::TempFileGuard;
 use async_trait::async_trait;
 use std::fs::{self, File};
 use std::path::Path;
@@ -254,12 +255,19 @@ impl Transport for LocalTransport {
             // Strategy 1: COW clone + selective writes (fast on APFS/BTRFS/XFS)
             // Strategy 2: In-place delta (for ext4, hard links, cross-filesystem)
             let temp_dest = dest.with_extension("sy.tmp");
+            let temp_guard = TempFileGuard::new(&temp_dest);
 
             let (bytes_written, literal_bytes, changed_blocks) = if use_cow_strategy {
                 // COW Strategy: Clone file (instant), then selectively overwrite changed blocks
-                fs::copy(&dest, &temp_dest).map_err(|e| SyncError::CopyError {
+                fs::copy(&dest, &temp_dest).map_err(|e| SyncError::DeltaSyncError {
                     path: temp_dest.clone(),
+                    strategy: "COW (clone + selective writes)".to_string(),
                     source: e,
+                    hint: "COW file cloning failed. This may happen if:\n  \
+                           - Filesystem doesn't support reflinks (needs APFS, BTRFS, or XFS)\n  \
+                           - Cross-filesystem operation detected\n  \
+                           - Insufficient disk space\n  \
+                           Falling back to in-place strategy may help.".to_string(),
                 })?;
 
                 // Strip xattrs from clone (fs::copy may preserve them)
@@ -367,13 +375,20 @@ impl Transport for LocalTransport {
                 // This avoids slow fs::copy() on non-COW filesystems like ext4
 
                 // Create empty temp file and allocate space
-                let temp_file = File::create(&temp_dest).map_err(|e| SyncError::CopyError {
+                let temp_file = File::create(&temp_dest).map_err(|e| SyncError::DeltaSyncError {
                     path: temp_dest.clone(),
+                    strategy: "in-place (full file rebuild)".to_string(),
                     source: e,
+                    hint: "Failed to create temporary file for delta sync.\n  \
+                           Check write permissions and disk space on destination.".to_string(),
                 })?;
-                temp_file.set_len(source_size).map_err(|e| SyncError::CopyError {
+                temp_file.set_len(source_size).map_err(|e| SyncError::DeltaSyncError {
                     path: temp_dest.clone(),
+                    strategy: "in-place (full file rebuild)".to_string(),
                     source: e,
+                    hint: format!("Failed to allocate {} for temporary file.\n  \
+                                  Check available disk space on destination.",
+                                  format_bytes(source_size)),
                 })?;
                 drop(temp_file);
 
@@ -482,6 +497,9 @@ impl Transport for LocalTransport {
                 path: dest.clone(),
                 source: e,
             })?;
+
+            // Defuse temp file guard - file successfully renamed
+            temp_guard.defuse();
 
             let total_blocks = bytes_written.div_ceil(block_size as u64) as usize;
             tracing::info!(

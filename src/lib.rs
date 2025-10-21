@@ -11,4 +11,5 @@ pub mod path;
 pub mod resource;
 pub mod ssh;
 pub mod sync;
+pub mod temp_file;
 pub mod transport;

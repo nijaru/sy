@@ -11,6 +11,7 @@ mod path;
 mod resource;
 mod ssh;
 mod sync;
+mod temp_file;
 mod transport;
 
 use anyhow::{Context as _, Result};

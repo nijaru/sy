@@ -32,6 +32,14 @@ pub enum SyncError {
         source: std::io::Error,
     },
 
+    #[error("Delta sync failed for {path}\nStrategy: {strategy}\nCause: {source}\n{hint}")]
+    DeltaSyncError {
+        path: PathBuf,
+        strategy: String,
+        source: std::io::Error,
+        hint: String,
+    },
+
     #[error("Invalid path: {path}\nPaths must be valid UTF-8 and not contain invalid characters.")]
     InvalidPath { path: PathBuf },
 
@@ -58,7 +66,7 @@ pub enum SyncError {
 pub type Result<T> = std::result::Result<T, SyncError>;
 
 /// Format bytes for human-readable display in error messages
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
