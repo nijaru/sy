@@ -285,9 +285,13 @@ fn test_inplace_strategy_used_with_hard_links() {
     let nlink = fs::metadata(&dest_file).unwrap().nlink();
     assert_eq!(nlink, 2, "Dest file should have hard link");
 
-    // Create source file with changes
+    // Create source file with changes (only change 25% to stay below 75% threshold)
     let source_file = source.path().join("test.dat");
-    let source_data = vec![1u8; 15_000_000];
+    let mut source_data = vec![0u8; 15_000_000];
+    // Change only the first 25% (3.75MB)
+    for byte in &mut source_data[..3_750_000] {
+        *byte = 1;
+    }
     fs::write(&source_file, &source_data).unwrap();
 
     // Sync with debug logging

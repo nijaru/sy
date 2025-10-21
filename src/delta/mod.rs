@@ -1,6 +1,7 @@
 pub mod applier;
 pub mod checksum;
 pub mod generator;
+pub mod ratio;
 pub mod rolling;
 
 // Delta sync functions for remote sync (not used for local sync which uses block comparison)
@@ -10,6 +11,8 @@ pub use applier::apply_delta;
 pub use checksum::{compute_checksums, BlockChecksum};
 #[allow(unused_imports)]
 pub use generator::{generate_delta, generate_delta_streaming, Delta, DeltaOp};
+#[allow(unused_imports)]
+pub use ratio::{estimate_change_ratio, ChangeRatioResult};
 pub use rolling::Adler32;
 
 /// Default block size calculation: sqrt(filesize)

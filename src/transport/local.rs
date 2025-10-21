@@ -219,11 +219,60 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
+            use crate::delta::estimate_change_ratio;
             use std::io::{BufReader, Read, Seek, SeekFrom, Write};
             use std::time::Instant;
 
             let block_size = 64 * 1024; // 64KB blocks for good I/O performance
             let total_start = Instant::now();
+
+            // Sample blocks to estimate change ratio
+            // If >75% of file has changed, full copy is faster than delta sync
+            let change_ratio_result = estimate_change_ratio(
+                &source,
+                &dest,
+                block_size,
+                Some(20), // Sample 20 blocks
+                Some(0.75), // 75% threshold
+            );
+
+            match change_ratio_result {
+                Ok(ratio) => {
+                    tracing::info!(
+                        "Change ratio: {} ({}/{} blocks changed)",
+                        ratio.change_ratio_percent(),
+                        ratio.blocks_changed,
+                        ratio.blocks_sampled
+                    );
+
+                    if !ratio.use_delta {
+                        tracing::info!(
+                            "Change ratio {} exceeds threshold {:.1}%, using full copy instead of delta sync",
+                            ratio.change_ratio_percent(),
+                            ratio.threshold * 100.0
+                        );
+
+                        // Fallback to full copy
+                        let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
+                            path: source.clone(),
+                            source: e,
+                        })?;
+
+                        return Ok(TransferResult::new(bytes_written));
+                    }
+
+                    tracing::info!(
+                        "Change ratio {} below threshold, proceeding with delta sync",
+                        ratio.change_ratio_percent()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to estimate change ratio: {}. Proceeding with delta sync anyway.",
+                        e
+                    );
+                }
+            }
 
             // Choose delta sync strategy based on filesystem capabilities and file properties
             let supports_cow = supports_cow_reflinks(&dest);
