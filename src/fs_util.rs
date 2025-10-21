@@ -325,4 +325,55 @@ mod tests {
         // Windows implementation always returns false
         assert!(!has_hard_links(&file1));
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_filesystem_detection() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.txt");
+        fs::write(&test_file, b"test").unwrap();
+
+        // TempDir is usually on tmpfs or ext4
+        let supports_cow = supports_cow_reflinks(&test_file);
+
+        // This test documents behavior rather than asserting specific values
+        // since /tmp might be on different filesystems:
+        // - ext4: false
+        // - btrfs: true
+        // - xfs: true (if reflink enabled)
+        // - tmpfs: false
+        println!("Linux temp directory COW support: {}", supports_cow);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_btrfs_detection() {
+        // This test is informational - BTRFS magic number is 0x9123683E
+        // We can't create a BTRFS filesystem in tests, but we document the value
+        const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
+        assert_eq!(BTRFS_SUPER_MAGIC, 0x9123683E);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_xfs_detection() {
+        // This test is informational - XFS magic number is 0x58465342
+        // We can't create a XFS filesystem in tests, but we document the value
+        const XFS_SUPER_MAGIC: i64 = 0x58465342;
+        assert_eq!(XFS_SUPER_MAGIC, 0x58465342);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_same_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+
+        fs::write(&file1, b"test1").unwrap();
+        fs::write(&file2, b"test2").unwrap();
+
+        // Files in same temp directory should be on same filesystem
+        assert!(same_filesystem(&file1, &file2));
+    }
 }

@@ -95,6 +95,53 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  linux-distros:
+    name: Linux Distros
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        distro:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+          - fedora:40
+          - alpine:3.19
+    container:
+      image: ${{ matrix.distro }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Debian/Ubuntu)
+        if: startsWith(matrix.distro, 'ubuntu') || startsWith(matrix.distro, 'debian')
+        run: |
+          apt-get update
+          apt-get install -y curl gcc libacl1-dev pkg-config libssl-dev
+
+      - name: Install dependencies (Fedora)
+        if: startsWith(matrix.distro, 'fedora')
+        run: |
+          dnf install -y gcc libacl-devel openssl-devel pkg-config curl
+
+      - name: Install dependencies (Alpine)
+        if: startsWith(matrix.distro, 'alpine')
+        run: |
+          apk add --no-cache curl gcc musl-dev acl-dev openssl-dev pkgconfig
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          . $HOME/.cargo/env
+          cargo build --verbose
+
+      - name: Run tests
+        run: |
+          . $HOME/.cargo/env
+          cargo test --all --verbose
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

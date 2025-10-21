@@ -1,6 +1,6 @@
 [package]
 name = "sy"
-version = "0.0.26"
+version = "0.0.27"
 edition = "2021"
 authors = ["Nick Russo <nick@nijaru.dev>"]
 description = "Modern rsync alternative - Fast, parallel file synchronization"
