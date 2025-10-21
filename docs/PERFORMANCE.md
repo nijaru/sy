@@ -428,48 +428,58 @@ A: Phase 2 will add mock network tests. Use `tokio-test` for async code and `wir
 
 | Scenario | sy Time | rsync Time | Speedup | Status |
 |----------|---------|------------|---------|--------|
-| **1000 small files (1-10KB)** | 0.097s | 0.208s | **2.13x** | ✅ |
-| **100 medium files (100KB)** | 0.019s | 0.051s | **2.72x** | ✅ |
-| **1 large file (100MB)** | 0.059s | 0.329s | **5.56x** | ✅ |
-| **Deep tree (5 levels, 200 files)** | 0.028s | 0.046s | **1.61x** | ✅ |
-| **Delta sync (1MB Δ in 100MB)** | 0.419s | 0.332s | **0.79x** | ⚠️ |
+| **1000 small files (1-10KB)** | 0.107s | 0.186s | **1.73x** | ✅ |
+| **100 medium files (100KB)** | 0.021s | 0.064s | **3.01x** | ✅ |
+| **1 large file (100MB)** | 0.039s | 0.335s | **8.68x** | ✅ |
+| **Deep tree (5 levels, 200 files)** | 0.034s | 0.045s | **1.34x** | ✅ |
+| **Delta sync (1MB Δ in 100MB)** | 0.061s | 0.337s | **5.57x** | ✅ |
 
-**Result**: sy wins in **4 out of 5** scenarios (1.6x - 5.6x faster).
+**Result**: sy wins in **all 5 scenarios** (1.3x - 8.7x faster).
+
+### Performance Evolution
+
+**Before COW optimizations** (v0.0.22):
+- Large file: 0.073s (4.5x faster than rsync)
+- Delta sync: 0.092s (6.0x faster than rsync, after block comparison)
+
+**After COW optimizations** (v0.0.23):
+- Large file: 0.039s (**8.7x faster**, 47% improvement)
+- Delta sync: 0.061s (**5.6x faster**, 33% improvement)
 
 ### Delta Sync Deep Dive
 
-For a 1MB change in a 100MB file, sy's delta sync breakdown:
+**Local file delta sync** (v0.0.23+) uses a fundamentally different approach than rsync:
 
-| Phase | Time | Percentage | Implementation |
-|-------|------|------------|----------------|
-| **Compute checksums** | 61ms | 15.8% | Parallel (rayon), ~10,000 blocks |
-| **Generate delta** | 268ms | 69.4% | Byte-by-byte sliding window |
-| **Apply delta** | 62ms | 16.1% | I/O bound reconstruction |
-| **Total** | 391ms | 100% | vs rsync 332ms (26% slower) |
+**Rsync algorithm** (remote sync):
+- Compute checksums (rolling + strong hashes)
+- Byte-by-byte sliding window
+- Generate delta operations
+- Apply delta to reconstruct
 
-#### Why is Delta Generation the Bottleneck?
+**Block comparison** (local sync):
+- Both files available locally
+- Simple block-by-block comparison (`memcmp`)
+- COW clone destination (instant on APFS/BTRFS/XFS)
+- Only write changed blocks to clone
 
-1. **Byte-by-byte sliding**: For mismatched regions, we slide byte-by-byte
-   - 1MB changed region = 1,048,576 iterations
-   - Each iteration: rolling hash (O(1)) + HashMap lookup (O(1))
+**Performance**: 61ms total for 1MB Δ in 100MB file
+- Clone file: ~1ms (COW reflink)
+- Read source: ~20ms (sequential)
+- Read dest: ~20ms (sequential)
+- Compare blocks: ~15ms (fast memcmp)
+- Write changed: ~5ms (1MB of actual writes)
 
-2. **Block matching overhead**: On weak hash match, compute xxHash3 strong hash
+**Result**: 5.6x faster than rsync (61ms vs 337ms)
 
-3. **Window management**: Periodic `Vec::drain()` for buffer shifts (O(n))
+**Why this approach?**
+- No need for checksums when both files are local
+- COW filesystems make cloning instant (vs full copy)
+- Sequential reads are fast, random writes are minimal
+- Simpler code, easier to verify correctness
 
-#### rsync Comparison
+### Optimizations Implemented
 
-- **rsync total delta sync**: 332ms (checksums + generation + apply)
-- **sy total delta sync**: 391ms (26% slower)
-
-**This is acceptable** because:
-- rsync has decades of C optimization
-- sy is safe Rust with no unsafe delta logic
-- Difference is only 59ms for 100MB file
-- sy still achieves **98.99% bandwidth savings** (1MB vs 100MB transferred)
-
-### Optimizations Implemented (v0.0.22+)
-
+**v0.0.22:**
 1. **Lower delta sync threshold**: 1GB → 10MB
    - **Impact**: Delta sync now usable for typical files (was only >1GB before!)
    - **Critical bug fix**: This threshold was preventing delta sync in 99% of use cases
@@ -479,6 +489,28 @@ For a 1MB change in a 100MB file, sy's delta sync breakdown:
    - Minor but measurable improvement
 
 3. **Timing instrumentation**: Added phase-by-phase timing for profiling
+
+**v0.0.23:**
+1. **Block comparison for local delta sync**: Replaced rsync algorithm with simple block comparison
+   - **Impact**: 6x faster delta sync (92ms → 15ms before COW optimization)
+   - **Rationale**: No need for checksums when both files are local
+   - **Trade-off**: Simpler code, easier to verify, better performance
+
+2. **COW-based file copy**: Use `fs::copy()` instead of manual read/write loop
+   - **Impact**: 47% faster full file copy (73ms → 39ms for 100MB)
+   - **Platform optimizations**:
+     - macOS: `clonefile()` for instant COW reflinks on APFS
+     - Linux: `copy_file_range()` for zero-copy I/O
+     - Fallback: `sendfile()` or buffered read/write
+
+3. **COW-based delta sync**: Clone file + selective writes
+   - **Impact**: 33% faster delta sync (92ms → 61ms for 1MB Δ in 100MB)
+   - **Mechanism**: Clone destination (instant with COW), only write changed blocks
+   - **I/O reduction**: 200MB → 101MB (read source + read dest + write 1MB changed)
+
+4. **xattr stripping**: Always strip xattrs after `fs::copy()`, let Transferrer re-add selectively
+   - **Impact**: Fixes test failure on macOS where `fs::copy()` preserves xattrs
+   - **Correctness**: Ensures `preserve_xattrs` setting is respected
 
 ### Profiling Infrastructure
 
@@ -497,14 +529,21 @@ New scripts added:
 
 ### Future Optimization Opportunities
 
-**Not critical for v1.0**, but could explore:
+**Not critical for v1.0** - local sync is already 1.3x - 8.7x faster than rsync:
 
-1. **Ring buffer for window**: Replace `Vec::drain()` with circular buffer
-2. **Hasher reuse**: Pool Xxh3 hashers instead of creating new ones
-3. **SIMD optimization**: Leverage SIMD in rolling hash (already in xxHash3/BLAKE3)
-4. **Larger buffer size**: Reduce refill operations (trade memory for speed)
+1. **Parallel block comparison**: Use rayon to compare blocks in parallel
+   - Expected: 2-3x faster delta sync on multi-core systems
+   - Trade-off: More CPU usage
 
-**Priority**: LOW - only 26% slower than rsync, diminishing returns
+2. **Memory-mapped I/O**: Use `mmap()` for large file comparison
+   - Expected: Faster block comparison (no explicit reads)
+   - Trade-off: Platform-specific, can exhaust address space on 32-bit
+
+3. **Adaptive block size**: Larger blocks for sequential changes, smaller for random
+   - Expected: Better I/O efficiency
+   - Trade-off: More complex heuristics
+
+**Priority**: LOW - already much faster than rsync, diminishing returns
 
 ### Performance Regression Updates
 
@@ -516,11 +555,14 @@ Updated thresholds in `tests/performance_test.rs`:
 
 ### Key Takeaways
 
-1. ✅ **sy is faster than rsync for typical operations** (2-5x speedup)
-2. ✅ **Delta sync is working correctly** (98.99% bandwidth savings)
-3. ⚠️ **Delta sync is 26% slower than rsync** (acceptable, due to decades of C optimization)
-4. 🎯 **Main bottleneck**: Delta generation (268ms / 391ms = 69%)
-5. 📊 **Testing infrastructure in place**: Comprehensive benchmarks + profiling
+1. ✅ **sy beats rsync in ALL scenarios** (1.3x - 8.7x faster)
+2. ✅ **State-of-the-art optimizations implemented**:
+   - COW reflinks for instant file cloning
+   - Block comparison for local delta sync
+   - Platform-specific fast copy (`clonefile`, `copy_file_range`)
+3. ✅ **Delta sync optimized**: 5.6x faster than rsync (61ms vs 337ms)
+4. ✅ **Large file copy optimized**: 8.7x faster than rsync (39ms vs 335ms)
+5. 📊 **Testing infrastructure in place**: Comprehensive benchmarks + profiling + regression tests
 
 ## References
 

@@ -1,5 +1,6 @@
 use super::{TransferResult, Transport};
 use crate::error::{Result, SyncError};
+use crate::fs_util::{has_hard_links, same_filesystem, supports_cow_reflinks};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
 use std::fs::{self, File};
@@ -103,6 +104,16 @@ impl Transport for LocalTransport {
                     source: e,
                 })?;
 
+                // Strip xattrs (fs::copy may preserve them on some platforms)
+                #[cfg(unix)]
+                {
+                    if let Ok(xattr_list) = xattr::list(&dest) {
+                        for attr_name in xattr_list {
+                            let _ = xattr::remove(&dest, &attr_name);
+                        }
+                    }
+                }
+
                 // Preserve modification time
                 if let Ok(mtime) = source_meta.modified() {
                     let _ = filetime::set_file_mtime(
@@ -120,58 +131,32 @@ impl Transport for LocalTransport {
                 return Ok(bytes_written);
             }
 
-            // Regular file copy with checksum verification
-            use std::io::{Read, Write};
-
-            // Open source and destination files
-            let mut source_file = fs::File::open(&source).map_err(|e| SyncError::CopyError {
+            // Use fs::copy() which is optimized per-platform:
+            // - macOS: clonefile() for COW reflinks on APFS (100x+ faster)
+            // - Linux: copy_file_range() for zero-copy (kernel-side)
+            // - Fallback: sendfile() or read/write
+            // This is MUCH faster than manual read/write loop
+            let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
                 path: source.clone(),
                 source: e,
             })?;
 
-            let mut dest_file = fs::File::create(&dest).map_err(|e| SyncError::CopyError {
-                path: dest.clone(),
-                source: e,
-            })?;
-
-            // Stream copy with checksum calculation
-            // 256KB optimal for disk I/O and checksum performance
-            const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
-            let mut buffer = vec![0u8; CHUNK_SIZE];
-            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-            let mut bytes_written = 0u64;
-
-            loop {
-                let bytes_read =
-                    source_file
-                        .read(&mut buffer)
-                        .map_err(|e| SyncError::CopyError {
-                            path: source.clone(),
-                            source: e,
-                        })?;
-
-                if bytes_read == 0 {
-                    break;
+            // fs::copy() may preserve xattrs on some platforms (e.g., macOS).
+            // Strip all xattrs so that Transferrer can selectively re-add them
+            // based on preserve_xattrs setting.
+            #[cfg(unix)]
+            {
+                if let Ok(xattr_list) = xattr::list(&dest) {
+                    for attr_name in xattr_list {
+                        let _ = xattr::remove(&dest, &attr_name);
+                    }
                 }
-
-                hasher.update(&buffer[..bytes_read]);
-                dest_file
-                    .write_all(&buffer[..bytes_read])
-                    .map_err(|e| SyncError::CopyError {
-                        path: dest.clone(),
-                        source: e,
-                    })?;
-
-                bytes_written += bytes_read as u64;
             }
 
-            let checksum = hasher.digest();
-
             tracing::debug!(
-                "Copied {} ({} bytes, xxh3: {:x})",
+                "Copied {} ({} bytes, fast copy)",
                 source.display(),
-                bytes_written,
-                checksum
+                bytes_written
             );
 
             // Preserve modification time
@@ -233,99 +218,245 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            use std::io::{BufReader, BufWriter, Read, Write};
+            use std::io::{BufReader, Read, Seek, SeekFrom, Write};
             use std::time::Instant;
-
-            // For local->local delta sync, we can do better than rsync algorithm:
-            // Just compare blocks directly since we have both files locally.
-            // This is MUCH faster: no checksumming, no hash lookups, sequential I/O only.
 
             let block_size = 64 * 1024; // 64KB blocks for good I/O performance
             let total_start = Instant::now();
 
-            // Open both files
-            let mut source_file = BufReader::with_capacity(
-                256 * 1024,
-                File::open(&source).map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
-                    source: e,
-                })?,
-            );
-            let mut dest_file = BufReader::with_capacity(
-                256 * 1024,
-                File::open(&dest).map_err(|e| SyncError::CopyError {
-                    path: dest.clone(),
-                    source: e,
-                })?,
-            );
+            // Choose delta sync strategy based on filesystem capabilities and file properties
+            let use_cow_strategy = supports_cow_reflinks(&dest)
+                && same_filesystem(&source, &dest)
+                && !has_hard_links(&dest);
 
-            // Create temp file for writing
+            if !use_cow_strategy {
+                tracing::debug!(
+                    "Using in-place delta sync (COW: {}, same FS: {}, hard links: {})",
+                    supports_cow_reflinks(&dest),
+                    same_filesystem(&source, &dest),
+                    has_hard_links(&dest)
+                );
+            }
+
+            // Strategy 1: COW clone + selective writes (fast on APFS/BTRFS/XFS)
+            // Strategy 2: In-place delta (for ext4, hard links, cross-filesystem)
             let temp_dest = dest.with_extension("sy.tmp");
-            let mut temp_file = BufWriter::with_capacity(
-                256 * 1024,
-                File::create(&temp_dest).map_err(|e| SyncError::CopyError {
+
+            let (bytes_written, literal_bytes, changed_blocks) = if use_cow_strategy {
+                // COW Strategy: Clone file (instant), then selectively overwrite changed blocks
+                fs::copy(&dest, &temp_dest).map_err(|e| SyncError::CopyError {
                     path: temp_dest.clone(),
                     source: e,
-                })?,
-            );
-
-            let mut source_buf = vec![0u8; block_size];
-            let mut dest_buf = vec![0u8; block_size];
-            let mut bytes_written = 0u64;
-            let mut literal_bytes = 0u64;
-            let mut copy_ops = 0usize;
-
-            // Compare and copy block by block
-            loop {
-                let src_read = source_file.read(&mut source_buf).map_err(|e| {
-                    SyncError::CopyError {
-                        path: source.clone(),
-                        source: e,
-                    }
                 })?;
-                if src_read == 0 {
-                    break; // EOF
+
+                // Strip xattrs from clone (fs::copy may preserve them)
+                #[cfg(unix)]
+                {
+                    if let Ok(xattr_list) = xattr::list(&temp_dest) {
+                        for attr_name in xattr_list {
+                            let _ = xattr::remove(&temp_dest, &attr_name);
+                        }
+                    }
                 }
 
-                let dst_read = dest_file.read(&mut dest_buf).map_err(|e| SyncError::CopyError {
-                    path: dest.clone(),
+                // Open source and original dest for reading (sequential)
+                let mut source_file = BufReader::with_capacity(
+                    256 * 1024,
+                    File::open(&source).map_err(|e| SyncError::CopyError {
+                        path: source.clone(),
+                        source: e,
+                    })?,
+                );
+                let mut dest_file = BufReader::with_capacity(
+                    256 * 1024,
+                    File::open(&dest).map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?,
+                );
+
+                // Open temp file for writing (selective, seek-based)
+                let mut temp_file = File::options()
+                    .write(true)
+                    .open(&temp_dest)
+                    .map_err(|e| SyncError::CopyError {
+                        path: temp_dest.clone(),
+                        source: e,
+                    })?;
+
+                let mut source_buf = vec![0u8; block_size];
+                let mut dest_buf = vec![0u8; block_size];
+                let mut offset = 0u64;
+                let mut bytes_written = 0u64;
+                let mut literal_bytes = 0u64;
+                let mut changed_blocks = 0usize;
+
+                // Compare blocks and only write changed ones
+                loop {
+                    let src_read = source_file.read(&mut source_buf).map_err(|e| {
+                        SyncError::CopyError {
+                            path: source.clone(),
+                            source: e,
+                        }
+                    })?;
+                    if src_read == 0 {
+                        break; // EOF
+                    }
+
+                    let dst_read = dest_file.read(&mut dest_buf).map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?;
+
+                    // Compare blocks
+                    let blocks_match = src_read == dst_read
+                        && source_buf[..src_read] == dest_buf[..dst_read];
+
+                    if !blocks_match {
+                        // Block changed - seek and write to temp file
+                        temp_file
+                            .seek(SeekFrom::Start(offset))
+                            .map_err(|e| SyncError::CopyError {
+                                path: temp_dest.clone(),
+                                source: e,
+                            })?;
+                        temp_file
+                            .write_all(&source_buf[..src_read])
+                            .map_err(|e| SyncError::CopyError {
+                                path: temp_dest.clone(),
+                                source: e,
+                            })?;
+                        literal_bytes += src_read as u64;
+                        changed_blocks += 1;
+                    }
+                    // If blocks match, we don't write anything! Clone already has the data.
+
+                    bytes_written += src_read as u64;
+                    offset += src_read as u64;
+                }
+
+                // Truncate temp file to source size (if source < dest)
+                temp_file.set_len(bytes_written).map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
                     source: e,
                 })?;
 
-                // Compare blocks
-                let blocks_match = src_read == dst_read && source_buf[..src_read] == dest_buf[..dst_read];
+                // Flush and sync temp file
+                temp_file.flush().map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?;
+                drop(temp_file);
 
-                if !blocks_match {
-                    // Block changed or sizes different - write new data
+                (bytes_written, literal_bytes, changed_blocks)
+            } else {
+                // In-place Strategy: Create temp file, copy only changed blocks
+                // This avoids slow fs::copy() on non-COW filesystems like ext4
+
+                // Create empty temp file and allocate space
+                let temp_file = File::create(&temp_dest).map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?;
+                temp_file.set_len(source_size).map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?;
+                drop(temp_file);
+
+                // Open source and dest for reading
+                let mut source_file = BufReader::with_capacity(
+                    256 * 1024,
+                    File::open(&source).map_err(|e| SyncError::CopyError {
+                        path: source.clone(),
+                        source: e,
+                    })?,
+                );
+                let mut dest_file = BufReader::with_capacity(
+                    256 * 1024,
+                    File::open(&dest).map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?,
+                );
+
+                // Open temp for random writes
+                let mut temp_file = File::options()
+                    .write(true)
+                    .open(&temp_dest)
+                    .map_err(|e| SyncError::CopyError {
+                        path: temp_dest.clone(),
+                        source: e,
+                    })?;
+
+                let mut source_buf = vec![0u8; block_size];
+                let mut dest_buf = vec![0u8; block_size];
+                let mut offset = 0u64;
+                let mut bytes_written = 0u64;
+                let mut literal_bytes = 0u64;
+                let mut changed_blocks = 0usize;
+
+                // Compare blocks and write ALL blocks (changed + unchanged)
+                // to build the complete new file
+                loop {
+                    let src_read = source_file.read(&mut source_buf).map_err(|e| {
+                        SyncError::CopyError {
+                            path: source.clone(),
+                            source: e,
+                        }
+                    })?;
+                    if src_read == 0 {
+                        break; // EOF
+                    }
+
+                    let dst_read = dest_file.read(&mut dest_buf).map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?;
+
+                    // Compare blocks
+                    let blocks_match = src_read == dst_read
+                        && source_buf[..src_read] == dest_buf[..dst_read];
+
+                    // Always seek and write (building complete file)
+                    temp_file
+                        .seek(SeekFrom::Start(offset))
+                        .map_err(|e| SyncError::CopyError {
+                            path: temp_dest.clone(),
+                            source: e,
+                        })?;
                     temp_file
                         .write_all(&source_buf[..src_read])
                         .map_err(|e| SyncError::CopyError {
                             path: temp_dest.clone(),
                             source: e,
                         })?;
-                    literal_bytes += src_read as u64;
-                } else {
-                    // Block unchanged - copy from destination
-                    temp_file
-                        .write_all(&dest_buf[..dst_read])
-                        .map_err(|e| SyncError::CopyError {
-                            path: temp_dest.clone(),
-                            source: e,
-                        })?;
-                    copy_ops += 1;
-                }
-                bytes_written += src_read as u64;
-            }
 
-            // Flush temp file
-            temp_file.flush().map_err(|e| SyncError::CopyError {
-                path: temp_dest.clone(),
-                source: e,
-            })?;
-            drop(temp_file);
+                    if !blocks_match {
+                        literal_bytes += src_read as u64;
+                        changed_blocks += 1;
+                    }
+
+                    bytes_written += src_read as u64;
+                    offset += src_read as u64;
+                }
+
+                // Flush and sync temp file
+                temp_file.flush().map_err(|e| SyncError::CopyError {
+                    path: temp_dest.clone(),
+                    source: e,
+                })?;
+                drop(temp_file);
+
+                (bytes_written, literal_bytes, changed_blocks)
+            };
 
             let total_elapsed = total_start.elapsed();
-            tracing::debug!("Local delta sync completed in {:?}", total_elapsed);
+            tracing::debug!(
+                "Local delta sync completed in {:?} ({} changed blocks)",
+                total_elapsed,
+                changed_blocks
+            );
 
             let compression_ratio = if source_size > 0 {
                 (literal_bytes as f64 / source_size as f64) * 100.0
@@ -339,16 +470,17 @@ impl Transport for LocalTransport {
                 source: e,
             })?;
 
-            let total_ops = copy_ops + if literal_bytes > 0 { 1 } else { 0 };
+            let total_blocks = bytes_written.div_ceil(block_size as u64) as usize;
             tracing::info!(
-                "Local delta sync: {} blocks compared, {:.1}% changed",
-                total_ops,
+                "Local delta sync: {} blocks compared, {} changed ({:.1}%)",
+                total_blocks,
+                changed_blocks,
                 compression_ratio
             );
 
             Ok::<TransferResult, SyncError>(TransferResult::with_delta(
                 bytes_written,
-                total_ops,
+                changed_blocks,
                 literal_bytes,
             ))
         })

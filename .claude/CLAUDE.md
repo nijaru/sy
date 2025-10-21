@@ -60,23 +60,62 @@ Updated for 2024+ hardware:
 - **<100 MB/s**: Adaptive zstd
 - **Local**: NEVER compress (disk I/O bottleneck)
 
+#### Local Delta Sync Optimization (v0.0.23)
+
+**Key Innovation**: Different algorithms for local vs remote sync
+
+**Local→Local sync** (`src/transport/local.rs`):
+- Replaces rsync algorithm with simple block comparison
+- **Rationale**: Both files available locally, no need for rolling hash
+- **Performance**: 5-9x faster than rsync
+
+**COW-aware strategies** (`src/fs_util.rs`):
+1. **COW Strategy** (APFS/BTRFS/XFS):
+   - Clone destination file using COW reflinks (instant, ~1ms for 100MB)
+   - Compare blocks from source vs original dest
+   - Only write changed blocks to clone
+   - **Use case**: Same filesystem, no hard links, COW supported
+
+2. **In-place Strategy** (ext4/NTFS or hard links):
+   - Create empty temp file, allocate space
+   - Compare blocks, write all blocks to temp
+   - **Use case**: Non-COW filesystem OR hard links OR cross-filesystem
+
+**Automatic detection**:
+- Filesystem type (statfs on Linux/macOS)
+- Same device check (dev_t comparison)
+- Hard link detection (nlink > 1)
+
+**Critical for correctness**:
+- Hard links must use in-place strategy (COW would break link)
+- File truncation when source < dest
+- Cross-filesystem fallback
+
+See `docs/PERFORMANCE.md` for benchmarks and `docs/EVALUATION_v0.0.23.md` for details.
+
 ## Implementation Roadmap
 
-### Current Status: Phase 4 Complete (v0.0.13)
+### Current Status: v0.0.23 (Performance Optimized)
 
 **Implemented Features**:
 - ✅ Local and remote (SSH) sync
-- ✅ Delta sync (rsync algorithm)
+- ✅ Delta sync with COW optimization (v0.0.23)
+- ✅ Filesystem-aware strategy selection (v0.0.23)
+- ✅ Hard link preservation (v0.0.23)
 - ✅ Parallel file transfers
 - ✅ Compression (zstd)
 - ✅ Progress display with colors
 - ✅ Gitignore awareness
-- ✅ JSON output (v0.0.11)
-- ✅ Config profiles (v0.0.11)
-- ✅ Watch mode (v0.0.12)
-- ✅ Resume support (v0.0.13)
+- ✅ JSON output
+- ✅ Config profiles
+- ✅ Watch mode
+- ✅ Resume support
 
-**Note**: The project follows the MODERNIZATION_ROADMAP.md for implementation planning, which differs from the DESIGN.md phase numbering. DESIGN.md is a technical reference document, while MODERNIZATION_ROADMAP.md is the active implementation plan.
+**Performance** (v0.0.23): 1.3x - 8.8x faster than rsync
+- See `docs/PERFORMANCE.md` for detailed benchmarks
+- See `docs/EVALUATION_v0.0.23.md` for comprehensive analysis
+
+**Note**: The project follows MODERNIZATION_ROADMAP.md for implementation planning.
 
 ### Next Phase: Phase 5 (Verification & Reliability)
 See docs/MODERNIZATION_ROADMAP.md for detailed roadmap
@@ -92,6 +131,7 @@ sy/
 │   ├── sync/                   # Sync orchestration
 │   ├── integrity/              # Hash functions
 │   ├── transport/              # SSH/SFTP/local
+│   ├── fs_util.rs              # Filesystem utilities (COW, hard links) **NEW v0.0.23**
 │   ├── compress/               # zstd/lz4
 │   ├── filter/                 # gitignore/rsync patterns
 │   ├── progress/               # Progress UI

@@ -27,6 +27,7 @@ pub struct BlockChecksum {
 ///
 /// Uses parallel processing for 2-4x speedup on large files (>100MB).
 /// Each thread processes blocks independently with its own file handle.
+#[allow(dead_code)] // Reserved for future remote sync implementation
 pub fn compute_checksums(path: &Path, block_size: usize) -> io::Result<Vec<BlockChecksum>> {
     // Get file size to determine number of blocks
     let metadata = std::fs::metadata(path)?;

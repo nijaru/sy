@@ -4,6 +4,7 @@ mod config;
 mod delta;
 mod error;
 mod filter;
+mod fs_util;
 mod hooks;
 mod integrity;
 mod path;

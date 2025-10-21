@@ -5,6 +5,7 @@ use std::path::Path;
 
 /// Statistics about delta application
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Reserved for future remote sync implementation
 pub struct DeltaStats {
     pub operations_count: usize,
     pub literal_bytes: u64,
@@ -17,6 +18,7 @@ pub struct DeltaStats {
 /// to create new_file.
 ///
 /// Returns statistics about the delta application.
+#[allow(dead_code)] // Reserved for future remote sync implementation
 pub fn apply_delta(old_file: &Path, delta: &Delta, new_file: &Path) -> io::Result<DeltaStats> {
     let mut old = File::open(old_file)?;
     let mut new = File::create(new_file)?;

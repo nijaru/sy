@@ -3,7 +3,10 @@ pub mod checksum;
 pub mod generator;
 pub mod rolling;
 
+// Delta sync functions for remote sync (not used for local sync which uses block comparison)
+#[allow(unused_imports)]
 pub use applier::apply_delta;
+#[allow(unused_imports)]
 pub use checksum::{compute_checksums, BlockChecksum};
 #[allow(unused_imports)]
 pub use generator::{generate_delta, generate_delta_streaming, Delta, DeltaOp};
