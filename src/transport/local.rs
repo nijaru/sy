@@ -138,6 +138,10 @@ fn copy_sparse_file_blocks(source: &Path, dest: &Path) -> std::io::Result<u64> {
     }
     let mut dst_file = File::create(dest)?;
 
+    // Set file size FIRST using ftruncate
+    // This creates a sparse file with the correct size
+    dst_file.set_len(file_size)?;
+
     const BLOCK_SIZE: usize = 4096; // Typical filesystem block size
     let mut buffer = vec![0u8; BLOCK_SIZE];
     let mut pos = 0u64;
@@ -151,7 +155,7 @@ fn copy_sparse_file_blocks(source: &Path, dest: &Path) -> std::io::Result<u64> {
 
         // Check if block is all zeros (sparse hole)
         if buffer[..read].iter().all(|&b| b == 0) {
-            // Skip this block (create hole by seeking)
+            // Skip this block (hole is already there from ftruncate)
             pos += read as u64;
         } else {
             // Write non-zero data
@@ -159,13 +163,6 @@ fn copy_sparse_file_blocks(source: &Path, dest: &Path) -> std::io::Result<u64> {
             dst_file.write_all(&buffer[..read])?;
             pos += read as u64;
         }
-    }
-
-    // Ensure file has correct size by seeking to end
-    // This creates trailing holes without allocating space
-    if pos < file_size {
-        dst_file.seek(SeekFrom::Start(file_size - 1))?;
-        dst_file.write_all(&[0])?;
     }
 
     dst_file.sync_all()?;
