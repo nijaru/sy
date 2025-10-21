@@ -234,6 +234,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_windows_drive_letter_backslash() {
+        // C:\path with backslashes
+        let path = SyncPath::parse("C:\\Users\\nick");
+        assert!(path.is_local());
+        assert_eq!(path.path(), Path::new("C:\\Users\\nick"));
+    }
+
+    #[test]
+    fn test_parse_windows_lowercase_drive() {
+        // Lowercase drive letter
+        let path = SyncPath::parse("d:/projects");
+        assert!(path.is_local());
+        assert_eq!(path.path(), Path::new("d:/projects"));
+    }
+
+    #[test]
+    fn test_parse_windows_unc_path() {
+        // UNC path \\server\share\file
+        let path = SyncPath::parse("\\\\server\\share\\file.txt");
+        assert!(path.is_local());
+        // UNC paths should be treated as local Windows paths
+    }
+
+    #[test]
+    fn test_windows_reserved_names() {
+        // Windows reserved names should still parse as local
+        let path = SyncPath::parse("C:/Users/nick/CON");
+        assert!(path.is_local());
+
+        let path = SyncPath::parse("D:/temp/NUL.txt");
+        assert!(path.is_local());
+
+        let path = SyncPath::parse("C:/PRN");
+        assert!(path.is_local());
+    }
+
+    #[test]
     fn test_display_local() {
         let path = SyncPath::Local(PathBuf::from("/home/user/docs"));
         assert_eq!(path.to_string(), "/home/user/docs");

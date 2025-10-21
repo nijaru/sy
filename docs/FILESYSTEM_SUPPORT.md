@@ -2,6 +2,9 @@
 
 This document details how `sy` behaves on different filesystems and operating systems, particularly for delta sync operations.
 
+**Platform-specific documentation**:
+- 🪟 [Windows Support (WINDOWS_SUPPORT.md)](WINDOWS_SUPPORT.md) - Windows-specific behavior, installation, and troubleshooting
+
 ## Quick Reference
 
 | Filesystem | OS | COW Support | Delta Sync Strategy | Performance |

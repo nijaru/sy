@@ -287,4 +287,42 @@ mod tests {
             assert!(has_hard_links(&file2));
         }
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_no_cow_support() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.txt");
+        fs::write(&test_file, b"test").unwrap();
+
+        // Windows NTFS should return false for COW support
+        // (ReFS is not commonly used)
+        assert!(!supports_cow_reflinks(&test_file));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_same_filesystem_conservative() {
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+
+        fs::write(&file1, b"test1").unwrap();
+        fs::write(&file2, b"test2").unwrap();
+
+        // Windows implementation is conservative - returns false
+        assert!(!same_filesystem(&file1, &file2));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_no_hard_link_detection() {
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+
+        fs::write(&file1, b"test").unwrap();
+
+        // Windows implementation always returns false
+        assert!(!has_hard_links(&file1));
+    }
 }
