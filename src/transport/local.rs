@@ -28,6 +28,107 @@ fn is_file_sparse(_metadata: &std::fs::Metadata) -> bool {
     false // Non-Unix platforms don't support sparse detection
 }
 
+/// Copy a sparse file while preserving holes using SEEK_HOLE/SEEK_DATA
+///
+/// This function uses lseek with SEEK_HOLE and SEEK_DATA to efficiently copy
+/// only the data regions of a sparse file, preserving the holes (unallocated regions).
+///
+/// # Implementation
+///
+/// 1. Remove destination file if it exists (to start fresh)
+/// 2. Use SEEK_DATA to find data regions, SEEK_HOLE to find holes
+/// 3. Copy data regions, seek past holes in destination
+/// 4. Truncate to final size to preserve trailing holes
+///
+/// This is much more efficient than fs::copy() which materializes all holes.
+#[cfg(unix)]
+fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    const SEEK_DATA: i32 = 3; // Find next data region
+    const SEEK_HOLE: i32 = 4; // Find next hole
+
+    // Open source file
+    let mut src_file = File::open(source)?;
+    let src_meta = src_file.metadata()?;
+    let file_size = src_meta.len();
+
+    // Remove destination if exists, create new file
+    if dest.exists() {
+        fs::remove_file(dest)?;
+    }
+    let mut dst_file = File::create(dest)?;
+
+    // Set destination file size (creates sparse file)
+    dst_file.set_len(file_size)?;
+
+    let mut pos: i64 = 0;
+    let file_size_i64 = file_size as i64;
+    let src_fd = src_file.as_raw_fd();
+
+    // Copy data regions while preserving holes
+    while pos < file_size_i64 {
+        // Find next data region
+        let data_start = unsafe { libc::lseek(src_fd, pos, SEEK_DATA) };
+
+        if data_start < 0 {
+            // No more data regions
+            break;
+        }
+
+        if data_start >= file_size_i64 {
+            // Past end of file
+            break;
+        }
+
+        // Find next hole after this data region
+        let hole_start = unsafe { libc::lseek(src_fd, data_start, SEEK_HOLE) };
+
+        let data_end = if hole_start < 0 || hole_start > file_size_i64 {
+            // No hole found, data extends to EOF
+            file_size_i64
+        } else {
+            hole_start
+        };
+
+        let data_len = (data_end - data_start) as usize;
+
+        // Seek source to data start
+        src_file.seek(SeekFrom::Start(data_start as u64))?;
+        dst_file.seek(SeekFrom::Start(data_start as u64))?;
+
+        // Copy this data region in chunks
+        let mut remaining = data_len;
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+
+        while remaining > 0 {
+            let chunk_size = remaining.min(buffer.len());
+            let read = src_file.read(&mut buffer[..chunk_size])?;
+
+            if read == 0 {
+                break;
+            }
+
+            dst_file.write_all(&buffer[..read])?;
+            remaining = remaining.saturating_sub(read);
+        }
+
+        pos = data_end;
+    }
+
+    // Ensure all data is written
+    dst_file.sync_all()?;
+
+    Ok(file_size)
+}
+
+#[cfg(not(unix))]
+fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    // On non-Unix platforms, fall back to regular copy
+    fs::copy(source, dest)
+}
+
 /// Local filesystem transport
 ///
 /// Implements the Transport trait for local filesystem operations.
@@ -237,6 +338,32 @@ impl Transport for LocalTransport {
             let block_size = 64 * 1024; // 64KB blocks for good I/O performance
             let total_start = Instant::now();
 
+            // Check if source file is sparse FIRST (before change ratio)
+            // Sparse files need special handling to preserve holes
+            let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
+                path: source.clone(),
+                source: e,
+            })?;
+
+            if is_file_sparse(&source_meta) {
+                tracing::info!(
+                    "Source file is sparse (allocated size < logical size), using sparse-aware copy"
+                );
+
+                // Use SEEK_HOLE/SEEK_DATA to preserve sparseness
+                let bytes_written = copy_sparse_file(&source, &dest).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+                tracing::debug!(
+                    "Sparse file copy complete: {} bytes logical size",
+                    bytes_written
+                );
+
+                return Ok(TransferResult::new(bytes_written));
+            }
+
             // Sample blocks to estimate change ratio
             // If >75% of file has changed, full copy is faster than delta sync
             let change_ratio_result = estimate_change_ratio(
@@ -263,7 +390,7 @@ impl Transport for LocalTransport {
                             ratio.threshold * 100.0
                         );
 
-                        // Fallback to full copy
+                        // Fallback to full copy (not sparse, so fs::copy is fine)
                         let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
                             path: source.clone(),
                             source: e,
@@ -283,32 +410,6 @@ impl Transport for LocalTransport {
                         e
                     );
                 }
-            }
-
-            // Check if source file is sparse
-            // Sparse files should use full copy to preserve holes efficiently
-            let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
-                path: source.clone(),
-                source: e,
-            })?;
-
-            if is_file_sparse(&source_meta) {
-                tracing::info!(
-                    "Source file is sparse (allocated size < logical size), using sparse-aware copy"
-                );
-
-                // Use fs::copy which preserves sparseness on Unix
-                let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
-                    source: e,
-                })?;
-
-                tracing::debug!(
-                    "Sparse file copy complete: {} bytes logical size",
-                    bytes_written
-                );
-
-                return Ok(TransferResult::new(bytes_written));
             }
 
             // Choose delta sync strategy based on filesystem capabilities and file properties
