@@ -96,7 +96,10 @@ impl PerformanceMetrics {
         use colored::Colorize;
 
         println!("\n{}", "Performance Summary:".bold());
-        println!("  Total time:      {}", Self::format_duration(self.total_duration).cyan());
+        println!(
+            "  Total time:      {}",
+            Self::format_duration(self.total_duration).cyan()
+        );
         println!(
             "    Scanning:      {} ({:.1}%)",
             Self::format_duration(self.scan_duration).cyan(),
@@ -113,18 +116,33 @@ impl PerformanceMetrics {
             (self.transfer_duration.as_secs_f64() / self.total_duration.as_secs_f64()) * 100.0
         );
 
-        println!("\n  Files:           {} processed", self.files_processed.to_string().green());
+        println!(
+            "\n  Files:           {} processed",
+            self.files_processed.to_string().green()
+        );
         if self.files_created > 0 {
-            println!("    Created:       {}", self.files_created.to_string().green());
+            println!(
+                "    Created:       {}",
+                self.files_created.to_string().green()
+            );
         }
         if self.files_updated > 0 {
-            println!("    Updated:       {}", self.files_updated.to_string().yellow());
+            println!(
+                "    Updated:       {}",
+                self.files_updated.to_string().yellow()
+            );
         }
         if self.files_deleted > 0 {
-            println!("    Deleted:       {}", self.files_deleted.to_string().red());
+            println!(
+                "    Deleted:       {}",
+                self.files_deleted.to_string().red()
+            );
         }
         if self.directories_created > 0 {
-            println!("    Dirs created:  {}", self.directories_created.to_string().green());
+            println!(
+                "    Dirs created:  {}",
+                self.directories_created.to_string().green()
+            );
         }
 
         println!(
@@ -379,10 +397,7 @@ mod tests {
         assert_eq!(PerformanceMetrics::format_speed(500.0), "500 B/s");
         assert_eq!(PerformanceMetrics::format_speed(1500.0), "1.50 KB/s");
         assert_eq!(PerformanceMetrics::format_speed(1500000.0), "1.50 MB/s");
-        assert_eq!(
-            PerformanceMetrics::format_speed(1500000000.0),
-            "1.50 GB/s"
-        );
+        assert_eq!(PerformanceMetrics::format_speed(1500000000.0), "1.50 GB/s");
     }
 
     #[test]

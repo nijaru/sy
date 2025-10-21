@@ -553,7 +553,11 @@ fn test_sparse_file_delta_sync_preserves_sparseness() {
         return;
     }
 
-    assert_eq!(dest_meta.len(), 10_000_000, "Dest logical size should be 10MB");
+    assert_eq!(
+        dest_meta.len(),
+        10_000_000,
+        "Dest logical size should be 10MB"
+    );
 
     // Create sparse source file (different content, still sparse)
     let source_file = source.path().join("sparse.dat");
@@ -584,7 +588,10 @@ fn test_sparse_file_delta_sync_preserves_sparseness() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Sync should succeed for sparse file");
+    assert!(
+        output.status.success(),
+        "Sync should succeed for sparse file"
+    );
 
     // Verify sparseness is preserved in destination
     let result_meta = fs::metadata(&dest_file).unwrap();

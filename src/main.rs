@@ -189,7 +189,8 @@ async fn main() -> Result<()> {
     let verify_on_write = verification_mode.verify_blocks();
 
     // Create transport router based on source and destination
-    let transport = TransportRouter::new(source, destination, checksum_type, verify_on_write).await?;
+    let transport =
+        TransportRouter::new(source, destination, checksum_type, verify_on_write).await?;
 
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();
