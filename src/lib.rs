@@ -8,6 +8,7 @@ pub mod fs_util;
 pub mod hooks;
 pub mod integrity;
 pub mod path;
+pub mod perf;
 pub mod resource;
 pub mod ssh;
 pub mod sync;
