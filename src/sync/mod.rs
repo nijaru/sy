@@ -12,6 +12,7 @@ use crate::cli::SymlinkMode;
 use crate::error::Result;
 use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
+use crate::perf::{PerformanceMetrics, PerformanceMonitor};
 use crate::resource;
 use crate::transport::Transport;
 use dircache::DirectoryCache;
@@ -79,6 +80,7 @@ pub struct SyncEngine<T: Transport> {
     checksum: bool,
     use_cache: bool,
     clear_cache: bool,
+    perf_monitor: Option<Arc<Mutex<PerformanceMonitor>>>,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -113,7 +115,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
         checksum: bool,
         use_cache: bool,
         clear_cache: bool,
+        perf: bool,
     ) -> Self {
+        let perf_monitor = if perf {
+            Some(Arc::new(Mutex::new(PerformanceMonitor::new(bwlimit))))
+        } else {
+            None
+        };
+
         Self {
             transport: Arc::new(transport),
             dry_run,
@@ -144,6 +153,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             checksum,
             use_cache,
             clear_cache,
+            perf_monitor,
         }
     }
 
@@ -208,6 +218,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
         } else {
             false
         };
+
+        // Start scan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().start_scan();
+        }
 
         // Scan source directory (or use cache)
         let all_files = if can_use_cache {
@@ -337,6 +352,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tracing::info!("Filtered out {} files", filtered_count);
         }
 
+        // End scan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().end_scan();
+        }
+
         // Check resources before starting sync
         if !self.dry_run {
             // Calculate estimated bytes needed
@@ -411,6 +431,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .as_ref()
             .map(|s| s.completed_paths())
             .unwrap_or_default();
+
+        // Start plan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().start_plan();
+        }
 
         // Plan sync operations
         let planner = StrategyPlanner::with_comparison_flags(
@@ -497,6 +522,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tasks.extend(deletions);
         }
 
+        // End plan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().end_plan();
+        }
+
         // Emit start event if JSON mode
         if self.json {
             SyncEvent::Start {
@@ -556,6 +586,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Create hardlink map for tracking inodes (shared across all parallel transfers)
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+        // Start transfer timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().start_transfer();
+        }
+
         // Parallel execution with semaphore for concurrency control
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let mut handles = Vec::with_capacity(tasks.len());
@@ -578,6 +613,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_hardlinks = self.preserve_hardlinks;
             let preserve_acls = self.preserve_acls;
             let hardlink_map = Arc::clone(&hardlink_map);
+            let perf_monitor = self.perf_monitor.clone();
 
             let handle = tokio::spawn(async move {
                 let transferrer = Transferrer::new(
@@ -620,6 +656,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let mut stats = stats.lock().unwrap();
                                         stats.bytes_transferred += bytes_written;
                                         stats.files_created += 1;
+
+                                        // Track in performance monitor
+                                        if let Some(monitor) = &perf_monitor {
+                                            monitor.lock().unwrap().add_file_created();
+                                            monitor
+                                                .lock()
+                                                .unwrap()
+                                                .add_bytes_transferred(bytes_written);
+                                            if !source.is_dir {
+                                                monitor.lock().unwrap().add_bytes_read(source.size);
+                                            }
+                                        }
 
                                         // In dry-run mode, track bytes that would be added
                                         if dry_run && !source.is_dir {
@@ -757,6 +805,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         }
                                         stats.files_updated += 1;
 
+                                        // Track in performance monitor
+                                        if let Some(monitor) = &perf_monitor {
+                                            monitor.lock().unwrap().add_file_updated();
+                                            monitor
+                                                .lock()
+                                                .unwrap()
+                                                .add_bytes_transferred(bytes_written);
+                                            if !source.is_dir {
+                                                monitor.lock().unwrap().add_bytes_read(source.size);
+                                            }
+                                        }
+
                                         // In dry-run mode, track bytes that would be changed
                                         if dry_run && !source.is_dir {
                                             stats.bytes_would_change += source.size;
@@ -865,6 +925,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     stats.files_deleted += 1;
                                 }
 
+                                // Track in performance monitor
+                                if let Some(monitor) = &perf_monitor {
+                                    monitor.lock().unwrap().add_file_deleted();
+                                }
+
                                 // Emit JSON event if enabled
                                 if json {
                                     SyncEvent::Delete {
@@ -890,6 +955,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Collect all results
         let results = futures::future::join_all(handles).await;
+
+        // End transfer timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().end_transfer();
+        }
 
         // Check for errors and count them
         let mut error_count = 0;
@@ -1241,6 +1311,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
         stats.duration = start_time.elapsed();
         Ok(stats)
     }
+
+    /// Get performance metrics (if performance monitoring is enabled)
+    pub fn get_performance_metrics(&self) -> Option<PerformanceMetrics> {
+        self.perf_monitor
+            .as_ref()
+            .map(|monitor| monitor.lock().unwrap().get_metrics())
+    }
 }
 
 #[cfg(test)]
@@ -1283,6 +1360,7 @@ mod tests {
             false, // checksum
             false, // use_cache (disabled in tests to avoid side effects)
             false, // clear_cache
+            false, // perf
         )
     }
 

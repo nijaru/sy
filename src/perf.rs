@@ -293,11 +293,13 @@ impl PerformanceMonitor {
     }
 
     /// Record directory created
+    #[allow(dead_code)]
     pub fn add_directory_created(&self) {
         self.directories_created.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Update peak speed if current speed is higher
+    #[allow(dead_code)]
     pub fn update_peak_speed(&self, bytes_per_sec: f64) {
         let speed = bytes_per_sec as u64;
         let mut current = self.peak_speed.load(Ordering::Relaxed);

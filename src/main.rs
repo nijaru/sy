@@ -8,6 +8,7 @@ mod fs_util;
 mod hooks;
 mod integrity;
 mod path;
+mod perf;
 mod resource;
 mod ssh;
 mod sync;
@@ -351,6 +352,7 @@ async fn main() -> Result<()> {
         cli.checksum,
         cli.use_cache,
         cli.clear_cache,
+        cli.perf,
     );
 
     // Execute pre-sync hook
@@ -589,6 +591,13 @@ async fn main() -> Result<()> {
                     }
                     .bright_black()
                 );
+            }
+        }
+
+        // Print performance summary if --perf is enabled
+        if cli.perf {
+            if let Some(metrics) = engine.get_performance_metrics() {
+                metrics.print_summary();
             }
         }
     }
