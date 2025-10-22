@@ -10,6 +10,7 @@ pub mod integrity;
 pub mod path;
 pub mod perf;
 pub mod resource;
+pub mod sparse;
 pub mod ssh;
 pub mod sync;
 pub mod temp_file;
