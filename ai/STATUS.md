@@ -31,6 +31,7 @@ _Last Updated: 2025-10-21_
 - **Performance monitoring**: Arc<Mutex<PerformanceMonitor>> with atomic counters provides thread-safe metrics without overhead
 - **Error collection**: Collecting errors in Vec<SyncError> during parallel execution gives users comprehensive view of all failures
 - **Documentation reorganization**: Following agent-contexts v0.1.1 patterns with docs/architecture/ and ai/ separation provides clear structure and knowledge graduation path
+- **Comprehensive documentation**: Documenting new features (--perf, error reporting) immediately after implementation helps users discover and use them
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -38,8 +39,10 @@ _Last Updated: 2025-10-21_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- Just completed v0.0.34 (comprehensive error reporting)
-- Just completed documentation reorganization (agent-contexts v0.1.1 patterns)
+- Just completed documentation updates for v0.0.33-34 features
+  - Documented --perf flag in README with examples
+  - Documented error reporting in README
+  - Created comprehensive troubleshooting guide
 
 ## Next Steps
 - Phase 5 features (see docs/MODERNIZATION_ROADMAP.md):
