@@ -34,7 +34,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Checksum Database** - Persistent SQLite cache for 10-100x faster re-syncs! (v0.0.35)
 ✅ **Verify-Only Mode** - Audit file integrity without modification, JSON output! (v0.0.36)
 ✅ **Compression Auto-Detection** - Content-based sampling for smart compression! (v0.0.37)
-🚀 **Current Version: v0.0.37 (in development)** - 338 tests passing!
+✅ **Enhanced Progress Display** - Byte-based progress with transfer speed and current file! (v0.0.38)
+🚀 **Current Version: v0.0.38 (in development)** - 338 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

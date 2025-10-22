@@ -33,16 +33,17 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-- Compression auto-detection (v0.0.37) - Implementation complete, testing successful!
+- Enhanced progress display (v0.0.38) - Implementation complete, testing successful!
 
 ## Recently Completed
 - Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
-- Compression auto-detection feature (content sampling, CLI flags, SSH integration)
+- Compression auto-detection feature (v0.0.37 - content sampling, CLI flags, SSH integration)
+- Enhanced progress display (v0.0.38 - byte-based, speed, current file)
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [x] Compression auto-detection (file type awareness) - COMPLETE ✅ (v0.0.37)
-- [ ] Enhanced progress display (current file, real-time speed, ETA)
-- [ ] Bandwidth utilization metrics
+- [x] Enhanced progress display (current file, real-time speed, ETA) - COMPLETE ✅ (v0.0.38)
+- [ ] Bandwidth utilization metrics (% of limit when using --bwlimit)
 - [ ] Symbolic link chain detection
 - [ ] Sparse file optimization improvements
 - [ ] macOS-specific features (Finder tags, resource forks)

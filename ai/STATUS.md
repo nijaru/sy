@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-22_
 
 ## Current State
-- Version: v0.0.37 (in development)
-- Phase: Compression Auto-Detection implemented!
+- Version: v0.0.38 (in development)
+- Phase: Enhanced Progress Display implemented!
 - Test Coverage: 338 tests passing (328 lib + 8 checksumdb + 1 verification + 1 compression)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
@@ -28,6 +28,7 @@ _Last Updated: 2025-10-22_
 - ✅ Checksum database (--checksum-db flag, v0.0.35) - 10-100x faster re-syncs!
 - ✅ Verify-only mode (--verify-only flag, v0.0.36) - audit integrity, JSON output, exit codes!
 - ✅ Compression auto-detection (--compression-detection flag, v0.0.37) - content sampling, 10% threshold!
+- ✅ Enhanced progress display (v0.0.38) - byte-based progress, transfer speed, current file!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -40,6 +41,7 @@ _Last Updated: 2025-10-22_
 - **Checksum database** (v0.0.35): SQLite-based persistent cache with mtime+size validation achieves 10-100x speedup on re-syncs by eliminating redundant I/O
 - **Verify-only mode** (v0.0.36): Read-only integrity audit with structured JSON output and exit codes enables automation and monitoring workflows
 - **Compression auto-detection** (v0.0.37): Content sampling with LZ4 (BorgBackup approach) provides accurate compressibility detection with minimal overhead (~3μs per file)
+- **Enhanced progress display** (v0.0.38): Byte-based progress with transfer speed and current file provides better UX and more accurate ETA than file-count-based approach
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -47,20 +49,20 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- ✅ Completed Compression Auto-Detection (v0.0.37)
-  - Content-based sampling with LZ4 (64KB samples)
-  - 10% compression ratio threshold
-  - CLI flag with 4 modes (auto|extension|always|never)
-  - Integrated with SSH transport layer
-  - 12 new tests (28 total compression tests)
-  - Research documented in ai/research/compression_auto_detection.md
+- ✅ Completed Enhanced Progress Display (v0.0.38)
+  - Byte-based progress (vs file count)
+  - Transfer speed display ({bytes_per_sec})
+  - Current file in message
+  - Accurate ETA based on bytes
+  - Terminal-adaptive wide bar
+  - Research documented in ai/research/enhanced_progress_display.md
 
 ## Next Steps
-- Compression auto-detection complete!
-- Future enhancement: Thread CLI detection mode through transport architecture (currently hardcoded to Auto)
+- Enhanced progress display complete!
+- Future enhancement: Bandwidth utilization percentage display (requires periodic speed access)
+- Future enhancement: Thread CLI compression detection mode through transport (currently hardcoded to Auto)
 - Future enhancement: Remote checksum support for Phase 5a/5b (backlog)
-- Future enhancement: Unit tests for verify() method internals (optional, e2e tests passing)
-- Next major work from backlog: Enhanced progress display OR bandwidth utilization metrics
+- Next major work from backlog: Symbolic link chain detection OR sparse file optimization improvements
 
 ## Blockers
 None currently
