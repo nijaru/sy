@@ -3,9 +3,9 @@
 _Last Updated: 2025-10-22_
 
 ## Current State
-- Version: v0.0.40 (in development)
-- Phase: Symlink loop detection complete!
-- Test Coverage: 341 tests passing (331 lib + 8 checksumdb + 1 verification + 1 performance)
+- Version: v0.0.41 (in development)
+- Phase: macOS BSD File Flags complete!
+- Test Coverage: 344 tests passing (334 lib + 8 checksumdb + 1 verification + 1 performance)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -31,6 +31,7 @@ _Last Updated: 2025-10-22_
 - ✅ Enhanced progress display (v0.0.38) - byte-based progress, transfer speed, current file!
 - ✅ Bandwidth utilization (--perf + --bwlimit, v0.0.39) - shows % utilization in summary and JSON!
 - ✅ Symlink loop detection (v0.0.40) - safe symlink traversal with automatic cycle detection!
+- ✅ BSD file flags preservation (--preserve-flags/-F flag, v0.0.41) - macOS hidden, immutable, nodump flags!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -48,6 +49,7 @@ _Last Updated: 2025-10-22_
 - **Symlink loop detection** (v0.0.40): Leveraging walkdir's built-in ancestor tracking for loop detection avoids custom DFS implementation; simpler and more reliable than manual cycle detection
 - **Performance optimization** (v0.0.40): Eliminated String allocation in is_compressed_extension (10,000 allocations saved for 10K files); comprehensive benchmark analysis shows NO regressions
 - **Sparse file module** (v0.0.40): Foundation laid with detect_data_regions using SEEK_HOLE/SEEK_DATA; infrastructure ready for future SSH sparse transfer (~8h remaining work)
+- **BSD file flags preservation** (v0.0.41): macOS-specific flag preservation using chflags() syscall; explicitly clears flags when not preserving to prevent auto-preservation; comprehensive tests for both preservation and clearing behaviors
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -55,19 +57,20 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- 🚧 In Progress (v0.0.41 - macOS BSD File Flags) - 90% Complete
+None currently - ready for next feature!
+
+## Recently Completed
+- ✅ macOS BSD File Flags (v0.0.41) - COMPLETE
   - Add bsd_flags field to FileEntry struct (DONE ✅)
   - Implement BSD flags capture in scanner (DONE ✅)
   - Add --preserve-flags CLI flag (DONE ✅)
   - Wire preserve_flags through SyncEngine (DONE ✅)
   - Implement write_bsd_flags() method (DONE ✅)
   - Add BSD flags tests (DONE ✅)
-  - Fix test Transferrer::new() calls for macOS (REMAINING)
-  - Handle immutable flags logic (OPTIONAL - can defer)
-  - Update documentation (REMAINING)
+  - Fix test compilation errors (DONE ✅)
+  - Update documentation (DONE ✅)
 
 ## Next Steps
-- Complete BSD file flags implementation (v0.0.41) - ~4-6 hours remaining
 - Quarantine stripping (--no-quarantine flag, v0.0.42) - 2-3 hours
 - Verbose metadata display enhancements (v0.0.43+) - 4-6 hours
 - Complete sparse SSH transfer (src/sparse.rs foundation ready, ~8h remaining)
