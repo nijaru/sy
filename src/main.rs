@@ -389,8 +389,41 @@ async fn main() -> Result<()> {
 
         let result = engine.verify(source.path(), destination.path()).await?;
 
-        // Print results
-        if !cli.quiet && !cli.json {
+        // Determine exit code
+        let exit_code = if !result.errors.is_empty() {
+            2  // Errors occurred
+        } else if !result.files_mismatched.is_empty() ||
+                  !result.files_only_in_source.is_empty() ||
+                  !result.files_only_in_dest.is_empty() {
+            1  // Mismatches found
+        } else {
+            0  // All matched
+        };
+
+        // JSON output
+        if cli.json {
+            use sy::sync::output::{SyncEvent, VerificationError};
+
+            let errors_json: Vec<VerificationError> = result.errors.iter()
+                .map(|e| VerificationError {
+                    path: e.path.clone(),
+                    error: e.error.clone(),
+                    action: e.action.clone(),
+                })
+                .collect();
+
+            let event = SyncEvent::VerificationResult {
+                files_matched: result.files_matched,
+                files_mismatched: result.files_mismatched.clone(),
+                files_only_in_source: result.files_only_in_source.clone(),
+                files_only_in_dest: result.files_only_in_dest.clone(),
+                errors: errors_json,
+                duration_secs: result.duration.as_secs_f64(),
+                exit_code,
+            };
+            event.emit();
+        } else if !cli.quiet {
+            // Human-readable output
             println!("\n✓ Verification complete\n");
             println!("  Files matched:        {}", result.files_matched);
 
@@ -425,17 +458,6 @@ async fn main() -> Result<()> {
 
             println!("\n  Duration:             {:?}", result.duration);
         }
-
-        // Determine exit code
-        let exit_code = if !result.errors.is_empty() {
-            2  // Errors occurred
-        } else if !result.files_mismatched.is_empty() ||
-                  !result.files_only_in_source.is_empty() ||
-                  !result.files_only_in_dest.is_empty() {
-            1  // Mismatches found
-        } else {
-            0  // All matched
-        };
 
         std::process::exit(exit_code);
     }
