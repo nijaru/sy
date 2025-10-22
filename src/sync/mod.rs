@@ -623,14 +623,28 @@ impl<T: Transport + 'static> SyncEngine<T> {
             errors: Vec::new(),
         }));
 
+        // Calculate total bytes to transfer (for accurate progress/ETA)
+        let total_bytes: u64 = tasks
+            .iter()
+            .filter(|t| !matches!(t.action, SyncAction::Skip | SyncAction::Delete))
+            .map(|t| {
+                t.source
+                    .as_ref()
+                    .map(|f| if f.is_dir { 0 } else { f.size })
+                    .unwrap_or(0)
+            })
+            .sum();
+
         // Create progress bar (only if not quiet)
         let pb = if self.quiet {
             ProgressBar::hidden()
         } else {
-            let pb = ProgressBar::new(tasks.len() as u64);
+            let pb = ProgressBar::new(total_bytes);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                    .template(
+                        "{msg}\n{spinner:.green} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
+                    )
                     .unwrap()
                     .progress_chars("#>-"),
             );
@@ -688,12 +702,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
-                // Update progress message
+                // Update progress message (show filename only for cleaner display)
+                let filename = task
+                    .dest_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_else(|| task.dest_path.to_str().unwrap_or(""));
+
                 let msg = match &task.action {
-                    SyncAction::Create => format!("Creating {}", task.dest_path.display()),
-                    SyncAction::Update => format!("Updating {}", task.dest_path.display()),
-                    SyncAction::Skip => format!("Skipping {}", task.dest_path.display()),
-                    SyncAction::Delete => format!("Deleting {}", task.dest_path.display()),
+                    SyncAction::Create => format!("Creating: {}", filename),
+                    SyncAction::Update => format!("Updating: {}", filename),
+                    SyncAction::Skip => format!("Skipping: {}", filename),
+                    SyncAction::Delete => format!("Deleting: {}", filename),
                 };
 
                 if !matches!(task.action, SyncAction::Skip) {
@@ -853,8 +873,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                                 if let Some(ratio) = result.compression_ratio() {
                                                     pb.set_message(format!(
-                                                        "Updated {} (delta: {:.1}% literal)",
-                                                        task.dest_path.display(),
+                                                        "Updating: {} (delta: {:.1}% literal)",
+                                                        filename,
                                                         ratio
                                                     ));
                                                 }
@@ -1038,7 +1058,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     }
                 };
 
-                pb.inc(1);
+                // Increment progress by bytes written (for byte-based progress bar)
+                let bytes_for_progress = match &task.action {
+                    SyncAction::Create | SyncAction::Update => {
+                        task.source.as_ref().map(|f| f.size).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                pb.inc(bytes_for_progress);
                 drop(permit);
                 result
             });
