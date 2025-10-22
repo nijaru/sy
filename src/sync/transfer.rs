@@ -1797,4 +1797,129 @@ mod tests {
         assert!(result.is_ok(), "Should succeed despite invalid ACL entries");
         assert!(dest.exists());
     }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_bsd_flags_preservation() {
+        use std::os::darwin::fs::MetadataExt;
+
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a file and set hidden flag
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        // Set hidden flag (UF_HIDDEN = 0x8000)
+        const UF_HIDDEN: u32 = 0x8000;
+        let c_path = std::ffi::CString::new(source_file.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chflags(c_path.as_ptr(), UF_HIDDEN as _);
+        }
+
+        // Verify flag is set
+        let flags = fs::metadata(&source_file).unwrap().st_flags();
+        assert_eq!(flags & UF_HIDDEN, UF_HIDDEN, "Hidden flag should be set on source");
+
+        let file_entry = FileEntry {
+            path: source_file.clone(),
+            relative_path: PathBuf::from("test.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+            bsd_flags: Some(flags),
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(
+            &transport,
+            false,
+            false,
+            SymlinkMode::Preserve,
+            false,
+            false,
+            false,
+            true, // preserve_flags = true
+            hardlink_map,
+        );
+        let dest_path = dest_dir.path().join("test.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Verify file exists
+        assert!(dest_path.exists());
+
+        // Verify BSD flags were preserved
+        let dest_flags = fs::metadata(&dest_path).unwrap().st_flags();
+        assert_eq!(dest_flags & UF_HIDDEN, UF_HIDDEN, "Hidden flag should be preserved on dest");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_bsd_flags_not_preserved_without_flag() {
+        use std::os::darwin::fs::MetadataExt;
+
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        // Set hidden flag
+        const UF_HIDDEN: u32 = 0x8000;
+        let c_path = std::ffi::CString::new(source_file.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chflags(c_path.as_ptr(), UF_HIDDEN as _);
+        }
+
+        let flags = fs::metadata(&source_file).unwrap().st_flags();
+
+        let file_entry = FileEntry {
+            path: source_file.clone(),
+            relative_path: PathBuf::from("test.txt"),
+            size: 12,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 12,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+            bsd_flags: Some(flags),
+        };
+
+        let transport = LocalTransport::new();
+        let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let transferrer = Transferrer::new(
+            &transport,
+            false,
+            false,
+            SymlinkMode::Preserve,
+            false,
+            false,
+            false,
+            false, // preserve_flags = false
+            hardlink_map,
+        );
+        let dest_path = dest_dir.path().join("test.txt");
+        transferrer.create(&file_entry, &dest_path).await.unwrap();
+
+        // Verify file exists
+        assert!(dest_path.exists());
+
+        // Verify BSD flags were NOT preserved
+        let dest_flags = fs::metadata(&dest_path).unwrap().st_flags();
+        assert_eq!(dest_flags & UF_HIDDEN, 0, "Hidden flag should not be preserved when preserve_flags=false");
+    }
 }
