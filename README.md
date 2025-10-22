@@ -28,7 +28,9 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 9 Complete** - Developer Experience (Hooks ✅, Ignore templates ✅, Improved dry-run ✅) (v0.0.22)
 ✅ **Phase 10 Complete** - S3/Cloud Storage (AWS S3, Cloudflare R2, Backblaze B2, Wasabi!) (v0.0.22)
 ✅ **Phase 11 Complete** - Scale (Incremental scanning ✅, Bloom filters ✅, Cache ✅, O(1) memory!) (v0.0.22)
-🚀 **Current Version: v0.0.22** - 289 tests passing, zero errors!
+✅ **Performance Monitoring** - Detailed performance metrics with `--perf` flag! (v0.0.33)
+✅ **Error Reporting** - Comprehensive error collection and reporting! (v0.0.34)
+🚀 **Current Version: v0.0.34** - 314 tests passing, zero errors!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -337,6 +339,67 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - Example: `sy /src /dst --dry-run --diff --delete`
   - Output includes: file counts + byte impact analysis
 
+**Performance Monitoring (v0.0.33)**:
+- **Detailed Metrics** with `--perf` flag:
+  - Total time broken down by phase (scanning, planning, transferring)
+  - Files processed (created, updated, deleted)
+  - Data transferred and read
+  - Average transfer speed and file processing rate
+  - Bandwidth utilization (if rate limit set)
+- **Thread-Safe Collection**:
+  - Arc<Mutex<PerformanceMonitor>> with AtomicU64 counters
+  - Real-time tracking during parallel execution
+  - Zero overhead when not enabled
+- **Example Output**:
+  ```
+  Performance Summary:
+    Total time:      0.00s
+      Scanning:      0.00s (26.6%)
+      Planning:      0.00s (5.1%)
+      Transferring:  0.00s (64.4%)
+    Files:           20 processed
+      Created:       20
+    Data:            1.95 MB transferred, 1.95 MB read
+    Speed:           858.75 MB/s avg
+    Rate:            5 files/sec
+  ```
+- **Use Cases**:
+  - Performance tuning and optimization
+  - Identifying bottlenecks (scan vs transfer)
+  - Benchmarking different configurations
+  - Monitoring large-scale syncs
+
+**Error Reporting (v0.0.34)**:
+- **Comprehensive Error Collection**:
+  - All errors collected during parallel execution
+  - Sync continues for successful files (up to max_errors threshold)
+  - Users see ALL problems at once, not just first failure
+- **Detailed Error Context**:
+  - File path where error occurred
+  - Action that failed (create/update/delete)
+  - Full error message with actionable details
+- **Beautiful Formatting**:
+  - Color-coded output (red header, yellow action tags)
+  - Clear numbering for multiple errors
+  - Total error count summary
+- **Example Output**:
+  ```
+  ⚠️  Errors occurred during sync:
+
+  1. [update] /path/to/file.txt
+     Permission denied (os error 13)
+
+  2. [create] /path/to/other.txt
+     Disk quota exceeded
+
+  Total errors: 2
+  ```
+- **Benefits**:
+  - Fix all problems in one go instead of iteratively
+  - Clear identification of problematic files
+  - Better debugging and troubleshooting
+  - Detailed context for every failure
+
 **Verification & Reliability (Phase 5 - Complete)**:
 - **Verification Modes** (v0.0.14):
   - **Fast**: Size + mtime only (trust filesystem)
@@ -586,12 +649,18 @@ sy /source /destination --delete
 # Parallel transfers (10 workers by default)
 sy /source /destination -j 20
 
+# Performance monitoring (detailed metrics)
+sy /source /destination --perf
+
 # File filtering
 sy /source /destination --min-size 1MB --max-size 100MB
 sy /source /destination --exclude "*.log" --exclude "node_modules"
 
 # Bandwidth limiting
 sy /source user@host:/dest --bwlimit 1MB
+
+# Combined: dry-run with performance metrics
+sy /source /destination --dry-run --diff --perf
 ```
 
 ## Design Highlights
