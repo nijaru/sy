@@ -469,6 +469,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -499,6 +500,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -529,6 +531,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let planner = StrategyPlanner::new();
@@ -562,6 +565,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         }];
 
         let planner = StrategyPlanner::new();
@@ -611,6 +615,7 @@ mod tests {
                 inode: None,
                 nlink: 1,
                 acls: None,
+                bsd_flags: None,
             });
         }
 
@@ -672,6 +677,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         // Create planner with checksum mode enabled
@@ -713,6 +719,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         // Create planner with checksum mode enabled
@@ -753,6 +760,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         // Create planner with checksum mode enabled
@@ -791,6 +799,7 @@ mod tests {
                 inode: None,
                 nlink: 1,
                 acls: None,
+                bsd_flags: None,
             },
             FileEntry {
                 path: PathBuf::from("/source/file2.txt"),
@@ -806,6 +815,7 @@ mod tests {
                 inode: None,
                 nlink: 1,
                 acls: None,
+                bsd_flags: None,
             },
         ];
 
