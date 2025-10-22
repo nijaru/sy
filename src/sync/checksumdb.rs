@@ -203,7 +203,10 @@ impl ChecksumDatabase {
         }
 
         if deleted_count > 0 {
-            tracing::info!("Pruned {} stale entries from checksum database", deleted_count);
+            tracing::info!(
+                "Pruned {} stale entries from checksum database",
+                deleted_count
+            );
         }
 
         Ok(deleted_count)
@@ -211,9 +214,9 @@ impl ChecksumDatabase {
 
     /// Get database statistics
     pub fn stats(&self) -> Result<ChecksumDbStats> {
-        let total_entries: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM checksums", [], |row| row.get(0))?;
+        let total_entries: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM checksums", [], |row| row.get(0))?;
 
         let fast_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM checksums WHERE checksum_type = 'fast'",

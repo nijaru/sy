@@ -880,8 +880,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                                 if let Some(ratio) = result.compression_ratio() {
                                                     pb.set_message(format!(
                                                         "Updating: {} (delta: {:.1}% literal)",
-                                                        filename,
-                                                        ratio
+                                                        filename, ratio
                                                     ));
                                                 }
                                             }
@@ -1289,8 +1288,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
             if !self.dry_run {
                 let mut stored_count = 0;
                 let verifier = IntegrityVerifier::new(
-                    if self.checksum { ChecksumType::Fast } else { ChecksumType::None },
-                    false
+                    if self.checksum {
+                        ChecksumType::Fast
+                    } else {
+                        ChecksumType::None
+                    },
+                    false,
                 );
 
                 for file in &source_files {
@@ -1301,8 +1304,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     // Compute checksum for source file
                     if let Ok(checksum) = verifier.compute_file_checksum(&file.path) {
                         // Store in database
-                        if let Err(e) = db.store_checksum(&file.path, file.modified, file.size, &checksum) {
-                            tracing::warn!("Failed to store checksum for {}: {}", file.path.display(), e);
+                        if let Err(e) =
+                            db.store_checksum(&file.path, file.modified, file.size, &checksum)
+                        {
+                            tracing::warn!(
+                                "Failed to store checksum for {}: {}",
+                                file.path.display(),
+                                e
+                            );
                         } else {
                             stored_count += 1;
                         }
@@ -1316,14 +1325,16 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 // Handle prune flag
                 if self.prune_checksum_db {
                     use std::collections::HashSet;
-                    let existing_paths: HashSet<_> = source_files.iter()
-                        .map(|f| f.path.clone())
-                        .collect();
+                    let existing_paths: HashSet<_> =
+                        source_files.iter().map(|f| f.path.clone()).collect();
 
                     match db.prune(&existing_paths) {
                         Ok(pruned) => {
                             if pruned > 0 {
-                                tracing::info!("Pruned {} stale entries from checksum database", pruned);
+                                tracing::info!(
+                                    "Pruned {} stale entries from checksum database",
+                                    pruned
+                                );
                             }
                         }
                         Err(e) => {
@@ -1366,13 +1377,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
             monitor.lock().unwrap().end_scan();
         }
 
-        tracing::info!("Found {} files in source, {} files in destination",
-                       source_files.len(), dest_files.len());
+        tracing::info!(
+            "Found {} files in source, {} files in destination",
+            source_files.len(),
+            dest_files.len()
+        );
 
         // Build destination file map for quick lookup (relative path -> FileEntry)
         let mut dest_map = std::collections::HashMap::new();
         for file in &dest_files {
-            let rel_path = file.path.strip_prefix(destination)
+            let rel_path = file
+                .path
+                .strip_prefix(destination)
                 .unwrap_or(&file.path)
                 .to_path_buf();
             dest_map.insert(rel_path, file);
@@ -1380,9 +1396,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Create integrity verifier for checksum computation
         let checksum_type = if self.checksum {
-            ChecksumType::Fast  // Use xxHash3 for fast verification
+            ChecksumType::Fast // Use xxHash3 for fast verification
         } else {
-            self.verification_mode  // Use user-specified mode
+            self.verification_mode // Use user-specified mode
         };
         let verifier = IntegrityVerifier::new(checksum_type, false);
 
@@ -1404,7 +1420,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 continue;
             }
 
-            let rel_path = source_file.path.strip_prefix(source)
+            let rel_path = source_file
+                .path
+                .strip_prefix(source)
                 .unwrap_or(&source_file.path)
                 .to_path_buf();
 
@@ -1447,7 +1465,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 continue;
             }
 
-            let rel_path = dest_file.path.strip_prefix(destination)
+            let rel_path = dest_file
+                .path
+                .strip_prefix(destination)
                 .unwrap_or(&dest_file.path)
                 .to_path_buf();
 

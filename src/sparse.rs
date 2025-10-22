@@ -2,7 +2,6 @@
 ///
 /// This module provides functions for detecting and working with sparse files
 /// (files with holes). It supports both local and remote (SSH) sparse file transfers.
-
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -27,7 +26,6 @@ pub struct DataRegion {
 /// Returns empty vec if file is all holes or if SEEK_DATA not supported.
 #[cfg(unix)]
 pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
-
     const SEEK_DATA: i32 = 3; // Find next data region
     const SEEK_HOLE: i32 = 4; // Find next hole
 
@@ -136,8 +134,9 @@ mod tests {
                 assert_eq!(r[0].offset, 0);
                 assert_eq!(r[0].length, 13);
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL)
-                || e.kind() == std::io::ErrorKind::Unsupported =>
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == std::io::ErrorKind::Unsupported =>
             {
                 // SEEK_DATA not supported on this filesystem - test passes
                 // (e.g., APFS on macOS, older ext4, network mounts)
@@ -207,8 +206,9 @@ mod tests {
                 // First region should start at or near 0
                 assert!(r[0].offset < 8192, "First region should be near start");
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL)
-                || e.kind() == std::io::ErrorKind::Unsupported =>
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == std::io::ErrorKind::Unsupported =>
             {
                 // SEEK_DATA not supported - acceptable (older kernels, some filesystems)
             }

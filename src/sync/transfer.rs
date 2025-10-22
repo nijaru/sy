@@ -1888,7 +1888,11 @@ mod tests {
 
         // Verify flag is set
         let flags = fs::metadata(&source_file).unwrap().st_flags();
-        assert_eq!(flags & UF_HIDDEN, UF_HIDDEN, "Hidden flag should be set on source");
+        assert_eq!(
+            flags & UF_HIDDEN,
+            UF_HIDDEN,
+            "Hidden flag should be set on source"
+        );
 
         let file_entry = FileEntry {
             path: source_file.clone(),
@@ -1928,7 +1932,11 @@ mod tests {
 
         // Verify BSD flags were preserved
         let dest_flags = fs::metadata(&dest_path).unwrap().st_flags();
-        assert_eq!(dest_flags & UF_HIDDEN, UF_HIDDEN, "Hidden flag should be preserved on dest");
+        assert_eq!(
+            dest_flags & UF_HIDDEN,
+            UF_HIDDEN,
+            "Hidden flag should be preserved on dest"
+        );
     }
 
     #[tokio::test]
@@ -1989,6 +1997,10 @@ mod tests {
 
         // Verify BSD flags were NOT preserved
         let dest_flags = fs::metadata(&dest_path).unwrap().st_flags();
-        assert_eq!(dest_flags & UF_HIDDEN, 0, "Hidden flag should not be preserved when preserve_flags=false");
+        assert_eq!(
+            dest_flags & UF_HIDDEN,
+            0,
+            "Hidden flag should not be preserved when preserve_flags=false"
+        );
     }
 }

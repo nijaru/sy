@@ -161,7 +161,6 @@ mod tests {
             false,                              // preserve_xattrs
             false,                              // preserve_hardlinks
             false,                              // preserve_acls
-            #[cfg(target_os = "macos")]
             false,                              // preserve_flags
             false,                              // ignore_times
             false,                              // size_only
@@ -223,8 +222,7 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
-            false,
+            false, // preserve_flags
             false, // ignore_times
             false, // size_only
             false, // checksum

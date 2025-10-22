@@ -97,7 +97,8 @@ const COMPRESSED_EXTENSIONS: &[&str] = &[
 /// Check if file extension indicates already-compressed data
 pub fn is_compressed_extension(filename: &str) -> bool {
     if let Some(ext) = filename.rsplit('.').next() {
-        COMPRESSED_EXTENSIONS.iter()
+        COMPRESSED_EXTENSIONS
+            .iter()
             .any(|&e| ext.eq_ignore_ascii_case(e))
     } else {
         false
