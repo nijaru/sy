@@ -34,10 +34,10 @@
 - [ ] State-of-the-art compression algorithms for file sync
 
 ## Documentation
-- [ ] Add --perf flag examples to README
-- [ ] Document error reporting in user guide
-- [ ] Update performance comparison charts
-- [ ] Create troubleshooting guide
+- [x] Add --perf flag examples to README
+- [x] Document error reporting in user guide
+- [x] Update performance comparison charts
+- [x] Create troubleshooting guide
 
 ## Testing
 - [ ] Add tests for sparse file edge cases
