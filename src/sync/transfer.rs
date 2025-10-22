@@ -24,8 +24,7 @@ pub struct Transferrer<'a, T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    #[cfg(target_os = "macos")]
-    preserve_flags: bool,
+    preserve_flags: bool, // macOS only, no-op on other platforms
     hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>, // inode -> state
 }
 
@@ -39,7 +38,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
-        #[cfg(target_os = "macos")] preserve_flags: bool,
+        preserve_flags: bool, // macOS only, no-op on other platforms
         hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>,
     ) -> Self {
         Self {
@@ -50,7 +49,6 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             preserve_xattrs,
             preserve_hardlinks,
             preserve_acls,
-            #[cfg(target_os = "macos")]
             preserve_flags,
             hardlink_map,
         }

@@ -95,8 +95,7 @@ pub struct SyncEngine<T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    #[cfg(target_os = "macos")]
-    preserve_flags: bool,
+    preserve_flags: bool, // macOS only, no-op on other platforms
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
@@ -136,7 +135,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
-        #[cfg(target_os = "macos")] preserve_flags: bool,
+        preserve_flags: bool, // macOS only, no-op on other platforms
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
@@ -179,7 +178,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             preserve_xattrs,
             preserve_hardlinks,
             preserve_acls,
-            #[cfg(target_os = "macos")]
             preserve_flags,
             ignore_times,
             size_only,
@@ -705,7 +703,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     preserve_xattrs,
                     preserve_hardlinks,
                     preserve_acls,
-                    #[cfg(target_os = "macos")]
                     preserve_flags,
                     hardlink_map,
                 );
@@ -1539,7 +1536,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.preserve_xattrs,
             self.preserve_hardlinks,
             self.preserve_acls,
-            #[cfg(target_os = "macos")]
             self.preserve_flags,
             hardlink_map,
         );
