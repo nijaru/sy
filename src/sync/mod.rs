@@ -90,6 +90,9 @@ pub struct SyncEngine<T: Transport> {
     checksum: bool,
     use_cache: bool,
     clear_cache: bool,
+    checksum_db: bool,
+    clear_checksum_db: bool,
+    prune_checksum_db: bool,
     perf_monitor: Option<Arc<Mutex<PerformanceMonitor>>>,
 }
 
@@ -125,6 +128,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         checksum: bool,
         use_cache: bool,
         clear_cache: bool,
+        checksum_db: bool,
+        clear_checksum_db: bool,
+        prune_checksum_db: bool,
         perf: bool,
     ) -> Self {
         let perf_monitor = if perf {
@@ -163,6 +169,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             checksum,
             use_cache,
             clear_cache,
+            checksum_db,
+            clear_checksum_db,
+            prune_checksum_db,
             perf_monitor,
         }
     }
@@ -1430,6 +1439,9 @@ mod tests {
             false, // checksum
             false, // use_cache (disabled in tests to avoid side effects)
             false, // clear_cache
+            false, // checksum_db
+            false, // clear_checksum_db
+            false, // prune_checksum_db
             false, // perf
         )
     }
@@ -1534,6 +1546,9 @@ mod tests {
             false, // checksum
             false, // use_cache
             false, // clear_cache
+            false, // checksum_db
+            false, // clear_checksum_db
+            false, // prune_checksum_db
             false, // perf
         );
 

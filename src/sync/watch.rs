@@ -166,6 +166,9 @@ mod tests {
             false,                              // checksum
             false,                              // use_cache
             false,                              // clear_cache
+            false,                              // checksum_db
+            false,                              // clear_checksum_db
+            false,                              // prune_checksum_db
             false,                              // perf
         );
 
@@ -222,6 +225,9 @@ mod tests {
             false, // checksum
             false, // use_cache
             false, // clear_cache
+            false, // checksum_db
+            false, // clear_checksum_db
+            false, // prune_checksum_db
             false, // perf
         );
 
