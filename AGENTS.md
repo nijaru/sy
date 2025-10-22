@@ -9,7 +9,7 @@
 2. Check `ai/TODO.md` for active tasks
 3. Check `ai/STATUS.md` for current project state
 4. Reference `ai/DECISIONS.md` for architectural context
-5. See `DESIGN.md` for comprehensive technical design
+5. See `docs/architecture/DESIGN.md` for comprehensive technical design
 
 **Organization patterns**: Follow [@external/agent-contexts/PRACTICES.md](https://github.com/nijaru/agent-contexts)
 
@@ -27,33 +27,67 @@
 
 ```
 sy/
-├── AGENTS.md              # This file (AI entry point)
-├── ai/                    # AI working context
-│   ├── TODO.md           # Active tasks and priorities
-│   ├── STATUS.md         # Current project state
-│   ├── DECISIONS.md      # Architectural decisions
-│   └── RESEARCH.md       # Research findings
-├── docs/                  # Project documentation
-│   ├── DESIGN.md         # Comprehensive technical design (2,400 lines)
-│   ├── MODERNIZATION_ROADMAP.md  # Implementation phases
-│   ├── PERFORMANCE.md    # Performance analysis
-│   ├── EVALUATION_*.md   # Version evaluations
-│   └── *_SUPPORT.md      # Platform-specific docs
-├── src/                   # Rust source code
-│   ├── main.rs
-│   ├── sync/             # Sync orchestration
-│   ├── transport/        # SSH/SFTP/local transports
-│   ├── integrity/        # Hash functions (xxHash3, BLAKE3)
-│   ├── compress/         # zstd/lz4 compression
-│   ├── filter/           # Gitignore/rsync patterns
-│   ├── perf.rs           # Performance monitoring
+├── AGENTS.md                       # This file (AI entry point)
+├── DESIGN.md → docs/architecture/  # Symlink for easy access
+├── ai/                             # AI working context (evolving)
+│   ├── TODO.md                    # Active tasks and priorities
+│   ├── STATUS.md                  # Current state, what worked/didn't
+│   ├── DECISIONS.md               # Working decision log
+│   ├── RESEARCH.md                # Research index
+│   └── research/                  # AI research findings
+│       └── archive/               # Old research snapshots
+├── docs/                           # Permanent documentation (human-facing)
+│   ├── architecture/              # System design, technical specs
+│   │   ├── DESIGN.md             # Comprehensive design (2,400 lines)
+│   │   ├── MODERNIZATION_ROADMAP.md
+│   │   ├── PHASE2_PLAN.md
+│   │   ├── PHASE4_DESIGN.md
+│   │   ├── PHASE5_DESIGN.md
+│   │   └── ROADMAP_v0.1.0.md
+│   ├── PERFORMANCE.md             # Performance analysis
+│   ├── BENCHMARK_RESULTS.md       # Benchmark data
+│   ├── CODE_QUALITY.md            # Code quality metrics
+│   ├── OPTIMIZATIONS.md           # Optimization strategies
+│   ├── EVALUATION_v*.md           # Version evaluations
+│   ├── *_SUPPORT.md               # Platform-specific docs
 │   └── ...
-├── tests/                 # Integration tests
-├── benches/               # Performance benchmarks
-├── README.md              # User-facing overview
-├── DESIGN.md → docs/      # Symlink for easy access
-├── CONTRIBUTING.md        # Contributor guidelines
-└── .claude/CLAUDE.md      # Legacy AI context (references this file)
+├── src/                            # Rust source code
+│   ├── main.rs
+│   ├── sync/                      # Sync orchestration
+│   ├── transport/                 # SSH/SFTP/local transports
+│   ├── integrity/                 # Hash functions (xxHash3, BLAKE3)
+│   ├── compress/                  # zstd/lz4 compression
+│   ├── filter/                    # Gitignore/rsync patterns
+│   ├── perf.rs                    # Performance monitoring
+│   └── ...
+├── tests/                          # Integration tests
+├── benches/                        # Performance benchmarks
+├── README.md                       # User-facing overview
+├── CONTRIBUTING.md                 # Contributor guidelines
+├── CHANGELOG.md                    # Version history
+└── .claude/CLAUDE.md               # Legacy AI context (references this file)
+```
+
+**Directory Organization:**
+- **docs/** — Permanent, human-facing documentation (versioned, deliberate changes)
+- **ai/** — Evolving, AI-optimized working context (changes frequently during development)
+
+## Decision Flow (Knowledge Graduation)
+
+```
+Active work → ai/TODO.md
+           ↓ (completed)
+         ai/STATUS.md (what worked/didn't)
+           ↓ (if important decision)
+         ai/DECISIONS.md (working log)
+           ↓ (if architectural/permanent)
+         docs/architecture/DESIGN.md
+
+Research → ai/RESEARCH.md + ai/research/{topic}.md
+        ↓ (if valuable/permanent)
+      docs/architecture/ or code comments
+        ↓ (if outdated)
+      ai/research/archive/
 ```
 
 ## Key Documents
@@ -61,13 +95,13 @@ sy/
 Read these in order for architectural understanding:
 
 1. **ai/STATUS.md** - Current state, what's implemented, what worked/didn't
-2. **ai/DECISIONS.md** - Key architectural decisions with rationale
-3. **DESIGN.md** - Comprehensive technical design (2,400 lines)
+2. **ai/DECISIONS.md** - Key architectural decisions (working log)
+3. **docs/architecture/DESIGN.md** - Comprehensive technical design (2,400 lines)
    - Hash functions (line 79-128)
    - Transport protocols (line 252-322)
    - Compression (line 143-181)
    - Edge cases (line 548-1036)
-4. **docs/MODERNIZATION_ROADMAP.md** - Implementation phases
+4. **docs/architecture/MODERNIZATION_ROADMAP.md** - Implementation phases
 5. **ai/TODO.md** - Active work and backlog
 
 ## Development Setup
@@ -117,7 +151,7 @@ cargo build --release
 
 ## Current Focus
 
-**Active**: Documentation reorganization (ai/ directory structure)
+**Active**: Phase 2 implementation, recently completed error reporting (v0.0.34)
 
 **Next**: Phase 5 verification enhancements
 - Pre-transfer checksums
@@ -178,7 +212,7 @@ See `docs/PERFORMANCE.md` for detailed benchmarks.
 - `indicatif` - Progress bars
 - `walkdir`, `ignore` - Directory traversal
 
-**Architecture**: See DESIGN.md:2095-2144 for complete dependency rationale.
+**Architecture**: See docs/architecture/DESIGN.md:2095-2144 for complete dependency rationale.
 
 ## Multi-Session Handoff
 
@@ -187,21 +221,24 @@ See `docs/PERFORMANCE.md` for detailed benchmarks.
 2. Update `ai/STATUS.md` with current state
 3. Document discoveries in `ai/RESEARCH.md`
 4. Record decisions in `ai/DECISIONS.md`
+5. Archive old research to `ai/research/archive/`
 
 **Starting new session**:
 1. Load this AGENTS.md
 2. Check `ai/TODO.md` for active work
 3. Check `ai/STATUS.md` for current state
-4. Continue from documented state
+4. Reference `ai/DECISIONS.md` for context
+5. Continue from documented state
 
 ## Quick Reference
 
 **Find information about**:
-- Hashing → DESIGN.md:79-128
-- Transport → DESIGN.md:252-322
-- Compression → DESIGN.md:143-181
-- Filters → DESIGN.md:1059-1129
-- Edge cases → DESIGN.md:548-1036
+- Hashing → docs/architecture/DESIGN.md:79-128
+- Transport → docs/architecture/DESIGN.md:252-322
+- Compression → docs/architecture/DESIGN.md:143-181
+- Filters → docs/architecture/DESIGN.md:1059-1129
+- Edge cases → docs/architecture/DESIGN.md:548-1036
+- Roadmap → docs/architecture/MODERNIZATION_ROADMAP.md
 - Current status → ai/STATUS.md
 - Active tasks → ai/TODO.md
 - Past decisions → ai/DECISIONS.md
@@ -210,3 +247,4 @@ See `docs/PERFORMANCE.md` for detailed benchmarks.
 ---
 
 **Version**: v0.0.34 (Last updated: 2025-10-21)
+**Follows**: [agent-contexts v0.1.1](https://github.com/nijaru/agent-contexts)
