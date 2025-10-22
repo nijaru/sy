@@ -1562,6 +1562,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         inode: None,
                         nlink: 1,
                         acls: None,
+                        #[cfg(target_os = "macos")]
+                        bsd_flags: None,
                     },
                     destination,
                 )
@@ -1630,6 +1632,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         inode: None,
                         nlink: 1,
                         acls: None,
+                        #[cfg(target_os = "macos")]
+                        bsd_flags: None,
                     },
                     destination,
                 )

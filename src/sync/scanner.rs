@@ -7,6 +7,9 @@ use std::time::SystemTime;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(target_os = "macos")]
+use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
@@ -24,6 +27,8 @@ pub struct FileEntry {
     pub inode: Option<u64>,                       // Inode number (Unix only)
     pub nlink: u64,                               // Number of hard links to this file
     pub acls: Option<Vec<u8>>,                    // Serialized ACLs (if enabled)
+    #[cfg(target_os = "macos")]
+    pub bsd_flags: Option<u32>, // BSD file flags (hidden, immutable, etc.)
 }
 
 /// Detect if a file is sparse and get its allocated size
@@ -134,6 +139,19 @@ fn read_acls(path: &Path) -> Option<Vec<u8>> {
 /// Non-Unix platforms don't support ACLs
 #[cfg(not(unix))]
 fn read_acls(_path: &Path) -> Option<Vec<u8>> {
+    None
+}
+
+/// Read BSD file flags (macOS only)
+/// Returns None if not supported or if reading fails
+#[cfg(target_os = "macos")]
+fn read_bsd_flags(metadata: &std::fs::Metadata) -> Option<u32> {
+    Some(metadata.st_flags())
+}
+
+/// Non-macOS platforms don't support BSD file flags
+#[cfg(not(target_os = "macos"))]
+fn read_bsd_flags(_metadata: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
@@ -292,6 +310,10 @@ impl Iterator for StreamingScanner {
             // Read ACLs (always scan them, writing is conditional)
             let acls = read_acls(&path);
 
+            // Read BSD file flags (macOS only)
+            #[cfg(target_os = "macos")]
+            let bsd_flags = read_bsd_flags(&metadata);
+
             let modified = match metadata.modified() {
                 Ok(m) => m,
                 Err(e) => {
@@ -316,6 +338,8 @@ impl Iterator for StreamingScanner {
                 inode,
                 nlink,
                 acls,
+                #[cfg(target_os = "macos")]
+                bsd_flags,
             }));
         }
     }

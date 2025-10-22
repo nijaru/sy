@@ -27,7 +27,6 @@ pub struct DataRegion {
 /// Returns empty vec if file is all holes or if SEEK_DATA not supported.
 #[cfg(unix)]
 pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
-    use std::io::Seek;
 
     const SEEK_DATA: i32 = 3; // Find next data region
     const SEEK_HOLE: i32 = 4; // Find next hole
