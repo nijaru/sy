@@ -4,8 +4,8 @@ _Last Updated: 2025-10-21_
 
 ## Current State
 - Version: v0.0.35 (in development)
-- Phase: Phase 5a (Pre-Transfer Checksums) - Implementation in progress
-- Test Coverage: 317 tests passing
+- Phase: Phase 5b (Checksum Database) - Foundation complete, integration in progress
+- Test Coverage: 325 tests passing (317 lib + 8 checksumdb)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -41,16 +41,22 @@ _Last Updated: 2025-10-21_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
+- 🚧 Implementing Phase 5b: Checksum Database (v0.0.35/36)
+  - ✅ Added rusqlite dependency (v0.31 with bundled SQLite)
+  - ✅ Implemented ChecksumDatabase module with full SQLite backend
+  - ✅ Created schema: path, mtime, size, checksum_type, checksum, updated_at
+  - ✅ Implemented get_checksum(), store_checksum(), clear(), prune(), stats()
+  - ✅ Added CLI flags: --checksum-db, --clear-checksum-db, --prune-checksum-db
+  - ✅ 8 comprehensive tests for database operations (all passing)
+  - 🚧 Need: Integrate database with SyncEngine
+  - 🚧 Need: Update StrategyPlanner to use cached checksums
+  - 🚧 Need: Store checksums after successful transfers
+  - 🚧 Need: End-to-end testing with --checksum-db flag
+
 - ✅ Completed Phase 5a: Pre-Transfer Checksums (v0.0.35)
-  - ✅ Added checksum fields to SyncTask struct
-  - ✅ Implemented checksum computation in StrategyPlanner
-  - ✅ Added xxHash3-based comparison (15 GB/s throughput)
-  - ✅ Checksums compared during planning to skip identical files
-  - ✅ Added 3 comprehensive tests (all 317 tests passing)
-  - ✅ Local→local support working
-  - ✅ Documentation complete (README + TROUBLESHOOTING)
-  - ✅ End-to-end testing verified (checksum comparison working perfectly)
-  - 📋 Future: Remote checksum support (via sy-remote extension in Phase 5a+)
+  - All features complete and tested
+  - Documentation comprehensive
+  - Remote support deferred to future enhancement
 
 ## Next Steps
 - Phase 5b: Checksum Database (v0.0.36)
