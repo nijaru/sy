@@ -25,10 +25,9 @@ pub struct FileEntry {
     pub allocated_size: u64, // Actual bytes allocated on disk
     pub xattrs: Option<HashMap<String, Vec<u8>>>, // Extended attributes (if enabled)
     pub inode: Option<u64>,                       // Inode number (Unix only)
-    pub nlink: u64,                               // Number of hard links to this file
-    pub acls: Option<Vec<u8>>,                    // Serialized ACLs (if enabled)
-    #[cfg(target_os = "macos")]
-    pub bsd_flags: Option<u32>, // BSD file flags (hidden, immutable, etc.)
+    pub nlink: u64,             // Number of hard links to this file
+    pub acls: Option<Vec<u8>>,  // Serialized ACLs (if enabled)
+    pub bsd_flags: Option<u32>, // BSD file flags (hidden, immutable, etc.) - macOS only, None on other platforms
 }
 
 /// Detect if a file is sparse and get its allocated size
@@ -338,7 +337,6 @@ impl Iterator for StreamingScanner {
                 inode,
                 nlink,
                 acls,
-                #[cfg(target_os = "macos")]
                 bsd_flags,
             }));
         }
