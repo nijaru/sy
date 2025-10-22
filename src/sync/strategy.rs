@@ -105,7 +105,9 @@ impl StrategyPlanner {
                     };
 
                     // If checksums are available and match, skip transfer
-                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) = (&source_cksum, &dest_cksum) {
+                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) =
+                        (&source_cksum, &dest_cksum)
+                    {
                         if src_cksum == dst_cksum {
                             tracing::debug!(
                                 "Checksums match for {}, skipping transfer",
@@ -164,16 +166,25 @@ impl StrategyPlanner {
         let source_checksum = if source.path.exists() {
             // Try database first
             if let Some(db) = checksum_db {
-                if let Ok(Some(cached)) = db.get_checksum(&source.path, source.modified, source.size, checksum_type) {
+                if let Ok(Some(cached)) =
+                    db.get_checksum(&source.path, source.modified, source.size, checksum_type)
+                {
                     tracing::debug!("Database hit for source: {}", source.path.display());
                     Some(cached)
                 } else {
                     // Cache miss, compute
-                    tracing::debug!("Database miss for source: {}, computing", source.path.display());
+                    tracing::debug!(
+                        "Database miss for source: {}, computing",
+                        source.path.display()
+                    );
                     match verifier.compute_file_checksum(&source.path) {
                         Ok(cksum) => Some(cksum),
                         Err(e) => {
-                            tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
+                            tracing::warn!(
+                                "Failed to compute source checksum for {}: {}",
+                                source.path.display(),
+                                e
+                            );
                             None
                         }
                     }
@@ -183,7 +194,11 @@ impl StrategyPlanner {
                 match verifier.compute_file_checksum(&source.path) {
                     Ok(cksum) => Some(cksum),
                     Err(e) => {
-                        tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
+                        tracing::warn!(
+                            "Failed to compute source checksum for {}: {}",
+                            source.path.display(),
+                            e
+                        );
                         None
                     }
                 }
@@ -213,7 +228,11 @@ impl StrategyPlanner {
                     match verifier.compute_file_checksum(dest_path) {
                         Ok(cksum) => Some(cksum),
                         Err(e) => {
-                            tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
+                            tracing::warn!(
+                                "Failed to compute dest checksum for {}: {}",
+                                dest_path.display(),
+                                e
+                            );
                             None
                         }
                     }
@@ -223,7 +242,11 @@ impl StrategyPlanner {
                 match verifier.compute_file_checksum(dest_path) {
                     Ok(cksum) => Some(cksum),
                     Err(e) => {
-                        tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
+                        tracing::warn!(
+                            "Failed to compute dest checksum for {}: {}",
+                            dest_path.display(),
+                            e
+                        );
                         None
                     }
                 }
@@ -261,7 +284,9 @@ impl StrategyPlanner {
                     };
 
                     // If checksums are available and match, skip transfer
-                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) = (&source_cksum, &dest_cksum) {
+                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) =
+                        (&source_cksum, &dest_cksum)
+                    {
                         if src_cksum == dst_cksum {
                             tracing::debug!(
                                 "Checksums match for {}, skipping transfer",

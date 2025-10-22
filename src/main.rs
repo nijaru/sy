@@ -392,20 +392,23 @@ async fn main() -> Result<()> {
 
         // Determine exit code
         let exit_code = if !result.errors.is_empty() {
-            2  // Errors occurred
-        } else if !result.files_mismatched.is_empty() ||
-                  !result.files_only_in_source.is_empty() ||
-                  !result.files_only_in_dest.is_empty() {
-            1  // Mismatches found
+            2 // Errors occurred
+        } else if !result.files_mismatched.is_empty()
+            || !result.files_only_in_source.is_empty()
+            || !result.files_only_in_dest.is_empty()
+        {
+            1 // Mismatches found
         } else {
-            0  // All matched
+            0 // All matched
         };
 
         // JSON output
         if cli.json {
             use sy::sync::output::{SyncEvent, VerificationError};
 
-            let errors_json: Vec<VerificationError> = result.errors.iter()
+            let errors_json: Vec<VerificationError> = result
+                .errors
+                .iter()
                 .map(|e| VerificationError {
                     path: e.path.clone(),
                     error: e.error.clone(),
@@ -429,21 +432,30 @@ async fn main() -> Result<()> {
             println!("  Files matched:        {}", result.files_matched);
 
             if !result.files_mismatched.is_empty() {
-                println!("  Files mismatched:     {} ✗", result.files_mismatched.len());
+                println!(
+                    "  Files mismatched:     {} ✗",
+                    result.files_mismatched.len()
+                );
                 for path in &result.files_mismatched {
                     println!("    - {}", path.display());
                 }
             }
 
             if !result.files_only_in_source.is_empty() {
-                println!("  Only in source:       {}", result.files_only_in_source.len());
+                println!(
+                    "  Only in source:       {}",
+                    result.files_only_in_source.len()
+                );
                 for path in &result.files_only_in_source {
                     println!("    → {}", path.display());
                 }
             }
 
             if !result.files_only_in_dest.is_empty() {
-                println!("  Only in destination:  {}", result.files_only_in_dest.len());
+                println!(
+                    "  Only in destination:  {}",
+                    result.files_only_in_dest.len()
+                );
                 for path in &result.files_only_in_dest {
                     println!("    ← {}", path.display());
                 }

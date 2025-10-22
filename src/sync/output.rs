@@ -160,13 +160,11 @@ mod tests {
             files_mismatched: vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")],
             files_only_in_source: vec![PathBuf::from("src_only.txt")],
             files_only_in_dest: vec![PathBuf::from("dst_only.txt")],
-            errors: vec![
-                VerificationError {
-                    path: PathBuf::from("error_file.txt"),
-                    error: "Permission denied".to_string(),
-                    action: "verify".to_string(),
-                },
-            ],
+            errors: vec![VerificationError {
+                path: PathBuf::from("error_file.txt"),
+                error: "Permission denied".to_string(),
+                action: "verify".to_string(),
+            }],
             duration_secs: 1.5,
             exit_code: 1,
         };
