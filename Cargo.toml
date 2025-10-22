@@ -1,6 +1,6 @@
 [package]
 name = "sy"
-version = "0.0.34"
+version = "0.0.35"
 edition = "2021"
 authors = ["Nick Russo <nick@nijaru.dev>"]
 description = "Modern rsync alternative - Fast, parallel file synchronization"
@@ -57,6 +57,9 @@ num_cpus = "1.16"  # CPU count detection for parallel scanning
 
 # Scale (Phase 11)
 fastbloom = "0.7"  # Bloom filters for efficient deletion checks
+
+# Database (Phase 5b)
+rusqlite = { version = "0.31", features = ["bundled"] }  # Checksum database for persistent storage
 
 # SSH (Phase 2)
 ssh2 = "0.9"

@@ -1,3 +1,4 @@
+pub mod checksumdb;
 pub mod dircache;
 pub mod output;
 mod ratelimit;
