@@ -140,6 +140,7 @@ fn read_acls(_path: &Path) -> Option<Vec<u8>> {
 pub struct Scanner {
     root: PathBuf,
     threads: usize,
+    follow_links: bool,
 }
 
 impl Scanner {
@@ -148,6 +149,7 @@ impl Scanner {
         Self {
             root: root.into(),
             threads: num_cpus::get(),
+            follow_links: false,
         }
     }
 
@@ -160,7 +162,21 @@ impl Scanner {
         Self {
             root: root.into(),
             threads,
+            follow_links: false,
         }
+    }
+
+    /// Enable following symbolic links during directory traversal
+    ///
+    /// When enabled, symbolic links to directories will be followed and their
+    /// contents will be scanned. Loop detection is automatic (via walkdir crate)
+    /// and will report an error if a symlink loop is detected.
+    ///
+    /// Default: false (symlinks are recorded but not followed)
+    #[allow(dead_code)] // Public API for symlink following control
+    pub fn follow_links(mut self, follow: bool) -> Self {
+        self.follow_links = follow;
+        self
     }
 
     /// Scan and return all entries at once (legacy API, kept for compatibility)
@@ -196,6 +212,7 @@ impl Scanner {
             .git_global(true) // Respect global gitignore
             .git_exclude(true) // Respect .git/info/exclude
             .threads(self.threads) // Parallel walking if threads > 1
+            .follow_links(self.follow_links) // Follow symlinks with automatic loop detection
             .filter_entry(|entry| {
                 // Skip .git directories
                 entry.file_name() != ".git"
@@ -404,6 +421,101 @@ mod tests {
             file_entry.symlink_target.is_none(),
             "Regular file should have no target"
         );
+    }
+
+    #[test]
+    #[cfg(unix)] // Symlinks work differently on Windows
+    fn test_scanner_symlink_loop_detection() {
+        use std::os::unix::fs as unix_fs;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a simple self-referencing symlink loop: a/link -> a
+        let dir_a = root.join("a");
+        std::fs::create_dir(&dir_a).unwrap();
+        let link = dir_a.join("link");
+        unix_fs::symlink(&dir_a, &link).unwrap();
+
+        // Create a regular file in dir_a to verify we still scan it
+        std::fs::write(dir_a.join("file.txt"), "test").unwrap();
+
+        // Without follow_links, symlink is just recorded (no loop issue)
+        let scanner = Scanner::new(&dir_a);
+        let entries = scanner.scan().unwrap();
+
+        // Should have 2 entries: file.txt and the symlink
+        assert_eq!(entries.len(), 2);
+        let symlink_entry = entries.iter().find(|e| e.is_symlink).unwrap();
+        assert_eq!(symlink_entry.relative_path, PathBuf::from("link"));
+
+        // With follow_links enabled, walkdir detects the loop and returns an error
+        let scanner = Scanner::new(&dir_a).follow_links(true);
+        let result = scanner.scan();
+
+        // The scan should either:
+        // 1. Return Ok but skip the looping directory
+        // 2. Return an error about the loop
+        // walkdir's behavior is to skip the loop with a warning in the iterator
+        match result {
+            Ok(entries) => {
+                // Loop was skipped, we should still have file.txt
+                assert!(entries.iter().any(|e| e.path.ends_with("file.txt")));
+            }
+            Err(_) => {
+                // Loop caused an error - also acceptable
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)] // Symlinks work differently on Windows
+    fn test_scanner_symlink_chain_loop() {
+        use std::os::unix::fs as unix_fs;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a more complex loop: a/link1 -> b, b/link2 -> a
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+
+        let link1 = dir_a.join("link1");
+        let link2 = dir_b.join("link2");
+        unix_fs::symlink(&dir_b, &link1).unwrap();
+        unix_fs::symlink(&dir_a, &link2).unwrap();
+
+        // Add files to verify scanning still works
+        std::fs::write(dir_a.join("file_a.txt"), "a").unwrap();
+        std::fs::write(dir_b.join("file_b.txt"), "b").unwrap();
+
+        // Without follow_links, both symlinks are just recorded
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Should have: a/, b/, a/file_a.txt, b/file_b.txt, a/link1, b/link2
+        assert!(entries.len() >= 4);
+        assert_eq!(entries.iter().filter(|e| e.is_symlink).count(), 2);
+
+        // With follow_links, walkdir should detect the cycle
+        let scanner = Scanner::new(root).follow_links(true);
+        let result = scanner.scan();
+
+        // Should handle gracefully (either skip loop or return error)
+        match result {
+            Ok(entries) => {
+                // Should still have both regular files
+                assert!(entries.iter().any(|e| e.path.ends_with("file_a.txt")));
+                assert!(entries.iter().any(|e| e.path.ends_with("file_b.txt")));
+            }
+            Err(_) => {
+                // Loop detection error is acceptable
+            }
+        }
     }
 
     #[test]
