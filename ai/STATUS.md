@@ -55,18 +55,23 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- ✅ Completed Session (v0.0.40)
-  - Symlink loop detection (follow_links option, walkdir integration)
-  - Performance optimization (extension matching, zero allocations)
-  - Performance analysis (no regressions detected, benchmarks stable)
-  - Sparse file module foundation (detect_data_regions, SEEK_HOLE/SEEK_DATA)
+- 🚧 In Progress (v0.0.41 - macOS BSD File Flags)
+  - Add bsd_flags field to FileEntry struct (DONE)
+  - Implement BSD flags capture in scanner (DONE)
+  - Add --preserve-flags CLI flag (DONE)
+  - Wire preserve_flags through SyncEngine (REMAINING)
+  - Implement set_bsd_flags() in LocalTransport (REMAINING)
+  - Handle immutable flags logic (REMAINING)
+  - Add tests for BSD flags preservation (REMAINING)
+  - Update documentation (REMAINING)
 
 ## Next Steps
-- v0.0.40 complete with 4 features/improvements!
-- Future work: Complete sparse SSH transfer (src/sparse.rs foundation ready, ~8h remaining)
-- Future enhancement: Thread CLI compression detection mode through transport
-- Future enhancement: Remote checksum support for Phase 5a/5b (backlog)
-- Next major work from backlog: macOS-specific features OR Windows-specific features
+- Complete BSD file flags implementation (v0.0.41) - ~4-6 hours remaining
+- Quarantine stripping (--no-quarantine flag, v0.0.42) - 2-3 hours
+- Verbose metadata display enhancements (v0.0.43+) - 4-6 hours
+- Complete sparse SSH transfer (src/sparse.rs foundation ready, ~8h remaining)
+- Thread CLI compression detection mode through transport
+- Remote checksum support for Phase 5a/5b (backlog)
 
 ## Blockers
 None currently
