@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::str::FromStr;
 
 /// Compression algorithm
@@ -143,6 +145,133 @@ pub fn should_compress_adaptive(
 /// (Legacy function for backward compatibility)
 pub fn should_compress(filename: &str, file_size: u64) -> Compression {
     should_compress_adaptive(filename, file_size, false, None)
+}
+
+/// Detect file compressibility by sampling first 64KB with LZ4
+///
+/// Returns compression ratio (compressed_size / original_size)
+/// - Ratio < 0.9 means compressible (>10% savings)
+/// - Ratio >= 0.9 means incompressible (<10% savings)
+///
+/// Uses LZ4 for fast testing (23 GB/s throughput)
+/// Inspired by BorgBackup's auto-compression heuristic
+pub fn detect_compressibility(file_path: &Path) -> io::Result<f64> {
+    const SAMPLE_SIZE: usize = 64 * 1024; // 64KB sample
+
+    let mut file = File::open(file_path)?;
+    let mut buffer = vec![0u8; SAMPLE_SIZE];
+    let bytes_read = file.read(&mut buffer)?;
+
+    // Empty file or very small file
+    if bytes_read == 0 {
+        return Ok(1.0); // No benefit
+    }
+
+    let sample = &buffer[..bytes_read];
+    let compressed = compress_lz4(sample)?;
+
+    // Calculate compression ratio
+    let ratio = compressed.len() as f64 / sample.len() as f64;
+
+    Ok(ratio)
+}
+
+/// Compression detection mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompressionDetection {
+    /// Content-based detection with sampling (default)
+    Auto,
+
+    /// Extension-only detection (legacy behavior)
+    Extension,
+
+    /// Always compress (override detection)
+    Always,
+
+    /// Never compress (override detection)
+    Never,
+}
+
+impl Default for CompressionDetection {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Smart compression detection using content sampling
+///
+/// This function extends should_compress_adaptive() with content-based detection
+/// for improved accuracy. It follows BorgBackup's proven approach of sampling
+/// file content to determine compressibility.
+///
+/// # Arguments
+/// * `file_path` - Optional path to the file for content sampling
+/// * `filename` - Filename for extension-based filtering
+/// * `file_size` - Size in bytes
+/// * `is_local` - Whether this is a local transfer
+/// * `detection_mode` - Detection mode (Auto, Extension, Always, Never)
+///
+/// # Detection Strategy
+/// 1. Fast path: Skip if local transfer, small file, or known compressed extension
+/// 2. Content sampling: Read first 64KB, test with LZ4, measure ratio
+/// 3. Decision: Ratio <0.9 → compress with Zstd, ≥0.9 → skip compression
+pub fn should_compress_smart(
+    file_path: Option<&Path>,
+    filename: &str,
+    file_size: u64,
+    is_local: bool,
+    detection_mode: CompressionDetection,
+) -> Compression {
+    // LOCAL: Never compress (disk I/O is bottleneck, not network/CPU)
+    if is_local {
+        return Compression::None;
+    }
+
+    // Handle explicit overrides
+    match detection_mode {
+        CompressionDetection::Always => return Compression::Zstd,
+        CompressionDetection::Never => return Compression::None,
+        _ => {} // Continue with detection
+    }
+
+    // Skip small files (overhead > benefit)
+    if file_size < 1024 * 1024 {
+        return Compression::None;
+    }
+
+    // Skip known compressed extensions (fast path)
+    if is_compressed_extension(filename) {
+        return Compression::None;
+    }
+
+    // Extension-only mode (legacy behavior)
+    if detection_mode == CompressionDetection::Extension {
+        return Compression::Zstd;
+    }
+
+    // Content sampling (auto mode)
+    // This is the new smart detection that tests actual compressibility
+    if let Some(path) = file_path {
+        match detect_compressibility(path) {
+            Ok(ratio) if ratio < 0.9 => {
+                // Compressible: >10% savings achieved
+                Compression::Zstd
+            }
+            Ok(_ratio) => {
+                // Incompressible: <10% savings, not worth CPU overhead
+                Compression::None
+            }
+            Err(_) => {
+                // Error reading file, fall back to trying compression
+                // Better to compress and waste some CPU than skip and lose bandwidth
+                Compression::Zstd
+            }
+        }
+    } else {
+        // No file path available, fall back to extension-based heuristic
+        // This happens when we only have filename/size but not actual file
+        Compression::Zstd
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +437,221 @@ mod tests {
             should_compress_adaptive("test.txt", 512_000, false, Some(10)),
             Compression::None
         );
+    }
+
+    #[test]
+    fn test_detect_compressibility_text() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a highly compressible text file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let repetitive_text = "Hello world! ".repeat(5000); // ~60KB of repetitive text
+        temp_file.write_all(repetitive_text.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let ratio = detect_compressibility(temp_file.path()).unwrap();
+
+        // Repetitive text should compress very well (ratio should be < 0.5)
+        assert!(ratio < 0.5, "Ratio: {}", ratio);
+    }
+
+    #[test]
+    fn test_detect_compressibility_random() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a file with high-entropy data (incompressible)
+        // Use a better pseudo-random sequence that doesn't compress well
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let random_data: Vec<u8> = (0u32..65536)
+            .map(|i| {
+                // Mix bits from multiple positions to create high entropy
+                let x = i.wrapping_mul(2654435761); // Knuth's multiplicative hash
+                ((x ^ (x >> 16)) & 0xFF) as u8
+            })
+            .collect();
+        temp_file.write_all(&random_data).unwrap();
+        temp_file.flush().unwrap();
+
+        let ratio = detect_compressibility(temp_file.path()).unwrap();
+
+        // High-entropy data should not compress well (ratio should be > 0.85)
+        // Note: Even good pseudo-random may compress slightly, so we use 0.85 threshold
+        assert!(ratio > 0.85, "Ratio: {}", ratio);
+    }
+
+    #[test]
+    fn test_detect_compressibility_empty() {
+        use tempfile::NamedTempFile;
+
+        // Create an empty file
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let ratio = detect_compressibility(temp_file.path()).unwrap();
+
+        // Empty file should return 1.0 (no benefit)
+        assert_eq!(ratio, 1.0);
+    }
+
+    #[test]
+    fn test_should_compress_smart_auto_compressible() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a compressible file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let text = "Compressible text data! ".repeat(50000); // ~1.2MB
+        temp_file.write_all(text.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = should_compress_smart(
+            Some(temp_file.path()),
+            "test.txt",
+            1_200_000,
+            false,
+            CompressionDetection::Auto,
+        );
+
+        assert_eq!(result, Compression::Zstd);
+    }
+
+    #[test]
+    fn test_should_compress_smart_auto_incompressible() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create an incompressible file (high entropy)
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let random_data: Vec<u8> = (0u32..1_200_000)
+            .map(|i| {
+                // Use Knuth's multiplicative hash for high-entropy data
+                let x = i.wrapping_mul(2654435761);
+                ((x ^ (x >> 16)) & 0xFF) as u8
+            })
+            .collect();
+        temp_file.write_all(&random_data).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = should_compress_smart(
+            Some(temp_file.path()),
+            "data.bin",
+            1_200_000,
+            false,
+            CompressionDetection::Auto,
+        );
+
+        // Should skip compression for incompressible data
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_always() {
+        // Always mode should always compress
+        let result = should_compress_smart(
+            None,
+            "test.jpg", // Even for compressed extension
+            10_000_000,
+            false,
+            CompressionDetection::Always,
+        );
+
+        assert_eq!(result, Compression::Zstd);
+    }
+
+    #[test]
+    fn test_should_compress_smart_never() {
+        // Never mode should never compress
+        let result = should_compress_smart(
+            None,
+            "test.txt", // Even for text files
+            10_000_000,
+            false,
+            CompressionDetection::Never,
+        );
+
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_extension_mode() {
+        // Extension mode should use legacy behavior (compress unless known extension)
+        let result = should_compress_smart(
+            None,
+            "test.txt",
+            10_000_000,
+            false,
+            CompressionDetection::Extension,
+        );
+
+        assert_eq!(result, Compression::Zstd);
+
+        // Should skip known compressed extensions even in extension mode
+        let result = should_compress_smart(
+            None,
+            "test.jpg",
+            10_000_000,
+            false,
+            CompressionDetection::Extension,
+        );
+
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_local() {
+        // Local transfers should never compress regardless of detection mode
+        let result = should_compress_smart(
+            None,
+            "test.txt",
+            10_000_000,
+            true, // is_local
+            CompressionDetection::Auto,
+        );
+
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_small_file() {
+        // Small files should not be compressed
+        let result = should_compress_smart(
+            None,
+            "test.txt",
+            512_000, // < 1MB
+            false,
+            CompressionDetection::Auto,
+        );
+
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_known_compressed_extension() {
+        // Files with known compressed extensions should be skipped (fast path)
+        let result = should_compress_smart(
+            None,
+            "video.mp4",
+            100_000_000,
+            false,
+            CompressionDetection::Auto,
+        );
+
+        assert_eq!(result, Compression::None);
+    }
+
+    #[test]
+    fn test_should_compress_smart_no_path_fallback() {
+        // Without file path, should fall back to extension-based heuristic
+        let result = should_compress_smart(
+            None, // No path
+            "data.bin",
+            10_000_000,
+            false,
+            CompressionDetection::Auto,
+        );
+
+        // Should default to compressing when path not available
+        assert_eq!(result, Compression::Zstd);
     }
 }
