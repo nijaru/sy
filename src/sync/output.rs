@@ -44,6 +44,22 @@ pub enum SyncEvent {
         files_verified: usize,
         verification_failures: usize,
     },
+    VerificationResult {
+        files_matched: usize,
+        files_mismatched: Vec<PathBuf>,
+        files_only_in_source: Vec<PathBuf>,
+        files_only_in_dest: Vec<PathBuf>,
+        errors: Vec<VerificationError>,
+        duration_secs: f64,
+        exit_code: i32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerificationError {
+    pub path: PathBuf,
+    pub error: String,
+    pub action: String,
 }
 
 impl SyncEvent {
@@ -118,5 +134,38 @@ mod tests {
         assert!(json.contains(r#""duration_secs":12.5"#));
         assert!(json.contains(r#""files_verified":15"#));
         assert!(json.contains(r#""verification_failures":0"#));
+    }
+
+    #[test]
+    fn test_serialize_verification_result() {
+        let event = SyncEvent::VerificationResult {
+            files_matched: 10,
+            files_mismatched: vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")],
+            files_only_in_source: vec![PathBuf::from("src_only.txt")],
+            files_only_in_dest: vec![PathBuf::from("dst_only.txt")],
+            errors: vec![
+                VerificationError {
+                    path: PathBuf::from("error_file.txt"),
+                    error: "Permission denied".to_string(),
+                    action: "verify".to_string(),
+                },
+            ],
+            duration_secs: 1.5,
+            exit_code: 1,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"verification_result"#));
+        assert!(json.contains(r#""files_matched":10"#));
+        assert!(json.contains(r#""files_mismatched"#));
+        assert!(json.contains(r#""file1.txt"#));
+        assert!(json.contains(r#""files_only_in_source"#));
+        assert!(json.contains(r#""src_only.txt"#));
+        assert!(json.contains(r#""files_only_in_dest"#));
+        assert!(json.contains(r#""dst_only.txt"#));
+        assert!(json.contains(r#""errors"#));
+        assert!(json.contains(r#""error_file.txt"#));
+        assert!(json.contains(r#""duration_secs":1.5"#));
+        assert!(json.contains(r#""exit_code":1"#));
     }
 }
