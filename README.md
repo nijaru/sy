@@ -35,7 +35,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Verify-Only Mode** - Audit file integrity without modification, JSON output! (v0.0.36)
 ✅ **Compression Auto-Detection** - Content-based sampling for smart compression! (v0.0.37)
 ✅ **Enhanced Progress Display** - Byte-based progress with transfer speed and current file! (v0.0.38)
-🚀 **Current Version: v0.0.38 (in development)** - 338 tests passing!
+✅ **Bandwidth Utilization JSON** - Performance metrics including bandwidth % in JSON output! (v0.0.39)
+🚀 **Current Version: v0.0.39 (in development)** - 339 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
