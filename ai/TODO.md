@@ -3,18 +3,18 @@
 ## High Priority
 - [ ] Phase 5: Verification enhancements
   - [x] Design (see ai/research/phase5_verification_design.md)
-  - [x] Phase 5a: Pre-transfer checksums (v0.0.35) - Core implementation done
+  - [x] Phase 5a: Pre-transfer checksums (v0.0.35) - COMPLETE ✅
     - [x] Add checksum fields to SyncTask
     - [x] Implement checksum computation in planner
     - [x] Add tests (3 new tests, all 317 passing)
-    - [ ] Update documentation
-    - [ ] End-to-end CLI testing
+    - [x] Update documentation (README + TROUBLESHOOTING)
+    - [x] End-to-end CLI testing (verified working)
     - [ ] Remote checksum support (deferred to follow-up)
-  - [ ] Phase 5b: Checksum database (v0.0.36)
+  - [ ] Phase 5b: Checksum database (v0.0.36) - NEXT
   - [ ] Phase 5c: --verify-only mode (v0.0.37)
 
 ## In Progress
-- Phase 5a implementation - core done, needs docs and e2e testing
+- Phase 5a complete! Ready for Phase 5b or other tasks
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [ ] Compression auto-detection (file type awareness)
