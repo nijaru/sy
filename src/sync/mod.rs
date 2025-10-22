@@ -1222,6 +1222,28 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 verification_failures: final_stats.verification_failures,
             }
             .emit();
+
+            // Emit performance metrics if performance monitoring is enabled
+            if let Some(perf_metrics) = self.get_performance_metrics() {
+                SyncEvent::Performance {
+                    total_duration_secs: perf_metrics.total_duration.as_secs_f64(),
+                    scan_duration_secs: perf_metrics.scan_duration.as_secs_f64(),
+                    plan_duration_secs: perf_metrics.plan_duration.as_secs_f64(),
+                    transfer_duration_secs: perf_metrics.transfer_duration.as_secs_f64(),
+                    bytes_transferred: perf_metrics.bytes_transferred,
+                    bytes_read: perf_metrics.bytes_read,
+                    files_processed: perf_metrics.files_processed,
+                    files_created: perf_metrics.files_created,
+                    files_updated: perf_metrics.files_updated,
+                    files_deleted: perf_metrics.files_deleted,
+                    directories_created: perf_metrics.directories_created,
+                    avg_transfer_speed: perf_metrics.avg_transfer_speed,
+                    peak_transfer_speed: perf_metrics.peak_transfer_speed,
+                    files_per_second: perf_metrics.files_per_second,
+                    bandwidth_utilization: perf_metrics.bandwidth_utilization,
+                }
+                .emit();
+            }
         }
 
         // Clean up resume state on successful completion
