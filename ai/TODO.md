@@ -33,10 +33,14 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
+- Compression auto-detection (v0.0.37) - Implementation complete, testing successful!
+
+## Recently Completed
 - Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
+- Compression auto-detection feature (content sampling, CLI flags, SSH integration)
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
-- [ ] Compression auto-detection (file type awareness)
+- [x] Compression auto-detection (file type awareness) - COMPLETE ✅ (v0.0.37)
 - [ ] Enhanced progress display (current file, real-time speed, ETA)
 - [ ] Bandwidth utilization metrics
 - [ ] Symbolic link chain detection

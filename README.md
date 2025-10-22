@@ -33,7 +33,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Pre-Transfer Checksums** - Compare checksums before transfer to skip identical files! (v0.0.35)
 ✅ **Checksum Database** - Persistent SQLite cache for 10-100x faster re-syncs! (v0.0.35)
 ✅ **Verify-Only Mode** - Audit file integrity without modification, JSON output! (v0.0.36)
-🚀 **Current Version: v0.0.36 (in development)** - 326 tests passing!
+✅ **Compression Auto-Detection** - Content-based sampling for smart compression! (v0.0.37)
+🚀 **Current Version: v0.0.37 (in development)** - 338 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -308,15 +309,23 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
 - **Performance** (benchmarked):
   - LZ4: 23 GB/s throughput
   - Zstd: 8 GB/s throughput (level 3)
+- **Smart Detection** (v0.0.37 - NEW!):
+  - **Content Sampling**: Tests first 64KB with LZ4 (~3μs overhead)
+  - **10% Threshold**: Only compress if >10% savings (ratio <0.9)
+  - **Auto-Detection**: Catches compressed files without extensions (minified JS, executables, etc.)
+  - **CLI Control**: `--compression-detection` (auto|extension|always|never)
+  - **BorgBackup-inspired**: Proven approach from production backup tool
 - **Smart Heuristics**:
   - Local: never compress (disk I/O bottleneck)
-  - Network: always Zstd (CPU never bottleneck, even on 100 Gbps)
+  - Network: content-based detection (auto mode)
   - Skip: files <1MB, pre-compressed formats (jpg, mp4, zip, pdf, etc.)
+  - Skip: incompressible data detected via sampling
 - **Status**:
-  - ✅ Module implemented and tested (18 unit tests)
+  - ✅ Module implemented and tested (28 unit tests, +12 new)
   - ✅ Integration tests pass (5 tests, proven end-to-end)
   - ✅ Benchmarks prove 50x faster than originally assumed
   - ✅ Production integration complete (v0.0.10)
+  - ✅ Content-based auto-detection (v0.0.37)
   - ✅ Compression stats tracked and displayed
   - ✅ 2-5x reduction on text/code files
 

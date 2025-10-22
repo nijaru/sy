@@ -3,9 +3,9 @@
 _Last Updated: 2025-10-22_
 
 ## Current State
-- Version: v0.0.36 (in development)
-- Phase: Phase 5 Complete! All verification enhancements implemented (5a, 5b, 5c)
-- Test Coverage: 326 tests passing (317 lib + 8 checksumdb + 1 verification)
+- Version: v0.0.37 (in development)
+- Phase: Compression Auto-Detection implemented!
+- Test Coverage: 338 tests passing (328 lib + 8 checksumdb + 1 verification + 1 compression)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -15,7 +15,7 @@ _Last Updated: 2025-10-22_
 - ✅ Filesystem-aware strategy selection
 - ✅ Hard link preservation
 - ✅ Parallel file transfers
-- ✅ Compression (zstd)
+- ✅ Compression (zstd) with content-based auto-detection (v0.0.37)
 - ✅ Progress display with colors
 - ✅ Gitignore awareness
 - ✅ JSON output
@@ -27,6 +27,7 @@ _Last Updated: 2025-10-22_
 - ✅ Pre-transfer checksums (--checksum flag, v0.0.35) - local→local, saves bandwidth!
 - ✅ Checksum database (--checksum-db flag, v0.0.35) - 10-100x faster re-syncs!
 - ✅ Verify-only mode (--verify-only flag, v0.0.36) - audit integrity, JSON output, exit codes!
+- ✅ Compression auto-detection (--compression-detection flag, v0.0.37) - content sampling, 10% threshold!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -38,6 +39,7 @@ _Last Updated: 2025-10-22_
 - **Pre-transfer checksums** (v0.0.35): Computing xxHash3 checksums during planning phase before transfer saves bandwidth on re-syncs and detects bit rot
 - **Checksum database** (v0.0.35): SQLite-based persistent cache with mtime+size validation achieves 10-100x speedup on re-syncs by eliminating redundant I/O
 - **Verify-only mode** (v0.0.36): Read-only integrity audit with structured JSON output and exit codes enables automation and monitoring workflows
+- **Compression auto-detection** (v0.0.37): Content sampling with LZ4 (BorgBackup approach) provides accurate compressibility detection with minimal overhead (~3μs per file)
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -45,27 +47,20 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- ✅ Completed Phase 5c: Verify-Only Mode (v0.0.36)
-  - All features complete and tested
-  - JSON output working perfectly
-  - Exit codes (0/1/2) verified
-  - Comprehensive documentation
-
-- ✅ Completed Phase 5b: Checksum Database (v0.0.35)
-  - All features complete and tested
-  - 10-100x speedup verified in end-to-end testing
-  - Documentation comprehensive
-
-- ✅ Completed Phase 5a: Pre-Transfer Checksums (v0.0.35)
-  - All features complete and tested
-  - Documentation comprehensive
-  - Remote support deferred to future enhancement
+- ✅ Completed Compression Auto-Detection (v0.0.37)
+  - Content-based sampling with LZ4 (64KB samples)
+  - 10% compression ratio threshold
+  - CLI flag with 4 modes (auto|extension|always|never)
+  - Integrated with SSH transport layer
+  - 12 new tests (28 total compression tests)
+  - Research documented in ai/research/compression_auto_detection.md
 
 ## Next Steps
-- Phase 5 fully complete! All verification enhancements delivered.
-- Next major work: Compression auto-detection (backlog)
+- Compression auto-detection complete!
+- Future enhancement: Thread CLI detection mode through transport architecture (currently hardcoded to Auto)
 - Future enhancement: Remote checksum support for Phase 5a/5b (backlog)
 - Future enhancement: Unit tests for verify() method internals (optional, e2e tests passing)
+- Next major work from backlog: Enhanced progress display OR bandwidth utilization metrics
 
 ## Blockers
 None currently
