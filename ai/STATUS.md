@@ -24,7 +24,7 @@ _Last Updated: 2025-10-21_
 - ✅ Resume support
 - ✅ Performance monitoring (--perf flag, v0.0.33)
 - ✅ Comprehensive error reporting (v0.0.34)
-- 🚧 Pre-transfer checksums (--checksum flag, v0.0.35) - local→local only
+- ✅ Pre-transfer checksums (--checksum flag, v0.0.35) - local→local, saves bandwidth!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -33,6 +33,7 @@ _Last Updated: 2025-10-21_
 - **Error collection**: Collecting errors in Vec<SyncError> during parallel execution gives users comprehensive view of all failures
 - **Documentation reorganization**: Following agent-contexts v0.1.1 patterns with docs/architecture/ and ai/ separation provides clear structure and knowledge graduation path
 - **Comprehensive documentation**: Documenting new features (--perf, error reporting) immediately after implementation helps users discover and use them
+- **Pre-transfer checksums** (v0.0.35): Computing xxHash3 checksums during planning phase before transfer saves bandwidth on re-syncs and detects bit rot
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -40,22 +41,26 @@ _Last Updated: 2025-10-21_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- Implementing Phase 5a: Pre-Transfer Checksums (v0.0.35)
+- ✅ Completed Phase 5a: Pre-Transfer Checksums (v0.0.35)
   - ✅ Added checksum fields to SyncTask struct
   - ✅ Implemented checksum computation in StrategyPlanner
   - ✅ Added xxHash3-based comparison (15 GB/s throughput)
   - ✅ Checksums compared during planning to skip identical files
   - ✅ Added 3 comprehensive tests (all 317 tests passing)
   - ✅ Local→local support working
-  - 🚧 Need: Documentation updates
-  - 🚧 Need: End-to-end testing with actual CLI
-  - 📋 Future: Remote checksum support (via sy-remote extension)
+  - ✅ Documentation complete (README + TROUBLESHOOTING)
+  - ✅ End-to-end testing verified (checksum comparison working perfectly)
+  - 📋 Future: Remote checksum support (via sy-remote extension in Phase 5a+)
 
 ## Next Steps
-- Phase 5 features (see docs/MODERNIZATION_ROADMAP.md):
-  - Pre-transfer checksums
-  - Verification enhancements
-  - Compression auto-detection
+- Phase 5b: Checksum Database (v0.0.36)
+  - SQLite-based persistent checksum storage
+  - 10-100x speedup for --checksum re-syncs
+  - Automatic cache invalidation on mtime/size change
+- Phase 5c: --verify-only mode (v0.0.37)
+  - Audit file integrity without modification
+  - Scriptable with JSON output + exit codes
+- Compression auto-detection (backlog)
 
 ## Blockers
 None currently
