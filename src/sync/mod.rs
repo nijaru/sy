@@ -28,6 +28,13 @@ use strategy::{StrategyPlanner, SyncAction};
 use tokio::sync::Semaphore;
 use transfer::Transferrer;
 
+#[derive(Debug, Clone)]
+pub struct SyncError {
+    pub path: PathBuf,
+    pub error: String,
+    pub action: String,
+}
+
 #[derive(Debug)]
 pub struct SyncStats {
     pub files_scanned: usize,
@@ -47,6 +54,8 @@ pub struct SyncStats {
     pub bytes_would_add: u64,
     pub bytes_would_change: u64,
     pub bytes_would_delete: u64,
+    // Error tracking
+    pub errors: Vec<SyncError>,
 }
 
 pub struct SyncEngine<T: Transport> {
@@ -561,6 +570,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            errors: Vec::new(),
         }));
 
         // Create progress bar (only if not quiet)
@@ -747,7 +757,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                     Ok(())
                                 }
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    // Record error
+                                    {
+                                        let mut stats = stats.lock().unwrap();
+                                        stats.errors.push(SyncError {
+                                            path: task.dest_path.clone(),
+                                            error: e.to_string(),
+                                            action: "create".to_string(),
+                                        });
+                                    }
+                                    Err(e)
+                                }
                             }
                         } else {
                             Ok(())
@@ -884,7 +905,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                     Ok(())
                                 }
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    // Record error
+                                    {
+                                        let mut stats = stats.lock().unwrap();
+                                        stats.errors.push(SyncError {
+                                            path: task.dest_path.clone(),
+                                            error: e.to_string(),
+                                            action: "update".to_string(),
+                                        });
+                                    }
+                                    Err(e)
+                                }
                             }
                         } else {
                             Ok(())
@@ -940,7 +972,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                 Ok(())
                             }
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                // Record error
+                                {
+                                    let mut stats = stats.lock().unwrap();
+                                    stats.errors.push(SyncError {
+                                        path: task.dest_path.clone(),
+                                        error: e.to_string(),
+                                        action: "delete".to_string(),
+                                    });
+                                }
+                                Err(e)
+                            }
                         }
                     }
                 };
@@ -1041,18 +1084,43 @@ impl<T: Transport + 'static> SyncEngine<T> {
             }
         }
 
-        // Log summary of errors if any occurred but we didn't abort
-        if error_count > 0 {
-            tracing::warn!("Sync completed with {} errors", error_count);
+        pb.finish_with_message("Sync complete");
+
+        // Extract final stats before reporting errors
+        let mut final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+
+        // Print detailed error report if errors occurred
+        if !final_stats.errors.is_empty() {
+            tracing::warn!("Sync completed with {} errors", final_stats.errors.len());
+
             if !self.quiet && !self.json {
-                eprintln!("⚠️  Warning: {} errors occurred during sync", error_count);
+                use colored::Colorize;
+                eprintln!("\n{}", "⚠️  Errors occurred during sync:".red().bold());
+                eprintln!();
+
+                for (i, err) in final_stats.errors.iter().enumerate() {
+                    eprintln!(
+                        "  {}. {} {}",
+                        (i + 1).to_string().bright_black(),
+                        format!("[{}]", err.action).yellow(),
+                        err.path.display().to_string().white()
+                    );
+                    eprintln!("     {}", err.error.bright_black());
+                    if i < final_stats.errors.len() - 1 {
+                        eprintln!();
+                    }
+                }
+
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    format!("Total errors: {}", final_stats.errors.len()).red()
+                );
+                eprintln!();
             }
         }
 
-        pb.finish_with_message("Sync complete");
-
-        // Extract final stats and add duration
-        let mut final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+        // Add duration after extracting stats
         final_stats.duration = start_time.elapsed();
 
         tracing::info!(
@@ -1142,6 +1210,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            errors: Vec::new(),
         };
 
         // Check if destination exists
