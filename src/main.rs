@@ -380,6 +380,66 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Verify-only mode
+    if cli.verify_only {
+        if !cli.quiet && !cli.json {
+            println!("sy v{}", env!("CARGO_PKG_VERSION"));
+            println!("Verifying {} ↔ {}\n", source, destination);
+        }
+
+        let result = engine.verify(source.path(), destination.path()).await?;
+
+        // Print results
+        if !cli.quiet && !cli.json {
+            println!("\n✓ Verification complete\n");
+            println!("  Files matched:        {}", result.files_matched);
+
+            if !result.files_mismatched.is_empty() {
+                println!("  Files mismatched:     {} ✗", result.files_mismatched.len());
+                for path in &result.files_mismatched {
+                    println!("    - {}", path.display());
+                }
+            }
+
+            if !result.files_only_in_source.is_empty() {
+                println!("  Only in source:       {}", result.files_only_in_source.len());
+                for path in &result.files_only_in_source {
+                    println!("    → {}", path.display());
+                }
+            }
+
+            if !result.files_only_in_dest.is_empty() {
+                println!("  Only in destination:  {}", result.files_only_in_dest.len());
+                for path in &result.files_only_in_dest {
+                    println!("    ← {}", path.display());
+                }
+            }
+
+            if !result.errors.is_empty() {
+                println!("\n⚠️  Errors occurred during verification:\n");
+                for (i, error) in result.errors.iter().enumerate() {
+                    println!("{}. [{}] {}", i + 1, error.action, error.path.display());
+                    println!("   {}", error.error);
+                }
+            }
+
+            println!("\n  Duration:             {:?}", result.duration);
+        }
+
+        // Determine exit code
+        let exit_code = if !result.errors.is_empty() {
+            2  // Errors occurred
+        } else if !result.files_mismatched.is_empty() ||
+                  !result.files_only_in_source.is_empty() ||
+                  !result.files_only_in_dest.is_empty() {
+            1  // Mismatches found
+        } else {
+            0  // All matched
+        };
+
+        std::process::exit(exit_code);
+    }
+
     // Watch mode or regular sync
     if cli.watch {
         // Watch mode - continuous sync on file changes

@@ -98,7 +98,6 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
-    #[allow(dead_code)] // Integration with verify() method pending
     verify_only: bool,
     use_cache: bool,
     clear_cache: bool,
@@ -1282,6 +1281,160 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // If we got here, either no errors occurred or errors were within the threshold
         Ok(final_stats)
+    }
+
+    /// Verify file integrity without modification
+    ///
+    /// Compares source and destination by computing checksums for all files.
+    /// Returns detailed results including matched files, mismatches, and files
+    /// only in source or destination.
+    pub async fn verify(&self, source: &Path, destination: &Path) -> Result<VerificationResult> {
+        let start_time = std::time::Instant::now();
+
+        tracing::info!(
+            "Starting verification: {} ↔ {}",
+            source.display(),
+            destination.display()
+        );
+
+        // Start scan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().start_scan();
+        }
+
+        // Scan source and destination
+        let source_files = self.transport.scan(source).await?;
+        let dest_files = self.transport.scan(destination).await?;
+
+        // End scan timing
+        if let Some(ref monitor) = self.perf_monitor {
+            monitor.lock().unwrap().end_scan();
+        }
+
+        tracing::info!("Found {} files in source, {} files in destination",
+                       source_files.len(), dest_files.len());
+
+        // Build destination file map for quick lookup (relative path -> FileEntry)
+        let mut dest_map = std::collections::HashMap::new();
+        for file in &dest_files {
+            let rel_path = file.path.strip_prefix(destination)
+                .unwrap_or(&file.path)
+                .to_path_buf();
+            dest_map.insert(rel_path, file);
+        }
+
+        // Create integrity verifier for checksum computation
+        let checksum_type = if self.checksum {
+            ChecksumType::Fast  // Use xxHash3 for fast verification
+        } else {
+            self.verification_mode  // Use user-specified mode
+        };
+        let verifier = IntegrityVerifier::new(checksum_type, false);
+
+        // Results tracking
+        let mut files_matched = 0;
+        let mut files_mismatched = Vec::new();
+        let mut files_only_in_source = Vec::new();
+        let mut errors = Vec::new();
+
+        // Verify each source file
+        for source_file in &source_files {
+            // Skip directories
+            if source_file.is_dir {
+                continue;
+            }
+
+            // Apply size filters
+            if self.should_filter_by_size(source_file.size) {
+                continue;
+            }
+
+            let rel_path = source_file.path.strip_prefix(source)
+                .unwrap_or(&source_file.path)
+                .to_path_buf();
+
+            // Check if file exists in destination
+            if let Some(dest_file) = dest_map.get(&rel_path) {
+                // File exists in both - compare checksums
+                match self.compare_checksums(&source_file.path, &dest_file.path, &verifier) {
+                    Ok(true) => {
+                        // Checksums match
+                        files_matched += 1;
+                        if !self.quiet {
+                            tracing::debug!("✓ {}", rel_path.display());
+                        }
+                    }
+                    Ok(false) => {
+                        // Checksums mismatch
+                        files_mismatched.push(rel_path.clone());
+                        tracing::warn!("✗ Mismatch: {}", rel_path.display());
+                    }
+                    Err(e) => {
+                        errors.push(SyncError {
+                            path: rel_path.clone(),
+                            error: e.to_string(),
+                            action: "verify".to_string(),
+                        });
+                        tracing::error!("Error verifying {}: {}", rel_path.display(), e);
+                    }
+                }
+            } else {
+                // File only in source
+                files_only_in_source.push(rel_path.clone());
+                tracing::info!("→ Only in source: {}", rel_path.display());
+            }
+        }
+
+        // Find files only in destination
+        let mut files_only_in_dest = Vec::new();
+        for dest_file in &dest_files {
+            if dest_file.is_dir {
+                continue;
+            }
+
+            let rel_path = dest_file.path.strip_prefix(destination)
+                .unwrap_or(&dest_file.path)
+                .to_path_buf();
+
+            // Build corresponding source path
+            let source_path = source.join(&rel_path);
+            if !source_path.exists() {
+                files_only_in_dest.push(rel_path.clone());
+                tracing::info!("← Only in destination: {}", rel_path.display());
+            }
+        }
+
+        let duration = start_time.elapsed();
+
+        tracing::info!(
+            "Verification complete: {} matched, {} mismatched, {} only in source, {} only in dest, {} errors",
+            files_matched,
+            files_mismatched.len(),
+            files_only_in_source.len(),
+            files_only_in_dest.len(),
+            errors.len()
+        );
+
+        Ok(VerificationResult {
+            files_matched,
+            files_mismatched,
+            files_only_in_source,
+            files_only_in_dest,
+            errors,
+            duration,
+        })
+    }
+
+    /// Compare checksums of two files
+    fn compare_checksums(
+        &self,
+        source_path: &Path,
+        dest_path: &Path,
+        verifier: &IntegrityVerifier,
+    ) -> Result<bool> {
+        let source_checksum = verifier.compute_file_checksum(source_path)?;
+        let dest_checksum = verifier.compute_file_checksum(dest_path)?;
+        Ok(source_checksum == dest_checksum)
     }
 
     /// Sync a single file (source is a file, not a directory)
