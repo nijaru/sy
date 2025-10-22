@@ -33,7 +33,17 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-None currently
+- [ ] macOS BSD File Flags (v0.0.41) - 60% complete
+  - [x] Research macOS-specific features (comprehensive analysis complete)
+  - [x] Add bsd_flags field to FileEntry struct
+  - [x] Implement BSD flags capture in scanner (using st_flags())
+  - [x] Add --preserve-flags (-F) CLI flag
+  - [x] Add preserve_flags to Transferrer struct
+  - [ ] Wire preserve_flags through SyncEngine and all Transferrer::new() calls
+  - [ ] Implement set_bsd_flags() function in LocalTransport
+  - [ ] Handle immutable flags (UF_IMMUTABLE/SF_IMMUTABLE with temp clear)
+  - [ ] Add tests for BSD flags preservation
+  - [ ] Update documentation (README, MACOS_SUPPORT.md)
 
 ## Recently Completed
 - Symlink loop detection (v0.0.40 - follow_links option, walkdir integration, comprehensive tests)
