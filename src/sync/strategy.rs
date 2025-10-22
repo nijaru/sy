@@ -1,5 +1,6 @@
 use super::scanner::FileEntry;
 use crate::error::Result;
+use crate::integrity::{Checksum, ChecksumType, IntegrityVerifier};
 use crate::transport::{FileInfo, Transport};
 use std::path::Path;
 use std::time::SystemTime;
@@ -21,6 +22,10 @@ pub struct SyncTask {
     pub source: Option<FileEntry>,
     pub dest_path: std::path::PathBuf,
     pub action: SyncAction,
+    /// Pre-computed source checksum (for --checksum mode)
+    pub source_checksum: Option<Checksum>,
+    /// Pre-computed destination checksum (for --checksum mode)
+    pub dest_checksum: Option<Checksum>,
 }
 
 pub struct StrategyPlanner {
@@ -32,6 +37,8 @@ pub struct StrategyPlanner {
     size_only: bool,
     /// Always compare checksums instead of size+mtime
     checksum: bool,
+    /// Integrity verifier for checksum computation
+    verifier: Option<IntegrityVerifier>,
 }
 
 impl StrategyPlanner {
@@ -41,16 +48,26 @@ impl StrategyPlanner {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verifier: None,
         }
     }
 
     /// Create a new planner with custom comparison flags
     pub fn with_comparison_flags(ignore_times: bool, size_only: bool, checksum: bool) -> Self {
+        // Create verifier if checksum mode is enabled
+        let verifier = if checksum {
+            // Use Fast (xxHash3) checksums for pre-transfer comparison (faster than BLAKE3)
+            Some(IntegrityVerifier::new(ChecksumType::Fast, false))
+        } else {
+            None
+        };
+
         Self {
             mtime_tolerance: 1,
             ignore_times,
             size_only,
             checksum,
+            verifier,
         }
     }
 
@@ -63,26 +80,54 @@ impl StrategyPlanner {
     ) -> Result<SyncTask> {
         let dest_path = dest_root.join(&source.relative_path);
 
-        let action = if source.is_dir {
+        let (action, source_checksum, dest_checksum) = if source.is_dir {
             // For directories, just check existence (no metadata needed)
             let exists = transport.exists(&dest_path).await.unwrap_or(false);
-            if exists {
+            let action = if exists {
                 SyncAction::Skip
             } else {
                 SyncAction::Create
-            }
+            };
+            (action, None, None)
         } else {
             // For files, check existence and file info
             match transport.file_info(&dest_path).await {
                 Ok(dest_info) => {
-                    let needs_update = self.needs_update(source, &dest_info);
-                    if needs_update {
-                        SyncAction::Update
+                    // Compute checksums if verifier is present and files are local
+                    let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
+                        self.compute_checksums_local(source, &dest_path, verifier)?
                     } else {
-                        SyncAction::Skip
-                    }
+                        (None, None)
+                    };
+
+                    // If checksums are available and match, skip transfer
+                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) = (&source_cksum, &dest_cksum) {
+                        if src_cksum == dst_cksum {
+                            tracing::debug!(
+                                "Checksums match for {}, skipping transfer",
+                                source.relative_path.display()
+                            );
+                            SyncAction::Skip
+                        } else {
+                            tracing::debug!(
+                                "Checksums differ for {}, will transfer",
+                                source.relative_path.display()
+                            );
+                            SyncAction::Update
+                        }
+                    } else {
+                        // No checksums available, use normal comparison
+                        let needs_update = self.needs_update(source, &dest_info);
+                        if needs_update {
+                            SyncAction::Update
+                        } else {
+                            SyncAction::Skip
+                        }
+                    };
+
+                    (action, source_cksum, dest_cksum)
                 }
-                Err(_) => SyncAction::Create,
+                Err(_) => (SyncAction::Create, None, None),
             }
         };
 
@@ -90,7 +135,46 @@ impl StrategyPlanner {
             source: Some(source.clone()),
             dest_path,
             action,
+            source_checksum,
+            dest_checksum,
         })
+    }
+
+    /// Compute checksums for local files (both source and dest)
+    /// Returns (source_checksum, dest_checksum) if both files are accessible locally
+    fn compute_checksums_local(
+        &self,
+        source: &FileEntry,
+        dest_path: &Path,
+        verifier: &IntegrityVerifier,
+    ) -> Result<(Option<Checksum>, Option<Checksum>)> {
+        // Try to compute source checksum (source should always be local in current design)
+        let source_checksum = if source.path.exists() {
+            match verifier.compute_file_checksum(&source.path) {
+                Ok(cksum) => Some(cksum),
+                Err(e) => {
+                    tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Try to compute dest checksum (only if it exists and is local)
+        let dest_checksum = if dest_path.exists() {
+            match verifier.compute_file_checksum(dest_path) {
+                Ok(cksum) => Some(cksum),
+                Err(e) => {
+                    tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok((source_checksum, dest_checksum))
     }
 
     /// Determine sync action for a source file (sync version for local-only)
@@ -98,30 +182,58 @@ impl StrategyPlanner {
     pub fn plan_file(&self, source: &FileEntry, dest_root: &Path) -> SyncTask {
         let dest_path = dest_root.join(&source.relative_path);
 
-        let action = if source.is_dir {
+        let (action, source_checksum, dest_checksum) = if source.is_dir {
             // For directories, just check existence (no metadata needed)
-            if dest_path.exists() {
+            let action = if dest_path.exists() {
                 SyncAction::Skip
             } else {
                 SyncAction::Create
-            }
+            };
+            (action, None, None)
         } else {
             // For files, check existence and metadata
             match std::fs::metadata(&dest_path) {
                 Ok(dest_meta) => {
-                    // Convert Metadata to FileInfo for comparison
-                    let dest_info = FileInfo {
-                        size: dest_meta.len(),
-                        modified: dest_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    };
-                    let needs_update = self.needs_update(source, &dest_info);
-                    if needs_update {
-                        SyncAction::Update
+                    // Compute checksums if verifier is present
+                    let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
+                        self.compute_checksums_local(source, &dest_path, verifier)
+                            .unwrap_or((None, None))
                     } else {
-                        SyncAction::Skip
-                    }
+                        (None, None)
+                    };
+
+                    // If checksums are available and match, skip transfer
+                    let action = if let (Some(ref src_cksum), Some(ref dst_cksum)) = (&source_cksum, &dest_cksum) {
+                        if src_cksum == dst_cksum {
+                            tracing::debug!(
+                                "Checksums match for {}, skipping transfer",
+                                source.relative_path.display()
+                            );
+                            SyncAction::Skip
+                        } else {
+                            tracing::debug!(
+                                "Checksums differ for {}, will transfer",
+                                source.relative_path.display()
+                            );
+                            SyncAction::Update
+                        }
+                    } else {
+                        // No checksums available, use normal comparison
+                        let dest_info = FileInfo {
+                            size: dest_meta.len(),
+                            modified: dest_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                        };
+                        let needs_update = self.needs_update(source, &dest_info);
+                        if needs_update {
+                            SyncAction::Update
+                        } else {
+                            SyncAction::Skip
+                        }
+                    };
+
+                    (action, source_cksum, dest_cksum)
                 }
-                Err(_) => SyncAction::Create,
+                Err(_) => (SyncAction::Create, None, None),
             }
         };
 
@@ -129,6 +241,8 @@ impl StrategyPlanner {
             source: Some(source.clone()),
             dest_path,
             action,
+            source_checksum,
+            dest_checksum,
         }
     }
 
@@ -220,6 +334,8 @@ impl StrategyPlanner {
                             source: None,
                             dest_path: dest_file.path,
                             action: SyncAction::Delete,
+                            source_checksum: None,
+                            dest_checksum: None,
                         });
                     } else {
                         // Bloom says "might exist" - verify with HashMap to handle false positives
@@ -228,6 +344,8 @@ impl StrategyPlanner {
                                 source: None,
                                 dest_path: dest_file.path,
                                 action: SyncAction::Delete,
+                                source_checksum: None,
+                                dest_checksum: None,
                             });
                         }
                     }
@@ -249,6 +367,8 @@ impl StrategyPlanner {
                             source: None,
                             dest_path: dest_file.path,
                             action: SyncAction::Delete,
+                            source_checksum: None,
+                            dest_checksum: None,
                         });
                     }
                 }
@@ -469,6 +589,123 @@ mod tests {
         // Should delete all files in destination
         assert_eq!(deletions.len(), 2);
         assert!(deletions.iter().all(|t| t.action == SyncAction::Delete));
+    }
+
+    #[test]
+    fn test_checksum_mode_skip_identical_files() {
+        let temp = TempDir::new().unwrap();
+        let dest_root = temp.path();
+
+        // Create destination file with same content as source
+        let content = b"Hello, world!";
+        fs::write(dest_root.join("file.txt"), content).unwrap();
+
+        let source_file = FileEntry {
+            path: dest_root.join("file.txt"), // Use same file as source for testing
+            relative_path: PathBuf::from("file.txt"),
+            size: content.len() as u64,
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: content.len() as u64,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+        };
+
+        // Create planner with checksum mode enabled
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let task = planner.plan_file(&source_file, dest_root);
+
+        // Should skip because checksums match
+        assert_eq!(task.action, SyncAction::Skip);
+        // Checksums should be computed
+        assert!(task.source_checksum.is_some());
+        assert!(task.dest_checksum.is_some());
+        // Checksums should match
+        assert_eq!(task.source_checksum, task.dest_checksum);
+    }
+
+    #[test]
+    fn test_checksum_mode_transfer_different_files() {
+        let temp = TempDir::new().unwrap();
+        let source_dir = temp.path().join("source");
+        let dest_dir = temp.path().join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        // Create source and dest files with different content
+        fs::write(source_dir.join("file.txt"), b"Source content").unwrap();
+        fs::write(dest_dir.join("file.txt"), b"Dest content (different)").unwrap();
+
+        let source_file = FileEntry {
+            path: source_dir.join("file.txt"),
+            relative_path: PathBuf::from("file.txt"),
+            size: 14, // "Source content".len()
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 14,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+        };
+
+        // Create planner with checksum mode enabled
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let task = planner.plan_file(&source_file, &dest_dir);
+
+        // Should update because checksums differ
+        assert_eq!(task.action, SyncAction::Update);
+        // Checksums should be computed
+        assert!(task.source_checksum.is_some());
+        assert!(task.dest_checksum.is_some());
+        // Checksums should differ
+        assert_ne!(task.source_checksum, task.dest_checksum);
+    }
+
+    #[test]
+    fn test_checksum_mode_create_new_file() {
+        let temp = TempDir::new().unwrap();
+        let source_dir = temp.path().join("source");
+        let dest_dir = temp.path().join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        // Create source file, no dest file
+        fs::write(source_dir.join("file.txt"), b"New file content").unwrap();
+
+        let source_file = FileEntry {
+            path: source_dir.join("file.txt"),
+            relative_path: PathBuf::from("file.txt"),
+            size: 16, // "New file content".len()
+            modified: SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 16,
+            xattrs: None,
+            inode: None,
+            nlink: 1,
+            acls: None,
+        };
+
+        // Create planner with checksum mode enabled
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let task = planner.plan_file(&source_file, &dest_dir);
+
+        // Should create because dest doesn't exist
+        assert_eq!(task.action, SyncAction::Create);
+        // No checksums computed for non-existent dest
+        assert!(task.source_checksum.is_none());
+        assert!(task.dest_checksum.is_none());
     }
 
     #[test]
