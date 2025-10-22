@@ -9,10 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Stores file checksums with metadata to avoid recomputing on every sync.
 /// Uses SQLite for reliability and efficient querying.
+#[allow(dead_code)] // Integration with SyncEngine pending
 pub struct ChecksumDatabase {
     conn: Connection,
 }
 
+#[allow(dead_code)] // Integration with SyncEngine pending
 impl ChecksumDatabase {
     /// Database file name in destination directory
     const DB_FILE: &'static str = ".sy-checksums.db";
@@ -235,6 +237,7 @@ impl ChecksumDatabase {
 
 /// Database statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Integration with SyncEngine pending
 pub struct ChecksumDbStats {
     pub total_entries: usize,
     pub fast_checksums: usize,
@@ -242,6 +245,7 @@ pub struct ChecksumDbStats {
 }
 
 /// Convert SystemTime to (seconds, nanoseconds) tuple
+#[allow(dead_code)] // Integration with SyncEngine pending
 fn system_time_to_parts(time: SystemTime) -> (i64, i32) {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos() as i32),

@@ -23,8 +23,10 @@ pub struct SyncTask {
     pub dest_path: std::path::PathBuf,
     pub action: SyncAction,
     /// Pre-computed source checksum (for --checksum mode)
+    #[allow(dead_code)] // Will be used for checksum database storage (Phase 5b)
     pub source_checksum: Option<Checksum>,
     /// Pre-computed destination checksum (for --checksum mode)
+    #[allow(dead_code)] // Will be used for checksum database storage (Phase 5b)
     pub dest_checksum: Option<Checksum>,
 }
 
