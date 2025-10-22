@@ -1464,6 +1464,7 @@ mod tests {
             false, // checksum
             false, // use_cache
             false, // clear_cache
+            false, // perf
         );
 
         let stats = engine
