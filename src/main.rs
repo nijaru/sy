@@ -352,6 +352,9 @@ async fn main() -> Result<()> {
         cli.checksum,
         cli.use_cache,
         cli.clear_cache,
+        cli.checksum_db,
+        cli.clear_checksum_db,
+        cli.prune_checksum_db,
         cli.perf,
     );
 
