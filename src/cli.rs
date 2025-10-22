@@ -4,6 +4,9 @@ use clap::{Parser, ValueEnum};
 // Import integrity types for verification modes
 use crate::integrity::ChecksumType;
 
+// Import compression types for detection modes
+use crate::compress::CompressionDetection;
+
 fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
@@ -270,6 +273,14 @@ pub struct Cli {
     /// Enable compression for network transfers (auto-detects based on file type)
     #[arg(long)]
     pub compress: bool,
+
+    /// Compression detection mode (auto, extension, always, never)
+    /// - auto: Content-based detection with sampling (default)
+    /// - extension: Extension-only detection (legacy)
+    /// - always: Always compress (override detection)
+    /// - never: Never compress (override detection)
+    #[arg(long, value_enum, default_value = "auto")]
+    pub compression_detection: CompressionDetection,
 
     /// Symlink handling mode (preserve, follow, skip)
     #[arg(long, value_enum, default_value = "preserve")]
@@ -542,6 +553,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -605,6 +617,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -672,6 +685,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -742,6 +756,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -805,6 +820,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -868,6 +884,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -931,6 +948,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -994,6 +1012,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1076,6 +1095,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1142,6 +1162,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1205,6 +1226,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Fast, // Set to Fast
             verify: true,                 // But --verify flag should override
             resume: true,
@@ -1294,6 +1316,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1357,6 +1380,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1420,6 +1444,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1483,6 +1508,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1553,6 +1579,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1622,6 +1649,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1692,6 +1720,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1762,6 +1791,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
@@ -1829,6 +1859,7 @@ mod tests {
             ignore_template: vec![],
             bwlimit: None,
             compress: false,
+            compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
             resume: true,
