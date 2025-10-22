@@ -307,6 +307,63 @@ ls -le dest/file.txt
 # 0: user:alice allow read,write
 ```
 
+### BSD File Flags
+
+macOS BSD file flags are preserved with `-F` or `--preserve-flags`:
+
+```bash
+# Set hidden flag on a file
+chflags hidden secret.txt
+
+# Set immutable flag (prevents modification)
+chflags uchg important.txt
+
+# Sync with BSD flags
+sy -F source dest
+
+# Or with archive mode (includes flags on macOS)
+sy -a source dest
+
+# Verify flags
+ls -lO dest/secret.txt
+# -rw-r--r--  1 user  staff  hidden  0 Jan  1 12:00 secret.txt
+```
+
+**Common BSD Flags**:
+- `hidden` (UF_HIDDEN) - Hide file in Finder
+- `uchg` (UF_IMMUTABLE) - File cannot be changed or deleted
+- `uappnd` (UF_APPEND) - Only allow appending to file
+- `nodump` (UF_NODUMP) - Exclude from backups
+- `opaque` (UF_OPAQUE) - Directory is opaque in union filesystems
+- `compressed` (UF_COMPRESSED) - File is compressed by HFS+/APFS
+
+**System Flags** (require root):
+- `schg` (SF_IMMUTABLE) - System immutable flag
+- `sappnd` (SF_APPEND) - System append-only flag
+- `sunlnk` (SF_NOUNLINK) - Cannot be removed or renamed
+
+**Flag Management**:
+```bash
+# View flags
+ls -lO file.txt
+
+# Set multiple flags
+chflags hidden,nodump file.txt
+
+# Remove flag
+chflags nohidden file.txt
+
+# Remove all flags
+chflags 0 file.txt
+```
+
+**Behavior**:
+- When `--preserve-flags` is enabled: Source flags are copied to destination
+- When disabled (default): Destination flags are explicitly cleared to 0
+- This prevents macOS file operations from auto-preserving flags
+
+**Note**: BSD flags are macOS-specific and will be ignored when syncing to/from non-macOS systems.
+
 ## Performance
 
 ### Benchmark: macOS 15 (Sequoia) - Apple Silicon M3
