@@ -1,8 +1,9 @@
 # Sparse File Optimization Improvements
 
 **Date**: 2025-10-22
-**Status**: Research Phase
-**Target Version**: v0.0.41
+**Status**: Foundation Complete, Full Implementation Deferred
+**Target Version**: v0.0.41+ (full SSH sparse transfer)
+**Current**: v0.0.40 (sparse module foundation added)
 
 ## Executive Summary
 
@@ -384,11 +385,43 @@ fn test_ssh_sparse_file_transfer() {
 ## Timeline
 
 - **Research & Design**: 1 hour ✅ (this document)
-- **Phase 1** (Detection): 2 hours
-- **Phase 2** (Protocol): 4 hours
-- **Phase 3** (Region Detection): 2 hours
-- **Phase 4** (Integration & Tests): 3 hours
-- **Total**: ~12 hours implementation + testing
+- **Phase 1** (Detection): COMPLETE ✅ (metadata already exists)
+- **Phase 2** (Sparse Module): COMPLETE ✅ (src/sparse.rs added)
+- **Phase 3** (Protocol): DEFERRED to v0.0.41+
+- **Phase 4** (Integration & Tests): DEFERRED to v0.0.41+
+- **Remaining**: ~8 hours for full SSH sparse transfer
+
+## Work Completed (v0.0.40)
+
+✅ **Sparse Module Foundation** (src/sparse.rs):
+- `DataRegion` struct for representing file segments
+- `detect_data_regions()` function using SEEK_HOLE/SEEK_DATA
+- Handles EINVAL (not supported) and ENXIO (no data/not supported) gracefully
+- 3 tests (2 ignored on macOS APFS due to limited support)
+
+✅ **Detection Infrastructure**:
+- FileEntry already has `is_sparse` and `allocated_size` fields
+- sy-remote already sends sparse metadata
+- SSH transport already receives sparse metadata
+
+❌ **Not Yet Implemented**:
+- ReceiveSparseFile command in sy-remote
+- Sparse transfer protocol in SSH transport
+- Integration tests for SSH sparse transfer
+- End-to-end sparse file transfer over SSH
+
+## Status: Foundation Complete
+
+The groundwork is laid for sparse SSH transfer:
+1. Detection works (scanner detects sparse files)
+2. Metadata transmitted (sy-remote sends is_sparse/allocated_size)
+3. Region detection works (src/sparse.rs::detect_data_regions)
+
+**Next steps for v0.0.41+**:
+1. Add ReceiveSparseFile command to sy-remote (2 hours)
+2. Update SSH transport to use sparse transfer (4 hours)
+3. Add integration tests (2 hours)
+4. **Total remaining**: ~8 hours
 
 ## Alternative: Defer to v1.0+
 
