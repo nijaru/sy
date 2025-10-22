@@ -20,10 +20,20 @@
     - [x] Add tests (8 new tests, all 325 passing)
     - [x] End-to-end CLI testing (verified 10-100x speedup)
     - [x] Update documentation (comprehensive README coverage)
-  - [ ] Phase 5c: --verify-only mode (v0.0.36) - NEXT
+  - [x] Phase 5c: --verify-only mode (v0.0.36) - COMPLETE ✅
+    - [x] Add --verify-only CLI flag with validation
+    - [x] Create VerificationResult struct
+    - [x] Implement verify() async method in SyncEngine
+    - [x] Add compare_checksums() helper method
+    - [x] Integrate with main.rs (human-readable output)
+    - [x] Implement exit codes (0=match, 1=mismatch, 2=error)
+    - [x] Add JSON output support (VerificationResult event)
+    - [x] Add test for JSON serialization (1 new test, 326 passing)
+    - [x] End-to-end CLI testing (all scenarios verified)
+    - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-- Phase 5b complete! Ready for Phase 5c or other tasks
+- Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [ ] Compression auto-detection (file type awareness)
