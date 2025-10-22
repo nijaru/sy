@@ -46,6 +46,8 @@ _Last Updated: 2025-10-22_
 - **Enhanced progress display** (v0.0.38): Byte-based progress with transfer speed and current file provides better UX and more accurate ETA than file-count-based approach
 - **Bandwidth utilization** (v0.0.39): Performance metrics including bandwidth % now available in JSON output for automation; was already working in --perf mode
 - **Symlink loop detection** (v0.0.40): Leveraging walkdir's built-in ancestor tracking for loop detection avoids custom DFS implementation; simpler and more reliable than manual cycle detection
+- **Performance optimization** (v0.0.40): Eliminated String allocation in is_compressed_extension (10,000 allocations saved for 10K files); comprehensive benchmark analysis shows NO regressions
+- **Sparse file module** (v0.0.40): Foundation laid with detect_data_regions using SEEK_HOLE/SEEK_DATA; infrastructure ready for future SSH sparse transfer (~8h remaining work)
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -53,17 +55,18 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- ✅ Completed Symlink Loop Detection (v0.0.40)
-  - Added follow_links option to Scanner
-  - Leverages walkdir's built-in loop detection
-  - Two comprehensive tests for loop scenarios
-  - Research documented in ai/research/symlink_loop_detection.md
+- ✅ Completed Session (v0.0.40)
+  - Symlink loop detection (follow_links option, walkdir integration)
+  - Performance optimization (extension matching, zero allocations)
+  - Performance analysis (no regressions detected, benchmarks stable)
+  - Sparse file module foundation (detect_data_regions, SEEK_HOLE/SEEK_DATA)
 
 ## Next Steps
-- Symlink loop detection complete!
-- Future enhancement: Thread CLI compression detection mode through transport (currently hardcoded to Auto)
+- v0.0.40 complete with 4 features/improvements!
+- Future work: Complete sparse SSH transfer (src/sparse.rs foundation ready, ~8h remaining)
+- Future enhancement: Thread CLI compression detection mode through transport
 - Future enhancement: Remote checksum support for Phase 5a/5b (backlog)
-- Next major work from backlog: Sparse file optimization improvements OR macOS-specific features
+- Next major work from backlog: macOS-specific features OR Windows-specific features
 
 ## Blockers
 None currently
