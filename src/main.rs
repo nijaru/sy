@@ -347,6 +347,8 @@ async fn main() -> Result<()> {
         cli.preserve_xattrs,
         cli.preserve_hardlinks,
         cli.preserve_acls,
+        #[cfg(target_os = "macos")]
+        cli.preserve_flags,
         cli.ignore_times,
         cli.size_only,
         cli.checksum,
