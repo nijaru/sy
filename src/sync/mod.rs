@@ -59,6 +59,16 @@ pub struct SyncStats {
     pub errors: Vec<SyncError>,
 }
 
+#[derive(Debug)]
+pub struct VerificationResult {
+    pub files_matched: usize,
+    pub files_mismatched: Vec<PathBuf>,
+    pub files_only_in_source: Vec<PathBuf>,
+    pub files_only_in_dest: Vec<PathBuf>,
+    pub errors: Vec<SyncError>,
+    pub duration: Duration,
+}
+
 pub struct SyncEngine<T: Transport> {
     transport: Arc<T>,
     dry_run: bool,
@@ -88,6 +98,8 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
+    #[allow(dead_code)] // Integration with verify() method pending
+    verify_only: bool,
     use_cache: bool,
     clear_cache: bool,
     checksum_db: bool,
@@ -126,6 +138,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
+        verify_only: bool,
         use_cache: bool,
         clear_cache: bool,
         checksum_db: bool,
@@ -167,6 +180,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             ignore_times,
             size_only,
             checksum,
+            verify_only,
             use_cache,
             clear_cache,
             checksum_db,
@@ -1514,6 +1528,7 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // verify_only
             false, // use_cache (disabled in tests to avoid side effects)
             false, // clear_cache
             false, // checksum_db
@@ -1621,6 +1636,7 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db

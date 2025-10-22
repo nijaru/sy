@@ -328,6 +328,12 @@ pub struct Cli {
     #[arg(short = 'c', long)]
     pub checksum: bool,
 
+    /// Verify-only mode: audit file integrity without modifying anything
+    /// Compares source and destination checksums and reports mismatches
+    /// Returns exit code 0 if all match, 1 if mismatches found, 2 on error
+    #[arg(long)]
+    pub verify_only: bool,
+
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -383,6 +389,19 @@ impl Cli {
                 "--delete-threshold must be between 0 and 100 (got: {})",
                 self.delete_threshold
             );
+        }
+
+        // --verify-only conflicts with modification flags
+        if self.verify_only {
+            if self.delete {
+                anyhow::bail!("--verify-only cannot be used with --delete (read-only mode)");
+            }
+            if self.watch {
+                anyhow::bail!("--verify-only cannot be used with --watch (read-only mode)");
+            }
+            if self.dry_run {
+                anyhow::bail!("--verify-only is already read-only, --dry-run is redundant");
+            }
         }
 
         // --list-profiles and --show-profile don't need source/destination
@@ -543,6 +562,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -605,6 +625,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -671,6 +692,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -740,6 +762,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -802,6 +825,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -864,6 +888,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -926,6 +951,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -988,6 +1014,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1069,6 +1096,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1134,6 +1162,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1196,6 +1225,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1284,6 +1314,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1346,6 +1377,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1408,6 +1440,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1470,6 +1503,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1539,6 +1573,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1607,6 +1642,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1676,6 +1712,7 @@ mod tests {
             ignore_times: true, // Both enabled - should fail
             size_only: true,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1745,6 +1782,7 @@ mod tests {
             ignore_times: true, // Only this flag enabled
             size_only: false,
             checksum: false,
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,
@@ -1811,6 +1849,7 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: true, // Only this flag enabled
+            verify_only: false,
             json: false,
             watch: false,
             no_hooks: false,

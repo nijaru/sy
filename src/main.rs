@@ -350,6 +350,7 @@ async fn main() -> Result<()> {
         cli.ignore_times,
         cli.size_only,
         cli.checksum,
+        cli.verify_only,
         cli.use_cache,
         cli.clear_cache,
         cli.checksum_db,
