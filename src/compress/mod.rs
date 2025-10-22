@@ -97,7 +97,8 @@ const COMPRESSED_EXTENSIONS: &[&str] = &[
 /// Check if file extension indicates already-compressed data
 pub fn is_compressed_extension(filename: &str) -> bool {
     if let Some(ext) = filename.rsplit('.').next() {
-        COMPRESSED_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        COMPRESSED_EXTENSIONS.iter()
+            .any(|&e| ext.eq_ignore_ascii_case(e))
     } else {
         false
     }
@@ -320,11 +321,22 @@ mod tests {
 
     #[test]
     fn test_is_compressed_extension() {
+        // Lowercase
         assert!(is_compressed_extension("file.jpg"));
         assert!(is_compressed_extension("video.mp4"));
         assert!(is_compressed_extension("archive.zip"));
         assert!(is_compressed_extension("document.pdf"));
 
+        // Uppercase (should work case-insensitively)
+        assert!(is_compressed_extension("file.JPG"));
+        assert!(is_compressed_extension("video.MP4"));
+        assert!(is_compressed_extension("archive.ZIP"));
+
+        // Mixed case
+        assert!(is_compressed_extension("file.JpG"));
+        assert!(is_compressed_extension("video.Mp4"));
+
+        // Not compressed
         assert!(!is_compressed_extension("file.txt"));
         assert!(!is_compressed_extension("code.rs"));
         assert!(!is_compressed_extension("data.csv"));
