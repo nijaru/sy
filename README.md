@@ -32,7 +32,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Error Reporting** - Comprehensive error collection and reporting! (v0.0.34)
 ✅ **Pre-Transfer Checksums** - Compare checksums before transfer to skip identical files! (v0.0.35)
 ✅ **Checksum Database** - Persistent SQLite cache for 10-100x faster re-syncs! (v0.0.35)
-🚀 **Current Version: v0.0.35 (in development)** - 325 tests passing!
+✅ **Verify-Only Mode** - Audit file integrity without modification, JSON output! (v0.0.36)
+🚀 **Current Version: v0.0.36 (in development)** - 326 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -203,6 +204,17 @@ sy /source /destination --checksum --checksum-db=true  # Second sync: 10-100x fa
 sy /source /destination --checksum --checksum-db=true --clear-checksum-db  # Clear cache and start fresh
 sy /source /destination --checksum --checksum-db=true --prune-checksum-db  # Remove stale entries
 # Database: .sy-checksums.db in destination, ~200 bytes per file
+
+# Verify-only mode - audit without modifying (new in v0.0.36+)
+sy /source /destination --verify-only                   # Compare checksums, report mismatches
+sy /source /destination --verify-only --json            # JSON output for scripting
+# Exit codes: 0 = all match, 1 = mismatches/differences, 2 = errors
+# Reports:
+#   - Files that match (checksum comparison)
+#   - Files that mismatch (content differs)
+#   - Files only in source (missing from dest)
+#   - Files only in destination (extra files)
+# Use cases: Verify backup integrity, detect corruption, audit sync results
 
 # Deletion safety (new in v0.0.18+)
 sy /source /destination --delete --delete-threshold 75  # Allow up to 75% of files to be deleted
@@ -488,6 +500,63 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - `--prune-checksum-db`: Remove entries for deleted files
   - Database grows with file count (~200 bytes per file)
   - Safe to delete `.sy-checksums.db` manually (will be recreated)
+
+**Verify-Only Mode (v0.0.36)**:
+- **Audit Without Modification** with `--verify-only` flag:
+  - Compares source and destination by computing checksums
+  - Reports matched files, mismatches, and differences
+  - **Read-only**: Never modifies any files
+  - **Scriptable**: JSON output with clear exit codes
+- **Key Benefits**:
+  - **Backup Verification**: Confirm backups match source data
+  - **Corruption Detection**: Identify files that changed unexpectedly
+  - **Audit Results**: Verify sync completed successfully
+  - **Integration**: Exit codes enable automation and monitoring
+- **Usage**:
+  ```bash
+  # Basic verification (human-readable output)
+  sy /source /destination --verify-only
+
+  # JSON output for scripting
+  sy /source /destination --verify-only --json
+
+  # Use in scripts with exit code checking
+  if sy /backup /original --verify-only --json; then
+    echo "Backup verified successfully"
+  else
+    echo "Backup verification failed"
+  fi
+  ```
+- **Exit Codes**:
+  - `0`: All files match (perfect integrity)
+  - `1`: Mismatches or differences found
+  - `2`: Errors occurred during verification
+- **Output Details**:
+  - **Files matched**: Count of files with identical checksums
+  - **Files mismatched**: List of files with different content
+  - **Files only in source**: Missing from destination
+  - **Files only in destination**: Extra files not in source
+  - **Errors**: Any files that couldn't be verified
+  - **Duration**: Total verification time
+- **JSON Format**:
+  ```json
+  {
+    "type": "verification_result",
+    "files_matched": 100,
+    "files_mismatched": ["file1.txt"],
+    "files_only_in_source": ["new.txt"],
+    "files_only_in_dest": ["old.txt"],
+    "errors": [],
+    "duration_secs": 0.532,
+    "exit_code": 1
+  }
+  ```
+- **Use Cases**:
+  - Verify backup integrity after sync
+  - Detect bit rot or corruption over time
+  - Audit cloud storage vs. local files
+  - Monitor file synchronization systems
+  - Integration testing for sync workflows
 
 **Verification & Reliability (Phase 5 - Complete)**:
 - **Verification Modes** (v0.0.14):
