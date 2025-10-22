@@ -3,10 +3,10 @@
 _Last Updated: 2025-10-21_
 
 ## Current State
-- Version: v0.0.34
-- Phase: Moving into Phase 2 (Verification & Reliability)
-- Test Coverage: 314 tests passing
-- Build: Passing (CI running)
+- Version: v0.0.35 (in development)
+- Phase: Phase 5a (Pre-Transfer Checksums) - Implementation in progress
+- Test Coverage: 317 tests passing
+- Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
 ## Implemented Features
@@ -24,6 +24,7 @@ _Last Updated: 2025-10-21_
 - ✅ Resume support
 - ✅ Performance monitoring (--perf flag, v0.0.33)
 - ✅ Comprehensive error reporting (v0.0.34)
+- 🚧 Pre-transfer checksums (--checksum flag, v0.0.35) - local→local only
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -39,11 +40,16 @@ _Last Updated: 2025-10-21_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- Just completed Phase 5 verification enhancements design
-  - Designed pre-transfer checksums (save bandwidth, detect bit rot)
-  - Designed checksum database (SQLite-based persistent storage)
-  - Designed --verify-only mode (audit without syncing)
-  - Created comprehensive design doc: ai/research/phase5_verification_design.md
+- Implementing Phase 5a: Pre-Transfer Checksums (v0.0.35)
+  - ✅ Added checksum fields to SyncTask struct
+  - ✅ Implemented checksum computation in StrategyPlanner
+  - ✅ Added xxHash3-based comparison (15 GB/s throughput)
+  - ✅ Checksums compared during planning to skip identical files
+  - ✅ Added 3 comprehensive tests (all 317 tests passing)
+  - ✅ Local→local support working
+  - 🚧 Need: Documentation updates
+  - 🚧 Need: End-to-end testing with actual CLI
+  - 📋 Future: Remote checksum support (via sy-remote extension)
 
 ## Next Steps
 - Phase 5 features (see docs/MODERNIZATION_ROADMAP.md):
