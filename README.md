@@ -30,7 +30,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Phase 11 Complete** - Scale (Incremental scanning ✅, Bloom filters ✅, Cache ✅, O(1) memory!) (v0.0.22)
 ✅ **Performance Monitoring** - Detailed performance metrics with `--perf` flag! (v0.0.33)
 ✅ **Error Reporting** - Comprehensive error collection and reporting! (v0.0.34)
-🚀 **Current Version: v0.0.34** - 314 tests passing, zero errors!
+🚧 **Pre-Transfer Checksums** - Compare checksums before transfer to skip identical files! (v0.0.35)
+🚀 **Current Version: v0.0.35 (in development)** - 317 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -183,11 +184,17 @@ sy /source /destination -o                             # Preserve owner (require
 sy /source /destination -D                             # Preserve device files (requires root)
 sy /source /destination -ptg                           # Combine flags (perms + times + group)
 
-# File comparison modes (new in v0.0.18+)
+# File comparison modes (new in v0.0.18+, enhanced in v0.0.35)
 sy /source /destination --ignore-times                 # Always compare checksums (ignore mtime)
 sy /source /destination --size-only                    # Only compare file size (skip mtime checks)
-sy /source /destination -c                             # Always use checksums instead of size+mtime
+sy /source /destination -c                             # Pre-transfer checksums: skip if content identical
 sy /source /destination --checksum                     # Same as -c (rsync compatibility)
+
+# Pre-transfer checksum benefits (v0.0.35+):
+# - Skip transfers when content unchanged (even if mtime changed)
+# - Detect bit rot (content changed but mtime unchanged)
+# - Uses xxHash3 (15 GB/s) for fast comparison
+# - Saves bandwidth on re-syncs of touched but unmodified files
 
 # Deletion safety (new in v0.0.18+)
 sy /source /destination --delete --delete-threshold 75  # Allow up to 75% of files to be deleted
@@ -399,6 +406,36 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - Clear identification of problematic files
   - Better debugging and troubleshooting
   - Detailed context for every failure
+
+**Pre-Transfer Checksums (v0.0.35)**:
+- **Smart Content Comparison** with `--checksum` / `-c` flag:
+  - Computes checksums **before** transfer to detect identical files
+  - Uses xxHash3 (Fast mode) for comparison - **15 GB/s throughput**
+  - Skips transfer if checksums match, even if mtime differs
+  - Transfers only if checksums differ
+- **Key Benefits**:
+  - **Bandwidth Savings**: Skip files where only mtime changed (touched but not modified)
+  - **Bit Rot Detection**: Detect corruption when content changed but mtime unchanged
+  - **Fast Re-Syncs**: Ideal for scenarios where files are frequently touched
+  - **Minimal Overhead**: xxHash3 adds ~5% overhead on SSDs
+- **Usage**:
+  ```bash
+  # Compare checksums before transfer
+  sy /source /destination --checksum
+
+  # Short form
+  sy /source /destination -c
+
+  # Use with dry-run to see what would be skipped
+  sy /source /destination -c --dry-run --diff
+  ```
+- **Current Scope**:
+  - ✅ Local→Local sync (fully working)
+  - 📋 Remote support (planned for follow-up)
+- **Implementation**:
+  - Checksums computed during planning phase
+  - Stored in SyncTask for potential future use (checksum database)
+  - Zero overhead when flag not enabled
 
 **Verification & Reliability (Phase 5 - Complete)**:
 - **Verification Modes** (v0.0.14):
