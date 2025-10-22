@@ -221,6 +221,33 @@ impl<T: Transport + 'static> SyncEngine<T> {
             None
         };
 
+        // Handle checksum database
+        let checksum_db = if self.checksum && self.checksum_db {
+            // Open checksum database
+            match checksumdb::ChecksumDatabase::open(destination) {
+                Ok(db) => {
+                    tracing::debug!("Opened checksum database");
+
+                    // Clear if requested
+                    if self.clear_checksum_db && !self.dry_run {
+                        if let Err(e) = db.clear() {
+                            tracing::warn!("Failed to clear checksum database: {}", e);
+                        } else {
+                            tracing::info!("Cleared checksum database");
+                        }
+                    }
+
+                    Some(db)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open checksum database: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Check if we can use cached scan results (incremental scanning)
         let can_use_cache = if let Some(ref cache) = dir_cache {
             // Check source directory mtime
@@ -472,7 +499,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             }
 
             let task = planner
-                .plan_file_async(file, destination, &self.transport)
+                .plan_file_async(file, destination, &self.transport, checksum_db.as_ref())
                 .await?;
             tasks.push(task);
         }
