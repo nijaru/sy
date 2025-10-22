@@ -33,19 +33,20 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-- Bandwidth utilization metrics (v0.0.39) - JSON output complete, documentation updates pending
+None currently
 
 ## Recently Completed
-- Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
-- Compression auto-detection feature (v0.0.37 - content sampling, CLI flags, SSH integration)
+- Symlink loop detection (v0.0.40 - follow_links option, walkdir integration, comprehensive tests)
+- Bandwidth utilization metrics (v0.0.39 - JSON output complete)
 - Enhanced progress display (v0.0.38 - byte-based, speed, current file)
-- Bandwidth utilization metrics (v0.0.39 - already in --perf, now in JSON output)
+- Compression auto-detection feature (v0.0.37 - content sampling, CLI flags, SSH integration)
+- Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [x] Compression auto-detection (file type awareness) - COMPLETE ✅ (v0.0.37)
 - [x] Enhanced progress display (current file, real-time speed, ETA) - COMPLETE ✅ (v0.0.38)
 - [x] Bandwidth utilization metrics (% of limit when using --bwlimit) - COMPLETE ✅ (v0.0.39)
-- [ ] Symbolic link chain detection
+- [x] Symbolic link chain detection - COMPLETE ✅ (v0.0.40)
 - [ ] Sparse file optimization improvements
 - [ ] macOS-specific features (Finder tags, resource forks)
 - [ ] Windows-specific features (file attributes, ACLs)
