@@ -63,6 +63,9 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Database error: {0}\nCheck that the destination directory is writable.")]
+    Database(String),
+
     #[error("Data corruption detected: {path}\nBlock {block_number} checksum mismatch after write.\nExpected: {expected_checksum}\nActual: {actual_checksum}\nThis indicates storage or memory corruption. The transfer has been aborted.")]
     BlockCorruption {
         path: PathBuf,
@@ -70,6 +73,12 @@ pub enum SyncError {
         expected_checksum: String,
         actual_checksum: String,
     },
+}
+
+impl From<rusqlite::Error> for SyncError {
+    fn from(err: rusqlite::Error) -> Self {
+        SyncError::Database(err.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;

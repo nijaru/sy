@@ -246,6 +246,19 @@ pub struct Cli {
     #[arg(long)]
     pub clear_cache: bool,
 
+    /// Use checksum database for faster --checksum re-syncs (default: false)
+    /// The database stores checksums to avoid recomputation for unchanged files
+    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
+    pub checksum_db: bool,
+
+    /// Clear checksum database before starting
+    #[arg(long)]
+    pub clear_checksum_db: bool,
+
+    /// Remove stale entries from checksum database (files no longer in source)
+    #[arg(long)]
+    pub prune_checksum_db: bool,
+
     /// Verification mode (fast, standard, verify, paranoid)
     #[arg(long, value_enum, default_value = "standard")]
     pub mode: VerificationMode,
@@ -539,6 +552,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -598,6 +614,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -661,6 +680,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -727,6 +749,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -786,6 +811,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -845,6 +873,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -904,6 +935,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -963,6 +997,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1041,6 +1078,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
         };
@@ -1103,6 +1143,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1162,6 +1205,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1247,6 +1293,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1306,6 +1355,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1365,6 +1417,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1424,6 +1479,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1490,6 +1548,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1555,6 +1616,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1621,6 +1685,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1687,6 +1754,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
@@ -1750,6 +1820,9 @@ mod tests {
             show_profile: None,
             use_cache: false,
             clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
             min_size: None,
             max_size: None,
         };
