@@ -1,13 +1,6 @@
 # TODO
 
 ## High Priority
-- [ ] Complete documentation reorganization
-  - [x] Create ai/ directory structure
-  - [x] Extract STATUS.md
-  - [x] Extract DECISIONS.md
-  - [ ] Create RESEARCH.md
-  - [ ] Create AGENTS.md
-  - [ ] Update .claude/CLAUDE.md
 - [ ] Phase 5: Verification enhancements
   - [ ] Pre-transfer checksums
   - [ ] Checksum database for future verification

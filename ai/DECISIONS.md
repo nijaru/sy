@@ -158,3 +158,30 @@ pub struct SyncError {
 - Token-efficient context loading
 
 **References**: ~/github/nijaru/agent-contexts/PRACTICES.md
+
+---
+
+## 2025-10-21: Reorganize docs/ following agent-contexts v0.1.1
+
+**Context**: Updated recommendations in agent-contexts added comprehensive directory organization
+
+**Decision**: Reorganize documentation with subdirectories
+- **docs/architecture/** - System design, technical specs, roadmaps
+- **ai/research/archive/** - Historical snapshots
+
+**Changes**:
+- Moved DESIGN.md to docs/architecture/ (symlink at root for compatibility)
+- Moved phase plans and roadmaps to docs/architecture/
+- Moved old STATUS files to ai/research/archive/
+- Updated AGENTS.md with Decision Flow diagram
+
+**Rationale**:
+- Clearer separation: permanent docs (docs/) vs evolving context (ai/)
+- Architecture docs grouped together in docs/architecture/
+- Historical snapshots preserved but separated
+- Knowledge graduation path: ai/ → docs/ when permanent
+- Follows standardized agent-contexts v0.1.1 patterns
+
+**Tradeoffs**: More directory depth, but better organization
+
+**References**: https://github.com/nijaru/agent-contexts (v0.1.1)

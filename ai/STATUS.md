@@ -30,6 +30,7 @@ _Last Updated: 2025-10-21_
 - **COW-aware strategies**: Automatic filesystem detection and strategy selection prevents data corruption
 - **Performance monitoring**: Arc<Mutex<PerformanceMonitor>> with atomic counters provides thread-safe metrics without overhead
 - **Error collection**: Collecting errors in Vec<SyncError> during parallel execution gives users comprehensive view of all failures
+- **Documentation reorganization**: Following agent-contexts v0.1.1 patterns with docs/architecture/ and ai/ separation provides clear structure and knowledge graduation path
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -38,7 +39,7 @@ _Last Updated: 2025-10-21_
 
 ## Active Work
 - Just completed v0.0.34 (comprehensive error reporting)
-- Documentation reorganization in progress (creating ai/ directory structure)
+- Just completed documentation reorganization (agent-contexts v0.1.1 patterns)
 
 ## Next Steps
 - Phase 5 features (see docs/MODERNIZATION_ROADMAP.md):
