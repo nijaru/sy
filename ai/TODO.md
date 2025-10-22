@@ -33,17 +33,18 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-- Enhanced progress display (v0.0.38) - Implementation complete, testing successful!
+- Bandwidth utilization metrics (v0.0.39) - JSON output complete, documentation updates pending
 
 ## Recently Completed
 - Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
 - Compression auto-detection feature (v0.0.37 - content sampling, CLI flags, SSH integration)
 - Enhanced progress display (v0.0.38 - byte-based, speed, current file)
+- Bandwidth utilization metrics (v0.0.39 - already in --perf, now in JSON output)
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [x] Compression auto-detection (file type awareness) - COMPLETE ✅ (v0.0.37)
 - [x] Enhanced progress display (current file, real-time speed, ETA) - COMPLETE ✅ (v0.0.38)
-- [ ] Bandwidth utilization metrics (% of limit when using --bwlimit)
+- [x] Bandwidth utilization metrics (% of limit when using --bwlimit) - COMPLETE ✅ (v0.0.39)
 - [ ] Symbolic link chain detection
 - [ ] Sparse file optimization improvements
 - [ ] macOS-specific features (Finder tags, resource forks)
@@ -55,9 +56,9 @@
 
 ## Technical Debt
 - [ ] Remove --mode flag placeholder (not yet implemented)
-- [ ] Implement actual bandwidth limiting (currently placeholder)
-- [ ] Add directory creation tracking to perf monitor (method exists but unused)
-- [ ] Add peak speed tracking to perf monitor (method exists but unused)
+- ~~[ ] Implement actual bandwidth limiting (currently placeholder)~~ - **DONE!** Already fully implemented
+- ~~[ ] Add directory creation tracking to perf monitor~~ - **DONE!** Already tracked
+- ~~[ ] Add peak speed tracking to perf monitor~~ - **DONE!** Already tracked via update_peak_speed()
 
 ## Research Needed
 - [ ] Modern SSH multiplexing best practices (2025)

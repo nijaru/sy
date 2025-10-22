@@ -3,9 +3,9 @@
 _Last Updated: 2025-10-22_
 
 ## Current State
-- Version: v0.0.38 (in development)
-- Phase: Enhanced Progress Display implemented!
-- Test Coverage: 338 tests passing (328 lib + 8 checksumdb + 1 verification + 1 compression)
+- Version: v0.0.39 (in development)
+- Phase: Bandwidth Utilization JSON output complete!
+- Test Coverage: 339 tests passing (329 lib + 8 checksumdb + 1 verification + 1 performance)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -29,6 +29,7 @@ _Last Updated: 2025-10-22_
 - ✅ Verify-only mode (--verify-only flag, v0.0.36) - audit integrity, JSON output, exit codes!
 - ✅ Compression auto-detection (--compression-detection flag, v0.0.37) - content sampling, 10% threshold!
 - ✅ Enhanced progress display (v0.0.38) - byte-based progress, transfer speed, current file!
+- ✅ Bandwidth utilization (--perf + --bwlimit, v0.0.39) - shows % utilization in summary and JSON!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -42,6 +43,7 @@ _Last Updated: 2025-10-22_
 - **Verify-only mode** (v0.0.36): Read-only integrity audit with structured JSON output and exit codes enables automation and monitoring workflows
 - **Compression auto-detection** (v0.0.37): Content sampling with LZ4 (BorgBackup approach) provides accurate compressibility detection with minimal overhead (~3μs per file)
 - **Enhanced progress display** (v0.0.38): Byte-based progress with transfer speed and current file provides better UX and more accurate ETA than file-count-based approach
+- **Bandwidth utilization** (v0.0.39): Performance metrics including bandwidth % now available in JSON output for automation; was already working in --perf mode
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -49,17 +51,14 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- ✅ Completed Enhanced Progress Display (v0.0.38)
-  - Byte-based progress (vs file count)
-  - Transfer speed display ({bytes_per_sec})
-  - Current file in message
-  - Accurate ETA based on bytes
-  - Terminal-adaptive wide bar
-  - Research documented in ai/research/enhanced_progress_display.md
+- ✅ Completed Bandwidth Utilization JSON Output (v0.0.39)
+  - Added Performance event to JSON output
+  - Includes all PerformanceMetrics fields
+  - Bandwidth utilization now accessible for automation
+  - Feature was already working in --perf mode
 
 ## Next Steps
-- Enhanced progress display complete!
-- Future enhancement: Bandwidth utilization percentage display (requires periodic speed access)
+- Bandwidth utilization JSON output complete!
 - Future enhancement: Thread CLI compression detection mode through transport (currently hardcoded to Auto)
 - Future enhancement: Remote checksum support for Phase 5a/5b (backlog)
 - Next major work from backlog: Symbolic link chain detection OR sparse file optimization improvements
