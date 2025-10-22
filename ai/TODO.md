@@ -2,12 +2,13 @@
 
 ## High Priority
 - [ ] Phase 5: Verification enhancements
-  - [ ] Pre-transfer checksums
-  - [ ] Checksum database for future verification
-  - [ ] --verify-only mode
+  - [x] Design (see ai/research/phase5_verification_design.md)
+  - [ ] Phase 5a: Pre-transfer checksums (v0.0.35)
+  - [ ] Phase 5b: Checksum database (v0.0.36)
+  - [ ] Phase 5c: --verify-only mode (v0.0.37)
 
 ## In Progress
-- Documentation reorganization (ai/ structure)
+- Phase 5 verification enhancements (design complete, ready for implementation)
 
 ## Backlog (from docs/MODERNIZATION_ROADMAP.md)
 - [ ] Compression auto-detection (file type awareness)

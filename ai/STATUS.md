@@ -39,10 +39,11 @@ _Last Updated: 2025-10-21_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- Just completed documentation updates for v0.0.33-34 features
-  - Documented --perf flag in README with examples
-  - Documented error reporting in README
-  - Created comprehensive troubleshooting guide
+- Just completed Phase 5 verification enhancements design
+  - Designed pre-transfer checksums (save bandwidth, detect bit rot)
+  - Designed checksum database (SQLite-based persistent storage)
+  - Designed --verify-only mode (audit without syncing)
+  - Created comprehensive design doc: ai/research/phase5_verification_design.md
 
 ## Next Steps
 - Phase 5 features (see docs/MODERNIZATION_ROADMAP.md):
