@@ -176,10 +176,14 @@ sy /source /destination --preserve-hardlinks           # Same as -H
 sy /source /destination -A                             # Preserve ACLs (Unix/Linux/macOS)
 sy /source /destination --preserve-acls                # Same as -A
 
+# BSD file flags preservation (new in v0.0.41+, macOS only)
+sy /source /destination -F                             # Preserve BSD file flags (macOS hidden, immutable, etc.)
+sy /source /destination --preserve-flags               # Same as -F
+
 # Archive mode (new in v0.0.18+) - equivalent to -rlptgoD
 sy /source /destination -a                             # Archive mode: recursive, links, perms, times, group, owner, devices
 sy /source /destination --archive                      # Same as -a (rsync compatibility)
-sy /source /destination -a -X -A -H                    # Full-fidelity backup (archive + xattrs + ACLs + hardlinks)
+sy /source /destination -a -X -A -H -F                 # Full-fidelity backup (archive + xattrs + ACLs + hardlinks + flags)
 
 # Individual metadata flags (new in v0.0.18+)
 sy /source /destination -p                             # Preserve permissions only
@@ -617,6 +621,14 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - Essential for enterprise systems with complex permission models
   - Cross-platform (Unix/Linux/macOS)
   - Fully implemented and tested
+- **BSD File Flags** (v0.0.41, macOS only):
+  - `-F` flag to preserve BSD file flags (hidden, immutable, nodump, etc.)
+  - Explicitly sets or clears flags to prevent auto-preservation
+  - Preserves macOS-specific file attributes like Finder hidden flag
+  - Uses `chflags()` syscall for accurate flag management
+  - Essential for maintaining macOS file metadata in backups
+  - Includes comprehensive tests for preservation and clearing behaviors
+  - Fully implemented and tested on macOS
 - **Rsync-Style Filters** (v0.0.18):
   - `--filter` flag for ordered include/exclude rules (first match wins)
   - `--include` and `--exclude` flags for simple patterns
