@@ -1,5 +1,5 @@
 use super::{TransferResult, Transport};
-use crate::compress::{compress, should_compress, Compression};
+use crate::compress::{compress, should_compress_smart, Compression, CompressionDetection};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
@@ -320,8 +320,16 @@ impl Transport for SshTransport {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
 
-            // Determine if compression would be beneficial
-            let compression_mode = should_compress(filename, file_size);
+            // Determine if compression would be beneficial using smart detection
+            // Use content-based detection with Auto mode (default)
+            // TODO: Thread compression_detection mode from CLI through transport
+            let compression_mode = should_compress_smart(
+                Some(&source_path),
+                filename,
+                file_size,
+                false, // SSH transfers are always remote (not local)
+                CompressionDetection::Auto,
+            );
 
             // Use compressed transfer for compressible files, SFTP for others
             match compression_mode {
