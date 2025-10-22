@@ -55,14 +55,15 @@ _Last Updated: 2025-10-22_
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
 
 ## Active Work
-- 🚧 In Progress (v0.0.41 - macOS BSD File Flags)
-  - Add bsd_flags field to FileEntry struct (DONE)
-  - Implement BSD flags capture in scanner (DONE)
-  - Add --preserve-flags CLI flag (DONE)
-  - Wire preserve_flags through SyncEngine (REMAINING)
-  - Implement set_bsd_flags() in LocalTransport (REMAINING)
-  - Handle immutable flags logic (REMAINING)
-  - Add tests for BSD flags preservation (REMAINING)
+- 🚧 In Progress (v0.0.41 - macOS BSD File Flags) - 90% Complete
+  - Add bsd_flags field to FileEntry struct (DONE ✅)
+  - Implement BSD flags capture in scanner (DONE ✅)
+  - Add --preserve-flags CLI flag (DONE ✅)
+  - Wire preserve_flags through SyncEngine (DONE ✅)
+  - Implement write_bsd_flags() method (DONE ✅)
+  - Add BSD flags tests (DONE ✅)
+  - Fix test Transferrer::new() calls for macOS (REMAINING)
+  - Handle immutable flags logic (OPTIONAL - can defer)
   - Update documentation (REMAINING)
 
 ## Next Steps
