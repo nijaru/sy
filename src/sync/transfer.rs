@@ -418,48 +418,50 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
         #[cfg(target_os = "macos")]
         {
-            if !self.preserve_flags {
-                return Ok(());
-            }
+            let dest_path = dest_path.to_path_buf();
 
-            if let Some(flags) = file_entry.bsd_flags {
-                let dest_path = dest_path.to_path_buf();
+            // Determine what flags to set: source flags if preserving, 0 if not
+            let flags_to_set = if self.preserve_flags {
+                file_entry.bsd_flags.unwrap_or(0)
+            } else {
+                // Clear flags when not preserving (macOS file copy may preserve them automatically)
+                0
+            };
 
-                tokio::task::spawn_blocking(move || {
-                    use std::ffi::CString;
+            tokio::task::spawn_blocking(move || {
+                use std::ffi::CString;
 
-                    let c_path = match CString::new(dest_path.to_str().unwrap_or("")) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create C string for {}: {}",
-                                dest_path.display(),
-                                e
-                            );
-                            return;
-                        }
-                    };
-
-                    let result = unsafe { libc::chflags(c_path.as_ptr(), flags as _) };
-
-                    if result != 0 {
-                        let err = std::io::Error::last_os_error();
+                let c_path = match CString::new(dest_path.to_str().unwrap_or("")) {
+                    Ok(p) => p,
+                    Err(e) => {
                         tracing::warn!(
-                            "Failed to set BSD flags on {}: {}",
+                            "Failed to create C string for {}: {}",
                             dest_path.display(),
-                            err
+                            e
                         );
-                    } else {
-                        tracing::debug!(
-                            "Set BSD flags 0x{:x} on {}",
-                            flags,
-                            dest_path.display()
-                        );
+                        return;
                     }
-                })
-                .await
-                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
-            }
+                };
+
+                let result = unsafe { libc::chflags(c_path.as_ptr(), flags_to_set as _) };
+
+                if result != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!(
+                        "Failed to set BSD flags on {}: {}",
+                        dest_path.display(),
+                        err
+                    );
+                } else {
+                    tracing::debug!(
+                        "Set BSD flags 0x{:x} on {}",
+                        flags_to_set,
+                        dest_path.display()
+                    );
+                }
+            })
+            .await
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
             Ok(())
         }
@@ -581,6 +583,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -592,6 +595,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -624,6 +629,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -635,6 +641,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // dry_run = true
@@ -663,6 +671,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -674,6 +683,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -715,6 +726,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -726,6 +738,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -769,6 +783,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -780,6 +795,8 @@ mod tests {
             SymlinkMode::Follow,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -823,6 +840,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -834,6 +852,8 @@ mod tests {
             SymlinkMode::Skip,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -880,6 +900,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -891,6 +912,8 @@ mod tests {
             SymlinkMode::Preserve,
             true,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // preserve_xattrs = true
@@ -938,6 +961,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -949,6 +973,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // preserve_xattrs = false
@@ -1000,6 +1026,7 @@ mod tests {
             inode: Some(inode),
             nlink: 2,
             acls: None,
+            bsd_flags: None,
         };
 
         let link_entry = FileEntry {
@@ -1016,6 +1043,7 @@ mod tests {
             inode: Some(inode),
             nlink: 2,
             acls: None,
+            bsd_flags: None,
         };
 
         // Transfer with preserve_hardlinks = true
@@ -1028,6 +1056,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             true,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             Arc::clone(&hardlink_map),
         );
@@ -1105,6 +1135,7 @@ mod tests {
             inode: Some(inode),
             nlink: 2,
             acls: None,
+            bsd_flags: None,
         };
 
         let link_entry = FileEntry {
@@ -1121,6 +1152,7 @@ mod tests {
             inode: Some(inode),
             nlink: 2,
             acls: None,
+            bsd_flags: None,
         };
 
         // Transfer with preserve_hardlinks = false
@@ -1133,6 +1165,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1202,6 +1236,7 @@ mod tests {
             inode: Some(inode),
             nlink: 3,
             acls: None,
+            bsd_flags: None,
         };
 
         let entry2 = FileEntry {
@@ -1218,6 +1253,7 @@ mod tests {
             inode: Some(inode),
             nlink: 3,
             acls: None,
+            bsd_flags: None,
         };
 
         let entry3 = FileEntry {
@@ -1234,6 +1270,7 @@ mod tests {
             inode: Some(inode),
             nlink: 3,
             acls: None,
+            bsd_flags: None,
         };
 
         // Transfer with preserve_hardlinks = true
@@ -1246,6 +1283,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             true,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1300,6 +1339,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1311,6 +1351,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1354,6 +1396,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1365,6 +1408,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1396,6 +1441,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1434,6 +1481,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1445,6 +1493,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1483,6 +1533,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1494,6 +1545,8 @@ mod tests {
             SymlinkMode::Follow,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1528,6 +1581,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: None,
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1539,6 +1593,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1573,6 +1629,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: Some(acls_text.into_bytes()),
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1585,6 +1642,8 @@ mod tests {
             false,
             false,
             true,
+            #[cfg(target_os = "macos")]
+            false,
             hardlink_map,
         );
 
@@ -1618,6 +1677,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: Some(acls_text.into_bytes()),
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1629,6 +1689,8 @@ mod tests {
             SymlinkMode::Preserve,
             false,
             false,
+            false,
+            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1662,6 +1724,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: Some(Vec::new()), // Empty ACLs
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1674,6 +1737,8 @@ mod tests {
             false,
             false,
             true,
+            #[cfg(target_os = "macos")]
+            false,
             hardlink_map,
         );
 
@@ -1721,6 +1786,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: Some(acls_bytes),
+            bsd_flags: None,
         };
 
         // Transfer with preserve_acls = true
@@ -1734,6 +1800,8 @@ mod tests {
             false,
             false,
             true,
+            #[cfg(target_os = "macos")]
+            false,
             hardlink_map,
         );
 
@@ -1777,6 +1845,7 @@ mod tests {
             inode: None,
             nlink: 1,
             acls: Some(acls_text.into_bytes()),
+            bsd_flags: None,
         };
 
         let transport = LocalTransport::new();
@@ -1789,6 +1858,8 @@ mod tests {
             false,
             false,
             true,
+            #[cfg(target_os = "macos")]
+            false,
             hardlink_map,
         );
 
