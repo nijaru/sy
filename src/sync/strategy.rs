@@ -1,3 +1,4 @@
+use super::checksumdb::ChecksumDatabase;
 use super::scanner::FileEntry;
 use crate::error::Result;
 use crate::integrity::{Checksum, ChecksumType, IntegrityVerifier};
@@ -79,6 +80,7 @@ impl StrategyPlanner {
         source: &FileEntry,
         dest_root: &Path,
         transport: &T,
+        checksum_db: Option<&ChecksumDatabase>,
     ) -> Result<SyncTask> {
         let dest_path = dest_root.join(&source.relative_path);
 
@@ -97,7 +99,7 @@ impl StrategyPlanner {
                 Ok(dest_info) => {
                     // Compute checksums if verifier is present and files are local
                     let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
-                        self.compute_checksums_local(source, &dest_path, verifier)?
+                        self.compute_checksums_local(source, &dest_path, verifier, checksum_db)?
                     } else {
                         (None, None)
                     };
@@ -144,32 +146,86 @@ impl StrategyPlanner {
 
     /// Compute checksums for local files (both source and dest)
     /// Returns (source_checksum, dest_checksum) if both files are accessible locally
+    /// Queries checksum database first if provided, computes only on cache miss
     fn compute_checksums_local(
         &self,
         source: &FileEntry,
         dest_path: &Path,
         verifier: &IntegrityVerifier,
+        checksum_db: Option<&ChecksumDatabase>,
     ) -> Result<(Option<Checksum>, Option<Checksum>)> {
-        // Try to compute source checksum (source should always be local in current design)
+        let checksum_type = match verifier.checksum_type() {
+            ChecksumType::None => "none",
+            ChecksumType::Fast => "fast",
+            ChecksumType::Cryptographic => "cryptographic",
+        };
+
+        // Try to get source checksum (check database first, then compute)
         let source_checksum = if source.path.exists() {
-            match verifier.compute_file_checksum(&source.path) {
-                Ok(cksum) => Some(cksum),
-                Err(e) => {
-                    tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
-                    None
+            // Try database first
+            if let Some(db) = checksum_db {
+                if let Ok(Some(cached)) = db.get_checksum(&source.path, source.modified, source.size, checksum_type) {
+                    tracing::debug!("Database hit for source: {}", source.path.display());
+                    Some(cached)
+                } else {
+                    // Cache miss, compute
+                    tracing::debug!("Database miss for source: {}, computing", source.path.display());
+                    match verifier.compute_file_checksum(&source.path) {
+                        Ok(cksum) => Some(cksum),
+                        Err(e) => {
+                            tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                // No database, compute directly
+                match verifier.compute_file_checksum(&source.path) {
+                    Ok(cksum) => Some(cksum),
+                    Err(e) => {
+                        tracing::warn!("Failed to compute source checksum for {}: {}", source.path.display(), e);
+                        None
+                    }
                 }
             }
         } else {
             None
         };
 
-        // Try to compute dest checksum (only if it exists and is local)
+        // Try to get dest checksum (check database first, then compute)
         let dest_checksum = if dest_path.exists() {
-            match verifier.compute_file_checksum(dest_path) {
-                Ok(cksum) => Some(cksum),
-                Err(e) => {
-                    tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
-                    None
+            // Get dest metadata for database query
+            let dest_metadata = std::fs::metadata(dest_path).ok();
+            let (dest_mtime, dest_size) = if let Some(ref meta) = dest_metadata {
+                (meta.modified().ok(), Some(meta.len()))
+            } else {
+                (None, None)
+            };
+
+            // Try database first
+            if let (Some(db), Some(mtime), Some(size)) = (checksum_db, dest_mtime, dest_size) {
+                if let Ok(Some(cached)) = db.get_checksum(dest_path, mtime, size, checksum_type) {
+                    tracing::debug!("Database hit for dest: {}", dest_path.display());
+                    Some(cached)
+                } else {
+                    // Cache miss, compute
+                    tracing::debug!("Database miss for dest: {}, computing", dest_path.display());
+                    match verifier.compute_file_checksum(dest_path) {
+                        Ok(cksum) => Some(cksum),
+                        Err(e) => {
+                            tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                // No database or metadata, compute directly
+                match verifier.compute_file_checksum(dest_path) {
+                    Ok(cksum) => Some(cksum),
+                    Err(e) => {
+                        tracing::warn!("Failed to compute dest checksum for {}: {}", dest_path.display(), e);
+                        None
+                    }
                 }
             }
         } else {
@@ -198,7 +254,7 @@ impl StrategyPlanner {
                 Ok(dest_meta) => {
                     // Compute checksums if verifier is present
                     let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
-                        self.compute_checksums_local(source, &dest_path, verifier)
+                        self.compute_checksums_local(source, &dest_path, verifier, None)
                             .unwrap_or((None, None))
                     } else {
                         (None, None)
