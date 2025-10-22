@@ -1216,6 +1216,56 @@ impl<T: Transport + 'static> SyncEngine<T> {
             }
         }
 
+        // Store checksums in database if enabled
+        if let Some(ref db) = checksum_db {
+            if !self.dry_run {
+                let mut stored_count = 0;
+                let verifier = IntegrityVerifier::new(
+                    if self.checksum { ChecksumType::Fast } else { ChecksumType::None },
+                    false
+                );
+
+                for file in &source_files {
+                    if file.is_dir {
+                        continue; // Skip directories
+                    }
+
+                    // Compute checksum for source file
+                    if let Ok(checksum) = verifier.compute_file_checksum(&file.path) {
+                        // Store in database
+                        if let Err(e) = db.store_checksum(&file.path, file.modified, file.size, &checksum) {
+                            tracing::warn!("Failed to store checksum for {}: {}", file.path.display(), e);
+                        } else {
+                            stored_count += 1;
+                        }
+                    }
+                }
+
+                if stored_count > 0 {
+                    tracing::info!("Stored {} checksums in database", stored_count);
+                }
+
+                // Handle prune flag
+                if self.prune_checksum_db {
+                    use std::collections::HashSet;
+                    let existing_paths: HashSet<_> = source_files.iter()
+                        .map(|f| f.path.clone())
+                        .collect();
+
+                    match db.prune(&existing_paths) {
+                        Ok(pruned) => {
+                            if pruned > 0 {
+                                tracing::info!("Pruned {} stale entries from checksum database", pruned);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to prune checksum database: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         // If we got here, either no errors occurred or errors were within the threshold
         Ok(final_stats)
     }
