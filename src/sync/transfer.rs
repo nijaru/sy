@@ -155,6 +155,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                                 // Write ACLs if present
                                 self.write_acls(source, dest_path).await?;
 
+                                // Write BSD flags if present (macOS only)
+                                self.write_bsd_flags(source, dest_path).await?;
+
                                 // Mark as completed and notify waiters
                                 {
                                     let mut map = self.hardlink_map.lock().unwrap();
@@ -180,6 +183,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
             // Write ACLs if present
             self.write_acls(source, dest_path).await?;
+
+            // Write BSD flags if present (macOS only)
+            self.write_bsd_flags(source, dest_path).await?;
 
             Ok(Some(result))
         }
@@ -217,6 +223,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
             // Write ACLs if present
             self.write_acls(source, dest_path).await?;
+
+            // Write BSD flags if present (macOS only)
+            self.write_bsd_flags(source, dest_path).await?;
 
             tracing::info!(
                 "Updated: {} -> {}",
@@ -397,6 +406,63 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         }
 
         Ok(())
+    }
+
+    async fn write_bsd_flags(&self, file_entry: &FileEntry, dest_path: &Path) -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            // BSD flags only supported on macOS
+            let _ = (file_entry, dest_path);
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if !self.preserve_flags {
+                return Ok(());
+            }
+
+            if let Some(flags) = file_entry.bsd_flags {
+                let dest_path = dest_path.to_path_buf();
+
+                tokio::task::spawn_blocking(move || {
+                    use std::ffi::CString;
+
+                    let c_path = match CString::new(dest_path.to_str().unwrap_or("")) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to create C string for {}: {}",
+                                dest_path.display(),
+                                e
+                            );
+                            return;
+                        }
+                    };
+
+                    let result = unsafe { libc::chflags(c_path.as_ptr(), flags as _) };
+
+                    if result != 0 {
+                        let err = std::io::Error::last_os_error();
+                        tracing::warn!(
+                            "Failed to set BSD flags on {}: {}",
+                            dest_path.display(),
+                            err
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Set BSD flags 0x{:x} on {}",
+                            flags,
+                            dest_path.display()
+                        );
+                    }
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
+            Ok(())
+        }
     }
 
     async fn handle_symlink(

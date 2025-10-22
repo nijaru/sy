@@ -95,6 +95,8 @@ pub struct SyncEngine<T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
+    #[cfg(target_os = "macos")]
+    preserve_flags: bool,
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
@@ -134,6 +136,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
+        #[cfg(target_os = "macos")] preserve_flags: bool,
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
@@ -176,6 +179,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             preserve_xattrs,
             preserve_hardlinks,
             preserve_acls,
+            #[cfg(target_os = "macos")]
+            preserve_flags,
             ignore_times,
             size_only,
             checksum,
@@ -686,6 +691,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_xattrs = self.preserve_xattrs;
             let preserve_hardlinks = self.preserve_hardlinks;
             let preserve_acls = self.preserve_acls;
+            #[cfg(target_os = "macos")]
+            let preserve_flags = self.preserve_flags;
             let hardlink_map = Arc::clone(&hardlink_map);
             let perf_monitor = self.perf_monitor.clone();
 
@@ -698,6 +705,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     preserve_xattrs,
                     preserve_hardlinks,
                     preserve_acls,
+                    #[cfg(target_os = "macos")]
+                    preserve_flags,
                     hardlink_map,
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -1530,6 +1539,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.preserve_xattrs,
             self.preserve_hardlinks,
             self.preserve_acls,
+            #[cfg(target_os = "macos")]
+            self.preserve_flags,
             hardlink_map,
         );
 
