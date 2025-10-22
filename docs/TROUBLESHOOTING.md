@@ -176,6 +176,49 @@ dd if=/dev/zero of=/tmp/test.img bs=1M count=1024
 rm /tmp/test.img
 ```
 
+### Wasted Bandwidth on Unchanged Files
+
+**Problem**: Files are being re-transferred even though content hasn't changed
+
+**This happens when**:
+- Files have been "touched" (mtime updated but content unchanged)
+- Build systems update timestamps
+- Version control operations change mtimes
+
+**Solution** (v0.0.35+):
+```bash
+# Use --checksum flag to compare content before transfer
+sy /source /dest --checksum
+
+# Short form
+sy /source /dest -c
+
+# Preview what would be skipped
+sy /source /dest -c --dry-run --diff
+
+# Combine with performance monitoring
+sy /source /dest -c --perf
+```
+
+**How it works**:
+- Computes xxHash3 checksums for both source and dest (15 GB/s, ~5% overhead)
+- Skips transfer if checksums match, even if mtime differs
+- Transfers only if checksums actually differ
+- Detects bit rot (content changed but mtime unchanged)
+
+**Example output**:
+```
+# Files with matching checksums are skipped:
+✓ file1.txt (checksum match, skipped)
+→ file2.txt (checksum differs, transferring)
+```
+
+**When to use**:
+- Re-syncing after build operations
+- Syncing after git checkout
+- Periodic backups where files may be touched but not modified
+- Detecting bit rot or silent corruption
+
 ## Permission Errors
 
 ### "Operation not permitted" for Extended Attributes
@@ -428,4 +471,4 @@ When reporting issues, include:
 
 ---
 
-**Last Updated**: v0.0.34 (2025-10-21)
+**Last Updated**: v0.0.35 (2025-10-21)
