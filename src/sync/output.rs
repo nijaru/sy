@@ -53,6 +53,23 @@ pub enum SyncEvent {
         duration_secs: f64,
         exit_code: i32,
     },
+    Performance {
+        total_duration_secs: f64,
+        scan_duration_secs: f64,
+        plan_duration_secs: f64,
+        transfer_duration_secs: f64,
+        bytes_transferred: u64,
+        bytes_read: u64,
+        files_processed: u64,
+        files_created: u64,
+        files_updated: u64,
+        files_deleted: u64,
+        directories_created: u64,
+        avg_transfer_speed: f64,
+        peak_transfer_speed: f64,
+        files_per_second: f64,
+        bandwidth_utilization: Option<f64>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -167,5 +184,32 @@ mod tests {
         assert!(json.contains(r#""error_file.txt"#));
         assert!(json.contains(r#""duration_secs":1.5"#));
         assert!(json.contains(r#""exit_code":1"#));
+    }
+
+    #[test]
+    fn test_serialize_performance_event() {
+        let event = SyncEvent::Performance {
+            total_duration_secs: 10.5,
+            scan_duration_secs: 1.2,
+            plan_duration_secs: 0.8,
+            transfer_duration_secs: 8.5,
+            bytes_transferred: 1_000_000,
+            bytes_read: 1_200_000,
+            files_processed: 100,
+            files_created: 50,
+            files_updated: 30,
+            files_deleted: 10,
+            directories_created: 5,
+            avg_transfer_speed: 117_647.0,
+            peak_transfer_speed: 200_000.0,
+            files_per_second: 9.52,
+            bandwidth_utilization: Some(87.5),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"performance"#));
+        assert!(json.contains(r#""bytes_transferred":1000000"#));
+        assert!(json.contains(r#""avg_transfer_speed":117647"#));
+        assert!(json.contains(r#""bandwidth_utilization":87.5"#));
     }
 }
