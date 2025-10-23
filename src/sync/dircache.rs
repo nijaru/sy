@@ -46,7 +46,6 @@ impl CachedFile {
             inode: None,
             nlink: 1,
             acls: None,
-            #[cfg(target_os = "macos")]
             bsd_flags: None,
         }
     }

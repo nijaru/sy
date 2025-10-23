@@ -251,7 +251,6 @@ impl Transport for SshTransport {
                     inode: e.inode,
                     nlink: e.nlink,
                     acls,
-                    #[cfg(target_os = "macos")]
                     bsd_flags: None, // TODO: Serialize BSD flags in SSH protocol
                 })
             })
