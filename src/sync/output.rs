@@ -44,6 +44,7 @@ pub enum SyncEvent {
         files_verified: usize,
         verification_failures: usize,
     },
+    #[allow(dead_code)] // Event for verify-only mode (Phase 5c)
     VerificationResult {
         files_matched: usize,
         files_mismatched: Vec<PathBuf>,

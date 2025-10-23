@@ -112,6 +112,7 @@ pub fn is_compressed_extension(filename: &str) -> bool {
 /// - Zstd: 8 GB/s (level 3)
 ///
 /// CPU is NEVER the bottleneck - network always is, even on 100 Gbps!
+#[allow(dead_code)] // Public API for future use
 pub fn should_compress_adaptive(
     filename: &str,
     file_size: u64,
@@ -145,6 +146,7 @@ pub fn should_compress_adaptive(
 
 /// Determine if we should compress based on file size and extension
 /// (Legacy function for backward compatibility)
+#[allow(dead_code)] // Public API for future use
 pub fn should_compress(filename: &str, file_size: u64) -> Compression {
     should_compress_adaptive(filename, file_size, false, None)
 }
