@@ -99,6 +99,7 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
+    #[allow(dead_code)] // TODO: Use verify_only field in sync logic
     verify_only: bool,
     use_cache: bool,
     clear_cache: bool,
@@ -689,7 +690,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_xattrs = self.preserve_xattrs;
             let preserve_hardlinks = self.preserve_hardlinks;
             let preserve_acls = self.preserve_acls;
-            #[cfg(target_os = "macos")]
             let preserve_flags = self.preserve_flags;
             let hardlink_map = Arc::clone(&hardlink_map);
             let perf_monitor = self.perf_monitor.clone();
@@ -1589,7 +1589,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         inode: None,
                         nlink: 1,
                         acls: None,
-                        #[cfg(target_os = "macos")]
                         bsd_flags: None,
                     },
                     destination,
@@ -1659,7 +1658,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         inode: None,
                         nlink: 1,
                         acls: None,
-                        #[cfg(target_os = "macos")]
                         bsd_flags: None,
                     },
                     destination,

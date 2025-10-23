@@ -309,8 +309,7 @@ impl Iterator for StreamingScanner {
             // Read ACLs (always scan them, writing is conditional)
             let acls = read_acls(&path);
 
-            // Read BSD file flags (macOS only)
-            #[cfg(target_os = "macos")]
+            // Read BSD file flags (macOS only, None on other platforms)
             let bsd_flags = read_bsd_flags(&metadata);
 
             let modified = match metadata.modified() {
