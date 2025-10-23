@@ -97,4 +97,7 @@ None currently - ready for next feature!
 - [ ] Add tests for sparse file edge cases
 - [ ] Add tests for error collection with max_errors threshold
 - [ ] Add performance monitoring accuracy tests
-- [ ] Add COW strategy selection tests for various filesystems
+- [x] Add COW strategy selection tests for various filesystems - COMPLETE ✅
+  - Added 11 edge case tests in fs_util.rs
+  - Non-existent paths, parent/child relationships, symlinks, 3-way hard links
+  - All 355 tests passing (353 + 2 ignored APFS sparse tests)

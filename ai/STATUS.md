@@ -5,7 +5,7 @@ _Last Updated: 2025-10-23_
 ## Current State
 - Version: v0.0.41 (RELEASED ✅)
 - Phase: macOS platform features complete! Cross-platform compilation verified!
-- Test Coverage: 346 tests passing (336 lib + 8 checksumdb + 1 verification + 1 performance)
+- Test Coverage: 355 tests passing (353 + 2 ignored APFS sparse tests)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -55,6 +55,7 @@ _Last Updated: 2025-10-23_
 - **macOS resource forks** (v0.0.16+): Already supported via xattr preservation; stored as `com.apple.ResourceFork` xattr on modern macOS; AppleDouble format for legacy compatibility
 - **Windows strategy** (v0.0.41+): Focus on core rsync advantages (native binary, delta-transfer, SSH) rather than Windows-specific features (ACLs/attributes); fills gap where Robocopy lacks delta-transfer and SSH support
 - **SSH multiplexing research** (v0.0.41+): ControlMaster NOT recommended for sy's parallel file transfers (bottlenecks on one TCP connection); better approach is SSH connection pooling (N connections = N workers) for true parallel throughput; see ai/research/ssh_multiplexing_2025.md
+- **COW strategy edge case tests** (v0.0.41+): Added 11 comprehensive edge case tests for filesystem detection (non-existent paths, parent/child relationships, symlinks, 3-way hard links); all edge cases handle errors gracefully by returning false (conservative approach); test coverage increased to 355 tests
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
