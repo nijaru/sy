@@ -4,7 +4,7 @@ _Last Updated: 2025-10-23_
 
 ## Current State
 - Version: v0.0.42-dev
-- Phase: SSH connection pooling implemented! Ready for parallel SSH transfers!
+- Phase: SSH sparse file transfer protocol implemented! Integration pending.
 - Test Coverage: 382 tests passing (375 + 7 ignored APFS sparse tests)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
@@ -67,9 +67,14 @@ _Last Updated: 2025-10-23_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-- Documentation updates for SSH connection pooling feature
+- SSH sparse file transfer integration and testing (~4 hours remaining)
 
 ## Recently Completed
+- 🚧 SSH Sparse File Transfer Protocol (2025-10-23) - WIP
+  - sy-remote ReceiveSparseFile command complete ✅
+  - SSH transport copy_sparse_file() method complete ✅
+  - Protocol design: send regions JSON + stream data ✅
+  - Remaining: integration with copy_file, SyncEngine, tests (~4h)
 - ✅ SSH Connection Pooling (2025-10-23)
   - Implemented ConnectionPool with round-robin session distribution ✅
   - Pool size automatically matches --parallel worker count ✅
