@@ -569,7 +569,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -635,7 +634,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -705,7 +703,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -778,7 +775,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -844,7 +840,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -910,7 +905,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -976,7 +970,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1042,7 +1035,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1127,7 +1119,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1196,7 +1187,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1262,7 +1252,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1354,7 +1343,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1420,7 +1408,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1486,7 +1473,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1552,7 +1538,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1625,7 +1610,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: true, // Only permissions enabled
             preserve_times: false,
@@ -1697,7 +1681,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: true, // Explicit flag also enabled
             preserve_times: false,
@@ -1770,7 +1753,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1843,7 +1825,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
@@ -1913,7 +1894,6 @@ mod tests {
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
-            #[cfg(target_os = "macos")]
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
