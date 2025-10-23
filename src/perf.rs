@@ -482,14 +482,12 @@ mod tests {
 
         // Verify durations are within reasonable bounds (allow 10ms variance)
         assert!(
-            metrics.scan_duration.as_millis() >= 50
-                && metrics.scan_duration.as_millis() < 60,
+            metrics.scan_duration.as_millis() >= 50 && metrics.scan_duration.as_millis() < 60,
             "scan_duration: {:?}",
             metrics.scan_duration
         );
         assert!(
-            metrics.plan_duration.as_millis() >= 30
-                && metrics.plan_duration.as_millis() < 40,
+            metrics.plan_duration.as_millis() >= 30 && metrics.plan_duration.as_millis() < 40,
             "plan_duration: {:?}",
             metrics.plan_duration
         );
@@ -523,8 +521,7 @@ mod tests {
 
         // Average speed should be approximately 1 MB/s (allow some variance)
         assert!(
-            metrics.avg_transfer_speed >= 900_000.0
-                && metrics.avg_transfer_speed <= 1_100_000.0,
+            metrics.avg_transfer_speed >= 900_000.0 && metrics.avg_transfer_speed <= 1_100_000.0,
             "avg_transfer_speed: {:.0}",
             metrics.avg_transfer_speed
         );

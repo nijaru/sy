@@ -329,10 +329,7 @@ mod tests {
                 .seek(std::io::SeekFrom::Start(region.offset))
                 .unwrap();
             output_file
-                .write_all(
-                    &input_data
-                        [offset_in_buffer..offset_in_buffer + region.length as usize],
-                )
+                .write_all(&input_data[offset_in_buffer..offset_in_buffer + region.length as usize])
                 .unwrap();
             offset_in_buffer += region.length as usize;
         }
