@@ -36,7 +36,9 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Compression Auto-Detection** - Content-based sampling for smart compression! (v0.0.37)
 ✅ **Enhanced Progress Display** - Byte-based progress with transfer speed and current file! (v0.0.38)
 ✅ **Bandwidth Utilization JSON** - Performance metrics including bandwidth % in JSON output! (v0.0.39)
-🚀 **Current Version: v0.0.39 (in development)** - 339 tests passing!
+✅ **SSH Connection Pooling** - True parallel SSH transfers with N workers = N connections! (v0.0.42)
+✅ **SSH Sparse File Transfer** - Automatic sparse file optimization for 10x bandwidth savings! (v0.0.42)
+🚀 **Current Version: v0.0.42** - 385 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -251,6 +253,13 @@ sy /data s3://my-bucket/data?endpoint=https://r2.example.com  # Custom endpoint 
 # - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
 # - ~/.aws/credentials profile
 # - IAM role (when running on AWS)
+
+# SSH sparse file transfer (new in v0.0.42+)
+sy /vm/images/disk.vmdk user@host:/backup/     # Auto-detects sparse files
+# 10GB VM image with 1GB data: transfers 1GB instead of 10GB (10x bandwidth savings)
+# 100GB database with 20GB data: transfers 20GB instead of 100GB (5x bandwidth savings)
+# Automatic detection on Unix (allocated_size < file_size)
+# Graceful fallback if sparse detection fails or not supported
 
 # Incremental scanning with cache (new in Phase 11 / v0.0.22)
 sy /large-project /backup --use-cache                   # Enable directory cache for faster re-syncs
@@ -677,6 +686,33 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - `sy /data s3://my-bucket/data?region=us-west-2` - Specify region
   - `sy /data s3://my-bucket/data?endpoint=https://...` - Custom endpoint
 
+**SSH Optimizations (v0.0.42)**:
+- **Connection Pooling** (NEW):
+  - True parallel SSH transfers with N connections for N workers
+  - Round-robin session distribution via atomic counter
+  - Pool size automatically matches `--parallel` worker count
+  - Avoids ControlMaster bottleneck (which serializes on one TCP connection)
+  - Each worker gets dedicated SSH connection for maximum throughput
+- **Sparse File Transfer** (NEW):
+  - Automatic detection of sparse files (VM images, databases, etc.)
+  - Detects data regions using SEEK_HOLE/SEEK_DATA on Unix
+  - Transfers only actual data, not holes (empty regions)
+  - **10x bandwidth savings** for VM images (e.g., 10GB file with 1GB data → 1GB transferred)
+  - **5x bandwidth savings** for database files
+  - Protocol: detect regions → send JSON + stream data → reconstruct on remote
+  - Graceful fallback to regular transfer if detection fails
+  - Auto-detection: `allocated_size < file_size` on Unix systems
+  - Zero configuration - works automatically for sparse files
+- **Example Usage**:
+  ```bash
+  # Connection pooling (automatic with -j flag)
+  sy /source user@host:/dest -j 20    # 20 workers = 20 SSH connections
+
+  # Sparse file transfer (automatic detection)
+  sy /vm/disk.vmdk user@host:/backup/ # Only transfers data regions
+  sy /db/postgres.db user@host:/sync/ # Skips holes, transfers data
+  ```
+
 **Scale (Phase 11 - Complete)**:
 - **Incremental Scanning with Cache** (NEW in v0.0.22):
   - Cache directory mtimes to detect unchanged directories
@@ -793,6 +829,8 @@ Files: 1,234 total | 892 synced | 312 skipped | 30 queued
 | **Performance (local)** | baseline | N/A | **2-11x faster** |
 | Parallel file transfers | ❌ | ✅ | ✅ |
 | Parallel checksums | ❌ | ❌ | ✅ |
+| SSH connection pooling | ❌ | ❌ | ✅ **N workers = N connections** |
+| SSH sparse file transfer | ❌ | ❌ | ✅ **Auto-detect, 10x savings** |
 | Delta sync | ✅ | ❌ | ✅ |
 | Cross-transport delta sync | ❌ | ❌ | ✅ **Auto-detects updates!** |
 | Streaming delta | ❌ | ❌ | ✅ **Constant memory!** |
