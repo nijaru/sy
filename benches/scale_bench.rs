@@ -37,6 +37,7 @@ fn bench_deletion_planning(c: &mut Criterion) {
                         inode: None,
                         nlink: 1,
                         acls: None,
+                        bsd_flags: None,
                     })
                     .collect();
 
