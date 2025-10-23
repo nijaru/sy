@@ -26,11 +26,15 @@ impl TransportRouter {
     /// - Remote → Local: Use DualTransport (SSH for source, Local for dest)
     /// - Local → Remote: Use DualTransport (Local for source, SSH for dest)
     /// - Remote → Remote: Not supported yet (would require two SSH connections)
+    ///
+    /// `pool_size` controls the number of SSH connections in the pool for parallel transfers.
+    /// Should typically match the number of parallel workers.
     pub async fn new(
         source: &SyncPath,
         destination: &SyncPath,
         checksum_type: ChecksumType,
         verify_on_write: bool,
+        pool_size: usize,
     ) -> Result<Self> {
         let verifier = IntegrityVerifier::new(checksum_type, verify_on_write);
 
@@ -54,7 +58,8 @@ impl TransportRouter {
                 };
 
                 let source_transport = Box::new(LocalTransport::with_verifier(verifier.clone()));
-                let dest_transport = Box::new(SshTransport::new(&config).await?);
+                let dest_transport =
+                    Box::new(SshTransport::with_pool_size(&config, pool_size).await?);
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
@@ -70,7 +75,8 @@ impl TransportRouter {
                     parse_ssh_config(host)?
                 };
 
-                let source_transport = Box::new(SshTransport::new(&config).await?);
+                let source_transport =
+                    Box::new(SshTransport::with_pool_size(&config, pool_size).await?);
                 let dest_transport = Box::new(LocalTransport::with_verifier(verifier));
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
