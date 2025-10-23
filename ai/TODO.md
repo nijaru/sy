@@ -49,6 +49,7 @@ None currently - ready for next feature!
   - [x] Fix test FileEntry initializations (35+ locations)
   - [x] Fix flag preservation behavior (explicitly clear when not preserving)
   - [x] Update documentation (README, MACOS_SUPPORT.md)
+  - [x] Fix cross-platform compilation (remove all #[cfg] from preserve_flags usage sites)
   - [ ] Optional: Handle immutable flags (deferred to future version if needed)
 - Symlink loop detection (v0.0.40 - follow_links option, walkdir integration, comprehensive tests)
 - Bandwidth utilization metrics (v0.0.39 - JSON output complete)
