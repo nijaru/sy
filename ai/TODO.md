@@ -71,7 +71,7 @@ None currently - ready for next feature!
 - [ ] Plugin system
 
 ## Technical Debt
-- [ ] Remove --mode flag placeholder (not yet implemented)
+- ~~[ ] Remove --mode flag placeholder (not yet implemented)~~ - **DONE!** Already fully implemented (VerificationMode enum with fast/standard/verify/paranoid)
 - ~~[ ] Implement actual bandwidth limiting (currently placeholder)~~ - **DONE!** Already fully implemented
 - ~~[ ] Add directory creation tracking to perf monitor~~ - **DONE!** Already tracked
 - ~~[ ] Add peak speed tracking to perf monitor~~ - **DONE!** Already tracked via update_peak_speed()
