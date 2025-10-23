@@ -190,8 +190,15 @@ async fn main() -> Result<()> {
     let verify_on_write = verification_mode.verify_blocks();
 
     // Create transport router based on source and destination
-    let transport =
-        TransportRouter::new(source, destination, checksum_type, verify_on_write).await?;
+    // Use worker count for SSH connection pool size to enable true parallel transfers
+    let transport = TransportRouter::new(
+        source,
+        destination,
+        checksum_type,
+        verify_on_write,
+        cli.parallel, // SSH connection pool size = number of workers
+    )
+    .await?;
 
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();
