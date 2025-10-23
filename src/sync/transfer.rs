@@ -24,7 +24,8 @@ pub struct Transferrer<'a, T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    preserve_flags: bool, // macOS only, no-op on other platforms
+    #[allow(dead_code)] // macOS only, no-op on other platforms - TODO: implement
+    preserve_flags: bool,
     hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>, // inode -> state
 }
 
@@ -594,7 +595,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -640,7 +640,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // dry_run = true
@@ -682,7 +681,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -737,7 +735,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -794,7 +791,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -851,7 +847,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -911,7 +906,6 @@ mod tests {
             true,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // preserve_xattrs = true
@@ -972,7 +966,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         ); // preserve_xattrs = false
@@ -1055,7 +1048,6 @@ mod tests {
             false,
             true,
             false,
-            #[cfg(target_os = "macos")]
             false,
             Arc::clone(&hardlink_map),
         );
@@ -1164,7 +1156,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1282,7 +1273,6 @@ mod tests {
             false,
             true,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1350,7 +1340,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1407,7 +1396,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1440,7 +1428,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1492,7 +1479,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1544,7 +1530,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1592,7 +1577,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1640,7 +1624,6 @@ mod tests {
             false,
             false,
             true,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1688,7 +1671,6 @@ mod tests {
             false,
             false,
             false,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1735,7 +1717,6 @@ mod tests {
             false,
             false,
             true,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1798,7 +1779,6 @@ mod tests {
             false,
             false,
             true,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
@@ -1856,7 +1836,6 @@ mod tests {
             false,
             false,
             true,
-            #[cfg(target_os = "macos")]
             false,
             hardlink_map,
         );
