@@ -215,4 +215,352 @@ mod tests {
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
+
+    // === Edge Case Tests ===
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_data_regions_nonexistent_file() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("nonexistent.txt");
+
+        let result = detect_data_regions(&file_path);
+
+        // Should return an I/O error (file not found)
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
+    fn test_detect_data_regions_leading_hole() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("leading_hole.dat");
+
+        // Create file with hole at start, data at end
+        let mut file = File::create(&file_path).unwrap();
+
+        // Seek to 1MB offset and write data
+        file.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        file.write_all(b"Data after hole").unwrap();
+        drop(file);
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) => {
+                // Should detect data region at ~1MB offset
+                assert!(!r.is_empty(), "Should have at least one data region");
+                assert!(
+                    r[0].offset >= 1024 * 1024,
+                    "First region should start at/after 1MB, got offset: {}",
+                    r[0].offset
+                );
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
+    fn test_detect_data_regions_trailing_hole() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("trailing_hole.dat");
+
+        // Create file with data at start, hole at end
+        let mut file = File::create(&file_path).unwrap();
+
+        // Write data at start
+        file.write_all(b"Data at start").unwrap();
+
+        // Seek to 1MB and truncate/extend to create trailing hole
+        file.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        file.write_all(&[0]).unwrap(); // Write 1 byte to extend file
+        drop(file);
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) => {
+                // Should have at least one region (the initial data)
+                assert!(!r.is_empty(), "Should have at least one data region");
+
+                // First region should be at/near start
+                assert!(
+                    r[0].offset < 1024,
+                    "First region should be at start, got offset: {}",
+                    r[0].offset
+                );
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
+    fn test_detect_data_regions_multiple_data_regions() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("multiple_regions.dat");
+
+        // Create file with multiple data/hole alternations
+        let mut file = File::create(&file_path).unwrap();
+
+        // Data region 1: 0-4KB
+        file.write_all(&vec![0x41; 4096]).unwrap();
+
+        // Hole: 4KB-1MB (seek ahead)
+        file.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+
+        // Data region 2: 1MB-1MB+4KB
+        file.write_all(&vec![0x42; 4096]).unwrap();
+
+        // Hole: 1MB+4KB-2MB
+        file.seek(SeekFrom::Start(2 * 1024 * 1024)).unwrap();
+
+        // Data region 3: 2MB-2MB+4KB
+        file.write_all(&vec![0x43; 4096]).unwrap();
+
+        drop(file);
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) => {
+                // Should detect multiple data regions (at least 2-3)
+                assert!(
+                    r.len() >= 2,
+                    "Should have multiple data regions, got {}",
+                    r.len()
+                );
+
+                // Regions should be ordered by offset
+                for i in 0..r.len() - 1 {
+                    assert!(
+                        r[i].offset < r[i + 1].offset,
+                        "Regions should be ordered: region {} offset {} >= region {} offset {}",
+                        i,
+                        r[i].offset,
+                        i + 1,
+                        r[i + 1].offset
+                    );
+                }
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
+    fn test_detect_data_regions_very_large_offset() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("large_offset.dat");
+
+        // Create file with data at very large offset (1GB)
+        let mut file = File::create(&file_path).unwrap();
+        let large_offset = 1024 * 1024 * 1024u64; // 1GB
+
+        // Seek to 1GB and write small data
+        file.seek(SeekFrom::Start(large_offset)).unwrap();
+        file.write_all(b"Far away data").unwrap();
+        drop(file);
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) => {
+                // Should detect data at large offset
+                assert!(!r.is_empty(), "Should have at least one data region");
+
+                // First region should be at/near the large offset
+                assert!(
+                    r[0].offset >= large_offset - 4096, // Allow some FS block rounding
+                    "First region should be at large offset, got: {}",
+                    r[0].offset
+                );
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
+    fn test_detect_data_regions_single_byte() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("single_byte.dat");
+
+        // Create file with single byte of data surrounded by holes
+        let mut file = File::create(&file_path).unwrap();
+
+        // Seek to 1MB, write 1 byte, then extend to 2MB
+        file.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        file.write_all(&[0x99]).unwrap();
+        file.seek(SeekFrom::Start(2 * 1024 * 1024)).unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) => {
+                // Should detect at least one region containing that byte
+                // (filesystem may round to block size)
+                assert!(!r.is_empty(), "Should have at least one data region");
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_data_regions_region_ordering() {
+        // This test verifies the DataRegion ordering invariant
+        // All detected regions should be in ascending order by offset
+
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("ordering.dat");
+
+        // Create any non-sparse file
+        std::fs::write(&file_path, b"Test data for ordering").unwrap();
+
+        let regions = detect_data_regions(&file_path);
+
+        match regions {
+            Ok(r) if !r.is_empty() => {
+                // Verify regions are ordered by offset
+                for i in 0..r.len() - 1 {
+                    assert!(
+                        r[i].offset < r[i + 1].offset,
+                        "Regions must be ordered by offset"
+                    );
+
+                    // Also verify no overlap
+                    assert!(
+                        r[i].offset + r[i].length <= r[i + 1].offset,
+                        "Regions must not overlap"
+                    );
+                }
+
+                // Verify all regions have non-zero length
+                for region in r.iter() {
+                    assert!(region.length > 0, "Regions must have non-zero length");
+                }
+            }
+            Ok(_) => {
+                // Empty result is OK (empty file or all holes)
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINVAL)
+                    || e.kind() == io::ErrorKind::Unsupported =>
+            {
+                // SEEK_DATA not supported - acceptable
+            }
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_data_regions_boundary_conditions() {
+        let temp = TempDir::new().unwrap();
+
+        // Test 1: File with data exactly at offset 0
+        let file1 = temp.path().join("at_zero.dat");
+        std::fs::write(&file1, b"At zero").unwrap();
+
+        let regions = detect_data_regions(&file1);
+        if let Ok(r) = regions {
+            if !r.is_empty() {
+                assert_eq!(r[0].offset, 0, "First region should start at 0");
+            }
+        }
+
+        // Test 2: Very small file (1 byte)
+        let file2 = temp.path().join("one_byte.dat");
+        std::fs::write(&file2, b"X").unwrap();
+
+        let regions = detect_data_regions(&file2);
+        if let Ok(r) = regions {
+            if !r.is_empty() {
+                assert_eq!(r[0].offset, 0);
+                assert!(r[0].length >= 1, "Should contain at least 1 byte");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn test_detect_data_regions_unsupported_platform() {
+        // On non-Unix platforms, should return Unsupported error
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("test.dat");
+        std::fs::write(&file_path, b"test").unwrap();
+
+        let result = detect_data_regions(&file_path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_data_region_serialization() {
+        // Test that DataRegion can be serialized/deserialized
+        let region = DataRegion {
+            offset: 1024,
+            length: 4096,
+        };
+
+        let json = serde_json::to_string(&region).unwrap();
+        let deserialized: DataRegion = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(region, deserialized);
+        assert_eq!(deserialized.offset, 1024);
+        assert_eq!(deserialized.length, 4096);
+    }
 }

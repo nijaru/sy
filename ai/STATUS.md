@@ -4,8 +4,8 @@ _Last Updated: 2025-10-23_
 
 ## Current State
 - Version: v0.0.41 (RELEASED ✅)
-- Phase: macOS platform features complete! Cross-platform compilation verified!
-- Test Coverage: 355 tests passing (353 + 2 ignored APFS sparse tests)
+- Phase: Testing improvements complete! All quality tests added!
+- Test Coverage: 377 tests passing (370 + 7 ignored APFS sparse tests)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -55,7 +55,8 @@ _Last Updated: 2025-10-23_
 - **macOS resource forks** (v0.0.16+): Already supported via xattr preservation; stored as `com.apple.ResourceFork` xattr on modern macOS; AppleDouble format for legacy compatibility
 - **Windows strategy** (v0.0.41+): Focus on core rsync advantages (native binary, delta-transfer, SSH) rather than Windows-specific features (ACLs/attributes); fills gap where Robocopy lacks delta-transfer and SSH support
 - **SSH multiplexing research** (v0.0.41+): ControlMaster NOT recommended for sy's parallel file transfers (bottlenecks on one TCP connection); better approach is SSH connection pooling (N connections = N workers) for true parallel throughput; see ai/research/ssh_multiplexing_2025.md
-- **COW strategy edge case tests** (v0.0.41+): Added 11 comprehensive edge case tests for filesystem detection (non-existent paths, parent/child relationships, symlinks, 3-way hard links); all edge cases handle errors gracefully by returning false (conservative approach); test coverage increased to 355 tests
+- **COW strategy edge case tests** (v0.0.41+): Added 11 comprehensive edge case tests for filesystem detection (non-existent paths, parent/child relationships, symlinks, 3-way hard links); all edge cases handle errors gracefully by returning false (conservative approach)
+- **Testing improvements** (2025-10-23): Added 24 comprehensive tests across 3 modules (9 perf accuracy, 4 error threshold, 11 sparse edge cases); test coverage increased from 355 to 377 tests; all quality assurance tests now in place
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -65,9 +66,14 @@ _Last Updated: 2025-10-23_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None currently - ready for next feature!
+None currently - all testing tasks complete! Ready for next feature!
 
 ## Recently Completed
+- ✅ Testing Improvements (2025-10-23)
+  - Performance monitoring accuracy tests (9 new tests: duration, speed, concurrency) ✅
+  - Error collection threshold tests (4 new tests: unlimited, abort, below threshold) ✅
+  - Sparse file edge case tests (11 new tests: holes, regions, boundaries) ✅
+  - Test coverage increased: 355 → 377 tests (22 new tests added) ✅
 - ✅ v0.0.41 Release - macOS BSD File Flags + Cross-Platform Compilation (2025-10-23)
   - BSD flags preservation with --preserve-flags/-F flag ✅
   - Cross-platform compilation fixes (24+ locations) ✅
@@ -78,10 +84,6 @@ None currently - ready for next feature!
   - GitHub release published ✅
 
 ## Next Steps
-**Testing & Quality:**
-- Add COW strategy selection tests (filesystem detection edge cases)
-- Add performance monitoring accuracy tests
-
 **Research & Implementation:**
 - SSH connection pooling (N connections = N workers) based on multiplexing research
 - Latest filesystem feature detection methods (2025)

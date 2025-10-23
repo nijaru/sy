@@ -458,4 +458,269 @@ mod tests {
         assert_eq!(metrics.directories_created, 1);
         assert_eq!(metrics.files_processed, 3); // created + updated
     }
+
+    #[test]
+    fn test_phase_duration_accuracy() {
+        let mut monitor = PerformanceMonitor::new(None);
+
+        // Scan phase
+        monitor.start_scan();
+        thread::sleep(Duration::from_millis(50));
+        monitor.end_scan();
+
+        // Plan phase
+        monitor.start_plan();
+        thread::sleep(Duration::from_millis(30));
+        monitor.end_plan();
+
+        // Transfer phase
+        monitor.start_transfer();
+        thread::sleep(Duration::from_millis(20));
+        monitor.end_transfer();
+
+        let metrics = monitor.get_metrics();
+
+        // Verify durations are within reasonable bounds (allow 10ms variance)
+        assert!(
+            metrics.scan_duration.as_millis() >= 50
+                && metrics.scan_duration.as_millis() < 60,
+            "scan_duration: {:?}",
+            metrics.scan_duration
+        );
+        assert!(
+            metrics.plan_duration.as_millis() >= 30
+                && metrics.plan_duration.as_millis() < 40,
+            "plan_duration: {:?}",
+            metrics.plan_duration
+        );
+        assert!(
+            metrics.transfer_duration.as_millis() >= 20
+                && metrics.transfer_duration.as_millis() < 30,
+            "transfer_duration: {:?}",
+            metrics.transfer_duration
+        );
+
+        // Total duration should be at least the sum of all phases
+        let sum_phases = metrics.scan_duration + metrics.plan_duration + metrics.transfer_duration;
+        assert!(
+            metrics.total_duration >= sum_phases,
+            "total: {:?}, sum: {:?}",
+            metrics.total_duration,
+            sum_phases
+        );
+    }
+
+    #[test]
+    fn test_speed_calculation_accuracy() {
+        let mut monitor = PerformanceMonitor::new(None);
+
+        monitor.start_transfer();
+        monitor.add_bytes_transferred(1_000_000); // 1 MB
+        thread::sleep(Duration::from_secs(1)); // Wait 1 second
+        monitor.end_transfer();
+
+        let metrics = monitor.get_metrics();
+
+        // Average speed should be approximately 1 MB/s (allow some variance)
+        assert!(
+            metrics.avg_transfer_speed >= 900_000.0
+                && metrics.avg_transfer_speed <= 1_100_000.0,
+            "avg_transfer_speed: {:.0}",
+            metrics.avg_transfer_speed
+        );
+    }
+
+    #[test]
+    fn test_concurrent_byte_counting() {
+        use std::sync::Arc;
+
+        let monitor = Arc::new(PerformanceMonitor::new(None));
+        let mut handles = vec![];
+
+        // Spawn 10 threads, each adding 1000 bytes transferred and 2000 bytes read
+        for _ in 0..10 {
+            let monitor_clone = Arc::clone(&monitor);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    monitor_clone.add_bytes_transferred(10);
+                    monitor_clone.add_bytes_read(20);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let metrics = monitor.get_metrics();
+        // 10 threads * 100 iterations * 10 bytes = 10,000 bytes transferred
+        // 10 threads * 100 iterations * 20 bytes = 20,000 bytes read
+        assert_eq!(
+            metrics.bytes_transferred, 10_000,
+            "bytes_transferred: {}",
+            metrics.bytes_transferred
+        );
+        assert_eq!(
+            metrics.bytes_read, 20_000,
+            "bytes_read: {}",
+            metrics.bytes_read
+        );
+    }
+
+    #[test]
+    fn test_concurrent_file_counting() {
+        use std::sync::Arc;
+
+        let monitor = Arc::new(PerformanceMonitor::new(None));
+        let mut handles = vec![];
+
+        // Spawn multiple threads updating counters concurrently
+        for _ in 0..5 {
+            let monitor_clone = Arc::clone(&monitor);
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    monitor_clone.add_file_created();
+                    monitor_clone.add_file_updated();
+                    monitor_clone.add_file_deleted();
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let metrics = monitor.get_metrics();
+        assert_eq!(metrics.files_created, 50); // 5 threads * 10 iterations
+        assert_eq!(metrics.files_updated, 50);
+        assert_eq!(metrics.files_deleted, 50);
+        assert_eq!(metrics.files_processed, 100); // created + updated
+    }
+
+    #[test]
+    fn test_files_per_second_accuracy() {
+        let monitor = PerformanceMonitor::new(None);
+
+        // Simulate processing 100 files
+        for _ in 0..100 {
+            monitor.add_file_created();
+        }
+
+        // Wait long enough to get measurable duration
+        thread::sleep(Duration::from_millis(100));
+
+        let metrics = monitor.get_metrics();
+
+        // Should process approximately 1000 files/sec (100 files in 0.1 sec)
+        // Allow wide range due to thread scheduling variance
+        assert!(
+            metrics.files_per_second >= 500.0 && metrics.files_per_second <= 2000.0,
+            "files_per_second: {:.2}",
+            metrics.files_per_second
+        );
+    }
+
+    #[test]
+    fn test_bandwidth_utilization_accuracy() {
+        let mut monitor = PerformanceMonitor::new(Some(1_000_000)); // 1 MB/s limit
+
+        monitor.start_transfer();
+        monitor.add_bytes_transferred(500_000); // 500 KB transferred
+        thread::sleep(Duration::from_secs(1)); // Over 1 second
+        monitor.end_transfer();
+
+        let metrics = monitor.get_metrics();
+
+        // Utilization should be around 50% (500 KB/s with 1 MB/s limit)
+        assert!(metrics.bandwidth_utilization.is_some());
+        let utilization = metrics.bandwidth_utilization.unwrap();
+        assert!(
+            utilization >= 40.0 && utilization <= 60.0,
+            "bandwidth_utilization: {:.2}%",
+            utilization
+        );
+    }
+
+    #[test]
+    fn test_zero_duration_edge_case() {
+        let monitor = PerformanceMonitor::new(None);
+
+        // Get metrics immediately without any transfers
+        let metrics = monitor.get_metrics();
+
+        // Should handle zero duration gracefully
+        assert_eq!(metrics.avg_transfer_speed, 0.0);
+        assert_eq!(metrics.files_per_second, 0.0);
+    }
+
+    #[test]
+    fn test_peak_speed_concurrent_updates() {
+        use std::sync::Arc;
+
+        let monitor = Arc::new(PerformanceMonitor::new(None));
+        let mut handles = vec![];
+
+        // Spawn threads updating peak speed concurrently with different values
+        for i in 1..=10 {
+            let monitor_clone = Arc::clone(&monitor);
+            let speed = (i * 100_000) as f64; // 100KB, 200KB, ..., 1MB
+            let handle = thread::spawn(move || {
+                monitor_clone.update_peak_speed(speed);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let metrics = monitor.get_metrics();
+        // Peak should be the maximum: 1,000,000
+        assert_eq!(metrics.peak_transfer_speed, 1_000_000.0);
+    }
+
+    #[test]
+    fn test_phase_percentage_accuracy() {
+        let mut monitor = PerformanceMonitor::new(None);
+
+        monitor.start_scan();
+        thread::sleep(Duration::from_millis(100));
+        monitor.end_scan();
+
+        monitor.start_plan();
+        thread::sleep(Duration::from_millis(50));
+        monitor.end_plan();
+
+        monitor.start_transfer();
+        thread::sleep(Duration::from_millis(50));
+        monitor.end_transfer();
+
+        let metrics = monitor.get_metrics();
+
+        // Calculate percentages
+        let scan_pct =
+            (metrics.scan_duration.as_secs_f64() / metrics.total_duration.as_secs_f64()) * 100.0;
+        let plan_pct =
+            (metrics.plan_duration.as_secs_f64() / metrics.total_duration.as_secs_f64()) * 100.0;
+        let transfer_pct = (metrics.transfer_duration.as_secs_f64()
+            / metrics.total_duration.as_secs_f64())
+            * 100.0;
+
+        // Percentages should sum to approximately 100% (within rounding)
+        let total_pct = scan_pct + plan_pct + transfer_pct;
+        assert!(
+            total_pct >= 95.0 && total_pct <= 105.0,
+            "total_pct: {:.2}%",
+            total_pct
+        );
+
+        // Scan should be roughly 50% (100ms out of ~200ms total)
+        assert!(
+            scan_pct >= 40.0 && scan_pct <= 60.0,
+            "scan_pct: {:.2}%",
+            scan_pct
+        );
+    }
 }
