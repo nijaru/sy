@@ -2,6 +2,7 @@ use super::{TransferResult, Transport};
 use crate::compress::{compress, should_compress_smart, Compression, CompressionDetection};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
+use crate::sparse;
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
 use crate::sync::scanner::FileEntry;
@@ -248,6 +249,184 @@ impl SshTransport {
         }
 
         Ok(output)
+    }
+
+    /// Copy a sparse file over SSH by transferring only data regions
+    ///
+    /// This method detects sparse file regions and transfers only the actual data,
+    /// skipping holes. This can save significant bandwidth for files like VM disk
+    /// images, databases, and other sparse files.
+    async fn copy_sparse_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
+        let source_path = source.to_path_buf();
+        let dest_path = dest.to_path_buf();
+        let session_arc = self.connection_pool.get_session();
+        let remote_binary = self.remote_binary_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Get source metadata
+            let metadata = std::fs::metadata(&source_path).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to get metadata for {}: {}",
+                        source_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+
+            let file_size = metadata.len();
+
+            // Detect data regions in the sparse file
+            let data_regions = sparse::detect_data_regions(&source_path).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to detect sparse regions for {}: {}",
+                        source_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+
+            // If no regions detected or sparse detection not supported, fall back to regular copy
+            if data_regions.is_empty() {
+                tracing::debug!(
+                    "No sparse regions detected for {}, using regular transfer",
+                    source_path.display()
+                );
+                // This will be handled by the caller falling back to copy_file
+                return Err(SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Sparse detection returned no regions",
+                )));
+            }
+
+            // Calculate total data size (sum of all region lengths)
+            let total_data_size: u64 = data_regions.iter().map(|r| r.length).sum();
+            let sparse_ratio = file_size as f64 / total_data_size.max(1) as f64;
+
+            tracing::info!(
+                "Sparse file {}: {} total, {} data ({:.1}x sparse ratio, {} regions)",
+                source_path.display(),
+                file_size,
+                total_data_size,
+                sparse_ratio,
+                data_regions.len()
+            );
+
+            // Serialize regions to JSON for command line
+            let regions_json = serde_json::to_string(&data_regions).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to serialize sparse regions: {}",
+                    e
+                )))
+            })?;
+
+            // Get mtime for receive-sparse-file command
+            let mtime_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
+            // Build command
+            let dest_path_str = dest_path.to_string_lossy();
+            let mtime_arg = mtime_secs
+                .map(|s| format!("--mtime {}", s))
+                .unwrap_or_default();
+
+            let command = format!(
+                "{} receive-sparse-file {} --total-size {} --regions '{}' {}",
+                remote_binary, dest_path_str, file_size, regions_json, mtime_arg
+            );
+
+            // Open source file for reading
+            let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to open {}: {}", source_path.display(), e),
+                ))
+            })?;
+
+            // Read all data regions into a buffer
+            use std::io::{Seek, SeekFrom};
+            let mut data_buffer = Vec::with_capacity(total_data_size as usize);
+
+            for region in &data_regions {
+                // Seek to region offset
+                source_file
+                    .seek(SeekFrom::Start(region.offset))
+                    .map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "Failed to seek to offset {} in {}: {}",
+                                region.offset,
+                                source_path.display(),
+                                e
+                            ),
+                        ))
+                    })?;
+
+                // Read region data
+                let mut region_data = vec![0u8; region.length as usize];
+                source_file.read_exact(&mut region_data).map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to read {} bytes at offset {} from {}: {}",
+                            region.length,
+                            region.offset,
+                            source_path.display(),
+                            e
+                        ),
+                    ))
+                })?;
+
+                data_buffer.extend_from_slice(&region_data);
+            }
+
+            // Execute command with data regions as stdin
+            let output = Self::execute_command_with_stdin(
+                Arc::clone(&session_arc),
+                &command,
+                &data_buffer,
+            )?;
+
+            // Parse response
+            #[derive(Deserialize)]
+            struct SparseResponse {
+                bytes_written: u64,
+                file_size: u64,
+                regions: usize,
+            }
+
+            let response: SparseResponse = serde_json::from_str(output.trim()).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to parse sparse transfer response: {} (output: {})",
+                    e, output
+                )))
+            })?;
+
+            tracing::debug!(
+                "Sparse transfer complete: {} bytes data transferred, {} total file size, {} regions",
+                response.bytes_written,
+                response.file_size,
+                response.regions
+            );
+
+            // Return transfer result with actual bytes transferred (not file size)
+            Ok(TransferResult {
+                bytes_written: response.file_size,
+                delta_operations: None,
+                literal_bytes: None,
+                transferred_bytes: Some(response.bytes_written),
+                compression_used: false,
+            })
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 }
 
@@ -599,6 +778,7 @@ impl Transport for SshTransport {
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
+
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Check if remote destination exists

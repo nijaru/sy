@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use sy::compress::{decompress, Compression};
 use sy::delta::{apply_delta, compute_checksums, Delta};
+use sy::sparse::DataRegion;
 use sy::sync::scanner::Scanner;
 
 #[derive(Parser)]
@@ -40,6 +41,20 @@ enum Commands {
     ReceiveFile {
         /// Output file path
         output_path: PathBuf,
+        /// Optional modification time (seconds since epoch)
+        #[arg(long)]
+        mtime: Option<u64>,
+    },
+    /// Receive a sparse file with specified data regions
+    ReceiveSparseFile {
+        /// Output file path
+        output_path: PathBuf,
+        /// Total file size in bytes
+        #[arg(long)]
+        total_size: u64,
+        /// Data regions as JSON (array of {offset, length} objects)
+        #[arg(long)]
+        regions: String,
         /// Optional modification time (seconds since epoch)
         #[arg(long)]
         mtime: Option<u64>,
@@ -204,6 +219,62 @@ fn main() -> anyhow::Result<()> {
 
             // Report success with bytes written
             println!("{{\"bytes_written\": {}}}", file_data.len());
+        }
+        Commands::ReceiveSparseFile {
+            output_path,
+            total_size,
+            regions,
+            mtime,
+        } => {
+            // Parse data regions from JSON
+            let data_regions: Vec<DataRegion> = serde_json::from_str(&regions)?;
+
+            // Ensure parent directory exists
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Create file and set its size (creates sparse file with holes)
+            let mut output_file = std::fs::File::create(&output_path)?;
+            output_file.set_len(total_size)?;
+
+            // Read and write each data region from stdin
+            let mut stdin = std::io::stdin();
+            let mut total_bytes_written = 0u64;
+
+            for region in &data_regions {
+                // Seek to the region's offset
+                output_file.seek(SeekFrom::Start(region.offset))?;
+
+                // Read exactly `region.length` bytes from stdin
+                let mut buffer = vec![0u8; region.length as usize];
+                stdin.read_exact(&mut buffer)?;
+
+                // Write to file
+                output_file.write_all(&buffer)?;
+                total_bytes_written += region.length;
+            }
+
+            output_file.flush()?;
+            output_file.sync_all()?;
+
+            // Set mtime if provided
+            if let Some(mtime_secs) = mtime {
+                use std::time::{Duration, UNIX_EPOCH};
+                let mtime = UNIX_EPOCH + Duration::from_secs(mtime_secs);
+                let _ = filetime::set_file_mtime(
+                    &output_path,
+                    filetime::FileTime::from_system_time(mtime),
+                );
+            }
+
+            // Report success with total data bytes written (not file size)
+            println!(
+                "{{\"bytes_written\": {}, \"file_size\": {}, \"regions\": {}}}",
+                total_bytes_written,
+                total_size,
+                data_regions.len()
+            );
         }
     }
 
