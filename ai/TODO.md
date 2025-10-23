@@ -62,8 +62,11 @@ None currently - ready for next feature!
 - [x] Enhanced progress display (current file, real-time speed, ETA) - COMPLETE ✅ (v0.0.38)
 - [x] Bandwidth utilization metrics (% of limit when using --bwlimit) - COMPLETE ✅ (v0.0.39)
 - [x] Symbolic link chain detection - COMPLETE ✅ (v0.0.40)
+- [x] macOS-specific features (Finder tags, resource forks) - COMPLETE ✅ (v0.0.16 xattr support, v0.0.41 BSD flags)
+  - Finder tags preserved via `com.apple.metadata:_kMDItemUserTags` xattr
+  - Resource forks preserved via `com.apple.ResourceFork` xattr
+  - BSD file flags preserved with `-F` flag (hidden, immutable, nodump, etc.)
 - [ ] Sparse file optimization improvements
-- [ ] macOS-specific features (Finder tags, resource forks)
 - [ ] Windows-specific features (file attributes, ACLs)
 - [ ] Multi-destination sync
 - [ ] Bidirectional sync
