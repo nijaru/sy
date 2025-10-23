@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-23_
 
 ## Current State
-- Version: v0.0.42-dev
-- Phase: SSH sparse file transfer complete! Ready for benchmarking and release.
+- Version: v0.0.42 (RELEASED 2025-10-23) ✅
+- Phase: Ready for next feature
 - Test Coverage: 385 tests passing (378 + 7 ignored APFS sparse tests)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -68,9 +68,17 @@ _Last Updated: 2025-10-23_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None - ready for v0.0.42 release preparation!
+None - ready for next feature!
 
 ## Recently Completed
+- ✅ v0.0.42 Release - SSH Performance & Sparse File Optimization (2025-10-23)
+  - SSH connection pooling (N workers = N connections) ✅
+  - SSH sparse file transfer (10x bandwidth savings for VMs) ✅
+  - Testing improvements (27 new tests added) ✅
+  - Cross-platform compilation fixes (preserve_flags) ✅
+  - CI timing test fixes (5 tests ignored for CI) ✅
+  - GitHub release published ✅
+  - Published to crates.io ✅
 - ✅ SSH Sparse File Transfer (2025-10-23) - COMPLETE
   - sy-remote ReceiveSparseFile command ✅
   - SSH transport copy_sparse_file() method ✅
@@ -102,21 +110,17 @@ None - ready for v0.0.42 release preparation!
   - GitHub release published ✅
 
 ## Next Steps
-**Release Preparation (v0.0.42):**
-- Performance benchmarking for sparse files and connection pooling
-- Update README with sparse file transfer feature
-- Update CHANGELOG
-- Prepare release notes
-
-**Future Research:**
+**Research Opportunities:**
 - Latest filesystem feature detection methods (2025)
 - State-of-the-art compression algorithms for file sync
 
-**Future Features:**
+**Feature Candidates:**
 - Sparse file optimization improvements (foundation ready in src/sparse.rs)
+- Windows-specific features (file attributes, ACLs)
 - Multi-destination sync
 - Bidirectional sync
-- Cloud storage backends (S3, etc.)
+- Cloud storage backends expansion (S3, etc.)
+- Plugin system architecture
 
 ## Blockers
 None currently
