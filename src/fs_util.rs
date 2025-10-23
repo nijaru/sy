@@ -456,4 +456,163 @@ mod tests {
         assert_eq!(APFS_TYPE_NAME, "apfs");
         assert_eq!(APFS_TYPE_NAME.len(), 4);
     }
+
+    // Edge case tests for filesystem detection
+
+    #[test]
+    fn test_cow_detection_nonexistent_path() {
+        // Non-existent path should return false (conservative approach)
+        let nonexistent = Path::new("/nonexistent/path/that/does/not/exist.txt");
+        assert!(
+            !supports_cow_reflinks(nonexistent),
+            "Non-existent path should return false for COW support"
+        );
+    }
+
+    #[test]
+    fn test_cow_detection_nonexistent_parent() {
+        // Path with non-existent parent should return false
+        let nonexistent = Path::new("/nonexistent/parent/dir/file.txt");
+        assert!(
+            !supports_cow_reflinks(nonexistent),
+            "Path with non-existent parent should return false"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_same_filesystem_nonexistent_paths() {
+        // Both paths non-existent should return false
+        let path1 = Path::new("/nonexistent/path1.txt");
+        let path2 = Path::new("/nonexistent/path2.txt");
+        assert!(
+            !same_filesystem(path1, path2),
+            "Non-existent paths should return false"
+        );
+
+        // One exists, one doesn't - should return false
+        let temp = TempDir::new().unwrap();
+        let existing = temp.path().join("exists.txt");
+        fs::write(&existing, b"test").unwrap();
+
+        let nonexistent = temp.path().join("nonexistent.txt");
+        assert!(
+            !same_filesystem(&existing, &nonexistent),
+            "Mixed existent/non-existent should return false"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_same_filesystem_parent_and_child() {
+        // File and its parent directory should be on same filesystem
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("test.txt");
+        fs::write(&file, b"test").unwrap();
+
+        assert!(
+            same_filesystem(&file, temp.path()),
+            "File and parent directory should be on same filesystem"
+        );
+
+        // Nested file and grandparent directory
+        let subdir = temp.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        let nested_file = subdir.join("nested.txt");
+        fs::write(&nested_file, b"test").unwrap();
+
+        assert!(
+            same_filesystem(&nested_file, temp.path()),
+            "Nested file and grandparent should be on same filesystem"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_has_hard_links_nonexistent() {
+        // Non-existent file should return false
+        let nonexistent = Path::new("/nonexistent/file.txt");
+        assert!(
+            !has_hard_links(nonexistent),
+            "Non-existent file should return false for hard links"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_has_hard_links_directory() {
+        // Directories have nlink >= 2 by default (., .., and parent's entry)
+        // but we care about regular files
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("testdir");
+        fs::create_dir(&dir).unwrap();
+
+        // Directory nlink detection is implementation-dependent
+        // Just verify it doesn't crash
+        let _ = has_hard_links(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_hard_links_three_way() {
+        // Test file with 3 hard links (nlink=3)
+        let temp = TempDir::new().unwrap();
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+        let file3 = temp.path().join("file3.txt");
+
+        fs::write(&file1, b"shared").unwrap();
+        fs::hard_link(&file1, &file2).unwrap();
+        fs::hard_link(&file1, &file3).unwrap();
+
+        // All three should report has_hard_links=true
+        assert!(has_hard_links(&file1));
+        assert!(has_hard_links(&file2));
+        assert!(has_hard_links(&file3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_same_filesystem_symlink() {
+        // Symlinks: same_filesystem should follow the symlink
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("file.txt");
+        fs::write(&file, b"test").unwrap();
+
+        let symlink = temp.path().join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&file, &symlink).unwrap();
+
+        // Symlink and target should be on same filesystem (metadata follows symlink)
+        assert!(
+            same_filesystem(&file, &symlink),
+            "Symlink and target should be on same filesystem"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_filesystem_magic_numbers() {
+        // Document the filesystem magic numbers we check for
+        const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
+        const XFS_SUPER_MAGIC: i64 = 0x58465342;
+
+        // Verify these are the values we expect
+        assert_eq!(BTRFS_SUPER_MAGIC, 0x9123683E);
+        assert_eq!(XFS_SUPER_MAGIC, 0x58465342);
+
+        // Verify they're different (no collision)
+        assert_ne!(BTRFS_SUPER_MAGIC, XFS_SUPER_MAGIC);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_hfs_plus_not_cow() {
+        // HFS+ (legacy macOS filesystem) does not support COW
+        // APFS replaced it in macOS 10.13+
+        // This test documents the filesystem type name for HFS+
+        const HFS_PLUS_TYPE_NAME: &str = "hfs";
+        assert_eq!(HFS_PLUS_TYPE_NAME, "hfs");
+        assert_ne!(HFS_PLUS_TYPE_NAME, "apfs");
+    }
 }
