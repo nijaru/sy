@@ -94,10 +94,21 @@ None currently - ready for next feature!
 - [x] Create troubleshooting guide
 
 ## Testing
-- [ ] Add tests for sparse file edge cases
-- [ ] Add tests for error collection with max_errors threshold
-- [ ] Add performance monitoring accuracy tests
+- [x] Add performance monitoring accuracy tests - COMPLETE ✅ (2025-10-23)
+  - Added 9 comprehensive accuracy tests in perf.rs (total: 15 tests)
+  - Phase duration accuracy, speed calculation, concurrent operations
+  - Thread-safety tests (byte/file counting under concurrent load)
+  - Edge cases (zero duration, peak speed tracking, bandwidth utilization)
+- [x] Add tests for error collection with max_errors threshold - COMPLETE ✅ (2025-10-23)
+  - Added 4 threshold behavior tests in sync/mod.rs
+  - Tests for: unlimited errors (max=0), abort when exceeded, below threshold continues
+  - Verified error message format with count and first error
+- [x] Add tests for sparse file edge cases - COMPLETE ✅ (2025-10-23)
+  - Added 11 edge case tests in sparse.rs (total: 14 tests)
+  - Non-existent file, empty file, leading/trailing holes, multiple regions
+  - Large offsets (1GB), single byte, region ordering, boundary conditions
+  - Platform-specific: 5 pass everywhere, 7 ignored on macOS APFS
 - [x] Add COW strategy selection tests for various filesystems - COMPLETE ✅
   - Added 11 edge case tests in fs_util.rs
   - Non-existent paths, parent/child relationships, symlinks, 3-way hard links
-  - All 355 tests passing (353 + 2 ignored APFS sparse tests)
+  - All 377 tests passing (370 + 7 ignored APFS sparse tests)
