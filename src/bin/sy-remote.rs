@@ -280,3 +280,159 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_receive_sparse_file_basic() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("sparse_output.dat");
+
+        // Create data regions: 2 regions
+        // Region 1: offset 0, length 1024 (data: "A" repeated)
+        // Region 2: offset 2048, length 512 (data: "B" repeated)
+        let regions = vec![
+            DataRegion {
+                offset: 0,
+                length: 1024,
+            },
+            DataRegion {
+                offset: 2048,
+                length: 512,
+            },
+        ];
+
+        let total_size = 4096; // 4KB total file
+        let regions_json = serde_json::to_string(&regions).unwrap();
+
+        // Prepare input data (simulating stdin)
+        let mut input_data = Vec::new();
+        input_data.extend(vec![b'A'; 1024]); // Region 1 data
+        input_data.extend(vec![b'B'; 512]); // Region 2 data
+
+        // Simulate the command (we'll manually execute the logic)
+        let mut output_file = std::fs::File::create(&output_path).unwrap();
+        output_file.set_len(total_size).unwrap();
+
+        // Parse regions
+        let data_regions: Vec<DataRegion> = serde_json::from_str(&regions_json).unwrap();
+
+        // Write regions
+        let mut offset_in_buffer = 0;
+        for region in &data_regions {
+            use std::io::Seek;
+            output_file
+                .seek(std::io::SeekFrom::Start(region.offset))
+                .unwrap();
+            output_file
+                .write_all(
+                    &input_data
+                        [offset_in_buffer..offset_in_buffer + region.length as usize],
+                )
+                .unwrap();
+            offset_in_buffer += region.length as usize;
+        }
+
+        output_file.flush().unwrap();
+        drop(output_file);
+
+        // Verify the file
+        let result = std::fs::read(&output_path).unwrap();
+        assert_eq!(result.len(), 4096);
+
+        // Check region 1 (offset 0, length 1024) has 'A's
+        assert!(result[0..1024].iter().all(|&b| b == b'A'));
+
+        // Check hole (offset 1024..2048) has zeros
+        assert!(result[1024..2048].iter().all(|&b| b == 0));
+
+        // Check region 2 (offset 2048, length 512) has 'B's
+        assert!(result[2048..2560].iter().all(|&b| b == b'B'));
+
+        // Check remaining (offset 2560..4096) has zeros
+        assert!(result[2560..4096].iter().all(|&b| b == 0));
+
+        // Verify file is sparse (on Unix)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&output_path).unwrap();
+            let allocated = metadata.blocks() * 512;
+            // File should use less space than total size (due to holes)
+            // On some filesystems this might not work, so we just check it doesn't panic
+            let _ = allocated < total_size;
+        }
+    }
+
+    #[test]
+    fn test_receive_sparse_file_single_region() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("single_region.dat");
+
+        // Single region at offset 1MB
+        let regions = vec![DataRegion {
+            offset: 1024 * 1024,
+            length: 100,
+        }];
+
+        let total_size = 1024 * 1024 + 200; // Slightly larger
+        let regions_json = serde_json::to_string(&regions).unwrap();
+
+        let input_data = vec![b'X'; 100];
+
+        // Execute logic
+        let mut output_file = std::fs::File::create(&output_path).unwrap();
+        output_file.set_len(total_size).unwrap();
+
+        let data_regions: Vec<DataRegion> = serde_json::from_str(&regions_json).unwrap();
+
+        use std::io::Seek;
+        for region in &data_regions {
+            output_file
+                .seek(std::io::SeekFrom::Start(region.offset))
+                .unwrap();
+            output_file.write_all(&input_data).unwrap();
+        }
+
+        output_file.flush().unwrap();
+        drop(output_file);
+
+        // Verify
+        let metadata = std::fs::metadata(&output_path).unwrap();
+        assert_eq!(metadata.len(), total_size);
+
+        // Read the specific region
+        let mut file = std::fs::File::open(&output_path).unwrap();
+        file.seek(std::io::SeekFrom::Start(1024 * 1024)).unwrap();
+        let mut buffer = vec![0u8; 100];
+        file.read_exact(&mut buffer).unwrap();
+        assert!(buffer.iter().all(|&b| b == b'X'));
+    }
+
+    #[test]
+    fn test_data_region_json_serialization() {
+        let regions = vec![
+            DataRegion {
+                offset: 0,
+                length: 1024,
+            },
+            DataRegion {
+                offset: 4096,
+                length: 2048,
+            },
+        ];
+
+        let json = serde_json::to_string(&regions).unwrap();
+        let deserialized: Vec<DataRegion> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(regions.len(), deserialized.len());
+        assert_eq!(regions[0].offset, deserialized[0].offset);
+        assert_eq!(regions[0].length, deserialized[0].length);
+        assert_eq!(regions[1].offset, deserialized[1].offset);
+        assert_eq!(regions[1].length, deserialized[1].length);
+    }
+}

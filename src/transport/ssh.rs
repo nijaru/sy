@@ -540,6 +540,41 @@ impl Transport for SshTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
+        // Check if file is sparse and try sparse transfer first
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if let Ok(metadata) = std::fs::metadata(source) {
+                let file_size = metadata.len();
+                let allocated_size = metadata.blocks() * 512;
+                let is_sparse = allocated_size < file_size && file_size > 0;
+
+                if is_sparse {
+                    // Try sparse transfer
+                    match self.copy_sparse_file(source, dest).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                "Sparse transfer succeeded for {} ({} file size, {} transferred)",
+                                source.display(),
+                                file_size,
+                                result.transferred_bytes.unwrap_or(file_size)
+                            );
+                            return Ok(result);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Sparse transfer failed for {}, falling back to regular copy: {}",
+                                source.display(),
+                                e
+                            );
+                            // Fall through to regular transfer
+                        }
+                    }
+                }
+            }
+        }
+
         let source_path = source.to_path_buf();
         let dest_path = dest.to_path_buf();
         let session_arc = self.connection_pool.get_session();
