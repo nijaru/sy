@@ -240,7 +240,24 @@ xattr -l dest/file.txt
 # com.apple.quarantine: 0001;12345678;Safari;
 ```
 
+#### Finder Tags
+
+Finder tags (colors and labels) are preserved automatically with `-X`:
+
+```bash
+# Tag files in Finder (or use command line tools)
+tag -a "Work,Important" project.txt
+tag -a "Red" urgent.pdf
+
+# Sync preserves Finder tags
+sy -X ~/Documents user@backup:/backups
+
+# Tags are restored on destination
+# Stored in com.apple.metadata:_kMDItemUserTags xattr
+```
+
 **Common macOS attributes**:
+- `com.apple.metadata:_kMDItemUserTags` - Finder tags (colors/labels)
 - `com.apple.metadata:*` - Spotlight metadata
 - `com.apple.quarantine` - Gatekeeper quarantine
 - `com.apple.FinderInfo` - Finder labels/colors
