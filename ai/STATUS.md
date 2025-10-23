@@ -1,11 +1,11 @@
 # Status
 
-_Last Updated: 2025-10-22_
+_Last Updated: 2025-10-23_
 
 ## Current State
-- Version: v0.0.41 (in development)
-- Phase: macOS BSD File Flags complete!
-- Test Coverage: 344 tests passing (334 lib + 8 checksumdb + 1 verification + 1 performance)
+- Version: v0.0.41 (RELEASED ✅)
+- Phase: macOS platform features complete! Cross-platform compilation verified!
+- Test Coverage: 346 tests passing (336 lib + 8 checksumdb + 1 verification + 1 performance)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync (see docs/PERFORMANCE.md)
 
@@ -50,32 +50,47 @@ _Last Updated: 2025-10-22_
 - **Performance optimization** (v0.0.40): Eliminated String allocation in is_compressed_extension (10,000 allocations saved for 10K files); comprehensive benchmark analysis shows NO regressions
 - **Sparse file module** (v0.0.40): Foundation laid with detect_data_regions using SEEK_HOLE/SEEK_DATA; infrastructure ready for future SSH sparse transfer (~8h remaining work)
 - **BSD file flags preservation** (v0.0.41): macOS-specific flag preservation using chflags() syscall; explicitly clears flags when not preserving to prevent auto-preservation; comprehensive tests for both preservation and clearing behaviors
+- **Cross-platform BSD flags compilation** (v0.0.41): Removed all `#[cfg(target_os = "macos")]` from preserve_flags usage sites (24+ locations); field definitions unconditional with runtime checks in helpers; enables compilation on Linux/Windows while maintaining macOS-only runtime behavior
+- **macOS Finder tags** (v0.0.16+): Already supported via xattr preservation (`-X` flag); tags stored as `com.apple.metadata:_kMDItemUserTags` xattr; works seamlessly with existing infrastructure
+- **macOS resource forks** (v0.0.16+): Already supported via xattr preservation; stored as `com.apple.ResourceFork` xattr on modern macOS; AppleDouble format for legacy compatibility
+- **Windows strategy** (v0.0.41+): Focus on core rsync advantages (native binary, delta-transfer, SSH) rather than Windows-specific features (ACLs/attributes); fills gap where Robocopy lacks delta-transfer and SSH support
+- **SSH multiplexing research** (v0.0.41+): ControlMaster NOT recommended for sy's parallel file transfers (bottlenecks on one TCP connection); better approach is SSH connection pooling (N connections = N workers) for true parallel throughput; see ai/research/ssh_multiplexing_2025.md
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
 - Compression on local/high-speed: CPU bottleneck negates benefits above 4Gbps
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
+- macOS APFS sparse detection: SEEK_DATA/SEEK_HOLE not reliably supported; tests must be ignored on APFS
+- SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
 None currently - ready for next feature!
 
 ## Recently Completed
-- ✅ macOS BSD File Flags (v0.0.41) - COMPLETE
-  - Add bsd_flags field to FileEntry struct (DONE ✅)
-  - Implement BSD flags capture in scanner (DONE ✅)
-  - Add --preserve-flags CLI flag (DONE ✅)
-  - Wire preserve_flags through SyncEngine (DONE ✅)
-  - Implement write_bsd_flags() method (DONE ✅)
-  - Add BSD flags tests (DONE ✅)
-  - Fix test compilation errors (DONE ✅)
-  - Update documentation (DONE ✅)
+- ✅ v0.0.41 Release - macOS BSD File Flags + Cross-Platform Compilation (2025-10-23)
+  - BSD flags preservation with --preserve-flags/-F flag ✅
+  - Cross-platform compilation fixes (24+ locations) ✅
+  - Finder tags documentation (already working via xattrs) ✅
+  - Resource forks support (already working via xattrs) ✅
+  - SSH multiplexing research (2025 best practices) ✅
+  - Windows strategy decision (focus on core strengths) ✅
+  - GitHub release published ✅
 
 ## Next Steps
-- Quarantine stripping (--no-quarantine flag, v0.0.42) - 2-3 hours
-- Verbose metadata display enhancements (v0.0.43+) - 4-6 hours
-- Complete sparse SSH transfer (src/sparse.rs foundation ready, ~8h remaining)
-- Thread CLI compression detection mode through transport
-- Remote checksum support for Phase 5a/5b (backlog)
+**Testing & Quality:**
+- Add COW strategy selection tests (filesystem detection edge cases)
+- Add performance monitoring accuracy tests
+
+**Research & Implementation:**
+- SSH connection pooling (N connections = N workers) based on multiplexing research
+- Latest filesystem feature detection methods (2025)
+- State-of-the-art compression algorithms for file sync
+
+**Future Features:**
+- Sparse file optimization improvements (foundation ready in src/sparse.rs)
+- Multi-destination sync
+- Bidirectional sync
+- Cloud storage backends (S3, etc.)
 
 ## Blockers
 None currently
