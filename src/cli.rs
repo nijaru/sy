@@ -302,8 +302,7 @@ pub struct Cli {
     #[arg(short = 'A', long)]
     pub preserve_acls: bool,
 
-    /// Preserve BSD file flags (macOS: hidden, immutable, nodump, etc.)
-    #[cfg(target_os = "macos")]
+    /// Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; no-op on other platforms)
     #[arg(short = 'F', long)]
     pub preserve_flags: bool,
 
