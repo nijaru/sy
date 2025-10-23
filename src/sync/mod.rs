@@ -2318,8 +2318,7 @@ mod tests {
                 // Should contain "Error threshold exceeded" in the error message
                 let error_msg = e.to_string();
                 assert!(
-                    error_msg.contains("Error threshold exceeded")
-                        || error_msg.contains("errors"),
+                    error_msg.contains("Error threshold exceeded") || error_msg.contains("errors"),
                     "Error should mention threshold: {}",
                     error_msg
                 );
@@ -2395,10 +2394,7 @@ mod tests {
                 assert!(stats.files_created <= 8, "Should sync remaining files");
                 // Errors should be collected in stats
                 if !stats.errors.is_empty() {
-                    assert!(
-                        stats.errors.len() <= 5,
-                        "Errors should be below threshold"
-                    );
+                    assert!(stats.errors.len() <= 5, "Errors should be below threshold");
                 }
             }
             Err(_) => {

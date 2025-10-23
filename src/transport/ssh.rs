@@ -66,7 +66,10 @@ impl ConnectionPool {
             sessions.push(Arc::new(Mutex::new(session)));
         }
 
-        tracing::info!("SSH connection pool initialized with {} connections", pool_size);
+        tracing::info!(
+            "SSH connection pool initialized with {} connections",
+            pool_size
+        );
 
         Ok(Self {
             sessions,
@@ -813,7 +816,6 @@ impl Transport for SshTransport {
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
-
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Check if remote destination exists
