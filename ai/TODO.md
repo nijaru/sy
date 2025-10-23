@@ -80,7 +80,10 @@ None currently - ready for next feature!
 - ~~[ ] Add peak speed tracking to perf monitor~~ - **DONE!** Already tracked via update_peak_speed()
 
 ## Research Needed
-- [ ] Modern SSH multiplexing best practices (2025)
+- [x] Modern SSH multiplexing best practices (2025) - COMPLETE ✅
+  - ControlMaster NOT recommended for parallel file transfers (bottlenecks on one TCP connection)
+  - Better: SSH connection pooling (N connections = N workers) for true parallel throughput
+  - See ai/research/ssh_multiplexing_2025.md
 - [ ] Latest filesystem feature detection methods
 - [ ] State-of-the-art compression algorithms for file sync
 
