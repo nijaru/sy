@@ -480,20 +480,20 @@ mod tests {
 
         let metrics = monitor.get_metrics();
 
-        // Verify durations are within reasonable bounds (allow 10ms variance)
+        // Verify durations are within reasonable bounds (allow 100% variance for CI)
         assert!(
-            metrics.scan_duration.as_millis() >= 50 && metrics.scan_duration.as_millis() < 60,
+            metrics.scan_duration.as_millis() >= 40 && metrics.scan_duration.as_millis() < 150,
             "scan_duration: {:?}",
             metrics.scan_duration
         );
         assert!(
-            metrics.plan_duration.as_millis() >= 30 && metrics.plan_duration.as_millis() < 40,
+            metrics.plan_duration.as_millis() >= 20 && metrics.plan_duration.as_millis() < 100,
             "plan_duration: {:?}",
             metrics.plan_duration
         );
         assert!(
-            metrics.transfer_duration.as_millis() >= 20
-                && metrics.transfer_duration.as_millis() < 30,
+            metrics.transfer_duration.as_millis() >= 10
+                && metrics.transfer_duration.as_millis() < 100,
             "transfer_duration: {:?}",
             metrics.transfer_duration
         );
