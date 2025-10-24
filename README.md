@@ -38,7 +38,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Bandwidth Utilization JSON** - Performance metrics including bandwidth % in JSON output! (v0.0.39)
 ✅ **SSH Connection Pooling** - True parallel SSH transfers with N workers = N connections! (v0.0.42)
 ✅ **SSH Sparse File Transfer** - Automatic sparse file optimization for 10x bandwidth savings! (v0.0.42)
-🚀 **Current Version: v0.0.42** - 385 tests passing!
+✅ **Bidirectional Sync** - Two-way sync with automatic conflict resolution, 6 strategies! (v0.0.43)
+🚀 **Current Version: v0.0.43** - 414 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -712,6 +713,52 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   sy /vm/disk.vmdk user@host:/backup/ # Only transfers data regions
   sy /db/postgres.db user@host:/sync/ # Skips holes, transfers data
   ```
+
+**Bidirectional Sync (v0.0.43 - NEW!)**:
+- **Two-Way Synchronization**:
+  - Sync changes in both directions automatically
+  - SQLite-based state tracking in `~/.cache/sy/bisync/`
+  - Detects new files, modifications, and deletions on both sides
+  - Handles 9 change types including conflicts
+- **Conflict Resolution Strategies** (6 options):
+  - `newer` (default): Most recent modification time wins
+  - `larger`: Largest file size wins
+  - `smaller`: Smallest file size wins
+  - `source`: Source always wins (force push)
+  - `dest`: Destination always wins (force pull)
+  - `rename`: Keep both files with `.conflict-{timestamp}-{side}` suffix
+  - Automatic tie-breaker: falls back to rename when attributes equal
+- **Safety Features**:
+  - Deletion limit: Default 50% threshold prevents mass deletion
+  - Dry-run support: Preview changes before syncing
+  - Content equality checks: Reduces false conflict detection
+  - State persistence: Survives interruptions and errors
+- **Example Usage**:
+  ```bash
+  # Basic bidirectional sync (newest-wins)
+  sy --bidirectional /laptop/docs /backup/docs
+  sy -b /local /remote  # Short form
+
+  # Explicit conflict resolution strategy
+  sy -b /a /b --conflict-resolve newer   # Most recent wins (default)
+  sy -b /a /b --conflict-resolve larger  # Largest file wins
+  sy -b /a /b --conflict-resolve rename  # Keep both files
+
+  # Force one direction in conflicts
+  sy -b /source /dest --conflict-resolve source  # Source always wins
+  sy -b /source /dest --conflict-resolve dest    # Dest always wins
+
+  # Safety limits
+  sy -b /a /b --max-delete 10   # Abort if >10% deletions
+  sy -b /a /b --max-delete 0    # No limit (dangerous!)
+
+  # Dry-run to preview changes
+  sy -b /a /b --dry-run
+
+  # Clear state and resync fresh
+  sy -b /a /b --clear-bisync-state
+  ```
+- **Current Status**: Local→local only (SSH support coming in future version)
 
 **Scale (Phase 11 - Complete)**:
 - **Incremental Scanning with Cache** (NEW in v0.0.22):

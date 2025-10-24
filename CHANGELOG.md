@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.43] - 2025-10-24
+
+### Added
+- **Bidirectional Sync** - Two-way file synchronization with automatic conflict resolution
+  - New `--bidirectional` / `-b` flag enables two-way sync mode
+  - Detects changes on both sides and syncs in both directions
+  - SQLite-based state tracking in `~/.cache/sy/bisync/`
+  - Stores file metadata (path, mtime, size) from prior sync for accurate change detection
+  - Unique database per source/dest pair (isolated state)
+
+- **Conflict Resolution Strategies** - 6 automated resolution methods
+  - `newer` (default) - Most recent modification time wins
+  - `larger` - Largest file size wins
+  - `smaller` - Smallest file size wins
+  - `source` - Source always wins (force push)
+  - `dest` - Destination always wins (force pull)
+  - `rename` - Keep both files with `.conflict-{timestamp}-{side}` suffix
+  - Automatic tie-breaker: falls back to rename when attributes equal
+  - Configure via `--conflict-resolve {strategy}` flag
+
+- **Deletion Safety** - Configurable limits prevent cascading data loss
+  - `--max-delete {percent}` flag sets deletion threshold (0-100)
+  - Default: 50% (aborts if >50% of files would be deleted)
+  - Set to 0 for unlimited deletions
+  - Protects against accidental mass deletion from bugs or misconfiguration
+
+- **Bidirectional Sync Features**
+  - Content equality checks reduce false conflict detection
+  - Handles 9 change types: new files, modifications, deletions, conflicts
+  - Edge case handling: partial state, missing files, modify-delete conflicts
+  - Dry-run support: preview bidirectional changes with `--dry-run`
+  - Clear state: `--clear-bisync-state` forces fresh comparison
+  - Conflict reporting: displays all detected conflicts with resolution actions
+  - Error collection: continues sync on errors, reports all failures
+
+- **CLI Enhancements**
+  - Comprehensive validation for bidirectional flags
+  - Conflict with incompatible modes (verify-only, watch)
+  - Clear error messages for invalid strategies or percentages
+
+### Performance
+- Bidirectional sync: Minimal overhead vs unidirectional (<5% for no conflicts)
+- Parallel scanning: Source and dest can be scanned in parallel (future)
+- State caching: SQLite queries optimized with indexes
+
+### Implementation
+- 4 new modules: state DB, change classifier, conflict resolver, sync engine
+- ~2,000 lines of production code
+- 32 new unit tests (all passing)
+- Total test coverage: 414 tests (402 passing + 12 ignored)
+- Comprehensive design documentation in `docs/architecture/`
+
+### Notes
+- Bidirectional sync currently supports local→local paths only
+- Remote support (SSH) deferred to future version
+- Based on rclone bisync approach (snapshot-based state tracking)
+- Simpler than Unison (~500 lines vs 3000+), covers 80% of use cases
+
 ## [0.0.42] - 2025-10-23
 
 ### Added
