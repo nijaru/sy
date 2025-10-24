@@ -3,9 +3,9 @@
 _Last Updated: 2025-10-23_
 
 ## Current State
-- Version: v0.0.42 (RELEASED 2025-10-23) ✅
-- Phase: Ready for next feature
-- Test Coverage: 385 tests passing (378 + 7 ignored APFS sparse tests)
+- Version: v0.0.43-dev (bidirectional sync in progress)
+- Phase: Implementing bidirectional sync feature
+- Test Coverage: 414 tests passing (402 + 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 
@@ -59,6 +59,11 @@ _Last Updated: 2025-10-23_
 - **Testing improvements** (2025-10-23): Added 24 comprehensive tests across 3 modules (9 perf accuracy, 4 error threshold, 11 sparse edge cases); test coverage increased from 355 to 377 tests; all quality assurance tests now in place
 - **SSH connection pooling** (2025-10-23): Implemented connection pool with N sessions = N workers for true parallel SSH transfers; avoids ControlMaster bottleneck (which serializes on one TCP connection); round-robin distribution via atomic counter; pool size automatically matches --parallel flag; 5 new unit tests added
 - **SSH sparse file transfer** (2025-10-23): Implemented automatic sparse file detection and transfer over SSH; detects data regions using SEEK_HOLE/SEEK_DATA, sends only actual data (not holes), reconstructs sparse file on remote; achieves 10x bandwidth savings for VM images, 5x for databases; auto-detection on Unix (allocated_size < file_size); graceful fallback if sparse detection fails; 3 new integration tests
+- **Bidirectional sync research** (2025-10-24): Analyzed rclone bisync, Unison, Syncthing; snapshot-based state tracking (rclone approach) chosen over vector clocks for simplicity; covers 80% use cases with ~500 lines vs. 3000+ for full Unison approach
+- **Bisync state DB** (2025-10-24): SQLite-based persistent state in ~/.cache/sy/bisync/; stores (path, side, mtime, size, checksum) from prior sync; enables accurate conflict detection without complex algorithms
+- **Change classification** (2025-10-24): 9 change types with content equality checks reduce false conflicts; handles edge cases (partial state, missing files) gracefully
+- **Conflict resolution strategies** (2025-10-24): 6 automated strategies (newer/larger/smaller/source/dest/rename) with automatic tie-breaker fallback; simpler than Unison's manual reconciliation, more flexible than Syncthing's rename-only
+- **Deletion safety** (2025-10-24): Configurable max-delete percentage (default 50%) prevents cascading data loss from bugs or misconfiguration
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -68,7 +73,20 @@ _Last Updated: 2025-10-23_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None - ready for next feature!
+**Bidirectional Sync (v0.0.43) - 90% Complete:**
+- ✅ Research & design (rclone bisync, Unison, Syncthing approaches)
+- ✅ State DB module (SQLite-based, ~/.cache/sy/bisync/)
+- ✅ Change classifier (9 change types, content equality checks)
+- ✅ Conflict resolver (6 strategies: newer/larger/smaller/source/dest/rename)
+- ✅ Sync engine (orchestration, deletion limits, dry-run)
+- ✅ CLI flags (--bidirectional, --conflict-resolve, --max-delete)
+- 🔄 Integration testing (pending)
+- 🔄 Documentation updates (pending)
+
+**Implementation Stats:**
+- Core: ~1,875 lines + 32 tests (all passing)
+- Files: state.rs, classifier.rs, resolver.rs, engine.rs
+- Remaining: integration tests, docs, final polish
 
 ## Recently Completed
 - ✅ v0.0.42 Release - SSH Performance & Sparse File Optimization (2025-10-23)
