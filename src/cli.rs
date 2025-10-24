@@ -376,6 +376,26 @@ pub struct Cli {
     /// Show details of a specific profile
     #[arg(long)]
     pub show_profile: Option<String>,
+
+    /// Bidirectional sync mode - sync changes in both directions
+    /// Detects and resolves conflicts automatically based on --conflict-resolve strategy
+    #[arg(short = 'b', long)]
+    pub bidirectional: bool,
+
+    /// Conflict resolution strategy for bidirectional sync
+    /// Options: newer (default), larger, smaller, source, dest, rename
+    #[arg(long, default_value = "newer")]
+    pub conflict_resolve: String,
+
+    /// Maximum percentage of files that can be deleted in bidirectional sync (0-100)
+    /// Set to 0 for unlimited deletions (default: 50)
+    #[arg(long, default_value = "50")]
+    pub max_delete: u8,
+
+    /// Clear bidirectional sync state before syncing
+    /// Forces full comparison instead of using cached state
+    #[arg(long)]
+    pub clear_bisync_state: bool,
 }
 
 impl Cli {
@@ -416,6 +436,35 @@ impl Cli {
             }
             if self.dry_run {
                 anyhow::bail!("--verify-only is already read-only, --dry-run is redundant");
+            }
+        }
+
+        // Bidirectional sync validation
+        if self.bidirectional {
+            // Validate max_delete percentage
+            if self.max_delete > 100 {
+                anyhow::bail!(
+                    "--max-delete must be between 0 and 100 (got: {})",
+                    self.max_delete
+                );
+            }
+
+            // Validate conflict resolution strategy
+            let valid_strategies = ["newer", "larger", "smaller", "source", "dest", "rename"];
+            if !valid_strategies.contains(&self.conflict_resolve.as_str()) {
+                anyhow::bail!(
+                    "Invalid --conflict-resolve strategy '{}'. Valid options: {}",
+                    self.conflict_resolve,
+                    valid_strategies.join(", ")
+                );
+            }
+
+            // Bidirectional conflicts with certain flags
+            if self.verify_only {
+                anyhow::bail!("--bidirectional cannot be used with --verify-only (conflicts with sync logic)");
+            }
+            if self.watch {
+                anyhow::bail!("--bidirectional with --watch is not yet supported (deferred to future version)");
             }
         }
 
@@ -587,6 +636,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -652,6 +705,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -721,6 +778,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -793,6 +854,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -858,6 +923,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -923,6 +992,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -988,6 +1061,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1053,6 +1130,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1137,6 +1218,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1205,6 +1290,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1270,6 +1359,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1361,6 +1454,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1426,6 +1523,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1491,6 +1592,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1556,6 +1661,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1628,6 +1737,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1699,6 +1812,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1771,6 +1888,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1843,6 +1964,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
@@ -1912,6 +2037,10 @@ mod tests {
             profile: None,
             list_profiles: false,
             show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
             use_cache: false,
             clear_cache: false,
             checksum_db: false,
