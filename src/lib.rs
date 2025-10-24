@@ -1,3 +1,4 @@
+pub mod bisync;
 pub mod cli;
 pub mod compress;
 pub mod config;
