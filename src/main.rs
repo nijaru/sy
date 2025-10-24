@@ -1,3 +1,4 @@
+mod bisync;
 mod cli;
 mod compress;
 mod config;
@@ -10,6 +11,7 @@ mod integrity;
 mod path;
 mod perf;
 mod resource;
+mod sparse;
 mod ssh;
 mod sync;
 mod temp_file;
@@ -23,6 +25,7 @@ use config::Config;
 use filter::FilterEngine;
 use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
+use std::path::PathBuf;
 use std::time::Duration;
 use sync::{watch::WatchMode, SyncEngine};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -496,8 +499,67 @@ async fn main() -> Result<()> {
         return Ok(()); // Watch mode handles its own output
     }
 
-    // Run sync (single file or directory)
-    let stats = if cli.is_single_file() {
+    // Run sync (single file, directory, or bidirectional)
+    let stats = if cli.bidirectional {
+        // Bidirectional sync mode
+        if !source.is_local() || !destination.is_local() {
+            anyhow::bail!("Bidirectional sync currently only supports local→local paths");
+        }
+
+        if !cli.quiet && !cli.json {
+            println!("sy v{}", env!("CARGO_PKG_VERSION"));
+            println!("Mode: Bidirectional sync");
+            println!("Strategy: {}", cli.conflict_resolve);
+            println!("{} ↔ {}\n", source, destination);
+        }
+
+        let bisync_engine = bisync::BisyncEngine::new();
+        let bisync_opts = bisync::BisyncOptions {
+            conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
+                .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,
+            max_delete_percent: cli.max_delete,
+            dry_run: cli.dry_run,
+            clear_state: cli.clear_bisync_state,
+        };
+
+        let bisync_result = bisync_engine.sync(source.path(), destination.path(), bisync_opts)?;
+
+        // Print conflicts if any
+        if !bisync_result.conflicts.is_empty() && !cli.quiet && !cli.json {
+            println!("\n{} conflicts detected:", bisync_result.conflicts.len());
+            for conflict in &bisync_result.conflicts {
+                println!("  {} - {}", conflict.path.display(), conflict.action);
+            }
+            println!();
+        }
+
+        // Convert BisyncStats to SyncStats for compatibility
+        sync::SyncStats {
+            files_scanned: (bisync_result.stats.files_synced_to_source
+                + bisync_result.stats.files_synced_to_dest),
+            files_created: bisync_result.stats.files_synced_to_dest,
+            files_updated: bisync_result.stats.files_synced_to_source,
+            files_deleted: bisync_result.stats.files_deleted_from_source
+                + bisync_result.stats.files_deleted_from_dest,
+            files_skipped: 0,
+            bytes_transferred: bisync_result.stats.bytes_transferred,
+            files_delta_synced: 0,
+            delta_bytes_saved: 0,
+            files_compressed: 0,
+            compression_bytes_saved: 0,
+            files_verified: 0,
+            verification_failures: 0,
+            duration: std::time::Duration::from_millis(bisync_result.stats.duration_ms as u64),
+            bytes_would_add: 0,
+            bytes_would_change: 0,
+            bytes_would_delete: 0,
+            errors: bisync_result.errors.into_iter().map(|e| sync::SyncError {
+                path: PathBuf::new(),
+                error: e,
+                action: "bidirectional sync".to_string(),
+            }).collect(),
+        }
+    } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
         }

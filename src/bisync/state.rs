@@ -118,21 +118,11 @@ impl BisyncStateDb {
             [],
         )?;
 
-        // Check/set schema version
-        let version: Option<i32> = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if version.is_none() {
-            conn.execute(
-                "INSERT INTO metadata (key, value) VALUES ('schema_version', ?1)",
-                params![Self::SCHEMA_VERSION.to_string()],
-            )?;
-        }
+        // Check/set schema version (use INSERT OR REPLACE to handle multiple opens)
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?1)",
+            params![Self::SCHEMA_VERSION.to_string()],
+        )?;
 
         Ok(Self {
             conn,
