@@ -1,10 +1,10 @@
 # Status
 
-_Last Updated: 2025-10-23_
+_Last Updated: 2025-10-24_
 
 ## Current State
-- Version: v0.0.43-dev (bidirectional sync in progress)
-- Phase: Implementing bidirectional sync feature
+- Version: v0.0.43 (ready for release)
+- Phase: Bidirectional sync feature complete
 - Test Coverage: 414 tests passing (402 + 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -73,22 +73,18 @@ _Last Updated: 2025-10-23_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-**Bidirectional Sync (v0.0.43) - 90% Complete:**
-- ✅ Research & design (rclone bisync, Unison, Syncthing approaches)
-- ✅ State DB module (SQLite-based, ~/.cache/sy/bisync/)
-- ✅ Change classifier (9 change types, content equality checks)
-- ✅ Conflict resolver (6 strategies: newer/larger/smaller/source/dest/rename)
-- ✅ Sync engine (orchestration, deletion limits, dry-run)
-- ✅ CLI flags (--bidirectional, --conflict-resolve, --max-delete)
-- 🔄 Integration testing (pending)
-- 🔄 Documentation updates (pending)
-
-**Implementation Stats:**
-- Core: ~1,875 lines + 32 tests (all passing)
-- Files: state.rs, classifier.rs, resolver.rs, engine.rs
-- Remaining: integration tests, docs, final polish
+None - v0.0.43 ready for release
 
 ## Recently Completed
+- ✅ v0.0.43 Release - Bidirectional Sync (2025-10-24)
+  - SQLite-based state tracking in ~/.cache/sy/bisync/ ✅
+  - 9 change types with content equality checks ✅
+  - 6 conflict resolution strategies (newer/larger/smaller/source/dest/rename) ✅
+  - Deletion safety with configurable max-delete percentage ✅
+  - CLI flags: --bidirectional, --conflict-resolve, --max-delete, --clear-bisync-state ✅
+  - Core implementation: ~2,000 lines + 32 tests ✅
+  - End-to-end testing: verified working with real file scenarios ✅
+  - Documentation: CHANGELOG, README, design docs complete ✅
 - ✅ v0.0.42 Release - SSH Performance & Sparse File Optimization (2025-10-23)
   - SSH connection pooling (N workers = N connections) ✅
   - SSH sparse file transfer (10x bandwidth savings for VMs) ✅
