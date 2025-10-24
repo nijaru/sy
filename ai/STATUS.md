@@ -32,6 +32,9 @@ _Last Updated: 2025-10-24_
 - ✅ Bandwidth utilization (--perf + --bwlimit, v0.0.39) - shows % utilization in summary and JSON!
 - ✅ Symlink loop detection (v0.0.40) - safe symlink traversal with automatic cycle detection!
 - ✅ BSD file flags preservation (--preserve-flags/-F flag, v0.0.41) - macOS hidden, immutable, nodump flags!
+- ✅ Bidirectional sync (--bidirectional/-b flag, v0.0.43) - two-way sync with conflict resolution!
+- ✅ SQLite state tracking (v0.0.43) - persistent state in ~/.cache/sy/bisync/ for accurate conflict detection!
+- ✅ 6 conflict resolution strategies (v0.0.43) - newer/larger/smaller/source/dest/rename!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
