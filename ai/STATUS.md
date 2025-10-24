@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-24_
 
 ## Current State
-- Version: v0.0.43 (ready for release)
-- Phase: Bidirectional sync feature complete
+- Version: v0.0.43 (released to crates.io)
+- Phase: Release complete
 - Test Coverage: 414 tests passing (402 + 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -73,7 +73,7 @@ _Last Updated: 2025-10-24_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None - v0.0.43 ready for release
+None
 
 ## Recently Completed
 - ✅ v0.0.43 Release - Bidirectional Sync (2025-10-24)
@@ -85,6 +85,8 @@ None - v0.0.43 ready for release
   - Core implementation: ~2,000 lines + 32 tests ✅
   - End-to-end testing: verified working with real file scenarios ✅
   - Documentation: CHANGELOG, README, design docs complete ✅
+  - Git tag v0.0.43 created and pushed ✅
+  - Published to crates.io ✅
 - ✅ v0.0.42 Release - SSH Performance & Sparse File Optimization (2025-10-23)
   - SSH connection pooling (N workers = N connections) ✅
   - SSH sparse file transfer (10x bandwidth savings for VMs) ✅
