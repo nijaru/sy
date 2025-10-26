@@ -1,10 +1,10 @@
 # Status
 
-_Last Updated: 2025-10-24_
+_Last Updated: 2025-10-26_
 
 ## Current State
-- Version: v0.0.43 (released to crates.io)
-- Phase: Release complete
+- Version: v0.0.44-dev (bisync state refactoring complete)
+- Phase: Code simplification and refactoring
 - Test Coverage: 414 tests passing (402 + 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -33,7 +33,7 @@ _Last Updated: 2025-10-24_
 - ✅ Symlink loop detection (v0.0.40) - safe symlink traversal with automatic cycle detection!
 - ✅ BSD file flags preservation (--preserve-flags/-F flag, v0.0.41) - macOS hidden, immutable, nodump flags!
 - ✅ Bidirectional sync (--bidirectional/-b flag, v0.0.43) - two-way sync with conflict resolution!
-- ✅ SQLite state tracking (v0.0.43) - persistent state in ~/.cache/sy/bisync/ for accurate conflict detection!
+- ✅ Text-based state tracking (v0.0.44) - persistent state in ~/.cache/sy/bisync/ for accurate conflict detection!
 - ✅ 6 conflict resolution strategies (v0.0.43) - newer/larger/smaller/source/dest/rename!
 
 ## What Worked
@@ -67,6 +67,7 @@ _Last Updated: 2025-10-24_
 - **Change classification** (2025-10-24): 9 change types with content equality checks reduce false conflicts; handles edge cases (partial state, missing files) gracefully
 - **Conflict resolution strategies** (2025-10-24): 6 automated strategies (newer/larger/smaller/source/dest/rename) with automatic tie-breaker fallback; simpler than Unison's manual reconciliation, more flexible than Syncthing's rename-only
 - **Deletion safety** (2025-10-24): Configurable max-delete percentage (default 50%) prevents cascading data loss from bugs or misconfiguration
+- **Text-based state format** (2025-10-26): Refactored bisync from SQLite to text files; simpler (~100 lines less code), debuggable (cat ~/.cache/sy/bisync/*.lst), inspired by rclone bisync format; atomic writes with temp+rename
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -76,11 +77,19 @@ _Last Updated: 2025-10-24_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None
+- Completed bisync state refactoring; ready for next feature or release
 
 ## Recently Completed
+- ✅ Bisync State Refactoring (2025-10-26)
+  - Switched from SQLite to text-based format (.lst files) ✅
+  - Format inspired by rclone bisync: human-readable, debuggable ✅
+  - Simpler implementation: ~300 lines vs ~400 (removed ~100 lines SQL) ✅
+  - Atomic writes with temp file + rename ✅
+  - Format spec documented in docs/architecture/BISYNC_STATE_FORMAT.md ✅
+  - All 414 tests passing ✅
+  - Breaking change: v0.0.43 .db files ignored (clean break) ✅
 - ✅ v0.0.43 Release - Bidirectional Sync (2025-10-24)
-  - SQLite-based state tracking in ~/.cache/sy/bisync/ ✅
+  - Text-based state tracking in ~/.cache/sy/bisync/ (refactored in v0.0.44) ✅
   - 9 change types with content equality checks ✅
   - 6 conflict resolution strategies (newer/larger/smaller/source/dest/rename) ✅
   - Deletion safety with configurable max-delete percentage ✅
