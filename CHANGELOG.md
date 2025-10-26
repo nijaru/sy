@@ -7,15 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.44] - 2025-10-26
+
+### Changed
+- **Bisync State Storage Refactored** - Switched from SQLite to text-based format
+  - Text-based listing files in `~/.cache/sy/bisync/` (`.lst` instead of `.db`)
+  - Format inspired by rclone bisync: human-readable, debuggable
+  - Simpler implementation: ~300 lines vs ~400 lines (SQL removed)
+  - Atomic writes with temp file + rename for consistency
+  - Same file format spec documented in `docs/architecture/BISYNC_STATE_FORMAT.md`
+  - Header with version, sync pair info, and last sync timestamp
+  - One file per sync pair with both source and dest state
+  - Quoted paths for special characters support
+
+### Removed
+- SQLite dependency for bisync state (still used for `--checksum-db`)
+- ~100 lines of SQL code from bisync module
+
+### Benefits
+- **Simplicity**: Plain text, no schema migrations needed
+- **Debuggability**: `cat ~/.cache/sy/bisync/*.lst` shows full state
+- **Proven approach**: Similar to rclone bisync text format
+- **Fewer moving parts**: One less database to manage
+
+### Migration
+- **Breaking change**: Old `.db` files from v0.0.43 are ignored
+- Use `--clear-bisync-state` if upgrading from v0.0.43
+- Fresh sync will create new `.lst` files automatically
+
 ## [0.0.43] - 2025-10-24
 
 ### Added
 - **Bidirectional Sync** - Two-way file synchronization with automatic conflict resolution
   - New `--bidirectional` / `-b` flag enables two-way sync mode
   - Detects changes on both sides and syncs in both directions
-  - SQLite-based state tracking in `~/.cache/sy/bisync/`
+  - State tracking in `~/.cache/sy/bisync/` (text-based in v0.0.44+, SQLite in v0.0.43)
   - Stores file metadata (path, mtime, size) from prior sync for accurate change detection
-  - Unique database per source/dest pair (isolated state)
+  - Unique state file per source/dest pair (isolated state)
 
 - **Conflict Resolution Strategies** - 6 automated resolution methods
   - `newer` (default) - Most recent modification time wins

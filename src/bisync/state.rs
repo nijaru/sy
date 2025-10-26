@@ -1,11 +1,12 @@
 // Bidirectional sync state tracking
 //
 // Stores filesystem state from prior sync to detect changes and conflicts.
-// Uses SQLite for persistent state storage in ~/.cache/sy/bisync/
+// Uses text-based format for persistent state storage in ~/.cache/sy/bisync/
 
 use crate::error::Result;
-use rusqlite::{Connection, params};
 use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,15 +45,18 @@ impl Side {
     }
 }
 
-/// Bidirectional sync state database
+/// Bidirectional sync state database (text-based)
 pub struct BisyncStateDb {
-    conn: Connection,
-    sync_pair_hash: String,
+    state_file: PathBuf,
+    source_path: PathBuf,
+    dest_path: PathBuf,
+    // In-memory cache for faster lookups
+    states: HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>,
 }
 
 impl BisyncStateDb {
-    /// Database schema version
-    const SCHEMA_VERSION: i32 = 1;
+    /// Format version
+    const FORMAT_VERSION: &'static str = "v1";
 
     /// Generate unique hash for source+dest pair
     fn generate_sync_pair_hash(source: &Path, dest: &Path) -> String {
@@ -65,8 +69,8 @@ impl BisyncStateDb {
         format!("{:x}", hasher.finish())
     }
 
-    /// Get database directory (~/.cache/sy/bisync/)
-    fn get_db_dir() -> Result<PathBuf> {
+    /// Get state directory (~/.cache/sy/bisync/)
+    fn get_state_dir() -> Result<PathBuf> {
         let cache_dir = if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
             PathBuf::from(xdg_cache)
         } else if let Ok(home) = std::env::var("HOME") {
@@ -77,154 +81,87 @@ impl BisyncStateDb {
             ));
         };
 
-        let db_dir = cache_dir.join("sy").join("bisync");
-        std::fs::create_dir_all(&db_dir)?;
-        Ok(db_dir)
+        let state_dir = cache_dir.join("sy").join("bisync");
+        fs::create_dir_all(&state_dir)?;
+        Ok(state_dir)
     }
 
     /// Open or create bisync state database for source/dest pair
     pub fn open(source: &Path, dest: &Path) -> Result<Self> {
         let sync_pair_hash = Self::generate_sync_pair_hash(source, dest);
-        let db_dir = Self::get_db_dir()?;
-        let db_path = db_dir.join(format!("{}.db", sync_pair_hash));
+        let state_dir = Self::get_state_dir()?;
+        let state_file = state_dir.join(format!("{}.lst", sync_pair_hash));
 
-        let conn = Connection::open(&db_path)?;
-
-        // Create schema if not exists
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS sync_state (
-                path TEXT NOT NULL,
-                side TEXT NOT NULL,
-                mtime INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                checksum INTEGER,
-                last_sync INTEGER NOT NULL,
-                PRIMARY KEY (path, side)
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_path_side ON sync_state(path, side)",
-            [],
-        )?;
-
-        // Version tracking
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            [],
-        )?;
-
-        // Check/set schema version (use INSERT OR REPLACE to handle multiple opens)
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?1)",
-            params![Self::SCHEMA_VERSION.to_string()],
-        )?;
+        let states = if state_file.exists() {
+            Self::load_from_file(&state_file)?
+        } else {
+            HashMap::new()
+        };
 
         Ok(Self {
-            conn,
-            sync_pair_hash,
+            state_file,
+            source_path: source.to_path_buf(),
+            dest_path: dest.to_path_buf(),
+            states,
         })
     }
 
-    /// Store state for a file
-    pub fn store(&mut self, state: &SyncState) -> Result<()> {
-        let mtime_ns = state
-            .mtime
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-
-        let last_sync_ns = state
-            .last_sync
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO sync_state (path, side, mtime, size, checksum, last_sync)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                state.path.to_string_lossy(),
-                state.side.as_str(),
-                mtime_ns,
-                state.size as i64,
-                state.checksum.map(|c| c as i64),
-                last_sync_ns,
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    /// Retrieve state for a specific file and side
-    pub fn get(&self, path: &Path, side: Side) -> Result<Option<SyncState>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, side, mtime, size, checksum, last_sync
-             FROM sync_state
-             WHERE path = ?1 AND side = ?2",
-        )?;
-
-        let result = stmt.query_row(
-            params![path.to_string_lossy(), side.as_str()],
-            |row| {
-                let mtime_ns: i64 = row.get(2)?;
-                let size: i64 = row.get(3)?;
-                let checksum: Option<i64> = row.get(4)?;
-                let last_sync_ns: i64 = row.get(5)?;
-
-                Ok(SyncState {
-                    path: PathBuf::from(row.get::<_, String>(0)?),
-                    side: Side::from_str(&row.get::<_, String>(1)?).unwrap(),
-                    mtime: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64),
-                    size: size as u64,
-                    checksum: checksum.map(|c| c as u64),
-                    last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(last_sync_ns as u64),
-                })
-            },
-        );
-
-        match result {
-            Ok(state) => Ok(Some(state)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Load all state records
-    pub fn load_all(&self) -> Result<HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, side, mtime, size, checksum, last_sync
-             FROM sync_state
-             ORDER BY path, side",
-        )?;
-
+    /// Load state from file
+    fn load_from_file(
+        path: &Path,
+    ) -> Result<HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>> {
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
         let mut states: HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)> =
             HashMap::new();
 
-        let rows = stmt.query_map([], |row| {
-            let mtime_ns: i64 = row.get(2)?;
-            let size: i64 = row.get(3)?;
-            let checksum: Option<i64> = row.get(4)?;
-            let last_sync_ns: i64 = row.get(5)?;
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
 
-            Ok(SyncState {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                side: Side::from_str(&row.get::<_, String>(1)?).unwrap(),
+            // Skip comments and blank lines
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Parse: <side> <mtime_ns> <size> <checksum> <path>
+            let parts: Vec<&str> = line.splitn(5, ' ').collect();
+            if parts.len() != 5 {
+                continue; // Skip malformed lines
+            }
+
+            let side = match Side::from_str(parts[0]) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let mtime_ns: i64 = parts[1].parse().unwrap_or(0);
+            let size: u64 = parts[2].parse().unwrap_or(0);
+            let checksum: Option<u64> = if parts[3] == "-" {
+                None
+            } else {
+                u64::from_str_radix(parts[3], 16).ok()
+            };
+
+            // Unquote path if needed
+            let path_str = parts[4];
+            let path = if path_str.starts_with('"') && path_str.ends_with('"') {
+                PathBuf::from(&path_str[1..path_str.len() - 1])
+            } else {
+                PathBuf::from(path_str)
+            };
+
+            let state = SyncState {
+                path: path.clone(),
+                side,
                 mtime: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64),
-                size: size as u64,
-                checksum: checksum.map(|c| c as u64),
-                last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(last_sync_ns as u64),
-            })
-        })?;
+                size,
+                checksum,
+                last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64), // Use mtime as last_sync
+            };
 
-        for state_result in rows {
-            let state = state_result?;
-            let entry = states.entry(state.path.clone()).or_insert((None, None));
-            match state.side {
+            let entry = states.entry(path).or_insert((None, None));
+            match side {
                 Side::Source => entry.0 = Some(state),
                 Side::Dest => entry.1 = Some(state),
             }
@@ -233,18 +170,119 @@ impl BisyncStateDb {
         Ok(states)
     }
 
+    /// Save all state to file (atomic write)
+    fn save_to_file(&self) -> Result<()> {
+        let temp_file = self.state_file.with_extension("tmp");
+
+        {
+            let mut file = fs::File::create(&temp_file)?;
+
+            // Write header
+            writeln!(file, "# sy bisync {}", Self::FORMAT_VERSION)?;
+            writeln!(
+                file,
+                "# sync_pair: {} <-> {}",
+                self.source_path.display(),
+                self.dest_path.display()
+            )?;
+            let now = chrono::Utc::now();
+            writeln!(file, "# last_sync: {}", now.to_rfc3339())?;
+
+            // Collect and sort entries for deterministic output
+            let mut entries: Vec<(&PathBuf, &(Option<SyncState>, Option<SyncState>))> =
+                self.states.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+
+            // Write each state
+            for (_, (source_state, dest_state)) in entries {
+                if let Some(state) = source_state {
+                    self.write_state(&mut file, state)?;
+                }
+                if let Some(state) = dest_state {
+                    self.write_state(&mut file, state)?;
+                }
+            }
+        }
+
+        // Atomic rename
+        fs::rename(&temp_file, &self.state_file)?;
+
+        Ok(())
+    }
+
+    /// Write a single state entry
+    fn write_state(&self, file: &mut fs::File, state: &SyncState) -> Result<()> {
+        let mtime_ns = state
+            .mtime
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let checksum_str = if let Some(cs) = state.checksum {
+            format!("{:x}", cs)
+        } else {
+            "-".to_string()
+        };
+
+        let path_str = state.path.to_string_lossy();
+        let path_formatted = if path_str.contains(' ') || path_str.contains('"') {
+            format!("\"{}\"", path_str.replace('"', "\\\""))
+        } else {
+            path_str.to_string()
+        };
+
+        writeln!(
+            file,
+            "{} {} {} {} {}",
+            state.side.as_str(),
+            mtime_ns,
+            state.size,
+            checksum_str,
+            path_formatted
+        )?;
+
+        Ok(())
+    }
+
+    /// Store state for a file
+    pub fn store(&mut self, state: &SyncState) -> Result<()> {
+        let entry = self.states.entry(state.path.clone()).or_insert((None, None));
+        match state.side {
+            Side::Source => entry.0 = Some(state.clone()),
+            Side::Dest => entry.1 = Some(state.clone()),
+        }
+        self.save_to_file()?;
+        Ok(())
+    }
+
+    /// Retrieve state for a specific file and side
+    pub fn get(&self, path: &Path, side: Side) -> Result<Option<SyncState>> {
+        if let Some((source_state, dest_state)) = self.states.get(path) {
+            match side {
+                Side::Source => Ok(source_state.clone()),
+                Side::Dest => Ok(dest_state.clone()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load all state records
+    pub fn load_all(&self) -> Result<HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>> {
+        Ok(self.states.clone())
+    }
+
     /// Delete state for a specific file
     pub fn delete(&mut self, path: &Path) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sync_state WHERE path = ?1",
-            params![path.to_string_lossy()],
-        )?;
+        self.states.remove(path);
+        self.save_to_file()?;
         Ok(())
     }
 
     /// Clear all state (for --clear-bisync-state)
     pub fn clear_all(&mut self) -> Result<()> {
-        self.conn.execute("DELETE FROM sync_state", [])?;
+        self.states.clear();
+        self.save_to_file()?;
         Ok(())
     }
 
@@ -257,8 +295,8 @@ impl BisyncStateDb {
     }
 
     /// Get sync pair hash (for logging/debugging)
-    pub fn sync_pair_hash(&self) -> &str {
-        &self.sync_pair_hash
+    pub fn sync_pair_hash(&self) -> String {
+        Self::generate_sync_pair_hash(&self.source_path, &self.dest_path)
     }
 }
 
@@ -273,7 +311,7 @@ mod tests {
         let dest = temp_dir.path().join("dest");
         let db = BisyncStateDb::open(&source, &dest).unwrap();
         let temp_path = temp_dir.path().to_path_buf();
-        std::mem::forget(temp_dir);  // Keep temp dir alive
+        std::mem::forget(temp_dir); // Keep temp dir alive
         (db, temp_path)
     }
 
