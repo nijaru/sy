@@ -56,7 +56,7 @@ pub struct BisyncStateDb {
 
 impl BisyncStateDb {
     /// Format version
-    const FORMAT_VERSION: &'static str = "v1";
+    const FORMAT_VERSION: &'static str = "v2";
 
     /// Generate unique hash for source+dest pair
     fn generate_sync_pair_hash(source: &Path, dest: &Path) -> String {
@@ -106,6 +106,33 @@ impl BisyncStateDb {
         })
     }
 
+    /// Unescape a path string (handles \n, \", \\)
+    fn unescape_path(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => result.push('\n'),
+                    Some('t') => result.push('\t'),
+                    Some('r') => result.push('\r'),
+                    Some('"') => result.push('"'),
+                    Some('\\') => result.push('\\'),
+                    Some(other) => {
+                        result.push('\\');
+                        result.push(other);
+                    }
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
+    }
+
     /// Load state from file
     fn load_from_file(
         path: &Path,
@@ -115,7 +142,7 @@ impl BisyncStateDb {
         let mut states: HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)> =
             HashMap::new();
 
-        for line in reader.lines() {
+        for (line_num, line) in reader.lines().enumerate() {
             let line = line?;
             let line = line.trim();
 
@@ -124,32 +151,61 @@ impl BisyncStateDb {
                 continue;
             }
 
-            // Parse: <side> <mtime_ns> <size> <checksum> <path>
-            let parts: Vec<&str> = line.splitn(5, ' ').collect();
-            if parts.len() != 5 {
-                continue; // Skip malformed lines
-            }
+            // Parse: <side> <mtime_ns> <size> <checksum> <last_sync_ns> <path>
+            let parts: Vec<&str> = line.splitn(6, ' ').collect();
 
-            let side = match Side::from_str(parts[0]) {
-                Some(s) => s,
-                None => continue,
-            };
+            // Support both v1 (5 parts) and v2 (6 parts) formats
+            let (side_str, mtime_str, size_str, checksum_str, last_sync_str, path_str) =
+                if parts.len() == 6 {
+                    // v2 format
+                    (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
+                } else if parts.len() == 5 {
+                    // v1 format (backward compat): last_sync = mtime
+                    (parts[0], parts[1], parts[2], parts[3], parts[1], parts[4])
+                } else {
+                    return Err(crate::error::SyncError::Config(
+                        format!("Malformed state file line {}: expected 5 or 6 fields, got {}",
+                                line_num + 1, parts.len())
+                    ));
+                };
 
-            let mtime_ns: i64 = parts[1].parse().unwrap_or(0);
-            let size: u64 = parts[2].parse().unwrap_or(0);
-            let checksum: Option<u64> = if parts[3] == "-" {
+            let side = Side::from_str(side_str)
+                .ok_or_else(|| crate::error::SyncError::Config(
+                    format!("Invalid side '{}' on line {}", side_str, line_num + 1)
+                ))?;
+
+            let mtime_ns: i64 = mtime_str.parse()
+                .map_err(|_| crate::error::SyncError::Config(
+                    format!("Invalid mtime '{}' on line {}", mtime_str, line_num + 1)
+                ))?;
+
+            let size: u64 = size_str.parse()
+                .map_err(|_| crate::error::SyncError::Config(
+                    format!("Invalid size '{}' on line {}", size_str, line_num + 1)
+                ))?;
+
+            let checksum: Option<u64> = if checksum_str == "-" {
                 None
             } else {
-                u64::from_str_radix(parts[3], 16).ok()
+                Some(u64::from_str_radix(checksum_str, 16)
+                    .map_err(|_| crate::error::SyncError::Config(
+                        format!("Invalid checksum '{}' on line {}", checksum_str, line_num + 1)
+                    ))?)
             };
 
-            // Unquote path if needed
-            let path_str = parts[4];
-            let path = if path_str.starts_with('"') && path_str.ends_with('"') {
-                PathBuf::from(&path_str[1..path_str.len() - 1])
+            let last_sync_ns: i64 = last_sync_str.parse()
+                .map_err(|_| crate::error::SyncError::Config(
+                    format!("Invalid last_sync '{}' on line {}", last_sync_str, line_num + 1)
+                ))?;
+
+            // Unquote and unescape path
+            let path_unescaped = if path_str.starts_with('"') && path_str.ends_with('"') {
+                Self::unescape_path(&path_str[1..path_str.len() - 1])
             } else {
-                PathBuf::from(path_str)
+                path_str.to_string()
             };
+
+            let path = PathBuf::from(path_unescaped);
 
             let state = SyncState {
                 path: path.clone(),
@@ -157,7 +213,7 @@ impl BisyncStateDb {
                 mtime: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64),
                 size,
                 checksum,
-                last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64), // Use mtime as last_sync
+                last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(last_sync_ns as u64),
             };
 
             let entry = states.entry(path).or_insert((None, None));
@@ -210,10 +266,36 @@ impl BisyncStateDb {
         Ok(())
     }
 
+    /// Escape a path string (handles \n, \", \\, \t, \r)
+    fn escape_path(s: &str) -> String {
+        let mut result = String::with_capacity(s.len() + 10);
+        result.push('"');
+
+        for c in s.chars() {
+            match c {
+                '\\' => result.push_str("\\\\"),
+                '"' => result.push_str("\\\""),
+                '\n' => result.push_str("\\n"),
+                '\t' => result.push_str("\\t"),
+                '\r' => result.push_str("\\r"),
+                _ => result.push(c),
+            }
+        }
+
+        result.push('"');
+        result
+    }
+
     /// Write a single state entry
     fn write_state(&self, file: &mut fs::File, state: &SyncState) -> Result<()> {
         let mtime_ns = state
             .mtime
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let last_sync_ns = state
+            .last_sync
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
@@ -225,20 +307,17 @@ impl BisyncStateDb {
         };
 
         let path_str = state.path.to_string_lossy();
-        let path_formatted = if path_str.contains(' ') || path_str.contains('"') {
-            format!("\"{}\"", path_str.replace('"', "\\\""))
-        } else {
-            path_str.to_string()
-        };
+        let path_escaped = Self::escape_path(&path_str);
 
         writeln!(
             file,
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             state.side.as_str(),
             mtime_ns,
             state.size,
             checksum_str,
-            path_formatted
+            last_sync_ns,
+            path_escaped
         )?;
 
         Ok(())
@@ -475,5 +554,144 @@ mod tests {
 
         // Different source → different hash
         assert_ne!(db1.sync_pair_hash(), db2.sync_pair_hash());
+    }
+
+    #[test]
+    fn test_escape_unescape_quotes() {
+        let original = r#"file"with"quotes.txt"#;
+        let escaped = BisyncStateDb::escape_path(original);
+        assert_eq!(escaped, r#""file\"with\"quotes.txt""#);
+
+        let unescaped = BisyncStateDb::unescape_path(&escaped[1..escaped.len() - 1]);
+        assert_eq!(unescaped, original);
+    }
+
+    #[test]
+    fn test_escape_unescape_newlines() {
+        let original = "file\nwith\nnewlines.txt";
+        let escaped = BisyncStateDb::escape_path(original);
+        assert_eq!(escaped, r#""file\nwith\nnewlines.txt""#);
+
+        let unescaped = BisyncStateDb::unescape_path(&escaped[1..escaped.len() - 1]);
+        assert_eq!(unescaped, original);
+    }
+
+    #[test]
+    fn test_escape_unescape_backslashes() {
+        let original = r"file\with\backslashes.txt";
+        let escaped = BisyncStateDb::escape_path(original);
+        assert_eq!(escaped, r#""file\\with\\backslashes.txt""#);
+
+        let unescaped = BisyncStateDb::unescape_path(&escaped[1..escaped.len() - 1]);
+        assert_eq!(unescaped, original);
+    }
+
+    #[test]
+    fn test_escape_unescape_tabs() {
+        let original = "file\twith\ttabs.txt";
+        let escaped = BisyncStateDb::escape_path(original);
+        assert_eq!(escaped, r#""file\twith\ttabs.txt""#);
+
+        let unescaped = BisyncStateDb::unescape_path(&escaped[1..escaped.len() - 1]);
+        assert_eq!(unescaped, original);
+    }
+
+    #[test]
+    fn test_edge_case_round_trip() {
+        let (mut db, _temp) = temp_db();
+
+        // Create state with edge-case filename
+        let edge_case_path = PathBuf::from("file\"with\nnewline\tand\\backslash.txt");
+        let state = SyncState {
+            path: edge_case_path.clone(),
+            side: Side::Source,
+            mtime: SystemTime::now(),
+            size: 1024,
+            checksum: Some(0xdeadbeef),
+            last_sync: SystemTime::now(),
+        };
+
+        // Store and retrieve
+        db.store(&state).unwrap();
+        let retrieved = db.get(&edge_case_path, Side::Source).unwrap().unwrap();
+
+        // Path should round-trip correctly
+        assert_eq!(retrieved.path, edge_case_path);
+        assert_eq!(retrieved.size, 1024);
+        assert_eq!(retrieved.checksum, Some(0xdeadbeef));
+    }
+
+    #[test]
+    fn test_last_sync_separate_from_mtime() {
+        let (mut db, _temp) = temp_db();
+
+        let now = SystemTime::now();
+        let earlier = now - Duration::from_secs(3600);
+
+        let state = SyncState {
+            path: PathBuf::from("test.txt"),
+            side: Side::Source,
+            mtime: earlier,           // File modified 1 hour ago
+            size: 1024,
+            checksum: None,
+            last_sync: now,           // But synced just now
+        };
+
+        db.store(&state).unwrap();
+        let retrieved = db.get(&state.path, Side::Source).unwrap().unwrap();
+
+        // last_sync should be preserved separately
+        let mtime_diff = retrieved.mtime.duration_since(earlier).unwrap();
+        let sync_diff = retrieved.last_sync.duration_since(now).unwrap();
+
+        assert!(mtime_diff < Duration::from_millis(10)); // Close to earlier
+        assert!(sync_diff < Duration::from_millis(10));  // Close to now
+    }
+
+    #[test]
+    fn test_v1_backward_compatibility() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source");
+        let dest = temp_dir.path().join("dest");
+
+        // Create a v1 format state file manually
+        let state_dir = temp_dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_file = state_dir.join("test.lst");
+
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v1").unwrap();
+        writeln!(file, "# sync_pair: /source <-> /dest").unwrap();
+        writeln!(file, "# last_sync: 2025-01-01T00:00:00Z").unwrap();
+        writeln!(file, "source 1730000000000000000 1024 abc123 test.txt").unwrap();
+
+        // Load v1 file
+        let states = BisyncStateDb::load_from_file(&state_file).unwrap();
+
+        assert_eq!(states.len(), 1);
+        let (source_state, _) = states.get(&PathBuf::from("test.txt")).unwrap();
+        let state = source_state.as_ref().unwrap();
+
+        // In v1, last_sync should equal mtime (backward compat)
+        assert_eq!(state.mtime, state.last_sync);
+    }
+
+    #[test]
+    fn test_parse_error_handling() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("bad.lst");
+
+        // Create malformed state file
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "source INVALID_NUMBER 1024 - 1730000000000000000 test.txt").unwrap();
+
+        // Should error, not return 0/1970
+        let result = BisyncStateDb::load_from_file(&state_file);
+        assert!(result.is_err());
     }
 }

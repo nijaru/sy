@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.45] - 2025-10-26
+
+### Fixed
+- **Bisync State Format v2** - Fixed critical data corruption bugs in text format
+  - **Proper escaping**: Handles quotes, newlines, backslashes, tabs correctly
+  - **Error handling**: Parse failures now return errors instead of silent corruption
+  - **last_sync field**: Now stored separately from mtime (was incorrectly using mtime)
+  - **Backward compatible**: Can still read v1 format files from v0.0.44
+
+### Added
+- 8 new edge-case tests for state file format
+  - Quote handling, newline handling, backslash handling
+  - Round-trip testing, v1 backward compatibility
+  - Parse error detection
+
+### Changed
+- Format version bumped from v1 to v2
+- All paths now quoted and escaped automatically
+- Test count: 410 tests passing (up from 402)
+
+### Migration
+- v0.0.44 state files (.lst) are automatically upgraded to v2
+- No user action required (format is backward compatible)
+
 ## [0.0.44] - 2025-10-26
 
 ### Changed
