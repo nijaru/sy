@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-26_
 
 ## Current State
-- Version: v0.0.44-dev (bisync state refactoring complete)
-- Phase: Code simplification and refactoring
+- Version: v0.0.44 (ready for release)
+- Phase: Release preparation
 - Test Coverage: 414 tests passing (402 + 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -77,7 +77,7 @@ _Last Updated: 2025-10-26_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-- Completed bisync state refactoring; ready for next feature or release
+None - v0.0.44 ready for release
 
 ## Recently Completed
 - ✅ Bisync State Refactoring (2025-10-26)

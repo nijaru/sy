@@ -39,7 +39,7 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **SSH Connection Pooling** - True parallel SSH transfers with N workers = N connections! (v0.0.42)
 ✅ **SSH Sparse File Transfer** - Automatic sparse file optimization for 10x bandwidth savings! (v0.0.42)
 ✅ **Bidirectional Sync** - Two-way sync with automatic conflict resolution, 6 strategies! (v0.0.43)
-🚀 **Current Version: v0.0.43** - 414 tests passing!
+🚀 **Current Version: v0.0.44** - 414 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
