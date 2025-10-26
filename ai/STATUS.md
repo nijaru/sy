@@ -4,9 +4,9 @@ _Last Updated: 2025-10-26_
 
 ## Current State
 - Version: v0.0.45 (released to crates.io)
-- Phase: Release complete
+- Phase: Code quality maintenance
 - Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
-- Build: Passing (all tests green)
+- Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 
 ## Implemented Features
@@ -68,6 +68,7 @@ _Last Updated: 2025-10-26_
 - **Conflict resolution strategies** (2025-10-24): 6 automated strategies (newer/larger/smaller/source/dest/rename) with automatic tie-breaker fallback; simpler than Unison's manual reconciliation, more flexible than Syncthing's rename-only
 - **Deletion safety** (2025-10-24): Configurable max-delete percentage (default 50%) prevents cascading data loss from bugs or misconfiguration
 - **Text-based state format** (2025-10-26): Refactored bisync from SQLite to text files; simpler (~100 lines less code), debuggable (cat ~/.cache/sy/bisync/*.lst), inspired by rclone bisync format; atomic writes with temp+rename
+- **Dead code annotations** (2025-10-26): Using #[allow(dead_code)] with explanatory comments for intentional unused code (public APIs, future features, test infrastructure) maintains production quality while preserving library interface and extensibility points
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -80,6 +81,14 @@ _Last Updated: 2025-10-26_
 None
 
 ## Recently Completed
+- ✅ Compiler Warning Cleanup (2025-10-26, commit 63a267b)
+  - Fixed all 6 compiler warnings with #[allow(dead_code)] annotations ✅
+  - ConflictInfo fields (future detailed reporting) ✅
+  - BisyncStateDb methods (future state management) ✅
+  - Sparse file infrastructure (foundation for optimization) ✅
+  - SSH pool API methods (backward compatibility) ✅
+  - Build status: 0 warnings, 410 tests passing ✅
+  - Committed and pushed to main ✅
 - ✅ v0.0.45 Release - Bisync State Format v2 (2025-10-26)
   - Fixed proper escaping for quotes, newlines, backslashes, tabs ✅
   - Fixed parse error handling (no more silent corruption) ✅
