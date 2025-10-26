@@ -2,7 +2,9 @@
 //
 // Detects what changed between source, dest, and prior sync state
 
-use crate::bisync::state::{Side, SyncState};
+#[cfg(test)]
+use crate::bisync::state::Side;
+use crate::bisync::state::SyncState;
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use std::collections::HashMap;
