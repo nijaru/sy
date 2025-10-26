@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-26_
 
 ## Current State
-- Version: v0.0.45 (ready for release)
-- Phase: Release preparation
+- Version: v0.0.45 (released to crates.io)
+- Phase: Release complete
 - Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -77,16 +77,18 @@ _Last Updated: 2025-10-26_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None - v0.0.45 ready for release
+None
 
 ## Recently Completed
-- ✅ Bisync State Format v2 - Critical Bug Fixes (2025-10-26)
+- ✅ v0.0.45 Release - Bisync State Format v2 (2025-10-26)
   - Fixed proper escaping for quotes, newlines, backslashes, tabs ✅
   - Fixed parse error handling (no more silent corruption) ✅
   - Fixed last_sync field (now separate from mtime) ✅
   - Added backward compatibility with v1 format ✅
   - Added 8 comprehensive edge-case tests ✅
   - All 410 tests passing ✅
+  - Git tag v0.0.45 created and pushed ✅
+  - Published to crates.io ✅
 - ✅ v0.0.44 Release - Bisync State Refactoring (2025-10-26)
   - Switched from SQLite to text-based format (.lst files) ✅
   - Format inspired by rclone bisync: human-readable, debuggable ✅
