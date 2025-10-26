@@ -48,10 +48,15 @@ pub struct BisyncStats {
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
     pub path: PathBuf,
+    #[allow(dead_code)] // Used for future detailed reporting
     pub source_mtime: Option<SystemTime>,
+    #[allow(dead_code)]
     pub source_size: Option<u64>,
+    #[allow(dead_code)]
     pub dest_mtime: Option<SystemTime>,
+    #[allow(dead_code)]
     pub dest_size: Option<u64>,
+    #[allow(dead_code)]
     pub resolution: ConflictResolution,
     pub action: String,
 }

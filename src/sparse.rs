@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Represents a contiguous region of data in a sparse file
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(dead_code)] // Foundation for future sparse file optimizations
 pub struct DataRegion {
     /// Offset from start of file in bytes
     pub offset: u64,
@@ -25,6 +26,7 @@ pub struct DataRegion {
 /// Returns a list of (offset, length) pairs representing non-zero regions.
 /// Returns empty vec if file is all holes or if SEEK_DATA not supported.
 #[cfg(unix)]
+#[allow(dead_code)] // Foundation for future sparse file optimizations
 pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
     const SEEK_DATA: i32 = 3; // Find next data region
     const SEEK_HOLE: i32 = 4; // Find next hole

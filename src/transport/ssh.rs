@@ -122,6 +122,7 @@ struct ConnectionPool {
 
 impl ConnectionPool {
     /// Create a new connection pool with the specified number of sessions
+    #[allow(dead_code)] // Used via SshTransport::with_pool_size
     async fn new(config: &SshConfig, pool_size: usize) -> Result<Self> {
         if pool_size == 0 {
             return Err(SyncError::Io(std::io::Error::other(
@@ -158,6 +159,7 @@ impl ConnectionPool {
     }
 
     /// Get the number of connections in the pool
+    #[allow(dead_code)] // Useful for debugging and monitoring
     fn size(&self) -> usize {
         self.sessions.len()
     }
@@ -170,6 +172,7 @@ pub struct SshTransport {
 
 impl SshTransport {
     /// Create a new SSH transport with a single connection (backward compatibility)
+    #[allow(dead_code)] // Public API for backward compatibility
     pub async fn new(config: &SshConfig) -> Result<Self> {
         Self::with_pool_size(config, 1).await
     }
@@ -187,6 +190,7 @@ impl SshTransport {
     }
 
     /// Get the number of connections in the pool
+    #[allow(dead_code)] // Useful for debugging and monitoring
     pub fn pool_size(&self) -> usize {
         self.connection_pool.size()
     }

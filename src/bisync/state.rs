@@ -335,6 +335,7 @@ impl BisyncStateDb {
     }
 
     /// Retrieve state for a specific file and side
+    #[allow(dead_code)] // Used in tests and future features
     pub fn get(&self, path: &Path, side: Side) -> Result<Option<SyncState>> {
         if let Some((source_state, dest_state)) = self.states.get(path) {
             match side {
@@ -366,6 +367,7 @@ impl BisyncStateDb {
     }
 
     /// Prune deleted files (files not in recent syncs)
+    #[allow(dead_code)] // Future feature: automatic state pruning
     pub fn prune_stale(&mut self, keep_syncs: usize) -> Result<usize> {
         // Not implemented yet - will add in follow-up
         // For now, just return 0 (no pruning)
@@ -374,6 +376,7 @@ impl BisyncStateDb {
     }
 
     /// Get sync pair hash (for logging/debugging)
+    #[allow(dead_code)] // Useful for debugging and future features
     pub fn sync_pair_hash(&self) -> String {
         Self::generate_sync_pair_hash(&self.source_path, &self.dest_path)
     }
