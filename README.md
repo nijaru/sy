@@ -39,7 +39,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **SSH Connection Pooling** - True parallel SSH transfers with N workers = N connections! (v0.0.42)
 ✅ **SSH Sparse File Transfer** - Automatic sparse file optimization for 10x bandwidth savings! (v0.0.42)
 ✅ **Bidirectional Sync** - Two-way sync with automatic conflict resolution, 6 strategies! (v0.0.43)
-🚀 **Current Version: v0.0.45** - 410 tests passing!
+✅ **SSH Bidirectional Sync** - Bisync works with remote servers (local↔remote, remote↔remote)! (v0.0.46)
+🚀 **Current Version: v0.0.46-dev** - 410 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -714,12 +715,13 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   sy /db/postgres.db user@host:/sync/ # Skips holes, transfers data
   ```
 
-**Bidirectional Sync (v0.0.43 - NEW!)**:
+**Bidirectional Sync (v0.0.43+)**:
 - **Two-Way Synchronization**:
   - Sync changes in both directions automatically
-  - SQLite-based state tracking in `~/.cache/sy/bisync/`
+  - Text-based state tracking in `~/.cache/sy/bisync/` (v0.0.44+)
   - Detects new files, modifications, and deletions on both sides
   - Handles 9 change types including conflicts
+  - **SSH Support** (v0.0.46+): Works with remote servers (local↔remote, remote↔remote)
 - **Conflict Resolution Strategies** (6 options):
   - `newer` (default): Most recent modification time wins
   - `larger`: Largest file size wins
@@ -757,8 +759,13 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
 
   # Clear state and resync fresh
   sy -b /a /b --clear-bisync-state
+
+  # SSH bidirectional sync (v0.0.46+)
+  sy -b /local/docs user@host:/remote/docs       # Local ↔ Remote
+  sy -b user@host1:/data user@host2:/backup      # Remote ↔ Remote
+  sy -b /laptop/work user@server:/work -p 8      # With parallel transfers
   ```
-- **Current Status**: Local→local only (SSH support coming in future version)
+- **Current Status**: Supports local↔local, local↔remote, and remote↔remote (v0.0.46+)
 
 **Scale (Phase 11 - Complete)**:
 - **Incremental Scanning with Cache** (NEW in v0.0.22):

@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-26_
 
 ## Current State
-- Version: v0.0.45 (released to crates.io)
-- Phase: Code quality maintenance
+- Version: v0.0.46-dev (in development)
+- Phase: SSH bidirectional sync implementation
 - Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -35,6 +35,7 @@ _Last Updated: 2025-10-26_
 - ✅ Bidirectional sync (--bidirectional/-b flag, v0.0.43) - two-way sync with conflict resolution!
 - ✅ Text-based state tracking (v0.0.44) - persistent state in ~/.cache/sy/bisync/ for accurate conflict detection!
 - ✅ 6 conflict resolution strategies (v0.0.43) - newer/larger/smaller/source/dest/rename!
+- ✅ SSH bidirectional sync (v0.0.46-dev) - bisync now works with remote servers (local↔remote, remote↔remote)!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
@@ -69,6 +70,7 @@ _Last Updated: 2025-10-26_
 - **Deletion safety** (2025-10-24): Configurable max-delete percentage (default 50%) prevents cascading data loss from bugs or misconfiguration
 - **Text-based state format** (2025-10-26): Refactored bisync from SQLite to text files; simpler (~100 lines less code), debuggable (cat ~/.cache/sy/bisync/*.lst), inspired by rclone bisync format; atomic writes with temp+rename
 - **Dead code annotations** (2025-10-26): Using #[allow(dead_code)] with explanatory comments for intentional unused code (public APIs, future features, test infrastructure) maintains production quality while preserving library interface and extensibility points
+- **SSH bidirectional sync** (2025-10-26): Refactored BisyncEngine to use Transport abstraction; made sync() async; replaced direct std::fs calls with transport.read_file()/write_file(); enables local↔remote and remote↔remote bisync; ~200 lines changed in engine.rs + ~70 lines in main.rs
 
 ## What Didn't Work
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
@@ -78,7 +80,14 @@ _Last Updated: 2025-10-26_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None
+- SSH Bidirectional Sync (v0.0.46)
+  - ✅ Refactored BisyncEngine to use Transport abstraction
+  - ✅ Made sync() async and updated all call sites
+  - ✅ Replaced std::fs with transport methods (read_file, write_file, remove)
+  - ✅ Updated CLI to create transports based on path types
+  - ✅ All 410 tests passing
+  - 🔄 Documentation updates in progress
+  - ⏳ Final testing and validation pending
 
 ## Recently Completed
 - ✅ Compiler Warning Cleanup (2025-10-26, commit 63a267b)

@@ -502,10 +502,6 @@ async fn main() -> Result<()> {
     // Run sync (single file, directory, or bidirectional)
     let stats = if cli.bidirectional {
         // Bidirectional sync mode
-        if !source.is_local() || !destination.is_local() {
-            anyhow::bail!("Bidirectional sync currently only supports local→local paths");
-        }
-
         if !cli.quiet && !cli.json {
             println!("sy v{}", env!("CARGO_PKG_VERSION"));
             println!("Mode: Bidirectional sync");
@@ -513,7 +509,80 @@ async fn main() -> Result<()> {
             println!("{} ↔ {}\n", source, destination);
         }
 
-        let bisync_engine = bisync::BisyncEngine::new();
+        // Create transports for source and destination
+        let (source_transport, dest_transport): (
+            std::sync::Arc<dyn transport::Transport>,
+            std::sync::Arc<dyn transport::Transport>,
+        ) = match (&source, &destination) {
+            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Local(_)) => {
+                // Both local
+                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
+                let local_source = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier.clone()));
+                let local_dest = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                (local_source, local_dest)
+            }
+            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Remote { host, user, .. }) => {
+                // Local → Remote
+                let config = if let Some(user) = user {
+                    ssh::config::SshConfig {
+                        hostname: host.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    ssh::config::parse_ssh_config(host)?
+                };
+                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
+                let local = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                let remote = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?);
+                (local, remote)
+            }
+            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local(_)) => {
+                // Remote → Local
+                let config = if let Some(user) = user {
+                    ssh::config::SshConfig {
+                        hostname: host.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    ssh::config::parse_ssh_config(host)?
+                };
+                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
+                let remote = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?);
+                let local = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                (remote, local)
+            }
+            (crate::path::SyncPath::Remote { host: host1, user: user1, .. }, crate::path::SyncPath::Remote { host: host2, user: user2, .. }) => {
+                // Remote → Remote
+                let config1 = if let Some(user) = user1 {
+                    ssh::config::SshConfig {
+                        hostname: host1.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    ssh::config::parse_ssh_config(host1)?
+                };
+                let config2 = if let Some(user) = user2 {
+                    ssh::config::SshConfig {
+                        hostname: host2.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    ssh::config::parse_ssh_config(host2)?
+                };
+                let remote1 = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config1, cli.parallel).await?);
+                let remote2 = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config2, cli.parallel).await?);
+                (remote1, remote2)
+            }
+            _ => {
+                anyhow::bail!("Bidirectional sync does not support S3 paths");
+            }
+        };
+
+        let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
         let bisync_opts = bisync::BisyncOptions {
             conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
                 .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,
@@ -522,7 +591,7 @@ async fn main() -> Result<()> {
             clear_state: cli.clear_bisync_state,
         };
 
-        let bisync_result = bisync_engine.sync(source.path(), destination.path(), bisync_opts)?;
+        let bisync_result = bisync_engine.sync(source.path(), destination.path(), bisync_opts).await?;
 
         // Print conflicts if any
         if !bisync_result.conflicts.is_empty() && !cli.quiet && !cli.json {

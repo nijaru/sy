@@ -7,8 +7,9 @@ use crate::bisync::{
     ConflictResolution, ResolvedChanges, Side, SyncAction, SyncState,
 };
 use crate::error::{Result, SyncError};
-use crate::sync::scanner::Scanner;
+use crate::transport::Transport;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Options for bidirectional sync
@@ -70,15 +71,21 @@ pub struct BisyncResult {
 }
 
 /// Bidirectional sync engine
-pub struct BisyncEngine {}
+pub struct BisyncEngine {
+    source_transport: Arc<dyn Transport>,
+    dest_transport: Arc<dyn Transport>,
+}
 
 impl BisyncEngine {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(source_transport: Arc<dyn Transport>, dest_transport: Arc<dyn Transport>) -> Self {
+        Self {
+            source_transport,
+            dest_transport,
+        }
     }
 
     /// Perform bidirectional sync
-    pub fn sync(
+    pub async fn sync(
         &self,
         source: &Path,
         dest: &Path,
@@ -96,12 +103,9 @@ impl BisyncEngine {
         // 2. Load prior state
         let prior_state = state_db.load_all()?;
 
-        // 3. Scan both sides
-        let source_scanner = Scanner::new(source);
-        let dest_scanner = Scanner::new(dest);
-
-        let source_files = source_scanner.scan()?;
-        let dest_files = dest_scanner.scan()?;
+        // 3. Scan both sides using transports
+        let source_files = self.source_transport.scan(source).await?;
+        let dest_files = self.dest_transport.scan(dest).await?;
 
         // 4. Classify changes
         let changes = classify_changes(&source_files, &dest_files, &prior_state)?;
@@ -122,7 +126,14 @@ impl BisyncEngine {
             (stats, Vec::new())
         } else {
             // Actually perform sync
-            let (stats, errors) = execute_actions(source, dest, &resolved)?;
+            let (stats, errors) = execute_actions(
+                &self.source_transport,
+                &self.dest_transport,
+                source,
+                dest,
+                &resolved,
+            )
+            .await?;
 
             // 9. Update state database
             update_state(&mut state_db, &resolved)?;
@@ -144,11 +155,6 @@ impl BisyncEngine {
     }
 }
 
-impl Default for BisyncEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Check if deletion limit would be exceeded
 fn check_deletion_limit(changes: &[Change], max_delete_percent: u8) -> Result<()> {
@@ -252,7 +258,9 @@ fn simulate_actions(resolved: &ResolvedChanges) -> BisyncStats {
 }
 
 /// Execute sync actions
-fn execute_actions(
+async fn execute_actions(
+    source_transport: &Arc<dyn Transport>,
+    dest_transport: &Arc<dyn Transport>,
     source_root: &Path,
     dest_root: &Path,
     resolved: &ResolvedChanges,
@@ -261,7 +269,14 @@ fn execute_actions(
     let mut errors = Vec::new();
 
     for action in &resolved.actions {
-        let result = execute_single_action(source_root, dest_root, action);
+        let result = execute_single_action(
+            source_transport,
+            dest_transport,
+            source_root,
+            dest_root,
+            action,
+        )
+        .await;
 
         match result {
             Ok(bytes) => {
@@ -290,30 +305,34 @@ fn execute_actions(
 }
 
 /// Execute a single sync action
-fn execute_single_action(
+async fn execute_single_action(
+    source_transport: &Arc<dyn Transport>,
+    dest_transport: &Arc<dyn Transport>,
     source_root: &Path,
     dest_root: &Path,
     action: &SyncAction,
 ) -> Result<u64> {
     match action {
         SyncAction::CopyToSource(entry) => {
+            // Copy from dest to source
             let src = dest_root.join(&entry.relative_path);
             let dst = source_root.join(&entry.relative_path);
-            copy_file(&src, &dst)
+            copy_file_across_transports(dest_transport, source_transport, &src, &dst).await
         }
         SyncAction::CopyToDest(entry) => {
+            // Copy from source to dest
             let src = source_root.join(&entry.relative_path);
             let dst = dest_root.join(&entry.relative_path);
-            copy_file(&src, &dst)
+            copy_file_across_transports(source_transport, dest_transport, &src, &dst).await
         }
         SyncAction::DeleteFromSource(path) => {
             let target = source_root.join(path);
-            delete_file(&target)?;
+            source_transport.remove(&target, false).await?;
             Ok(0)
         }
         SyncAction::DeleteFromDest(path) => {
             let target = dest_root.join(path);
-            delete_file(&target)?;
+            dest_transport.remove(&target, false).await?;
             Ok(0)
         }
         SyncAction::RenameConflict {
@@ -328,27 +347,41 @@ fn execute_single_action(
             let source_conflict = conflict_filename(&source_path, timestamp, "source");
             let dest_conflict = conflict_filename(&dest_path, timestamp, "dest");
 
-            std::fs::rename(&source_path, &source_conflict)?;
-            std::fs::rename(&dest_path, &dest_conflict)?;
+            // Read -> Write -> Delete to rename across transports
+            let source_data = source_transport.read_file(&source_path).await?;
+            let source_mtime = source_transport.get_mtime(&source_path).await?;
+            source_transport
+                .write_file(&source_conflict, &source_data, source_mtime)
+                .await?;
+            source_transport.remove(&source_path, false).await?;
+
+            let dest_data = dest_transport.read_file(&dest_path).await?;
+            let dest_mtime = dest_transport.get_mtime(&dest_path).await?;
+            dest_transport
+                .write_file(&dest_conflict, &dest_data, dest_mtime)
+                .await?;
+            dest_transport.remove(&dest_path, false).await?;
 
             Ok(0)
         }
     }
 }
 
-/// Copy a file (simple implementation, will use transport layer in full version)
-fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
-    // Create parent directory if needed
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+/// Copy a file across transports (e.g., local to SSH, or SSH to local)
+async fn copy_file_across_transports(
+    from_transport: &Arc<dyn Transport>,
+    to_transport: &Arc<dyn Transport>,
+    src: &Path,
+    dst: &Path,
+) -> Result<u64> {
+    // Read from source transport
+    let data = from_transport.read_file(src).await?;
+    let mtime = from_transport.get_mtime(src).await?;
 
-    std::fs::copy(src, dst).map_err(Into::into)
-}
+    // Write to destination transport
+    to_transport.write_file(dst, &data, mtime).await?;
 
-/// Delete a file
-fn delete_file(path: &Path) -> Result<()> {
-    std::fs::remove_file(path).map_err(Into::into)
+    Ok(data.len() as u64)
 }
 
 /// Update state database after sync
