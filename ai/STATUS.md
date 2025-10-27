@@ -3,11 +3,19 @@
 _Last Updated: 2025-10-27_
 
 ## Current State
-- Version: v0.0.46 (released 2025-10-27)
-- Phase: SSH bidirectional sync - production ready
+- Version: v0.0.47-dev (fix ready, not yet released)
+- Phase: SSH bidirectional sync - **FIXED** ✅
 - Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
+
+### ✅ CRITICAL BUG FIXED (v0.0.47-dev)
+**SSH Bidirectional Sync Now Works**
+- **v0.0.46 Issue**: `SshTransport` missing `write_file()` implementation - bisync reported success but files never written to remote
+- **v0.0.47 Fix**: Implemented `write_file()` for SSH transport (src/transport/ssh.rs:1244-1332)
+- **Testing**: All 8 real-world SSH bisync tests pass (Mac ↔ Fedora over Tailscale)
+- **Verification**: Deletion propagation, conflict resolution, large files (10MB @ 8.27 MB/s), dry-run all work
+- **Status**: Ready for v0.0.47 release
 
 ## Implemented Features
 - ✅ Local and remote (SSH) sync
@@ -72,9 +80,11 @@ _Last Updated: 2025-10-27_
 - **Dead code annotations** (2025-10-26): Using #[allow(dead_code)] with explanatory comments for intentional unused code (public APIs, future features, test infrastructure) maintains production quality while preserving library interface and extensibility points
 - **SSH bidirectional sync** (2025-10-26): Refactored BisyncEngine to use Transport abstraction; made sync() async; replaced direct std::fs calls with transport.read_file()/write_file(); enables local↔remote and remote↔remote bisync; ~200 lines changed in engine.rs + ~70 lines in main.rs
 - **Real-world bisync testing** (2025-10-27): Created comprehensive test suite (bisync_real_world_test.sh) with 7 scenarios; caught critical state storage bug before release; test-driven debugging approach (create minimal failing test → trace through code → identify root cause → fix → verify all tests pass) was highly effective
+- **SSH write_file() implementation** (2025-10-27): Discovered v0.0.46 shipped with broken SSH bisync (write_file not implemented); files reported as synced but never written to remote; implemented write_file() using SFTP session with recursive mkdir, file creation, mtime preservation; 89 lines; tested Mac↔Fedora over Tailscale; all 8 comprehensive tests pass including deletion propagation, conflicts, large files (10MB @ 8.27 MB/s), dry-run
 
 ## What Didn't Work
-- **Bisync state storage (2025-10-27)**: Initial implementation only stored destination side state after copy operations, not both sides; caused deletions to be misclassified as "new files" and copied back instead of propagating; fixed by storing both source AND dest states after any copy
+- **Bisync state storage (2025-10-27, v0.0.46)**: Initial implementation only stored destination side state after copy operations, not both sides; caused deletions to be misclassified as "new files" and copied back instead of propagating; fixed by storing both source AND dest states after any copy
+- **SSH bisync write_file missing** (2025-10-27, v0.0.46): SshTransport didn't implement write_file(), falling back to LocalTransport default which writes locally; bisync silently failed - reported success but files never reached remote; caught by real-world testing Mac↔Fedora; fixed in v0.0.47
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
 - Compression on local/high-speed: CPU bottleneck negates benefits above 4Gbps
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support

@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.47] - 2025-10-27
+
+### Fixed
+- **CRITICAL: SSH Bidirectional Sync** - Implemented missing `write_file()` for SSH transport
+  - Root cause: `SshTransport` didn't override `write_file()`, falling back to local filesystem writes
+  - Impact: v0.0.46 bisync reported success but files never reached remote server
+  - Fix: Implemented `write_file()` using SFTP with recursive directory creation and mtime preservation (89 lines)
+  - Testing: All 8 comprehensive SSH bisync tests pass (Mac ↔ Fedora over Tailscale)
+  - Verified: Deletion propagation, conflict resolution, large files (10MB @ 8.27 MB/s), dry-run mode
+  - **Users on v0.0.46: SSH bidirectional sync is broken, upgrade to v0.0.47 immediately**
+
+### Testing
+- Added comprehensive SSH bisync test suite with 8 real-world scenarios
+- Tested Mac (M3 Max) ↔ Fedora (i9-13900KF) over Tailscale
+- All 410 unit tests passing, 0 regressions
+
 ## [0.0.46] - 2025-10-27
+
+**⚠️ CRITICAL BUG: SSH bidirectional sync does not work in this version. Files are not written to remote. Upgrade to v0.0.47 immediately.**
 
 ### Added
 - **Conflict History Logging** - Automatic audit trail for bidirectional sync

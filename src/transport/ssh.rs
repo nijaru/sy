@@ -1241,6 +1241,103 @@ impl Transport for SshTransport {
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
+    async fn write_file(
+        &self,
+        path: &Path,
+        data: &[u8],
+        mtime: std::time::SystemTime,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let path_buf = path.to_path_buf();
+        let data_vec = data.to_vec();
+        let session_arc = self.connection_pool.get_session();
+
+        tokio::task::spawn_blocking(move || {
+            let session = session_arc.lock().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to lock session: {}",
+                    e
+                )))
+            })?;
+
+            let sftp = session.sftp().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create SFTP session: {}",
+                    e
+                )))
+            })?;
+
+            // Create parent directories recursively if needed
+            if let Some(parent) = path_buf.parent() {
+                let mut current = std::path::PathBuf::new();
+                for component in parent.components() {
+                    current.push(component);
+                    // Try to create each directory level, ignore if already exists
+                    sftp.mkdir(&current, 0o755).ok();
+                }
+            }
+
+            // Create/open remote file for writing
+            let mut remote_file = sftp
+                .create(&path_buf)
+                .map_err(|e| {
+                    SyncError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Failed to create remote file {}: {}", path_buf.display(), e),
+                    ))
+                })?;
+
+            // Write data
+            remote_file.write_all(&data_vec).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to write to {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            remote_file.flush().map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to flush {}: {}", path_buf.display(), e),
+                ))
+            })?;
+
+            // Set mtime on remote file
+            let mtime_secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            sftp.setstat(
+                &path_buf,
+                ssh2::FileStat {
+                    size: None,
+                    uid: None,
+                    gid: None,
+                    perm: None,
+                    atime: Some(mtime_secs),
+                    mtime: Some(mtime_secs),
+                },
+            )
+            .map_err(|e| {
+                tracing::warn!("Failed to set mtime on {}: {}", path_buf.display(), e);
+                // Don't fail the entire operation if setstat fails
+            })
+            .ok();
+
+            tracing::debug!(
+                "Wrote {} bytes to remote file {}",
+                data_vec.len(),
+                path_buf.display()
+            );
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
+
     async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
         let path_buf = path.to_path_buf();
         let session_arc = self.connection_pool.get_session();
