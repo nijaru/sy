@@ -225,7 +225,7 @@ impl Scanner {
         let mut walker = WalkBuilder::new(&self.root);
         walker
             .hidden(false) // Don't skip hidden files by default
-            .git_ignore(true) // Respect .gitignore
+            .git_ignore(true) // Respect .gitignore (in git repos)
             .git_global(true) // Respect global gitignore
             .git_exclude(true) // Respect .git/info/exclude
             .threads(self.threads) // Parallel walking if threads > 1
@@ -234,6 +234,13 @@ impl Scanner {
                 // Skip .git directories
                 entry.file_name() != ".git"
             });
+
+        // Also respect .gitignore files even outside git repos
+        // This allows .gitignore to work in non-git directories
+        let gitignore_path = self.root.join(".gitignore");
+        if gitignore_path.exists() {
+            walker.add_ignore(&gitignore_path);
+        }
 
         Ok(StreamingScanner {
             root: self.root.clone(),
@@ -395,6 +402,72 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.relative_path.to_str() == Some("included.txt")));
+    }
+
+    #[test]
+    fn test_scanner_gitignore_without_git_repo() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // NO git init - testing .gitignore without git repo
+
+        // Create .gitignore with multiple patterns
+        fs::write(
+            root.join(".gitignore"),
+            "*.tmp\n*.log\nnode_modules/\n.DS_Store\n",
+        )
+        .unwrap();
+
+        // Create files matching patterns (should be ignored)
+        fs::write(root.join("test.tmp"), "should be ignored").unwrap();
+        fs::write(root.join("debug.log"), "should be ignored").unwrap();
+        fs::create_dir(root.join("node_modules")).unwrap();
+        fs::write(
+            root.join("node_modules").join("package.txt"),
+            "should be ignored",
+        )
+        .unwrap();
+
+        // Create files NOT matching patterns (should be included)
+        fs::write(root.join("normal.txt"), "should be included").unwrap();
+        fs::write(root.join("important.rs"), "should be included").unwrap();
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // Ignored files should NOT appear
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.relative_path.to_str() == Some("test.tmp")),
+            "test.tmp should be ignored"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.relative_path.to_str() == Some("debug.log")),
+            "debug.log should be ignored"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.relative_path.to_str() == Some("node_modules")),
+            "node_modules/ should be ignored"
+        );
+
+        // Normal files SHOULD appear
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.relative_path.to_str() == Some("normal.txt")),
+            "normal.txt should be included"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.relative_path.to_str() == Some("important.rs")),
+            "important.rs should be included"
+        );
     }
 
     #[test]
