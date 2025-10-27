@@ -395,7 +395,8 @@ fn update_state(
         match action {
             SyncAction::CopyToSource(entry) => {
                 // File now exists on both sides with same content
-                let state = SyncState {
+                // Store state for both source and dest
+                let source_state = SyncState {
                     path: entry.relative_path.clone(),
                     side: Side::Source,
                     mtime: entry.modified,
@@ -403,10 +404,9 @@ fn update_state(
                     checksum: None,
                     last_sync: now,
                 };
-                state_db.store(&state)?;
-            }
-            SyncAction::CopyToDest(entry) => {
-                let state = SyncState {
+                state_db.store(&source_state)?;
+
+                let dest_state = SyncState {
                     path: entry.relative_path.clone(),
                     side: Side::Dest,
                     mtime: entry.modified,
@@ -414,7 +414,30 @@ fn update_state(
                     checksum: None,
                     last_sync: now,
                 };
-                state_db.store(&state)?;
+                state_db.store(&dest_state)?;
+            }
+            SyncAction::CopyToDest(entry) => {
+                // File now exists on both sides with same content
+                // Store state for both source and dest
+                let source_state = SyncState {
+                    path: entry.relative_path.clone(),
+                    side: Side::Source,
+                    mtime: entry.modified,
+                    size: entry.size,
+                    checksum: None,
+                    last_sync: now,
+                };
+                state_db.store(&source_state)?;
+
+                let dest_state = SyncState {
+                    path: entry.relative_path.clone(),
+                    side: Side::Dest,
+                    mtime: entry.modified,
+                    size: entry.size,
+                    checksum: None,
+                    last_sync: now,
+                };
+                state_db.store(&dest_state)?;
             }
             SyncAction::DeleteFromSource(path) => {
                 state_db.delete(path)?;
