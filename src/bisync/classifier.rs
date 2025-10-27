@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 use crate::bisync::state::Side;
-use crate::bisync::state::SyncState;
+use crate::bisync::state::{StateMap, SyncState};
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ pub struct Change {
 pub fn classify_changes(
     source_files: &[FileEntry],
     dest_files: &[FileEntry],
-    prior_state: &HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>,
+    prior_state: &StateMap,
 ) -> Result<Vec<Change>> {
     // Build lookups by relative path
     let mut source_map: HashMap<PathBuf, &FileEntry> = HashMap::new();
@@ -89,7 +89,7 @@ fn classify_single_path(
     prior_dest: Option<&SyncState>,
 ) -> Result<Option<Change>> {
     // Skip directories (we only sync files)
-    if source_entry.map_or(false, |e| e.is_dir) || dest_entry.map_or(false, |e| e.is_dir) {
+    if source_entry.is_some_and(|e| e.is_dir) || dest_entry.is_some_and(|e| e.is_dir) {
         return Ok(None);
     }
 

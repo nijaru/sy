@@ -28,6 +28,10 @@ pub enum Side {
     Dest,
 }
 
+/// Type alias for the state map returned by load_all()
+/// Maps path to (source_state, dest_state) tuple
+pub type StateMap = HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>;
+
 impl Side {
     fn as_str(&self) -> &'static str {
         match self {
@@ -51,7 +55,7 @@ pub struct BisyncStateDb {
     source_path: PathBuf,
     dest_path: PathBuf,
     // In-memory cache for faster lookups
-    states: HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>,
+    states: StateMap,
 }
 
 impl BisyncStateDb {
@@ -136,10 +140,10 @@ impl BisyncStateDb {
     /// Load state from file
     fn load_from_file(
         path: &Path,
-    ) -> Result<HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>> {
+    ) -> Result<StateMap> {
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let mut states: HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)> =
+        let mut states: StateMap =
             HashMap::new();
 
         for (line_num, line) in reader.lines().enumerate() {
@@ -348,7 +352,7 @@ impl BisyncStateDb {
     }
 
     /// Load all state records
-    pub fn load_all(&self) -> Result<HashMap<PathBuf, (Option<SyncState>, Option<SyncState>)>> {
+    pub fn load_all(&self) -> Result<StateMap> {
         Ok(self.states.clone())
     }
 

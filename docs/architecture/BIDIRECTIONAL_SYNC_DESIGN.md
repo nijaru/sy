@@ -1,14 +1,21 @@
 # Bidirectional Sync Design
 
-**Status**: Design Phase
-**Target Version**: v0.0.43
-**Complexity**: Medium (~500-700 lines estimated)
+**Status**: ✅ IMPLEMENTED
+**Implemented In**: v0.0.43 (local), v0.0.44 (text format), v0.0.46 (SSH support)
+**Lines of Code**: ~2,000 lines (engine, classifier, resolver, state)
 
 ## Overview
 
-Add bidirectional synchronization with automatic conflict resolution to sy, enabling laptop ↔ desktop, local ↔ backup, and similar two-way sync scenarios.
+Bidirectional synchronization with automatic conflict resolution, enabling laptop ↔ desktop, local ↔ backup, and remote server scenarios.
 
-**Goal**: Cover 80% of bidirectional use cases with minimal complexity using snapshot-based state tracking and newest-wins resolution.
+**Achieved**: Covers 80% of bidirectional use cases using snapshot-based state tracking with 6 conflict resolution strategies.
+
+**SSH Support** (v0.0.46): Works with remote servers via Transport abstraction. Supports:
+- Local ↔ Local
+- Local ↔ Remote (SSH)
+- Remote ↔ Remote (SSH)
+
+**Implementation Note**: Text-based state format (v0.0.44) replaced initial SQLite design for simplicity and debuggability.
 
 ## Non-Goals (Deferred to Future)
 

@@ -36,6 +36,13 @@
 None currently - ready for next feature!
 
 ## Recently Completed
+- [x] SSH Bidirectional Sync (v0.0.46) - COMPLETE ✅
+  - [x] Refactor BisyncEngine to use Transport abstraction
+  - [x] Make sync() async for remote operations
+  - [x] Support local↔local, local↔remote, and remote↔remote
+  - [x] Update CLI with transport creation logic
+  - [x] Performance profiling (no bottlenecks found)
+  - [x] All 410 tests passing, 0 warnings
 - [x] macOS BSD File Flags (v0.0.41) - COMPLETE ✅
   - [x] Research macOS-specific features (comprehensive analysis complete)
   - [x] Add bsd_flags field to FileEntry struct
@@ -66,11 +73,15 @@ None currently - ready for next feature!
   - Finder tags preserved via `com.apple.metadata:_kMDItemUserTags` xattr
   - Resource forks preserved via `com.apple.ResourceFork` xattr
   - BSD file flags preserved with `-F` flag (hidden, immutable, nodump, etc.)
-- [ ] Sparse file optimization improvements
+- [x] SSH connection pooling - COMPLETE ✅ (v0.0.42)
+- [x] SSH sparse file transfer - COMPLETE ✅ (v0.0.42)
+- [x] Bidirectional sync - COMPLETE ✅ (v0.0.43-v0.0.46)
+  - Text-based state tracking (v0.0.44)
+  - SSH support for remote servers (v0.0.46)
+- [ ] Sparse file optimization improvements (foundation complete, SSH integration done)
 - [ ] Windows-specific features (file attributes, ACLs)
-- [ ] Multi-destination sync
-- [ ] Bidirectional sync
-- [ ] Cloud storage backends
+- [ ] Multi-destination sync (deferred - shell loops work fine)
+- [ ] Cloud storage backends (AWS S3 basic support done v0.0.22, expansion TBD)
 - [ ] Plugin system
 
 ## Technical Debt
