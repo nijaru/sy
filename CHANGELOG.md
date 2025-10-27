@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.48] - 2025-10-27
+
+### Added
+- **Remote→Remote Bidirectional Sync** - Sync between two SSH hosts
+  - Dual SSH connection pools for parallel remote→remote operations
+  - Independent SSH configs for source and destination hosts
+  - Tested: Mac→Fedora→Fedora with bidirectional changes
+  - Removes major limitation from v0.0.47
+  - Example: `sy -b user@host1:/path user@host2:/path`
+
+### Fixed
+- **.gitignore Support Outside Git Repos** - Patterns now respected everywhere
+  - Root cause: `ignore` crate's `git_ignore(true)` only works in git repositories
+  - Impact: v0.0.47 synced all files (*.tmp, *.log, node_modules/) despite .gitignore
+  - Fix: Explicitly add .gitignore file using `WalkBuilder::add_ignore()`
+  - Works in any directory, git repo or not
+  - Added test: `test_scanner_gitignore_without_git_repo`
+  - Verified: SSH bisync respects .gitignore patterns correctly
+
+### Testing
+- Comprehensive test report: 23 scenarios, 91.3% pass rate (21/23)
+- Both previously failed tests now pass
+- 410+ unit tests passing
+
 ## [0.0.47] - 2025-10-27
 
 ### Fixed
