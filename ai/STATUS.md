@@ -3,11 +3,37 @@
 _Last Updated: 2025-10-27_
 
 ## Current State
-- Version: v0.0.48 (released 2025-10-27)
-- Phase: Remote→remote sync + .gitignore fixes - **RELEASED** ✅
-- Test Coverage: 411 tests passing (23/23 comprehensive SSH bisync tests pass, 12 ignored)
+- Version: v0.0.49 (in development)
+- Phase: Network interruption recovery - **IN PROGRESS** 🚧
+- Completed: Phase 1 (error classification) + Phase 2 (retry logic)
+- Test Coverage: 928 tests passing (23/23 comprehensive SSH bisync tests pass, 28 ignored)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
+
+### 🚧 v0.0.49 DEVELOPMENT (Network Interruption Recovery)
+**Goal**: Handle SSH disconnects mid-transfer gracefully with retry and resume
+
+**✅ Phase 1: Error Classification** (commit: 3e533a2)
+- Added 4 network error types: NetworkTimeout, NetworkDisconnected, NetworkRetryable, NetworkFatal
+- Implemented is_retryable() and requires_reconnection() helper methods
+- Added from_ssh_io_error() to classify IO errors based on ErrorKind
+- 12 comprehensive tests for error classification logic
+
+**✅ Phase 2: Retry Logic with Exponential Backoff** (commit: 3e533a2)
+- Created retry module with RetryConfig and retry_with_backoff()
+- Configurable max attempts (default: 3), initial delay (default: 1s), backoff multiplier (2.0)
+- Added --retry and --retry-delay CLI flags
+- 9 tests for retry logic (success, failure, exhaustion, non-retryable errors)
+
+**⏳ Phase 3: Resume Capability** (pending)
+- Chunked transfer with progress tracking
+- Store/load resume state
+- CLI flags: --no-resume, --resume-only, --clear-resume-state
+
+**⏳ Phase 4: Connection Pool Resilience** (pending)
+- Add is_session_alive() check
+- Implement reconnect_session()
+- Auto-reconnect on network errors
 
 ### ✅ v0.0.48 RELEASE (2025-10-27)
 **Two Critical Fixes from Comprehensive Testing**
@@ -90,6 +116,8 @@ _Last Updated: 2025-10-27_
 - **SSH bidirectional sync** (2025-10-26): Refactored BisyncEngine to use Transport abstraction; made sync() async; replaced direct std::fs calls with transport.read_file()/write_file(); enables local↔remote and remote↔remote bisync; ~200 lines changed in engine.rs + ~70 lines in main.rs
 - **Real-world bisync testing** (2025-10-27): Created comprehensive test suite (bisync_real_world_test.sh) with 7 scenarios; caught critical state storage bug before release; test-driven debugging approach (create minimal failing test → trace through code → identify root cause → fix → verify all tests pass) was highly effective
 - **SSH write_file() implementation** (2025-10-27): Discovered v0.0.46 shipped with broken SSH bisync (write_file not implemented); files reported as synced but never written to remote; implemented write_file() using SFTP session with recursive mkdir, file creation, mtime preservation; 89 lines; tested Mac↔Fedora over Tailscale; all 8 comprehensive tests pass including deletion propagation, conflicts, large files (10MB @ 8.27 MB/s), dry-run
+- **Network error classification** (2025-10-27, v0.0.49): Systematic classification of IO errors into retryable vs fatal types using ErrorKind pattern matching; helper methods (is_retryable, requires_reconnection, from_ssh_io_error) provide clean API; comprehensive test coverage (12 tests) ensures correct classification for all error types; foundation for robust network interruption handling
+- **Retry with exponential backoff** (2025-10-27, v0.0.49): Generic retry_with_backoff() function with configurable delays and backoff multiplier enables resilient network operations; CLI integration (--retry, --retry-delay flags) gives users control; 9 tests verify success, failure, exhaustion, and non-retryable scenarios; clean separation of retry logic from business logic promotes reuse
 
 ## What Didn't Work
 - **Bisync state storage (2025-10-27, v0.0.46)**: Initial implementation only stored destination side state after copy operations, not both sides; caused deletions to be misclassified as "new files" and copied back instead of propagating; fixed by storing both source AND dest states after any copy
@@ -101,7 +129,13 @@ _Last Updated: 2025-10-27_
 - SSH ControlMaster for parallel transfers: Bottlenecks all transfers on one TCP connection; defeats purpose of parallel workers
 
 ## Active Work
-None
+- **Network Interruption Recovery (v0.0.49)**
+  - ✅ Phase 1: Error classification (NetworkTimeout, NetworkDisconnected, NetworkRetryable, NetworkFatal)
+  - ✅ Phase 2: Retry logic with exponential backoff (--retry, --retry-delay flags)
+  - ⏳ Phase 3: Resume capability for interrupted transfers
+  - ⏳ Phase 4: Connection pool resilience (auto-reconnect)
+  - Design: ai/research/network_interruption_recovery_2025.md
+  - Next: Implement chunked transfers with resume state tracking
 
 ## Recently Completed
 - ✅ Performance Profiling (2025-10-26, commit d6ab721)
