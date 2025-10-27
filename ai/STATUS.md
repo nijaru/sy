@@ -3,19 +3,19 @@
 _Last Updated: 2025-10-27_
 
 ## Current State
-- Version: v0.0.47-dev (fix ready, not yet released)
-- Phase: SSH bidirectional sync - **FIXED** ✅
+- Version: v0.0.47 (released 2025-10-27)
+- Phase: SSH bidirectional sync - **FIXED AND RELEASED** ✅
 - Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 
-### ✅ CRITICAL BUG FIXED (v0.0.47-dev)
+### ✅ CRITICAL BUG FIXED (v0.0.47)
 **SSH Bidirectional Sync Now Works**
 - **v0.0.46 Issue**: `SshTransport` missing `write_file()` implementation - bisync reported success but files never written to remote
 - **v0.0.47 Fix**: Implemented `write_file()` for SSH transport (src/transport/ssh.rs:1244-1332)
 - **Testing**: All 8 real-world SSH bisync tests pass (Mac ↔ Fedora over Tailscale)
 - **Verification**: Deletion propagation, conflict resolution, large files (10MB @ 8.27 MB/s), dry-run all work
-- **Status**: Ready for v0.0.47 release
+- **Released**: 2025-10-27 to crates.io and GitHub
 
 ## Implemented Features
 - ✅ Local and remote (SSH) sync
