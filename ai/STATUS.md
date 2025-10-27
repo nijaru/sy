@@ -109,6 +109,14 @@ None
   - SSH pool API methods (backward compatibility) ✅
   - Build status: 0 warnings, 410 tests passing ✅
   - Committed and pushed to main ✅
+- ✅ Bisync Enhancements (2025-10-27, commit 074ec7a)
+  - **Conflict History Logging**: Automatic audit trail in ~/.cache/sy/bisync/*.conflicts.log ✅
+  - **Format**: timestamp | path | conflict_type | strategy | winner ✅
+  - **Winner Resolution**: Intelligent logic for newer/larger/smaller/source/dest/rename strategies ✅
+  - **Append-only**: Preserves complete conflict history across syncs ✅
+  - **Exclude Patterns**: Confirmed .gitignore support works with bisync ✅
+  - **Documentation**: Updated README and BIDIRECTIONAL_SYNC_DESIGN.md ✅
+  - **Testing**: All 410 unit tests + 11 real-world bisync tests pass ✅
 - ✅ Critical Bisync State Storage Bug Fix (2025-10-27, commit 84f065b)
   - **Issue**: update_state() only stored one side after copy operations ✅
   - **Impact**: Deletions misclassified as "new files", copied back instead of propagating ✅

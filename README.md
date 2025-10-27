@@ -735,6 +735,8 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   - Dry-run support: Preview changes before syncing
   - Content equality checks: Reduces false conflict detection
   - State persistence: Survives interruptions and errors
+  - **Conflict History Logging** (v0.0.46+): Automatic audit trail of all resolved conflicts in `~/.cache/sy/bisync/<pair>.conflicts.log`
+  - **Exclude Patterns**: Respects `.gitignore` files for filtering synced files (e.g., skip `.DS_Store`, `node_modules/`, `*.tmp`)
 - **Example Usage**:
   ```bash
   # Basic bidirectional sync (newest-wins)
@@ -764,6 +766,15 @@ sy /large-project /backup --clear-cache                 # Clear cache and re-sca
   sy -b /local/docs user@host:/remote/docs       # Local ↔ Remote
   sy -b user@host1:/data user@host2:/backup      # Remote ↔ Remote
   sy -b /laptop/work user@server:/work -p 8      # With parallel transfers
+
+  # View conflict history (v0.0.46+)
+  cat ~/.cache/sy/bisync/*.conflicts.log
+  # Format: timestamp | path | conflict_type | strategy | winner
+  # Example: 1761584658 | file.txt | both modified | newer | dest (newer)
+
+  # Exclude patterns (respects .gitignore)
+  echo "*.tmp\nnode_modules/\n.DS_Store" > /source/.gitignore
+  sy -b /source /dest  # Automatically skips excluded files
   ```
 - **Current Status**: Supports local↔local, local↔remote, and remote↔remote (v0.0.46+)
 

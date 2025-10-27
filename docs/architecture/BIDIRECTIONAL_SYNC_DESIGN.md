@@ -1,8 +1,8 @@
 # Bidirectional Sync Design
 
 **Status**: ✅ IMPLEMENTED
-**Implemented In**: v0.0.43 (local), v0.0.44 (text format), v0.0.46 (SSH support)
-**Lines of Code**: ~2,000 lines (engine, classifier, resolver, state)
+**Implemented In**: v0.0.43 (local), v0.0.44 (text format), v0.0.46 (SSH support + conflict logging)
+**Lines of Code**: ~2,100 lines (engine, classifier, resolver, state, conflict logging)
 
 ## Overview
 
@@ -22,7 +22,7 @@ Bidirectional synchronization with automatic conflict resolution, enabling lapto
 - Full Unison-style reconciliation with external merge tools
 - Syncthing-style continuous sync with vector clocks
 - Multi-device sync (>2 endpoints)
-- Conflict history tracking and manual resolution UI
+- Manual conflict resolution UI (automatic history logging implemented in v0.0.46)
 
 ## Design Principles
 
@@ -452,6 +452,62 @@ fn check_deletion_limit(changes: &[Change], max_delete_percent: u8) -> Result<()
 - Display conflicts and how they would be resolved
 - Do NOT modify files or update state
 - Exit code: 0 if no conflicts, 1 if conflicts detected
+
+### Conflict History Logging (v0.0.46+)
+
+**Purpose**: Provide audit trail of all resolved conflicts for debugging and compliance
+
+**Implementation**:
+- Log file: `~/.cache/sy/bisync/<hash>.conflicts.log`
+- Format: `timestamp | path | conflict_type | strategy | winner`
+- Append-only: Preserves complete history across syncs
+- Automatically logged after conflict detection (except dry-run)
+
+**Winner Resolution**:
+- `newer`: Compares mtimes → "source (newer)" or "dest (newer)"
+- `larger`/`smaller`: Compares sizes → "source (larger)" etc.
+- `source`/`dest`: Shows "source" or "dest"
+- `rename`: Shows "both (renamed)"
+
+**Example Log Entries**:
+```
+1761584658 | conflict.txt | both modified | newer | dest (newer)
+1761584671 | rename.txt | both modified | rename | both (renamed)
+1761584682 | force.txt | both modified | source | source
+```
+
+**Benefits**:
+- Audit trail for compliance and debugging
+- Track conflict patterns over time
+- Rollback decisions with historical context
+- No performance impact (append-only writes)
+
+### Exclude Patterns
+
+**Purpose**: Filter files during bidirectional sync (e.g., skip temp files, build artifacts)
+
+**Implementation**:
+- Respects `.gitignore` files in source directories
+- Respects global gitignore (`~/.gitignore_global`)
+- Respects `.git/info/exclude`
+- Automatically filters `.git` directories
+
+**Common Use Cases**:
+```gitignore
+# macOS
+.DS_Store
+.AppleDouble
+
+# Build artifacts
+node_modules/
+target/
+*.o
+*.pyc
+
+# Temporary files
+*.tmp
+*.swp
+```
 
 ## Error Handling
 
