@@ -33,10 +33,78 @@
     - [x] Update documentation (comprehensive README coverage)
 
 ## In Progress
-None currently - ready for next feature!
+
+### Phase: Production Hardening (v0.0.49+)
+**Goal**: Close critical test gaps before wider adoption. Based on COMPREHENSIVE_TEST_REPORT.md findings.
+
+**🔴 HIGH PRIORITY - Production-Critical**
+
+- [ ] Network Interruption Recovery (v0.0.49)
+  - [ ] Handle SSH disconnects mid-transfer gracefully
+  - [ ] Add resume capability (track partial transfers)
+  - [ ] Implement retry logic with exponential backoff
+  - [ ] Clear error messages on network failures
+  - [ ] Test: Simulate drops during large transfers
+  - **Why**: Most likely real-world failure mode, users lose work without this
+
+- [ ] Large File Testing (1GB+)
+  - [ ] Test 100MB, 500MB, 1GB files
+  - [ ] Verify no OOM issues
+  - [ ] Check progress accuracy at scale
+  - [ ] Measure throughput degradation
+  - **Why**: Current max tested is 10MB, backup use cases need confidence
+
+- [ ] Massive Directory Testing (10K+ files)
+  - [ ] Test with 1K, 10K, 100K file trees
+  - [ ] Verify O(n) memory behavior
+  - [ ] Check performance doesn't degrade
+  - [ ] Validate state file sizes reasonable
+  - **Why**: Real repos/projects much larger than 100 files tested
+
+**🟡 MEDIUM PRIORITY - Safety & Polish**
+
+- [ ] State Corruption Recovery
+  - [ ] Detect corrupt ~/.cache/sy/bisync/*.lst files
+  - [ ] Offer to rebuild state from scratch
+  - [ ] Add state file format validation
+  - **Why**: Users will inevitably mess with these files
+
+- [ ] Concurrent Sync Safety
+  - [ ] Prevent multiple syncs to same pair
+  - [ ] Add lock file or PID check
+  - [ ] Clear error message when blocked
+  - **Why**: Race conditions = data loss
+
+- [ ] Hard Link Handling in Bisync
+  - [ ] Test hard link preservation in bisync mode
+  - [ ] Add tests for hard link conflicts
+  - **Why**: Dev environments use hard links heavily (node_modules)
+
+**🟢 LOW PRIORITY - Future Features**
+
+- [ ] S3 Bidirectional Sync
+  - [ ] Extend bisync to S3↔local
+  - [ ] Handle S3 eventual consistency
+  - **Why**: Cloud backup workflows
+
+- [ ] Encryption Support
+  - [ ] Encrypt before sending over SSH
+  - [ ] Age or GPG integration
+  - **Why**: Zero-trust environments
+
+- [ ] Per-File Progress
+  - [ ] Show progress bar for individual large files
+  - [ ] Better UX than batch-only progress
+  - **Why**: User experience improvement
 
 ## Recently Completed
-- [x] SSH Bidirectional Sync (v0.0.46) - COMPLETE ✅
+- [x] Remote→Remote Sync + .gitignore Fixes (v0.0.48) - COMPLETE ✅
+  - [x] Implement remote→remote bidirectional sync (dual SSH pools)
+  - [x] Fix .gitignore support outside git repos (add_ignore fix)
+  - [x] Comprehensive testing: 23/23 scenarios pass (100% up from 91.3%)
+  - [x] Release: crates.io + GitHub
+  - [x] Documentation: COMPREHENSIVE_TEST_REPORT.md, release notes
+- [x] SSH Bidirectional Sync (v0.0.46-v0.0.47) - COMPLETE ✅
   - [x] Refactor BisyncEngine to use Transport abstraction
   - [x] Make sync() async for remote operations
   - [x] Support local↔local, local↔remote, and remote↔remote
