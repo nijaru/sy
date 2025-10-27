@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.46] - 2025-10-27
+
+### Added
+- **Conflict History Logging** - Automatic audit trail for bidirectional sync
+  - Logs all resolved conflicts to `~/.cache/sy/bisync/<pair>.conflicts.log`
+  - Format: `timestamp | path | conflict_type | strategy | winner`
+  - Append-only log preserves complete conflict history
+  - Intelligent winner resolution for all 6 conflict strategies
+  - Skips logging in dry-run mode
+- **Exclude Patterns Documentation** - Documented existing `.gitignore` support
+  - Bisync respects `.gitignore` files for filtering synced files
+  - Supports global gitignore (`~/.gitignore_global`)
+  - Automatically excludes `.git` directories
+  - Common patterns: `.DS_Store`, `node_modules/`, `*.tmp`
+
+### Fixed
+- **Critical Bisync State Storage Bug** - Fixed deletion propagation
+  - Root cause: `update_state()` only stored one side after copy operations
+  - Impact: Deletions were misclassified as "new files" and copied back
+  - Fix: Store both source AND dest states after any copy operation
+  - Deletion safety limits now work correctly
+  - State persistence across syncs now reliable
+  - Idempotent syncs properly detect no changes
+- **Clippy Warnings** - Resolved 5 clippy warnings for release
+  - Fixed `ptr_arg` warnings (use `&Path` instead of `&PathBuf`)
+  - Fixed `unnecessary_unwrap` with proper `if let` patterns
+  - Added annotations for intentional patterns
+
+### Changed
+- Enhanced documentation for conflict logging in README and design docs
+- Improved error messages for conflict resolution
+
+### Testing
+- Created `bisync_real_world_test.sh` with 7 comprehensive test scenarios
+- All 410 unit tests passing
+- All 11 real-world bisync tests passing
+- 0 compiler warnings, 0 clippy warnings
+
 ## [0.0.45] - 2025-10-26
 
 ### Fixed
