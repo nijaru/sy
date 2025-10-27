@@ -249,8 +249,7 @@ impl BisyncStateDb {
             writeln!(file, "# last_sync: {}", now.to_rfc3339())?;
 
             // Collect and sort entries for deterministic output
-            let mut entries: Vec<(&PathBuf, &(Option<SyncState>, Option<SyncState>))> =
-                self.states.iter().collect();
+            let mut entries: Vec<_> = self.states.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
 
             // Write each state

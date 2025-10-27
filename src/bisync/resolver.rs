@@ -3,7 +3,7 @@
 use crate::bisync::classifier::{Change, ChangeType};
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Conflict resolution strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum ConflictResolution {
 }
 
 impl ConflictResolution {
+    #[allow(clippy::should_implement_trait)] // Named to match other from_str methods in codebase
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "newer" => Some(Self::Newer),
@@ -32,6 +33,7 @@ impl ConflictResolution {
 
 /// Resolution action to take
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // RenameConflict is intentionally larger, used rarely
 pub enum SyncAction {
     CopyToSource(FileEntry),      // Copy dest → source
     CopyToDest(FileEntry),         // Copy source → dest
@@ -148,10 +150,13 @@ fn resolve_conflict(change: &Change, strategy: ConflictResolution) -> Result<Syn
             } else {
                 // Modify-delete conflict: can't rename if one doesn't exist
                 // Fall back to keeping the existing file
-                if source.is_some() {
-                    Ok(SyncAction::CopyToDest(source.unwrap().clone()))
+                if let Some(s) = source {
+                    Ok(SyncAction::CopyToDest(s.clone()))
+                } else if let Some(d) = dest {
+                    Ok(SyncAction::CopyToSource(d.clone()))
                 } else {
-                    Ok(SyncAction::CopyToSource(dest.unwrap().clone()))
+                    // Both None - shouldn't happen, but return a no-op action
+                    Ok(SyncAction::DeleteFromSource(PathBuf::new()))
                 }
             }
         }
@@ -162,7 +167,7 @@ fn resolve_conflict(change: &Change, strategy: ConflictResolution) -> Result<Syn
 fn resolve_by_mtime(
     source: Option<&FileEntry>,
     dest: Option<&FileEntry>,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<SyncAction> {
     match (source, dest) {
         (Some(s), Some(d)) => {
@@ -183,7 +188,7 @@ fn resolve_by_mtime(
         (None, Some(d)) => Ok(SyncAction::CopyToSource(d.clone())),
         (None, None) => {
             // Both deleted - nothing to do (shouldn't happen)
-            Ok(SyncAction::DeleteFromSource(path.clone()))
+            Ok(SyncAction::DeleteFromSource(path.to_path_buf()))
         }
     }
 }
@@ -192,7 +197,7 @@ fn resolve_by_mtime(
 fn resolve_by_size(
     source: Option<&FileEntry>,
     dest: Option<&FileEntry>,
-    path: &PathBuf,
+    path: &Path,
     prefer_smaller: bool,
 ) -> Result<SyncAction> {
     match (source, dest) {
@@ -218,7 +223,7 @@ fn resolve_by_size(
         }
         (Some(s), None) => Ok(SyncAction::CopyToDest(s.clone())),
         (None, Some(d)) => Ok(SyncAction::CopyToSource(d.clone())),
-        (None, None) => Ok(SyncAction::DeleteFromSource(path.clone())),
+        (None, None) => Ok(SyncAction::DeleteFromSource(path.to_path_buf())),
     }
 }
 
@@ -232,7 +237,7 @@ fn generate_conflict_timestamp() -> String {
 }
 
 /// Generate conflict filename
-pub fn conflict_filename(original: &PathBuf, timestamp: &str, side: &str) -> PathBuf {
+pub fn conflict_filename(original: &Path, timestamp: &str, side: &str) -> PathBuf {
     let parent = original.parent();
     let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = original.extension().and_then(|e| e.to_str());
