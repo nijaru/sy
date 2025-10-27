@@ -71,8 +71,10 @@ _Last Updated: 2025-10-26_
 - **Text-based state format** (2025-10-26): Refactored bisync from SQLite to text files; simpler (~100 lines less code), debuggable (cat ~/.cache/sy/bisync/*.lst), inspired by rclone bisync format; atomic writes with temp+rename
 - **Dead code annotations** (2025-10-26): Using #[allow(dead_code)] with explanatory comments for intentional unused code (public APIs, future features, test infrastructure) maintains production quality while preserving library interface and extensibility points
 - **SSH bidirectional sync** (2025-10-26): Refactored BisyncEngine to use Transport abstraction; made sync() async; replaced direct std::fs calls with transport.read_file()/write_file(); enables local↔remote and remote↔remote bisync; ~200 lines changed in engine.rs + ~70 lines in main.rs
+- **Real-world bisync testing** (2025-10-27): Created comprehensive test suite (bisync_real_world_test.sh) with 7 scenarios; caught critical state storage bug before release; test-driven debugging approach (create minimal failing test → trace through code → identify root cause → fix → verify all tests pass) was highly effective
 
 ## What Didn't Work
+- **Bisync state storage (2025-10-27)**: Initial implementation only stored destination side state after copy operations, not both sides; caused deletions to be misclassified as "new files" and copied back instead of propagating; fixed by storing both source AND dest states after any copy
 - QUIC transport: 45% slower than TCP on fast networks (>600 Mbps) - documented in DESIGN.md
 - Compression on local/high-speed: CPU bottleneck negates benefits above 4Gbps
 - Initial sparse file tests: Had to make filesystem-agnostic due to varying FS support
@@ -107,6 +109,16 @@ None
   - SSH pool API methods (backward compatibility) ✅
   - Build status: 0 warnings, 410 tests passing ✅
   - Committed and pushed to main ✅
+- ✅ Critical Bisync State Storage Bug Fix (2025-10-27, commit 84f065b)
+  - **Issue**: update_state() only stored one side after copy operations ✅
+  - **Impact**: Deletions misclassified as "new files", copied back instead of propagating ✅
+  - **Fix**: Store both source AND dest states after any copy operation ✅
+  - **Testing**: Created bisync_real_world_test.sh with 7 comprehensive scenarios ✅
+  - **Results**: All 7 real-world tests pass, all 410 unit tests pass ✅
+  - Deletion safety limits now work correctly (blocks 60% deletion at 50% threshold) ✅
+  - State persistence across syncs now works correctly ✅
+  - Idempotent syncs properly detect no changes ✅
+  - Conflict resolution (rename) works correctly ✅
 - ✅ v0.0.45 Release - Bisync State Format v2 (2025-10-26)
   - Fixed proper escaping for quotes, newlines, backslashes, tabs ✅
   - Fixed parse error handling (no more silent corruption) ✅
