@@ -461,7 +461,9 @@ impl Cli {
 
             // Bidirectional conflicts with certain flags
             if self.verify_only {
-                anyhow::bail!("--bidirectional cannot be used with --verify-only (conflicts with sync logic)");
+                anyhow::bail!(
+                    "--bidirectional cannot be used with --verify-only (conflicts with sync logic)"
+                );
             }
             if self.watch {
                 anyhow::bail!("--bidirectional with --watch is not yet supported (deferred to future version)");

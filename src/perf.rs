@@ -638,7 +638,7 @@ mod tests {
         assert!(metrics.bandwidth_utilization.is_some());
         let utilization = metrics.bandwidth_utilization.unwrap();
         assert!(
-            utilization >= 40.0 && utilization <= 60.0,
+            (40.0..=60.0).contains(&utilization),
             "bandwidth_utilization: {:.2}%",
             utilization
         );
@@ -713,14 +713,14 @@ mod tests {
         // Percentages should sum to approximately 100% (within rounding)
         let total_pct = scan_pct + plan_pct + transfer_pct;
         assert!(
-            total_pct >= 95.0 && total_pct <= 105.0,
+            (95.0..=105.0).contains(&total_pct),
             "total_pct: {:.2}%",
             total_pct
         );
 
         // Scan should be roughly 50% (100ms out of ~200ms total)
         assert!(
-            scan_pct >= 40.0 && scan_pct <= 60.0,
+            (40.0..=60.0).contains(&scan_pct),
             "scan_pct: {:.2}%",
             scan_pct
         );

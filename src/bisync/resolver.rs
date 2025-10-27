@@ -35,10 +35,10 @@ impl ConflictResolution {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // RenameConflict is intentionally larger, used rarely
 pub enum SyncAction {
-    CopyToSource(FileEntry),      // Copy dest → source
-    CopyToDest(FileEntry),         // Copy source → dest
-    DeleteFromSource(PathBuf),     // Delete file from source
-    DeleteFromDest(PathBuf),       // Delete file from dest
+    CopyToSource(FileEntry),   // Copy dest → source
+    CopyToDest(FileEntry),     // Copy source → dest
+    DeleteFromSource(PathBuf), // Delete file from source
+    DeleteFromDest(PathBuf),   // Delete file from dest
     RenameConflict {
         source: FileEntry,
         dest: FileEntry,
@@ -239,7 +239,10 @@ fn generate_conflict_timestamp() -> String {
 /// Generate conflict filename
 pub fn conflict_filename(original: &Path, timestamp: &str, side: &str) -> PathBuf {
     let parent = original.parent();
-    let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let stem = original
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
     let ext = original.extension().and_then(|e| e.to_str());
 
     let conflict_name = if let Some(e) = ext {
@@ -394,7 +397,10 @@ mod tests {
 
         let resolved = resolve_changes(changes, ConflictResolution::Rename).unwrap();
         assert_eq!(resolved.actions.len(), 1);
-        assert!(matches!(resolved.actions[0], SyncAction::RenameConflict { .. }));
+        assert!(matches!(
+            resolved.actions[0],
+            SyncAction::RenameConflict { .. }
+        ));
         assert_eq!(resolved.conflicts_renamed, 1);
     }
 
@@ -415,7 +421,10 @@ mod tests {
 
         let resolved = resolve_changes(changes, ConflictResolution::Newer).unwrap();
         assert_eq!(resolved.actions.len(), 1);
-        assert!(matches!(resolved.actions[0], SyncAction::RenameConflict { .. }));
+        assert!(matches!(
+            resolved.actions[0],
+            SyncAction::RenameConflict { .. }
+        ));
     }
 
     #[test]
@@ -462,12 +471,30 @@ mod tests {
 
     #[test]
     fn test_conflict_resolution_from_str() {
-        assert_eq!(ConflictResolution::from_str("newer"), Some(ConflictResolution::Newer));
-        assert_eq!(ConflictResolution::from_str("Larger"), Some(ConflictResolution::Larger));
-        assert_eq!(ConflictResolution::from_str("SMALLER"), Some(ConflictResolution::Smaller));
-        assert_eq!(ConflictResolution::from_str("source"), Some(ConflictResolution::Source));
-        assert_eq!(ConflictResolution::from_str("dest"), Some(ConflictResolution::Dest));
-        assert_eq!(ConflictResolution::from_str("rename"), Some(ConflictResolution::Rename));
+        assert_eq!(
+            ConflictResolution::from_str("newer"),
+            Some(ConflictResolution::Newer)
+        );
+        assert_eq!(
+            ConflictResolution::from_str("Larger"),
+            Some(ConflictResolution::Larger)
+        );
+        assert_eq!(
+            ConflictResolution::from_str("SMALLER"),
+            Some(ConflictResolution::Smaller)
+        );
+        assert_eq!(
+            ConflictResolution::from_str("source"),
+            Some(ConflictResolution::Source)
+        );
+        assert_eq!(
+            ConflictResolution::from_str("dest"),
+            Some(ConflictResolution::Dest)
+        );
+        assert_eq!(
+            ConflictResolution::from_str("rename"),
+            Some(ConflictResolution::Rename)
+        );
         assert_eq!(ConflictResolution::from_str("invalid"), None);
     }
 }

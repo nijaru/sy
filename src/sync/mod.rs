@@ -2233,7 +2233,7 @@ mod tests {
         match result {
             Ok(stats) => {
                 // All files should have been attempted (errors collected, not aborted)
-                assert!(stats.errors.len() > 0, "Should have collected errors");
+                assert!(!stats.errors.is_empty(), "Should have collected errors");
             }
             Err(_) => {
                 // May error out due to permission issues

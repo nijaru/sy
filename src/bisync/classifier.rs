@@ -460,8 +460,18 @@ mod tests {
         prior.insert(
             PathBuf::from("deleted_from_source.txt"),
             (
-                Some(make_sync_state("deleted_from_source.txt", 100, 60, Side::Source)),
-                Some(make_sync_state("deleted_from_source.txt", 100, 60, Side::Dest)),
+                Some(make_sync_state(
+                    "deleted_from_source.txt",
+                    100,
+                    60,
+                    Side::Source,
+                )),
+                Some(make_sync_state(
+                    "deleted_from_source.txt",
+                    100,
+                    60,
+                    Side::Dest,
+                )),
             ),
         );
 

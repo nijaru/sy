@@ -160,7 +160,6 @@ impl BisyncEngine {
     }
 }
 
-
 /// Check if deletion limit would be exceeded
 fn check_deletion_limit(changes: &[Change], max_delete_percent: u8) -> Result<()> {
     if max_delete_percent == 0 {
@@ -390,10 +389,7 @@ async fn copy_file_across_transports(
 }
 
 /// Update state database after sync
-fn update_state(
-    state_db: &mut BisyncStateDb,
-    resolved: &ResolvedChanges,
-) -> Result<()> {
+fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Result<()> {
     let now = SystemTime::now();
 
     for action in &resolved.actions {
@@ -526,14 +522,12 @@ mod tests {
 
     #[test]
     fn test_check_deletion_limit_unlimited() {
-        let changes = vec![
-            Change {
-                path: PathBuf::from("file1.txt"),
-                change_type: ChangeType::DeletedFromSource,
-                source_entry: None,
-                dest_entry: None,
-            },
-        ];
+        let changes = vec![Change {
+            path: PathBuf::from("file1.txt"),
+            change_type: ChangeType::DeletedFromSource,
+            source_entry: None,
+            dest_entry: None,
+        }];
 
         // max_delete_percent = 0 means unlimited
         assert!(check_deletion_limit(&changes, 0).is_ok());

@@ -1279,14 +1279,12 @@ impl Transport for SshTransport {
             }
 
             // Create/open remote file for writing
-            let mut remote_file = sftp
-                .create(&path_buf)
-                .map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("Failed to create remote file {}: {}", path_buf.display(), e),
-                    ))
-                })?;
+            let mut remote_file = sftp.create(&path_buf).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Failed to create remote file {}: {}", path_buf.display(), e),
+                ))
+            })?;
 
             // Write data
             remote_file.write_all(&data_vec).map_err(|e| {

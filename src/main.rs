@@ -517,8 +517,11 @@ async fn main() -> Result<()> {
             (crate::path::SyncPath::Local(_), crate::path::SyncPath::Local(_)) => {
                 // Both local
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let local_source = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier.clone()));
-                let local_dest = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                let local_source = std::sync::Arc::new(
+                    transport::local::LocalTransport::with_verifier(verifier.clone()),
+                );
+                let local_dest =
+                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (local_source, local_dest)
             }
             (crate::path::SyncPath::Local(_), crate::path::SyncPath::Remote { host, user, .. }) => {
@@ -533,8 +536,11 @@ async fn main() -> Result<()> {
                     ssh::config::parse_ssh_config(host)?
                 };
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let local = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
-                let remote = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?);
+                let local =
+                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                let remote = std::sync::Arc::new(
+                    transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?,
+                );
                 (local, remote)
             }
             (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local(_)) => {
@@ -549,11 +555,25 @@ async fn main() -> Result<()> {
                     ssh::config::parse_ssh_config(host)?
                 };
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let remote = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?);
-                let local = std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
+                let remote = std::sync::Arc::new(
+                    transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?,
+                );
+                let local =
+                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (remote, local)
             }
-            (crate::path::SyncPath::Remote { host: host1, user: user1, .. }, crate::path::SyncPath::Remote { host: host2, user: user2, .. }) => {
+            (
+                crate::path::SyncPath::Remote {
+                    host: host1,
+                    user: user1,
+                    ..
+                },
+                crate::path::SyncPath::Remote {
+                    host: host2,
+                    user: user2,
+                    ..
+                },
+            ) => {
                 // Remote → Remote
                 let config1 = if let Some(user) = user1 {
                     ssh::config::SshConfig {
@@ -573,8 +593,12 @@ async fn main() -> Result<()> {
                 } else {
                     ssh::config::parse_ssh_config(host2)?
                 };
-                let remote1 = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config1, cli.parallel).await?);
-                let remote2 = std::sync::Arc::new(transport::ssh::SshTransport::with_pool_size(&config2, cli.parallel).await?);
+                let remote1 = std::sync::Arc::new(
+                    transport::ssh::SshTransport::with_pool_size(&config1, cli.parallel).await?,
+                );
+                let remote2 = std::sync::Arc::new(
+                    transport::ssh::SshTransport::with_pool_size(&config2, cli.parallel).await?,
+                );
                 (remote1, remote2)
             }
             _ => {
@@ -591,7 +615,9 @@ async fn main() -> Result<()> {
             clear_state: cli.clear_bisync_state,
         };
 
-        let bisync_result = bisync_engine.sync(source.path(), destination.path(), bisync_opts).await?;
+        let bisync_result = bisync_engine
+            .sync(source.path(), destination.path(), bisync_opts)
+            .await?;
 
         // Print conflicts if any
         if !bisync_result.conflicts.is_empty() && !cli.quiet && !cli.json {
@@ -622,11 +648,15 @@ async fn main() -> Result<()> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
-            errors: bisync_result.errors.into_iter().map(|e| sync::SyncError {
-                path: PathBuf::new(),
-                error: e,
-                action: "bidirectional sync".to_string(),
-            }).collect(),
+            errors: bisync_result
+                .errors
+                .into_iter()
+                .map(|e| sync::SyncError {
+                    path: PathBuf::new(),
+                    error: e,
+                    action: "bidirectional sync".to_string(),
+                })
+                .collect(),
         }
     } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
