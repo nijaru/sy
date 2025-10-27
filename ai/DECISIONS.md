@@ -1,5 +1,36 @@
 # Decisions
 
+## 2025-10-27: Release Versioning Strategy
+
+**Context**: Planning version progression for a file synchronization tool where data safety is critical
+
+**Decision**: Stay on 0.0.x until proven in production, never jump to 0.1.0+ based on test results alone
+
+**Versioning Philosophy**:
+- **0.0.x** (Current): "Works great in testing, use at your own risk"
+  - For: Early adopters, testing, non-critical data
+  - Continue: Until 3-6 months of real-world usage without data loss
+
+- **0.1.0** (Future): "Production-ready, proven in the wild"
+  - Requires: Months of 0.0.x releases, user testimonials, no data loss reports
+  - Signals: API stabilizing, safe for production use
+
+- **1.0.0** (Distant future): "Stable, widely trusted, battle-tested"
+  - Years away, like rsync's maturity level
+
+**Rationale**:
+- File sync tools that lose data destroy trust forever
+- No amount of testing replaces diverse real-world usage
+- Edge cases emerge from actual environments that tests can't predict
+- Tests show what we checked, not what we missed
+- Conservative versioning protects users and reputation
+
+**Current Status**: v0.0.48 with 411 tests passing, 23/23 SSH bisync scenarios pass, but zero months of production validation
+
+**References**: .claude/CLAUDE.md, COMPREHENSIVE_TEST_REPORT.md
+
+---
+
 ## 2025-10-21: Hash Function Selection
 
 **Context**: Selecting hash functions for rolling hash, block checksums, and end-to-end verification
