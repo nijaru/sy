@@ -384,6 +384,97 @@ impl BisyncStateDb {
     pub fn sync_pair_hash(&self) -> String {
         Self::generate_sync_pair_hash(&self.source_path, &self.dest_path)
     }
+
+    /// Log conflicts to history file for audit trail
+    pub fn log_conflicts(&self, conflicts: &[crate::bisync::engine::ConflictInfo]) -> Result<()> {
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+
+        let cache_dir = Self::get_state_dir()?;
+        let hash = self.sync_pair_hash();
+        let log_path = cache_dir.join(format!("{}.conflicts.log", hash));
+
+        // Open in append mode to preserve history
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+
+        let now = SystemTime::now();
+        let timestamp = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        for conflict in conflicts {
+            // Determine winner based on resolution strategy
+            let winner = determine_winner(conflict);
+
+            // Format: timestamp | path | conflict_type | strategy | winner
+            writeln!(
+                file,
+                "{} | {} | {} | {} | {}",
+                timestamp,
+                conflict.path.display(),
+                conflict.action,
+                format!("{:?}", conflict.resolution).to_lowercase(),
+                winner
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Determine winner for conflict logging
+fn determine_winner(conflict: &crate::bisync::engine::ConflictInfo) -> String {
+    use crate::bisync::resolver::ConflictResolution;
+
+    match conflict.resolution {
+        ConflictResolution::Source => "source".to_string(),
+        ConflictResolution::Dest => "dest".to_string(),
+        ConflictResolution::Rename => "both (renamed)".to_string(),
+        ConflictResolution::Newer => {
+            if let (Some(s_mtime), Some(d_mtime)) = (conflict.source_mtime, conflict.dest_mtime) {
+                if s_mtime > d_mtime {
+                    "source (newer)".to_string()
+                } else if d_mtime > s_mtime {
+                    "dest (newer)".to_string()
+                } else {
+                    "both (tie)".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            }
+        }
+        ConflictResolution::Larger => {
+            if let (Some(s_size), Some(d_size)) = (conflict.source_size, conflict.dest_size) {
+                if s_size > d_size {
+                    "source (larger)".to_string()
+                } else if d_size > s_size {
+                    "dest (larger)".to_string()
+                } else {
+                    "both (tie)".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            }
+        }
+        ConflictResolution::Smaller => {
+            if let (Some(s_size), Some(d_size)) = (conflict.source_size, conflict.dest_size) {
+                if s_size < d_size {
+                    "source (smaller)".to_string()
+                } else if d_size < s_size {
+                    "dest (smaller)".to_string()
+                } else {
+                    "both (tie)".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

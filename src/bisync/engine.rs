@@ -119,6 +119,11 @@ impl BisyncEngine {
         // 7. Collect conflict info for reporting
         let conflicts = collect_conflict_info(&changes, opts.conflict_resolution);
 
+        // 7b. Log conflicts to history file (unless dry-run)
+        if !opts.dry_run && !conflicts.is_empty() {
+            state_db.log_conflicts(&conflicts)?;
+        }
+
         // 8. Execute sync actions (or dry run)
         let (stats, errors) = if opts.dry_run {
             // Dry run - just report what would happen
