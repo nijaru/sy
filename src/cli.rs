@@ -125,6 +125,10 @@ impl Default for SymlinkMode {
     sy /source /destination --verify            # BLAKE3 cryptographic verification
     sy /source /destination --mode paranoid     # Maximum reliability
 
+    # Network retry options
+    sy /source user@host:/dest --retry 5        # Retry up to 5 times on network errors
+    sy /source user@host:/dest --retry-delay 2  # Start with 2s delay (2s, 4s, 8s, ...)
+
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
@@ -396,6 +400,15 @@ pub struct Cli {
     /// Forces full comparison instead of using cached state
     #[arg(long)]
     pub clear_bisync_state: bool,
+
+    /// Maximum retry attempts for network operations (default: 3, 0 = no retries)
+    #[arg(long, default_value = "3")]
+    pub retry: u32,
+
+    /// Initial delay between retries in seconds (default: 1)
+    /// Delay increases exponentially with each retry (1s, 2s, 4s, ...)
+    #[arg(long, default_value = "1")]
+    pub retry_delay: u64,
 }
 
 impl Cli {
@@ -647,6 +660,8 @@ mod tests {
             checksum_db: false,
             clear_checksum_db: false,
             prune_checksum_db: false,
+            retry: 3,
+            retry_delay: 1,
         };
         assert!(cli.validate().is_ok());
     }
@@ -716,6 +731,8 @@ mod tests {
             checksum_db: false,
             clear_checksum_db: false,
             prune_checksum_db: false,
+            retry: 3,
+            retry_delay: 1,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -791,6 +808,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -867,6 +886,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert!(cli.validate().is_ok());
     }
@@ -936,6 +957,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1005,6 +1028,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1074,6 +1099,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -1143,6 +1170,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1231,6 +1260,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
+            retry: 3,
+            retry_delay: 1,
         };
 
         let result = cli.validate();
@@ -1303,6 +1334,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::Standard);
     }
@@ -1372,6 +1405,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
@@ -1467,6 +1502,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1536,6 +1573,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -1605,6 +1644,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -1674,6 +1715,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         // Archive mode should enable all these flags
@@ -1750,6 +1793,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         // Only permissions should be enabled
@@ -1825,6 +1870,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         // All should be enabled (archive mode OR individual flags)
@@ -1901,6 +1948,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         let result = cli.validate();
@@ -1977,6 +2026,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         // Should be valid - only one comparison flag
@@ -2050,6 +2101,8 @@ mod tests {
             prune_checksum_db: false,
             min_size: None,
             max_size: None,
+            retry: 3,
+            retry_delay: 1,
         };
 
         // Should be valid - only one comparison flag
