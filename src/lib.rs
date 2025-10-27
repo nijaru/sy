@@ -11,6 +11,7 @@ pub mod integrity;
 pub mod path;
 pub mod perf;
 pub mod resource;
+pub mod resume;
 pub mod retry;
 pub mod sparse;
 pub mod ssh;

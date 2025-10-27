@@ -129,6 +129,11 @@ impl Default for SymlinkMode {
     sy /source user@host:/dest --retry 5        # Retry up to 5 times on network errors
     sy /source user@host:/dest --retry-delay 2  # Start with 2s delay (2s, 4s, 8s, ...)
 
+    # Resume interrupted transfers
+    sy /source user@host:/dest --resume         # Auto-resume interrupted large files
+    sy /source user@host:/dest --resume-only    # Only resume, don't start new transfers
+    sy /source user@host:/dest --clear-resume-state  # Clear all resume state
+
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
@@ -231,6 +236,14 @@ pub struct Cli {
     /// Enable resume support (auto-resume if state file found, default: true)
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     pub resume: bool,
+
+    /// Only resume interrupted transfers, don't start new ones
+    #[arg(long)]
+    pub resume_only: bool,
+
+    /// Clear all resume state before starting
+    #[arg(long)]
+    pub clear_resume_state: bool,
 
     /// Checkpoint every N files (default: 10)
     #[arg(long, default_value = "10")]
@@ -662,6 +675,8 @@ mod tests {
             prune_checksum_db: false,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -733,6 +748,8 @@ mod tests {
             prune_checksum_db: false,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -810,6 +827,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -888,6 +907,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -959,6 +980,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1030,6 +1053,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1101,6 +1126,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -1172,6 +1199,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1262,6 +1291,8 @@ mod tests {
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         let result = cli.validate();
@@ -1336,6 +1367,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::Standard);
     }
@@ -1407,6 +1440,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
@@ -1504,6 +1539,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1575,6 +1612,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -1646,6 +1685,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -1717,6 +1758,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         // Archive mode should enable all these flags
@@ -1795,6 +1838,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         // Only permissions should be enabled
@@ -1872,6 +1917,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         // All should be enabled (archive mode OR individual flags)
@@ -1950,6 +1997,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         let result = cli.validate();
@@ -2028,6 +2077,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2103,6 +2154,8 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
         };
 
         // Should be valid - only one comparison flag
