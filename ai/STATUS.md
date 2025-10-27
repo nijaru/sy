@@ -3,19 +3,28 @@
 _Last Updated: 2025-10-27_
 
 ## Current State
-- Version: v0.0.47 (released 2025-10-27)
-- Phase: SSH bidirectional sync - **FIXED AND RELEASED** ✅
-- Test Coverage: 410 tests passing (402 + 8 bisync state tests, 12 ignored)
+- Version: v0.0.48 (released 2025-10-27)
+- Phase: Remote→remote sync + .gitignore fixes - **RELEASED** ✅
+- Test Coverage: 411 tests passing (23/23 comprehensive SSH bisync tests pass, 12 ignored)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 
-### ✅ CRITICAL BUG FIXED (v0.0.47)
-**SSH Bidirectional Sync Now Works**
-- **v0.0.46 Issue**: `SshTransport` missing `write_file()` implementation - bisync reported success but files never written to remote
-- **v0.0.47 Fix**: Implemented `write_file()` for SSH transport (src/transport/ssh.rs:1244-1332)
-- **Testing**: All 8 real-world SSH bisync tests pass (Mac ↔ Fedora over Tailscale)
-- **Verification**: Deletion propagation, conflict resolution, large files (10MB @ 8.27 MB/s), dry-run all work
-- **Released**: 2025-10-27 to crates.io and GitHub
+### ✅ v0.0.48 RELEASE (2025-10-27)
+**Two Critical Fixes from Comprehensive Testing**
+
+1. **Remote→Remote Bidirectional Sync** (feat: 6d9474d)
+   - Previously: Explicitly rejected with "Remote-to-remote sync not yet supported"
+   - Now: Dual SSH connection pools enable syncing between two SSH hosts
+   - Testing: Mac→Fedora→Fedora with bidirectional changes (3 files, 59 bytes in 472ms)
+   - Example: `sy -b user@host1:/path user@host2:/path`
+
+2. **.gitignore Support Outside Git Repos** (fix: 6453681)
+   - Previously: Patterns ignored in bisync (*.tmp, *.log, node_modules/ all synced)
+   - Root cause: `ignore` crate's `git_ignore(true)` only works in git repos
+   - Fix: Explicit `WalkBuilder::add_ignore()` for .gitignore files everywhere
+   - Testing: 2 files synced vs 5 before (patterns now respected)
+
+**Comprehensive Testing**: 23 scenarios tested over 2 hours (Mac ↔ Fedora), now 100% pass rate (up from 91.3%)
 
 ## Implemented Features
 - ✅ Local and remote (SSH) sync
@@ -43,7 +52,7 @@ _Last Updated: 2025-10-27_
 - ✅ Bidirectional sync (--bidirectional/-b flag, v0.0.43) - two-way sync with conflict resolution!
 - ✅ Text-based state tracking (v0.0.44) - persistent state in ~/.cache/sy/bisync/ for accurate conflict detection!
 - ✅ 6 conflict resolution strategies (v0.0.43) - newer/larger/smaller/source/dest/rename!
-- ✅ SSH bidirectional sync (v0.0.46) - bisync now works with remote servers (local↔remote, remote↔remote)!
+- ✅ SSH bidirectional sync (v0.0.46-v0.0.48) - bisync works with remote servers (local↔remote: v0.0.46, remote↔remote: v0.0.48)!
 
 ## What Worked
 - **Local delta sync optimization** (v0.0.23): Using simple block comparison instead of rolling hash for local→local sync achieved 5-9x speedup
