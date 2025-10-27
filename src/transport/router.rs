@@ -25,7 +25,7 @@ impl TransportRouter {
     /// - Local → Local: Use LocalTransport
     /// - Remote → Local: Use DualTransport (SSH for source, Local for dest)
     /// - Local → Remote: Use DualTransport (Local for source, SSH for dest)
-    /// - Remote → Remote: Not supported yet (would require two SSH connections)
+    /// - Remote → Remote: Use DualTransport (SSH for source, SSH for dest)
     ///
     /// `pool_size` controls the number of SSH connections in the pool for parallel transfers.
     /// Should typically match the number of parallel workers.
@@ -81,11 +81,45 @@ impl TransportRouter {
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
-            (SyncPath::Remote { .. }, SyncPath::Remote { .. }) => {
-                // Both remote: not supported yet
-                Err(crate::error::SyncError::Io(std::io::Error::other(
-                    "Remote-to-remote sync not yet supported",
-                )))
+            (
+                SyncPath::Remote {
+                    host: source_host,
+                    user: source_user,
+                    ..
+                },
+                SyncPath::Remote {
+                    host: dest_host,
+                    user: dest_user,
+                    ..
+                },
+            ) => {
+                // Remote → Remote: use DualTransport with two SSH connections
+                let source_config = if let Some(user) = source_user {
+                    SshConfig {
+                        hostname: source_host.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    parse_ssh_config(source_host)?
+                };
+
+                let dest_config = if let Some(user) = dest_user {
+                    SshConfig {
+                        hostname: dest_host.clone(),
+                        user: user.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    parse_ssh_config(dest_host)?
+                };
+
+                let source_transport =
+                    Box::new(SshTransport::with_pool_size(&source_config, pool_size).await?);
+                let dest_transport =
+                    Box::new(SshTransport::with_pool_size(&dest_config, pool_size).await?);
+                let dual = DualTransport::new(source_transport, dest_transport);
+                Ok(TransportRouter::Dual(dual))
             }
             (
                 SyncPath::Local(_),
