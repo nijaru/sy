@@ -37,12 +37,14 @@ impl RetryConfig {
     }
 
     /// Set the maximum delay between retries
+    #[allow(dead_code)] // Configuration builder - may be used for custom retry strategies
     pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
         self.max_delay = max_delay;
         self
     }
 
     /// Set the backoff multiplier
+    #[allow(dead_code)] // Configuration builder - may be used for custom retry strategies
     pub fn with_backoff_multiplier(mut self, multiplier: f64) -> Self {
         self.backoff_multiplier = multiplier;
         self
@@ -127,6 +129,7 @@ where
 }
 
 /// Convenience wrapper for retrying with default config
+#[allow(dead_code)] // Helper function - may be used for simple retry scenarios
 pub async fn retry_default<F, Fut, T>(operation: F) -> Result<T, SyncError>
 where
     F: FnMut() -> Fut,

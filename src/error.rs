@@ -105,6 +105,7 @@ impl SyncError {
     }
 
     /// Check if this error requires reconnection (session is dead)
+    #[allow(dead_code)] // Reserved for future connection pool health checks
     pub fn requires_reconnection(&self) -> bool {
         matches!(self, SyncError::NetworkDisconnected { .. })
     }

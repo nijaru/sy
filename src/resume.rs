@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Default chunk size for resume transfers (1 MB)
+#[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Transfer state for resume capability
+#[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferState {
     /// Source file path
@@ -30,6 +32,7 @@ pub struct TransferState {
 
 impl TransferState {
     /// Create a new transfer state
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn new(
         source: &Path,
         dest: &Path,
@@ -50,11 +53,13 @@ impl TransferState {
     }
 
     /// Check if transfer is complete
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn is_complete(&self) -> bool {
         self.bytes_transferred >= self.total_size
     }
 
     /// Get progress as percentage (0.0 to 100.0)
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn progress_percentage(&self) -> f64 {
         if self.total_size == 0 {
             100.0
@@ -64,17 +69,20 @@ impl TransferState {
     }
 
     /// Update bytes transferred
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn update_progress(&mut self, bytes: u64) {
         self.bytes_transferred = bytes;
         self.last_updated = SystemTime::now();
     }
 
     /// Check if state is stale (file modified since state created)
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn is_stale(&self, current_mtime: SystemTime) -> bool {
         current_mtime != self.mtime
     }
 
     /// Generate unique state ID from source, dest, and mtime
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     fn generate_state_id(source: &Path, dest: &Path, mtime: SystemTime) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(source.to_string_lossy().as_bytes());
@@ -90,6 +98,7 @@ impl TransferState {
     }
 
     /// Get resume state directory (~/.cache/sy/resume/)
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     fn get_resume_dir() -> Result<PathBuf> {
         let cache_dir = if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
             PathBuf::from(xdg_cache)
@@ -107,6 +116,7 @@ impl TransferState {
     }
 
     /// Get state file path for this transfer
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     fn get_state_file_path(source: &Path, dest: &Path, mtime: SystemTime) -> Result<PathBuf> {
         let state_id = Self::generate_state_id(source, dest, mtime);
         let resume_dir = Self::get_resume_dir()?;
@@ -114,6 +124,7 @@ impl TransferState {
     }
 
     /// Save state to disk
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn save(&self) -> Result<()> {
         let state_file = Self::get_state_file_path(&self.source_path, &self.dest_path, self.mtime)?;
 
@@ -129,6 +140,7 @@ impl TransferState {
     }
 
     /// Load state from disk if it exists
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn load(source: &Path, dest: &Path, mtime: SystemTime) -> Result<Option<Self>> {
         let state_file = Self::get_state_file_path(source, dest, mtime)?;
 
@@ -163,6 +175,7 @@ impl TransferState {
     }
 
     /// Clear resume state for a specific transfer
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn clear(source: &Path, dest: &Path, mtime: SystemTime) -> Result<()> {
         let state_file = Self::get_state_file_path(source, dest, mtime)?;
 
@@ -174,6 +187,7 @@ impl TransferState {
     }
 
     /// Clear all resume states
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn clear_all() -> Result<()> {
         let resume_dir = Self::get_resume_dir()?;
 
@@ -191,11 +205,13 @@ impl TransferState {
     }
 
     /// Get number of chunks needed for this transfer
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn total_chunks(&self) -> usize {
         ((self.total_size + self.chunk_size as u64 - 1) / self.chunk_size as u64) as usize
     }
 
     /// Get the next chunk to transfer (start_offset, length)
+    #[allow(dead_code)] // Will be used when resume is integrated in v0.0.51+
     pub fn next_chunk(&self) -> Option<(u64, usize)> {
         if self.is_complete() {
             return None;
