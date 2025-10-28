@@ -1098,13 +1098,8 @@ impl Transport for SshTransport {
             format!("rm -f '{}'", path_str)
         };
 
-        tokio::task::spawn_blocking({
-            let session = self.connection_pool.get_session();
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        self.execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
 
         Ok(())
     }
@@ -1117,12 +1112,8 @@ impl Transport for SshTransport {
         if let Some(parent) = dest.parent() {
             let parent_str = parent.to_string_lossy();
             let mkdir_cmd = format!("mkdir -p '{}'", parent_str);
-            tokio::task::spawn_blocking({
-                let session = self.connection_pool.get_session();
-                move || Self::execute_command(session, &mkdir_cmd)
-            })
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+            self.execute_command_with_retry(self.connection_pool.get_session(), &mkdir_cmd)
+                .await?;
         }
 
         // Create hardlink using ln command
@@ -1132,13 +1123,9 @@ impl Transport for SshTransport {
         let mut last_error = None;
 
         for attempt in 0..max_retries {
-            match tokio::task::spawn_blocking({
-                let session = self.connection_pool.get_session();
-                let cmd = command.clone();
-                move || Self::execute_command(session, &cmd)
-            })
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            match self
+                .execute_command_with_retry(self.connection_pool.get_session(), &command)
+                .await
             {
                 Ok(_) => {
                     tracing::debug!("Created hardlink: {} -> {}", dest_str, source_str);
@@ -1176,24 +1163,15 @@ impl Transport for SshTransport {
         if let Some(parent) = dest.parent() {
             let parent_str = parent.to_string_lossy();
             let mkdir_cmd = format!("mkdir -p '{}'", parent_str);
-            tokio::task::spawn_blocking({
-                let session = self.connection_pool.get_session();
-                move || Self::execute_command(session, &mkdir_cmd)
-            })
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+            self.execute_command_with_retry(self.connection_pool.get_session(), &mkdir_cmd)
+                .await?;
         }
 
         // Create symlink using ln -s command
         let command = format!("ln -s '{}' '{}'", target_str, dest_str);
 
-        tokio::task::spawn_blocking({
-            let session = self.connection_pool.get_session();
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        self.execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
 
         tracing::debug!("Created symlink: {} -> {}", dest_str, target_str);
         Ok(())
