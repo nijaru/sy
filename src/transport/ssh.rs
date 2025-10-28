@@ -808,6 +808,43 @@ impl Transport for SshTransport {
                         file_size
                     );
 
+                    // Get source mtime for resume state
+                    let mtime_systime = metadata.modified().map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to get mtime for {}: {}", source_path.display(), e),
+                        ))
+                    })?;
+
+                    // Try to load existing resume state
+                    let mut resume_state = TransferState::load(&source_path, &dest_path, mtime_systime)?;
+                    let is_resuming = resume_state.is_some();
+
+                    // Check if state is stale
+                    if let Some(ref state) = resume_state {
+                        if state.is_stale(mtime_systime) {
+                            eprintln!(
+                                "Resume state is stale for {} (file modified). Starting fresh.",
+                                source_path.display()
+                            );
+                            TransferState::clear(&source_path, &dest_path, mtime_systime)?;
+                            resume_state = None;
+                        }
+                    }
+
+                    // Determine starting position
+                    let start_offset = if let Some(ref state) = resume_state {
+                        eprintln!(
+                            "Resuming transfer of {} from offset {} ({:.1}% complete)",
+                            source_path.display(),
+                            state.bytes_transferred,
+                            state.progress_percentage()
+                        );
+                        state.bytes_transferred
+                    } else {
+                        0
+                    };
+
                     let session = session_arc.lock().map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
                             "Failed to lock session: {}",
@@ -827,6 +864,21 @@ impl Transport for SshTransport {
                         ))
                     })?;
 
+                    // Seek to resume position if resuming
+                    if start_offset > 0 {
+                        source_file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "Failed to seek source file {} to offset {}: {}",
+                                    source_path.display(),
+                                    start_offset,
+                                    e
+                                ),
+                            ))
+                        })?;
+                    }
+
                     // Get SFTP session
                     let sftp = session.sftp().map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
@@ -835,24 +887,62 @@ impl Transport for SshTransport {
                         )))
                     })?;
 
-                    // Write to remote file
-                    let mut remote_file = sftp.create(&dest_path).map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!(
-                            "Failed to create remote file {}: {}",
-                            dest_path.display(),
-                            e
-                        )))
-                    })?;
+                    // Open remote file (create if new, open for append if resuming)
+                    let mut remote_file = if is_resuming {
+                        use ssh2::OpenFlags;
+                        let mut file = sftp.open_mode(
+                            &dest_path,
+                            OpenFlags::WRITE,
+                            0o644,
+                            ssh2::OpenType::File,
+                        ).map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to open remote file for append {}: {}",
+                                dest_path.display(),
+                                e
+                            )))
+                        })?;
+
+                        // Seek to resume position
+                        file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "Failed to seek remote file {} to offset {}: {}",
+                                    dest_path.display(),
+                                    start_offset,
+                                    e
+                                ),
+                            ))
+                        })?;
+
+                        file
+                    } else {
+                        sftp.create(&dest_path).map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to create remote file {}: {}",
+                                dest_path.display(),
+                                e
+                            )))
+                        })?
+                    };
+
+                    // Initialize or update transfer state
+                    let mut state = resume_state.unwrap_or_else(|| {
+                        TransferState::new(&source_path, &dest_path, file_size, mtime_systime, DEFAULT_CHUNK_SIZE)
+                    });
 
                     // Stream file in chunks with checksum calculation
                     // 256KB optimal for modern networks (research: SFTP performance)
                     const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
                     let mut buffer = vec![0u8; CHUNK_SIZE];
                     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-                    let mut bytes_written = 0u64;
+                    let mut bytes_written = start_offset;
+                    let mut bytes_since_checkpoint = 0u64;
+                    const CHECKPOINT_INTERVAL: u64 = 10 * 1024 * 1024; // 10MB
 
                     loop {
-                        let bytes_read = std::io::Read::read(&mut source_file, &mut buffer)
+                        let bytes_read = source_file.read(&mut buffer)
                             .map_err(|e| {
                                 SyncError::Io(std::io::Error::new(
                                     e.kind(),
@@ -868,7 +958,7 @@ impl Transport for SshTransport {
                         hasher.update(&buffer[..bytes_read]);
 
                         // Write chunk to remote
-                        std::io::Write::write_all(&mut remote_file, &buffer[..bytes_read])
+                        remote_file.write_all(&buffer[..bytes_read])
                             .map_err(|e| {
                                 SyncError::Io(std::io::Error::other(format!(
                                     "Failed to write to remote file {}: {}",
@@ -878,15 +968,34 @@ impl Transport for SshTransport {
                             })?;
 
                         bytes_written += bytes_read as u64;
+                        bytes_since_checkpoint += bytes_read as u64;
+
+                        // Update state and save checkpoint every 10MB
+                        if bytes_since_checkpoint >= CHECKPOINT_INTERVAL {
+                            state.update_progress(bytes_written);
+                            state.save()?;
+                            bytes_since_checkpoint = 0;
+
+                            tracing::debug!(
+                                "Checkpoint saved for {} at {} bytes ({:.1}%)",
+                                source_path.display(),
+                                bytes_written,
+                                state.progress_percentage()
+                            );
+                        }
                     }
+
+                    // Clear resume state on successful completion
+                    TransferState::clear(&source_path, &dest_path, mtime_systime)?;
 
                     let checksum = hasher.digest();
 
                     tracing::debug!(
-                        "Transferred {} ({} bytes, xxh3: {:x})",
+                        "Transferred {} ({} bytes, xxh3: {:x}, resumed: {})",
                         source_path.display(),
                         bytes_written,
-                        checksum
+                        checksum,
+                        is_resuming
                     );
 
                     // Set modification time
