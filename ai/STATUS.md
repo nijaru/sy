@@ -17,11 +17,25 @@ _Last Updated: 2025-10-28_
 ### 🔄 v0.0.51 IN PROGRESS (Resume Integration)
 **Goal**: Integrate TransferState into file transfers for automatic resume of interrupted large files
 
-**Phase 1: SFTP Streaming Resume** (In Progress)
-- [ ] Add resume logic to copy_file_streaming (Remote→Local)
-- [ ] Implement checkpoint saving (every 10MB)
-- [ ] Handle SFTP seek/append operations
-- [ ] Test with large files (100MB+)
+**✅ Phase 1: SFTP Streaming Resume** (commit: e155c00)
+- ✅ Add resume logic to copy_file_streaming (Remote→Local)
+- ✅ Implement checkpoint saving (every 10MB)
+- ✅ Handle SFTP seek/append operations
+- ✅ Test with large files (all 444 library tests passing)
+
+**Implementation Details:**
+- TransferState loaded before each transfer starts
+- SFTP seek to resume offset using `remote_file.seek(SeekFrom::Start(offset))`
+- Local file opened in append mode when resuming
+- Checkpoint saves every 10MB (10 * 1MB chunks)
+- Resume state cleared on successful completion
+- User feedback shows resume progress percentage
+- Staleness detection via mtime comparison
+
+**Phase 2: Local→Remote Resume** (Pending)
+- Add resume logic to copy_file() SFTP write path
+- Implement checkpoint saving for local→remote
+- Test bidirectional resume
 
 **See**: ai/research/resume_integration_v0.0.51.md for full design
 
