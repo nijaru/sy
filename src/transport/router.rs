@@ -5,6 +5,7 @@ use super::{
 use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::path::SyncPath;
+use crate::retry::RetryConfig;
 use crate::ssh::config::{parse_ssh_config, SshConfig};
 use async_trait::async_trait;
 use std::path::Path;
@@ -29,12 +30,15 @@ impl TransportRouter {
     ///
     /// `pool_size` controls the number of SSH connections in the pool for parallel transfers.
     /// Should typically match the number of parallel workers.
+    ///
+    /// `retry_config` configures network interruption recovery behavior for SSH operations.
     pub async fn new(
         source: &SyncPath,
         destination: &SyncPath,
         checksum_type: ChecksumType,
         verify_on_write: bool,
         pool_size: usize,
+        retry_config: RetryConfig,
     ) -> Result<Self> {
         let verifier = IntegrityVerifier::new(checksum_type, verify_on_write);
 
@@ -59,7 +63,7 @@ impl TransportRouter {
 
                 let source_transport = Box::new(LocalTransport::with_verifier(verifier.clone()));
                 let dest_transport =
-                    Box::new(SshTransport::with_pool_size(&config, pool_size).await?);
+                    Box::new(SshTransport::with_retry_config(&config, pool_size, retry_config.clone()).await?);
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
@@ -76,7 +80,7 @@ impl TransportRouter {
                 };
 
                 let source_transport =
-                    Box::new(SshTransport::with_pool_size(&config, pool_size).await?);
+                    Box::new(SshTransport::with_retry_config(&config, pool_size, retry_config.clone()).await?);
                 let dest_transport = Box::new(LocalTransport::with_verifier(verifier));
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
@@ -115,9 +119,9 @@ impl TransportRouter {
                 };
 
                 let source_transport =
-                    Box::new(SshTransport::with_pool_size(&source_config, pool_size).await?);
+                    Box::new(SshTransport::with_retry_config(&source_config, pool_size, retry_config.clone()).await?);
                 let dest_transport =
-                    Box::new(SshTransport::with_pool_size(&dest_config, pool_size).await?);
+                    Box::new(SshTransport::with_retry_config(&dest_config, pool_size, retry_config.clone()).await?);
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }

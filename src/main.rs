@@ -11,6 +11,8 @@ mod integrity;
 mod path;
 mod perf;
 mod resource;
+mod resume;
+mod retry;
 mod sparse;
 mod ssh;
 mod sync;
@@ -192,6 +194,12 @@ async fn main() -> Result<()> {
     let checksum_type = verification_mode.checksum_type();
     let verify_on_write = verification_mode.verify_blocks();
 
+    // Create retry config from CLI args for network interruption recovery
+    let retry_config = retry::RetryConfig::new(
+        cli.retry,
+        std::time::Duration::from_secs(cli.retry_delay),
+    );
+
     // Create transport router based on source and destination
     // Use worker count for SSH connection pool size to enable true parallel transfers
     let transport = TransportRouter::new(
@@ -200,6 +208,7 @@ async fn main() -> Result<()> {
         checksum_type,
         verify_on_write,
         cli.parallel, // SSH connection pool size = number of workers
+        retry_config,
     )
     .await?;
 

@@ -2,6 +2,7 @@ use super::{TransferResult, Transport};
 use crate::compress::{compress, should_compress_smart, Compression, CompressionDetection};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
+use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
 use crate::sync::scanner::FileEntry;
@@ -168,6 +169,7 @@ impl ConnectionPool {
 pub struct SshTransport {
     connection_pool: Arc<ConnectionPool>,
     remote_binary_path: String,
+    retry_config: RetryConfig,
 }
 
 impl SshTransport {
@@ -182,10 +184,22 @@ impl SshTransport {
     /// `pool_size` should typically match the number of parallel workers.
     /// For sequential operations, use pool_size=1.
     pub async fn with_pool_size(config: &SshConfig, pool_size: usize) -> Result<Self> {
+        Self::with_retry_config(config, pool_size, RetryConfig::default()).await
+    }
+
+    /// Create a new SSH transport with custom retry configuration
+    ///
+    /// This allows configuring network interruption recovery behavior.
+    pub async fn with_retry_config(
+        config: &SshConfig,
+        pool_size: usize,
+        retry_config: RetryConfig,
+    ) -> Result<Self> {
         let connection_pool = ConnectionPool::new(config, pool_size).await?;
         Ok(Self {
             connection_pool: Arc::new(connection_pool),
             remote_binary_path: "sy-remote".to_string(),
+            retry_config,
         })
     }
 
@@ -197,59 +211,65 @@ impl SshTransport {
 
     fn execute_command(session: Arc<Mutex<Session>>, command: &str) -> Result<String> {
         let session = session.lock().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to lock session: {}",
-                e
-            )))
+            let io_err = std::io::Error::other(format!("Failed to lock session: {}", e));
+            SyncError::from_ssh_io_error(io_err, "SSH session lock")
         })?;
 
         let mut channel = session.channel_session().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to create channel: {}",
-                e
-            )))
+            let io_err = std::io::Error::other(format!("Failed to create channel: {}", e));
+            SyncError::from_ssh_io_error(io_err, "SSH channel creation")
         })?;
 
         channel.exec(command).map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to execute command: {}",
-                e
-            )))
+            let io_err = std::io::Error::other(format!("Failed to execute command: {}", e));
+            SyncError::from_ssh_io_error(io_err, "SSH command execution")
         })?;
 
         let mut output = String::new();
         channel.read_to_string(&mut output).map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to read command output: {}",
-                e
-            )))
+            SyncError::from_ssh_io_error(e, "SSH command output read")
         })?;
 
         let mut stderr = String::new();
         let _ = channel.stderr().read_to_string(&mut stderr);
 
         channel.wait_close().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to close channel: {}",
-                e
-            )))
+            let io_err = std::io::Error::other(format!("Failed to close channel: {}", e));
+            SyncError::from_ssh_io_error(io_err, "SSH channel close")
         })?;
 
         let exit_status = channel.exit_status().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to get exit status: {}",
-                e
-            )))
+            let io_err = std::io::Error::other(format!("Failed to get exit status: {}", e));
+            SyncError::from_ssh_io_error(io_err, "SSH exit status")
         })?;
 
         if exit_status != 0 {
-            return Err(SyncError::Io(std::io::Error::other(format!(
+            let io_err = std::io::Error::other(format!(
                 "Command '{}' failed with exit code {}\nstdout: {}\nstderr: {}",
                 command, exit_status, output, stderr
-            ))));
+            ));
+            return Err(SyncError::from_ssh_io_error(io_err, "SSH command failed"));
         }
 
         Ok(output)
+    }
+
+    /// Execute command with retry logic
+    #[allow(dead_code)] // Will be used when integrating retry into operations
+    async fn execute_command_with_retry(
+        &self,
+        session: Arc<Mutex<Session>>,
+        command: &str,
+    ) -> Result<String> {
+        let cmd = command.to_string();
+        let sess = session.clone();
+
+        retry_with_backoff(&self.retry_config, || {
+            let cmd = cmd.clone();
+            let sess = sess.clone();
+            async move { Self::execute_command(sess, &cmd) }
+        })
+        .await
     }
 
     /// Execute a command with stdin data (binary-safe)
