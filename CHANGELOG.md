@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.51] - 2025-10-28
+
+### Added
+- **Automatic Resume for Interrupted Transfers** - Large file transfers automatically resume after interruption
+  - **Bidirectional Resume Support**: Both Remote→Local and Local→Remote transfers can resume
+    - Remote→Local: SFTP streaming (copy_file_streaming) with remote seek + local append
+    - Local→Remote: SFTP write path (copy_file) with local seek + remote seek
+  - **Checkpoint Saves**: Progress saved every 10MB (10 * 1MB chunks) for recovery
+  - **Staleness Detection**: Rejects resume state if source file modified (via mtime comparison)
+  - **User Feedback**: Shows resume progress percentage when resuming
+  - **Atomic State Management**:
+    - Resume state stored in `~/.cache/sy/resume/<hash>.json`
+    - BLAKE3-based unique IDs (hash of source + dest + mtime)
+    - Atomic writes (temp + rename pattern)
+    - Automatic cleanup on successful completion
+  - **SFTP Seek Operations**:
+    - Remote→Local: `remote_file.seek(SeekFrom::Start(offset))` + local append mode
+    - Local→Remote: local `source_file.seek()` + `sftp.open_mode(WRITE)` + remote seek
+
+### Changed
+- **Removed dead_code attributes**: Resume infrastructure now actively used in production transfers
+- **Enhanced logging**: Transfer debug logs now show if transfer was resumed
+
 ## [0.0.50] - 2025-10-28
 
 ### Added
