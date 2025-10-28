@@ -4,15 +4,26 @@ _Last Updated: 2025-10-28_
 
 ## Current State
 - Version: v0.0.50 (RELEASED - 2025-10-28) ✅
-- Next: v0.0.51 (Resume integration) - Planning phase
+- Current Work: v0.0.51 (Resume integration) - Phase 1 in progress
 - Test Coverage: 957 tests passing (444 lib + integration tests)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 
-### Post-Release Maintenance
-- ✅ Published to crates.io (v0.0.50)
+### Post-Release Maintenance (v0.0.50)
+- ✅ Published to crates.io
 - ✅ GitHub release created
-- ✅ Dead code warnings resolved (resume module prepared for v0.0.51)
+- ✅ Dead code warnings resolved (commit: d122876)
+
+### 🔄 v0.0.51 IN PROGRESS (Resume Integration)
+**Goal**: Integrate TransferState into file transfers for automatic resume of interrupted large files
+
+**Phase 1: SFTP Streaming Resume** (In Progress)
+- [ ] Add resume logic to copy_file_streaming (Remote→Local)
+- [ ] Implement checkpoint saving (every 10MB)
+- [ ] Handle SFTP seek/append operations
+- [ ] Test with large files (100MB+)
+
+**See**: ai/research/resume_integration_v0.0.51.md for full design
 
 ### ✅ v0.0.50 COMPLETE (Network Recovery Activation)
 **Goal**: Activate retry infrastructure built in v0.0.49, making it functional in production
