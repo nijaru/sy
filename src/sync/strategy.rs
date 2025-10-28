@@ -402,10 +402,13 @@ impl StrategyPlanner {
 
             // Also keep a small HashSet for false positive verification
             // Only stored when Bloom filter says "might exist"
-            let source_paths: std::collections::HashSet<_> = source_files
-                .iter()
-                .map(|f| (*f.relative_path).clone())
-                .collect();
+            let source_paths: std::collections::HashSet<_> = {
+                let mut set = std::collections::HashSet::with_capacity(source_files.len());
+                for f in source_files {
+                    set.insert((*f.relative_path).clone());
+                }
+                set
+            };
 
             // Stream destination files and check against Bloom filter
             if let Ok(dest_scanner) = crate::sync::scanner::Scanner::new(dest_root).scan_streaming()

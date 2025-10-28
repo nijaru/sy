@@ -43,12 +43,12 @@ pub fn classify_changes(
     prior_state: &StateMap,
 ) -> Result<Vec<Change>> {
     // Build lookups by relative path
-    let mut source_map: HashMap<PathBuf, &FileEntry> = HashMap::new();
+    let mut source_map: HashMap<PathBuf, &FileEntry> = HashMap::with_capacity(source_files.len());
     for entry in source_files {
         source_map.insert((*entry.relative_path).clone(), entry);
     }
 
-    let mut dest_map: HashMap<PathBuf, &FileEntry> = HashMap::new();
+    let mut dest_map: HashMap<PathBuf, &FileEntry> = HashMap::with_capacity(dest_files.len());
     for entry in dest_files {
         dest_map.insert((*entry.relative_path).clone(), entry);
     }
