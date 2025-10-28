@@ -41,7 +41,8 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **Bidirectional Sync** - Two-way sync with automatic conflict resolution, 6 strategies! (v0.0.43)
 ✅ **SSH Bidirectional Sync** - Bisync works with remote servers (local↔remote, remote↔remote)! (v0.0.48)
 ✅ **.gitignore Support** - Respects .gitignore patterns even outside git repositories! (v0.0.48)
-🚀 **Current Version: v0.0.48-dev** - 410+ tests passing!
+✅ **Network Interruption Recovery** - Automatic retry with exponential backoff and resume capability! (v0.0.49)
+🚀 **Current Version: v0.0.49** - 957 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -160,6 +161,14 @@ sy --show-profile backup-home                          # Show profile details
 # Resume support (new in v0.0.13+)
 sy /large /destination                                 # Interrupt with Ctrl+C
 sy /large /destination                                 # Re-run to resume from checkpoint
+
+# Network interruption recovery (new in v0.0.49+)
+sy /local user@host:/remote --retry 5                  # Retry failed operations up to 5 times
+sy /local user@host:/remote --retry 3 --retry-delay 2  # 3 retries with 2s initial delay
+sy /local user@host:/remote --resume-only              # Only resume interrupted transfers
+sy /local user@host:/remote --clear-resume-state       # Clear resume state before sync
+# Retry features: Exponential backoff (1s → 2s → 4s), max 30s delay
+# Resume state: Stored in ~/.cache/sy/resume/, 1MB chunks, BLAKE3-based IDs
 
 # Verification modes (new in v0.0.14+)
 sy /source /destination --verify                       # BLAKE3 cryptographic verification

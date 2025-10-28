@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.49] - 2025-10-27
+
+### Added
+- **Network Interruption Recovery** - Comprehensive retry and resume infrastructure
+  - **Error Classification**: Automatic classification of retryable vs. fatal network errors
+    - NetworkTimeout, NetworkDisconnected, NetworkRetryable errors with clear user messages
+    - NetworkFatal errors for non-recoverable failures
+    - Helper methods: `is_retryable()` and `requires_reconnection()`
+    - Intelligent mapping from IO ErrorKinds to appropriate network error types
+  - **Retry Logic with Exponential Backoff**:
+    - `--retry <N>` flag to set max retry attempts (default: 3, 0 = no retries)
+    - `--retry-delay <seconds>` flag for initial delay between retries (default: 1s)
+    - Exponential backoff with 2.0 multiplier (1s → 2s → 4s → ...)
+    - Max delay cap: 30 seconds to prevent excessive waiting
+    - Generic `retry_with_backoff()` function for reusable retry infrastructure
+  - **Resume Capability for Interrupted Transfers**:
+    - Chunked transfer state tracking (1MB chunks by default)
+    - State persistence in `~/.cache/sy/resume/` (XDG-compliant)
+    - BLAKE3-based unique state IDs (hash of source + dest + mtime)
+    - Atomic state file writes (temp + rename pattern)
+    - Staleness detection: rejects resume state if source modified
+    - `--resume-only` flag to only resume, don't start new transfers
+    - `--clear-resume-state` flag to clear all resume state before sync
+  - **SSH Integration**: Retry config passed through all SSH transport operations
+    - All SSH operations now use classified error handling
+    - `from_ssh_io_error()` maintains context while classifying errors
+    - Infrastructure ready for active retry in SSH commands (future enhancement)
+
+### Fixed
+- SSH error handling improved with network-aware classification
+  - Connection errors (refused, reset, aborted, broken pipe) → NetworkDisconnected
+  - Timeout errors → NetworkTimeout with duration context
+  - Other IO errors intelligently classified as retryable or fatal
+
+### Technical
+- Added `src/error.rs` network error variants with 12 tests
+- Added `src/retry.rs` module with exponential backoff logic (9 tests)
+- Added `src/resume.rs` module for transfer state management (10 tests)
+- Updated `src/transport/ssh.rs` with retry_config field and error classification
+- Updated `src/transport/router.rs` to pass retry_config to all SSH transports
+- Updated `src/main.rs` to create RetryConfig from CLI args
+- All 957 tests passing (up from 938)
+
+### Implementation Details
+- **Commits**:
+  - Phase 1 (Error Classification): 3e533a2
+  - Phase 2 (Retry Logic): 3e533a2
+  - Phase 3 (Resume Capability): d266d9d
+  - Phase 4 (Integration): 15789e5
+- **Infrastructure Ready**: Retry and resume modules complete, ready for future activation in file transfer operations
+
 ## [0.0.48] - 2025-10-27
 
 ### Added
