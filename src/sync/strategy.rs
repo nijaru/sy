@@ -4,6 +4,7 @@ use crate::error::Result;
 use crate::integrity::{Checksum, ChecksumType, IntegrityVerifier};
 use crate::transport::{FileInfo, Transport};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +21,7 @@ pub enum SyncAction {
 
 #[derive(Debug)]
 pub struct SyncTask {
-    pub source: Option<FileEntry>,
+    pub source: Option<Arc<FileEntry>>,
     pub dest_path: std::path::PathBuf,
     pub action: SyncAction,
     /// Pre-computed source checksum (for --checksum mode)
@@ -138,7 +139,7 @@ impl StrategyPlanner {
         };
 
         Ok(SyncTask {
-            source: Some(source.clone()),
+            source: Some(Arc::new(source.clone())),
             dest_path,
             action,
             source_checksum,
@@ -321,7 +322,7 @@ impl StrategyPlanner {
         };
 
         SyncTask {
-            source: Some(source.clone()),
+            source: Some(Arc::new(source.clone())),
             dest_path,
             action,
             source_checksum,
