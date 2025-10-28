@@ -45,12 +45,12 @@ pub fn classify_changes(
     // Build lookups by relative path
     let mut source_map: HashMap<PathBuf, &FileEntry> = HashMap::new();
     for entry in source_files {
-        source_map.insert(entry.relative_path.clone(), entry);
+        source_map.insert((*entry.relative_path).clone(), entry);
     }
 
     let mut dest_map: HashMap<PathBuf, &FileEntry> = HashMap::new();
     for entry in dest_files {
-        dest_map.insert(entry.relative_path.clone(), entry);
+        dest_map.insert((*entry.relative_path).clone(), entry);
     }
 
     // Collect all unique paths
@@ -237,12 +237,13 @@ fn content_equal(source: &FileEntry, dest: &FileEntry) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     fn make_file_entry(path: &str, size: u64, mtime_secs_ago: u64) -> FileEntry {
         FileEntry {
-            path: PathBuf::from(path),
-            relative_path: PathBuf::from(path),
+            path: Arc::new(PathBuf::from(path)),
+            relative_path: Arc::new(PathBuf::from(path)),
             size,
             modified: SystemTime::now() - Duration::from_secs(mtime_secs_ago),
             is_dir: false,

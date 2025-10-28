@@ -319,14 +319,14 @@ async fn execute_single_action(
     match action {
         SyncAction::CopyToSource(entry) => {
             // Copy from dest to source
-            let src = dest_root.join(&entry.relative_path);
-            let dst = source_root.join(&entry.relative_path);
+            let src = dest_root.join(&*entry.relative_path);
+            let dst = source_root.join(&*entry.relative_path);
             copy_file_across_transports(dest_transport, source_transport, &src, &dst).await
         }
         SyncAction::CopyToDest(entry) => {
             // Copy from source to dest
-            let src = source_root.join(&entry.relative_path);
-            let dst = dest_root.join(&entry.relative_path);
+            let src = source_root.join(&*entry.relative_path);
+            let dst = dest_root.join(&*entry.relative_path);
             copy_file_across_transports(source_transport, dest_transport, &src, &dst).await
         }
         SyncAction::DeleteFromSource(path) => {
@@ -345,8 +345,8 @@ async fn execute_single_action(
             timestamp,
         } => {
             // Rename both files with conflict suffix
-            let source_path = source_root.join(&source.relative_path);
-            let dest_path = dest_root.join(&dest.relative_path);
+            let source_path = source_root.join(&*source.relative_path);
+            let dest_path = dest_root.join(&*dest.relative_path);
 
             let source_conflict = conflict_filename(&source_path, timestamp, "source");
             let dest_conflict = conflict_filename(&dest_path, timestamp, "dest");
@@ -398,7 +398,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
                 // File now exists on both sides with same content
                 // Store state for both source and dest
                 let source_state = SyncState {
-                    path: entry.relative_path.clone(),
+                    path: (*entry.relative_path).clone(),
                     side: Side::Source,
                     mtime: entry.modified,
                     size: entry.size,
@@ -408,7 +408,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
                 state_db.store(&source_state)?;
 
                 let dest_state = SyncState {
-                    path: entry.relative_path.clone(),
+                    path: (*entry.relative_path).clone(),
                     side: Side::Dest,
                     mtime: entry.modified,
                     size: entry.size,
@@ -421,7 +421,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
                 // File now exists on both sides with same content
                 // Store state for both source and dest
                 let source_state = SyncState {
-                    path: entry.relative_path.clone(),
+                    path: (*entry.relative_path).clone(),
                     side: Side::Source,
                     mtime: entry.modified,
                     size: entry.size,
@@ -431,7 +431,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
                 state_db.store(&source_state)?;
 
                 let dest_state = SyncState {
-                    path: entry.relative_path.clone(),
+                    path: (*entry.relative_path).clone(),
                     side: Side::Dest,
                     mtime: entry.modified,
                     size: entry.size,
@@ -449,7 +449,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
             SyncAction::RenameConflict { source, dest, .. } => {
                 // Both files kept with new names - update state
                 let source_state = SyncState {
-                    path: source.relative_path.clone(),
+                    path: (*source.relative_path).clone(),
                     side: Side::Source,
                     mtime: source.modified,
                     size: source.size,
@@ -459,7 +459,7 @@ fn update_state(state_db: &mut BisyncStateDb, resolved: &ResolvedChanges) -> Res
                 state_db.store(&source_state)?;
 
                 let dest_state = SyncState {
-                    path: dest.relative_path.clone(),
+                    path: (*dest.relative_path).clone(),
                     side: Side::Dest,
                     mtime: dest.modified,
                     size: dest.size,

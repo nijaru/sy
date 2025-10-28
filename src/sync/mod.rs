@@ -335,12 +335,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
             for file in &all_files {
                 // Update directory mtimes
                 if file.is_dir {
-                    cache.update(file.relative_path.clone(), file.modified);
+                    cache.update((*file.relative_path).clone(), file.modified);
                 }
 
                 // Group files by directory for caching
                 let dir_path = if file.is_dir {
-                    file.relative_path.clone()
+                    (*file.relative_path).clone()
                 } else {
                     file.relative_path
                         .parent()
@@ -391,7 +391,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                     // If this is a directory, track it to exclude its children
                     if file.is_dir {
-                        excluded_dirs.push(file.relative_path.clone());
+                        excluded_dirs.push((*file.relative_path).clone());
                     }
 
                     return false;
@@ -510,7 +510,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         for file in &source_files {
             // Skip files that are already completed (if resuming)
-            if !completed_paths.is_empty() && completed_paths.contains(&file.relative_path) {
+            if !completed_paths.is_empty() && completed_paths.contains(&**file.relative_path) {
                 tracing::debug!("Skipping completed file: {}", file.relative_path.display());
                 continue;
             }
@@ -1326,7 +1326,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 if self.prune_checksum_db {
                     use std::collections::HashSet;
                     let existing_paths: HashSet<_> =
-                        source_files.iter().map(|f| f.path.clone()).collect();
+                        source_files.iter().map(|f| (*f.path).clone()).collect();
 
                     match db.prune(&existing_paths) {
                         Ok(pruned) => {
@@ -1576,8 +1576,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             if let Some(result) = transferrer
                 .create(
                     &FileEntry {
-                        path: source.to_path_buf(),
-                        relative_path: PathBuf::from(filename),
+                        path: Arc::new(source.to_path_buf()),
+                        relative_path: Arc::new(PathBuf::from(filename)),
                         size: metadata.len(),
                         modified: metadata.modified()?,
                         is_dir: false,
@@ -1645,8 +1645,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             if let Some(result) = transferrer
                 .update(
                     &FileEntry {
-                        path: source.to_path_buf(),
-                        relative_path: PathBuf::from(filename),
+                        path: Arc::new(source.to_path_buf()),
+                        relative_path: Arc::new(PathBuf::from(filename)),
                         size: metadata.len(),
                         modified: metadata.modified()?,
                         is_dir: false,

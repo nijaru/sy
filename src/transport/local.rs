@@ -888,6 +888,7 @@ impl Transport for LocalTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -908,7 +909,7 @@ mod tests {
         assert!(entries.len() >= 3);
         assert!(entries
             .iter()
-            .any(|e| e.relative_path == PathBuf::from("file1.txt")));
+            .any(|e| **e.relative_path == PathBuf::from("file1.txt")));
     }
 
     #[tokio::test]

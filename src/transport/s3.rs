@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// S3 transport for cloud storage operations
@@ -235,8 +236,8 @@ impl Transport for S3Transport {
                 let is_dir = key.ends_with('/');
 
                 entries.push(FileEntry {
-                    path: PathBuf::from(key),
-                    relative_path: self.key_to_path(key),
+                    path: Arc::new(PathBuf::from(key)),
+                    relative_path: Arc::new(self.key_to_path(key)),
                     size,
                     modified,
                     is_dir,

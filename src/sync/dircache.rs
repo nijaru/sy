@@ -3,6 +3,7 @@ use crate::sync::scanner::FileEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Cached file metadata for incremental scanning
@@ -22,7 +23,7 @@ impl CachedFile {
     /// Create from FileEntry
     pub fn from_file_entry(file: &FileEntry) -> Self {
         Self {
-            path: file.relative_path.clone(),
+            path: (*file.relative_path).clone(),
             size: file.size,
             modified: file.modified,
             is_dir: file.is_dir,
@@ -33,8 +34,8 @@ impl CachedFile {
     /// Note: Some fields have default values for simplicity
     pub fn to_file_entry(&self, source_root: &Path) -> FileEntry {
         FileEntry {
-            path: source_root.join(&self.path),
-            relative_path: self.path.clone(),
+            path: Arc::new(source_root.join(&self.path)),
+            relative_path: Arc::new(self.path.clone()),
             size: self.size,
             modified: self.modified,
             is_dir: self.is_dir,

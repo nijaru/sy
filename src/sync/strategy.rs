@@ -82,7 +82,7 @@ impl StrategyPlanner {
         transport: &T,
         checksum_db: Option<&ChecksumDatabase>,
     ) -> Result<SyncTask> {
-        let dest_path = dest_root.join(&source.relative_path);
+        let dest_path = dest_root.join(&*source.relative_path);
 
         let (action, source_checksum, dest_checksum) = if source.is_dir {
             // For directories, just check existence (no metadata needed)
@@ -261,7 +261,7 @@ impl StrategyPlanner {
     /// Determine sync action for a source file (sync version for local-only)
     #[allow(dead_code)]
     pub fn plan_file(&self, source: &FileEntry, dest_root: &Path) -> SyncTask {
-        let dest_path = dest_root.join(&source.relative_path);
+        let dest_path = dest_root.join(&*source.relative_path);
 
         let (action, source_checksum, dest_checksum) = if source.is_dir {
             // For directories, just check existence (no metadata needed)
@@ -403,7 +403,7 @@ impl StrategyPlanner {
             // Only stored when Bloom filter says "might exist"
             let source_paths: std::collections::HashSet<_> = source_files
                 .iter()
-                .map(|f| f.relative_path.clone())
+                .map(|f| (*f.relative_path).clone())
                 .collect();
 
             // Stream destination files and check against Bloom filter
@@ -415,17 +415,17 @@ impl StrategyPlanner {
                         // Definitely not in source - safe to delete
                         deletions.push(SyncTask {
                             source: None,
-                            dest_path: dest_file.path,
+                            dest_path: (*dest_file.path).clone(),
                             action: SyncAction::Delete,
                             source_checksum: None,
                             dest_checksum: None,
                         });
                     } else {
                         // Bloom says "might exist" - verify with HashMap to handle false positives
-                        if !source_paths.contains(&dest_file.relative_path) {
+                        if !source_paths.contains(&**dest_file.relative_path) {
                             deletions.push(SyncTask {
                                 source: None,
-                                dest_path: dest_file.path,
+                                dest_path: (*dest_file.path).clone(),
                                 action: SyncAction::Delete,
                                 source_checksum: None,
                                 dest_checksum: None,
@@ -448,7 +448,7 @@ impl StrategyPlanner {
                     if !source_paths.contains(&dest_file.relative_path) {
                         deletions.push(SyncTask {
                             source: None,
-                            dest_path: dest_file.path,
+                            dest_path: (*dest_file.path).clone(),
                             action: SyncAction::Delete,
                             source_checksum: None,
                             dest_checksum: None,
@@ -470,6 +470,7 @@ impl Default for StrategyPlanner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -481,8 +482,8 @@ mod tests {
         let dest_root = temp.path();
 
         let source_file = FileEntry {
-            path: PathBuf::from("/source/file.txt"),
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(PathBuf::from("/source/file.txt")),
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 100,
             modified: SystemTime::now(),
             is_dir: false,
@@ -512,8 +513,8 @@ mod tests {
         fs::write(dest_root.join("file.txt"), "content").unwrap();
 
         let source_file = FileEntry {
-            path: PathBuf::from("/source/file.txt"),
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(PathBuf::from("/source/file.txt")),
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 7, // "content".len()
             modified: SystemTime::now(),
             is_dir: false,
@@ -543,8 +544,8 @@ mod tests {
         fs::write(dest_root.join("file.txt"), "old").unwrap();
 
         let source_file = FileEntry {
-            path: PathBuf::from("/source/file.txt"),
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(PathBuf::from("/source/file.txt")),
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 100, // Different size
             modified: SystemTime::now(),
             is_dir: false,
@@ -577,8 +578,8 @@ mod tests {
 
         // Source only has keep.txt
         let source_files = vec![FileEntry {
-            path: PathBuf::from("/source/keep.txt"),
-            relative_path: PathBuf::from("keep.txt"),
+            path: Arc::new(PathBuf::from("/source/keep.txt")),
+            relative_path: Arc::new(PathBuf::from("keep.txt")),
             size: 4,
             modified: SystemTime::now(),
             is_dir: false,
@@ -627,8 +628,8 @@ mod tests {
         let mut source_files = Vec::new();
         for i in 0..11_000 {
             source_files.push(FileEntry {
-                path: PathBuf::from(format!("/source/file{}.txt", i)),
-                relative_path: PathBuf::from(format!("file{}.txt", i)),
+                path: Arc::new(PathBuf::from(format!("/source/file{}.txt", i))),
+                relative_path: Arc::new(PathBuf::from(format!("file{}.txt", i))),
                 size: 7,
                 modified: SystemTime::now(),
                 is_dir: false,
@@ -689,8 +690,8 @@ mod tests {
         fs::write(dest_root.join("file.txt"), content).unwrap();
 
         let source_file = FileEntry {
-            path: dest_root.join("file.txt"), // Use same file as source for testing
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(dest_root.join("file.txt")), // Use same file as source for testing
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: content.len() as u64,
             modified: SystemTime::now(),
             is_dir: false,
@@ -731,8 +732,8 @@ mod tests {
         fs::write(dest_dir.join("file.txt"), b"Dest content (different)").unwrap();
 
         let source_file = FileEntry {
-            path: source_dir.join("file.txt"),
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(source_dir.join("file.txt")),
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 14, // "Source content".len()
             modified: SystemTime::now(),
             is_dir: false,
@@ -772,8 +773,8 @@ mod tests {
         fs::write(source_dir.join("file.txt"), b"New file content").unwrap();
 
         let source_file = FileEntry {
-            path: source_dir.join("file.txt"),
-            relative_path: PathBuf::from("file.txt"),
+            path: Arc::new(source_dir.join("file.txt")),
+            relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 16, // "New file content".len()
             modified: SystemTime::now(),
             is_dir: false,
@@ -811,8 +812,8 @@ mod tests {
         // Source has the same files
         let source_files = vec![
             FileEntry {
-                path: PathBuf::from("/source/file1.txt"),
-                relative_path: PathBuf::from("file1.txt"),
+                path: Arc::new(PathBuf::from("/source/file1.txt")),
+                relative_path: Arc::new(PathBuf::from("file1.txt")),
                 size: 7,
                 modified: SystemTime::now(),
                 is_dir: false,
@@ -827,8 +828,8 @@ mod tests {
                 bsd_flags: None,
             },
             FileEntry {
-                path: PathBuf::from("/source/file2.txt"),
-                relative_path: PathBuf::from("file2.txt"),
+                path: Arc::new(PathBuf::from("/source/file2.txt")),
+                relative_path: Arc::new(PathBuf::from("file2.txt")),
                 size: 7,
                 modified: SystemTime::now(),
                 is_dir: false,

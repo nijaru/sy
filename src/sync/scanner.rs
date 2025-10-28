@@ -2,6 +2,7 @@ use crate::error::{Result, SyncError};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -12,13 +13,13 @@ use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
-    pub path: PathBuf,
-    pub relative_path: PathBuf,
+    pub path: Arc<PathBuf>,
+    pub relative_path: Arc<PathBuf>,
     pub size: u64,
     pub modified: SystemTime,
     pub is_dir: bool,
     pub is_symlink: bool,
-    pub symlink_target: Option<PathBuf>,
+    pub symlink_target: Option<Arc<PathBuf>>,
     #[allow(dead_code)] // Used for sparse file detection
     pub is_sparse: bool,
     #[allow(dead_code)] // Used for sparse file optimization
@@ -330,13 +331,13 @@ impl Iterator for StreamingScanner {
             };
 
             return Some(Ok(FileEntry {
-                path: path.clone(),
-                relative_path,
+                path: Arc::new(path.clone()),
+                relative_path: Arc::new(relative_path),
                 size: metadata.len(),
                 modified,
                 is_dir: metadata.is_dir(),
                 is_symlink,
-                symlink_target,
+                symlink_target: symlink_target.map(Arc::new),
                 is_sparse,
                 allocated_size,
                 xattrs,
@@ -351,6 +352,7 @@ impl Iterator for StreamingScanner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use std::fs;
     use tempfile::TempDir;
@@ -371,7 +373,7 @@ mod tests {
         assert!(entries.len() >= 3); // dir1, file1.txt, dir1/file2.txt
         assert!(entries
             .iter()
-            .any(|e| e.relative_path == PathBuf::from("file1.txt")));
+            .any(|e| *e.relative_path == PathBuf::from("file1.txt")));
     }
 
     #[test]
@@ -488,7 +490,7 @@ mod tests {
         // Find the symlink entry
         let link_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("link.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("link.txt"))
             .expect("Symlink should be in scan results");
 
         assert!(link_entry.is_symlink, "Entry should be marked as symlink");
@@ -499,12 +501,12 @@ mod tests {
 
         // The target should be the absolute path to target.txt
         let target = link_entry.symlink_target.as_ref().unwrap();
-        assert_eq!(target, &root.join("target.txt"));
+        assert_eq!(&**target, &root.join("target.txt"));
 
         // Find the regular file entry
         let file_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("target.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("target.txt"))
             .expect("Target file should be in scan results");
 
         assert!(
@@ -542,7 +544,7 @@ mod tests {
         // Should have 2 entries: file.txt and the symlink
         assert_eq!(entries.len(), 2);
         let symlink_entry = entries.iter().find(|e| e.is_symlink).unwrap();
-        assert_eq!(symlink_entry.relative_path, PathBuf::from("link"));
+        assert_eq!(*symlink_entry.relative_path, PathBuf::from("link"));
 
         // With follow_links enabled, walkdir detects the loop and returns an error
         let scanner = Scanner::new(&dir_a).follow_links(true);
@@ -660,7 +662,7 @@ mod tests {
 
         let sparse_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("sparse.dat"))
+            .find(|e| *e.relative_path == PathBuf::from("sparse.dat"))
             .expect("Sparse file should be in scan results");
 
         assert_eq!(
@@ -708,7 +710,7 @@ mod tests {
 
         let regular_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("regular.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("regular.txt"))
             .expect("Regular file should be in scan results");
 
         // Regular file should not be marked as sparse
@@ -743,17 +745,17 @@ mod tests {
         // Find all three entries
         let original_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("original.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("original.txt"))
             .expect("Original file should be in scan results");
 
         let link1_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("link1.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("link1.txt"))
             .expect("Hardlink 1 should be in scan results");
 
         let link2_entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("link2.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("link2.txt"))
             .expect("Hardlink 2 should be in scan results");
 
         // All three should have nlink = 3
@@ -790,7 +792,7 @@ mod tests {
 
         let entry = entries
             .iter()
-            .find(|e| e.relative_path == PathBuf::from("single.txt"))
+            .find(|e| *e.relative_path == PathBuf::from("single.txt"))
             .expect("File should be in scan results");
 
         // Should have nlink = 1 (only itself)
@@ -842,7 +844,7 @@ mod tests {
         let entries = scanner.scan().unwrap();
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].relative_path, PathBuf::from(&long_name));
+        assert_eq!(*entries[0].relative_path, PathBuf::from(&long_name));
     }
 
     #[test]
@@ -871,7 +873,7 @@ mod tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| e.relative_path == PathBuf::from(name)),
+                    .any(|e| *e.relative_path == PathBuf::from(name)),
                 "Should find file: {}",
                 name
             );
@@ -905,7 +907,7 @@ mod tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| e.relative_path == PathBuf::from(name)),
+                    .any(|e| *e.relative_path == PathBuf::from(name)),
                 "Should find file: {}",
                 name
             );
@@ -995,7 +997,7 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size, 0);
-        assert_eq!(entries[0].relative_path, PathBuf::from("empty.txt"));
+        assert_eq!(*entries[0].relative_path, PathBuf::from("empty.txt"));
     }
 
     #[test]

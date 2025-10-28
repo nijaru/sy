@@ -262,12 +262,13 @@ pub fn conflict_filename(original: &Path, timestamp: &str, side: &str) -> PathBu
 mod tests {
     use super::*;
     use crate::bisync::classifier::ChangeType;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     fn make_file_entry(path: &str, size: u64, mtime_secs_ago: u64) -> FileEntry {
         FileEntry {
-            path: PathBuf::from(path),
-            relative_path: PathBuf::from(path),
+            path: Arc::new(PathBuf::from(path)),
+            relative_path: Arc::new(PathBuf::from(path)),
             size,
             modified: SystemTime::now() - Duration::from_secs(mtime_secs_ago),
             is_dir: false,

@@ -553,6 +553,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::transport::local::LocalTransport;
     use std::fs;
@@ -569,8 +570,8 @@ mod tests {
         fs::write(&source_file, "test content").unwrap();
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -614,8 +615,8 @@ mod tests {
         fs::write(&source_file, "test content").unwrap();
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -655,8 +656,8 @@ mod tests {
         let dest_dir = TempDir::new().unwrap();
 
         let dir_entry = FileEntry {
-            path: PathBuf::from("/source/subdir"),
-            relative_path: PathBuf::from("subdir"),
+            path: Arc::new(PathBuf::from("/source/subdir")),
+            relative_path: Arc::new(PathBuf::from("subdir")),
             size: 0,
             modified: SystemTime::now(),
             is_dir: true,
@@ -709,13 +710,13 @@ mod tests {
         let link_target = std::fs::read_link(&link_file).unwrap();
 
         let file_entry = FileEntry {
-            path: link_file.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link_file.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 0,
             modified: SystemTime::now(),
             is_dir: false,
             is_symlink: true,
-            symlink_target: Some(link_target.clone()),
+            symlink_target: Some(Arc::new(link_target.clone())),
             is_sparse: false,
             allocated_size: 0,
             xattrs: None,
@@ -765,13 +766,13 @@ mod tests {
         std::os::unix::fs::symlink(&target_file, &link_file).unwrap();
 
         let file_entry = FileEntry {
-            path: link_file.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link_file.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 0,
             modified: SystemTime::now(),
             is_dir: false,
             is_symlink: true,
-            symlink_target: Some(target_file.clone()),
+            symlink_target: Some(Arc::new(target_file.clone())),
             is_sparse: false,
             allocated_size: 0,
             xattrs: None,
@@ -821,13 +822,13 @@ mod tests {
         std::os::unix::fs::symlink(&target_file, &link_file).unwrap();
 
         let file_entry = FileEntry {
-            path: link_file.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link_file.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 0,
             modified: SystemTime::now(),
             is_dir: false,
             is_symlink: true,
-            symlink_target: Some(target_file),
+            symlink_target: Some(Arc::new(target_file)),
             is_sparse: false,
             allocated_size: 0,
             xattrs: None,
@@ -872,8 +873,8 @@ mod tests {
         xattr::set(&source_file, "user.another", b"value2").unwrap();
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -935,8 +936,8 @@ mod tests {
         xattr::set(&source_file, "user.test", b"value1").unwrap();
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1004,8 +1005,8 @@ mod tests {
 
         // Create FileEntries for both
         let original_entry = FileEntry {
-            path: original_file.clone(),
-            relative_path: PathBuf::from("original.txt"),
+            path: Arc::new(original_file.clone()),
+            relative_path: Arc::new(PathBuf::from("original.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1021,8 +1022,8 @@ mod tests {
         };
 
         let link_entry = FileEntry {
-            path: link_file.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link_file.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1112,8 +1113,8 @@ mod tests {
 
         // Create FileEntries
         let original_entry = FileEntry {
-            path: original_file.clone(),
-            relative_path: PathBuf::from("original.txt"),
+            path: Arc::new(original_file.clone()),
+            relative_path: Arc::new(PathBuf::from("original.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1129,8 +1130,8 @@ mod tests {
         };
 
         let link_entry = FileEntry {
-            path: link_file.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link_file.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1212,8 +1213,8 @@ mod tests {
 
         // Create FileEntries
         let entry1 = FileEntry {
-            path: file1,
-            relative_path: PathBuf::from("file1.txt"),
+            path: Arc::new(file1),
+            relative_path: Arc::new(PathBuf::from("file1.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1229,8 +1230,8 @@ mod tests {
         };
 
         let entry2 = FileEntry {
-            path: file2,
-            relative_path: PathBuf::from("file2.txt"),
+            path: Arc::new(file2),
+            relative_path: Arc::new(PathBuf::from("file2.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1246,8 +1247,8 @@ mod tests {
         };
 
         let entry3 = FileEntry {
-            path: file3,
-            relative_path: PathBuf::from("file3.txt"),
+            path: Arc::new(file3),
+            relative_path: Arc::new(PathBuf::from("file3.txt")),
             size: 7,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1314,8 +1315,8 @@ mod tests {
         let dest = temp.path().join("dest.txt");
 
         let entry = FileEntry {
-            path: nonexistent.clone(),
-            relative_path: PathBuf::from("nonexistent.txt"),
+            path: Arc::new(nonexistent.clone()),
+            relative_path: Arc::new(PathBuf::from("nonexistent.txt")),
             size: 100,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1370,8 +1371,8 @@ mod tests {
         let dest = dest_dir.join("dest.txt");
 
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 4,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1453,13 +1454,13 @@ mod tests {
         std::os::windows::fs::symlink_file(&source, &link).unwrap();
 
         let entry = FileEntry {
-            path: link.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 4,
             modified: SystemTime::now(),
             is_dir: false,
             is_symlink: true,
-            symlink_target: Some(source.clone()),
+            symlink_target: Some(Arc::new(source.clone())),
             is_sparse: false,
             allocated_size: 4,
             xattrs: None,
@@ -1504,13 +1505,13 @@ mod tests {
         std::os::windows::fs::symlink_file(&source, &link).unwrap();
 
         let entry = FileEntry {
-            path: link.clone(),
-            relative_path: PathBuf::from("link.txt"),
+            path: Arc::new(link.clone()),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
             is_symlink: true,
-            symlink_target: Some(source.clone()),
+            symlink_target: Some(Arc::new(source.clone())),
             is_sparse: false,
             allocated_size: 12,
             xattrs: None,
@@ -1551,8 +1552,8 @@ mod tests {
         fs::write(&source, b"test").unwrap();
 
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 4,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1598,8 +1599,8 @@ mod tests {
         // Create a file entry with ACLs present
         let acls_text = "user::rw-\ngroup::r--\nother::r--".to_string();
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1645,8 +1646,8 @@ mod tests {
         // Create a file entry with ACLs present
         let acls_text = "user::rw-\ngroup::r--\nother::r--".to_string();
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1691,8 +1692,8 @@ mod tests {
 
         // Create a file entry with empty ACLs
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1752,8 +1753,8 @@ mod tests {
         // Create file entry with ACLs (simulating what scanner would do)
         let acls_bytes = source_acl_text.join("\n").into_bytes();
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1810,8 +1811,8 @@ mod tests {
         // Note: we use generic format that should work if ACLs are supported
         let acls_text = "user::rw-\ninvalid_line_here\ngroup::r--\n\nanother_bad_line".to_string();
         let entry = FileEntry {
-            path: source.clone(),
-            relative_path: PathBuf::from("source.txt"),
+            path: Arc::new(source.clone()),
+            relative_path: Arc::new(PathBuf::from("source.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1874,8 +1875,8 @@ mod tests {
         );
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,
@@ -1939,8 +1940,8 @@ mod tests {
         let flags = fs::metadata(&source_file).unwrap().st_flags();
 
         let file_entry = FileEntry {
-            path: source_file.clone(),
-            relative_path: PathBuf::from("test.txt"),
+            path: Arc::new(source_file.clone()),
+            relative_path: Arc::new(PathBuf::from("test.txt")),
             size: 12,
             modified: SystemTime::now(),
             is_dir: false,

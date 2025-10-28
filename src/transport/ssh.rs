@@ -583,16 +583,18 @@ impl Transport for SshTransport {
                 let acls = e.acls.map(|acl_text| acl_text.into_bytes());
 
                 Ok(FileEntry {
-                    path: PathBuf::from(&e.path),
-                    relative_path: PathBuf::from(&e.path)
-                        .strip_prefix(path)
-                        .unwrap_or(Path::new(&e.path))
-                        .to_path_buf(),
+                    path: Arc::new(PathBuf::from(&e.path)),
+                    relative_path: Arc::new(
+                        PathBuf::from(&e.path)
+                            .strip_prefix(path)
+                            .unwrap_or(Path::new(&e.path))
+                            .to_path_buf()
+                    ),
                     size: e.size,
                     modified,
                     is_dir: e.is_dir,
                     is_symlink: e.is_symlink,
-                    symlink_target: e.symlink_target.map(PathBuf::from),
+                    symlink_target: e.symlink_target.map(|t| Arc::new(PathBuf::from(t))),
                     is_sparse: e.is_sparse,
                     allocated_size: e.allocated_size,
                     xattrs,
