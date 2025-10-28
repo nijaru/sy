@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.50] - 2025-10-28
+
+### Added
+- **Network Recovery Activation** - All SSH/SFTP operations now use automatic retry
+  - **14 Operations with Retry**: All SSH command, SFTP, and file transfer operations now automatically retry on network failures
+    - Command operations: scan, exists, create_dir_all, remove, create_hardlink, create_symlink
+    - SFTP operations: read_file, write_file, get_mtime, file_info, copy_file_streaming
+    - Transfer operations: copy_file, copy_sparse_file, sync_file_with_delta
+  - **Automatic Network Recovery**: SSH operations now recover from transient network failures without user intervention
+    - Exponential backoff (1s → 2s → 4s → 8s, capped at 30s max delay)
+    - Intelligent error classification (retries only on retryable errors)
+    - Zero overhead when operations succeed
+  - **Production-Ready Reliability**: All 957 tests passing, retry infrastructure fully activated
+
+### Changed
+- **Improved Error Handling**: All SSH/SFTP operations now use retry-wrapped async calls instead of direct spawn_blocking
+
 ## [0.0.49] - 2025-10-27
 
 ### Added

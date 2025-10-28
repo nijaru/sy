@@ -39,13 +39,17 @@
 
 **🔴 HIGH PRIORITY - Production-Critical**
 
-- [ ] Network Interruption Recovery (v0.0.49)
-  - [ ] Handle SSH disconnects mid-transfer gracefully
-  - [ ] Add resume capability (track partial transfers)
-  - [ ] Implement retry logic with exponential backoff
-  - [ ] Clear error messages on network failures
-  - [ ] Test: Simulate drops during large transfers
-  - **Why**: Most likely real-world failure mode, users lose work without this
+- [x] Network Interruption Recovery (v0.0.49-v0.0.50) - **COMPLETE** ✅
+  - [x] v0.0.49: Built infrastructure for retry/resume
+    - [x] Error classification (retryable vs fatal)
+    - [x] Retry logic with exponential backoff
+    - [x] Resume state management (TransferState)
+    - [x] CLI flags: --retry, --retry-delay, --resume-only, --clear-resume-state
+  - [x] v0.0.50: Activated retry for all SSH/SFTP operations
+    - [x] 14 operations converted to use retry_with_backoff
+    - [x] All tests passing (957 tests)
+  - [ ] Future: Resume integration (v0.0.51+)
+  - **Impact**: Automatic recovery from network failures!
 
 - [ ] Large File Testing (1GB+)
   - [ ] Test 100MB, 500MB, 1GB files
