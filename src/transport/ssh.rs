@@ -271,6 +271,7 @@ impl SshTransport {
         .await
     }
 
+
     /// Execute a command with stdin data (binary-safe)
     fn execute_command_with_stdin(
         session: Arc<Mutex<Session>>,
@@ -360,9 +361,15 @@ impl SshTransport {
         let session_arc = self.connection_pool.get_session();
         let remote_binary = self.remote_binary_path.clone();
 
-        tokio::task::spawn_blocking(move || {
-            // Get source metadata
-            let metadata = std::fs::metadata(&source_path).map_err(|e| {
+        retry_with_backoff(&self.retry_config, || {
+            let source_path = source_path.clone();
+            let dest_path = dest_path.clone();
+            let session_arc = session_arc.clone();
+            let remote_binary = remote_binary.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    // Get source metadata
+                    let metadata = std::fs::metadata(&source_path).map_err(|e| {
                 SyncError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -522,9 +529,12 @@ impl SshTransport {
                 transferred_bytes: Some(response.bytes_written),
                 compression_used: false,
             })
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 }
 
@@ -665,9 +675,15 @@ impl Transport for SshTransport {
         let session_arc = self.connection_pool.get_session();
         let remote_binary = self.remote_binary_path.clone();
 
-        tokio::task::spawn_blocking(move || {
-            // Get source metadata for mtime and size
-            let metadata = std::fs::metadata(&source_path).map_err(|e| {
+        retry_with_backoff(&self.retry_config, || {
+            let source_path = source_path.clone();
+            let dest_path = dest_path.clone();
+            let session_arc = session_arc.clone();
+            let remote_binary = remote_binary.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    // Get source metadata for mtime and size
+                    let metadata = std::fs::metadata(&source_path).map_err(|e| {
                 SyncError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -894,9 +910,12 @@ impl Transport for SshTransport {
                     Ok(TransferResult::new(bytes_written))
                 }
             }
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
@@ -920,10 +939,14 @@ impl Transport for SshTransport {
         let remote_binary = self.remote_binary_path.clone();
         let session_clone = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking({
-            let session_arc = session_clone;
-            move || {
-                let session = session_arc.lock().map_err(|e| {
+        retry_with_backoff(&self.retry_config, || {
+            let source_path = source_path.clone();
+            let dest_path = dest_path.clone();
+            let remote_binary = remote_binary.clone();
+            let session_arc = session_clone.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!(
                         "Failed to lock session: {}",
                         e
@@ -1084,10 +1107,12 @@ impl Transport for SshTransport {
                     stats.operations_count,
                     stats.literal_bytes,
                 ))
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
             }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn remove(&self, path: &Path, is_dir: bool) -> Result<()> {
@@ -1181,48 +1206,55 @@ impl Transport for SshTransport {
         let path_buf = path.to_path_buf();
         let session_arc = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking(move || {
-            let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to lock session: {}",
-                    e
-                )))
-            })?;
+        retry_with_backoff(&self.retry_config, || {
+            let path_buf = path_buf.clone();
+            let session_arc = session_arc.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
+                    })?;
 
-            let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to create SFTP session: {}",
-                    e
-                )))
-            })?;
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-            // Open remote file for reading
-            let mut remote_file = sftp.open(&path_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to open remote file {}: {}", path_buf.display(), e),
-                ))
-            })?;
+                    // Open remote file for reading
+                    let mut remote_file = sftp.open(&path_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Failed to open remote file {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
 
-            // Read entire file into memory
-            let mut buffer = Vec::new();
-            std::io::Read::read_to_end(&mut remote_file, &mut buffer).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to read from {}: {}", path_buf.display(), e),
-                ))
-            })?;
+                    // Read entire file into memory
+                    let mut buffer = Vec::new();
+                    std::io::Read::read_to_end(&mut remote_file, &mut buffer).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to read from {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
 
-            tracing::debug!(
-                "Read {} bytes from remote file {}",
-                buffer.len(),
-                path_buf.display()
-            );
+                    tracing::debug!(
+                        "Read {} bytes from remote file {}",
+                        buffer.len(),
+                        path_buf.display()
+                    );
 
-            Ok(buffer)
+                    Ok(buffer)
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn write_file(
@@ -1237,187 +1269,209 @@ impl Transport for SshTransport {
         let data_vec = data.to_vec();
         let session_arc = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking(move || {
-            let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to lock session: {}",
-                    e
-                )))
-            })?;
+        retry_with_backoff(&self.retry_config, || {
+            let path_buf = path_buf.clone();
+            let data_vec = data_vec.clone();
+            let session_arc = session_arc.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
+                    })?;
 
-            let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to create SFTP session: {}",
-                    e
-                )))
-            })?;
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-            // Create parent directories recursively if needed
-            if let Some(parent) = path_buf.parent() {
-                let mut current = std::path::PathBuf::new();
-                for component in parent.components() {
-                    current.push(component);
-                    // Try to create each directory level, ignore if already exists
-                    sftp.mkdir(&current, 0o755).ok();
-                }
+                    // Create parent directories recursively if needed
+                    if let Some(parent) = path_buf.parent() {
+                        let mut current = std::path::PathBuf::new();
+                        for component in parent.components() {
+                            current.push(component);
+                            // Try to create each directory level, ignore if already exists
+                            sftp.mkdir(&current, 0o755).ok();
+                        }
+                    }
+
+                    // Create/open remote file for writing
+                    let mut remote_file = sftp.create(&path_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("Failed to create remote file {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
+
+                    // Write data
+                    remote_file.write_all(&data_vec).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to write to {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
+
+                    remote_file.flush().map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to flush {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
+
+                    // Set mtime on remote file
+                    let mtime_secs = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    sftp.setstat(
+                        &path_buf,
+                        ssh2::FileStat {
+                            size: None,
+                            uid: None,
+                            gid: None,
+                            perm: None,
+                            atime: Some(mtime_secs),
+                            mtime: Some(mtime_secs),
+                        },
+                    )
+                    .map_err(|e| {
+                        tracing::warn!("Failed to set mtime on {}: {}", path_buf.display(), e);
+                        // Don't fail the entire operation if setstat fails
+                    })
+                    .ok();
+
+                    tracing::debug!(
+                        "Wrote {} bytes to remote file {}",
+                        data_vec.len(),
+                        path_buf.display()
+                    );
+
+                    Ok(())
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
             }
-
-            // Create/open remote file for writing
-            let mut remote_file = sftp.create(&path_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Failed to create remote file {}: {}", path_buf.display(), e),
-                ))
-            })?;
-
-            // Write data
-            remote_file.write_all(&data_vec).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to write to {}: {}", path_buf.display(), e),
-                ))
-            })?;
-
-            remote_file.flush().map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to flush {}: {}", path_buf.display(), e),
-                ))
-            })?;
-
-            // Set mtime on remote file
-            let mtime_secs = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            sftp.setstat(
-                &path_buf,
-                ssh2::FileStat {
-                    size: None,
-                    uid: None,
-                    gid: None,
-                    perm: None,
-                    atime: Some(mtime_secs),
-                    mtime: Some(mtime_secs),
-                },
-            )
-            .map_err(|e| {
-                tracing::warn!("Failed to set mtime on {}: {}", path_buf.display(), e);
-                // Don't fail the entire operation if setstat fails
-            })
-            .ok();
-
-            tracing::debug!(
-                "Wrote {} bytes to remote file {}",
-                data_vec.len(),
-                path_buf.display()
-            );
-
-            Ok(())
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn get_mtime(&self, path: &Path) -> Result<std::time::SystemTime> {
         let path_buf = path.to_path_buf();
         let session_arc = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking(move || {
-            let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to lock session: {}",
-                    e
-                )))
-            })?;
+        retry_with_backoff(&self.retry_config, || {
+            let path_buf = path_buf.clone();
+            let session_arc = session_arc.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
+                    })?;
 
-            let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to create SFTP session: {}",
-                    e
-                )))
-            })?;
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-            // Get file stats from remote
-            let stat = sftp.stat(&path_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to stat remote file {}: {}", path_buf.display(), e),
-                ))
-            })?;
+                    // Get file stats from remote
+                    let stat = sftp.stat(&path_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Failed to stat remote file {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
 
-            // Extract mtime
-            let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Remote file {} has no mtime",
-                    path_buf.display()
-                )))
-            })?;
+                    // Extract mtime
+                    let mtime = stat.mtime.ok_or_else(|| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Remote file {} has no mtime",
+                            path_buf.display()
+                        )))
+                    })?;
 
-            let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
+                    let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
 
-            tracing::debug!(
-                "Got mtime for remote file {}: {:?}",
-                path_buf.display(),
-                mtime_systime
-            );
+                    tracing::debug!(
+                        "Got mtime for remote file {}: {:?}",
+                        path_buf.display(),
+                        mtime_systime
+                    );
 
-            Ok(mtime_systime)
+                    Ok(mtime_systime)
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn file_info(&self, path: &Path) -> Result<super::FileInfo> {
         let path_buf = path.to_path_buf();
         let session_arc = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking(move || {
-            let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to lock session: {}",
-                    e
-                )))
-            })?;
+        retry_with_backoff(&self.retry_config, || {
+            let path_buf = path_buf.clone();
+            let session_arc = session_arc.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
+                    })?;
 
-            let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to create SFTP session: {}",
-                    e
-                )))
-            })?;
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-            // Get file stats from remote
-            let stat = sftp.stat(&path_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to stat remote file {}: {}", path_buf.display(), e),
-                ))
-            })?;
+                    // Get file stats from remote
+                    let stat = sftp.stat(&path_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Failed to stat remote file {}: {}", path_buf.display(), e),
+                        ))
+                    })?;
 
-            // Extract size and mtime
-            let size = stat.size.unwrap_or(0);
-            let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Remote file {} has no mtime",
-                    path_buf.display()
-                )))
-            })?;
+                    // Extract size and mtime
+                    let size = stat.size.unwrap_or(0);
+                    let mtime = stat.mtime.ok_or_else(|| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Remote file {} has no mtime",
+                            path_buf.display()
+                        )))
+                    })?;
 
-            let modified = UNIX_EPOCH + Duration::from_secs(mtime);
+                    let modified = UNIX_EPOCH + Duration::from_secs(mtime);
 
-            tracing::debug!(
-                "Got file info for remote file {}: {} bytes, {:?}",
-                path_buf.display(),
-                size,
-                modified
-            );
+                    tracing::debug!(
+                        "Got file info for remote file {}: {} bytes, {:?}",
+                        path_buf.display(),
+                        size,
+                        modified
+                    );
 
-            Ok(super::FileInfo { size, modified })
+                    Ok(super::FileInfo { size, modified })
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            }
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn copy_file_streaming(
@@ -1430,129 +1484,138 @@ impl Transport for SshTransport {
         let dest_buf = dest.to_path_buf();
         let session_arc = self.connection_pool.get_session();
 
-        tokio::task::spawn_blocking(move || {
-            let session = session_arc.lock().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to lock session: {}",
-                    e
-                )))
-            })?;
-
-            let sftp = session.sftp().map_err(|e| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Failed to create SFTP session: {}",
-                    e
-                )))
-            })?;
-
-            // Get file stats for mtime and size
-            let stat = sftp.stat(&source_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to stat remote file {}: {}", source_buf.display(), e),
-                ))
-            })?;
-
-            let file_size = stat.size.unwrap_or(0);
-            let mtime = stat.mtime.ok_or_else(|| {
-                SyncError::Io(std::io::Error::other(format!(
-                    "Remote file {} has no mtime",
-                    source_buf.display()
-                )))
-            })?;
-
-            // Open remote file for streaming read
-            let mut remote_file = sftp.open(&source_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to open remote file {}: {}", source_buf.display(), e),
-                ))
-            })?;
-
-            // Create parent directories if needed
-            if let Some(parent) = dest_buf.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "Failed to create parent directory {}: {}",
-                            parent.display(),
+        retry_with_backoff(&self.retry_config, || {
+            let source_buf = source_buf.clone();
+            let dest_buf = dest_buf.clone();
+            let session_arc = session_arc.clone();
+            let progress_callback = progress_callback.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
                             e
-                        ),
-                    ))
-                })?;
-            }
+                        )))
+                    })?;
 
-            // Create local destination file
-            let mut dest_file = std::fs::File::create(&dest_buf).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to create file {}: {}", dest_buf.display(), e),
-                ))
-            })?;
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-            // Stream in 64KB chunks
-            const CHUNK_SIZE: usize = 64 * 1024;
-            let mut buffer = vec![0u8; CHUNK_SIZE];
-            let mut total_bytes = 0u64;
-
-            if let Some(ref callback) = progress_callback {
-                callback(0, file_size);
-            }
-
-            loop {
-                let bytes_read =
-                    std::io::Read::read(&mut remote_file, &mut buffer).map_err(|e| {
+                    // Get file stats for mtime and size
+                    let stat = sftp.stat(&source_buf).map_err(|e| {
                         SyncError::Io(std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to read from remote {}: {}", source_buf.display(), e),
+                            std::io::ErrorKind::NotFound,
+                            format!("Failed to stat remote file {}: {}", source_buf.display(), e),
                         ))
                     })?;
 
-                if bytes_read == 0 {
-                    break;
-                }
+                    let file_size = stat.size.unwrap_or(0);
+                    let mtime = stat.mtime.ok_or_else(|| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Remote file {} has no mtime",
+                            source_buf.display()
+                        )))
+                    })?;
 
-                std::io::Write::write_all(&mut dest_file, &buffer[..bytes_read]).map_err(|e| {
-                    SyncError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to write to {}: {}", dest_buf.display(), e),
-                    ))
-                })?;
+                    // Open remote file for streaming read
+                    let mut remote_file = sftp.open(&source_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Failed to open remote file {}: {}", source_buf.display(), e),
+                        ))
+                    })?;
 
-                total_bytes += bytes_read as u64;
-                if let Some(ref callback) = progress_callback {
-                    callback(total_bytes, file_size);
-                }
+                    // Create parent directories if needed
+                    if let Some(parent) = dest_buf.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "Failed to create parent directory {}: {}",
+                                    parent.display(),
+                                    e
+                                ),
+                            ))
+                        })?;
+                    }
+
+                    // Create local destination file
+                    let mut dest_file = std::fs::File::create(&dest_buf).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to create file {}: {}", dest_buf.display(), e),
+                        ))
+                    })?;
+
+                    // Stream in 64KB chunks
+                    const CHUNK_SIZE: usize = 64 * 1024;
+                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                    let mut total_bytes = 0u64;
+
+                    if let Some(ref callback) = progress_callback {
+                        callback(0, file_size);
+                    }
+
+                    loop {
+                        let bytes_read =
+                            std::io::Read::read(&mut remote_file, &mut buffer).map_err(|e| {
+                                SyncError::Io(std::io::Error::new(
+                                    e.kind(),
+                                    format!("Failed to read from remote {}: {}", source_buf.display(), e),
+                                ))
+                            })?;
+
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        std::io::Write::write_all(&mut dest_file, &buffer[..bytes_read]).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!("Failed to write to {}: {}", dest_buf.display(), e),
+                            ))
+                        })?;
+
+                        total_bytes += bytes_read as u64;
+                        if let Some(ref callback) = progress_callback {
+                            callback(total_bytes, file_size);
+                        }
+                    }
+
+                    std::io::Write::flush(&mut dest_file).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to flush {}: {}", dest_buf.display(), e),
+                        ))
+                    })?;
+
+                    drop(dest_file);
+
+                    // Set mtime
+                    let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
+                    filetime::set_file_mtime(
+                        &dest_buf,
+                        filetime::FileTime::from_system_time(mtime_systime),
+                    )?;
+
+                    tracing::debug!(
+                        "Streamed {} bytes from {} to {}",
+                        total_bytes,
+                        source_buf.display(),
+                        dest_buf.display()
+                    );
+
+                    Ok(TransferResult::new(total_bytes))
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
             }
-
-            std::io::Write::flush(&mut dest_file).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to flush {}: {}", dest_buf.display(), e),
-                ))
-            })?;
-
-            drop(dest_file);
-
-            // Set mtime
-            let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
-            filetime::set_file_mtime(
-                &dest_buf,
-                filetime::FileTime::from_system_time(mtime_systime),
-            )?;
-
-            tracing::debug!(
-                "Streamed {} bytes from {} to {}",
-                total_bytes,
-                source_buf.display(),
-                dest_buf.display()
-            );
-
-            Ok(TransferResult::new(total_bytes))
         })
         .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 }
 
