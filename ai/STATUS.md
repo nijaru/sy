@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-28_
 
 ## Current State
-- Version: v0.0.50 (RELEASED - 2025-10-28) ✅
-- Current Work: v0.0.51 (Resume integration) - Phase 1 in progress
+- Version: v0.0.51 (READY FOR RELEASE - 2025-10-28) ✅
+- Current Work: Preparing v0.0.51 release (resume integration complete)
 - Test Coverage: 957 tests passing (444 lib + integration tests)
 - Build: Passing (0 warnings, all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
@@ -14,28 +14,33 @@ _Last Updated: 2025-10-28_
 - ✅ GitHub release created
 - ✅ Dead code warnings resolved (commit: d122876)
 
-### 🔄 v0.0.51 IN PROGRESS (Resume Integration)
+### ✅ v0.0.51 COMPLETE (Resume Integration)
 **Goal**: Integrate TransferState into file transfers for automatic resume of interrupted large files
 
 **✅ Phase 1: SFTP Streaming Resume** (commit: e155c00)
-- ✅ Add resume logic to copy_file_streaming (Remote→Local)
-- ✅ Implement checkpoint saving (every 10MB)
-- ✅ Handle SFTP seek/append operations
-- ✅ Test with large files (all 444 library tests passing)
+- Remote→Local transfers (copy_file_streaming)
+- SFTP seek to resume offset
+- Local file append mode
+- Checkpoint saves every 10MB
+- All 444 library tests passing
+
+**✅ Phase 2: Local→Remote Resume** (commit: 1ca5b5e)
+- Local→Remote transfers (copy_file SFTP path)
+- Local file seek + remote SFTP seek
+- Checkpoint saves every 10MB
+- Bidirectional resume complete
 
 **Implementation Details:**
 - TransferState loaded before each transfer starts
-- SFTP seek to resume offset using `remote_file.seek(SeekFrom::Start(offset))`
-- Local file opened in append mode when resuming
+- Remote→Local: `remote_file.seek()` + local append mode
+- Local→Remote: local `source_file.seek()` + `sftp.open_mode()` with WRITE + remote seek
 - Checkpoint saves every 10MB (10 * 1MB chunks)
 - Resume state cleared on successful completion
 - User feedback shows resume progress percentage
 - Staleness detection via mtime comparison
+- Atomic state writes (temp + rename)
 
-**Phase 2: Local→Remote Resume** (Pending)
-- Add resume logic to copy_file() SFTP write path
-- Implement checkpoint saving for local→remote
-- Test bidirectional resume
+**Impact**: sy now automatically resumes interrupted large file transfers in both directions!
 
 **See**: ai/research/resume_integration_v0.0.51.md for full design
 
