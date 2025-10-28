@@ -255,7 +255,6 @@ impl SshTransport {
     }
 
     /// Execute command with retry logic
-    #[allow(dead_code)] // Will be used when integrating retry into operations
     async fn execute_command_with_retry(
         &self,
         session: Arc<Mutex<Session>>,
@@ -535,13 +534,9 @@ impl Transport for SshTransport {
         let path_str = path.to_string_lossy();
         let command = format!("{} scan {}", self.remote_binary_path, path_str);
 
-        let output = tokio::task::spawn_blocking({
-            let session = self.connection_pool.get_session();
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        let output = self
+            .execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
 
         let scan_output: ScanOutput = serde_json::from_str(&output).map_err(|e| {
             SyncError::Io(std::io::Error::other(format!(
@@ -605,13 +600,9 @@ impl Transport for SshTransport {
         let path_str = path.to_string_lossy();
         let command = format!("test -e {} && echo 'exists' || echo 'not found'", path_str);
 
-        let output = tokio::task::spawn_blocking({
-            let session = self.connection_pool.get_session();
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        let output = self
+            .execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
 
         Ok(output.trim() == "exists")
     }
@@ -627,13 +618,8 @@ impl Transport for SshTransport {
         let path_str = path.to_string_lossy();
         let command = format!("mkdir -p '{}'", path_str);
 
-        tokio::task::spawn_blocking({
-            let session = self.connection_pool.get_session();
-            let cmd = command.clone();
-            move || Self::execute_command(session, &cmd)
-        })
-        .await
-        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))??;
+        self.execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
 
         Ok(())
     }
