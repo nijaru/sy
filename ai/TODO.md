@@ -77,11 +77,14 @@
   - **Result**: Users get clear error messages and recovery instructions
   - **Impact**: Graceful recovery from corrupted state instead of mysterious failures
 
-- [ ] Concurrent Sync Safety
-  - [ ] Prevent multiple syncs to same pair
-  - [ ] Add lock file or PID check
-  - [ ] Clear error message when blocked
-  - **Why**: Race conditions = data loss
+- [x] Concurrent Sync Safety - **COMPLETE** ✅ (commit: a3811f2)
+  - [x] Prevent multiple syncs to same pair (file-based locking)
+  - [x] Add lock file with PID (fs2 crate for cross-platform locks)
+  - [x] Clear error message when blocked (SyncLocked error)
+  - [x] Automatic cleanup on process exit (RAII lock guard)
+  - [x] Comprehensive tests (5 lock tests passing)
+  - **Result**: Race conditions prevented, clear user feedback
+  - **Impact**: Data safety - no more concurrent sync corruption
 
 - [ ] Hard Link Handling in Bisync
   - [ ] Test hard link preservation in bisync mode
