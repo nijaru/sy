@@ -51,19 +51,21 @@
   - [ ] Future: Resume integration (v0.0.51+)
   - **Impact**: Automatic recovery from network failures!
 
-- [ ] Large File Testing (1GB+)
-  - [ ] Test 100MB, 500MB, 1GB files
-  - [ ] Verify no OOM issues
-  - [ ] Check progress accuracy at scale
-  - [ ] Measure throughput degradation
-  - **Why**: Current max tested is 10MB, backup use cases need confidence
+- [x] Large File Testing (1GB+) - **COMPLETE** ✅ (v0.0.52, commit: 3588dac)
+  - [x] Test 100MB, 500MB, 1GB files
+  - [x] Verify no OOM issues
+  - [x] Check progress accuracy at scale
+  - [x] Measure throughput degradation
+  - **Result**: All tests passing! 500MB in 4.53s, idempotent 100MB in 11ms
+  - **Impact**: Confidence for backup/large file use cases
 
-- [ ] Massive Directory Testing (10K+ files)
-  - [ ] Test with 1K, 10K, 100K file trees
-  - [ ] Verify O(n) memory behavior
-  - [ ] Check performance doesn't degrade
-  - [ ] Validate state file sizes reasonable
-  - **Why**: Real repos/projects much larger than 100 files tested
+- [x] Massive Directory Testing (10K+ files) - **COMPLETE** ✅ (v0.0.52, commit: 3588dac)
+  - [x] Test with 1K, 10K, 100K file trees
+  - [x] Verify O(n) memory behavior
+  - [x] Check performance doesn't degrade
+  - [x] Validate state file sizes reasonable
+  - **Result**: All tests passing! 10K files in 1.9s, idempotent in 267ms
+  - **Impact**: Proven linear scaling, ready for large repos
 
 **🟡 MEDIUM PRIORITY - Safety & Polish**
 
