@@ -86,6 +86,7 @@ windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 criterion = "0.5"
 tempfile = "3"
 proptest = "1"
+serial_test = "3.0"
 
 [[bench]]
 name = "sync_bench"

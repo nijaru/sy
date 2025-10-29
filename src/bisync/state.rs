@@ -598,6 +598,7 @@ fn determine_winner(conflict: &crate::bisync::engine::ConflictInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::Duration;
 
     fn temp_db() -> (BisyncStateDb, PathBuf) {
@@ -714,6 +715,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_delete() {
         let (mut db, _temp) = temp_db();
 
@@ -734,6 +736,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_clear_all() {
         let (mut db, _temp) = temp_db();
 
@@ -1061,6 +1064,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_force_resync_deletes_corrupt_state() {
         use std::io::Write;
 

@@ -92,11 +92,13 @@ impl Drop for SyncLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
+    #[serial]
     fn test_acquire_lock() {
         let temp_dir = TempDir::new().unwrap();
         let source = temp_dir.path().join("source");
@@ -128,6 +130,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_concurrent_lock_fails() {
         let temp_dir = TempDir::new().unwrap();
         let source = temp_dir.path().join("source");
@@ -159,6 +162,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lock_released_on_drop() {
         let temp_dir = TempDir::new().unwrap();
         let source = temp_dir.path().join("source");
@@ -187,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_different_pairs_independent() {
         let temp_dir = TempDir::new().unwrap();
         let source1 = temp_dir.path().join("source1");
@@ -213,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lock_across_threads() {
         let temp_dir = TempDir::new().unwrap();
         let source = temp_dir.path().join("source");

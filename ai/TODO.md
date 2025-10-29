@@ -105,9 +105,12 @@
   - [ ] Age or GPG integration
   - **Why**: Zero-trust environments
 
-- [ ] Per-File Progress
-  - [ ] Show progress bar for individual large files
-  - [ ] Better UX than batch-only progress
+- [x] Per-File Progress - **COMPLETE** ✅ (commits: 28491f7, fff6be9)
+  - [x] Show progress bar for individual large files (>= 1MB)
+  - [x] Better UX than batch-only progress
+  - [x] TTY detection and quiet mode respect
+  - [x] Opt-in via --per-file-progress flag
+  - **Result**: Production-ready for SSH transfers, local streaming TBD
   - **Why**: User experience improvement
 
 ## Recently Completed
