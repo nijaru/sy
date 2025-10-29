@@ -919,8 +919,6 @@ mod tests {
 
     #[test]
     fn test_detect_empty_state_file() {
-        use std::io::Write;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let state_file = temp_dir.path().join("empty.lst");
 
