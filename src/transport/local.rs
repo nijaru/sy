@@ -884,6 +884,118 @@ impl Transport for LocalTransport {
         );
         Ok(())
     }
+
+    async fn copy_file_streaming(
+        &self,
+        source: &Path,
+        dest: &Path,
+        progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<TransferResult> {
+        // Ensure parent directory exists
+        if let Some(parent) = dest.parent() {
+            self.create_dir_all(parent).await?;
+        }
+
+        let source = source.to_path_buf();
+        let dest = dest.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+
+            // Get source metadata
+            let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
+                path: source.clone(),
+                source: e,
+            })?;
+
+            let total_size = source_meta.len();
+
+            // Open source for reading
+            let mut src_file = File::open(&source).map_err(|e| SyncError::CopyError {
+                path: source.clone(),
+                source: e,
+            })?;
+
+            // Create destination for writing
+            let mut dst_file = File::create(&dest).map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+
+            // Streaming copy with progress updates
+            const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+            let mut buffer = vec![0u8; CHUNK_SIZE];
+            let mut bytes_transferred = 0u64;
+
+            // Initial progress callback
+            if let Some(callback) = &progress_callback {
+                callback(0, total_size);
+            }
+
+            loop {
+                let bytes_read = src_file.read(&mut buffer).map_err(|e| SyncError::CopyError {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+                if bytes_read == 0 {
+                    break; // EOF
+                }
+
+                dst_file
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|e| SyncError::CopyError {
+                        path: dest.clone(),
+                        source: e,
+                    })?;
+
+                bytes_transferred += bytes_read as u64;
+
+                // Update progress after each chunk
+                if let Some(callback) = &progress_callback {
+                    callback(bytes_transferred, total_size);
+                }
+            }
+
+            // Flush and sync
+            dst_file.flush().map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+            dst_file.sync_all().map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+            drop(dst_file);
+
+            // Strip xattrs (to match copy_file behavior)
+            #[cfg(unix)]
+            {
+                if let Ok(xattr_list) = xattr::list(&dest) {
+                    for attr_name in xattr_list {
+                        let _ = xattr::remove(&dest, &attr_name);
+                    }
+                }
+            }
+
+            // Preserve modification time
+            if let Ok(mtime) = source_meta.modified() {
+                let _ =
+                    filetime::set_file_mtime(&dest, filetime::FileTime::from_system_time(mtime));
+            }
+
+            tracing::debug!(
+                "Streaming copy complete: {} ({} bytes)",
+                source.display(),
+                bytes_transferred
+            );
+
+            Ok(TransferResult::new(bytes_transferred))
+        })
+        .await
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
+        .and_then(|r| r)
+    }
 }
 
 #[cfg(test)]
@@ -1212,5 +1324,78 @@ mod tests {
         // Either way, we're testing that it doesn't crash
         // Both outcomes are acceptable - we just verify no panic
         let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_copy_file_streaming_with_progress() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a 5MB test file
+        let source_file = source_dir.path().join("large.dat");
+        let data = vec![0x42u8; 5 * 1024 * 1024]; // 5MB
+        fs::write(&source_file, &data).unwrap();
+
+        // Track progress updates
+        let progress_updates = Arc::new(AtomicU64::new(0));
+        let progress_updates_clone = progress_updates.clone();
+        let last_bytes = Arc::new(AtomicU64::new(0));
+        let last_bytes_clone = last_bytes.clone();
+
+        let progress_callback = Arc::new(move |bytes_transferred: u64, total: u64| {
+            progress_updates_clone.fetch_add(1, Ordering::SeqCst);
+            last_bytes_clone.store(bytes_transferred, Ordering::SeqCst);
+            assert!(bytes_transferred <= total, "Transferred bytes should not exceed total");
+        });
+
+        // Copy file with streaming and progress
+        let transport = LocalTransport::new();
+        let dest_file = dest_dir.path().join("large.dat");
+        let result = transport
+            .copy_file_streaming(&source_file, &dest_file, Some(progress_callback))
+            .await
+            .unwrap();
+
+        // Verify copy succeeded
+        assert_eq!(result.bytes_written, 5 * 1024 * 1024);
+        assert!(dest_file.exists());
+
+        // Verify content matches
+        let dest_data = fs::read(&dest_file).unwrap();
+        assert_eq!(dest_data, data);
+
+        // Verify progress was updated (should be at least 5 updates for 5MB file with 1MB chunks)
+        let updates = progress_updates.load(Ordering::SeqCst);
+        assert!(updates >= 5, "Expected at least 5 progress updates, got {}", updates);
+
+        // Verify final progress shows complete transfer
+        let final_bytes = last_bytes.load(Ordering::SeqCst);
+        assert_eq!(final_bytes, 5 * 1024 * 1024, "Final progress should show complete transfer");
+    }
+
+    #[tokio::test]
+    async fn test_copy_file_streaming_without_progress() {
+        let source_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+
+        // Create a test file
+        let source_file = source_dir.path().join("test.txt");
+        fs::write(&source_file, "test content").unwrap();
+
+        // Copy without progress callback
+        let transport = LocalTransport::new();
+        let dest_file = dest_dir.path().join("test.txt");
+        let result = transport
+            .copy_file_streaming(&source_file, &dest_file, None)
+            .await
+            .unwrap();
+
+        // Verify copy succeeded
+        assert_eq!(result.bytes_written, 12);
+        assert!(dest_file.exists());
+        assert_eq!(fs::read_to_string(&dest_file).unwrap(), "test content");
     }
 }

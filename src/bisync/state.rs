@@ -816,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_edge_case_round_trip() {
         let (mut db, _temp) = temp_db();
 
