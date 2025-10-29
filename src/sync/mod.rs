@@ -1,6 +1,7 @@
 pub mod checksumdb;
 pub mod dircache;
 pub mod output;
+pub mod progress;
 mod ratelimit;
 pub mod resume;
 pub mod scale;
@@ -96,6 +97,7 @@ pub struct SyncEngine<T: Transport> {
     preserve_hardlinks: bool,
     preserve_acls: bool,
     preserve_flags: bool, // macOS only, no-op on other platforms
+    per_file_progress: bool, // Show progress bar for large files
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
@@ -137,6 +139,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         preserve_hardlinks: bool,
         preserve_acls: bool,
         preserve_flags: bool, // macOS only, no-op on other platforms
+        per_file_progress: bool,
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
@@ -180,6 +183,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             preserve_hardlinks,
             preserve_acls,
             preserve_flags,
+            per_file_progress,
             ignore_times,
             size_only,
             checksum,
@@ -691,6 +695,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_hardlinks = self.preserve_hardlinks;
             let preserve_acls = self.preserve_acls;
             let preserve_flags = self.preserve_flags;
+            let per_file_progress = self.per_file_progress;
             let hardlink_map = Arc::clone(&hardlink_map);
             let perf_monitor = self.perf_monitor.clone();
 
@@ -704,6 +709,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     preserve_hardlinks,
                     preserve_acls,
                     preserve_flags,
+                    per_file_progress,
                     hardlink_map,
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -1557,6 +1563,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.preserve_hardlinks,
             self.preserve_acls,
             self.preserve_flags,
+            self.per_file_progress,
             hardlink_map,
         );
 
@@ -1757,6 +1764,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -1866,6 +1874,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2215,6 +2224,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2293,6 +2303,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2373,6 +2384,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2450,6 +2462,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum

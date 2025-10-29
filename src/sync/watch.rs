@@ -162,6 +162,7 @@ mod tests {
             false,                              // preserve_hardlinks
             false,                              // preserve_acls
             false,                              // preserve_flags
+            false,                              // per_file_progress
             false,                              // ignore_times
             false,                              // size_only
             false,                              // checksum
@@ -223,6 +224,7 @@ mod tests {
             false,
             false,
             false, // preserve_flags
+            false, // per_file_progress
             false, // ignore_times
             false, // size_only
             false, // checksum

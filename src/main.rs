@@ -367,6 +367,7 @@ async fn main() -> Result<()> {
         cli.preserve_hardlinks,
         cli.preserve_acls,
         cli.preserve_flags,
+        cli.per_file_progress,
         cli.ignore_times,
         cli.size_only,
         cli.checksum,
