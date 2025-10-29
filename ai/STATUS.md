@@ -4,8 +4,8 @@ _Last Updated: 2025-10-29_
 
 ## Current State
 - Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: Per-file progress feature + test fixes complete
-- Test Coverage: 463 tests (all passing) ✅
+- Current Work: Per-file progress feature fully complete (SSH + local streaming)
+- Test Coverage: 465 tests (all passing) ✅
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
@@ -43,7 +43,7 @@ _Last Updated: 2025-10-29_
 ### ✅ Per-File Progress Feature COMPLETE (2025-10-29)
 **Goal**: Improve UX for large file transfers
 
-**Implementation** (commits: 28491f7, fff6be9, bc7d8fe):
+**Implementation** (commits: 28491f7, fff6be9, bc7d8fe, 4ec46d2):
 
 1. **Per-File Progress Bars** (28491f7)
    - Real-time progress bars for files >= 1MB
@@ -51,7 +51,7 @@ _Last Updated: 2025-10-29_
    - Shows: filename, progress bar, speed (MB/s), percentage, ETA
    - Format: `filename.txt [=====>] 45MB/100MB (45%) 12MB/s ETA: 4s`
    - Leverages existing copy_file_streaming infrastructure
-   - Works with SSH remote transfers (local streaming TBD)
+   - Works with SSH remote transfers
 
 2. **Smart Behavior** (fff6be9)
    - Respects --quiet flag (disabled when quiet=true)
@@ -62,7 +62,14 @@ _Last Updated: 2025-10-29_
 3. **Test Fixes** (bc7d8fe)
    - Added serial_test crate for proper test isolation
    - Fixed 8 tests with XDG_CACHE_HOME pollution
-   - All 463 tests now passing ✅
+   - All 463 tests passing ✅
+
+4. **Local Streaming** (4ec46d2)
+   - Implemented copy_file_streaming() for LocalTransport
+   - Streams files in 1MB chunks (no memory issues for large files)
+   - Real-time progress callbacks after each chunk
+   - Added 2 comprehensive tests for streaming
+   - All 465 tests passing ✅
 
 **Usage**:
 ```bash
