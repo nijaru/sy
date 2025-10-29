@@ -69,11 +69,13 @@
 
 **🟡 MEDIUM PRIORITY - Safety & Polish**
 
-- [ ] State Corruption Recovery
-  - [ ] Detect corrupt ~/.cache/sy/bisync/*.lst files
-  - [ ] Offer to rebuild state from scratch
-  - [ ] Add state file format validation
-  - **Why**: Users will inevitably mess with these files
+- [x] State Corruption Recovery - **COMPLETE** ✅ (commit: 2c39cd0)
+  - [x] Detect corrupt ~/.cache/sy/bisync/*.lst files
+  - [x] Offer to rebuild state from scratch (--force-resync flag)
+  - [x] Add state file format validation (9 validation checks)
+  - [x] Comprehensive tests (9 corruption tests passing)
+  - **Result**: Users get clear error messages and recovery instructions
+  - **Impact**: Graceful recovery from corrupted state instead of mysterious failures
 
 - [ ] Concurrent Sync Safety
   - [ ] Prevent multiple syncs to same pair
