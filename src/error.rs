@@ -217,10 +217,7 @@ mod tests {
 
     #[test]
     fn test_is_retryable_other_errors() {
-        let err = SyncError::Io(std::io::Error::new(
-            ErrorKind::Other,
-            "Some IO error",
-        ));
+        let err = SyncError::Io(std::io::Error::other("Some IO error"));
         assert!(!err.is_retryable());
 
         let err = SyncError::Config("Invalid config".to_string());
@@ -324,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_from_ssh_io_error_fatal() {
-        let io_err = std::io::Error::new(ErrorKind::Other, "unknown error");
+        let io_err = std::io::Error::other("unknown error");
         let sync_err = SyncError::from_ssh_io_error(io_err, "test context");
         assert!(matches!(sync_err, SyncError::NetworkFatal { .. }));
         assert!(!sync_err.is_retryable());

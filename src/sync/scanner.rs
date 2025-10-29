@@ -352,7 +352,6 @@ impl Iterator for StreamingScanner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use std::fs;
     use tempfile::TempDir;

@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 use sy::bisync::{classify_changes, resolve_changes, ConflictResolution};
 use sy::sync::scanner::FileEntry;
@@ -9,8 +10,8 @@ fn make_file_entry(path: &str, size: u64, mtime_secs_ago: u64) -> FileEntry {
     let now = SystemTime::now();
     let mtime = now - std::time::Duration::from_secs(mtime_secs_ago);
     FileEntry {
-        path: PathBuf::from(path),
-        relative_path: PathBuf::from(path),
+        path: Arc::new(PathBuf::from(path)),
+        relative_path: Arc::new(PathBuf::from(path)),
         size,
         modified: mtime,
         is_dir: false,

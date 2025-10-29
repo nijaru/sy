@@ -194,7 +194,7 @@ impl TransferState {
     /// Get number of chunks needed for this transfer
     #[allow(dead_code)] // Future use for parallel chunk transfers
     pub fn total_chunks(&self) -> usize {
-        ((self.total_size + self.chunk_size as u64 - 1) / self.chunk_size as u64) as usize
+        self.total_size.div_ceil(self.chunk_size as u64) as usize
     }
 
     /// Get the next chunk to transfer (start_offset, length)

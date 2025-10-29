@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 use sy::sync::scanner::FileEntry;
 use sy::sync::strategy::StrategyPlanner;
@@ -24,8 +25,8 @@ fn bench_deletion_planning(c: &mut Criterion) {
                 // Create source file list (doesn't include delete*.txt files)
                 let source_files: Vec<FileEntry> = (0..count)
                     .map(|i| FileEntry {
-                        path: PathBuf::from(format!("/source/file{}.txt", i)),
-                        relative_path: PathBuf::from(format!("file{}.txt", i)),
+                        path: Arc::new(PathBuf::from(format!("/source/file{}.txt", i))),
+                        relative_path: Arc::new(PathBuf::from(format!("file{}.txt", i))),
                         size: 100,
                         modified: SystemTime::now(),
                         is_dir: false,

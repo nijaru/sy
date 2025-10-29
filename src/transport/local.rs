@@ -888,7 +888,6 @@ impl Transport for LocalTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
