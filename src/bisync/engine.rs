@@ -95,6 +95,9 @@ impl BisyncEngine {
     ) -> Result<BisyncResult> {
         let start = std::time::Instant::now();
 
+        // 0. Acquire lock to prevent concurrent syncs to same pair
+        let _lock = crate::bisync::SyncLock::acquire(source, dest)?;
+
         // 1. Open state database
         let mut state_db = BisyncStateDb::open(source, dest, opts.force_resync)?;
 
