@@ -20,9 +20,9 @@
 - **Language**: Rust (edition 2021)
 - **Status**: v0.0.52 (released 2025-10-28)
 - **Performance**: 1.3x - 8.8x faster than rsync
-- **Tests**: 465 passing (0 warnings)
+- **Tests**: 484 passing + 5 SSH tests (manual) - 0 warnings
 - **License**: MIT
-- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync with SSH support, production hardening, per-file progress
+- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync with SSH support, production hardening, per-file progress, comprehensive testing
 
 ## Project Structure
 

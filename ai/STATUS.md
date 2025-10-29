@@ -4,8 +4,12 @@ _Last Updated: 2025-10-29_
 
 ## Current State
 - Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: Per-file progress feature fully complete (SSH + local streaming)
-- Test Coverage: 465 tests (all passing) ✅
+- Current Work: Comprehensive testing complete, ready for production monitoring
+- Test Coverage: **484 tests (all passing)** + 5 SSH tests (manual) ✅
+  - **Unit tests**: 465 (all core functionality)
+  - **Integration tests**: 8 (per-file progress end-to-end)
+  - **Edge case tests**: 11 (error scenarios, concurrency, binary data)
+  - **SSH tests**: 5 (manual execution against fedora)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
@@ -70,6 +74,31 @@ _Last Updated: 2025-10-29_
    - Real-time progress callbacks after each chunk
    - Added 2 comprehensive tests for streaming
    - All 465 tests passing ✅
+
+5. **Comprehensive Test Suite** (16111e3) - **Production-Ready** ✅
+   - **24 new tests** covering all real-world scenarios
+   - **Integration tests** (8 tests - `tests/per_file_progress_test.rs`):
+     - Progress shown for files >= 1MB
+     - Progress hidden for files < 1MB
+     - Multiple large files with sequential progress
+     - Mixed file sizes (small + large)
+     - Very large files (100MB+)
+     - Nested directories
+     - File integrity verification
+   - **Edge case tests** (11 tests - `tests/per_file_progress_edge_cases.rs`):
+     - Empty files (0 bytes), exact chunk boundaries, odd file sizes
+     - Progress never exceeds total, monotonic increase
+     - Binary data integrity, mtime preservation
+     - Concurrent file transfers (parallel workers)
+     - Read-only source files
+     - Parent directory creation
+   - **SSH tests** (5 tests - `tests/ssh_per_file_progress_test.rs`):
+     - Local → Remote, Remote → Local, Remote → Remote
+     - Multiple large files over SSH
+     - Manual test script generator for fedora validation
+     - IGNORED by default (run with: `cargo test -- --ignored`)
+   - **Test isolation fixes**: Added `#[serial]` to 3 more state tests
+   - **Total**: 484 tests passing + 5 SSH tests (manual)
 
 **Usage**:
 ```bash
