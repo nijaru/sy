@@ -75,6 +75,12 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Bisync state file corrupted: {path}\nReason: {reason}\n\nTo recover:\n  1. Backup the corrupt file (optional): cp {path} {path}.backup\n  2. Rebuild state from scratch: sy --force-resync <source> <dest>\n\nNote: First sync after recovery will treat all differences as new changes.")]
+    StateCorruption {
+        path: PathBuf,
+        reason: String,
+    },
+
     #[error("Database error: {0}\nCheck that the destination directory is writable.")]
     Database(String),
 

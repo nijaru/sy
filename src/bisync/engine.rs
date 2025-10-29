@@ -19,6 +19,7 @@ pub struct BisyncOptions {
     pub max_delete_percent: u8, // 0-100, 0 = unlimited
     pub dry_run: bool,
     pub clear_state: bool,
+    pub force_resync: bool, // Ignore corrupt state and rebuild from scratch
 }
 
 impl Default for BisyncOptions {
@@ -28,6 +29,7 @@ impl Default for BisyncOptions {
             max_delete_percent: 50,
             dry_run: false,
             clear_state: false,
+            force_resync: false,
         }
     }
 }
@@ -94,7 +96,7 @@ impl BisyncEngine {
         let start = std::time::Instant::now();
 
         // 1. Open state database
-        let mut state_db = BisyncStateDb::open(source, dest)?;
+        let mut state_db = BisyncStateDb::open(source, dest, opts.force_resync)?;
 
         if opts.clear_state {
             state_db.clear_all()?;

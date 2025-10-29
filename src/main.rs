@@ -622,6 +622,7 @@ async fn main() -> Result<()> {
             max_delete_percent: cli.max_delete,
             dry_run: cli.dry_run,
             clear_state: cli.clear_bisync_state,
+            force_resync: cli.force_resync,
         };
 
         let bisync_result = bisync_engine

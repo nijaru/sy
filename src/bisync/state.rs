@@ -91,12 +91,22 @@ impl BisyncStateDb {
     }
 
     /// Open or create bisync state database for source/dest pair
-    pub fn open(source: &Path, dest: &Path) -> Result<Self> {
+    ///
+    /// If `force_resync` is true, deletes any existing corrupted state file
+    /// and starts fresh (used for recovery from corruption)
+    pub fn open(source: &Path, dest: &Path, force_resync: bool) -> Result<Self> {
         let sync_pair_hash = Self::generate_sync_pair_hash(source, dest);
         let state_dir = Self::get_state_dir()?;
         let state_file = state_dir.join(format!("{}.lst", sync_pair_hash));
 
+        // If force_resync is true, delete the state file if it exists (corruption recovery)
+        if force_resync && state_file.exists() {
+            fs::remove_file(&state_file)?;
+        }
+
         let states = if state_file.exists() {
+            // Validate before loading to catch corruption early
+            Self::validate_state_file(&state_file)?;
             Self::load_from_file(&state_file)?
         } else {
             HashMap::new()
@@ -135,6 +145,103 @@ impl BisyncStateDb {
         }
 
         result
+    }
+
+    /// Validate state file for corruption before loading
+    fn validate_state_file(path: &Path) -> Result<()> {
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().collect::<std::io::Result<Vec<_>>>()?;
+
+        // Check for completely empty file
+        if lines.is_empty() {
+            return Err(crate::error::SyncError::StateCorruption {
+                path: path.to_path_buf(),
+                reason: "State file is empty".to_string(),
+                
+                
+            });
+        }
+
+        // Check for valid header (should start with format version comment)
+        let has_header = lines.iter().any(|line| {
+            line.trim().starts_with("# sy bisync")
+        });
+
+        if !has_header {
+            return Err(crate::error::SyncError::StateCorruption {
+                path: path.to_path_buf(),
+                reason: "Missing or invalid format version header".to_string(),
+                
+                
+            });
+        }
+
+        // Count non-comment lines for basic sanity check
+        let data_lines: Vec<&String> = lines.iter()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .collect();
+
+        // If there are data lines, validate structure of first few
+        if !data_lines.is_empty() {
+            for (idx, line) in data_lines.iter().take(5).enumerate() {
+                let parts: Vec<&str> = line.splitn(6, ' ').collect();
+                if parts.len() != 5 && parts.len() != 6 {
+                    return Err(crate::error::SyncError::StateCorruption {
+                        path: path.to_path_buf(),
+                        reason: format!("Invalid field count at line {}: expected 5 or 6 fields, got {}", idx + 1, parts.len()),
+                        
+                        
+                    });
+                }
+
+                // Validate side field
+                if parts[0] != "source" && parts[0] != "dest" {
+                    return Err(crate::error::SyncError::StateCorruption {
+                        path: path.to_path_buf(),
+                        reason: format!("Invalid side field '{}' at line {}: must be 'source' or 'dest'", parts[0], idx + 1),
+                        
+                        
+                    });
+                }
+
+                // Validate mtime is parseable number
+                if parts[1].parse::<i64>().is_err() {
+                    return Err(crate::error::SyncError::StateCorruption {
+                        path: path.to_path_buf(),
+                        reason: format!("Invalid mtime '{}' at line {}: not a valid number", parts[1], idx + 1),
+                        
+                        
+                    });
+                }
+
+                // Validate size is parseable number
+                if parts[2].parse::<u64>().is_err() {
+                    return Err(crate::error::SyncError::StateCorruption {
+                        path: path.to_path_buf(),
+                        reason: format!("Invalid size '{}' at line {}: not a valid number", parts[2], idx + 1),
+                        
+                        
+                    });
+                }
+
+                // Validate checksum format (hex or '-')
+                let checksum = parts[3];
+                if checksum != "-" && u64::from_str_radix(checksum, 16).is_err() {
+                    return Err(crate::error::SyncError::StateCorruption {
+                        path: path.to_path_buf(),
+                        reason: format!("Invalid checksum '{}' at line {}: must be hex or '-'", checksum, idx + 1),
+                        
+                        
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Load state from file
@@ -497,7 +604,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("source");
         let dest = temp_dir.path().join("dest");
-        let db = BisyncStateDb::open(&source, &dest).unwrap();
+        let db = BisyncStateDb::open(&source, &dest, false).unwrap();
         let temp_path = temp_dir.path().to_path_buf();
         std::mem::forget(temp_dir); // Keep temp dir alive
         (db, temp_path)
@@ -658,8 +765,8 @@ mod tests {
         let source2 = temp_dir.path().join("source2");
         let dest = temp_dir.path().join("dest");
 
-        let db1 = BisyncStateDb::open(&source1, &dest).unwrap();
-        let db2 = BisyncStateDb::open(&source2, &dest).unwrap();
+        let db1 = BisyncStateDb::open(&source1, &dest, false).unwrap();
+        let db2 = BisyncStateDb::open(&source2, &dest, false).unwrap();
 
         // Different source → different hash
         assert_ne!(db1.sync_pair_hash(), db2.sync_pair_hash());
@@ -806,5 +913,221 @@ mod tests {
         // Should error, not return 0/1970
         let result = BisyncStateDb::load_from_file(&state_file);
         assert!(result.is_err());
+    }
+
+    // --- Corruption Detection Tests ---
+
+    #[test]
+    fn test_detect_empty_state_file() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("empty.lst");
+
+        // Create empty file
+        std::fs::File::create(&state_file).unwrap();
+
+        // Validation should catch empty file
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("empty"));
+    }
+
+    #[test]
+    fn test_detect_missing_header() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("no_header.lst");
+
+        // Create file without proper header
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# some random comment").unwrap();
+        writeln!(file, "source 1730000000000000000 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+
+        // Validation should catch missing header
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("header"));
+    }
+
+    #[test]
+    fn test_detect_invalid_side() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("bad_side.lst");
+
+        // Create file with invalid side field
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "invalid_side 1730000000000000000 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+
+        // Validation should catch invalid side
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("side"));
+    }
+
+    #[test]
+    fn test_detect_invalid_mtime() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("bad_mtime.lst");
+
+        // Create file with non-numeric mtime
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "source NOT_A_NUMBER 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+
+        // Validation should catch invalid mtime
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("mtime"));
+    }
+
+    #[test]
+    fn test_detect_invalid_size() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("bad_size.lst");
+
+        // Create file with non-numeric size
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "source 1730000000000000000 NOT_A_SIZE - 1730000000000000000 \"test.txt\"").unwrap();
+
+        // Validation should catch invalid size
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("size"));
+    }
+
+    #[test]
+    fn test_detect_invalid_checksum() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("bad_checksum.lst");
+
+        // Create file with invalid checksum (not hex or '-')
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "source 1730000000000000000 1024 INVALID_HEX 1730000000000000000 \"test.txt\"").unwrap();
+
+        // Validation should catch invalid checksum
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("checksum"));
+    }
+
+    #[test]
+    fn test_detect_wrong_field_count() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("wrong_fields.lst");
+
+        // Create file with wrong number of fields
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "source 1024").unwrap(); // Only 2 fields, need 5 or 6
+
+        // Validation should catch field count mismatch
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = format!("{}", err);
+        assert!(err_str.contains("field count"));
+    }
+
+    #[test]
+    fn test_force_resync_deletes_corrupt_state() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Save original XDG_CACHE_HOME to restore later
+        let original_cache_home = std::env::var("XDG_CACHE_HOME").ok();
+
+        // Set cache dir BEFORE creating paths (so get_state_dir() uses it)
+        std::env::set_var("XDG_CACHE_HOME", temp_dir.path().join("cache"));
+
+        let source = temp_dir.path().join("source");
+        let dest = temp_dir.path().join("dest");
+
+        // Create a corrupt state file manually in the actual state directory
+        let sync_pair_hash = BisyncStateDb::generate_sync_pair_hash(&source, &dest);
+        let state_dir = BisyncStateDb::get_state_dir().unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let corrupt_file = state_dir.join(format!("{}.lst", sync_pair_hash));
+
+        let mut file = std::fs::File::create(&corrupt_file).unwrap();
+        writeln!(file, "CORRUPT DATA").unwrap(); // No header, totally corrupt
+        drop(file);
+
+        assert!(corrupt_file.exists());
+
+        // Without force_resync, opening should fail
+        let result = BisyncStateDb::open(&source, &dest, false);
+        assert!(result.is_err());
+
+        // Verify file still exists after failed open
+        assert!(corrupt_file.exists());
+
+        // With force_resync, corrupt file should be deleted and new db created
+        let db = BisyncStateDb::open(&source, &dest, true).unwrap();
+
+        // Corrupt file should be deleted
+        assert!(!corrupt_file.exists());
+
+        // DB should be empty (fresh start)
+        assert_eq!(db.load_all().unwrap().len(), 0);
+
+        // Restore original XDG_CACHE_HOME to avoid leaking to other tests
+        match original_cache_home {
+            Some(val) => std::env::set_var("XDG_CACHE_HOME", val),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_valid_state_passes_validation() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("valid.lst");
+
+        // Create a properly formatted state file
+        let mut file = std::fs::File::create(&state_file).unwrap();
+        writeln!(file, "# sy bisync v2").unwrap();
+        writeln!(file, "# sync_pair: /source <-> /dest").unwrap();
+        writeln!(file, "source 1730000000000000000 1024 abc123 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(file, "dest 1730000000000000000 1024 - 1730000000000000000 \"test2.txt\"").unwrap();
+
+        // Validation should pass
+        let result = BisyncStateDb::validate_state_file(&state_file);
+        assert!(result.is_ok());
     }
 }
