@@ -92,11 +92,12 @@ _Last Updated: 2025-10-29_
      - Concurrent file transfers (parallel workers)
      - Read-only source files
      - Parent directory creation
-   - **SSH tests** (5 tests - `tests/ssh_per_file_progress_test.rs`):
-     - Local → Remote, Remote → Local, Remote → Remote
-     - Multiple large files over SSH
-     - Manual test script generator for fedora validation
-     - IGNORED by default (run with: `cargo test -- --ignored`)
+   - **SSH tests** (5 tests - `tests/ssh_remote_to_local_progress_test.rs`):
+     - Remote → Local downloads (2MB, 10MB, 5MB files)
+     - Progress monotonic increase verification
+     - Connection pooling with concurrent transfers
+     - IGNORED by default (run with: `cargo test --test ssh_remote_to_local_progress_test -- --ignored`)
+     - Note: Local → Remote tested via CLI (requires DualTransport setup)
    - **Test isolation fixes**: Added `#[serial]` to 3 more state tests
    - **Total**: 484 tests passing + 5 SSH tests (manual)
 
