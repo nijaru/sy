@@ -1,14 +1,44 @@
 # Status
 
-_Last Updated: 2025-10-28_
+_Last Updated: 2025-10-29_
 
 ## Current State
 - Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: Production hardening complete - ready for new features
-- Test Coverage: 444 library tests + 15 production hardening tests (all passing)
+- Current Work: Medium-priority safety features complete (state corruption, locking, hard links)
+- Test Coverage: 470 library tests + 21 safety tests (all passing)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
+
+### ✅ Medium-Priority Safety Features COMPLETE (2025-10-29)
+**Goal**: Close critical test gaps and improve data safety
+
+**Completed Features**:
+
+1. **State Corruption Recovery** (commit: 2c39cd0)
+   - Added StateCorruption error type with recovery instructions
+   - Implemented validate_state_file() with 9 validation checks
+   - Added --force-resync CLI flag for recovery
+   - Clear error messages guide users to recovery
+   - 9 comprehensive tests passing
+   - Impact: Graceful recovery from corrupted state instead of mysterious failures
+
+2. **Concurrent Sync Safety** (commit: a3811f2)
+   - File-based locking prevents simultaneous syncs to same directory pair
+   - SyncLock RAII guard with automatic cleanup
+   - Lock files in ~/.cache/sy/locks/ with PID tracking
+   - Cross-platform support via fs2 crate
+   - 5 comprehensive tests passing
+   - Impact: Data safety - prevents race conditions and corruption
+
+3. **Hard Link Handling Tests** (commit: c256733)
+   - 7 comprehensive tests for hard link detection and bisync behavior
+   - Documents current behavior: hard links NOT preserved (become independent files)
+   - Bisync correctly handles hard links without false conflicts
+   - Modifications detected and synced properly
+   - Impact: Verified correct behavior with hard links (dev environments, node_modules)
+
+**Test Script**: test-safety-features.sh runs all safety tests (commit: ed754b7)
 
 ### ✅ v0.0.52 COMPLETE (Performance at Scale)
 **Goal**: Optimize memory usage and performance for large-scale file synchronization (100K+ files)
