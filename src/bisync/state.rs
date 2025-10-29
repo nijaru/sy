@@ -612,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_store_and_retrieve() {
         let (mut db, _temp) = temp_db();
 
@@ -634,6 +635,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_store_both_sides() {
         let (mut db, _temp) = temp_db();
 
@@ -668,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_load_all() {
         let (mut db, _temp) = temp_db();
 
