@@ -221,7 +221,7 @@ mod tests {
     fn test_adler32_rolling_repeating_pattern() {
         // Test with repeating pattern
         let pattern = b"ABCD";
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(100 * pattern.len());
         for _ in 0..100 {
             data.extend_from_slice(pattern);
         }

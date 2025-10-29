@@ -568,7 +568,7 @@ mod tests {
         let mut dest = NamedTempFile::new().unwrap();
 
         // Create 512KB file (4 * 128KB chunks)
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(512 * 1024);
         for i in 0..512 {
             data.extend_from_slice(&[(i % 256) as u8; 1024]);
         }

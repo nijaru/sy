@@ -629,7 +629,7 @@ mod tests {
 
         // Source has 11,000 files (triggers Bloom filter path)
         // We'll create dummy entries without actual files
-        let mut source_files = Vec::new();
+        let mut source_files = Vec::with_capacity(11_000);
         for i in 0..11_000 {
             source_files.push(FileEntry {
                 path: Arc::new(PathBuf::from(format!("/source/file{}.txt", i))),
