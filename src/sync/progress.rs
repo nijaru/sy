@@ -2,6 +2,15 @@
 //
 // Shows real-time progress bars for files >= 1MB to provide better UX
 // for long-running transfers without cluttering output for small files.
+//
+// TTY Detection:
+// - indicatif automatically detects if stdout is a TTY
+// - Progress bars are hidden when output is piped/redirected
+// - Respects --quiet flag (handled in SyncEngine)
+//
+// Usage:
+//   sy /source /dest --per-file-progress  # Show progress for large files
+//   sy /source /dest --quiet               # Hide all progress
 
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;

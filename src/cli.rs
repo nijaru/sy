@@ -185,6 +185,7 @@ pub struct Cli {
     pub perf: bool,
 
     /// Show progress bar for each large file (>= 1MB) being transferred
+    /// Automatically hidden when output is piped or with --quiet
     #[arg(long)]
     pub per_file_progress: bool,
 

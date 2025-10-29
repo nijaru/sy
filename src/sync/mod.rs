@@ -695,7 +695,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_hardlinks = self.preserve_hardlinks;
             let preserve_acls = self.preserve_acls;
             let preserve_flags = self.preserve_flags;
-            let per_file_progress = self.per_file_progress;
+            // Per-file progress should respect quiet mode
+            let per_file_progress = self.per_file_progress && !self.quiet;
             let hardlink_map = Arc::clone(&hardlink_map);
             let perf_monitor = self.perf_monitor.clone();
 
@@ -1554,6 +1555,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Create hardlink map (not used for single-file sync, but required by Transferrer)
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+        // Per-file progress should respect quiet mode
+        let per_file_progress = self.per_file_progress && !self.quiet;
+
         let transferrer = Transferrer::new(
             self.transport.as_ref(),
             self.dry_run,
@@ -1563,7 +1567,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.preserve_hardlinks,
             self.preserve_acls,
             self.preserve_flags,
-            self.per_file_progress,
+            per_file_progress,
             hardlink_map,
         );
 
