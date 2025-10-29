@@ -18,11 +18,11 @@
 **sy** (pronounced "sigh") is a fast, modern file synchronization tool written in Rust - a reimagining of rsync with adaptive performance, verifiable integrity, and beautiful UX.
 
 - **Language**: Rust (edition 2021)
-- **Status**: v0.0.46 (released 2025-10-27)
+- **Status**: v0.0.52 (released 2025-10-28)
 - **Performance**: 1.3x - 8.8x faster than rsync
-- **Tests**: 410 passing (0 warnings)
+- **Tests**: 465 passing (0 warnings)
 - **License**: MIT
-- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync with SSH support
+- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync with SSH support, production hardening, per-file progress
 
 ## Project Structure
 
@@ -152,14 +152,18 @@ cargo build --release
 
 ## Current Focus
 
-**Active**: Phase 2 implementation, recently completed error reporting (v0.0.34)
+**Active**: Production hardening complete (v0.0.52)
+- ✅ State corruption recovery with --force-resync
+- ✅ Concurrent sync safety (file-based locking)
+- ✅ Large file testing (100MB-1GB)
+- ✅ Massive directory testing (10K-100K files)
+- ✅ Per-file progress bars (--per-file-progress)
 
-**Next**: Phase 5 verification enhancements
-- Pre-transfer checksums
-- Verification database
-- --verify-only mode
+**Next**: Monitoring v0.0.52 in production before adding new features
+- Gathering real-world feedback
+- Building confidence for 0.1.0 stability
 
-See `ai/TODO.md` for detailed task list.
+See `ai/TODO.md` for detailed task list and `ai/STATUS.md` for current state.
 
 ## Known Issues & Gotchas
 
@@ -247,5 +251,5 @@ See `docs/PERFORMANCE.md` for detailed benchmarks.
 
 ---
 
-**Version**: v0.0.46 (Last updated: 2025-10-27)
+**Version**: v0.0.52 (Last updated: 2025-10-29)
 **Follows**: [agent-contexts v0.1.1](https://github.com/nijaru/agent-contexts)

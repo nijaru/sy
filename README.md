@@ -42,7 +42,9 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 ✅ **SSH Bidirectional Sync** - Bisync works with remote servers (local↔remote, remote↔remote)! (v0.0.48)
 ✅ **.gitignore Support** - Respects .gitignore patterns even outside git repositories! (v0.0.48)
 ✅ **Network Interruption Recovery** - Automatic retry with exponential backoff and resume capability! (v0.0.49)
-🚀 **Current Version: v0.0.49** - 957 tests passing!
+✅ **Production Hardening** - State corruption recovery, concurrent sync safety, large file/directory testing! (v0.0.52)
+✅ **Per-File Progress** - Real-time progress bars for large files (>= 1MB) with speed and ETA! (v0.0.52)
+🚀 **Current Version: v0.0.52** - 465 tests passing!
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
