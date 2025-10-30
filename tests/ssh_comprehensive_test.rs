@@ -14,10 +14,9 @@
 /// - ~5GB free space on fedora:/tmp/
 ///
 use std::fs;
-use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 const FEDORA_HOST: &str = "fedora";
