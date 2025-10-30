@@ -4,17 +4,19 @@ _Last Updated: 2025-10-29_
 
 ## Current State
 - Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: **Comprehensive SSH testing added** - 43 SSH tests ready for validation
-- Test Coverage: **484 tests (all passing)** + 43 SSH tests (ready to run) ✅
-  - **Unit tests**: 465 (all core functionality)
-  - **Integration tests**: 8 (per-file progress end-to-end)
-  - **Edge case tests**: 11 (error scenarios, concurrency, binary data)
-  - **SSH tests**: 43 (comprehensive SSH functionality - run with --ignored flag)
-    - ssh_comprehensive_test.rs: 20 tests (operations, transfers, errors, edge cases, large scale)
-    - ssh_bisync_test.rs: 8 tests (bidirectional sync scenarios)
-    - ssh_sparse_hardlink_test.rs: 6 tests (sparse files, hard links)
-    - ssh_resume_retry_test.rs: 5 tests (retry with backoff)
-    - ssh_remote_to_local_progress_test.rs: 4 tests (per-file progress)
+- Current Work: **Comprehensive SSH testing added** - 48 SSH tests ready for validation
+- Test Coverage: **603 tests total (all passing)** ✅
+  - **Local tests**: 555 passing
+    - Library tests (sy): 465
+    - Main tests: 3
+    - Integration tests: 83 (change ratio, compression, delta sync, edge cases, hard links, per-file progress, performance, property tests)
+    - Doc tests: 4
+  - **SSH tests**: 48 (comprehensive SSH functionality - run with --ignored flag)
+    - ssh_comprehensive_test.rs: 21 tests (operations, transfers, errors, edge cases, large scale)
+    - ssh_bisync_test.rs: 9 tests (bidirectional sync scenarios)
+    - ssh_sparse_hardlink_test.rs: 7 tests (sparse files, hard links)
+    - ssh_resume_retry_test.rs: 6 tests (retry with backoff)
+    - ssh_remote_to_local_progress_test.rs: 5 tests (per-file progress)
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
