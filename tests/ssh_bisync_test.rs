@@ -338,7 +338,10 @@ async fn test_bisync_delete_from_local() {
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let result = engine2
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions {
+            max_delete_percent: 0, // Allow all deletions for this test
+            ..BisyncOptions::default()
+        })
         .await
         .expect("Second sync failed");
 

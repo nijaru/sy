@@ -51,6 +51,7 @@ fn cleanup_remote_path(path: &str) {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_scan_directory() {
     use sy::transport::ssh::SshTransport;
@@ -92,6 +93,7 @@ async fn test_ssh_scan_directory() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_exists() {
     use sy::transport::ssh::SshTransport;
@@ -130,6 +132,7 @@ async fn test_ssh_exists() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_create_dir_all() {
     use sy::transport::ssh::SshTransport;
@@ -159,6 +162,7 @@ async fn test_ssh_create_dir_all() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_read_write_file() {
     use sy::transport::ssh::SshTransport;
@@ -189,7 +193,9 @@ async fn test_ssh_read_write_file() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
+#[serial_test::serial]
 async fn test_ssh_remove() {
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
@@ -229,6 +235,7 @@ async fn test_ssh_remove() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_get_mtime() {
     use sy::transport::ssh::SshTransport;
@@ -261,7 +268,9 @@ async fn test_ssh_get_mtime() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
+#[serial_test::serial]
 async fn test_ssh_file_info() {
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
@@ -295,6 +304,7 @@ async fn test_ssh_file_info() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_copy_file_basic() {
     use sy::transport::ssh::SshTransport;
@@ -339,6 +349,7 @@ async fn test_ssh_copy_file_basic() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_copy_file_with_progress() {
     use sy::transport::ssh::SshTransport;
@@ -397,6 +408,7 @@ async fn test_ssh_copy_file_with_progress() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_copy_empty_file() {
     use sy::transport::ssh::SshTransport;
@@ -437,6 +449,7 @@ async fn test_ssh_copy_empty_file() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_create_symlink() {
     use sy::transport::ssh::SshTransport;
@@ -489,6 +502,7 @@ async fn test_ssh_create_symlink() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_read_nonexistent_file() {
     use sy::transport::ssh::SshTransport;
@@ -510,6 +524,7 @@ async fn test_ssh_read_nonexistent_file() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_remove_nonexistent_file() {
     use sy::transport::ssh::SshTransport;
@@ -533,6 +548,7 @@ async fn test_ssh_remove_nonexistent_file() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_write_to_readonly_parent() {
     use sy::transport::ssh::SshTransport;
@@ -577,6 +593,7 @@ async fn test_ssh_write_to_readonly_parent() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_special_characters_in_filename() {
     use sy::transport::ssh::SshTransport;
@@ -617,6 +634,7 @@ async fn test_ssh_special_characters_in_filename() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_deep_directory_hierarchy() {
     use sy::transport::ssh::SshTransport;
@@ -659,6 +677,7 @@ async fn test_ssh_deep_directory_hierarchy() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_binary_data_integrity() {
     use sy::transport::ssh::SshTransport;
@@ -699,6 +718,7 @@ async fn test_ssh_binary_data_integrity() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_large_file_100mb() {
     use sy::transport::ssh::SshTransport;
@@ -747,6 +767,7 @@ async fn test_ssh_large_file_100mb() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_many_small_files() {
     use sy::transport::ssh::SshTransport;
@@ -795,6 +816,7 @@ async fn test_ssh_many_small_files() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_ssh_connection_pool_concurrent_transfers() {
     use sy::transport::ssh::SshTransport;
