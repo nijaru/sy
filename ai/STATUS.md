@@ -4,19 +4,20 @@ _Last Updated: 2025-10-29_
 
 ## Current State
 - Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: **Comprehensive SSH testing added** - 48 SSH tests ready for validation
-- Test Coverage: **603 tests total (all passing)** ✅
+- Current Work: **Comprehensive SSH testing complete** - All 48 SSH tests passing! ✅
+- Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
     - Main tests: 3
     - Integration tests: 83 (change ratio, compression, delta sync, edge cases, hard links, per-file progress, performance, property tests)
     - Doc tests: 4
-  - **SSH tests**: 48 (comprehensive SSH functionality - run with --ignored flag)
-    - ssh_comprehensive_test.rs: 21 tests (operations, transfers, errors, edge cases, large scale)
-    - ssh_bisync_test.rs: 9 tests (bidirectional sync scenarios)
-    - ssh_sparse_hardlink_test.rs: 7 tests (sparse files, hard links)
-    - ssh_resume_retry_test.rs: 6 tests (retry with backoff)
-    - ssh_remote_to_local_progress_test.rs: 5 tests (per-file progress)
+  - **SSH tests**: 48 passing (validated against fedora via SSH)
+    - ssh_comprehensive_test.rs: 21/21 ✅ (operations, transfers, errors, edge cases, large scale)
+    - ssh_bisync_test.rs: 9/9 ✅ (bidirectional sync scenarios)
+    - ssh_sparse_hardlink_test.rs: 7/7 ✅ (sparse files, hard links)
+    - ssh_resume_retry_test.rs: 6/6 ✅ (retry with backoff)
+    - ssh_remote_to_local_progress_test.rs: 5/5 ✅ (per-file progress)
+  - **SSH Performance**: 20-33 MB/s transfers, 100 files in ~11s
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
