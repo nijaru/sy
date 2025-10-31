@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.55] - 2025-10-31
+
+### Fixed
+- **Proper remote disk space checking** - Disk space checks now work for SSH destinations
+  - v0.0.53/v0.0.54 skipped disk space checks for remote destinations
+  - v0.0.55 properly checks via `df` command executed over SSH
+  - Prevents out-of-space failures mid-sync
+  - Uses POSIX-format `df -P -B1` for cross-platform compatibility
+
+- **Proper remote extended attributes (xattrs)** - xattrs now set correctly on SSH destinations
+  - v0.0.53/v0.0.54 skipped xattrs for remote destinations
+  - v0.0.55 sets xattrs via platform-specific SSH commands
+  - Linux: uses `setfattr` command
+  - macOS: uses `xattr -w` command
+  - Base64-encodes binary values for safe shell transmission
+
+- **Proper remote ACLs** - POSIX ACLs now preserved for SSH destinations
+  - v0.0.53/v0.0.54 skipped ACLs for remote destinations
+  - v0.0.55 applies ACLs via `setfacl -M` over SSH
+  - Preserves full ACL entries for both Linux and macOS
+
+- **Proper remote BSD flags** - macOS file flags now preserved for SSH destinations
+  - v0.0.53/v0.0.54 skipped BSD flags for remote destinations
+  - v0.0.55 sets flags via `chflags` over SSH
+  - Preserves macOS-specific file attributes like hidden/immutable flags
+
+### Changed
+- All 465 tests passing with proper remote operations
+- Added Transport trait methods: check_disk_space(), set_xattrs(), set_acls(), set_bsd_flags()
+- SshTransport implements full remote operations via SSH commands
+- Operations gracefully warn and continue on failure (don't block sync)
+
+### Technical Details
+- Remote disk space check: Executes `df -P -B1` via SSH and parses output
+- Remote xattrs: Platform detection with fallback (setfattr → xattr -w)
+- Remote ACLs: Uses stdin piping for ACL entries
+- Remote BSD flags: Converts to octal format for chflags
+- All operations wrapped in spawn_blocking for proper async handling
+
 ## [0.0.54] - 2025-10-31
 
 ### Fixed

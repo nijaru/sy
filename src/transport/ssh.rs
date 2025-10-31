@@ -210,6 +210,25 @@ impl SshTransport {
         self.connection_pool.size()
     }
 
+    fn format_bytes(bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        const TB: u64 = GB * 1024;
+
+        if bytes >= TB {
+            format!("{:.2} TB", bytes as f64 / TB as f64)
+        } else if bytes >= GB {
+            format!("{:.2} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.2} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.2} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
     fn execute_command(session: Arc<Mutex<Session>>, command: &str) -> Result<String> {
         let session = session.lock().map_err(|e| {
             let io_err = std::io::Error::other(format!("Failed to lock session: {}", e));
@@ -1818,6 +1837,160 @@ impl Transport for SshTransport {
             }
         })
         .await
+    }
+
+    async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
+        let path_str = path.to_string_lossy();
+
+        // Use df command to get available space
+        // -P for POSIX format (portable), -B1 for bytes
+        let command = format!("df -P -B1 '{}'", path_str);
+
+        let output = self
+            .execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await?;
+
+        // Parse df output
+        // Format: Filesystem 1-blocks Used Available Use% Mounted
+        // We need the "Available" column (4th field in data line)
+        let lines: Vec<&str> = output.lines().collect();
+        if lines.len() < 2 {
+            return Err(SyncError::Io(std::io::Error::other(format!(
+                "Unexpected df output: {}", output
+            ))));
+        }
+
+        let data_line = lines[1];
+        let fields: Vec<&str> = data_line.split_whitespace().collect();
+        if fields.len() < 4 {
+            return Err(SyncError::Io(std::io::Error::other(format!(
+                "Failed to parse df output: {}", data_line
+            ))));
+        }
+
+        let available = fields[3].parse::<u64>().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to parse available space '{}': {}", fields[3], e
+            )))
+        })?;
+
+        // Require 10% buffer for safety
+        let required = bytes_needed + (bytes_needed / 10);
+
+        if available < required {
+            return Err(SyncError::InsufficientDiskSpace {
+                path: path.to_path_buf(),
+                required,
+                available,
+            });
+        }
+
+        // Warn if less than 20% buffer
+        let comfortable = bytes_needed + (bytes_needed / 5);
+        if available < comfortable {
+            tracing::warn!(
+                "Low disk space on remote {}: {} available, {} needed (plus buffer)",
+                path.display(),
+                Self::format_bytes(available),
+                Self::format_bytes(bytes_needed)
+            );
+        }
+
+        tracing::debug!(
+            "Remote disk space check passed: {} available for {} needed",
+            Self::format_bytes(available),
+            Self::format_bytes(bytes_needed)
+        );
+
+        Ok(())
+    }
+
+    async fn set_xattrs(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+        if xattrs.is_empty() {
+            return Ok(());
+        }
+
+        let path_str = path.to_string_lossy();
+
+        for (name, value) in xattrs {
+            // Encode value as base64 for safe shell transmission
+            use base64::{engine::general_purpose, Engine as _};
+            let value_b64 = general_purpose::STANDARD.encode(value);
+
+            // Try Linux setfattr first, fallback to macOS xattr
+            // Linux: setfattr -n name -v value path
+            // macOS: xattr -w name value path (but xattr expects text, not binary)
+            let command = format!(
+                "if command -v setfattr >/dev/null 2>&1; then \
+                    echo '{}' | base64 -d | setfattr -n '{}' -v - '{}'; \
+                 elif command -v xattr >/dev/null 2>&1; then \
+                    echo '{}' | base64 -d | xattr -w '{}' - '{}'; \
+                 else \
+                    echo 'No xattr tool found' >&2; exit 1; \
+                 fi",
+                value_b64, name, path_str,
+                value_b64, name, path_str
+            );
+
+            match self.execute_command_with_retry(self.connection_pool.get_session(), &command).await {
+                Ok(_) => {
+                    tracing::debug!("Set remote xattr {} on {}", name, path.display());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to set remote xattr {} on {}: {}", name, path.display(), e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
+        if acls_text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let path_str = path.to_string_lossy();
+
+        // Use setfacl with ACL entries piped via stdin
+        let command = format!("setfacl -M - '{}'", path_str);
+
+        match SshTransport::execute_command_with_stdin(
+            self.connection_pool.get_session(),
+            &command,
+            acls_text.as_bytes()
+        ) {
+            Ok(_) => {
+                tracing::debug!("Set remote ACLs on {}", path.display());
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to set remote ACLs on {}: {}", path.display(), e);
+                Ok(()) // Don't fail sync if ACLs can't be set
+            }
+        }
+    }
+
+    async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        if flags == 0 {
+            return Ok(());
+        }
+
+        let path_str = path.to_string_lossy();
+
+        // Convert flags to chflags format (octal)
+        let command = format!("chflags {:o} '{}'", flags, path_str);
+
+        match self.execute_command_with_retry(self.connection_pool.get_session(), &command).await {
+            Ok(_) => {
+                tracing::debug!("Set remote BSD flags 0x{:x} on {}", flags, path.display());
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to set remote BSD flags on {}: {}", path.display(), e);
+                Ok(()) // Don't fail sync if flags can't be set
+            }
+        }
     }
 }
 

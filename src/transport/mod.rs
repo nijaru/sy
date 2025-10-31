@@ -237,6 +237,123 @@ pub trait Transport: Send + Sync {
 
         Ok(TransferResult::new(total_size))
     }
+
+    /// Check available disk space at the destination
+    ///
+    /// Verifies that at least `bytes_needed` (plus 10% buffer) is available.
+    /// For remote transports, this may involve executing commands via SSH/SFTP.
+    async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
+        // Default implementation: use local disk space check
+        crate::resource::check_disk_space(path, bytes_needed)
+    }
+
+    /// Set extended attributes on a file
+    ///
+    /// For remote transports, executes platform-specific commands via SSH.
+    /// On Linux: uses setfattr
+    /// On macOS: uses xattr -w
+    async fn set_xattrs(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+        // Default implementation: use local xattr crate
+        #[cfg(unix)]
+        {
+            let path = path.to_path_buf();
+            let xattrs = xattrs.to_vec();
+
+            tokio::task::spawn_blocking(move || {
+                for (name, value) in xattrs {
+                    if let Err(e) = xattr::set(&path, &name, &value) {
+                        tracing::warn!("Failed to set xattr {} on {}: {}", name, path.display(), e);
+                    }
+                }
+            })
+            .await
+            .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, xattrs);
+        }
+        Ok(())
+    }
+
+    /// Set POSIX ACLs on a file
+    ///
+    /// For remote transports, executes setfacl via SSH.
+    async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
+        // Default implementation: use local exacl crate
+        #[cfg(unix)]
+        {
+            use exacl::{setfacl, AclEntry};
+            use std::str::FromStr;
+
+            let path = path.to_path_buf();
+            let acls_text = acls_text.to_string();
+
+            tokio::task::spawn_blocking(move || {
+                let mut acl_entries = Vec::new();
+                for line in acls_text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match AclEntry::from_str(line) {
+                        Ok(entry) => acl_entries.push(entry),
+                        Err(e) => {
+                            tracing::warn!("Failed to parse ACL entry '{}' for {}: {}", line, path.display(), e);
+                            continue;
+                        }
+                    }
+                }
+
+                if !acl_entries.is_empty() {
+                    if let Err(e) = setfacl(&[&path], &acl_entries, None) {
+                        tracing::warn!("Failed to set ACLs on {}: {}", path.display(), e);
+                    }
+                }
+            })
+            .await
+            .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, acls_text);
+        }
+        Ok(())
+    }
+
+    /// Set BSD file flags (macOS only)
+    ///
+    /// For remote transports, executes chflags via SSH.
+    async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        // Default implementation: use local libc chflags
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            let path = path.to_path_buf();
+
+            tokio::task::spawn_blocking(move || {
+                let c_path = match CString::new(path.to_str().unwrap_or("")) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("Failed to create C string for {}: {}", path.display(), e);
+                        return;
+                    }
+                };
+
+                let result = unsafe { libc::chflags(c_path.as_ptr(), flags as _) };
+                if result != 0 {
+                    tracing::warn!("Failed to set BSD flags on {}: {}", path.display(), std::io::Error::last_os_error());
+                }
+            })
+            .await
+            .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, flags);
+        }
+        Ok(())
+    }
 }
 
 // Implement Transport for Arc<T> where T: Transport

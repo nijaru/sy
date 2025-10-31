@@ -293,4 +293,40 @@ impl Transport for TransportRouter {
             TransportRouter::S3(t) => t.read_file(path).await,
         }
     }
+
+    async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.check_disk_space(path, bytes_needed).await,
+            TransportRouter::Dual(t) => t.check_disk_space(path, bytes_needed).await,
+#[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.check_disk_space(path, bytes_needed).await,
+        }
+    }
+
+    async fn set_xattrs(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.set_xattrs(path, xattrs).await,
+            TransportRouter::Dual(t) => t.set_xattrs(path, xattrs).await,
+#[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.set_xattrs(path, xattrs).await,
+        }
+    }
+
+    async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.set_acls(path, acls_text).await,
+            TransportRouter::Dual(t) => t.set_acls(path, acls_text).await,
+#[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.set_acls(path, acls_text).await,
+        }
+    }
+
+    async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.set_bsd_flags(path, flags).await,
+            TransportRouter::Dual(t) => t.set_bsd_flags(path, flags).await,
+#[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.set_bsd_flags(path, flags).await,
+        }
+    }
 }

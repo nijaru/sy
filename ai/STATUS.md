@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-31_
 
 ## Current State
-- Version: v0.0.53 (RELEASED - 2025-10-31) ✅
-- Current Work: **Implementing proper remote operations** - Replacing skip-based fixes with full functionality
+- Version: v0.0.54 (RELEASED - 2025-10-31) ✅
+- Current Work: **Remote verification restored** - Critical data integrity fix completed
 - Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
@@ -33,21 +33,26 @@ _Last Updated: 2025-10-31_
 - **Why shipped**: Unblocked users who couldn't sync at all
 - **Trade-off**: Basic SSH sync works, but missing critical features
 
-**v0.0.54 Work (IN PROGRESS)** - Implementing proper remote operations:
-1. **File verification** (CRITICAL - data integrity)
-   - Use transport.read_file() to verify remote files properly
-   - Restore corruption detection for SSH syncs
-2. **Disk space checks** (HIGH priority)
+**v0.0.54 Release (SHIPPED)** - Critical data integrity fix:
+1. ✅ **File verification** (CRITICAL - data integrity) - **COMPLETED**
+   - Implemented proper transport.read_file() for remote verification
+   - Added read_file() delegation to DualTransport and TransportRouter
+   - Remote files now verified via SFTP with same checksums as local
+   - **Tested**: 10/10 files verified on macOS → Linux SSH sync
+   - **Impact**: Restores corruption detection for SSH syncs
+
+**v0.0.55 Remaining Work** - Lower priority enhancements:
+1. **Disk space checks** (HIGH priority but not critical)
    - Execute `df` command via SSH to check remote space
    - Prevent out-of-space failures mid-sync
-3. **Xattrs/ACLs/BSD flags** (MEDIUM priority)
+2. **Xattrs/ACLs/BSD flags** (MEDIUM priority)
    - Execute `setfattr`, `setfacl`, `chflags` via SSH commands
-   - Restore full feature parity for remote syncs
+   - Feature preservation, not data integrity
 
-**Architecture Fix**:
-- Pattern: Check if destination exists locally → skip if not
-- Problem: Assumes local-only operations, loses functionality
-- Solution: Use SSH transport to execute operations remotely
+**Architecture Pattern**:
+- Problem: v0.0.53 checked `if !path.exists()` → skip operation
+- Solution: v0.0.54 uses transport layer for remote operations
+- Next: v0.0.55 will complete remaining remote operations
 
 ### ✅ Medium-Priority Safety Features COMPLETE (2025-10-29)
 **Goal**: Close critical test gaps and improve data safety

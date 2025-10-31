@@ -440,16 +440,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 .map(|f| f.size)
                 .sum();
 
-            // Check disk space (skip for remote destinations)
-            // For SSH syncs, destination path doesn't exist locally so we can't check via statvfs
-            if destination.exists() {
-                resource::check_disk_space(destination, bytes_needed)?;
-            } else {
-                tracing::debug!(
-                    "Skipping disk space check for {}: not accessible locally (likely remote destination)",
-                    destination.display()
-                );
-            }
+            // Check disk space via transport layer (works for both local and remote)
+            self.transport.check_disk_space(destination, bytes_needed).await?;
 
             // Check FD limits
             resource::check_fd_limits(self.max_concurrent)?;

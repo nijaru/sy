@@ -132,4 +132,24 @@ impl Transport for DualTransport {
         // Read from destination (where the file exists after sync)
         self.dest.read_file(path).await
     }
+
+    async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
+        // Check disk space on destination
+        self.dest.check_disk_space(path, bytes_needed).await
+    }
+
+    async fn set_xattrs(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+        // Set xattrs on destination
+        self.dest.set_xattrs(path, xattrs).await
+    }
+
+    async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
+        // Set ACLs on destination
+        self.dest.set_acls(path, acls_text).await
+    }
+
+    async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        // Set BSD flags on destination
+        self.dest.set_bsd_flags(path, flags).await
+    }
 }

@@ -1,5 +1,5 @@
 use crate::cli::SymlinkMode;
-use crate::error::{Result, SyncError};
+use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use crate::transport::{TransferResult, Transport};
 use std::collections::HashMap;
@@ -291,35 +291,14 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                     return Ok(());
                 }
 
-                // Check if destination file exists locally before attempting to set xattrs
-                // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
-                if !dest_path.exists() {
-                    tracing::debug!(
-                        "Skipping xattrs for {}: file not accessible locally (likely remote destination)",
-                        dest_path.display()
-                    );
-                    return Ok(());
-                }
+                // Convert HashMap to Vec of tuples for transport layer
+                let xattrs_vec: Vec<(String, Vec<u8>)> = xattrs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
 
-                let dest_path = dest_path.to_path_buf();
-                let xattrs_clone = xattrs.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    for (name, value) in xattrs_clone {
-                        if let Err(e) = xattr::set(&dest_path, &name, &value) {
-                            tracing::warn!(
-                                "Failed to set xattr {} on {}: {}",
-                                name,
-                                dest_path.display(),
-                                e
-                            );
-                        } else {
-                            tracing::debug!("Set xattr {} on {}", name, dest_path.display());
-                        }
-                    }
-                })
-                .await
-                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+                // Use transport layer to set xattrs (works for both local and remote)
+                self.transport.set_xattrs(dest_path, &xattrs_vec).await?;
             }
         }
 
@@ -344,87 +323,21 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                     return Ok(());
                 }
 
-                // Check if destination file exists locally before attempting to set ACLs
-                // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
-                if !dest_path.exists() {
-                    tracing::debug!(
-                        "Skipping ACLs for {}: file not accessible locally (likely remote destination)",
-                        dest_path.display()
-                    );
-                    return Ok(());
-                }
-
-                let dest_path = dest_path.to_path_buf();
-                let acls_bytes = acls_bytes.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    use exacl::{setfacl, AclEntry};
-                    use std::str::FromStr;
-
-                    // Parse ACL text back to string
-                    let acls_text = match String::from_utf8(acls_bytes) {
-                        Ok(text) => text,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse ACL text for {}: {}",
-                                dest_path.display(),
-                                e
-                            );
-                            return;
-                        }
-                    };
-
-                    // Parse each line as an ACL entry
-                    let mut acl_entries = Vec::new();
-                    for line in acls_text.lines() {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        // Parse ACL entry from standard text format
-                        match AclEntry::from_str(line) {
-                            Ok(entry) => acl_entries.push(entry),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to parse ACL entry '{}' for {}: {}",
-                                    line,
-                                    dest_path.display(),
-                                    e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    if acl_entries.is_empty() {
-                        tracing::debug!(
-                            "No valid ACL entries to write for {}",
-                            dest_path.display()
+                // Parse ACL text back to string
+                let acls_text = match String::from_utf8(acls_bytes.clone()) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse ACL text for {}: {}",
+                            dest_path.display(),
+                            e
                         );
-                        return;
+                        return Ok(());
                     }
+                };
 
-                    // Apply ACLs to destination file
-                    match setfacl(&[&dest_path], &acl_entries, None) {
-                        Ok(_) => {
-                            tracing::debug!(
-                                "Successfully applied {} ACL entries to {}",
-                                acl_entries.len(),
-                                dest_path.display()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to apply ACLs to {}: {}",
-                                dest_path.display(),
-                                e
-                            );
-                        }
-                    }
-                })
-                .await
-                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+                // Use transport layer to set ACLs (works for both local and remote)
+                self.transport.set_acls(dest_path, &acls_text).await?;
             }
         }
 
@@ -447,18 +360,6 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
         #[cfg(target_os = "macos")]
         {
-            let dest_path = dest_path.to_path_buf();
-
-            // Check if destination file exists locally before attempting to set flags
-            // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
-            if !dest_path.exists() {
-                tracing::debug!(
-                    "Skipping BSD flags for {}: file not accessible locally (likely remote destination)",
-                    dest_path.display()
-                );
-                return Ok(());
-            }
-
             // Determine what flags to set: source flags if preserving, 0 if not
             let flags_to_set = if self.preserve_flags {
                 file_entry.bsd_flags.unwrap_or(0)
@@ -467,40 +368,8 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                 0
             };
 
-            tokio::task::spawn_blocking(move || {
-                use std::ffi::CString;
-
-                let c_path = match CString::new(dest_path.to_str().unwrap_or("")) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to create C string for {}: {}",
-                            dest_path.display(),
-                            e
-                        );
-                        return;
-                    }
-                };
-
-                let result = unsafe { libc::chflags(c_path.as_ptr(), flags_to_set as _) };
-
-                if result != 0 {
-                    let err = std::io::Error::last_os_error();
-                    tracing::warn!(
-                        "Failed to set BSD flags on {}: {}",
-                        dest_path.display(),
-                        err
-                    );
-                } else {
-                    tracing::debug!(
-                        "Set BSD flags 0x{:x} on {}",
-                        flags_to_set,
-                        dest_path.display()
-                    );
-                }
-            })
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            // Use transport layer to set BSD flags (works for both local and remote)
+            self.transport.set_bsd_flags(dest_path, flags_to_set).await?;
 
             Ok(())
         }
