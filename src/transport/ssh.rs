@@ -1840,65 +1840,100 @@ impl Transport for SshTransport {
     }
 
     async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
-        let path_str = path.to_string_lossy();
+        let path_buf = path.to_path_buf();
+        let session_arc = self.connection_pool.get_session();
 
-        // Check if path exists, if not use parent directory (like local implementation)
-        // Use shell-agnostic commands (fish shell doesn't support bash syntax)
-        let check_path_cmd = format!("test -e '{}' && echo '{}' || dirname '{}'",
-            path_str, path_str, path_str
-        );
+        // Use SFTP statvfs for accurate filesystem stats (better than df shell command)
+        // This avoids shell parsing issues and works with any remote shell type
+        let available = retry_with_backoff(&self.retry_config, || {
+            let path_buf = path_buf.clone();
+            let session_arc = session_arc.clone();
+            async move {
+                let result: Result<u64> = tokio::task::spawn_blocking(move || {
+                    let session = session_arc.lock().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to lock session: {}",
+                            e
+                        )))
+                    })?;
 
-        let check_path = self
-            .execute_command_with_retry(self.connection_pool.get_session(), &check_path_cmd)
-            .await
-            .map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Failed to resolve path for disk space check on {}: {}. Path may not exist and parent directory may not be accessible.", path.display(), e),
-                ))
-            })?
-            .trim()
-            .to_string();
+                    let sftp = session.sftp().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to create SFTP session: {}",
+                            e
+                        )))
+                    })?;
 
-        tracing::debug!("Checking disk space for path: {} (resolved to: {})", path.display(), check_path);
+                    // Try to open the path as a directory to get filesystem stats
+                    // If path doesn't exist, fall back to parent directory
+                    let check_path = if let Ok(mut dir) = sftp.opendir(&path_buf) {
+                        // Path exists and is accessible
+                        let stats = dir.statvfs().map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to get filesystem stats for {}: {}",
+                                path_buf.display(),
+                                e
+                            )))
+                        })?;
 
-        // Use df command to get available space
-        // -P for POSIX format (portable), -B1 for bytes
-        let command = format!("df -P -B1 '{}'", check_path);
+                        tracing::debug!(
+                            "Got statvfs for {}: {} blocks available, {} bytes per fragment",
+                            path_buf.display(),
+                            stats.f_bavail,
+                            stats.f_frsize
+                        );
 
-        let output = self
-            .execute_command_with_retry(self.connection_pool.get_session(), &command)
-            .await
-            .map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to check disk space for {} (using path '{}'): {}. Ensure the destination path or its parent directory exists and is accessible.", path.display(), check_path, e),
-                ))
-            })?;
+                        return Ok(stats.f_bavail * stats.f_frsize);
+                    } else if let Some(parent) = path_buf.parent() {
+                        // Path doesn't exist, try parent directory
+                        tracing::debug!(
+                            "Path {} doesn't exist, checking parent: {}",
+                            path_buf.display(),
+                            parent.display()
+                        );
+                        parent.to_path_buf()
+                    } else {
+                        // No parent, use root
+                        PathBuf::from("/")
+                    };
 
-        // Parse df output
-        // Format: Filesystem 1-blocks Used Available Use% Mounted
-        // We need the "Available" column (4th field in data line)
-        let lines: Vec<&str> = output.lines().collect();
-        if lines.len() < 2 {
-            return Err(SyncError::Io(std::io::Error::other(format!(
-                "Unexpected df output: {}", output
-            ))));
-        }
+                    // Open parent/fallback path and get stats
+                    let mut dir = sftp.opendir(&check_path).map_err(|e| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "Failed to open directory {} for disk space check: {}. Ensure the destination path or its parent exists.",
+                                check_path.display(),
+                                e
+                            ),
+                        ))
+                    })?;
 
-        let data_line = lines[1];
-        let fields: Vec<&str> = data_line.split_whitespace().collect();
-        if fields.len() < 4 {
-            return Err(SyncError::Io(std::io::Error::other(format!(
-                "Failed to parse df output: {}", data_line
-            ))));
-        }
+                    let stats = dir.statvfs().map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to get filesystem stats for {}: {}",
+                            check_path.display(),
+                            e
+                        )))
+                    })?;
 
-        let available = fields[3].parse::<u64>().map_err(|e| {
-            SyncError::Io(std::io::Error::other(format!(
-                "Failed to parse available space '{}': {}", fields[3], e
-            )))
-        })?;
+                    tracing::debug!(
+                        "Got statvfs for {}: {} blocks available, {} bytes per fragment",
+                        check_path.display(),
+                        stats.f_bavail,
+                        stats.f_frsize
+                    );
+
+                    // Available space = available blocks * fragment size
+                    Ok(stats.f_bavail * stats.f_frsize)
+                })
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+
+                result
+            }
+        })
+        .await?;
 
         // Require 10% buffer for safety
         let required = bytes_needed + (bytes_needed / 10);
