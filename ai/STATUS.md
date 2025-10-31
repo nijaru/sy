@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-31_
 
 ## Current State
-- Version: v0.0.54 (RELEASED - 2025-10-31) ✅
-- Current Work: **Remote verification restored** - Critical data integrity fix completed
+- Version: v0.0.55 (RELEASED - 2025-10-31) ✅
+- Current Work: **All remote operations complete** - SSH syncs now fully functional
 - Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
@@ -41,13 +41,21 @@ _Last Updated: 2025-10-31_
    - **Tested**: 10/10 files verified on macOS → Linux SSH sync
    - **Impact**: Restores corruption detection for SSH syncs
 
-**v0.0.55 Remaining Work** - Lower priority enhancements:
-1. **Disk space checks** (HIGH priority but not critical)
-   - Execute `df` command via SSH to check remote space
-   - Prevent out-of-space failures mid-sync
-2. **Xattrs/ACLs/BSD flags** (MEDIUM priority)
-   - Execute `setfattr`, `setfacl`, `chflags` via SSH commands
-   - Feature preservation, not data integrity
+**v0.0.55 Release (SHIPPED)** - Complete remote operations:
+1. ✅ **Disk space checks** - **COMPLETED**
+   - Executes `df -P -B1` via SSH to check remote space
+   - Prevents out-of-space failures mid-sync
+   - Uses POSIX format for Linux/macOS compatibility
+2. ✅ **Xattrs/ACLs/BSD flags** - **COMPLETED**
+   - Xattrs: Platform-specific (setfattr on Linux, xattr on macOS)
+   - ACLs: `setfacl -M` via SSH with stdin piping
+   - BSD flags: `chflags` for macOS file attributes
+   - All operations gracefully warn on failure without blocking sync
+
+**Installation**: Now available via prebuilt binary for Apple Silicon!
+- Homebrew: `brew install nijaru/tap/sy` (1 second install, no Rust needed)
+- Crates.io: `cargo install sy`
+- GitHub: https://github.com/nijaru/sy/releases/tag/v0.0.55
 
 **Architecture Pattern**:
 - Problem: v0.0.53 checked `if !path.exists()` → skip operation
