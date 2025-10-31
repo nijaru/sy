@@ -1,6 +1,7 @@
 pub mod dual;
 pub mod local;
 pub mod router;
+#[cfg(feature = "s3")]
 pub mod s3;
 pub mod ssh;
 

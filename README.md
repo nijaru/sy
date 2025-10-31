@@ -56,12 +56,17 @@ See [DESIGN.md](DESIGN.md) for comprehensive technical design (2,400+ lines of d
 ### From crates.io (Recommended)
 
 ```bash
-# Install sy and sy-remote
+# Install sy and sy-remote (local + SSH sync)
 cargo install sy
+
+# Install with S3/cloud storage support (optional)
+cargo install sy --features s3
 
 # Verify installation
 sy --version
 ```
+
+**Note:** By default, S3 support is disabled to minimize dependencies (172 vs 381 crates). Only enable S3 if you need AWS S3, Cloudflare R2, Backblaze B2, or Wasabi storage.
 
 ### From Source
 
@@ -70,8 +75,11 @@ sy --version
 git clone https://github.com/nijaru/sy.git
 cd sy
 
-# Build and install
+# Build and install (without S3)
 cargo install --path .
+
+# Or with S3 support
+cargo install --path . --features s3
 
 # Verify installation
 sy --version

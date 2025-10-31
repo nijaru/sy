@@ -1,7 +1,9 @@
 use super::{
-    dual::DualTransport, local::LocalTransport, s3::S3Transport, ssh::SshTransport, TransferResult,
+    dual::DualTransport, local::LocalTransport, ssh::SshTransport, TransferResult,
     Transport,
 };
+#[cfg(feature = "s3")]
+use super::s3::S3Transport;
 use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::path::SyncPath;
@@ -16,6 +18,7 @@ use std::path::Path;
 pub enum TransportRouter {
     Local(LocalTransport),
     Dual(DualTransport),
+    #[cfg(feature = "s3")]
     S3(S3Transport),
 }
 
@@ -125,6 +128,7 @@ impl TransportRouter {
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
+            #[cfg(feature = "s3")]
             (
                 SyncPath::Local(_),
                 SyncPath::S3 {
@@ -144,6 +148,7 @@ impl TransportRouter {
                 .await?;
                 Ok(TransportRouter::S3(s3_transport))
             }
+            #[cfg(feature = "s3")]
             (
                 SyncPath::S3 {
                     bucket,
@@ -163,17 +168,25 @@ impl TransportRouter {
                 .await?;
                 Ok(TransportRouter::S3(s3_transport))
             }
+            #[cfg(feature = "s3")]
             (SyncPath::S3 { .. }, SyncPath::S3 { .. }) => {
                 // S3 → S3: not yet supported
                 Err(crate::error::SyncError::Io(std::io::Error::other(
                     "S3-to-S3 sync not yet supported",
                 )))
             }
+            #[cfg(feature = "s3")]
             (SyncPath::S3 { .. }, SyncPath::Remote { .. })
             | (SyncPath::Remote { .. }, SyncPath::S3 { .. }) => {
                 // S3 ↔ Remote SSH: not yet supported
                 Err(crate::error::SyncError::Io(std::io::Error::other(
                     "S3-to-SSH sync not yet supported",
+                )))
+            }
+            #[cfg(not(feature = "s3"))]
+            (SyncPath::S3 { .. }, _) | (_, SyncPath::S3 { .. }) => {
+                Err(crate::error::SyncError::Io(std::io::Error::other(
+                    "S3 support not enabled. Reinstall with: cargo install sy --features s3",
                 )))
             }
         }
@@ -186,6 +199,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.scan(path).await,
             TransportRouter::Dual(t) => t.scan(path).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.scan(path).await,
         }
     }
@@ -194,6 +208,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.exists(path).await,
             TransportRouter::Dual(t) => t.exists(path).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.exists(path).await,
         }
     }
@@ -202,6 +217,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.metadata(path).await,
             TransportRouter::Dual(t) => t.metadata(path).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.metadata(path).await,
         }
     }
@@ -210,6 +226,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.file_info(path).await,
             TransportRouter::Dual(t) => t.file_info(path).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.file_info(path).await,
         }
     }
@@ -218,6 +235,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_dir_all(path).await,
             TransportRouter::Dual(t) => t.create_dir_all(path).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_dir_all(path).await,
         }
     }
@@ -226,6 +244,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.copy_file(source, dest).await,
             TransportRouter::Dual(t) => t.copy_file(source, dest).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.copy_file(source, dest).await,
         }
     }
@@ -234,6 +253,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.sync_file_with_delta(source, dest).await,
             TransportRouter::Dual(t) => t.sync_file_with_delta(source, dest).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.sync_file_with_delta(source, dest).await,
         }
     }
@@ -242,6 +262,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.remove(path, is_dir).await,
             TransportRouter::Dual(t) => t.remove(path, is_dir).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.remove(path, is_dir).await,
         }
     }
@@ -250,6 +271,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_hardlink(source, dest).await,
             TransportRouter::Dual(t) => t.create_hardlink(source, dest).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_hardlink(source, dest).await,
         }
     }
@@ -258,6 +280,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_symlink(target, dest).await,
             TransportRouter::Dual(t) => t.create_symlink(target, dest).await,
+#[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_symlink(target, dest).await,
         }
     }

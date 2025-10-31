@@ -9,6 +9,10 @@ license = "MIT"
 keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 
+[features]
+default = []
+s3 = ["aws-config", "aws-sdk-s3", "aws-smithy-types"]
+
 [dependencies]
 # CLI & Config
 clap = { version = "4", features = ["derive", "env"] }
@@ -69,10 +73,10 @@ dirs = "5"
 regex = "1"
 futures = "0.3.31"
 
-# S3 / Cloud Storage (Phase 10)
-aws-config = { version = "1.5", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.52"
-aws-smithy-types = "1.2"
+# S3 / Cloud Storage (Phase 10) - Optional feature
+aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1.52", optional = true }
+aws-smithy-types = { version = "1.2", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
