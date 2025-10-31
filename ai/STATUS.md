@@ -1,10 +1,10 @@
 # Status
 
-_Last Updated: 2025-10-29_
+_Last Updated: 2025-10-31_
 
 ## Current State
-- Version: v0.0.52 (RELEASED - 2025-10-28) ✅
-- Current Work: **Comprehensive SSH testing complete** - All 48 SSH tests passing! ✅
+- Version: v0.0.53 (RELEASED - 2025-10-31) ✅
+- Current Work: **Implementing proper remote operations** - Replacing skip-based fixes with full functionality
 - Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
@@ -21,6 +21,33 @@ _Last Updated: 2025-10-29_
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
+
+### 🔧 v0.0.53 Critical Fixes & v0.0.54 Proper Solutions (2025-10-31)
+
+**v0.0.53 Release (SHIPPED)** - Hotfix for SSH sync failures:
+- Fixed 6 critical bugs preventing SSH sync to remote destinations
+- **Temporary solutions**: Skip operations that can't be done locally
+  - ⚠️ File verification: Skipped for remote (NO corruption detection)
+  - ⚠️ Disk space checks: Skipped for remote (NO out-of-space protection)
+  - ⚠️ Xattrs/ACLs/BSD flags: Skipped for remote (NO preservation)
+- **Why shipped**: Unblocked users who couldn't sync at all
+- **Trade-off**: Basic SSH sync works, but missing critical features
+
+**v0.0.54 Work (IN PROGRESS)** - Implementing proper remote operations:
+1. **File verification** (CRITICAL - data integrity)
+   - Use transport.read_file() to verify remote files properly
+   - Restore corruption detection for SSH syncs
+2. **Disk space checks** (HIGH priority)
+   - Execute `df` command via SSH to check remote space
+   - Prevent out-of-space failures mid-sync
+3. **Xattrs/ACLs/BSD flags** (MEDIUM priority)
+   - Execute `setfattr`, `setfacl`, `chflags` via SSH commands
+   - Restore full feature parity for remote syncs
+
+**Architecture Fix**:
+- Pattern: Check if destination exists locally → skip if not
+- Problem: Assumes local-only operations, loses functionality
+- Solution: Use SSH transport to execute operations remotely
 
 ### ✅ Medium-Priority Safety Features COMPLETE (2025-10-29)
 **Goal**: Close critical test gaps and improve data safety

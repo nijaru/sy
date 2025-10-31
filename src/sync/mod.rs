@@ -818,35 +818,58 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // Skip verification if destination doesn't exist locally (remote file)
-                                        if !dest_path.exists() {
+                                        // For remote files, use transport layer to read and verify
+                                        let verification_result = if !dest_path.exists() {
+                                            // Remote destination - read via transport and verify
                                             tracing::debug!(
-                                                "Skipping verification for {}: file not accessible locally (likely remote destination)",
+                                                "Verifying remote file {} via transport layer",
                                                 dest_path.display()
                                             );
-                                        } else {
-                                            match verifier.verify_transfer(source_path, dest_path) {
-                                                Ok(verified) => {
-                                                    let mut stats = stats.lock().unwrap();
-                                                    if verified {
-                                                        stats.files_verified += 1;
-                                                    } else {
-                                                        stats.verification_failures += 1;
-                                                        tracing::warn!(
-                                                            "Verification failed for {}: checksums do not match",
-                                                            dest_path.display()
-                                                        );
+
+                                            match transport.read_file(dest_path).await {
+                                                Ok(dest_data) => {
+                                                    // Compute source checksum
+                                                    match verifier.compute_file_checksum(source_path) {
+                                                        Ok(source_checksum) => {
+                                                            // Compute dest checksum from data
+                                                            match verifier.compute_data_checksum(&dest_data) {
+                                                                Ok(dest_checksum) => {
+                                                                    Ok(source_checksum == dest_checksum)
+                                                                }
+                                                                Err(e) => Err(e),
+                                                            }
+                                                        }
+                                                        Err(e) => Err(e),
                                                     }
                                                 }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Verification error for {}: {}",
-                                                        dest_path.display(),
-                                                        e
-                                                    );
-                                                    let mut stats = stats.lock().unwrap();
+                                                Err(e) => Err(e),
+                                            }
+                                        } else {
+                                            // Local destination - use standard verification
+                                            verifier.verify_transfer(source_path, dest_path)
+                                        };
+
+                                        match verification_result {
+                                            Ok(verified) => {
+                                                let mut stats = stats.lock().unwrap();
+                                                if verified {
+                                                    stats.files_verified += 1;
+                                                } else {
                                                     stats.verification_failures += 1;
+                                                    tracing::warn!(
+                                                        "Verification failed for {}: checksums do not match",
+                                                        dest_path.display()
+                                                    );
                                                 }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Verification error for {}: {}",
+                                                    dest_path.display(),
+                                                    e
+                                                );
+                                                let mut stats = stats.lock().unwrap();
+                                                stats.verification_failures += 1;
                                             }
                                         }
                                     }
@@ -968,35 +991,58 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // Skip verification if destination doesn't exist locally (remote file)
-                                        if !dest_path.exists() {
+                                        // For remote files, use transport layer to read and verify
+                                        let verification_result = if !dest_path.exists() {
+                                            // Remote destination - read via transport and verify
                                             tracing::debug!(
-                                                "Skipping verification for {}: file not accessible locally (likely remote destination)",
+                                                "Verifying remote file {} via transport layer",
                                                 dest_path.display()
                                             );
-                                        } else {
-                                            match verifier.verify_transfer(source_path, dest_path) {
-                                                Ok(verified) => {
-                                                    let mut stats = stats.lock().unwrap();
-                                                    if verified {
-                                                        stats.files_verified += 1;
-                                                    } else {
-                                                        stats.verification_failures += 1;
-                                                        tracing::warn!(
-                                                            "Verification failed for {}: checksums do not match",
-                                                            dest_path.display()
-                                                        );
+
+                                            match transport.read_file(dest_path).await {
+                                                Ok(dest_data) => {
+                                                    // Compute source checksum
+                                                    match verifier.compute_file_checksum(source_path) {
+                                                        Ok(source_checksum) => {
+                                                            // Compute dest checksum from data
+                                                            match verifier.compute_data_checksum(&dest_data) {
+                                                                Ok(dest_checksum) => {
+                                                                    Ok(source_checksum == dest_checksum)
+                                                                }
+                                                                Err(e) => Err(e),
+                                                            }
+                                                        }
+                                                        Err(e) => Err(e),
                                                     }
                                                 }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Verification error for {}: {}",
-                                                        dest_path.display(),
-                                                        e
-                                                    );
-                                                    let mut stats = stats.lock().unwrap();
+                                                Err(e) => Err(e),
+                                            }
+                                        } else {
+                                            // Local destination - use standard verification
+                                            verifier.verify_transfer(source_path, dest_path)
+                                        };
+
+                                        match verification_result {
+                                            Ok(verified) => {
+                                                let mut stats = stats.lock().unwrap();
+                                                if verified {
+                                                    stats.files_verified += 1;
+                                                } else {
                                                     stats.verification_failures += 1;
+                                                    tracing::warn!(
+                                                        "Verification failed for {}: checksums do not match",
+                                                        dest_path.display()
+                                                    );
                                                 }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Verification error for {}: {}",
+                                                    dest_path.display(),
+                                                    e
+                                                );
+                                                let mut stats = stats.lock().unwrap();
+                                                stats.verification_failures += 1;
                                             }
                                         }
                                     }

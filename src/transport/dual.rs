@@ -127,4 +127,9 @@ impl Transport for DualTransport {
         // Create symlink on destination
         self.dest.create_symlink(target, dest).await
     }
+
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        // Read from destination (where the file exists after sync)
+        self.dest.read_file(path).await
+    }
 }

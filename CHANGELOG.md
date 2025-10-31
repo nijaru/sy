@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.54] - 2025-10-31
+
+### Fixed
+- **CRITICAL: Proper remote file verification** - Restored corruption detection for SSH syncs
+  - v0.0.53 skipped verification for remote files (NO corruption detection)
+  - v0.0.54 properly verifies remote files via transport layer
+  - Uses transport.read_file() to read remote files via SFTP
+  - Added read_file() delegation to DualTransport and TransportRouter
+  - **Impact**: SSH syncs now detect corruption, preventing silent data loss
+  - Tested: 10/10 files verified successfully on macOS → Linux SSH sync
+
+### Changed
+- All 465 tests passing with proper remote verification
+- Remote files now verified with same checksums as local files (xxHash3/BLAKE3)
+
+### Known Limitations (will fix in v0.0.55)
+- Disk space checks still skipped for remote destinations
+- Xattrs/ACLs/BSD flags still skipped for remote destinations
+- These are feature preservation issues, not data integrity issues
+
 ## [0.0.53] - 2025-10-31
 
 ### Fixed

@@ -284,4 +284,13 @@ impl Transport for TransportRouter {
             TransportRouter::S3(t) => t.create_symlink(target, dest).await,
         }
     }
+
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        match self {
+            TransportRouter::Local(t) => t.read_file(path).await,
+            TransportRouter::Dual(t) => t.read_file(path).await,
+#[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.read_file(path).await,
+        }
+    }
 }

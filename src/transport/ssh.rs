@@ -1338,12 +1338,20 @@ impl Transport for SshTransport {
                     })?;
 
                     // Open remote file for reading
+                    tracing::debug!("Attempting to open remote file via SFTP: {}", path_buf.display());
                     let mut remote_file = sftp.open(&path_buf).map_err(|e| {
+                        tracing::error!(
+                            "SFTP open failed for {}: {} (error kind: {:?})",
+                            path_buf.display(),
+                            e,
+                            std::io::Error::last_os_error()
+                        );
                         SyncError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             format!("Failed to open remote file {}: {}", path_buf.display(), e),
                         ))
                     })?;
+                    tracing::debug!("Successfully opened remote file via SFTP: {}", path_buf.display());
 
                     // Read entire file into memory
                     let mut buffer = Vec::new();
