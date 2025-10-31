@@ -845,6 +845,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_last_sync_separate_from_mtime() {
         let (mut db, _temp) = temp_db();
 
