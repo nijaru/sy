@@ -1,6 +1,6 @@
 use super::checksumdb::ChecksumDatabase;
 use super::scanner::FileEntry;
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 use crate::integrity::{Checksum, ChecksumType, IntegrityVerifier};
 use crate::transport::{FileInfo, Transport};
 use std::path::Path;
@@ -182,7 +182,7 @@ impl StrategyPlanner {
                         Ok(cksum) => Some(cksum),
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to compute source checksum for {}: {}",
+                                "Failed to compute source checksum for {}: {} (file may have been deleted after scan)",
                                 source.path.display(),
                                 e
                             );
@@ -196,7 +196,7 @@ impl StrategyPlanner {
                     Ok(cksum) => Some(cksum),
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to compute source checksum for {}: {}",
+                            "Failed to compute source checksum for {}: {} (file may have been deleted after scan)",
                             source.path.display(),
                             e
                         );
@@ -209,14 +209,19 @@ impl StrategyPlanner {
         };
 
         // Try to get dest checksum (check database first, then compute)
+        // IMPORTANT: Only compute checksums for paths that exist locally.
+        // For remote SSH destinations, dest_path won't exist on the local filesystem.
+        // Attempting to access it would cause "No such file or directory" errors.
         let dest_checksum = if dest_path.exists() {
             // Get dest metadata for database query
-            let dest_metadata = std::fs::metadata(dest_path).ok();
-            let (dest_mtime, dest_size) = if let Some(ref meta) = dest_metadata {
-                (meta.modified().ok(), Some(meta.len()))
-            } else {
-                (None, None)
-            };
+            let dest_metadata = std::fs::metadata(dest_path).map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read metadata for destination file {}: {}. This may indicate a remote path being accessed locally.", dest_path.display(), e),
+                ))
+            })?;
+            let dest_mtime = dest_metadata.modified().ok();
+            let dest_size = Some(dest_metadata.len());
 
             // Try database first
             if let (Some(db), Some(mtime), Some(size)) = (checksum_db, dest_mtime, dest_size) {
@@ -230,7 +235,7 @@ impl StrategyPlanner {
                         Ok(cksum) => Some(cksum),
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to compute dest checksum for {}: {}",
+                                "Failed to compute dest checksum for {}: {} (if this is a remote destination, this is a bug - checksum computation should not access remote paths locally)",
                                 dest_path.display(),
                                 e
                             );
@@ -244,7 +249,7 @@ impl StrategyPlanner {
                     Ok(cksum) => Some(cksum),
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to compute dest checksum for {}: {}",
+                            "Failed to compute dest checksum for {}: {} (if this is a remote destination, this is a bug - checksum computation should not access remote paths locally)",
                             dest_path.display(),
                             e
                         );
@@ -253,6 +258,10 @@ impl StrategyPlanner {
                 }
             }
         } else {
+            tracing::debug!(
+                "Skipping destination checksum for {} (path doesn't exist locally - may be remote)",
+                dest_path.display()
+            );
             None
         };
 

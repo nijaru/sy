@@ -1842,13 +1842,39 @@ impl Transport for SshTransport {
     async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
         let path_str = path.to_string_lossy();
 
+        // Check if path exists, if not use parent directory (like local implementation)
+        // Use shell-agnostic commands (fish shell doesn't support bash syntax)
+        let check_path_cmd = format!("test -e '{}' && echo '{}' || dirname '{}'",
+            path_str, path_str, path_str
+        );
+
+        let check_path = self
+            .execute_command_with_retry(self.connection_pool.get_session(), &check_path_cmd)
+            .await
+            .map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to resolve path for disk space check on {}: {}. Path may not exist and parent directory may not be accessible.", path.display(), e),
+                ))
+            })?
+            .trim()
+            .to_string();
+
+        tracing::debug!("Checking disk space for path: {} (resolved to: {})", path.display(), check_path);
+
         // Use df command to get available space
         // -P for POSIX format (portable), -B1 for bytes
-        let command = format!("df -P -B1 '{}'", path_str);
+        let command = format!("df -P -B1 '{}'", check_path);
 
         let output = self
             .execute_command_with_retry(self.connection_pool.get_session(), &command)
-            .await?;
+            .await
+            .map_err(|e| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to check disk space for {} (using path '{}'): {}. Ensure the destination path or its parent directory exists and is accessible.", path.display(), check_path, e),
+                ))
+            })?;
 
         // Parse df output
         // Format: Filesystem 1-blocks Used Available Use% Mounted

@@ -431,6 +431,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             monitor.lock().unwrap().end_scan();
         }
 
+        tracing::debug!("Scan completed, about to check resources");
+
         // Check resources before starting sync
         if !self.dry_run {
             // Calculate estimated bytes needed
@@ -446,6 +448,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Check FD limits
             resource::check_fd_limits(self.max_concurrent)?;
         }
+
+        tracing::debug!("Resource checks completed, loading resume state");
 
         // Load or create resume state
         let current_flags = SyncFlags {
@@ -506,6 +510,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .map(|s| s.completed_paths())
             .unwrap_or_default();
 
+        tracing::debug!("Resume state loaded, starting plan timing");
+
         // Start plan timing
         if let Some(ref monitor) = self.perf_monitor {
             monitor.lock().unwrap().start_plan();
@@ -518,6 +524,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.checksum,
         );
         let mut tasks = Vec::with_capacity(source_files.len());
+
+        tracing::debug!("Starting to plan {} tasks", source_files.len());
 
         for file in &source_files {
             // Skip files that are already completed (if resuming)
