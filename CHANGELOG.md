@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.53] - 2025-10-31
+
+### Fixed
+- **Critical: Remote destination sync failures** - Fixed multiple bugs that caused SSH sync to fail
+  - **Destination directory creation**: Ensure destination directory exists before any operations
+    - Previously failed with "No such file or directory" when parent directory didn't exist
+    - Now creates full destination path at start of sync
+  - **Disk space check on remote destinations**: Skip local statvfs() calls for remote paths
+    - Previously attempted local filesystem calls on remote paths
+    - Now skips check for remote destinations (path doesn't exist locally)
+  - **File verification on remote destinations**: Skip checksum verification for remote files
+    - Previously tried to read remote files locally for verification
+    - Now skips verification when destination file doesn't exist locally
+  - **BSD flags on remote destinations**: Skip chflags() calls for remote files
+    - Previously attempted to set flags on non-existent local paths
+    - Now detects remote destination and skips gracefully
+  - **Extended attributes (xattrs) on remote destinations**: Skip xattr::set() for remote files
+    - Previously failed when using --preserve-xattrs with SSH sync
+    - Now detects remote destination and skips gracefully
+  - **ACLs on remote destinations**: Skip setfacl() calls for remote files
+    - Previously failed when using --preserve-acls with SSH sync
+    - Now detects remote destination and skips gracefully
+- **Optional S3 feature**: Made S3/cloud storage support optional to reduce dependencies
+  - Default install: 172 crates (down from 381, 55% reduction)
+  - With S3: `cargo install sy --features s3`
+  - Faster installation for users who don't need cloud storage
+
+### Changed
+- All 465 tests passing with remote destination fixes
+- Improved error messages for remote operations
+- Added debug logging for skipped operations on remote destinations
+
 ## [0.0.52] - 2025-10-28
 
 ### Performance

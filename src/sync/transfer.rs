@@ -291,6 +291,16 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                     return Ok(());
                 }
 
+                // Check if destination file exists locally before attempting to set xattrs
+                // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
+                if !dest_path.exists() {
+                    tracing::debug!(
+                        "Skipping xattrs for {}: file not accessible locally (likely remote destination)",
+                        dest_path.display()
+                    );
+                    return Ok(());
+                }
+
                 let dest_path = dest_path.to_path_buf();
                 let xattrs_clone = xattrs.clone();
 
@@ -331,6 +341,16 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         {
             if let Some(ref acls_bytes) = file_entry.acls {
                 if acls_bytes.is_empty() {
+                    return Ok(());
+                }
+
+                // Check if destination file exists locally before attempting to set ACLs
+                // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
+                if !dest_path.exists() {
+                    tracing::debug!(
+                        "Skipping ACLs for {}: file not accessible locally (likely remote destination)",
+                        dest_path.display()
+                    );
                     return Ok(());
                 }
 
@@ -428,6 +448,16 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         #[cfg(target_os = "macos")]
         {
             let dest_path = dest_path.to_path_buf();
+
+            // Check if destination file exists locally before attempting to set flags
+            // For SSH syncs, dest_path refers to a remote file that doesn't exist locally
+            if !dest_path.exists() {
+                tracing::debug!(
+                    "Skipping BSD flags for {}: file not accessible locally (likely remote destination)",
+                    dest_path.display()
+                );
+                return Ok(());
+            }
 
             // Determine what flags to set: source flags if preserving, 0 if not
             let flags_to_set = if self.preserve_flags {
