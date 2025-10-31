@@ -69,7 +69,8 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           strip sy
-          tar czf ${{ matrix.asset_name }}.tar.gz sy
+          strip sy-remote
+          tar czf sy-${{ matrix.target }}.tar.gz sy sy-remote
           cd -
 
       - name: Prepare binary (Windows)
@@ -86,8 +87,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz
-          asset_name: ${{ matrix.asset_name }}.tar.gz
+          asset_path: ./target/${{ matrix.target }}/release/sy-${{ matrix.target }}.tar.gz
+          asset_name: sy-${{ matrix.target }}.tar.gz
           asset_content_type: application/gzip
 
       - name: Upload Release Asset (Windows)
