@@ -427,4 +427,20 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
             .copy_file_streaming(source, dest, progress_callback)
             .await
     }
+
+    async fn check_disk_space(&self, path: &Path, bytes_needed: u64) -> Result<()> {
+        (**self).check_disk_space(path, bytes_needed).await
+    }
+
+    async fn set_xattrs(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+        (**self).set_xattrs(path, xattrs).await
+    }
+
+    async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
+        (**self).set_acls(path, acls_text).await
+    }
+
+    async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        (**self).set_bsd_flags(path, flags).await
+    }
 }
