@@ -3,8 +3,8 @@
 _Last Updated: 2025-10-31_
 
 ## Current State
-- Version: v0.0.55 (RELEASED - 2025-10-31) ✅
-- Current Work: **All remote operations complete** - SSH syncs now fully functional
+- Version: v0.0.56 (READY FOR RELEASE - 2025-10-31) ✅
+- Current Work: **Critical trait dispatch bug fixed** - Arc<T> Transport impl completed
 - Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
@@ -52,10 +52,18 @@ _Last Updated: 2025-10-31_
    - BSD flags: `chflags` for macOS file attributes
    - All operations gracefully warn on failure without blocking sync
 
+**v0.0.56 Release (READY)** - Critical trait dispatch fix:
+- **Root Cause**: Arc<T> Transport impl was missing several methods (check_disk_space, set_xattrs, set_acls, set_bsd_flags)
+- **Impact**: When these methods were called on Arc-wrapped transports, they fell back to default trait impl
+- **Symptom**: "No such file or directory (os error 2)" - tried to check remote path on local filesystem
+- **Fix**: Added all missing methods to Arc<T> impl to properly delegate (commit: b956aa3)
+- **Shell-agnostic commands**: Also fixed fish shell compatibility for disk space checks (commit: ee128bd)
+- **Tested**: Successfully synced 436-file project from macOS → Linux via SSH/Tailscale
+
 **Installation**: Now available via prebuilt binary for Apple Silicon!
 - Homebrew: `brew install nijaru/tap/sy` (1 second install, no Rust needed)
 - Crates.io: `cargo install sy`
-- GitHub: https://github.com/nijaru/sy/releases/tag/v0.0.55
+- GitHub: https://github.com/nijaru/sy/releases/latest
 
 **Architecture Pattern**:
 - Problem: v0.0.53 checked `if !path.exists()` → skip operation
