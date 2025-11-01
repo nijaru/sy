@@ -8,23 +8,29 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      tag_name: ${{ steps.get_tag.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Get tag name
+        id: get_tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
       - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+        run: |
+          gh release create ${{ steps.get_tag.outputs.tag }} \
+            --title "${{ steps.get_tag.outputs.tag }}" \
+            --generate-notes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ github.token }}
 
   build:
     name: Build Release
@@ -35,19 +41,14 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset_name: sy-linux-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset_name: sy-linux-x86_64-musl
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset_name: sy-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset_name: sy-macos-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_name: sy-windows-x86_64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -68,8 +69,7 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          strip sy
-          strip sy-remote
+          strip sy sy-remote || true
           tar czf sy-${{ matrix.target }}.tar.gz sy sy-remote
           cd -
 
@@ -77,27 +77,33 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ${{ matrix.asset_name }}.zip sy.exe
+          7z a sy-${{ matrix.target }}.zip sy.exe
           cd -
 
-      - name: Upload Release Asset (Unix)
-        if: matrix.os != 'windows-latest'
-        uses: actions/upload-release-asset@v1
+      - name: Upload Release Asset
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            gh release upload ${{ needs.create-release.outputs.tag_name }} target/${{ matrix.target }}/release/sy-${{ matrix.target }}.zip
+          else
+            gh release upload ${{ needs.create-release.outputs.tag_name }} target/${{ matrix.target }}/release/sy-${{ matrix.target }}.tar.gz
+          fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/${{ matrix.target }}/release/sy-${{ matrix.target }}.tar.gz
-          asset_name: sy-${{ matrix.target }}.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
 
-      - name: Upload Release Asset (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew formula
+        uses: mislav/bump-homebrew-formula-action@v3
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip
-          asset_name: ${{ matrix.asset_name }}.zip
-          asset_content_type: application/zip
+          formula-name: sy
+          formula-path: Formula/sy.rb
+          homebrew-tap: nijaru/homebrew-tap
+          download-url: https://github.com/nijaru/sy/releases/download/${{ needs.create-release.outputs.tag_name }}/sy-aarch64-apple-darwin.tar.gz
+          commit-message: |
+            chore: update sy to ${{ needs.create-release.outputs.tag_name }}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
