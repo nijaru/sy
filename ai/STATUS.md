@@ -1,10 +1,11 @@
 # Status
 
-_Last Updated: 2025-10-31_
+_Last Updated: 2025-11-10_
 
 ## Current State
-- Version: v0.0.56 (READY FOR RELEASE - 2025-10-31) ✅
-- Current Work: **Critical trait dispatch bug fixed** - Arc<T> Transport impl completed
+- Version: v0.0.56 (released 2025-10-31) ✅
+- Current Work: **Issue #3 fixed** - Cross-transport file copy bug (remote→local sync)
+- Next: Issue #2 - rsync-compatible directory copy behavior
 - Test Coverage: **603 tests total (100% passing)** ✅
   - **Local tests**: 555 passing
     - Library tests (sy): 465
@@ -21,6 +22,34 @@ _Last Updated: 2025-10-31_
 - Build: Passing (all tests green)
 - Performance: 1.3x - 8.8x faster than rsync; sparse files: up to 10x faster (see docs/PERFORMANCE.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
+
+### 🐛 Issue #3: Cross-Transport File Copy Bug (2025-11-10)
+
+**Status**: ✅ FIXED (PR #4 ready for merge)
+
+**Problem**: Remote→local sync failed with "No such file or directory" for all files in nested directories.
+
+**Root Cause**: `DualTransport.copy_file()` delegated to `dest.copy_file()` which couldn't read remote source files.
+
+**Fix** (commit: 38df8bd):
+- Implemented proper cross-transport copy using `source.read_file()` + `dest.write_file()` pattern
+- Added parent directory creation: `dest.create_dir_all(parent)`
+- Ensures remote files are read via SSH, written locally via filesystem
+
+**Testing**:
+- ✅ Added regression test: `remote_to_local_parent_dirs_test.rs`
+- ✅ All 477 existing tests pass
+- ✅ Real-world test: `nick@fedora:/tmp/sy-test-remote` → local with deeply nested structure
+  - 8/8 files created including `src/nested/deep/deep.txt`
+  - No errors, all content verified correct
+
+**Related Work**:
+- Discovered related limitation: Delta sync doesn't work for remote→local (documented in `ai/KNOWN_LIMITATIONS.md`)
+- Not a bug - graceful fallback to full copy works correctly
+- Low priority optimization for future if users report slow large file updates
+
+**Branch**: `fix/parent-dirs`
+**PR**: #4
 
 ### 🔧 v0.0.53 Critical Fixes & v0.0.54 Proper Solutions (2025-10-31)
 
