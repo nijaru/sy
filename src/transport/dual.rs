@@ -60,11 +60,6 @@ impl Transport for DualTransport {
             dest.display()
         );
 
-        // Ensure parent directory exists on destination
-        if let Some(parent) = dest.parent() {
-            self.dest.create_dir_all(parent).await?;
-        }
-
         // Read file from source transport
         let data = self.source.read_file(source).await?;
         let bytes_written = data.len() as u64;
@@ -72,7 +67,7 @@ impl Transport for DualTransport {
         // Get modification time from source
         let mtime = self.source.get_mtime(source).await?;
 
-        // Write to destination transport
+        // Write to destination transport (write_file handles parent directory creation)
         self.dest.write_file(dest, &data, mtime).await?;
 
         Ok(TransferResult::new(bytes_written))

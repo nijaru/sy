@@ -87,7 +87,7 @@ impl Transport for MockRemoteTransport {
 
     async fn metadata(&self, _path: &std::path::Path) -> Result<std::fs::Metadata> {
         Err(sy::error::SyncError::Io(std::io::Error::other(
-            "Mock remote transport doesn't support metadata",
+            "metadata() not implemented in MockRemoteTransport test fixture",
         )))
     }
 
@@ -102,7 +102,7 @@ impl Transport for MockRemoteTransport {
         _dest: &std::path::Path,
     ) -> Result<TransferResult> {
         Err(sy::error::SyncError::Io(std::io::Error::other(
-            "Mock remote transport doesn't support direct copy_file",
+            "copy_file() not implemented in MockRemoteTransport - DualTransport should use read_file/write_file instead",
         )))
     }
 
