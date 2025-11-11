@@ -15,8 +15,6 @@
 - 2x faster for idempotent syncs (8ms vs 17ms)
 - 11x faster for real-world workloads (500 files: <10ms vs 110ms)
 
-See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmarks.
-
 ## Installation
 
 ### Homebrew (macOS)
@@ -29,13 +27,10 @@ brew install sy
 ### From crates.io
 
 ```bash
-# Install sy (local + SSH sync)
 cargo install sy
 
-# With S3/cloud storage support (optional, experimental)
+# Or with S3 support (experimental)
 cargo install sy --features s3
-
-sy --version
 ```
 
 ### From Source
@@ -44,137 +39,87 @@ sy --version
 git clone https://github.com/nijaru/sy.git
 cd sy
 cargo install --path .
-
-# Or with S3 support
-cargo install --path . --features s3
 ```
 
-Requirements: Rust 1.70+
+**Requirements:** Rust 1.70+
 
-**For SSH sync:** Install sy on both local and remote machines. The remote server needs `sy` (or just `sy-remote`) in PATH.
+**For SSH sync:** Install sy on both local and remote machines.
 
 ## Quick Start
 
 ```bash
-# Basic sync
 sy /source /destination
-
-# Preview changes (dry-run)
-sy /source /destination --dry-run
-
-# Mirror mode (delete extra files)
-sy /source /destination --delete
-
-# SSH sync (requires sy installed on remote)
-sy /local user@host:/remote
-
-# S3 sync (experimental, requires --features s3)
-sy /local s3://my-bucket/backups/
-
-# Bidirectional sync
-sy --bidirectional /laptop/docs /backup/docs
 ```
 
-### Trailing Slash Behavior (rsync-compatible)
+That's it. Use `sy --help` for options.
 
-sy follows rsync semantics for directory copying:
+> **Directory behavior:** sy follows rsync semantics - `/source` copies the directory, `/source/` copies contents only.
 
+## Examples
+
+### Backup & Sync
 ```bash
-# Without trailing slash: copies directory itself
-sy /a/myproject /target
-# Result: /target/myproject/
-
-# With trailing slash: copies contents only
-sy /a/myproject/ /target
-# Result: /target/ (contents copied directly)
+sy ~/project ~/backup                    # Basic backup
+sy ~/src ~/dest --delete                 # Mirror (delete extra files)
+sy ~/backup ~/original --verify-only     # Verify integrity
+sy /source /dest --dry-run               # Preview changes
 ```
 
-See [docs/USAGE.md](docs/USAGE.md) for comprehensive examples.
-
-## Common Use Cases
-
+### Remote Sync
 ```bash
-# Backup with verification
-sy ~/project ~/backups/project --verify
-
-# Sync with filters
-sy ~/src ~/dest --exclude "*.log" --exclude "node_modules"
-
-# Bandwidth-limited remote sync (sy must be installed on remote)
+sy /local user@host:/remote              # SSH sync
 sy /large user@host:/backup --bwlimit 1MB
+sy /local s3://bucket/path               # S3 (experimental)
+```
 
-# Watch mode for continuous sync
-sy ~/dev /backup --watch
-
-# Performance monitoring
-sy /source /dest --perf
-
-# Verify backup integrity (read-only)
-sy ~/backup ~/original --verify-only
+### Advanced
+```bash
+sy ~/src ~/dest --exclude "*.log"        # With filters
+sy ~/dev /backup --watch                 # Continuous sync
+sy --bidirectional /laptop /backup       # Two-way sync
 ```
 
 ## Features
 
-### Core Performance
-- **Parallel transfers**: Multiple files transferred simultaneously
-- **Parallel checksums**: Fast integrity verification with xxHash3 and BLAKE3
-- **Delta sync**: Block-level updates using rsync algorithm (streaming, O(1) memory)
-- **Smart caching**: Checksum database for 10-100x faster re-syncs
-- **Compression auto-detection**: Skips already-compressed files
-- **SSH connection pooling**: Reuses connections for efficiency
-- **Sparse file optimization**: Efficient handling of sparse files
+**Core Performance:**
+- Parallel transfers and checksums
+- Delta sync (rsync algorithm, O(1) memory)
+- Checksum database (10-100x faster re-syncs)
+- Compression auto-detection
+- Sparse file optimization
 
-### Transports
-- **Local**: Fast local filesystem sync
-- **SSH**: Remote sync over SSH (requires sy on remote)
-- **S3/Cloud**: AWS S3, Cloudflare R2, Backblaze B2, Wasabi (experimental)
+**Transports:**
+- Local filesystem
+- SSH (requires sy on remote)
+- S3/cloud storage (experimental)
 
-### Reliability
-- **Multi-layer integrity**: xxHash3 (fast) and BLAKE3 (cryptographic) verification
-- **Atomic operations**: Safe file updates
-- **Resume support**: Automatic recovery from interruptions
-- **Dry-run mode**: Preview changes before applying
-- **Verify-only mode**: Audit backups without modifying files
+**Reliability:**
+- Multi-layer integrity (xxHash3 + BLAKE3)
+- Atomic operations
+- Resume support
+- Dry-run and verify-only modes
 
-### Advanced Features
-- **Bidirectional sync**: 6 conflict resolution strategies
-- **Watch mode**: Continuous sync with file monitoring
-- **Filters**: Rsync-style patterns and .gitignore support
-- **Hooks**: Pre/post sync automation
-- **Metadata preservation**: Symlinks, hardlinks, ACLs, xattrs, BSD flags
-- **JSON output**: Machine-readable progress and statistics
-- **Config profiles**: Reusable sync configurations
-- **Modern UX**: Beautiful progress bars and clear error messages
-
-See [docs/FEATURES.md](docs/FEATURES.md) for detailed feature documentation.
+**Advanced:**
+- Bidirectional sync with conflict resolution
+- Watch mode for continuous sync
+- Rsync-style filters and .gitignore support
+- Hooks, JSON output, config profiles
+- Metadata preservation (symlinks, ACLs, xattrs)
 
 ## Platform Support
 
-- ✅ **macOS**: Fully tested and supported
-- ✅ **Linux**: Fully tested and supported (Fedora, Ubuntu, etc.)
-- ⚠️ **Windows**: Untested - should compile but not officially supported
-  - Some features unavailable (sparse file detection)
-  - CI testing currently macOS and Linux only
-
-See [docs/FEATURES.md](docs/FEATURES.md) for platform-specific feature details.
-
-## Documentation
-
-- [Usage Guide](docs/USAGE.md) - Comprehensive usage examples
-- [Features](docs/FEATURES.md) - Detailed feature documentation
-- [Design](DESIGN.md) - Technical design and architecture
-- [Performance](docs/PERFORMANCE.md) - Performance analysis and benchmarks
-- [Contributing](CONTRIBUTING.md) - Development setup and guidelines
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
+- ✅ **macOS**: Fully tested
+- ✅ **Linux**: Fully tested
+- ⚠️ **Windows**: Untested (should compile)
 
 ## Contributing
 
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Especially interested in:
-- Windows testing and support
-- Performance profiling for large datasets
-- Real-world testing and feedback
+Interested in:
+- Windows testing
+- Performance profiling
+- Real-world feedback
 
 ## License
 
