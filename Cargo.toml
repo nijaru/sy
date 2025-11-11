@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "filesystem"]
 [features]
 default = []
 s3 = ["object_store"]
+seerdb-bench = ["seerdb"]
 
 [dependencies]
 # CLI & Config
@@ -72,6 +73,9 @@ futures = "0.3.31"
 # Database (Phase 5b)
 fjall = "2.11.2"
 
+# Database evaluation (requires nightly for seerdb)
+seerdb = { path = "../../omendb/seerdb", optional = true }
+
 # S3 / Cloud Storage (Phase 10) - Optional feature
 object_store = { version = "0.12.4", features = ["aws"], optional = true }
 bytes = "1.10.1"
@@ -112,6 +116,10 @@ harness = false
 
 [[bench]]
 name = "checksumdb_bench"
+harness = false
+
+[[bench]]
+name = "seerdb_comparison_bench"
 harness = false
 
 [[bin]]
