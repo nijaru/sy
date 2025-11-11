@@ -23,6 +23,7 @@ struct ChecksumEntry {
 /// Uses fjall LSM-tree for efficient key-value storage.
 #[allow(dead_code)] // Integration with SyncEngine pending
 pub struct ChecksumDatabase {
+    /// Keyspace owns the underlying storage - must be kept alive for partition validity
     keyspace: Keyspace,
     partition: PartitionHandle,
 }
@@ -51,6 +52,11 @@ impl ChecksumDatabase {
         })
     }
 
+    /// Convert path to database key (UTF-8 lossy bytes)
+    fn path_to_key(path: &Path) -> Vec<u8> {
+        path.to_string_lossy().as_bytes().to_vec()
+    }
+
     /// Get cached checksum if file unchanged (mtime + size match)
     ///
     /// Returns None if:
@@ -64,7 +70,7 @@ impl ChecksumDatabase {
         size: u64,
         checksum_type: &str,
     ) -> Result<Option<Checksum>> {
-        let key = path.to_string_lossy().as_bytes().to_vec();
+        let key = Self::path_to_key(path);
         let (mtime_secs, mtime_nanos) = system_time_to_parts(mtime);
 
         // Get entry from database
@@ -142,7 +148,7 @@ impl ChecksumDatabase {
         };
 
         // Serialize and store
-        let key = path.to_string_lossy().as_bytes().to_vec();
+        let key = Self::path_to_key(path);
         let value = bincode::serialize(&entry)?;
         self.partition.insert(&key, &value)?;
 
