@@ -402,6 +402,7 @@ impl SshTransport {
             let file_size = metadata.len();
 
             // Detect data regions in the sparse file
+            #[cfg(unix)]
             let data_regions = detect_data_regions(&source_path).map_err(|e| {
                 SyncError::Io(std::io::Error::new(
                     e.kind(),
@@ -413,7 +414,15 @@ impl SshTransport {
                 ))
             })?;
 
+            // Windows doesn't support sparse detection yet
+            #[cfg(not(unix))]
+            return Err(SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Sparse file detection not supported on Windows",
+            )));
+
             // If no regions detected or sparse detection not supported, fall back to regular copy
+            #[cfg(unix)]
             if data_regions.is_empty() {
                 tracing::debug!(
                     "No sparse regions detected for {}, using regular transfer",
@@ -426,6 +435,8 @@ impl SshTransport {
                 )));
             }
 
+            #[cfg(unix)]
+            {
             // Calculate total data size (sum of all region lengths)
             let total_data_size: u64 = data_regions.iter().map(|r| r.length).sum();
             let sparse_ratio = file_size as f64 / total_data_size.max(1) as f64;
@@ -548,6 +559,7 @@ impl SshTransport {
                 transferred_bytes: Some(response.bytes_written),
                 compression_used: false,
             })
+            }
                 })
                 .await
                 .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?

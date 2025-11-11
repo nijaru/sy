@@ -32,7 +32,10 @@ _Last Updated: 2025-11-10_
 
 ### Low Priority
 
-- [ ] **Windows Platform Testing** (Future)
+- [ ] **Windows Platform Support** (Future)
+  - [ ] Implement sparse file detection on Windows
+    - Use `DeviceIoControl` with `FSCTL_QUERY_ALLOCATED_RANGES`
+    - Currently falls back to regular copy (Unix-only implementation)
   - [ ] Test ACLs on Windows (different from POSIX)
   - [ ] Test NTFS-specific features
   - [ ] Verify extended attributes work correctly
