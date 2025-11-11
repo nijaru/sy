@@ -2,13 +2,16 @@
 #
 # Cross-platform testing script for sy (macOS ↔ Fedora)
 #
+# Automatically tests the current branch on both macOS and Fedora.
+# Builds sy on macOS, builds/installs sy-remote on Fedora, runs SSH tests.
+#
 # Usage:
-#   ./test-cross-platform.sh           # Basic output
-#   ./test-cross-platform.sh --verbose # Full logging
+#   scripts/test-cross-platform.sh           # Basic output
+#   scripts/test-cross-platform.sh --verbose # Full logging
 #
 # Prerequisites:
 # - SSH access to fedora (nick@fedora via tailscale)
-# - Git repo cloned on both machines
+# - Git repo will be auto-cloned on Fedora if missing
 
 set -euo pipefail
 
@@ -17,6 +20,7 @@ FEDORA_HOST="fedora"
 FEDORA_USER="nick"
 FEDORA_REPO_PATH="~/github/nijaru/sy"
 VERBOSE=false
+CURRENT_BRANCH=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -82,10 +86,13 @@ check_fedora_ssh() {
 build_macos() {
     log_info "Building sy on macOS..."
 
-    # Switch to feature branch
-    log_verbose "Checking out feature/library-migrations-v0.0.58"
+    # Detect current branch
+    CURRENT_BRANCH=$(git branch --show-current)
+    log_info "Testing branch: $CURRENT_BRANCH"
+
+    # Fetch latest from origin
+    log_verbose "Fetching latest from origin"
     run_cmd "git fetch origin"
-    run_cmd "git checkout feature/library-migrations-v0.0.58"
 
     # Build sy and sy-remote
     log_verbose "cargo build --release --bin sy"
@@ -108,23 +115,28 @@ build_macos() {
 # Setup sy on Fedora
 setup_fedora() {
     log_info "Setting up sy on Fedora..."
+    log_info "Using branch: $CURRENT_BRANCH"
 
-    # Check if repo exists
+    # Check if repo exists, clone if missing
     log_verbose "Checking if repo exists on Fedora"
     if ! ssh "$FEDORA_USER@$FEDORA_HOST" "test -d $FEDORA_REPO_PATH/.git" 2>/dev/null; then
-        log_error "Repository not found at $FEDORA_REPO_PATH on Fedora"
-        log_error "Please clone the repo first:"
-        echo "  ssh $FEDORA_USER@$FEDORA_HOST \"git clone https://github.com/nijaru/sy $FEDORA_REPO_PATH\""
-        return 1
+        log_warn "Repository not found, cloning from GitHub..."
+        if ! ssh "$FEDORA_USER@$FEDORA_HOST" "mkdir -p $(dirname $FEDORA_REPO_PATH) && git clone https://github.com/nijaru/sy $FEDORA_REPO_PATH" 2>&1 | while read -r line; do
+            log_verbose "$line"
+        done; then
+            log_error "Failed to clone repository"
+            return 1
+        fi
+        log_success "Repository cloned successfully"
     fi
 
-    # Pull latest code on Fedora
-    log_verbose "Pulling latest code on Fedora"
-    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && git fetch origin && git checkout feature/library-migrations-v0.0.58 && git pull origin feature/library-migrations-v0.0.58" 2>&1 | while read -r line; do
+    # Update to same branch as macOS
+    log_verbose "Syncing to branch: $CURRENT_BRANCH"
+    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && git fetch origin && git checkout $CURRENT_BRANCH && git pull origin $CURRENT_BRANCH" 2>&1 | while read -r line; do
         log_verbose "$line"
     done; then
         log_error "Failed to update git repo on Fedora"
-        log_error "Check that the branch exists: git fetch origin"
+        log_error "Check that branch '$CURRENT_BRANCH' exists on origin"
         return 1
     fi
 
@@ -199,8 +211,8 @@ run_tests() {
 
 # Cleanup function
 cleanup() {
-    log_verbose "Switching back to main branch"
-    git checkout main 2>/dev/null || true
+    # No-op - stay on the branch we were testing
+    :
 }
 
 # Main execution
@@ -227,16 +239,16 @@ main() {
     if [[ $test_result -eq 0 ]]; then
         log_success "All tests passed! ✨"
         echo ""
-        log_info "Next steps:"
-        echo "  1. Review test results above"
-        echo "  2. Check CI status on GitHub"
-        echo "  3. Merge PR #6 if everything looks good"
+        log_info "Branch '$CURRENT_BRANCH' is ready for:"
+        echo "  1. Pushing to origin (if not already pushed)"
+        echo "  2. Opening/updating PR on GitHub"
+        echo "  3. Merging after CI passes"
         echo ""
     else
         log_error "Some tests failed. Review output above."
         echo ""
         log_info "To debug:"
-        echo "  ./test-cross-platform.sh --verbose"
+        echo "  scripts/test-cross-platform.sh --verbose"
         echo ""
         exit 1
     fi
