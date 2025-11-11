@@ -459,11 +459,7 @@ async fn test_ssh_copy_empty_file() {
 
     // Create empty file
     transport
-        .write_file(
-            std::path::Path::new(&remote_source),
-            b"",
-            SystemTime::now(),
-        )
+        .write_file(std::path::Path::new(&remote_source), b"", SystemTime::now())
         .await
         .expect("write_file failed");
 
