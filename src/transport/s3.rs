@@ -79,7 +79,6 @@ impl S3Transport {
         };
         PathBuf::from(key)
     }
-
 }
 
 #[async_trait]
@@ -105,7 +104,7 @@ impl Transport for S3Transport {
             })?;
 
             let key = meta.location.as_ref();
-            let size = meta.size as u64;
+            let size = meta.size;
             let modified = meta.last_modified.into();
 
             // Check if this is a directory marker (ends with /)
@@ -156,7 +155,7 @@ impl Transport for S3Transport {
         })?;
 
         Ok(FileInfo {
-            size: meta.size as u64,
+            size: meta.size,
             modified: meta.last_modified.into(),
         })
     }

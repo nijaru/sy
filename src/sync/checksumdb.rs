@@ -45,7 +45,10 @@ impl ChecksumDatabase {
         // Open or create partition for checksums
         let partition = keyspace.open_partition(Self::PARTITION_NAME, Default::default())?;
 
-        Ok(Self { keyspace, partition })
+        Ok(Self {
+            keyspace,
+            partition,
+        })
     }
 
     /// Get cached checksum if file unchanged (mtime + size match)
@@ -77,9 +80,7 @@ impl ChecksumDatabase {
         let entry: ChecksumEntry = bincode::deserialize(&value)?;
 
         // Verify metadata matches
-        if entry.mtime_secs != mtime_secs
-            || entry.mtime_nanos != mtime_nanos
-            || entry.size != size
+        if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
         {
             tracing::debug!("Metadata mismatch for {}", path.display());
             return Ok(None);
