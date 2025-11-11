@@ -144,9 +144,11 @@ fn test_hard_links_preserved() {
     assert_eq!(inode1, inode2, "Source files should be hard linked");
 
     // Sync directory with --preserve-hardlinks flag
+    // Use trailing slash to copy contents (rsync-compatible behavior)
+    let source_path = format!("{}/", source.path().display());
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &source_path,
             dest.path().to_str().unwrap(),
             "--preserve-hardlinks",
         ])
@@ -189,9 +191,11 @@ fn test_hard_link_update_both_files_same_content() {
     fs::hard_link(&file1, &file2).unwrap();
 
     // Initial sync with --preserve-hardlinks
+    // Use trailing slash to copy contents (rsync-compatible behavior)
+    let source_path = format!("{}/", source.path().display());
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &source_path,
             dest.path().to_str().unwrap(),
             "--preserve-hardlinks",
         ])
@@ -205,7 +209,7 @@ fn test_hard_link_update_both_files_same_content() {
     // Sync again with --preserve-hardlinks
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &source_path,
             dest.path().to_str().unwrap(),
             "--preserve-hardlinks",
         ])

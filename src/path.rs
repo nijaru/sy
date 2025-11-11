@@ -3,17 +3,22 @@ use std::path::{Path, PathBuf};
 /// Represents a sync path that can be either local, remote (SSH), or S3
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncPath {
-    Local(PathBuf),
+    Local {
+        path: PathBuf,
+        has_trailing_slash: bool,
+    },
     Remote {
         host: String,
         user: Option<String>,
         path: PathBuf,
+        has_trailing_slash: bool,
     },
     S3 {
         bucket: String,
         key: String,
         region: Option<String>,
         endpoint: Option<String>,
+        has_trailing_slash: bool,
     },
 }
 
@@ -24,7 +29,22 @@ impl SyncPath {
     /// - Local: `/path/to/dir`, `./relative/path`, `relative/path`
     /// - Remote: `user@host:/path`, `host:/path`
     /// - S3: `s3://bucket/key/path`, `s3://bucket/key?region=us-west-2`, `s3://bucket/key?endpoint=https://...`
+    ///
+    /// Trailing slash semantics (rsync-compatible):
+    /// - `/path/to/dir` (no slash): Copy directory itself to destination
+    /// - `/path/to/dir/` (with slash): Copy directory contents to destination
     pub fn parse(s: &str) -> Self {
+        // Detect trailing slash (before parsing)
+        // For S3 paths with query parameters, check the path portion before '?'
+        let has_trailing_slash = if s.starts_with("s3://") {
+            if let Some(q_pos) = s.find('?') {
+                s[..q_pos].ends_with('/')
+            } else {
+                s.ends_with('/')
+            }
+        } else {
+            s.ends_with('/') || s.ends_with('\\')
+        };
         // Check for S3 URL format
         if let Some(remainder) = s.strip_prefix("s3://") {
             // Split on ? to separate path from query params
@@ -60,6 +80,7 @@ impl SyncPath {
                     key,
                     region,
                     endpoint,
+                    has_trailing_slash,
                 };
             } else {
                 // Just bucket, no key (treat as root)
@@ -68,6 +89,7 @@ impl SyncPath {
                     key: String::new(),
                     region: None,
                     endpoint: None,
+                    has_trailing_slash,
                 };
             }
         }
@@ -81,7 +103,10 @@ impl SyncPath {
             if before_colon.len() == 1 && before_colon.chars().next().unwrap().is_ascii_alphabetic()
             {
                 // Windows drive letter, treat as local
-                return SyncPath::Local(PathBuf::from(s));
+                return SyncPath::Local {
+                    path: PathBuf::from(s),
+                    has_trailing_slash,
+                };
             }
 
             if !before_colon.contains('/') && !before_colon.is_empty() {
@@ -96,27 +121,45 @@ impl SyncPath {
                         host,
                         user: Some(user),
                         path: PathBuf::from(path_part),
+                        has_trailing_slash,
                     };
                 } else {
                     return SyncPath::Remote {
                         host: before_colon.to_string(),
                         user: None,
                         path: PathBuf::from(path_part),
+                        has_trailing_slash,
                     };
                 }
             }
         }
 
         // Otherwise it's a local path
-        SyncPath::Local(PathBuf::from(s))
+        SyncPath::Local {
+            path: PathBuf::from(s),
+            has_trailing_slash,
+        }
     }
 
     /// Get the path component
     pub fn path(&self) -> &Path {
         match self {
-            SyncPath::Local(path) => path,
+            SyncPath::Local { path, .. } => path,
             SyncPath::Remote { path, .. } => path,
             SyncPath::S3 { key, .. } => Path::new(key),
+        }
+    }
+
+    /// Check if the original path string had a trailing slash
+    ///
+    /// This is used for rsync-compatible directory behavior:
+    /// - No trailing slash: copy the directory itself
+    /// - Trailing slash: copy only the directory contents
+    pub fn has_trailing_slash(&self) -> bool {
+        match self {
+            SyncPath::Local { has_trailing_slash, .. } => *has_trailing_slash,
+            SyncPath::Remote { has_trailing_slash, .. } => *has_trailing_slash,
+            SyncPath::S3 { has_trailing_slash, .. } => *has_trailing_slash,
         }
     }
 
@@ -128,7 +171,7 @@ impl SyncPath {
 
     /// Check if this is a local path
     pub fn is_local(&self) -> bool {
-        matches!(self, SyncPath::Local(_))
+        matches!(self, SyncPath::Local { .. })
     }
 
     /// Check if this is an S3 path
@@ -141,8 +184,8 @@ impl SyncPath {
 impl std::fmt::Display for SyncPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SyncPath::Local(path) => write!(f, "{}", path.display()),
-            SyncPath::Remote { host, user, path } => {
+            SyncPath::Local { path, .. } => write!(f, "{}", path.display()),
+            SyncPath::Remote { host, user, path, .. } => {
                 if let Some(u) = user {
                     write!(f, "{}@{}:{}", u, host, path.display())
                 } else {
@@ -154,6 +197,7 @@ impl std::fmt::Display for SyncPath {
                 key,
                 region,
                 endpoint,
+                ..
             } => {
                 write!(f, "s3://{}/{}", bucket, key)?;
                 let mut query_params = Vec::new();
@@ -272,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_display_local() {
-        let path = SyncPath::Local(PathBuf::from("/home/user/docs"));
+        let path = SyncPath::Local { path: PathBuf::from("/home/user/docs"), has_trailing_slash: false };
         assert_eq!(path.to_string(), "/home/user/docs");
     }
 
@@ -282,6 +326,7 @@ mod tests {
             host: "server".to_string(),
             user: Some("nick".to_string()),
             path: PathBuf::from("/home/nick/docs"),
+            has_trailing_slash: false,
         };
         assert_eq!(path.to_string(), "nick@server:/home/nick/docs");
     }
@@ -292,6 +337,7 @@ mod tests {
             host: "server".to_string(),
             user: None,
             path: PathBuf::from("/home/nick/docs"),
+            has_trailing_slash: false,
         };
         assert_eq!(path.to_string(), "server:/home/nick/docs");
     }
@@ -307,6 +353,7 @@ mod tests {
                 key,
                 region,
                 endpoint,
+                ..
             } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(key, "path/to/file.txt");
@@ -327,6 +374,7 @@ mod tests {
                 key,
                 region,
                 endpoint,
+                ..
             } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(key, "file.txt");
@@ -347,6 +395,7 @@ mod tests {
                 key,
                 region,
                 endpoint,
+                ..
             } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(key, "file.txt");
@@ -377,6 +426,7 @@ mod tests {
             key: "path/to/file.txt".to_string(),
             region: None,
             endpoint: None,
+            has_trailing_slash: false,
         };
         assert_eq!(path.to_string(), "s3://my-bucket/path/to/file.txt");
     }
@@ -388,6 +438,7 @@ mod tests {
             key: "file.txt".to_string(),
             region: Some("us-west-2".to_string()),
             endpoint: None,
+            has_trailing_slash: false,
         };
         assert_eq!(path.to_string(), "s3://my-bucket/file.txt?region=us-west-2");
     }
@@ -399,6 +450,7 @@ mod tests {
             key: "file.txt".to_string(),
             region: None,
             endpoint: Some("https://s3.example.com".to_string()),
+            has_trailing_slash: false,
         };
         assert_eq!(
             path.to_string(),

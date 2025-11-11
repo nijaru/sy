@@ -26,7 +26,7 @@ fn test_empty_directories() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -65,7 +65,7 @@ fn test_special_characters_in_filenames() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -105,7 +105,7 @@ fn test_unicode_filenames() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -143,7 +143,7 @@ fn test_deeply_nested_paths() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -175,7 +175,7 @@ fn test_large_file() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -208,7 +208,7 @@ fn test_many_small_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -240,8 +240,8 @@ fn test_same_source_and_dest() {
     // Try to sync directory to itself
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
+            &format!("{}/", source.path().display()),
         ])
         .output()
         .unwrap();
@@ -265,7 +265,7 @@ fn test_binary_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -291,7 +291,7 @@ fn test_hidden_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -326,7 +326,7 @@ fn test_file_permissions_preserved() {
 
         let output = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -357,7 +357,7 @@ fn test_zero_byte_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()

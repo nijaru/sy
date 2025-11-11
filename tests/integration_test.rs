@@ -32,7 +32,7 @@ fn test_basic_sync() {
     // Run sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -56,7 +56,7 @@ fn test_dry_run() {
     // Run dry-run
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--dry-run",
         ])
@@ -81,7 +81,7 @@ fn test_delete_mode() {
     // Run with --delete
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--delete",
         ])
@@ -105,7 +105,7 @@ fn test_gitignore_support() {
     // Run sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -130,7 +130,7 @@ fn test_nested_directories() {
     // Run sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -150,7 +150,7 @@ fn test_update_existing_files() {
     fs::write(source.path().join("file.txt"), "v1").unwrap();
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -170,7 +170,7 @@ fn test_update_existing_files() {
     // Sync again
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -195,7 +195,7 @@ fn test_skip_unchanged_files() {
     // First sync
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -204,7 +204,7 @@ fn test_skip_unchanged_files() {
     // Second sync (should skip)
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -223,7 +223,7 @@ fn test_quiet_mode() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--quiet",
         ])
@@ -287,7 +287,7 @@ fn test_git_directory_excluded() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -309,7 +309,7 @@ fn test_update_shows_correct_stats() {
     // Initial sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -329,7 +329,7 @@ fn test_update_shows_correct_stats() {
     // Sync again - should show updates
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -378,7 +378,7 @@ fn test_large_file_update_with_delta_sync() {
     // Initial sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -401,7 +401,7 @@ fn test_large_file_update_with_delta_sync() {
     // Sync again - should use delta sync
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -442,7 +442,7 @@ fn test_directory_cache_created() {
     // Run sync with --use-cache
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])
@@ -478,7 +478,7 @@ fn test_directory_cache_not_created_by_default() {
     // Run sync WITHOUT --use-cache
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -507,7 +507,7 @@ fn test_directory_cache_persists() {
     // First sync with cache
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])
@@ -535,7 +535,7 @@ fn test_directory_cache_persists() {
     // Second sync with cache (no changes)
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])
@@ -563,7 +563,7 @@ fn test_directory_cache_clear() {
     // First sync with cache
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])
@@ -576,7 +576,7 @@ fn test_directory_cache_clear() {
     // Sync with --clear-cache
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--clear-cache",
         ])
@@ -601,7 +601,7 @@ fn test_directory_cache_dry_run() {
     // Dry run with --use-cache should not save cache
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
             "--dry-run",
@@ -628,7 +628,7 @@ fn test_directory_cache_updates_on_new_directories() {
 
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])
@@ -652,7 +652,7 @@ fn test_directory_cache_updates_on_new_directories() {
     // Sync again
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--use-cache=true",
         ])

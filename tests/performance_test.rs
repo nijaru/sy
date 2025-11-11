@@ -37,7 +37,7 @@ fn perf_regression_100_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -78,7 +78,7 @@ fn perf_regression_1000_files() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -114,7 +114,7 @@ fn perf_regression_large_file() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -154,7 +154,7 @@ fn perf_regression_deep_nesting() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -193,7 +193,7 @@ fn perf_regression_idempotent_sync() {
     // First sync
     Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -204,7 +204,7 @@ fn perf_regression_idempotent_sync() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -257,7 +257,7 @@ fn perf_regression_gitignore_filtering() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()
@@ -310,7 +310,7 @@ fn perf_memory_usage_stays_bounded() {
 
     let output = Command::new(sy_bin())
         .args([
-            source.path().to_str().unwrap(),
+            &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
         .output()

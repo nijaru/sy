@@ -33,6 +33,35 @@ use sync::{watch::WatchMode, SyncEngine};
 use tracing_subscriber::{fmt, EnvFilter};
 use transport::router::TransportRouter;
 
+/// Compute effective destination path based on rsync trailing slash semantics
+///
+/// Trailing slash behavior (applies to directories):
+/// - Source without trailing slash (`/a/dir`): Copy directory itself → `dest/dir/`
+/// - Source with trailing slash (`/a/dir/`): Copy contents only → `dest/`
+///
+/// For files, trailing slash semantics don't apply - the sync engine handles them
+/// by using the destination path directly or appending the filename as needed.
+///
+/// Note: This function works with path strings and doesn't check the filesystem,
+/// so it works correctly for local, remote (SSH), and S3 sources.
+fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBuf {
+    let source_path = source.path();
+
+    // For sources with trailing slash, use destination as-is (copy contents)
+    if source.has_trailing_slash() {
+        return destination.path().to_path_buf();
+    }
+
+    // For sources without trailing slash, append source name to destination
+    // (copies the directory/file itself)
+    if let Some(name) = source_path.file_name() {
+        destination.path().join(name)
+    } else {
+        // Fallback: use destination as-is (e.g., root paths)
+        destination.path().to_path_buf()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments
@@ -524,7 +553,7 @@ async fn main() -> Result<()> {
             std::sync::Arc<dyn transport::Transport>,
             std::sync::Arc<dyn transport::Transport>,
         ) = match (&source, &destination) {
-            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Local(_)) => {
+            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Local { .. }) => {
                 // Both local
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
                 let local_source = std::sync::Arc::new(
@@ -534,7 +563,7 @@ async fn main() -> Result<()> {
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (local_source, local_dest)
             }
-            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Remote { host, user, .. }) => {
+            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -553,7 +582,7 @@ async fn main() -> Result<()> {
                 );
                 (local, remote)
             }
-            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local(_)) => {
+            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local { .. }) => {
                 // Remote → Local
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -626,8 +655,15 @@ async fn main() -> Result<()> {
             force_resync: cli.force_resync,
         };
 
+        // Compute effective destination path based on trailing slash semantics
+        // For bidirectional sync, trailing slash determines directory structure:
+        //   - `sy /a/dir /b/` → syncs /a/dir/ ↔ /b/dir/ (creates dir/ in destination)
+        //   - `sy /a/dir/ /b/` → syncs /a/dir/ ↔ /b/ (copies contents directly)
+        // This matches rsync behavior and ensures consistent directory structure on both sides.
+        let effective_dest = compute_destination_path(&source, &destination);
+
         let bisync_result = bisync_engine
-            .sync(source.path(), destination.path(), bisync_opts)
+            .sync(source.path(), &effective_dest, bisync_opts)
             .await?;
 
         // Print conflicts if any
@@ -673,11 +709,14 @@ async fn main() -> Result<()> {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
         }
+        // For single files, trailing slash doesn't apply - use destination as-is
         engine
             .sync_single_file(source.path(), destination.path())
             .await?
     } else {
-        engine.sync(source.path(), destination.path()).await?
+        // Compute effective destination path based on trailing slash semantics
+        let effective_dest = compute_destination_path(&source, &destination);
+        engine.sync(source.path(), &effective_dest).await?
     };
 
     // Execute post-sync hook

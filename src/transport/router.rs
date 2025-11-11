@@ -46,13 +46,13 @@ impl TransportRouter {
         let verifier = IntegrityVerifier::new(checksum_type, verify_on_write);
 
         match (source, destination) {
-            (SyncPath::Local(_), SyncPath::Local(_)) => {
+            (SyncPath::Local { .. }, SyncPath::Local { .. }) => {
                 // Both local: use local transport
                 Ok(TransportRouter::Local(LocalTransport::with_verifier(
                     verifier,
                 )))
             }
-            (SyncPath::Local(_), SyncPath::Remote { host, user, .. }) => {
+            (SyncPath::Local { .. }, SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote: use DualTransport
                 let config = if let Some(user) = user {
                     SshConfig {
@@ -70,7 +70,7 @@ impl TransportRouter {
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
-            (SyncPath::Remote { host, user, .. }, SyncPath::Local(_)) => {
+            (SyncPath::Remote { host, user, .. }, SyncPath::Local { .. }) => {
                 // Remote → Local: use DualTransport
                 let config = if let Some(user) = user {
                     SshConfig {
