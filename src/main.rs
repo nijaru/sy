@@ -552,7 +552,7 @@ async fn main() -> Result<()> {
             std::sync::Arc<dyn transport::Transport>,
             std::sync::Arc<dyn transport::Transport>,
         ) = match (&source, &destination) {
-            (crate::path::SyncPath::Local { path: _, has_trailing_slash: false }, crate::path::SyncPath::Local { path: _, has_trailing_slash: false }) => {
+            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Local { .. }) => {
                 // Both local
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
                 let local_source = std::sync::Arc::new(
@@ -562,7 +562,7 @@ async fn main() -> Result<()> {
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (local_source, local_dest)
             }
-            (crate::path::SyncPath::Local { path: _, has_trailing_slash: false }, crate::path::SyncPath::Remote { host, user, .. }) => {
+            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -581,7 +581,7 @@ async fn main() -> Result<()> {
                 );
                 (local, remote)
             }
-            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local { path: _, has_trailing_slash: false }) => {
+            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local { .. }) => {
                 // Remote → Local
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {

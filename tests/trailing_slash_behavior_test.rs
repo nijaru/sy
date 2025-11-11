@@ -6,6 +6,25 @@
 
 use std::path::PathBuf;
 
+/// Helper function that mirrors the logic from compute_destination_path in main.rs
+/// This duplication is intentional to document the expected behavior independently
+fn compute_test_destination(source: &sy::path::SyncPath, dest: &sy::path::SyncPath) -> PathBuf {
+    let source_path = source.path();
+
+    // For directories with trailing slash, use destination as-is (copy contents)
+    if source.has_trailing_slash() {
+        return dest.path().to_path_buf();
+    }
+
+    // For directories without trailing slash, append directory name to destination
+    if let Some(dir_name) = source_path.file_name() {
+        dest.path().join(dir_name)
+    } else {
+        // Fallback: use destination as-is
+        dest.path().to_path_buf()
+    }
+}
+
 #[test]
 fn test_syncpath_trailing_slash_detection() {
     // Test trailing slash detection for local paths
@@ -39,19 +58,7 @@ fn test_destination_computation_without_trailing_slash() {
     let source = sy::path::SyncPath::parse("/a/myproject");
     let dest = sy::path::SyncPath::parse("/target");
 
-    let source_path = source.path();
-
-    // Logic from compute_destination_path in main.rs:
-    let effective_dest = if source.has_trailing_slash() {
-        dest.path().to_path_buf()
-    } else {
-        if let Some(dir_name) = source_path.file_name() {
-            dest.path().join(dir_name)
-        } else {
-            dest.path().to_path_buf()
-        }
-    };
-
+    let effective_dest = compute_test_destination(&source, &dest);
     assert_eq!(effective_dest, PathBuf::from("/target/myproject"));
 }
 
@@ -64,19 +71,7 @@ fn test_destination_computation_with_trailing_slash() {
     let source = sy::path::SyncPath::parse("/a/myproject/");
     let dest = sy::path::SyncPath::parse("/target");
 
-    let source_path = source.path();
-
-    // Logic from compute_destination_path in main.rs:
-    let effective_dest = if source.has_trailing_slash() {
-        dest.path().to_path_buf()
-    } else {
-        if let Some(dir_name) = source_path.file_name() {
-            dest.path().join(dir_name)
-        } else {
-            dest.path().to_path_buf()
-        }
-    };
-
+    let effective_dest = compute_test_destination(&source, &dest);
     assert_eq!(effective_dest, PathBuf::from("/target"));
 }
 
@@ -90,18 +85,7 @@ fn test_remote_destination_computation_without_trailing_slash() {
     let dest = sy::path::SyncPath::parse("/target");
 
     assert!(!source.has_trailing_slash());
-
-    let source_path = source.path();
-    let effective_dest = if source.has_trailing_slash() {
-        dest.path().to_path_buf()
-    } else {
-        if let Some(dir_name) = source_path.file_name() {
-            dest.path().join(dir_name)
-        } else {
-            dest.path().to_path_buf()
-        }
-    };
-
+    let effective_dest = compute_test_destination(&source, &dest);
     assert_eq!(effective_dest, PathBuf::from("/target/myproject"));
 }
 
@@ -115,17 +99,6 @@ fn test_remote_destination_computation_with_trailing_slash() {
     let dest = sy::path::SyncPath::parse("/target");
 
     assert!(source.has_trailing_slash());
-
-    let source_path = source.path();
-    let effective_dest = if source.has_trailing_slash() {
-        dest.path().to_path_buf()
-    } else {
-        if let Some(dir_name) = source_path.file_name() {
-            dest.path().join(dir_name)
-        } else {
-            dest.path().to_path_buf()
-        }
-    };
-
+    let effective_dest = compute_test_destination(&source, &dest);
     assert_eq!(effective_dest, PathBuf::from("/target"));
 }
