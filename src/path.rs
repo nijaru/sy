@@ -157,9 +157,15 @@ impl SyncPath {
     /// - Trailing slash: copy only the directory contents
     pub fn has_trailing_slash(&self) -> bool {
         match self {
-            SyncPath::Local { has_trailing_slash, .. } => *has_trailing_slash,
-            SyncPath::Remote { has_trailing_slash, .. } => *has_trailing_slash,
-            SyncPath::S3 { has_trailing_slash, .. } => *has_trailing_slash,
+            SyncPath::Local {
+                has_trailing_slash, ..
+            } => *has_trailing_slash,
+            SyncPath::Remote {
+                has_trailing_slash, ..
+            } => *has_trailing_slash,
+            SyncPath::S3 {
+                has_trailing_slash, ..
+            } => *has_trailing_slash,
         }
     }
 
@@ -185,7 +191,9 @@ impl std::fmt::Display for SyncPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SyncPath::Local { path, .. } => write!(f, "{}", path.display()),
-            SyncPath::Remote { host, user, path, .. } => {
+            SyncPath::Remote {
+                host, user, path, ..
+            } => {
                 if let Some(u) = user {
                     write!(f, "{}@{}:{}", u, host, path.display())
                 } else {
@@ -316,7 +324,10 @@ mod tests {
 
     #[test]
     fn test_display_local() {
-        let path = SyncPath::Local { path: PathBuf::from("/home/user/docs"), has_trailing_slash: false };
+        let path = SyncPath::Local {
+            path: PathBuf::from("/home/user/docs"),
+            has_trailing_slash: false,
+        };
         assert_eq!(path.to_string(), "/home/user/docs");
     }
 

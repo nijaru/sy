@@ -311,7 +311,10 @@ async fn test_streaming_with_nested_directories() {
     assert!(dest_file.exists());
 
     let update_count = updates.load(Ordering::SeqCst);
-    assert!(update_count >= 3, "Nested file should have progress updates");
+    assert!(
+        update_count >= 3,
+        "Nested file should have progress updates"
+    );
 }
 
 #[tokio::test]
@@ -347,5 +350,8 @@ async fn test_progress_maintains_file_integrity() {
     // Verify data integrity
     let dest_data = fs::read(&dest_file).unwrap();
     assert_eq!(dest_data.len(), data.len());
-    assert_eq!(dest_data, data, "File data should be identical after progress streaming");
+    assert_eq!(
+        dest_data, data,
+        "File data should be identical after progress streaming"
+    );
 }

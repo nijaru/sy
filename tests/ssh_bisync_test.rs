@@ -17,8 +17,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use std::thread::sleep;
+use std::time::Duration;
 use tempfile::TempDir;
 
 const FEDORA_HOST: &str = "fedora";
@@ -59,7 +59,10 @@ fn read_remote_file(remote_path: &str) -> Vec<u8> {
         .expect("Failed to read remote file");
 
     if !output.status.success() {
-        panic!("Failed to read remote file: {}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "Failed to read remote file: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     output.stdout
@@ -93,8 +96,8 @@ fn create_remote_file(remote_path: &str, content: &[u8]) {
 #[ignore]
 async fn test_bisync_initial_local_to_remote() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("initial_l2r");
@@ -113,17 +116,28 @@ async fn test_bisync_initial_local_to_remote() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     // Initial sync
     let result = engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
-    assert!(result.stats.files_synced_to_dest >= 2, "Should copy at least 2 files in initial sync");
+    assert!(
+        result.stats.files_synced_to_dest >= 2,
+        "Should copy at least 2 files in initial sync"
+    );
 
     // Verify remote files exist
     let file1_content = read_remote_file(&format!("{}/file1.txt", remote_dir));
@@ -140,8 +154,8 @@ async fn test_bisync_initial_local_to_remote() {
 #[ignore]
 async fn test_bisync_initial_remote_to_local() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("initial_r2l");
@@ -159,17 +173,28 @@ async fn test_bisync_initial_remote_to_local() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     // Initial sync
     let result = engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
-    assert!(result.stats.files_synced_to_source >= 2, "Should copy at least 2 files from remote");
+    assert!(
+        result.stats.files_synced_to_source >= 2,
+        "Should copy at least 2 files from remote"
+    );
 
     // Verify local files
     let file1 = fs::read(local_dir.path().join("file1.txt")).unwrap();
@@ -190,8 +215,8 @@ async fn test_bisync_initial_remote_to_local() {
 #[ignore]
 async fn test_bisync_add_file_to_local() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("add_local");
@@ -208,13 +233,21 @@ async fn test_bisync_add_file_to_local() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport.clone(), remote_transport.clone());
 
     // Initial sync
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
@@ -224,15 +257,26 @@ async fn test_bisync_add_file_to_local() {
 
     // Second sync (recreate engine to clear state cache)
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let result = engine2
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Second sync failed");
 
-    assert!(result.stats.files_synced_to_dest >= 1, "Should copy at least 1 new file");
+    assert!(
+        result.stats.files_synced_to_dest >= 1,
+        "Should copy at least 1 new file"
+    );
 
     // Verify remote has new file
     let new_content = read_remote_file(&format!("{}/new.txt", remote_dir));
@@ -246,8 +290,8 @@ async fn test_bisync_add_file_to_local() {
 #[ignore]
 async fn test_bisync_add_file_to_remote() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("add_remote");
@@ -264,12 +308,20 @@ async fn test_bisync_add_file_to_remote() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
@@ -279,15 +331,26 @@ async fn test_bisync_add_file_to_remote() {
 
     // Second sync
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let result = engine2
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Second sync failed");
 
-    assert!(result.stats.files_synced_to_source >= 1, "Should copy at least 1 file from remote");
+    assert!(
+        result.stats.files_synced_to_source >= 1,
+        "Should copy at least 1 file from remote"
+    );
 
     // Verify local has new file
     let local_new = fs::read(local_dir.path().join("remote_new.txt")).unwrap();
@@ -301,8 +364,8 @@ async fn test_bisync_add_file_to_remote() {
 #[ignore]
 async fn test_bisync_delete_from_local() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("delete_local");
@@ -320,12 +383,20 @@ async fn test_bisync_delete_from_local() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
@@ -334,21 +405,35 @@ async fn test_bisync_delete_from_local() {
 
     // Second sync
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let result = engine2
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions {
-            max_delete_percent: 0, // Allow all deletions for this test
-            ..BisyncOptions::default()
-        })
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions {
+                max_delete_percent: 0, // Allow all deletions for this test
+                ..BisyncOptions::default()
+            },
+        )
         .await
         .expect("Second sync failed");
 
-    assert!(result.stats.files_deleted_from_dest >= 1, "Should delete at least 1 file from remote");
+    assert!(
+        result.stats.files_deleted_from_dest >= 1,
+        "Should delete at least 1 file from remote"
+    );
 
     // Verify remote file is gone
-    let check_cmd = format!("ssh {} 'test -f {}/delete.txt && echo exists || echo missing'", FEDORA_HOST, remote_dir);
+    let check_cmd = format!(
+        "ssh {} 'test -f {}/delete.txt && echo exists || echo missing'",
+        FEDORA_HOST, remote_dir
+    );
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(&check_cmd)
@@ -369,8 +454,8 @@ async fn test_bisync_delete_from_local() {
 #[ignore]
 async fn test_bisync_conflict_newer_wins() {
     use sy::bisync::{BisyncEngine, BisyncOptions, ConflictResolution};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("conflict_newer");
@@ -387,12 +472,20 @@ async fn test_bisync_conflict_newer_wins() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
@@ -401,11 +494,18 @@ async fn test_bisync_conflict_newer_wins() {
 
     // Wait and modify remote (later timestamp)
     sleep(Duration::from_secs(2));
-    create_remote_file(&format!("{}/conflict.txt", remote_dir), b"remote version newer");
+    create_remote_file(
+        &format!("{}/conflict.txt", remote_dir),
+        b"remote version newer",
+    );
 
     // Sync with Newer strategy
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let opts = BisyncOptions {
@@ -418,8 +518,10 @@ async fn test_bisync_conflict_newer_wins() {
         .await
         .expect("Sync with conflict failed");
 
-    assert!(result.stats.conflicts_resolved >= 1 || result.stats.files_synced_to_source >= 1,
-            "Should resolve conflict or sync newer file");
+    assert!(
+        result.stats.conflicts_resolved >= 1 || result.stats.files_synced_to_source >= 1,
+        "Should resolve conflict or sync newer file"
+    );
 
     // Newer (remote) should win
     let local_content = fs::read(local_dir.path().join("conflict.txt")).unwrap();
@@ -433,8 +535,8 @@ async fn test_bisync_conflict_newer_wins() {
 #[ignore]
 async fn test_bisync_conflict_larger_wins() {
     use sy::bisync::{BisyncEngine, BisyncOptions, ConflictResolution};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("conflict_larger");
@@ -451,23 +553,38 @@ async fn test_bisync_conflict_larger_wins() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
     // Create conflict: local is smaller, remote is larger
     sleep(Duration::from_secs(1));
     create_local_file(&local_dir.path().join("conflict.txt"), b"small");
-    create_remote_file(&format!("{}/conflict.txt", remote_dir), b"this is much larger content");
+    create_remote_file(
+        &format!("{}/conflict.txt", remote_dir),
+        b"this is much larger content",
+    );
 
     // Sync with Larger strategy
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let opts = BisyncOptions {
@@ -480,8 +597,10 @@ async fn test_bisync_conflict_larger_wins() {
         .await
         .expect("Sync failed");
 
-    assert!(result.stats.conflicts_resolved >= 1 || result.stats.files_synced_to_source >= 1,
-            "Should resolve conflict or sync larger file");
+    assert!(
+        result.stats.conflicts_resolved >= 1 || result.stats.files_synced_to_source >= 1,
+        "Should resolve conflict or sync larger file"
+    );
 
     // Larger (remote) should win
     let local_content = fs::read(local_dir.path().join("conflict.txt")).unwrap();
@@ -499,8 +618,8 @@ async fn test_bisync_conflict_larger_wins() {
 #[ignore]
 async fn test_bisync_max_delete_limit() {
     use sy::bisync::{BisyncEngine, BisyncOptions};
-    use sy::transport::ssh::SshTransport;
     use sy::transport::local::LocalTransport;
+    use sy::transport::ssh::SshTransport;
 
     let local_dir = TempDir::new().unwrap();
     let remote_dir = create_remote_test_path("max_delete");
@@ -519,12 +638,20 @@ async fn test_bisync_max_delete_limit() {
 
     let local_transport = Arc::new(LocalTransport::new());
     let remote_config = create_fedora_config();
-    let remote_transport = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
 
     let engine = BisyncEngine::new(local_transport, remote_transport);
 
     engine
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await
         .expect("Initial sync failed");
 
@@ -535,15 +662,26 @@ async fn test_bisync_max_delete_limit() {
 
     // Sync should fail due to max_delete limit
     let local_transport2 = Arc::new(LocalTransport::new());
-    let remote_transport2 = Arc::new(SshTransport::new(&remote_config).await.expect("Failed to connect"));
+    let remote_transport2 = Arc::new(
+        SshTransport::new(&remote_config)
+            .await
+            .expect("Failed to connect"),
+    );
     let engine2 = BisyncEngine::new(local_transport2, remote_transport2);
 
     let result = engine2
-        .sync(local_dir.path(), &PathBuf::from(&remote_dir), BisyncOptions::default())
+        .sync(
+            local_dir.path(),
+            &PathBuf::from(&remote_dir),
+            BisyncOptions::default(),
+        )
         .await;
 
     // Should error due to deletion safety
-    assert!(result.is_err(), "Sync should fail when deletions exceed max_delete");
+    assert!(
+        result.is_err(),
+        "Sync should fail when deletions exceed max_delete"
+    );
 
     cleanup_remote_path(&remote_dir);
     println!("✅ bisync_max_delete_limit: PASS");

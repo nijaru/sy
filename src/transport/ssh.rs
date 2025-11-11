@@ -246,9 +246,9 @@ impl SshTransport {
         })?;
 
         let mut output = String::new();
-        channel.read_to_string(&mut output).map_err(|e| {
-            SyncError::from_ssh_io_error(e, "SSH command output read")
-        })?;
+        channel
+            .read_to_string(&mut output)
+            .map_err(|e| SyncError::from_ssh_io_error(e, "SSH command output read"))?;
 
         let mut stderr = String::new();
         let _ = channel.stderr().read_to_string(&mut stderr);
@@ -290,7 +290,6 @@ impl SshTransport {
         })
         .await
     }
-
 
     /// Execute a command with stdin data (binary-safe)
     fn execute_command_with_stdin(
@@ -607,7 +606,7 @@ impl Transport for SshTransport {
                         PathBuf::from(&e.path)
                             .strip_prefix(path)
                             .unwrap_or(Path::new(&e.path))
-                            .to_path_buf()
+                            .to_path_buf(),
                     ),
                     size: e.size,
                     modified,
@@ -706,341 +705,361 @@ impl Transport for SshTransport {
                 tokio::task::spawn_blocking(move || {
                     // Get source metadata for mtime and size
                     let metadata = std::fs::metadata(&source_path).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to get metadata for {}: {}",
-                        source_path.display(),
-                        e
-                    ),
-                ))
-            })?;
-
-            let file_size = metadata.len();
-            let filename = source_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-
-            // Determine if compression would be beneficial using smart detection
-            // Use content-based detection with Auto mode (default)
-            // TODO: Thread compression_detection mode from CLI through transport
-            let compression_mode = should_compress_smart(
-                Some(&source_path),
-                filename,
-                file_size,
-                false, // SSH transfers are always remote (not local)
-                CompressionDetection::Auto,
-            );
-
-            // Use compressed transfer for compressible files, SFTP for others
-            match compression_mode {
-                Compression::Lz4 | Compression::Zstd => {
-                    tracing::debug!(
-                        "File {}: {} bytes, using compressed transfer ({})",
-                        filename,
-                        file_size,
-                        compression_mode.as_str()
-                    );
-
-                    // Read entire file (compression only used for smaller files)
-                    let file_data = std::fs::read(&source_path).map_err(|e| {
-                        SyncError::Io(std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to read {}: {}", source_path.display(), e),
-                        ))
-                    })?;
-
-                    let uncompressed_size = file_data.len();
-
-                    // Compress the data
-                    let compressed_data = compress(&file_data, compression_mode).map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!(
-                            "Failed to compress {}: {}",
-                            source_path.display(),
-                            e
-                        )))
-                    })?;
-
-                    let compressed_size = compressed_data.len();
-                    let ratio = uncompressed_size as f64 / compressed_size as f64;
-
-                    tracing::debug!(
-                        "Compressed {}: {} → {} bytes ({:.1}x)",
-                        filename,
-                        uncompressed_size,
-                        compressed_size,
-                        ratio
-                    );
-
-                    // Get mtime for receive-file command
-                    let mtime_secs = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs());
-
-                    // Send via receive-file command with stdin
-                    let dest_path_str = dest_path.to_string_lossy();
-                    let mtime_arg = mtime_secs
-                        .map(|s| format!("--mtime {}", s))
-                        .unwrap_or_default();
-
-                    let command = format!(
-                        "{} receive-file {} {}",
-                        remote_binary, dest_path_str, mtime_arg
-                    );
-
-                    let output = Self::execute_command_with_stdin(
-                        Arc::clone(&session_arc),
-                        &command,
-                        &compressed_data,
-                    )?;
-
-                    // Parse response to verify
-                    #[derive(serde::Deserialize)]
-                    struct ReceiveResult {
-                        bytes_written: u64,
-                    }
-
-                    let result: ReceiveResult = serde_json::from_str(&output).map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!(
-                            "Failed to parse receive-file output: {}",
-                            e
-                        )))
-                    })?;
-
-                    tracing::info!(
-                        "Transferred {} ({} bytes compressed, {:.1}x reduction)",
-                        source_path.display(),
-                        compressed_size,
-                        ratio
-                    );
-
-                    Ok(TransferResult::with_compression(
-                        result.bytes_written,
-                        compressed_size as u64,
-                    ))
-                }
-                Compression::None => {
-                    tracing::debug!(
-                        "File {}: {} bytes, using SFTP streaming (incompressible or too large)",
-                        filename,
-                        file_size
-                    );
-
-                    // Get source mtime for resume state
-                    let mtime_systime = metadata.modified().map_err(|e| {
-                        SyncError::Io(std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to get mtime for {}: {}", source_path.display(), e),
-                        ))
-                    })?;
-
-                    // Try to load existing resume state
-                    let mut resume_state = TransferState::load(&source_path, &dest_path, mtime_systime)?;
-                    let is_resuming = resume_state.is_some();
-
-                    // Check if state is stale
-                    if let Some(ref state) = resume_state {
-                        if state.is_stale(mtime_systime) {
-                            eprintln!(
-                                "Resume state is stale for {} (file modified). Starting fresh.",
-                                source_path.display()
-                            );
-                            TransferState::clear(&source_path, &dest_path, mtime_systime)?;
-                            resume_state = None;
-                        }
-                    }
-
-                    // Determine starting position
-                    let start_offset = if let Some(ref state) = resume_state {
-                        eprintln!(
-                            "Resuming transfer of {} from offset {} ({:.1}% complete)",
-                            source_path.display(),
-                            state.bytes_transferred,
-                            state.progress_percentage()
-                        );
-                        state.bytes_transferred
-                    } else {
-                        0
-                    };
-
-                    let session = session_arc.lock().map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!(
-                            "Failed to lock session: {}",
-                            e
-                        )))
-                    })?;
-
-                    // Open source file for streaming
-                    let mut source_file = std::fs::File::open(&source_path).map_err(|e| {
                         SyncError::Io(std::io::Error::new(
                             e.kind(),
                             format!(
-                                "Failed to open source file {}: {}",
+                                "Failed to get metadata for {}: {}",
                                 source_path.display(),
                                 e
                             ),
                         ))
                     })?;
 
-                    // Seek to resume position if resuming
-                    if start_offset > 0 {
-                        source_file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
-                            SyncError::Io(std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "Failed to seek source file {} to offset {}: {}",
-                                    source_path.display(),
-                                    start_offset,
-                                    e
-                                ),
-                            ))
-                        })?;
-                    }
+                    let file_size = metadata.len();
+                    let filename = source_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
 
-                    // Get SFTP session
-                    let sftp = session.sftp().map_err(|e| {
-                        SyncError::Io(std::io::Error::other(format!(
-                            "Failed to create SFTP session: {}",
-                            e
-                        )))
-                    })?;
+                    // Determine if compression would be beneficial using smart detection
+                    // Use content-based detection with Auto mode (default)
+                    // TODO: Thread compression_detection mode from CLI through transport
+                    let compression_mode = should_compress_smart(
+                        Some(&source_path),
+                        filename,
+                        file_size,
+                        false, // SSH transfers are always remote (not local)
+                        CompressionDetection::Auto,
+                    );
 
-                    // Open remote file (create if new, open for append if resuming)
-                    let mut remote_file = if is_resuming {
-                        use ssh2::OpenFlags;
-                        let mut file = sftp.open_mode(
-                            &dest_path,
-                            OpenFlags::WRITE,
-                            0o644,
-                            ssh2::OpenType::File,
-                        ).map_err(|e| {
-                            SyncError::Io(std::io::Error::other(format!(
-                                "Failed to open remote file for append {}: {}",
-                                dest_path.display(),
-                                e
-                            )))
-                        })?;
+                    // Use compressed transfer for compressible files, SFTP for others
+                    match compression_mode {
+                        Compression::Lz4 | Compression::Zstd => {
+                            tracing::debug!(
+                                "File {}: {} bytes, using compressed transfer ({})",
+                                filename,
+                                file_size,
+                                compression_mode.as_str()
+                            );
 
-                        // Seek to resume position
-                        file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
-                            SyncError::Io(std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "Failed to seek remote file {} to offset {}: {}",
-                                    dest_path.display(),
-                                    start_offset,
-                                    e
-                                ),
-                            ))
-                        })?;
-
-                        file
-                    } else {
-                        sftp.create(&dest_path).map_err(|e| {
-                            SyncError::Io(std::io::Error::other(format!(
-                                "Failed to create remote file {}: {}",
-                                dest_path.display(),
-                                e
-                            )))
-                        })?
-                    };
-
-                    // Initialize or update transfer state
-                    let mut state = resume_state.unwrap_or_else(|| {
-                        TransferState::new(&source_path, &dest_path, file_size, mtime_systime, DEFAULT_CHUNK_SIZE)
-                    });
-
-                    // Stream file in chunks with checksum calculation
-                    // 256KB optimal for modern networks (research: SFTP performance)
-                    const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
-                    let mut buffer = vec![0u8; CHUNK_SIZE];
-                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-                    let mut bytes_written = start_offset;
-                    let mut bytes_since_checkpoint = 0u64;
-                    const CHECKPOINT_INTERVAL: u64 = 10 * 1024 * 1024; // 10MB
-
-                    loop {
-                        let bytes_read = source_file.read(&mut buffer)
-                            .map_err(|e| {
+                            // Read entire file (compression only used for smaller files)
+                            let file_data = std::fs::read(&source_path).map_err(|e| {
                                 SyncError::Io(std::io::Error::new(
                                     e.kind(),
-                                    format!("Failed to read from {}: {}", source_path.display(), e),
+                                    format!("Failed to read {}: {}", source_path.display(), e),
                                 ))
                             })?;
 
-                        if bytes_read == 0 {
-                            break; // EOF
+                            let uncompressed_size = file_data.len();
+
+                            // Compress the data
+                            let compressed_data =
+                                compress(&file_data, compression_mode).map_err(|e| {
+                                    SyncError::Io(std::io::Error::other(format!(
+                                        "Failed to compress {}: {}",
+                                        source_path.display(),
+                                        e
+                                    )))
+                                })?;
+
+                            let compressed_size = compressed_data.len();
+                            let ratio = uncompressed_size as f64 / compressed_size as f64;
+
+                            tracing::debug!(
+                                "Compressed {}: {} → {} bytes ({:.1}x)",
+                                filename,
+                                uncompressed_size,
+                                compressed_size,
+                                ratio
+                            );
+
+                            // Get mtime for receive-file command
+                            let mtime_secs = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs());
+
+                            // Send via receive-file command with stdin
+                            let dest_path_str = dest_path.to_string_lossy();
+                            let mtime_arg = mtime_secs
+                                .map(|s| format!("--mtime {}", s))
+                                .unwrap_or_default();
+
+                            let command = format!(
+                                "{} receive-file {} {}",
+                                remote_binary, dest_path_str, mtime_arg
+                            );
+
+                            let output = Self::execute_command_with_stdin(
+                                Arc::clone(&session_arc),
+                                &command,
+                                &compressed_data,
+                            )?;
+
+                            // Parse response to verify
+                            #[derive(serde::Deserialize)]
+                            struct ReceiveResult {
+                                bytes_written: u64,
+                            }
+
+                            let result: ReceiveResult =
+                                serde_json::from_str(&output).map_err(|e| {
+                                    SyncError::Io(std::io::Error::other(format!(
+                                        "Failed to parse receive-file output: {}",
+                                        e
+                                    )))
+                                })?;
+
+                            tracing::info!(
+                                "Transferred {} ({} bytes compressed, {:.1}x reduction)",
+                                source_path.display(),
+                                compressed_size,
+                                ratio
+                            );
+
+                            Ok(TransferResult::with_compression(
+                                result.bytes_written,
+                                compressed_size as u64,
+                            ))
                         }
+                        Compression::None => {
+                            tracing::debug!(
+                        "File {}: {} bytes, using SFTP streaming (incompressible or too large)",
+                        filename,
+                        file_size
+                    );
 
-                        // Update checksum
-                        hasher.update(&buffer[..bytes_read]);
+                            // Get source mtime for resume state
+                            let mtime_systime = metadata.modified().map_err(|e| {
+                                SyncError::Io(std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "Failed to get mtime for {}: {}",
+                                        source_path.display(),
+                                        e
+                                    ),
+                                ))
+                            })?;
 
-                        // Write chunk to remote
-                        remote_file.write_all(&buffer[..bytes_read])
-                            .map_err(|e| {
+                            // Try to load existing resume state
+                            let mut resume_state =
+                                TransferState::load(&source_path, &dest_path, mtime_systime)?;
+                            let is_resuming = resume_state.is_some();
+
+                            // Check if state is stale
+                            if let Some(ref state) = resume_state {
+                                if state.is_stale(mtime_systime) {
+                                    eprintln!(
+                                "Resume state is stale for {} (file modified). Starting fresh.",
+                                source_path.display()
+                            );
+                                    TransferState::clear(&source_path, &dest_path, mtime_systime)?;
+                                    resume_state = None;
+                                }
+                            }
+
+                            // Determine starting position
+                            let start_offset = if let Some(ref state) = resume_state {
+                                eprintln!(
+                                    "Resuming transfer of {} from offset {} ({:.1}% complete)",
+                                    source_path.display(),
+                                    state.bytes_transferred,
+                                    state.progress_percentage()
+                                );
+                                state.bytes_transferred
+                            } else {
+                                0
+                            };
+
+                            let session = session_arc.lock().map_err(|e| {
                                 SyncError::Io(std::io::Error::other(format!(
-                                    "Failed to write to remote file {}: {}",
-                                    dest_path.display(),
+                                    "Failed to lock session: {}",
                                     e
                                 )))
                             })?;
 
-                        bytes_written += bytes_read as u64;
-                        bytes_since_checkpoint += bytes_read as u64;
+                            // Open source file for streaming
+                            let mut source_file =
+                                std::fs::File::open(&source_path).map_err(|e| {
+                                    SyncError::Io(std::io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "Failed to open source file {}: {}",
+                                            source_path.display(),
+                                            e
+                                        ),
+                                    ))
+                                })?;
 
-                        // Update state and save checkpoint every 10MB
-                        if bytes_since_checkpoint >= CHECKPOINT_INTERVAL {
-                            state.update_progress(bytes_written);
-                            state.save()?;
-                            bytes_since_checkpoint = 0;
+                            // Seek to resume position if resuming
+                            if start_offset > 0 {
+                                source_file
+                                    .seek(SeekFrom::Start(start_offset))
+                                    .map_err(|e| {
+                                        SyncError::Io(std::io::Error::new(
+                                            e.kind(),
+                                            format!(
+                                                "Failed to seek source file {} to offset {}: {}",
+                                                source_path.display(),
+                                                start_offset,
+                                                e
+                                            ),
+                                        ))
+                                    })?;
+                            }
+
+                            // Get SFTP session
+                            let sftp = session.sftp().map_err(|e| {
+                                SyncError::Io(std::io::Error::other(format!(
+                                    "Failed to create SFTP session: {}",
+                                    e
+                                )))
+                            })?;
+
+                            // Open remote file (create if new, open for append if resuming)
+                            let mut remote_file = if is_resuming {
+                                use ssh2::OpenFlags;
+                                let mut file = sftp
+                                    .open_mode(
+                                        &dest_path,
+                                        OpenFlags::WRITE,
+                                        0o644,
+                                        ssh2::OpenType::File,
+                                    )
+                                    .map_err(|e| {
+                                        SyncError::Io(std::io::Error::other(format!(
+                                            "Failed to open remote file for append {}: {}",
+                                            dest_path.display(),
+                                            e
+                                        )))
+                                    })?;
+
+                                // Seek to resume position
+                                file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
+                                    SyncError::Io(std::io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "Failed to seek remote file {} to offset {}: {}",
+                                            dest_path.display(),
+                                            start_offset,
+                                            e
+                                        ),
+                                    ))
+                                })?;
+
+                                file
+                            } else {
+                                sftp.create(&dest_path).map_err(|e| {
+                                    SyncError::Io(std::io::Error::other(format!(
+                                        "Failed to create remote file {}: {}",
+                                        dest_path.display(),
+                                        e
+                                    )))
+                                })?
+                            };
+
+                            // Initialize or update transfer state
+                            let mut state = resume_state.unwrap_or_else(|| {
+                                TransferState::new(
+                                    &source_path,
+                                    &dest_path,
+                                    file_size,
+                                    mtime_systime,
+                                    DEFAULT_CHUNK_SIZE,
+                                )
+                            });
+
+                            // Stream file in chunks with checksum calculation
+                            // 256KB optimal for modern networks (research: SFTP performance)
+                            const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
+                            let mut buffer = vec![0u8; CHUNK_SIZE];
+                            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                            let mut bytes_written = start_offset;
+                            let mut bytes_since_checkpoint = 0u64;
+                            const CHECKPOINT_INTERVAL: u64 = 10 * 1024 * 1024; // 10MB
+
+                            loop {
+                                let bytes_read = source_file.read(&mut buffer).map_err(|e| {
+                                    SyncError::Io(std::io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "Failed to read from {}: {}",
+                                            source_path.display(),
+                                            e
+                                        ),
+                                    ))
+                                })?;
+
+                                if bytes_read == 0 {
+                                    break; // EOF
+                                }
+
+                                // Update checksum
+                                hasher.update(&buffer[..bytes_read]);
+
+                                // Write chunk to remote
+                                remote_file.write_all(&buffer[..bytes_read]).map_err(|e| {
+                                    SyncError::Io(std::io::Error::other(format!(
+                                        "Failed to write to remote file {}: {}",
+                                        dest_path.display(),
+                                        e
+                                    )))
+                                })?;
+
+                                bytes_written += bytes_read as u64;
+                                bytes_since_checkpoint += bytes_read as u64;
+
+                                // Update state and save checkpoint every 10MB
+                                if bytes_since_checkpoint >= CHECKPOINT_INTERVAL {
+                                    state.update_progress(bytes_written);
+                                    state.save()?;
+                                    bytes_since_checkpoint = 0;
+
+                                    tracing::debug!(
+                                        "Checkpoint saved for {} at {} bytes ({:.1}%)",
+                                        source_path.display(),
+                                        bytes_written,
+                                        state.progress_percentage()
+                                    );
+                                }
+                            }
+
+                            // Clear resume state on successful completion
+                            TransferState::clear(&source_path, &dest_path, mtime_systime)?;
+
+                            let checksum = hasher.digest();
 
                             tracing::debug!(
-                                "Checkpoint saved for {} at {} bytes ({:.1}%)",
+                                "Transferred {} ({} bytes, xxh3: {:x}, resumed: {})",
                                 source_path.display(),
                                 bytes_written,
-                                state.progress_percentage()
+                                checksum,
+                                is_resuming
                             );
+
+                            // Set modification time
+                            if let Ok(modified) = metadata.modified() {
+                                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                                    let mtime = duration.as_secs();
+                                    let atime = mtime;
+                                    let _ = sftp.setstat(
+                                        &dest_path,
+                                        ssh2::FileStat {
+                                            size: Some(bytes_written),
+                                            uid: None,
+                                            gid: None,
+                                            perm: None,
+                                            atime: Some(atime),
+                                            mtime: Some(mtime),
+                                        },
+                                    );
+                                }
+                            }
+
+                            Ok(TransferResult::new(bytes_written))
                         }
                     }
-
-                    // Clear resume state on successful completion
-                    TransferState::clear(&source_path, &dest_path, mtime_systime)?;
-
-                    let checksum = hasher.digest();
-
-                    tracing::debug!(
-                        "Transferred {} ({} bytes, xxh3: {:x}, resumed: {})",
-                        source_path.display(),
-                        bytes_written,
-                        checksum,
-                        is_resuming
-                    );
-
-                    // Set modification time
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                            let mtime = duration.as_secs();
-                            let atime = mtime;
-                            let _ = sftp.setstat(
-                                &dest_path,
-                                ssh2::FileStat {
-                                    size: Some(bytes_written),
-                                    uid: None,
-                                    gid: None,
-                                    perm: None,
-                                    atime: Some(atime),
-                                    mtime: Some(mtime),
-                                },
-                            );
-                        }
-                    }
-
-                    Ok(TransferResult::new(bytes_written))
-                }
-            }
                 })
                 .await
                 .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
@@ -1078,166 +1097,168 @@ impl Transport for SshTransport {
             async move {
                 tokio::task::spawn_blocking(move || {
                     let session = session_arc.lock().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to lock session: {}",
-                        e
-                    )))
-                })?;
-
-                let sftp = session.sftp().map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to create SFTP session: {}",
-                        e
-                    )))
-                })?;
-
-                // Get remote file size
-                let remote_stat = sftp.stat(&dest_path).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to stat remote file {}: {}",
-                        dest_path.display(),
-                        e
-                    )))
-                })?;
-
-                let dest_size = remote_stat.size.unwrap_or(0);
-
-                // Skip delta if destination is too small
-                if dest_size < 4096 {
-                    tracing::debug!("Remote destination too small for delta sync, using full copy");
-                    drop(session);
-                    return Err(SyncError::Io(std::io::Error::other(
-                        "Destination too small, caller should use copy_file",
-                    )));
-                }
-
-                // Calculate block size
-                let block_size = calculate_block_size(dest_size);
-
-                // Compute checksums on remote side (avoid downloading entire file!)
-                tracing::debug!("Computing remote checksums via sy-remote...");
-                drop(session); // Unlock session before remote command
-
-                let dest_path_str = dest_path.to_string_lossy();
-                let command = format!(
-                    "{} checksums {} --block-size {}",
-                    remote_binary, dest_path_str, block_size
-                );
-
-                let output = tokio::task::block_in_place(|| {
-                    Self::execute_command(Arc::clone(&session_arc), &command)
-                })?;
-
-                let dest_checksums: Vec<BlockChecksum> =
-                    serde_json::from_str(&output).map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
-                            "Failed to parse remote checksums: {}",
+                            "Failed to lock session: {}",
                             e
                         )))
                     })?;
 
-                // Generate delta with streaming (constant memory)
-                tracing::debug!("Generating delta with streaming...");
-                let delta = generate_delta_streaming(&source_path, &dest_checksums, block_size)
-                    .map_err(|e| SyncError::CopyError {
-                        path: source_path.clone(),
-                        source: e,
-                    })?;
-
-                // Calculate compression ratio
-                let literal_bytes: u64 = delta
-                    .ops
-                    .iter()
-                    .filter_map(|op| {
-                        if let DeltaOp::Data(data) = op {
-                            Some(data.len() as u64)
-                        } else {
-                            None
-                        }
-                    })
-                    .sum();
-
-                let compression_ratio = if source_size > 0 {
-                    (literal_bytes as f64 / source_size as f64) * 100.0
-                } else {
-                    0.0
-                };
-
-                // Serialize delta to JSON
-                let delta_json = serde_json::to_string(&delta).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to serialize delta: {}",
-                        e
-                    )))
-                })?;
-
-                // Compress delta JSON (typically 5-10x reduction for JSON data)
-                let uncompressed_size = delta_json.len();
-                let compressed_delta =
-                    compress(delta_json.as_bytes(), Compression::Zstd).map_err(|e| {
+                    let sftp = session.sftp().map_err(|e| {
                         SyncError::Io(std::io::Error::other(format!(
-                            "Failed to compress delta: {}",
+                            "Failed to create SFTP session: {}",
                             e
                         )))
                     })?;
-                let compressed_size = compressed_delta.len();
 
-                tracing::debug!(
-                    "Delta: {} ops, {} bytes JSON, {} bytes compressed ({:.1}x)",
-                    delta.ops.len(),
-                    uncompressed_size,
-                    compressed_size,
-                    uncompressed_size as f64 / compressed_size as f64
-                );
+                    // Get remote file size
+                    let remote_stat = sftp.stat(&dest_path).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to stat remote file {}: {}",
+                            dest_path.display(),
+                            e
+                        )))
+                    })?;
 
-                // Apply delta on remote side (avoids uploading full file!)
-                // Send compressed delta via stdin to avoid command line length limits
-                tracing::debug!("Sending compressed delta to remote for application...");
-                let temp_remote_path = format!("{}.sy-tmp", dest_path.display());
-                let command = format!(
-                    "{} apply-delta {} {}",
-                    remote_binary, dest_path_str, temp_remote_path
-                );
+                    let dest_size = remote_stat.size.unwrap_or(0);
 
-                let output = tokio::task::block_in_place(|| {
-                    Self::execute_command_with_stdin(
-                        Arc::clone(&session_arc),
-                        &command,
-                        &compressed_delta,
-                    )
-                })?;
+                    // Skip delta if destination is too small
+                    if dest_size < 4096 {
+                        tracing::debug!(
+                            "Remote destination too small for delta sync, using full copy"
+                        );
+                        drop(session);
+                        return Err(SyncError::Io(std::io::Error::other(
+                            "Destination too small, caller should use copy_file",
+                        )));
+                    }
 
-                #[derive(Deserialize)]
-                struct ApplyStats {
-                    operations_count: usize,
-                    literal_bytes: u64,
-                }
+                    // Calculate block size
+                    let block_size = calculate_block_size(dest_size);
 
-                let stats: ApplyStats = serde_json::from_str(&output).map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!(
-                        "Failed to parse apply-delta output: {}",
-                        e
-                    )))
-                })?;
+                    // Compute checksums on remote side (avoid downloading entire file!)
+                    tracing::debug!("Computing remote checksums via sy-remote...");
+                    drop(session); // Unlock session before remote command
 
-                // Rename temp file to final destination (atomic)
-                let rename_command = format!("mv '{}' '{}'", temp_remote_path, dest_path_str);
-                tokio::task::block_in_place(|| {
-                    Self::execute_command(Arc::clone(&session_arc), &rename_command)
-                })?;
+                    let dest_path_str = dest_path.to_string_lossy();
+                    let command = format!(
+                        "{} checksums {} --block-size {}",
+                        remote_binary, dest_path_str, block_size
+                    );
 
-                tracing::info!(
+                    let output = tokio::task::block_in_place(|| {
+                        Self::execute_command(Arc::clone(&session_arc), &command)
+                    })?;
+
+                    let dest_checksums: Vec<BlockChecksum> = serde_json::from_str(&output)
+                        .map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to parse remote checksums: {}",
+                                e
+                            )))
+                        })?;
+
+                    // Generate delta with streaming (constant memory)
+                    tracing::debug!("Generating delta with streaming...");
+                    let delta = generate_delta_streaming(&source_path, &dest_checksums, block_size)
+                        .map_err(|e| SyncError::CopyError {
+                            path: source_path.clone(),
+                            source: e,
+                        })?;
+
+                    // Calculate compression ratio
+                    let literal_bytes: u64 = delta
+                        .ops
+                        .iter()
+                        .filter_map(|op| {
+                            if let DeltaOp::Data(data) = op {
+                                Some(data.len() as u64)
+                            } else {
+                                None
+                            }
+                        })
+                        .sum();
+
+                    let compression_ratio = if source_size > 0 {
+                        (literal_bytes as f64 / source_size as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    // Serialize delta to JSON
+                    let delta_json = serde_json::to_string(&delta).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to serialize delta: {}",
+                            e
+                        )))
+                    })?;
+
+                    // Compress delta JSON (typically 5-10x reduction for JSON data)
+                    let uncompressed_size = delta_json.len();
+                    let compressed_delta = compress(delta_json.as_bytes(), Compression::Zstd)
+                        .map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!(
+                                "Failed to compress delta: {}",
+                                e
+                            )))
+                        })?;
+                    let compressed_size = compressed_delta.len();
+
+                    tracing::debug!(
+                        "Delta: {} ops, {} bytes JSON, {} bytes compressed ({:.1}x)",
+                        delta.ops.len(),
+                        uncompressed_size,
+                        compressed_size,
+                        uncompressed_size as f64 / compressed_size as f64
+                    );
+
+                    // Apply delta on remote side (avoids uploading full file!)
+                    // Send compressed delta via stdin to avoid command line length limits
+                    tracing::debug!("Sending compressed delta to remote for application...");
+                    let temp_remote_path = format!("{}.sy-tmp", dest_path.display());
+                    let command = format!(
+                        "{} apply-delta {} {}",
+                        remote_binary, dest_path_str, temp_remote_path
+                    );
+
+                    let output = tokio::task::block_in_place(|| {
+                        Self::execute_command_with_stdin(
+                            Arc::clone(&session_arc),
+                            &command,
+                            &compressed_delta,
+                        )
+                    })?;
+
+                    #[derive(Deserialize)]
+                    struct ApplyStats {
+                        operations_count: usize,
+                        literal_bytes: u64,
+                    }
+
+                    let stats: ApplyStats = serde_json::from_str(&output).map_err(|e| {
+                        SyncError::Io(std::io::Error::other(format!(
+                            "Failed to parse apply-delta output: {}",
+                            e
+                        )))
+                    })?;
+
+                    // Rename temp file to final destination (atomic)
+                    let rename_command = format!("mv '{}' '{}'", temp_remote_path, dest_path_str);
+                    tokio::task::block_in_place(|| {
+                        Self::execute_command(Arc::clone(&session_arc), &rename_command)
+                    })?;
+
+                    tracing::info!(
                     "Delta sync: {} ops, {:.1}% literal data, transferred ~{} bytes (delta only)",
                     stats.operations_count,
                     compression_ratio,
                     literal_bytes
                 );
 
-                Ok::<TransferResult, SyncError>(TransferResult::with_delta(
-                    source_size, // Full file size
-                    stats.operations_count,
-                    stats.literal_bytes,
-                ))
+                    Ok::<TransferResult, SyncError>(TransferResult::with_delta(
+                        source_size, // Full file size
+                        stats.operations_count,
+                        stats.literal_bytes,
+                    ))
                 })
                 .await
                 .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
@@ -1357,7 +1378,10 @@ impl Transport for SshTransport {
                     })?;
 
                     // Open remote file for reading
-                    tracing::debug!("Attempting to open remote file via SFTP: {}", path_buf.display());
+                    tracing::debug!(
+                        "Attempting to open remote file via SFTP: {}",
+                        path_buf.display()
+                    );
                     let mut remote_file = sftp.open(&path_buf).map_err(|e| {
                         tracing::error!(
                             "SFTP open failed for {}: {} (error kind: {:?})",
@@ -1370,7 +1394,10 @@ impl Transport for SshTransport {
                             format!("Failed to open remote file {}: {}", path_buf.display(), e),
                         ))
                     })?;
-                    tracing::debug!("Successfully opened remote file via SFTP: {}", path_buf.display());
+                    tracing::debug!(
+                        "Successfully opened remote file via SFTP: {}",
+                        path_buf.display()
+                    );
 
                     // Read entire file into memory
                     let mut buffer = Vec::new();
@@ -1662,7 +1689,8 @@ impl Transport for SshTransport {
                     let mtime_systime = UNIX_EPOCH + Duration::from_secs(mtime);
 
                     // Try to load existing resume state
-                    let mut resume_state = TransferState::load(&source_buf, &dest_buf, mtime_systime)?;
+                    let mut resume_state =
+                        TransferState::load(&source_buf, &dest_buf, mtime_systime)?;
                     let is_resuming = resume_state.is_some();
 
                     // Check if state is stale (shouldn't happen since load() checks, but be safe)
@@ -1700,17 +1728,19 @@ impl Transport for SshTransport {
 
                     // Seek to resume position if resuming
                     if start_offset > 0 {
-                        remote_file.seek(SeekFrom::Start(start_offset)).map_err(|e| {
-                            SyncError::Io(std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "Failed to seek remote file {} to offset {}: {}",
-                                    source_buf.display(),
-                                    start_offset,
-                                    e
-                                ),
-                            ))
-                        })?;
+                        remote_file
+                            .seek(SeekFrom::Start(start_offset))
+                            .map_err(|e| {
+                                SyncError::Io(std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "Failed to seek remote file {} to offset {}: {}",
+                                        source_buf.display(),
+                                        start_offset,
+                                        e
+                                    ),
+                                ))
+                            })?;
                     }
 
                     // Create parent directories if needed
@@ -1735,7 +1765,11 @@ impl Transport for SshTransport {
                             .map_err(|e| {
                                 SyncError::Io(std::io::Error::new(
                                     e.kind(),
-                                    format!("Failed to open file for append {}: {}", dest_buf.display(), e),
+                                    format!(
+                                        "Failed to open file for append {}: {}",
+                                        dest_buf.display(),
+                                        e
+                                    ),
                                 ))
                             })?
                     } else {
@@ -1749,7 +1783,13 @@ impl Transport for SshTransport {
 
                     // Initialize or update transfer state
                     let mut state = resume_state.unwrap_or_else(|| {
-                        TransferState::new(&source_buf, &dest_buf, file_size, mtime_systime, DEFAULT_CHUNK_SIZE)
+                        TransferState::new(
+                            &source_buf,
+                            &dest_buf,
+                            file_size,
+                            mtime_systime,
+                            DEFAULT_CHUNK_SIZE,
+                        )
                     });
 
                     // Stream in 64KB chunks (optimized for network)
@@ -1767,7 +1807,11 @@ impl Transport for SshTransport {
                         let bytes_read = remote_file.read(&mut buffer).map_err(|e| {
                             SyncError::Io(std::io::Error::new(
                                 e.kind(),
-                                format!("Failed to read from remote {}: {}", source_buf.display(), e),
+                                format!(
+                                    "Failed to read from remote {}: {}",
+                                    source_buf.display(),
+                                    e
+                                ),
                             ))
                         })?;
 
@@ -1844,7 +1888,8 @@ impl Transport for SshTransport {
 
         // Check if path exists, if not use parent directory (like local implementation)
         // Use shell-agnostic commands (fish shell doesn't support bash syntax)
-        let check_path_cmd = format!("test -e '{}' && echo '{}' || dirname '{}'",
+        let check_path_cmd = format!(
+            "test -e '{}' && echo '{}' || dirname '{}'",
             path_str, path_str, path_str
         );
 
@@ -1860,7 +1905,11 @@ impl Transport for SshTransport {
             .trim()
             .to_string();
 
-        tracing::debug!("Checking disk space for path: {} (resolved to: {})", path.display(), check_path);
+        tracing::debug!(
+            "Checking disk space for path: {} (resolved to: {})",
+            path.display(),
+            check_path
+        );
 
         // Use df command to get available space
         // -P for POSIX format (portable), -B1 for bytes
@@ -1870,8 +1919,7 @@ impl Transport for SshTransport {
             .execute_command_with_retry(self.connection_pool.get_session(), &command)
             .await
             .map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                SyncError::Io(std::io::Error::other(
                     format!("Failed to check disk space for {} (using path '{}'): {}. Ensure the destination path or its parent directory exists and is accessible.", path.display(), check_path, e),
                 ))
             })?;
@@ -1882,7 +1930,8 @@ impl Transport for SshTransport {
         let lines: Vec<&str> = output.lines().collect();
         if lines.len() < 2 {
             return Err(SyncError::Io(std::io::Error::other(format!(
-                "Unexpected df output: {}", output
+                "Unexpected df output: {}",
+                output
             ))));
         }
 
@@ -1890,13 +1939,15 @@ impl Transport for SshTransport {
         let fields: Vec<&str> = data_line.split_whitespace().collect();
         if fields.len() < 4 {
             return Err(SyncError::Io(std::io::Error::other(format!(
-                "Failed to parse df output: {}", data_line
+                "Failed to parse df output: {}",
+                data_line
             ))));
         }
 
         let available = fields[3].parse::<u64>().map_err(|e| {
             SyncError::Io(std::io::Error::other(format!(
-                "Failed to parse available space '{}': {}", fields[3], e
+                "Failed to parse available space '{}': {}",
+                fields[3], e
             )))
         })?;
 
@@ -1954,16 +2005,23 @@ impl Transport for SshTransport {
                  else \
                     echo 'No xattr tool found' >&2; exit 1; \
                  fi",
-                value_b64, name, path_str,
-                value_b64, name, path_str
+                value_b64, name, path_str, value_b64, name, path_str
             );
 
-            match self.execute_command_with_retry(self.connection_pool.get_session(), &command).await {
+            match self
+                .execute_command_with_retry(self.connection_pool.get_session(), &command)
+                .await
+            {
                 Ok(_) => {
                     tracing::debug!("Set remote xattr {} on {}", name, path.display());
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to set remote xattr {} on {}: {}", name, path.display(), e);
+                    tracing::warn!(
+                        "Failed to set remote xattr {} on {}: {}",
+                        name,
+                        path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -1984,7 +2042,7 @@ impl Transport for SshTransport {
         match SshTransport::execute_command_with_stdin(
             self.connection_pool.get_session(),
             &command,
-            acls_text.as_bytes()
+            acls_text.as_bytes(),
         ) {
             Ok(_) => {
                 tracing::debug!("Set remote ACLs on {}", path.display());
@@ -2007,13 +2065,20 @@ impl Transport for SshTransport {
         // Convert flags to chflags format (octal)
         let command = format!("chflags {:o} '{}'", flags, path_str);
 
-        match self.execute_command_with_retry(self.connection_pool.get_session(), &command).await {
+        match self
+            .execute_command_with_retry(self.connection_pool.get_session(), &command)
+            .await
+        {
             Ok(_) => {
                 tracing::debug!("Set remote BSD flags 0x{:x} on {}", flags, path.display());
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("Failed to set remote BSD flags on {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to set remote BSD flags on {}: {}",
+                    path.display(),
+                    e
+                );
                 Ok(()) // Don't fail sync if flags can't be set
             }
         }

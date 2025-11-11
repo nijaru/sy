@@ -42,7 +42,11 @@ fn test_sync_1000_files() {
         .expect("Failed to execute sy");
     let elapsed = start.elapsed();
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify all files were copied
     let dest_count = fs::read_dir(dest_dir.path()).unwrap().count();
@@ -71,7 +75,11 @@ fn test_sync_10k_files() {
         .expect("Failed to execute sy");
     let elapsed = start.elapsed();
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify all files were copied
     let dest_count = fs::read_dir(dest_dir.path()).unwrap().count();
@@ -109,7 +117,11 @@ fn test_sync_100k_files() {
         .expect("Failed to execute sy");
     let sync_elapsed = sync_start.elapsed();
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify all files were copied
     println!("Verifying file count...");
@@ -188,7 +200,11 @@ fn test_deletion_planning_10k_files() {
         .expect("Failed to execute sy");
     let elapsed = start.elapsed();
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify exactly 10,000 files remain (the 100 extras deleted)
     let dest_count = fs::read_dir(dest_dir.path()).unwrap().count();
@@ -227,7 +243,11 @@ fn test_nested_directories_10k_files() {
         .expect("Failed to execute sy");
     let elapsed = start.elapsed();
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify directory structure was copied
     let dir_count = fs::read_dir(dest_dir.path()).unwrap().count();

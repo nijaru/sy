@@ -27,6 +27,7 @@ impl SyncLock {
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .open(&lock_path)?;
 
         // Try to acquire exclusive lock (non-blocking)
@@ -238,16 +239,17 @@ mod tests {
         let dest_clone = dest.clone();
 
         // Spawn thread that tries to acquire same lock
-        let handle = thread::spawn(move || {
-            SyncLock::acquire(&source_clone, &dest_clone)
-        });
+        let handle = thread::spawn(move || SyncLock::acquire(&source_clone, &dest_clone));
 
         // Give thread time to attempt lock acquisition
         thread::sleep(Duration::from_millis(100));
 
         // Thread should have failed to acquire lock
         let result = handle.join().unwrap();
-        assert!(result.is_err(), "Expected lock acquisition to fail while lock is held");
+        assert!(
+            result.is_err(),
+            "Expected lock acquisition to fail while lock is held"
+        );
 
         // Release lock
         drop(lock);

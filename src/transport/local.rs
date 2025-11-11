@@ -933,10 +933,12 @@ impl Transport for LocalTransport {
             }
 
             loop {
-                let bytes_read = src_file.read(&mut buffer).map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
-                    source: e,
-                })?;
+                let bytes_read = src_file
+                    .read(&mut buffer)
+                    .map_err(|e| SyncError::CopyError {
+                        path: source.clone(),
+                        source: e,
+                    })?;
 
                 if bytes_read == 0 {
                     break; // EOF
@@ -1020,7 +1022,7 @@ mod tests {
         assert!(entries.len() >= 3);
         assert!(entries
             .iter()
-            .any(|e| **e.relative_path == PathBuf::from("file1.txt")));
+            .any(|e| e.relative_path.as_path() == Path::new("file1.txt")));
     }
 
     #[tokio::test]
@@ -1348,7 +1350,10 @@ mod tests {
         let progress_callback = Arc::new(move |bytes_transferred: u64, total: u64| {
             progress_updates_clone.fetch_add(1, Ordering::SeqCst);
             last_bytes_clone.store(bytes_transferred, Ordering::SeqCst);
-            assert!(bytes_transferred <= total, "Transferred bytes should not exceed total");
+            assert!(
+                bytes_transferred <= total,
+                "Transferred bytes should not exceed total"
+            );
         });
 
         // Copy file with streaming and progress
@@ -1369,11 +1374,19 @@ mod tests {
 
         // Verify progress was updated (should be at least 5 updates for 5MB file with 1MB chunks)
         let updates = progress_updates.load(Ordering::SeqCst);
-        assert!(updates >= 5, "Expected at least 5 progress updates, got {}", updates);
+        assert!(
+            updates >= 5,
+            "Expected at least 5 progress updates, got {}",
+            updates
+        );
 
         // Verify final progress shows complete transfer
         let final_bytes = last_bytes.load(Ordering::SeqCst);
-        assert_eq!(final_bytes, 5 * 1024 * 1024, "Final progress should show complete transfer");
+        assert_eq!(
+            final_bytes,
+            5 * 1024 * 1024,
+            "Final progress should show complete transfer"
+        );
     }
 
     #[tokio::test]

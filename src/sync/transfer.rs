@@ -149,7 +149,8 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                                 );
 
                                 // Copy the file
-                                let result = self.copy_file(&source.path, dest_path, source.size).await?;
+                                let result =
+                                    self.copy_file(&source.path, dest_path, source.size).await?;
 
                                 // Write extended attributes if present
                                 self.write_xattrs(source, dest_path).await?;
@@ -258,7 +259,12 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         Ok(())
     }
 
-    async fn copy_file(&self, source: &Path, dest: &Path, file_size: u64) -> Result<TransferResult> {
+    async fn copy_file(
+        &self,
+        source: &Path,
+        dest: &Path,
+        file_size: u64,
+    ) -> Result<TransferResult> {
         use crate::sync::progress::{create_progress_callback, MIN_SIZE_FOR_PROGRESS};
 
         // Ensure parent directory exists
@@ -269,7 +275,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         // Use streaming copy with progress for large files
         let result = if self.per_file_progress && file_size >= MIN_SIZE_FOR_PROGRESS {
             let progress_callback = create_progress_callback(source, file_size);
-            self.transport.copy_file_streaming(source, dest, Some(progress_callback)).await?
+            self.transport
+                .copy_file_streaming(source, dest, Some(progress_callback))
+                .await?
         } else {
             self.transport.copy_file(source, dest).await?
         };
@@ -292,10 +300,8 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                 }
 
                 // Convert HashMap to Vec of tuples for transport layer
-                let xattrs_vec: Vec<(String, Vec<u8>)> = xattrs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let xattrs_vec: Vec<(String, Vec<u8>)> =
+                    xattrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
                 // Use transport layer to set xattrs (works for both local and remote)
                 self.transport.set_xattrs(dest_path, &xattrs_vec).await?;
@@ -369,7 +375,9 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             };
 
             // Use transport layer to set BSD flags (works for both local and remote)
-            self.transport.set_bsd_flags(dest_path, flags_to_set).await?;
+            self.transport
+                .set_bsd_flags(dest_path, flags_to_set)
+                .await?;
 
             Ok(())
         }
@@ -464,11 +472,11 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::transport::local::LocalTransport;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::SystemTime;
     use tempfile::TempDir;
 

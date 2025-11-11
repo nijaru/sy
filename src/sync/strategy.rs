@@ -483,10 +483,10 @@ impl Default for StrategyPlanner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]

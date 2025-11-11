@@ -181,9 +181,10 @@ pub fn detect_compressibility(file_path: &Path) -> io::Result<f64> {
 }
 
 /// Compression detection mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum CompressionDetection {
     /// Content-based detection with sampling (default)
+    #[default]
     Auto,
 
     /// Extension-only detection (legacy behavior)
@@ -194,12 +195,6 @@ pub enum CompressionDetection {
 
     /// Never compress (override detection)
     Never,
-}
-
-impl Default for CompressionDetection {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Smart compression detection using content sampling

@@ -299,7 +299,12 @@ pub trait Transport: Send + Sync {
                     match AclEntry::from_str(line) {
                         Ok(entry) => acl_entries.push(entry),
                         Err(e) => {
-                            tracing::warn!("Failed to parse ACL entry '{}' for {}: {}", line, path.display(), e);
+                            tracing::warn!(
+                                "Failed to parse ACL entry '{}' for {}: {}",
+                                line,
+                                path.display(),
+                                e
+                            );
                             continue;
                         }
                     }
@@ -342,7 +347,11 @@ pub trait Transport: Send + Sync {
 
                 let result = unsafe { libc::chflags(c_path.as_ptr(), flags as _) };
                 if result != 0 {
-                    tracing::warn!("Failed to set BSD flags on {}: {}", path.display(), std::io::Error::last_os_error());
+                    tracing::warn!(
+                        "Failed to set BSD flags on {}: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    );
                 }
             })
             .await

@@ -45,9 +45,9 @@ fn cleanup_remote_path(path: &str) {
 #[tokio::test]
 #[ignore]
 async fn test_retry_basic_operation() {
+    use sy::retry::RetryConfig;
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
-    use sy::retry::RetryConfig;
 
     let remote_path = create_remote_test_path("retry_basic");
 
@@ -98,9 +98,9 @@ async fn test_retry_basic_operation() {
 #[tokio::test]
 #[ignore]
 async fn test_retry_with_aggressive_backoff() {
+    use sy::retry::RetryConfig;
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
-    use sy::retry::RetryConfig;
 
     let remote_path = create_remote_test_path("retry_backoff");
 
@@ -154,9 +154,9 @@ async fn test_retry_with_aggressive_backoff() {
 #[tokio::test]
 #[ignore]
 async fn test_retry_eventual_failure() {
-    use sy::transport::ssh::SshTransport;
     use sy::retry::RetryConfig;
     use sy::ssh::config::SshConfig;
+    use sy::transport::ssh::SshTransport;
 
     // Try to connect to non-existent host (will fail after retries)
     let mut bad_config = SshConfig::new("nonexistent-host-12345.invalid");
@@ -185,9 +185,9 @@ async fn test_retry_eventual_failure() {
 #[tokio::test]
 #[ignore]
 async fn test_connection_pool_with_retry() {
+    use sy::retry::RetryConfig;
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
-    use sy::retry::RetryConfig;
 
     let remote_base = create_remote_test_path("pool_retry");
 
@@ -262,9 +262,9 @@ async fn test_connection_pool_with_retry() {
 #[tokio::test]
 #[ignore]
 async fn test_large_file_transfer_with_retry() {
+    use sy::retry::RetryConfig;
     use sy::transport::ssh::SshTransport;
     use sy::transport::Transport;
-    use sy::retry::RetryConfig;
 
     let remote_source = create_remote_test_path("large_retry");
 
@@ -301,11 +301,7 @@ async fn test_large_file_transfer_with_retry() {
     let start = std::time::Instant::now();
 
     let result = transport
-        .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
-            &dest_file,
-            None,
-        )
+        .copy_file_streaming(&std::path::Path::new(&remote_source), &dest_file, None)
         .await
         .expect("Transfer failed");
 

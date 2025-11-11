@@ -25,7 +25,11 @@ fn create_fedora_config() -> sy::ssh::config::SshConfig {
 }
 
 fn create_remote_test_path(test_name: &str) -> String {
-    format!("/tmp/sy_ssh_sparse_test_{}_{}", test_name, std::process::id())
+    format!(
+        "/tmp/sy_ssh_sparse_test_{}_{}",
+        test_name,
+        std::process::id()
+    )
 }
 
 fn cleanup_remote_path(path: &str) {
@@ -81,7 +85,11 @@ async fn test_ssh_detect_sparse_file_via_scan() {
     println!("  Is sparse: {}", sparse_entry.is_sparse);
 
     // File should be 10MB
-    assert_eq!(sparse_entry.size, 10 * 1024 * 1024, "File size should be 10MB");
+    assert_eq!(
+        sparse_entry.size,
+        10 * 1024 * 1024,
+        "File size should be 10MB"
+    );
 
     // Note: sparse detection depends on filesystem support
     if sparse_entry.is_sparse {
@@ -190,8 +198,14 @@ async fn test_ssh_detect_hardlink_via_scan() {
         .find(|e| e.path.to_str().unwrap().contains("link2.txt"))
         .expect("Link2 not found");
 
-    assert_eq!(original.inode, link1.inode, "Original and link1 should have same inode");
-    assert_eq!(original.inode, link2.inode, "Original and link2 should have same inode");
+    assert_eq!(
+        original.inode, link1.inode,
+        "Original and link1 should have same inode"
+    );
+    assert_eq!(
+        original.inode, link2.inode,
+        "Original and link2 should have same inode"
+    );
 
     cleanup_remote_path(&remote_base);
     println!("✅ SSH detect_hardlink_via_scan: PASS");
@@ -270,11 +284,7 @@ async fn test_ssh_transfer_large_file() {
     let start = std::time::Instant::now();
 
     let result = transport
-        .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
-            &dest_file,
-            None,
-        )
+        .copy_file_streaming(&std::path::Path::new(&remote_source), &dest_file, None)
         .await
         .expect("Transfer failed");
 
@@ -353,7 +363,10 @@ async fn test_ssh_create_and_verify_hardlink() {
         .await
         .expect("read_file failed");
 
-    assert_eq!(original_content, link_content, "Hard link content should match");
+    assert_eq!(
+        original_content, link_content,
+        "Hard link content should match"
+    );
 
     // Verify nlink count via scan
     let entries = transport

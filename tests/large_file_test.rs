@@ -64,7 +64,11 @@ fn test_sync_100mb_file() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify file was copied
     let dest_file = dest_dir.path().join("large.dat");
@@ -96,7 +100,11 @@ fn test_sync_500mb_file() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify file was copied
     let dest_file = dest_dir.path().join("large.dat");
@@ -116,7 +124,7 @@ fn test_sync_1gb_file() {
     let dest_dir = TempDir::new().unwrap();
 
     let source_file = source_dir.path().join("large.dat");
-    let size = 1 * GB;
+    let size = GB;
 
     println!("Creating 1GB test file...");
     create_large_file(&source_file, size).unwrap();
@@ -129,7 +137,11 @@ fn test_sync_1gb_file() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify file was copied
     let dest_file = dest_dir.path().join("large.dat");
@@ -171,7 +183,11 @@ fn test_sync_1gb_sparse_file() {
     drop(file);
 
     let source_allocated = fs::metadata(&source_file).unwrap().len();
-    println!("Source file: logical={}MB, allocated={}MB", size / MB, source_allocated / MB);
+    println!(
+        "Source file: logical={}MB, allocated={}MB",
+        size / MB,
+        source_allocated / MB
+    );
 
     // Sync using sy
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
@@ -180,7 +196,11 @@ fn test_sync_1gb_sparse_file() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify sparse file was preserved
     let dest_file = dest_dir.path().join("sparse.dat");
@@ -213,7 +233,11 @@ fn test_progress_accuracy_100mb() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 

@@ -224,10 +224,8 @@ async fn main() -> Result<()> {
     let verify_on_write = verification_mode.verify_blocks();
 
     // Create retry config from CLI args for network interruption recovery
-    let retry_config = retry::RetryConfig::new(
-        cli.retry,
-        std::time::Duration::from_secs(cli.retry_delay),
-    );
+    let retry_config =
+        retry::RetryConfig::new(cli.retry, std::time::Duration::from_secs(cli.retry_delay));
 
     // Create transport router based on source and destination
     // Use worker count for SSH connection pool size to enable true parallel transfers
@@ -563,7 +561,10 @@ async fn main() -> Result<()> {
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (local_source, local_dest)
             }
-            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Remote { host, user, .. }) => {
+            (
+                crate::path::SyncPath::Local { .. },
+                crate::path::SyncPath::Remote { host, user, .. },
+            ) => {
                 // Local → Remote
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -582,7 +583,10 @@ async fn main() -> Result<()> {
                 );
                 (local, remote)
             }
-            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local { .. }) => {
+            (
+                crate::path::SyncPath::Remote { host, user, .. },
+                crate::path::SyncPath::Local { .. },
+            ) => {
                 // Remote → Local
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -660,7 +664,7 @@ async fn main() -> Result<()> {
         //   - `sy /a/dir /b/` → syncs /a/dir/ ↔ /b/dir/ (creates dir/ in destination)
         //   - `sy /a/dir/ /b/` → syncs /a/dir/ ↔ /b/ (copies contents directly)
         // This matches rsync behavior and ensures consistent directory structure on both sides.
-        let effective_dest = compute_destination_path(&source, &destination);
+        let effective_dest = compute_destination_path(source, destination);
 
         let bisync_result = bisync_engine
             .sync(source.path(), &effective_dest, bisync_opts)
@@ -715,7 +719,7 @@ async fn main() -> Result<()> {
             .await?
     } else {
         // Compute effective destination path based on trailing slash semantics
-        let effective_dest = compute_destination_path(&source, &destination);
+        let effective_dest = compute_destination_path(source, destination);
         engine.sync(source.path(), &effective_dest).await?
     };
 

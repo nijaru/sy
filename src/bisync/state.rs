@@ -158,27 +158,24 @@ impl BisyncStateDb {
             return Err(crate::error::SyncError::StateCorruption {
                 path: path.to_path_buf(),
                 reason: "State file is empty".to_string(),
-                
-                
             });
         }
 
         // Check for valid header (should start with format version comment)
-        let has_header = lines.iter().any(|line| {
-            line.trim().starts_with("# sy bisync")
-        });
+        let has_header = lines
+            .iter()
+            .any(|line| line.trim().starts_with("# sy bisync"));
 
         if !has_header {
             return Err(crate::error::SyncError::StateCorruption {
                 path: path.to_path_buf(),
                 reason: "Missing or invalid format version header".to_string(),
-                
-                
             });
         }
 
         // Count non-comment lines for basic sanity check
-        let data_lines: Vec<&String> = lines.iter()
+        let data_lines: Vec<&String> = lines
+            .iter()
             .filter(|line| {
                 let trimmed = line.trim();
                 !trimmed.is_empty() && !trimmed.starts_with('#')
@@ -192,9 +189,11 @@ impl BisyncStateDb {
                 if parts.len() != 5 && parts.len() != 6 {
                     return Err(crate::error::SyncError::StateCorruption {
                         path: path.to_path_buf(),
-                        reason: format!("Invalid field count at line {}: expected 5 or 6 fields, got {}", idx + 1, parts.len()),
-                        
-                        
+                        reason: format!(
+                            "Invalid field count at line {}: expected 5 or 6 fields, got {}",
+                            idx + 1,
+                            parts.len()
+                        ),
                     });
                 }
 
@@ -202,9 +201,11 @@ impl BisyncStateDb {
                 if parts[0] != "source" && parts[0] != "dest" {
                     return Err(crate::error::SyncError::StateCorruption {
                         path: path.to_path_buf(),
-                        reason: format!("Invalid side field '{}' at line {}: must be 'source' or 'dest'", parts[0], idx + 1),
-                        
-                        
+                        reason: format!(
+                            "Invalid side field '{}' at line {}: must be 'source' or 'dest'",
+                            parts[0],
+                            idx + 1
+                        ),
                     });
                 }
 
@@ -212,9 +213,11 @@ impl BisyncStateDb {
                 if parts[1].parse::<i64>().is_err() {
                     return Err(crate::error::SyncError::StateCorruption {
                         path: path.to_path_buf(),
-                        reason: format!("Invalid mtime '{}' at line {}: not a valid number", parts[1], idx + 1),
-                        
-                        
+                        reason: format!(
+                            "Invalid mtime '{}' at line {}: not a valid number",
+                            parts[1],
+                            idx + 1
+                        ),
                     });
                 }
 
@@ -222,9 +225,11 @@ impl BisyncStateDb {
                 if parts[2].parse::<u64>().is_err() {
                     return Err(crate::error::SyncError::StateCorruption {
                         path: path.to_path_buf(),
-                        reason: format!("Invalid size '{}' at line {}: not a valid number", parts[2], idx + 1),
-                        
-                        
+                        reason: format!(
+                            "Invalid size '{}' at line {}: not a valid number",
+                            parts[2],
+                            idx + 1
+                        ),
                     });
                 }
 
@@ -233,9 +238,11 @@ impl BisyncStateDb {
                 if checksum != "-" && u64::from_str_radix(checksum, 16).is_err() {
                     return Err(crate::error::SyncError::StateCorruption {
                         path: path.to_path_buf(),
-                        reason: format!("Invalid checksum '{}' at line {}: must be hex or '-'", checksum, idx + 1),
-                        
-                        
+                        reason: format!(
+                            "Invalid checksum '{}' at line {}: must be hex or '-'",
+                            checksum,
+                            idx + 1
+                        ),
                     });
                 }
             }
@@ -952,7 +959,11 @@ mod tests {
         // Create file without proper header
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# some random comment").unwrap();
-        writeln!(file, "source 1730000000000000000 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(
+            file,
+            "source 1730000000000000000 1024 - 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
 
         // Validation should catch missing header
         let result = BisyncStateDb::validate_state_file(&state_file);
@@ -973,7 +984,11 @@ mod tests {
         // Create file with invalid side field
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# sy bisync v2").unwrap();
-        writeln!(file, "invalid_side 1730000000000000000 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(
+            file,
+            "invalid_side 1730000000000000000 1024 - 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
 
         // Validation should catch invalid side
         let result = BisyncStateDb::validate_state_file(&state_file);
@@ -994,7 +1009,11 @@ mod tests {
         // Create file with non-numeric mtime
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# sy bisync v2").unwrap();
-        writeln!(file, "source NOT_A_NUMBER 1024 - 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(
+            file,
+            "source NOT_A_NUMBER 1024 - 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
 
         // Validation should catch invalid mtime
         let result = BisyncStateDb::validate_state_file(&state_file);
@@ -1015,7 +1034,11 @@ mod tests {
         // Create file with non-numeric size
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# sy bisync v2").unwrap();
-        writeln!(file, "source 1730000000000000000 NOT_A_SIZE - 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(
+            file,
+            "source 1730000000000000000 NOT_A_SIZE - 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
 
         // Validation should catch invalid size
         let result = BisyncStateDb::validate_state_file(&state_file);
@@ -1036,7 +1059,11 @@ mod tests {
         // Create file with invalid checksum (not hex or '-')
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# sy bisync v2").unwrap();
-        writeln!(file, "source 1730000000000000000 1024 INVALID_HEX 1730000000000000000 \"test.txt\"").unwrap();
+        writeln!(
+            file,
+            "source 1730000000000000000 1024 INVALID_HEX 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
 
         // Validation should catch invalid checksum
         let result = BisyncStateDb::validate_state_file(&state_file);
@@ -1130,8 +1157,16 @@ mod tests {
         let mut file = std::fs::File::create(&state_file).unwrap();
         writeln!(file, "# sy bisync v2").unwrap();
         writeln!(file, "# sync_pair: /source <-> /dest").unwrap();
-        writeln!(file, "source 1730000000000000000 1024 abc123 1730000000000000000 \"test.txt\"").unwrap();
-        writeln!(file, "dest 1730000000000000000 1024 - 1730000000000000000 \"test2.txt\"").unwrap();
+        writeln!(
+            file,
+            "source 1730000000000000000 1024 abc123 1730000000000000000 \"test.txt\""
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "dest 1730000000000000000 1024 - 1730000000000000000 \"test2.txt\""
+        )
+        .unwrap();
 
         // Validation should pass
         let result = BisyncStateDb::validate_state_file(&state_file);

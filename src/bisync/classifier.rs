@@ -55,7 +55,8 @@ pub fn classify_changes(
 
     // Collect all unique paths (pre-allocate for worst case: all unique)
     let capacity = source_map.len() + dest_map.len() + prior_state.len();
-    let mut all_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::with_capacity(capacity);
+    let mut all_paths: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::with_capacity(capacity);
     all_paths.extend(source_map.keys().cloned());
     all_paths.extend(dest_map.keys().cloned());
     all_paths.extend(prior_state.keys().cloned());

@@ -52,8 +52,8 @@ impl RetryConfig {
 
     /// Calculate delay for a given attempt number (0-indexed)
     fn calculate_delay(&self, attempt: u32) -> Duration {
-        let delay_secs = self.initial_delay.as_secs_f64()
-            * self.backoff_multiplier.powi(attempt as i32);
+        let delay_secs =
+            self.initial_delay.as_secs_f64() * self.backoff_multiplier.powi(attempt as i32);
         let delay = Duration::from_secs_f64(delay_secs);
         std::cmp::min(delay, self.max_delay)
     }
@@ -264,7 +264,10 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SyncError::NetworkTimeout { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SyncError::NetworkTimeout { .. }
+        ));
         // Initial attempt + 2 retries = 3 total
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
@@ -287,7 +290,10 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SyncError::NetworkFatal { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SyncError::NetworkFatal { .. }
+        ));
         // Should fail immediately without retries
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }

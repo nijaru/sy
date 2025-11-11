@@ -3,13 +3,13 @@
 //! This test verifies that when syncing from remote to local, parent directories
 //! are created before files are copied into them.
 
-use std::path::PathBuf;
-use std::time::SystemTime;
-use sy::sync::scanner::FileEntry;
-use sy::transport::{Transport, TransferResult};
-use sy::error::Result;
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
+use sy::error::Result;
+use sy::sync::scanner::FileEntry;
+use sy::transport::{TransferResult, Transport};
 use tempfile::TempDir;
 
 /// Mock remote transport that simulates a remote directory structure
@@ -110,11 +110,19 @@ impl Transport for MockRemoteTransport {
         Ok(())
     }
 
-    async fn create_hardlink(&self, _source: &std::path::Path, _dest: &std::path::Path) -> Result<()> {
+    async fn create_hardlink(
+        &self,
+        _source: &std::path::Path,
+        _dest: &std::path::Path,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn create_symlink(&self, _target: &std::path::Path, _dest: &std::path::Path) -> Result<()> {
+    async fn create_symlink(
+        &self,
+        _target: &std::path::Path,
+        _dest: &std::path::Path,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -153,7 +161,11 @@ async fn test_remote_to_local_creates_parent_dirs() {
     let result = dual_transport.copy_file(&source_path, &dest_path).await;
 
     // Verify the file was created
-    assert!(result.is_ok(), "copy_file should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "copy_file should succeed: {:?}",
+        result.err()
+    );
     assert!(dest_path.exists(), "Destination file should exist");
     assert!(dest_root.exists(), "Parent directory should exist");
 
@@ -162,7 +174,14 @@ async fn test_remote_to_local_creates_parent_dirs() {
     let dest_nested = dest_root.join("src/main.rs");
 
     let result = dual_transport.copy_file(&source_nested, &dest_nested).await;
-    assert!(result.is_ok(), "Nested file copy should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Nested file copy should succeed: {:?}",
+        result.err()
+    );
     assert!(dest_nested.exists(), "Nested destination file should exist");
-    assert!(dest_nested.parent().unwrap().exists(), "Nested parent directory should exist");
+    assert!(
+        dest_nested.parent().unwrap().exists(),
+        "Nested parent directory should exist"
+    );
 }

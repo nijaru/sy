@@ -137,9 +137,8 @@ impl TransferState {
         }
 
         let json = fs::read_to_string(&state_file)?;
-        let state: Self = serde_json::from_str(&json).map_err(|e| {
-            SyncError::Config(format!("Failed to parse resume state: {}", e))
-        })?;
+        let state: Self = serde_json::from_str(&json)
+            .map_err(|e| SyncError::Config(format!("Failed to parse resume state: {}", e)))?;
 
         // Verify state matches current transfer
         if state.source_path != source || state.dest_path != dest {
@@ -152,9 +151,7 @@ impl TransferState {
 
         // Check if stale
         if state.is_stale(mtime) {
-            eprintln!(
-                "Warning: Resume state is stale (file modified). Starting fresh transfer."
-            );
+            eprintln!("Warning: Resume state is stale (file modified). Starting fresh transfer.");
             Self::clear(source, dest, mtime)?;
             return Ok(None);
         }
@@ -294,13 +291,8 @@ mod tests {
         assert_eq!(state2.total_chunks(), 2);
 
         // 10 chunks
-        let state3 = TransferState::new(
-            &source,
-            &dest,
-            10 * 1024 * 1024,
-            mtime,
-            DEFAULT_CHUNK_SIZE,
-        );
+        let state3 =
+            TransferState::new(&source, &dest, 10 * 1024 * 1024, mtime, DEFAULT_CHUNK_SIZE);
         assert_eq!(state3.total_chunks(), 10);
     }
 

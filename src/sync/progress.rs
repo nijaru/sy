@@ -73,6 +73,7 @@ pub fn create_progress_callback(
 /// Finish a progress bar
 ///
 /// Call this after the transfer completes to finalize the display
+#[allow(dead_code)]
 pub fn finish_progress_bar(pb: Arc<ProgressBar>) {
     pb.finish_with_message("✓ Transfer complete");
 }

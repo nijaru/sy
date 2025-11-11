@@ -120,7 +120,11 @@ fn test_sync_preserves_hardlinks() {
         .output()
         .expect("Failed to execute sy");
 
-    assert!(output.status.success(), "Sync failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Sync failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Check if destination preserves hard links
     let dest_file1 = dest_dir.path().join("original.txt");
@@ -137,7 +141,10 @@ fn test_sync_preserves_hardlinks() {
     // If hard links are NOT preserved: dest_inode1 != dest_inode2 and nlink == 1
 
     if dest_inode1 == dest_inode2 {
-        println!("✅ Hard links preserved: both files share inode {}", dest_inode1);
+        println!(
+            "✅ Hard links preserved: both files share inode {}",
+            dest_inode1
+        );
         assert_eq!(get_nlink(&dest_file1).unwrap(), 2);
         assert_eq!(get_nlink(&dest_file2).unwrap(), 2);
     } else {
@@ -189,7 +196,10 @@ fn test_bisync_with_hardlinks() {
 
     // Idempotent sync should show no changes
     // (hard links shouldn't trigger false positives)
-    assert!(!stdout.contains("conflict"), "Hard links shouldn't cause conflicts");
+    assert!(
+        !stdout.contains("conflict"),
+        "Hard links shouldn't cause conflicts"
+    );
 
     println!("✅ Bisync handles hard links without false conflicts");
 }
@@ -245,7 +255,12 @@ fn test_hardlinks_across_directories() {
     fs::create_dir(source_dir.path().join("dir2")).unwrap();
 
     // Create file in dir1 and hard link in dir2
-    let file1 = create_file(source_dir.path().join("dir1").as_path(), "data.txt", "shared").unwrap();
+    let file1 = create_file(
+        source_dir.path().join("dir1").as_path(),
+        "data.txt",
+        "shared",
+    )
+    .unwrap();
     let file2 = source_dir.path().join("dir2").join("data.txt");
     fs::hard_link(&file1, &file2).unwrap();
 
@@ -302,7 +317,11 @@ fn test_hardlink_modification_detection() {
 
     // Modify one of the hard-linked files
     std::thread::sleep(std::time::Duration::from_millis(10));
-    let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&file1).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&file1)
+        .unwrap();
     write!(file, "modified content").unwrap();
     drop(file);
 

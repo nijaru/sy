@@ -1,9 +1,8 @@
-use super::{
-    dual::DualTransport, local::LocalTransport, ssh::SshTransport, TransferResult,
-    Transport,
-};
 #[cfg(feature = "s3")]
 use super::s3::S3Transport;
+use super::{
+    dual::DualTransport, local::LocalTransport, ssh::SshTransport, TransferResult, Transport,
+};
 use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::path::SyncPath;
@@ -65,8 +64,10 @@ impl TransportRouter {
                 };
 
                 let source_transport = Box::new(LocalTransport::with_verifier(verifier.clone()));
-                let dest_transport =
-                    Box::new(SshTransport::with_retry_config(&config, pool_size, retry_config.clone()).await?);
+                let dest_transport = Box::new(
+                    SshTransport::with_retry_config(&config, pool_size, retry_config.clone())
+                        .await?,
+                );
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
@@ -82,8 +83,10 @@ impl TransportRouter {
                     parse_ssh_config(host)?
                 };
 
-                let source_transport =
-                    Box::new(SshTransport::with_retry_config(&config, pool_size, retry_config.clone()).await?);
+                let source_transport = Box::new(
+                    SshTransport::with_retry_config(&config, pool_size, retry_config.clone())
+                        .await?,
+                );
                 let dest_transport = Box::new(LocalTransport::with_verifier(verifier));
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
@@ -121,10 +124,18 @@ impl TransportRouter {
                     parse_ssh_config(dest_host)?
                 };
 
-                let source_transport =
-                    Box::new(SshTransport::with_retry_config(&source_config, pool_size, retry_config.clone()).await?);
-                let dest_transport =
-                    Box::new(SshTransport::with_retry_config(&dest_config, pool_size, retry_config.clone()).await?);
+                let source_transport = Box::new(
+                    SshTransport::with_retry_config(
+                        &source_config,
+                        pool_size,
+                        retry_config.clone(),
+                    )
+                    .await?,
+                );
+                let dest_transport = Box::new(
+                    SshTransport::with_retry_config(&dest_config, pool_size, retry_config.clone())
+                        .await?,
+                );
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
@@ -199,7 +210,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.scan(path).await,
             TransportRouter::Dual(t) => t.scan(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.scan(path).await,
         }
     }
@@ -208,7 +219,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.exists(path).await,
             TransportRouter::Dual(t) => t.exists(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.exists(path).await,
         }
     }
@@ -217,7 +228,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.metadata(path).await,
             TransportRouter::Dual(t) => t.metadata(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.metadata(path).await,
         }
     }
@@ -226,7 +237,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.file_info(path).await,
             TransportRouter::Dual(t) => t.file_info(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.file_info(path).await,
         }
     }
@@ -235,7 +246,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_dir_all(path).await,
             TransportRouter::Dual(t) => t.create_dir_all(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_dir_all(path).await,
         }
     }
@@ -244,7 +255,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.copy_file(source, dest).await,
             TransportRouter::Dual(t) => t.copy_file(source, dest).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.copy_file(source, dest).await,
         }
     }
@@ -253,7 +264,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.sync_file_with_delta(source, dest).await,
             TransportRouter::Dual(t) => t.sync_file_with_delta(source, dest).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.sync_file_with_delta(source, dest).await,
         }
     }
@@ -262,7 +273,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.remove(path, is_dir).await,
             TransportRouter::Dual(t) => t.remove(path, is_dir).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.remove(path, is_dir).await,
         }
     }
@@ -271,7 +282,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_hardlink(source, dest).await,
             TransportRouter::Dual(t) => t.create_hardlink(source, dest).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_hardlink(source, dest).await,
         }
     }
@@ -280,7 +291,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.create_symlink(target, dest).await,
             TransportRouter::Dual(t) => t.create_symlink(target, dest).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_symlink(target, dest).await,
         }
     }
@@ -289,7 +300,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.read_file(path).await,
             TransportRouter::Dual(t) => t.read_file(path).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.read_file(path).await,
         }
     }
@@ -298,7 +309,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.check_disk_space(path, bytes_needed).await,
             TransportRouter::Dual(t) => t.check_disk_space(path, bytes_needed).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.check_disk_space(path, bytes_needed).await,
         }
     }
@@ -307,7 +318,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.set_xattrs(path, xattrs).await,
             TransportRouter::Dual(t) => t.set_xattrs(path, xattrs).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_xattrs(path, xattrs).await,
         }
     }
@@ -316,7 +327,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.set_acls(path, acls_text).await,
             TransportRouter::Dual(t) => t.set_acls(path, acls_text).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_acls(path, acls_text).await,
         }
     }
@@ -325,7 +336,7 @@ impl Transport for TransportRouter {
         match self {
             TransportRouter::Local(t) => t.set_bsd_flags(path, flags).await,
             TransportRouter::Dual(t) => t.set_bsd_flags(path, flags).await,
-#[cfg(feature = "s3")]
+            #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_bsd_flags(path, flags).await,
         }
     }

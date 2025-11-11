@@ -372,7 +372,7 @@ mod tests {
         assert!(entries.len() >= 3); // dir1, file1.txt, dir1/file2.txt
         assert!(entries
             .iter()
-            .any(|e| *e.relative_path == PathBuf::from("file1.txt")));
+            .any(|e| e.relative_path.as_path() == Path::new("file1.txt")));
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
         // Find the symlink entry
         let link_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("link.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("link.txt"))
             .expect("Symlink should be in scan results");
 
         assert!(link_entry.is_symlink, "Entry should be marked as symlink");
@@ -505,7 +505,7 @@ mod tests {
         // Find the regular file entry
         let file_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("target.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("target.txt"))
             .expect("Target file should be in scan results");
 
         assert!(
@@ -661,7 +661,7 @@ mod tests {
 
         let sparse_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("sparse.dat"))
+            .find(|e| e.relative_path.as_path() == Path::new("sparse.dat"))
             .expect("Sparse file should be in scan results");
 
         assert_eq!(
@@ -709,7 +709,7 @@ mod tests {
 
         let regular_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("regular.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("regular.txt"))
             .expect("Regular file should be in scan results");
 
         // Regular file should not be marked as sparse
@@ -744,17 +744,17 @@ mod tests {
         // Find all three entries
         let original_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("original.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("original.txt"))
             .expect("Original file should be in scan results");
 
         let link1_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("link1.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("link1.txt"))
             .expect("Hardlink 1 should be in scan results");
 
         let link2_entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("link2.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("link2.txt"))
             .expect("Hardlink 2 should be in scan results");
 
         // All three should have nlink = 3
@@ -791,7 +791,7 @@ mod tests {
 
         let entry = entries
             .iter()
-            .find(|e| *e.relative_path == PathBuf::from("single.txt"))
+            .find(|e| e.relative_path.as_path() == Path::new("single.txt"))
             .expect("File should be in scan results");
 
         // Should have nlink = 1 (only itself)
@@ -872,7 +872,7 @@ mod tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| *e.relative_path == PathBuf::from(name)),
+                    .any(|e| e.relative_path.as_path() == Path::new(name)),
                 "Should find file: {}",
                 name
             );
@@ -906,7 +906,7 @@ mod tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| *e.relative_path == PathBuf::from(name)),
+                    .any(|e| e.relative_path.as_path() == Path::new(name)),
                 "Should find file: {}",
                 name
             );

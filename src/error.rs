@@ -76,10 +76,7 @@ pub enum SyncError {
     Config(String),
 
     #[error("Bisync state file corrupted: {path}\nReason: {reason}\n\nTo recover:\n  1. Backup the corrupt file (optional): cp {path} {path}.backup\n  2. Rebuild state from scratch: sy --force-resync <source> <dest>\n\nNote: First sync after recovery will treat all differences as new changes.")]
-    StateCorruption {
-        path: PathBuf,
-        reason: String,
-    },
+    StateCorruption { path: PathBuf, reason: String },
 
     #[error("Sync already in progress for this directory pair:\n  Source: {source_path}\n  Dest: {dest_path}\n  Lock file: {lock_file}\n\nAnother sy process is currently syncing these directories.\nWait for it to complete or check if the process is still running.\n\nIf no sync is running and the lock is stale:\n  rm {lock_file}")]
     SyncLocked {

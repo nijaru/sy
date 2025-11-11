@@ -29,24 +29,42 @@ fn compute_test_destination(source: &sy::path::SyncPath, dest: &sy::path::SyncPa
 fn test_syncpath_trailing_slash_detection() {
     // Test trailing slash detection for local paths
     let path_without = sy::path::SyncPath::parse("/home/user/mydir");
-    assert!(!path_without.has_trailing_slash(), "/home/user/mydir should NOT have trailing slash");
+    assert!(
+        !path_without.has_trailing_slash(),
+        "/home/user/mydir should NOT have trailing slash"
+    );
 
     let path_with = sy::path::SyncPath::parse("/home/user/mydir/");
-    assert!(path_with.has_trailing_slash(), "/home/user/mydir/ should have trailing slash");
+    assert!(
+        path_with.has_trailing_slash(),
+        "/home/user/mydir/ should have trailing slash"
+    );
 
     // Test remote paths
     let remote_without = sy::path::SyncPath::parse("user@host:/path/to/dir");
-    assert!(!remote_without.has_trailing_slash(), "user@host:/path/to/dir should NOT have trailing slash");
+    assert!(
+        !remote_without.has_trailing_slash(),
+        "user@host:/path/to/dir should NOT have trailing slash"
+    );
 
     let remote_with = sy::path::SyncPath::parse("user@host:/path/to/dir/");
-    assert!(remote_with.has_trailing_slash(), "user@host:/path/to/dir/ should have trailing slash");
+    assert!(
+        remote_with.has_trailing_slash(),
+        "user@host:/path/to/dir/ should have trailing slash"
+    );
 
     // Test Windows paths
     let windows_without = sy::path::SyncPath::parse("C:\\Users\\name\\dir");
-    assert!(!windows_without.has_trailing_slash(), "C:\\Users\\name\\dir should NOT have trailing slash");
+    assert!(
+        !windows_without.has_trailing_slash(),
+        "C:\\Users\\name\\dir should NOT have trailing slash"
+    );
 
     let windows_with = sy::path::SyncPath::parse("C:\\Users\\name\\dir\\");
-    assert!(windows_with.has_trailing_slash(), "C:\\Users\\name\\dir\\ should have trailing slash");
+    assert!(
+        windows_with.has_trailing_slash(),
+        "C:\\Users\\name\\dir\\ should have trailing slash"
+    );
 }
 
 #[test]

@@ -96,7 +96,7 @@ pub struct SyncEngine<T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    preserve_flags: bool, // macOS only, no-op on other platforms
+    preserve_flags: bool,    // macOS only, no-op on other platforms
     per_file_progress: bool, // Show progress bar for large files
     ignore_times: bool,
     size_only: bool,
@@ -227,7 +227,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Ensure destination directory exists before any operations
         // This is critical for remote syncs where the destination path may not exist yet
         if !self.dry_run {
-            tracing::debug!("Ensuring destination directory exists: {}", destination.display());
+            tracing::debug!(
+                "Ensuring destination directory exists: {}",
+                destination.display()
+            );
             self.transport.create_dir_all(destination).await?;
         }
 
@@ -443,7 +446,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 .sum();
 
             // Check disk space via transport layer (works for both local and remote)
-            self.transport.check_disk_space(destination, bytes_needed).await?;
+            self.transport
+                .check_disk_space(destination, bytes_needed)
+                .await?;
 
             // Check FD limits
             resource::check_fd_limits(self.max_concurrent)?;
@@ -829,12 +834,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             match transport.read_file(dest_path).await {
                                                 Ok(dest_data) => {
                                                     // Compute source checksum
-                                                    match verifier.compute_file_checksum(source_path) {
+                                                    match verifier
+                                                        .compute_file_checksum(source_path)
+                                                    {
                                                         Ok(source_checksum) => {
                                                             // Compute dest checksum from data
-                                                            match verifier.compute_data_checksum(&dest_data) {
+                                                            match verifier
+                                                                .compute_data_checksum(&dest_data)
+                                                            {
                                                                 Ok(dest_checksum) => {
-                                                                    Ok(source_checksum == dest_checksum)
+                                                                    Ok(source_checksum
+                                                                        == dest_checksum)
                                                                 }
                                                                 Err(e) => Err(e),
                                                             }
@@ -1002,12 +1012,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             match transport.read_file(dest_path).await {
                                                 Ok(dest_data) => {
                                                     // Compute source checksum
-                                                    match verifier.compute_file_checksum(source_path) {
+                                                    match verifier
+                                                        .compute_file_checksum(source_path)
+                                                    {
                                                         Ok(source_checksum) => {
                                                             // Compute dest checksum from data
-                                                            match verifier.compute_data_checksum(&dest_data) {
+                                                            match verifier
+                                                                .compute_data_checksum(&dest_data)
+                                                            {
                                                                 Ok(dest_checksum) => {
-                                                                    Ok(source_checksum == dest_checksum)
+                                                                    Ok(source_checksum
+                                                                        == dest_checksum)
                                                                 }
                                                                 Err(e) => Err(e),
                                                             }

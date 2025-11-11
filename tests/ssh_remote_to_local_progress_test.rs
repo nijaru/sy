@@ -12,7 +12,7 @@
 /// - fedora accessible via SSH
 /// - SSH keys configured for passwordless login
 ///
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -95,7 +95,11 @@ async fn test_remote_to_local_with_progress() {
     assert!(local_dest.exists());
 
     let update_count = updates.load(Ordering::SeqCst);
-    assert!(update_count >= 3, "Expected progress updates, got {}", update_count);
+    assert!(
+        update_count >= 3,
+        "Expected progress updates, got {}",
+        update_count
+    );
 
     let final_bytes = last_bytes.load(Ordering::SeqCst);
     assert_eq!(final_bytes, 2 * 1024 * 1024);
@@ -139,7 +143,11 @@ async fn test_remote_to_local_large_file() {
     assert_eq!(result.bytes_written, 10 * 1024 * 1024);
 
     let update_count = updates.load(Ordering::SeqCst);
-    assert!(update_count >= 10, "Expected >= 10 updates for 10MB, got {}", update_count);
+    assert!(
+        update_count >= 10,
+        "Expected >= 10 updates for 10MB, got {}",
+        update_count
+    );
 
     cleanup_remote_file(&remote_source);
 
@@ -183,7 +191,10 @@ async fn test_remote_to_local_progress_monotonic() {
         .await
         .expect("Monotonic test failed");
 
-    assert!(monotonic.load(Ordering::SeqCst), "Progress must increase monotonically");
+    assert!(
+        monotonic.load(Ordering::SeqCst),
+        "Progress must increase monotonically"
+    );
 
     cleanup_remote_file(&remote_source);
 
