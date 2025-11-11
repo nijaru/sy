@@ -216,3 +216,59 @@ pub struct SyncError {
 **Tradeoffs**: More directory depth, but better organization
 
 **References**: https://github.com/nijaru/agent-contexts (v0.1.1)
+
+---
+
+## 2025-11-11: Database Evaluation Framework
+
+**Context**: Evaluating pure Rust database migrations (fjall, russh, object_store) against actual performance requirements
+
+**Decision**: Evaluate on performance merit, not ideology. Migrate when real benefits exist.
+
+**Results**:
+- **fjall (LSM-tree, pure Rust)**: 56.8% faster writes than rusqlite on checksumdb workload → KEEP
+- **object_store (multi-cloud)**: Cleaner API, multi-cloud support → KEEP as optional feature
+- **russh (pure Rust SSH)**: SSH agent auth blocker (needs 200-300 LOC custom protocol code) → REJECT, use ssh2-rs
+
+**Rationale**:
+- Benchmarking shows fjall's 56% write advantage is material for large syncs (checksumdb is write-heavy)
+- Reads are rare (only when metadata matches), so don't measure perf impact
+- russh fails architectural requirements despite being pure Rust
+- Pure Rust changes should be judged on outcomes, not philosophy
+
+**Validation**: Created benches/checksumdb_bench.rs comparing fjall vs rusqlite (1,000 checksums)
+- fjall write: 340.17 ms
+- rusqlite write: 533.54 ms (56.8% slower)
+
+**References**: ai/research/database-comparisons.md
+
+---
+
+## 2025-11-11: seerdb Evaluation (Rejected)
+
+**Context**: Evaluated research-grade LSM (seerdb with learned indexes, WiscKey, Dostoevsky) against fjall
+
+**Benchmark Results** (1K checksum operations):
+- **fjall**: 328-342 ms write, 256-258 ms read
+- **seerdb**: 18.0-18.4 ms write (18.2x faster), 6.3-8.5 ms read (30-43x faster)
+
+**Decision**: Keep fjall as primary
+
+**Reasons for Rejection**:
+1. **Nightly-only**: seerdb requires Rust nightly (std::simd)
+   - Creates deployment complexity
+   - CI/release pipeline issues
+   - Potential incompatibility with stable toolchains
+
+2. **Experimental status**: README states "Not recommended for production use"
+   - Checksumdb is durability-critical (data loss = re-hashing entire sync)
+   - No production track record
+
+3. **Workload mismatch**: seerdb advantages (18ms/1K) don't translate to real-world sync performance
+   - Network/disk I/O dominates checksumdb queries
+   - Typical sync has ~10K checksums, not benchmarks at 1M scale
+   - 18ms improvement is sub-millisecond in sync context
+
+**Future consideration**: If sy ever supports multi-TB syncs with millions of files, add optional `checksumdb-seerdb` feature for nightly builds with documentation warning
+
+**References**: ai/research/database-comparisons.md, benches/seerdb_comparison_bench.rs

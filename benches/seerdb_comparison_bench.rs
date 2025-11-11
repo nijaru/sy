@@ -6,7 +6,7 @@ use sy::sync::checksumdb::ChecksumDatabase;
 use tempfile::TempDir;
 
 #[cfg(feature = "seerdb-bench")]
-use seerdb::{DB, DBOptions};
+use seerdb::{DBOptions, DB};
 
 /// Benchmark fjall writes (1,000 checksums)
 fn bench_fjall_write(c: &mut Criterion) {
@@ -23,8 +23,7 @@ fn bench_fjall_write(c: &mut Criterion) {
                 let mtime = SystemTime::now();
                 let size = 1024u64;
 
-                db.store_checksum(&path, mtime, size, &checksum)
-                    .unwrap();
+                db.store_checksum(&path, mtime, size, &checksum).unwrap();
             }
         });
     });

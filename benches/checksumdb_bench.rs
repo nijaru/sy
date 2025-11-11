@@ -21,8 +21,7 @@ fn bench_write_checksums(c: &mut Criterion) {
                 let mtime = SystemTime::now();
                 let size = 1024u64;
 
-                db.store_checksum(&path, mtime, size, &checksum)
-                    .unwrap();
+                db.store_checksum(&path, mtime, size, &checksum).unwrap();
             }
         });
     });
@@ -41,8 +40,7 @@ fn bench_read_checksums(c: &mut Criterion) {
         let checksum = Checksum::cryptographic(vec![0u8; 32]);
         let size = 1024u64;
 
-        db.store_checksum(&path, now, size, &checksum)
-            .unwrap();
+        db.store_checksum(&path, now, size, &checksum).unwrap();
     }
 
     drop(db); // Close the database
