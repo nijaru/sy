@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.57] - 2025-11-10
+
+### Fixed
+- **Rsync-compatible trailing slash semantics** (issue #2)
+  - Without trailing slash: copies directory itself (e.g., `sy /a/myproject /target` → `/target/myproject/`)
+  - With trailing slash: copies contents only (e.g., `sy /a/myproject/ /target` → `/target/`)
+  - Works consistently across local, SSH, and S3 transports
+  - Added comprehensive tests for trailing slash detection and destination computation
+
+- **Remote sync nested file creation** (issue #4)
+  - Fixed remote sync failures when creating files in nested directories
+  - Ensures parent directories exist before file creation on remote destinations
+  - Tested with SSH sync to verify proper directory hierarchy creation
+
+### Changed
+- **Documentation overhaul**
+  - Rewrote README.md from 1161 lines to 198 lines (83% reduction)
+  - Created comprehensive docs/FEATURES.md (861 lines) with feature categorization
+  - Created comprehensive docs/USAGE.md (1139 lines) with real-world examples
+  - Simplified comparison tables to only compare against rsync (removed rclone)
+  - Marked S3/cloud storage as experimental throughout documentation
+
+### Testing
+- All 484 tests passing
+- Added trailing slash behavior tests
+- Added remote nested directory creation tests
+
+## [0.0.56] - 2025-11-01
+
+### Added
+- **Homebrew Tap Automation** - Automated release process updates Homebrew tap
+  - Formula automatically updated on each release
+  - GitHub Actions workflow syncs with nijaru/homebrew-tap
+  - Users can install via `brew tap nijaru/tap && brew install sy`
+
+### Fixed
+- **Arc<T> Transport Implementation** - Added missing methods to Arc<T> Transport impl
+  - Implemented check_disk_space(), set_xattrs(), set_acls(), set_bsd_flags()
+  - Arc-wrapped transports now support full metadata preservation
+  - Fixes compilation errors when using Arc-wrapped transports
+
+### Technical
+- All 484 tests passing
+- GitHub Actions workflow for Homebrew tap updates
+
 ## [0.0.55] - 2025-10-31
 
 ### Fixed
