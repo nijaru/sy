@@ -1,210 +1,95 @@
 # TODO
 
-## High Priority
-- [ ] Phase 5: Verification enhancements
-  - [x] Design (see ai/research/phase5_verification_design.md)
-  - [x] Phase 5a: Pre-transfer checksums (v0.0.35) - COMPLETE ✅
-    - [x] Add checksum fields to SyncTask
-    - [x] Implement checksum computation in planner
-    - [x] Add tests (3 new tests, all 317 passing)
-    - [x] Update documentation (README + TROUBLESHOOTING)
-    - [x] End-to-end CLI testing (verified working)
-    - [ ] Remote checksum support (deferred to follow-up)
-  - [x] Phase 5b: Checksum database (v0.0.35) - COMPLETE ✅
-    - [x] Add rusqlite dependency
-    - [x] Implement ChecksumDatabase module with SQLite backend
-    - [x] Add CLI flags (--checksum-db, --clear-checksum-db, --prune-checksum-db)
-    - [x] Integrate with SyncEngine and StrategyPlanner
-    - [x] Store checksums after successful transfers
-    - [x] Handle prune flag for stale entries
-    - [x] Add tests (8 new tests, all 325 passing)
-    - [x] End-to-end CLI testing (verified 10-100x speedup)
-    - [x] Update documentation (comprehensive README coverage)
-  - [x] Phase 5c: --verify-only mode (v0.0.36) - COMPLETE ✅
-    - [x] Add --verify-only CLI flag with validation
-    - [x] Create VerificationResult struct
-    - [x] Implement verify() async method in SyncEngine
-    - [x] Add compare_checksums() helper method
-    - [x] Integrate with main.rs (human-readable output)
-    - [x] Implement exit codes (0=match, 1=mismatch, 2=error)
-    - [x] Add JSON output support (VerificationResult event)
-    - [x] Add test for JSON serialization (1 new test, 326 passing)
-    - [x] End-to-end CLI testing (all scenarios verified)
-    - [x] Update documentation (comprehensive README coverage)
+_Last Updated: 2025-11-10_
 
-## In Progress
+## Active Work
 
-### Phase: Production Hardening (v0.0.49+)
-**Goal**: Close critical test gaps before wider adoption. Based on COMPREHENSIVE_TEST_REPORT.md findings.
+### High Priority
 
-**🔴 HIGH PRIORITY - Production-Critical**
+- [ ] **CI/CD Infrastructure** (v0.0.58)
+  - [ ] Create simplified CI workflow for macOS + Linux + Windows
+  - [ ] Run tests on 3 platforms (ubuntu-latest, macos-latest, windows-latest)
+  - [ ] Add clippy and rustfmt checks
+  - [ ] Keep it simple - no multi-version testing, no coverage reports
+  - **Goal**: Catch cross-platform regressions automatically
 
-- [x] Network Interruption Recovery (v0.0.49-v0.0.50) - **COMPLETE** ✅
-  - [x] v0.0.49: Built infrastructure for retry/resume
-    - [x] Error classification (retryable vs fatal)
-    - [x] Retry logic with exponential backoff
-    - [x] Resume state management (TransferState)
-    - [x] CLI flags: --retry, --retry-delay, --resume-only, --clear-resume-state
-  - [x] v0.0.50: Activated retry for all SSH/SFTP operations
-    - [x] 14 operations converted to use retry_with_backoff
-    - [x] All tests passing (957 tests)
-  - [ ] Future: Resume integration (v0.0.51+)
-  - **Impact**: Automatic recovery from network failures!
+### Medium Priority
 
-- [x] Large File Testing (1GB+) - **COMPLETE** ✅ (v0.0.52, commit: 3588dac)
-  - [x] Test 100MB, 500MB, 1GB files
-  - [x] Verify no OOM issues
-  - [x] Check progress accuracy at scale
-  - [x] Measure throughput degradation
-  - **Result**: All tests passing! 500MB in 4.53s, idempotent 100MB in 11ms
-  - **Impact**: Confidence for backup/large file use cases
+- [ ] **S3 Testing & Stabilization** (Future)
+  - [ ] Add integration tests for S3 sync
+  - [ ] Test with AWS, Cloudflare R2, Backblaze B2, Wasabi
+  - [ ] Document authentication patterns
+  - [ ] Remove "experimental" tag once proven stable
 
-- [x] Massive Directory Testing (10K+ files) - **COMPLETE** ✅ (v0.0.52, commit: 3588dac)
-  - [x] Test with 1K, 10K, 100K file trees
-  - [x] Verify O(n) memory behavior
-  - [x] Check performance doesn't degrade
-  - [x] Validate state file sizes reasonable
-  - **Result**: All tests passing! 10K files in 1.9s, idempotent in 267ms
-  - **Impact**: Proven linear scaling, ready for large repos
+- [ ] **Performance Profiling** (Future)
+  - [ ] Profile large-scale syncs (100K+ files)
+  - [ ] Identify bottlenecks in parallel transfers
+  - [ ] Optimize memory usage for massive directories
 
-**🟡 MEDIUM PRIORITY - Safety & Polish**
+### Low Priority
 
-- [x] State Corruption Recovery - **COMPLETE** ✅ (commit: 2c39cd0)
-  - [x] Detect corrupt ~/.cache/sy/bisync/*.lst files
-  - [x] Offer to rebuild state from scratch (--force-resync flag)
-  - [x] Add state file format validation (9 validation checks)
-  - [x] Comprehensive tests (9 corruption tests passing)
-  - **Result**: Users get clear error messages and recovery instructions
-  - **Impact**: Graceful recovery from corrupted state instead of mysterious failures
+- [ ] **Windows Platform Testing** (Future)
+  - [ ] Test ACLs on Windows (different from POSIX)
+  - [ ] Test NTFS-specific features
+  - [ ] Verify extended attributes work correctly
 
-- [x] Concurrent Sync Safety - **COMPLETE** ✅ (commit: a3811f2)
-  - [x] Prevent multiple syncs to same pair (file-based locking)
-  - [x] Add lock file with PID (fs2 crate for cross-platform locks)
-  - [x] Clear error message when blocked (SyncLocked error)
-  - [x] Automatic cleanup on process exit (RAII lock guard)
-  - [x] Comprehensive tests (5 lock tests passing)
-  - **Result**: Race conditions prevented, clear user feedback
-  - **Impact**: Data safety - no more concurrent sync corruption
+## Recently Completed (v0.0.57)
 
-- [x] Hard Link Handling in Bisync - **COMPLETE** ✅
-  - [x] Test hard link preservation in bisync mode
-  - [x] Add tests for hard link conflicts (7 comprehensive tests)
-  - **Result**: Hard links NOT preserved (files copied independently), but bisync handles correctly
-  - **Why**: Dev environments use hard links heavily (node_modules)
-  - **Note**: Current behavior is acceptable - prioritizes correctness over preservation
+- [x] **Issue #2: Rsync-compatible trailing slash semantics** (PR #5)
+  - [x] Implement trailing slash detection for SyncPath
+  - [x] Add destination path computation logic
+  - [x] Add comprehensive tests (5 tests)
+  - [x] Works across local, SSH, and S3 transports
 
-**🟢 LOW PRIORITY - Future Features**
+- [x] **Issue #4: Remote sync nested file creation** (PR #4)
+  - [x] Fix DualTransport cross-transport copy
+  - [x] Add parent directory creation
+  - [x] Add regression tests
 
-- [ ] S3 Bidirectional Sync
-  - [ ] Extend bisync to S3↔local
-  - [ ] Handle S3 eventual consistency
-  - **Why**: Cloud backup workflows
+- [x] **Documentation Overhaul** (v0.0.57)
+  - [x] Rewrite README.md (1161 → 198 lines)
+  - [x] Create docs/FEATURES.md (861 lines)
+  - [x] Create docs/USAGE.md (1139 lines)
+  - [x] Mark S3 as experimental
+  - [x] Simplify comparison tables (rsync only)
 
-- [ ] Encryption Support
-  - [ ] Encrypt before sending over SSH
-  - [ ] Age or GPG integration
-  - **Why**: Zero-trust environments
+- [x] **OpenSSL Cross-Platform Fix** (v0.0.57)
+  - [x] Revert vendored OpenSSL to system OpenSSL
+  - [x] Test on macOS (465 tests passing)
+  - [x] Test on Fedora (462 tests passing)
 
-- [x] Per-File Progress - **COMPLETE** ✅ (commits: 28491f7, fff6be9, 4ec46d2)
-  - [x] Show progress bar for individual large files (>= 1MB)
-  - [x] Better UX than batch-only progress
-  - [x] TTY detection and quiet mode respect
-  - [x] Opt-in via --per-file-progress flag
-  - [x] Streaming implementation for local transfers
-  - **Result**: Production-ready for all transports (SSH + local streaming)
-  - **Why**: User experience improvement
+## Backlog (Future Versions)
 
-## Recently Completed
-- [x] Remote→Remote Sync + .gitignore Fixes (v0.0.48) - COMPLETE ✅
-  - [x] Implement remote→remote bidirectional sync (dual SSH pools)
-  - [x] Fix .gitignore support outside git repos (add_ignore fix)
-  - [x] Comprehensive testing: 23/23 scenarios pass (100% up from 91.3%)
-  - [x] Release: crates.io + GitHub
-  - [x] Documentation: COMPREHENSIVE_TEST_REPORT.md, release notes
-- [x] SSH Bidirectional Sync (v0.0.46-v0.0.47) - COMPLETE ✅
-  - [x] Refactor BisyncEngine to use Transport abstraction
-  - [x] Make sync() async for remote operations
-  - [x] Support local↔local, local↔remote, and remote↔remote
-  - [x] Update CLI with transport creation logic
-  - [x] Performance profiling (no bottlenecks found)
-  - [x] All 410 tests passing, 0 warnings
-- [x] macOS BSD File Flags (v0.0.41) - COMPLETE ✅
-  - [x] Research macOS-specific features (comprehensive analysis complete)
-  - [x] Add bsd_flags field to FileEntry struct
-  - [x] Implement BSD flags capture in scanner (using st_flags())
-  - [x] Add --preserve-flags (-F) CLI flag
-  - [x] Add preserve_flags to Transferrer struct
-  - [x] Wire preserve_flags through SyncEngine
-  - [x] Implement write_bsd_flags() method using chflags()
-  - [x] Add tests for BSD flags preservation (2 tests added)
-  - [x] Fix test Transferrer::new() and SyncEngine::new() calls
-  - [x] Fix test FileEntry initializations (35+ locations)
-  - [x] Fix flag preservation behavior (explicitly clear when not preserving)
-  - [x] Update documentation (README, MACOS_SUPPORT.md)
-  - [x] Fix cross-platform compilation (remove all #[cfg] from preserve_flags usage sites)
-  - [ ] Optional: Handle immutable flags (deferred to future version if needed)
-- Symlink loop detection (v0.0.40 - follow_links option, walkdir integration, comprehensive tests)
-- Bandwidth utilization metrics (v0.0.39 - JSON output complete)
-- Enhanced progress display (v0.0.38 - byte-based, speed, current file)
-- Compression auto-detection feature (v0.0.37 - content sampling, CLI flags, SSH integration)
-- Phase 5 (Verification Enhancements) complete! All sub-phases done: 5a, 5b, 5c
+### Features
+- [ ] Parallel chunk transfers within single files
+- [ ] Network speed detection for adaptive compression
+- [ ] Periodic checkpointing during long syncs
+- [ ] S3 bidirectional sync support
+- [ ] Multi-destination sync (one source → multiple destinations)
 
-## Backlog (from docs/MODERNIZATION_ROADMAP.md)
-- [x] Compression auto-detection (file type awareness) - COMPLETE ✅ (v0.0.37)
-- [x] Enhanced progress display (current file, real-time speed, ETA) - COMPLETE ✅ (v0.0.38)
-- [x] Bandwidth utilization metrics (% of limit when using --bwlimit) - COMPLETE ✅ (v0.0.39)
-- [x] Symbolic link chain detection - COMPLETE ✅ (v0.0.40)
-- [x] macOS-specific features (Finder tags, resource forks) - COMPLETE ✅ (v0.0.16 xattr support, v0.0.41 BSD flags)
-  - Finder tags preserved via `com.apple.metadata:_kMDItemUserTags` xattr
-  - Resource forks preserved via `com.apple.ResourceFork` xattr
-  - BSD file flags preserved with `-F` flag (hidden, immutable, nodump, etc.)
-- [x] SSH connection pooling - COMPLETE ✅ (v0.0.42)
-- [x] SSH sparse file transfer - COMPLETE ✅ (v0.0.42)
-- [x] Bidirectional sync - COMPLETE ✅ (v0.0.43-v0.0.46)
-  - Text-based state tracking (v0.0.44)
-  - SSH support for remote servers (v0.0.46)
-- [ ] Sparse file optimization improvements (foundation complete, SSH integration done)
-- [ ] Windows-specific features (file attributes, ACLs)
-- [ ] Multi-destination sync (deferred - shell loops work fine)
-- [ ] Cloud storage backends (AWS S3 basic support done v0.0.22, expansion TBD)
-- [ ] Plugin system
+### Optimizations
+- [ ] SIMD acceleration for checksums
+- [ ] Zero-copy optimizations where possible
+- [ ] Further memory reduction for massive scale
 
-## Technical Debt
-- ~~[ ] Remove --mode flag placeholder (not yet implemented)~~ - **DONE!** Already fully implemented (VerificationMode enum with fast/standard/verify/paranoid)
-- ~~[ ] Implement actual bandwidth limiting (currently placeholder)~~ - **DONE!** Already fully implemented
-- ~~[ ] Add directory creation tracking to perf monitor~~ - **DONE!** Already tracked
-- ~~[ ] Add peak speed tracking to perf monitor~~ - **DONE!** Already tracked via update_peak_speed()
+### Platform Support
+- [ ] Windows native builds and testing
+- [ ] BSD platform support
+- [ ] Android/Termux support
 
-## Research Needed
-- [x] Modern SSH multiplexing best practices (2025) - COMPLETE ✅
-  - ControlMaster NOT recommended for parallel file transfers (bottlenecks on one TCP connection)
-  - Better: SSH connection pooling (N connections = N workers) for true parallel throughput
-  - See ai/research/ssh_multiplexing_2025.md
-- [ ] Latest filesystem feature detection methods
-- [ ] State-of-the-art compression algorithms for file sync
+## Archive (Completed Phases)
 
-## Documentation
-- [x] Add --perf flag examples to README
-- [x] Document error reporting in user guide
-- [x] Update performance comparison charts
-- [x] Create troubleshooting guide
+All Phase 1-11 work is complete and shipped in versions v0.0.1 through v0.0.56. See CHANGELOG.md for full history.
 
-## Testing
-- [x] Add performance monitoring accuracy tests - COMPLETE ✅ (2025-10-23)
-  - Added 9 comprehensive accuracy tests in perf.rs (total: 15 tests)
-  - Phase duration accuracy, speed calculation, concurrent operations
-  - Thread-safety tests (byte/file counting under concurrent load)
-  - Edge cases (zero duration, peak speed tracking, bandwidth utilization)
-- [x] Add tests for error collection with max_errors threshold - COMPLETE ✅ (2025-10-23)
-  - Added 4 threshold behavior tests in sync/mod.rs
-  - Tests for: unlimited errors (max=0), abort when exceeded, below threshold continues
-  - Verified error message format with count and first error
-- [x] Add tests for sparse file edge cases - COMPLETE ✅ (2025-10-23)
-  - Added 11 edge case tests in sparse.rs (total: 14 tests)
-  - Non-existent file, empty file, leading/trailing holes, multiple regions
-  - Large offsets (1GB), single byte, region ordering, boundary conditions
-  - Platform-specific: 5 pass everywhere, 7 ignored on macOS APFS
-- [x] Add COW strategy selection tests for various filesystems - COMPLETE ✅
-  - Added 11 edge case tests in fs_util.rs
-  - Non-existent paths, parent/child relationships, symlinks, 3-way hard links
-  - All 377 tests passing (370 + 7 ignored APFS sparse tests)
+Key completed phases:
+- Phase 1: MVP (Local sync)
+- Phase 2: Network + Delta (SSH transport, rsync algorithm)
+- Phase 3: Parallelism + Optimization
+- Phase 4: Advanced Features (hooks, watch mode, config profiles)
+- Phase 5: Verification & Integrity
+- Phase 6: Metadata Preservation
+- Phase 7: Bidirectional Sync
+- Phase 8: Production Hardening
+- Phase 9: Developer Experience
+- Phase 10: Cloud Era (S3 support)
+- Phase 11: Scale optimizations

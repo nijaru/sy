@@ -18,11 +18,11 @@
 **sy** (pronounced "sigh") is a fast, modern file synchronization tool written in Rust - a reimagining of rsync with adaptive performance, verifiable integrity, and beautiful UX.
 
 - **Language**: Rust (edition 2021)
-- **Status**: v0.0.52 (released 2025-10-28)
-- **Performance**: 1.3x - 8.8x faster than rsync
-- **Tests**: 603 total (555 local + 48 SSH) - all passing, 0 warnings
+- **Status**: v0.0.57 (released 2025-11-10)
+- **Performance**: 2-11x faster than rsync
+- **Tests**: 484 total (465 lib + 5 trailing slash + 14 integration) - all passing, 0 warnings
 - **License**: MIT
-- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync with SSH support, production hardening, per-file progress, comprehensive testing
+- **Key Features**: Delta sync, parallel transfers, SSH pooling, sparse files, bidirectional sync, rsync-compatible trailing slash behavior, S3/cloud storage (experimental)
 
 ## Project Structure
 
