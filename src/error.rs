@@ -97,14 +97,14 @@ pub enum SyncError {
     },
 }
 
-impl From<fjall::Error> for SyncError {
-    fn from(err: fjall::Error) -> Self {
+impl From<bincode::Error> for SyncError {
+    fn from(err: bincode::Error) -> Self {
         SyncError::Database(err.to_string())
     }
 }
 
-impl From<bincode::Error> for SyncError {
-    fn from(err: bincode::Error) -> Self {
+impl From<fjall::Error> for SyncError {
+    fn from(err: fjall::Error) -> Self {
         SyncError::Database(err.to_string())
     }
 }
