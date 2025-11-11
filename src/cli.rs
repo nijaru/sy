@@ -622,8 +622,8 @@ mod tests {
     fn test_validate_source_exists() {
         let temp = TempDir::new().unwrap();
         let cli = Cli {
-            source: Some(SyncPath::Local(temp.path().to_path_buf())),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: temp.path().to_path_buf(), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     fn test_validate_source_not_exists() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/nonexistent/path"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/nonexistent/path"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -776,8 +776,8 @@ mod tests {
         fs::write(&file_path, "content").unwrap();
 
         let cli = Cli {
-            source: Some(SyncPath::Local(file_path.clone())),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: file_path.clone(), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -857,8 +857,9 @@ mod tests {
                 host: "server".to_string(),
                 user: Some("user".to_string()),
                 path: PathBuf::from("/remote/path"),
+                has_trailing_slash: false,
             }),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -931,8 +932,8 @@ mod tests {
     #[test]
     fn test_log_level_quiet() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1005,8 +1006,8 @@ mod tests {
     #[test]
     fn test_log_level_default() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1079,8 +1080,8 @@ mod tests {
     #[test]
     fn test_log_level_verbose() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1153,8 +1154,8 @@ mod tests {
     #[test]
     fn test_log_level_very_verbose() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1246,8 +1247,8 @@ mod tests {
     #[test]
     fn test_size_filter_validation() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1323,8 +1324,8 @@ mod tests {
     #[test]
     fn test_verification_mode_default() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1397,8 +1398,8 @@ mod tests {
     #[test]
     fn test_verification_mode_verify_flag_override() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1497,8 +1498,8 @@ mod tests {
     #[test]
     fn test_symlink_mode_default() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1571,8 +1572,8 @@ mod tests {
     #[test]
     fn test_symlink_mode_copy_links_override() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1645,8 +1646,8 @@ mod tests {
     #[test]
     fn test_symlink_mode_skip() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1719,8 +1720,8 @@ mod tests {
     #[test]
     fn test_archive_mode_enables_all_flags() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1800,8 +1801,8 @@ mod tests {
     #[test]
     fn test_individual_preserve_flags() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1880,8 +1881,8 @@ mod tests {
     #[test]
     fn test_explicit_flag_overrides_with_archive() {
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -1961,8 +1962,8 @@ mod tests {
     fn test_comparison_flags_mutually_exclusive() {
         // Test that --ignore-times and --size-only are mutually exclusive
         let cli = Cli {
-            source: Some(SyncPath::Local(PathBuf::from("/tmp/src"))),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: PathBuf::from("/tmp/src"), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -2042,8 +2043,8 @@ mod tests {
     fn test_ignore_times_flag_alone() {
         let temp = TempDir::new().unwrap();
         let cli = Cli {
-            source: Some(SyncPath::Local(temp.path().to_path_buf())),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: temp.path().to_path_buf(), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,
@@ -2120,8 +2121,8 @@ mod tests {
     fn test_checksum_flag_alone() {
         let temp = TempDir::new().unwrap();
         let cli = Cli {
-            source: Some(SyncPath::Local(temp.path().to_path_buf())),
-            destination: Some(SyncPath::Local(PathBuf::from("/tmp/dest"))),
+            source: Some(SyncPath::Local { path: temp.path().to_path_buf(), has_trailing_slash: false }),
+            destination: Some(SyncPath::Local { path: PathBuf::from("/tmp/dest"), has_trailing_slash: false }),
             dry_run: false,
             diff: false,
             delete: false,

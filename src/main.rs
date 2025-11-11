@@ -33,6 +33,34 @@ use sync::{watch::WatchMode, SyncEngine};
 use tracing_subscriber::{fmt, EnvFilter};
 use transport::router::TransportRouter;
 
+/// Compute effective destination path based on rsync trailing slash semantics
+///
+/// Only applies to directory sources:
+/// - Source without trailing slash (`/a/dir`): Copy directory itself → `dest/dir/`
+/// - Source with trailing slash (`/a/dir/`): Copy contents only → `dest/`
+/// - Files: Always use destination as-is
+fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBuf {
+    let source_path = source.path();
+
+    // For files, always use destination as-is
+    if source_path.is_file() {
+        return destination.path().to_path_buf();
+    }
+
+    // For directories with trailing slash, use destination as-is (copy contents)
+    if source.has_trailing_slash() {
+        return destination.path().to_path_buf();
+    }
+
+    // For directories without trailing slash, append directory name to destination
+    if let Some(dir_name) = source_path.file_name() {
+        destination.path().join(dir_name)
+    } else {
+        // Fallback: use destination as-is
+        destination.path().to_path_buf()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments
@@ -524,7 +552,7 @@ async fn main() -> Result<()> {
             std::sync::Arc<dyn transport::Transport>,
             std::sync::Arc<dyn transport::Transport>,
         ) = match (&source, &destination) {
-            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Local(_)) => {
+            (crate::path::SyncPath::Local { path: _, has_trailing_slash: false }, crate::path::SyncPath::Local { path: _, has_trailing_slash: false }) => {
                 // Both local
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
                 let local_source = std::sync::Arc::new(
@@ -534,7 +562,7 @@ async fn main() -> Result<()> {
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 (local_source, local_dest)
             }
-            (crate::path::SyncPath::Local(_), crate::path::SyncPath::Remote { host, user, .. }) => {
+            (crate::path::SyncPath::Local { path: _, has_trailing_slash: false }, crate::path::SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -553,7 +581,7 @@ async fn main() -> Result<()> {
                 );
                 (local, remote)
             }
-            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local(_)) => {
+            (crate::path::SyncPath::Remote { host, user, .. }, crate::path::SyncPath::Local { path: _, has_trailing_slash: false }) => {
                 // Remote → Local
                 let config = if let Some(user) = user {
                     ssh::config::SshConfig {
@@ -626,8 +654,11 @@ async fn main() -> Result<()> {
             force_resync: cli.force_resync,
         };
 
+        // Compute effective destination path based on trailing slash semantics
+        let effective_dest = compute_destination_path(&source, &destination);
+
         let bisync_result = bisync_engine
-            .sync(source.path(), destination.path(), bisync_opts)
+            .sync(source.path(), &effective_dest, bisync_opts)
             .await?;
 
         // Print conflicts if any
@@ -673,11 +704,14 @@ async fn main() -> Result<()> {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
         }
+        // For single files, trailing slash doesn't apply - use destination as-is
         engine
             .sync_single_file(source.path(), destination.path())
             .await?
     } else {
-        engine.sync(source.path(), destination.path()).await?
+        // Compute effective destination path based on trailing slash semantics
+        let effective_dest = compute_destination_path(&source, &destination);
+        engine.sync(source.path(), &effective_dest).await?
     };
 
     // Execute post-sync hook
