@@ -25,7 +25,7 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 # Install sy (local + SSH sync)
 cargo install sy
 
-# With S3/cloud storage support (optional)
+# With S3/cloud storage support (optional, experimental)
 cargo install sy --features s3
 
 sy --version
