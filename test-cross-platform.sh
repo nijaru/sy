@@ -109,25 +109,55 @@ build_macos() {
 setup_fedora() {
     log_info "Setting up sy on Fedora..."
 
+    # Check if repo exists
+    log_verbose "Checking if repo exists on Fedora"
+    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "test -d $FEDORA_REPO_PATH/.git" 2>/dev/null; then
+        log_error "Repository not found at $FEDORA_REPO_PATH on Fedora"
+        log_error "Please clone the repo first:"
+        echo "  ssh $FEDORA_USER@$FEDORA_HOST \"git clone https://github.com/nijaru/sy $FEDORA_REPO_PATH\""
+        return 1
+    fi
+
     # Pull latest code on Fedora
     log_verbose "Pulling latest code on Fedora"
-    ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && git fetch origin && git checkout feature/library-migrations-v0.0.58 && git pull origin feature/library-migrations-v0.0.58" 2>&1 | while read -r line; do
+    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && git fetch origin && git checkout feature/library-migrations-v0.0.58 && git pull origin feature/library-migrations-v0.0.58" 2>&1 | while read -r line; do
         log_verbose "$line"
-    done
+    done; then
+        log_error "Failed to update git repo on Fedora"
+        log_error "Check that the branch exists: git fetch origin"
+        return 1
+    fi
 
     # Build sy-remote on Fedora
     log_verbose "Building sy-remote on Fedora"
     if [[ "$VERBOSE" == true ]]; then
-        ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo build --release --bin sy-remote 2>&1"
+        if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo build --release --bin sy-remote" 2>&1; then
+            log_error "Build failed on Fedora"
+            return 1
+        fi
     else
-        ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo build --release --bin sy-remote 2>&1" | grep -E "(Compiling sy|Finished)" || true
+        if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo build --release --bin sy-remote" 2>&1 | grep -E "(Compiling sy|Finished)" || true; then
+            log_error "Build may have failed on Fedora (run with --verbose to see details)"
+            return 1
+        fi
     fi
 
-    # Install sy-remote to ~/.cargo/bin on Fedora
-    log_verbose "Installing sy-remote on Fedora"
-    ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo install --path . --bin sy-remote 2>&1" | while read -r line; do
+    # Install sy-remote to ~/.cargo/bin on Fedora (overwrites existing)
+    log_verbose "Installing sy-remote on Fedora (will overwrite if already installed)"
+    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "cd $FEDORA_REPO_PATH && cargo install --path . --bin sy-remote" 2>&1 | while read -r line; do
         log_verbose "$line"
-    done
+    done; then
+        log_error "Installation failed on Fedora"
+        return 1
+    fi
+
+    # Verify sy-remote is accessible
+    log_verbose "Verifying sy-remote installation"
+    if ! ssh "$FEDORA_USER@$FEDORA_HOST" "command -v sy-remote >/dev/null 2>&1" 2>/dev/null; then
+        log_error "sy-remote not found in PATH after installation"
+        log_error "Ensure ~/.cargo/bin is in PATH on Fedora"
+        return 1
+    fi
 
     log_success "Fedora setup complete"
 }
