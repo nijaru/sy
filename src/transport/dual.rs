@@ -51,9 +51,8 @@ impl Transport for DualTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Cross-transport copy: delegate to destination transport
-        // The destination transport (e.g., SshTransport) knows how to copy
-        // from a local source path to its destination (local or remote)
+        // Cross-transport copy: read from source transport, write to dest transport
+        // This is the proper way to handle cross-transport file copies
 
         tracing::debug!(
             "DualTransport: copying {} to {}",
@@ -61,10 +60,17 @@ impl Transport for DualTransport {
             dest.display()
         );
 
-        // Delegate to destination transport which handles the cross-transport copy
-        // For local→remote: dest is SshTransport which reads from local source and writes remote
-        // For remote→local: dest is LocalTransport but source should be readable
-        self.dest.copy_file(source, dest).await
+        // Read file from source transport
+        let data = self.source.read_file(source).await?;
+        let bytes_written = data.len() as u64;
+
+        // Get modification time from source
+        let mtime = self.source.get_mtime(source).await?;
+
+        // Write to destination transport (write_file handles parent directory creation)
+        self.dest.write_file(dest, &data, mtime).await?;
+
+        Ok(TransferResult::new(bytes_written))
     }
 
     async fn sync_file_with_delta(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
