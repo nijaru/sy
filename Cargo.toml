@@ -2,7 +2,7 @@
 name = "sy"
 version = "0.0.57"
 edition = "2021"
-authors = ["Nick Russo <nick@nijaru.dev>"]
+authors = ["Nick Russo <nijaru7@gmail.com>"]
 description = "Modern rsync alternative - Fast, parallel file synchronization"
 repository = "https://github.com/nijaru/sy"
 license = "MIT"
@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "filesystem"]
 
 [features]
 default = []
-s3 = ["aws-config", "aws-sdk-s3", "aws-smithy-types"]
+s3 = ["object_store"]
 
 [dependencies]
 # CLI & Config
@@ -26,7 +26,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 async-trait = "0.1"
 
 # Filesystem
-walkdir = "2"
 ignore = "0.4"
 filetime = "0.2"
 tempfile = "3"
@@ -63,9 +62,6 @@ num_cpus = "1.16"  # CPU count detection for parallel scanning
 # Scale (Phase 11)
 fastbloom = "0.7"  # Bloom filters for efficient deletion checks
 
-# Database (Phase 5b)
-rusqlite = { version = "0.31", features = ["bundled"] }  # Checksum database for persistent storage
-
 # SSH (Phase 2)
 ssh2 = "0.9"
 whoami = "1"
@@ -73,10 +69,12 @@ dirs = "5"
 regex = "1"
 futures = "0.3.31"
 
+# Database (Phase 5b)
+fjall = "2.11.2"
+
 # S3 / Cloud Storage (Phase 10) - Optional feature
-aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
-aws-sdk-s3 = { version = "1.52", optional = true }
-aws-smithy-types = { version = "1.2", optional = true }
+object_store = { version = "0.12.4", features = ["aws"], optional = true }
+bytes = "1.10.1"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]

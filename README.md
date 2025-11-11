@@ -25,7 +25,7 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 # Install sy (local + SSH sync)
 cargo install sy
 
-# With S3/cloud storage support (optional)
+# With S3/cloud storage support (optional, experimental)
 cargo install sy --features s3
 
 sy --version
@@ -44,6 +44,8 @@ cargo install --path . --features s3
 
 Requirements: Rust 1.70+
 
+**For SSH sync:** Install sy on both local and remote machines. The remote server needs `sy` (or just `sy-remote`) in PATH.
+
 ## Quick Start
 
 ```bash
@@ -56,7 +58,7 @@ sy /source /destination --dry-run
 # Mirror mode (delete extra files)
 sy /source /destination --delete
 
-# SSH sync
+# SSH sync (requires sy installed on remote)
 sy /local user@host:/remote
 
 # S3 sync (experimental, requires --features s3)
@@ -116,7 +118,7 @@ sy ~/project ~/backups/project --verify
 # Sync with filters
 sy ~/src ~/dest --exclude "*.log" --exclude "node_modules"
 
-# Bandwidth-limited remote sync
+# Bandwidth-limited remote sync (sy must be installed on remote)
 sy /large user@host:/backup --bwlimit 1MB
 
 # Watch mode for continuous sync

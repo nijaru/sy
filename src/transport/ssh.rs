@@ -264,6 +264,10 @@ impl SshTransport {
         })?;
 
         if exit_status != 0 {
+            // TODO: Detect "command not found" errors (exit code 127) and auto-deploy sy-remote
+            // See ai/TODO.md: "Auto-deploy sy-remote on SSH connections"
+            // Current UX: User gets cryptic "bash: sy-remote: command not found" error
+            // Desired UX: sy auto-copies sy-remote binary to remote server on first use
             let io_err = std::io::Error::other(format!(
                 "Command '{}' failed with exit code {}\nstdout: {}\nstderr: {}",
                 command, exit_status, output, stderr

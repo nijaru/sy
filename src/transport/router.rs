@@ -141,12 +141,13 @@ impl TransportRouter {
             }
             #[cfg(feature = "s3")]
             (
-                SyncPath::Local(_),
+                SyncPath::Local { .. },
                 SyncPath::S3 {
                     bucket,
                     key,
                     region,
                     endpoint,
+                    ..
                 },
             ) => {
                 // Local → S3: use S3Transport for destination
@@ -166,8 +167,9 @@ impl TransportRouter {
                     key,
                     region,
                     endpoint,
+                    ..
                 },
-                SyncPath::Local(_),
+                SyncPath::Local { .. },
             ) => {
                 // S3 → Local: use S3Transport for source
                 let s3_transport = S3Transport::new(

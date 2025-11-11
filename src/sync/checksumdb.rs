@@ -1,67 +1,68 @@
 use crate::error::Result;
 use crate::integrity::Checksum;
-use rusqlite::{params, Connection};
+use fjall::{Config, Keyspace, PartitionHandle};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Entry stored in the checksum database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChecksumEntry {
+    mtime_secs: i64,
+    mtime_nanos: i32,
+    size: u64,
+    checksum_type: String,
+    checksum: Vec<u8>,
+    updated_at: i64,
+}
+
 /// Persistent checksum database for fast re-verification
 ///
 /// Stores file checksums with metadata to avoid recomputing on every sync.
-/// Uses SQLite for reliability and efficient querying.
+/// Uses fjall LSM-tree for efficient key-value storage.
 #[allow(dead_code)] // Integration with SyncEngine pending
 pub struct ChecksumDatabase {
-    conn: Connection,
+    /// Keyspace owns the underlying storage - serves as lifetime anchor for partition.
+    /// The partition handle holds references into the keyspace's memory; dropping keyspace
+    /// invalidates the partition. Rust's ownership rules (keyspace field) ensure this never happens.
+    keyspace: Keyspace,
+    partition: PartitionHandle,
 }
 
 #[allow(dead_code)] // Integration with SyncEngine pending
 impl ChecksumDatabase {
-    /// Database file name in destination directory
-    const DB_FILE: &'static str = ".sy-checksums.db";
+    /// Database directory name in destination directory
+    const DB_DIR: &'static str = ".sy-checksums";
 
-    /// Database schema version
-    const SCHEMA_VERSION: i32 = 1;
+    /// Partition name for checksums
+    const PARTITION_NAME: &'static str = "checksums";
 
     /// Open or create checksum database in destination directory
     pub fn open(dest_path: &Path) -> Result<Self> {
-        let db_path = dest_path.join(Self::DB_FILE);
-        let conn = Connection::open(&db_path)?;
+        let db_path = dest_path.join(Self::DB_DIR);
 
-        // Create schema if not exists
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS checksums (
-                path TEXT PRIMARY KEY,
-                mtime_secs INTEGER NOT NULL,
-                mtime_nanos INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                checksum_type TEXT NOT NULL,
-                checksum BLOB NOT NULL,
-                updated_at INTEGER NOT NULL
-            )",
-            [],
-        )?;
+        // Create keyspace with default config
+        let keyspace = Config::new(&db_path).open()?;
 
-        // Create index for faster queries
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_updated_at ON checksums(updated_at)",
-            [],
-        )?;
+        // Open or create partition for checksums
+        let partition = keyspace.open_partition(Self::PARTITION_NAME, Default::default())?;
 
-        // Store schema version in metadata table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
-            )",
-            [],
-        )?;
+        Ok(Self {
+            keyspace,
+            partition,
+        })
+    }
 
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?1)",
-            params![Self::SCHEMA_VERSION],
-        )?;
-
-        Ok(Self { conn })
+    /// Convert path to database key (UTF-8 lossy bytes)
+    ///
+    /// Note: Paths with invalid UTF-8 sequences are converted lossily (replacement
+    /// characters) on both encoding and decoding. This is consistent with Rust's
+    /// `Path::to_string_lossy()` semantics. Since database operations only use
+    /// paths reconstructed from stored keys via the same function, round-tripping
+    /// is consistent within a session. Non-UTF-8 paths are not officially supported.
+    fn path_to_key(path: &Path) -> Vec<u8> {
+        path.to_string_lossy().as_bytes().to_vec()
     }
 
     /// Get cached checksum if file unchanged (mtime + size match)
@@ -77,55 +78,57 @@ impl ChecksumDatabase {
         size: u64,
         checksum_type: &str,
     ) -> Result<Option<Checksum>> {
-        let path_str = path.to_string_lossy();
+        let key = Self::path_to_key(path);
         let (mtime_secs, mtime_nanos) = system_time_to_parts(mtime);
 
-        let mut stmt = self.conn.prepare(
-            "SELECT checksum_type, checksum FROM checksums
-             WHERE path = ?1 AND mtime_secs = ?2 AND mtime_nanos = ?3 AND size = ?4",
-        )?;
-
-        let result = stmt.query_row(
-            params![path_str.as_ref(), mtime_secs, mtime_nanos, size as i64],
-            |row| {
-                let stored_type: String = row.get(0)?;
-                let checksum_blob: Vec<u8> = row.get(1)?;
-                Ok((stored_type, checksum_blob))
-            },
-        );
-
-        match result {
-            Ok((stored_type, checksum_blob)) => {
-                // Verify checksum type matches
-                if stored_type != checksum_type {
-                    tracing::debug!(
-                        "Checksum type mismatch for {}: expected {}, got {}",
-                        path.display(),
-                        checksum_type,
-                        stored_type
-                    );
-                    return Ok(None);
-                }
-
-                // Reconstruct Checksum based on type
-                let checksum = match stored_type.as_str() {
-                    "fast" => Checksum::Fast(checksum_blob),
-                    "cryptographic" => Checksum::Cryptographic(checksum_blob),
-                    _ => {
-                        tracing::warn!("Unknown checksum type in database: {}", stored_type);
-                        return Ok(None);
-                    }
-                };
-
-                tracing::debug!("Cache hit for {}", path.display());
-                Ok(Some(checksum))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
+        // Get entry from database
+        let value = match self.partition.get(&key)? {
+            Some(v) => v,
+            None => {
                 tracing::debug!("Cache miss for {}", path.display());
-                Ok(None)
+                return Ok(None);
             }
-            Err(e) => Err(e.into()),
+        };
+
+        // Deserialize entry
+        let entry: ChecksumEntry = bincode::deserialize(&value).map_err(|e| {
+            crate::error::SyncError::Database(format!(
+                "Failed to deserialize checksum entry for {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        // Verify metadata matches
+        if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
+        {
+            tracing::debug!("Metadata mismatch for {}", path.display());
+            return Ok(None);
         }
+
+        // Verify checksum type matches
+        if entry.checksum_type != checksum_type {
+            tracing::debug!(
+                "Checksum type mismatch for {}: expected {}, got {}",
+                path.display(),
+                checksum_type,
+                entry.checksum_type
+            );
+            return Ok(None);
+        }
+
+        // Reconstruct Checksum based on type
+        let checksum = match entry.checksum_type.as_str() {
+            "fast" => Checksum::Fast(entry.checksum),
+            "cryptographic" => Checksum::Cryptographic(entry.checksum),
+            _ => {
+                tracing::warn!("Unknown checksum type in database: {}", entry.checksum_type);
+                return Ok(None);
+            }
+        };
+
+        tracing::debug!("Cache hit for {}", path.display());
+        Ok(Some(checksum))
     }
 
     /// Store checksum after successful transfer
@@ -136,7 +139,6 @@ impl ChecksumDatabase {
         size: u64,
         checksum: &Checksum,
     ) -> Result<()> {
-        let path_str = path.to_string_lossy();
         let (mtime_secs, mtime_nanos) = system_time_to_parts(mtime);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -149,20 +151,20 @@ impl ChecksumDatabase {
             Checksum::Cryptographic(bytes) => ("cryptographic", bytes.clone()),
         };
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO checksums
-             (path, mtime_secs, mtime_nanos, size, checksum_type, checksum, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                path_str.as_ref(),
-                mtime_secs,
-                mtime_nanos,
-                size as i64,
-                checksum_type,
-                checksum_blob,
-                now
-            ],
-        )?;
+        // Create entry
+        let entry = ChecksumEntry {
+            mtime_secs,
+            mtime_nanos,
+            size,
+            checksum_type: checksum_type.to_string(),
+            checksum: checksum_blob,
+            updated_at: now,
+        };
+
+        // Serialize and store
+        let key = Self::path_to_key(path);
+        let value = bincode::serialize(&entry)?;
+        self.partition.insert(&key, &value)?;
 
         tracing::debug!("Stored checksum for {}", path.display());
         Ok(())
@@ -170,7 +172,18 @@ impl ChecksumDatabase {
 
     /// Clear all cached checksums
     pub fn clear(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM checksums", [])?;
+        // Collect all keys first (can't delete while iterating)
+        let keys: Vec<_> = self
+            .partition
+            .iter()
+            .map(|item| item.map(|(k, _)| k.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+
+        // Delete all entries
+        for key in keys {
+            self.partition.remove(&key)?;
+        }
+
         tracing::info!("Cleared checksum database");
         Ok(())
     }
@@ -179,27 +192,28 @@ impl ChecksumDatabase {
     ///
     /// Takes a set of existing file paths and removes database entries
     /// for paths not in the set.
+    ///
+    /// Note: Uses the same lossy UTF-8 conversion as path_to_key() for consistency.
+    /// Paths are matched against the set after round-tripping through to_string_lossy().
     pub fn prune(&self, existing_files: &HashSet<PathBuf>) -> Result<usize> {
-        // Get all paths in database
-        let mut stmt = self.conn.prepare("SELECT path FROM checksums")?;
-        let db_paths: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        // Find paths to delete (in database but not in existing_files)
+        // Collect paths to delete
         let mut to_delete = Vec::new();
-        for db_path in &db_paths {
-            let path = PathBuf::from(db_path);
+
+        for item in self.partition.iter() {
+            let (key, _) = item?;
+            // Use same lossy conversion as path_to_key() for consistent matching
+            let path_str = String::from_utf8_lossy(&key);
+            let path = PathBuf::from(path_str.as_ref());
+
             if !existing_files.contains(&path) {
-                to_delete.push(db_path.clone());
+                to_delete.push(key.to_vec());
             }
         }
 
         // Delete stale entries
         let deleted_count = to_delete.len();
-        for path in to_delete {
-            self.conn
-                .execute("DELETE FROM checksums WHERE path = ?1", params![path])?;
+        for key in to_delete {
+            self.partition.remove(&key)?;
         }
 
         if deleted_count > 0 {
@@ -214,26 +228,32 @@ impl ChecksumDatabase {
 
     /// Get database statistics
     pub fn stats(&self) -> Result<ChecksumDbStats> {
-        let total_entries: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM checksums", [], |row| row.get(0))?;
+        let mut total_entries = 0;
+        let mut fast_count = 0;
+        let mut crypto_count = 0;
 
-        let fast_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM checksums WHERE checksum_type = 'fast'",
-            [],
-            |row| row.get(0),
-        )?;
+        for item in self.partition.iter() {
+            let (key, value) = item?;
+            let entry: ChecksumEntry = bincode::deserialize(&value).map_err(|e| {
+                crate::error::SyncError::Database(format!(
+                    "Failed to deserialize checksum entry for {}: {}",
+                    String::from_utf8_lossy(&key),
+                    e
+                ))
+            })?;
 
-        let crypto_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM checksums WHERE checksum_type = 'cryptographic'",
-            [],
-            |row| row.get(0),
-        )?;
+            total_entries += 1;
+            match entry.checksum_type.as_str() {
+                "fast" => fast_count += 1,
+                "cryptographic" => crypto_count += 1,
+                _ => {}
+            }
+        }
 
         Ok(ChecksumDbStats {
-            total_entries: total_entries as usize,
-            fast_checksums: fast_count as usize,
-            cryptographic_checksums: crypto_count as usize,
+            total_entries,
+            fast_checksums: fast_count,
+            cryptographic_checksums: crypto_count,
         })
     }
 }
@@ -266,8 +286,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db = ChecksumDatabase::open(temp_dir.path()).unwrap();
 
-        // Verify database file was created
-        assert!(temp_dir.path().join(ChecksumDatabase::DB_FILE).exists());
+        // Verify database directory was created
+        assert!(temp_dir.path().join(ChecksumDatabase::DB_DIR).exists());
 
         // Verify we can query stats
         let stats = db.stats().unwrap();
