@@ -82,30 +82,40 @@ sy /a/myproject/ /target
 # Result: /target/ (contents copied directly)
 ```
 
-This matters for:
-- Directory structure: controls where files end up
-- Bidirectional sync: ensures consistent paths on both sides
-- SSH/S3 operations: works the same across all transports
-
 See [docs/USAGE.md](docs/USAGE.md) for comprehensive examples.
 
-## Key Features
+## Features
 
-- **Fast**: Parallel transfers, parallel checksums, smart caching
-- **Reliable**: Multi-layer integrity verification (xxHash3, BLAKE3)
-- **Smart**: Delta sync, compression auto-detection, sparse file optimization
-- **Flexible**: Local, SSH, S3/cloud storage support
-- **Safe**: Dry-run mode, deletion limits, automatic retry with resume
-- **Modern**: Beautiful progress bars, JSON output, config profiles
+### Core Performance
+- **Parallel transfers**: Multiple files transferred simultaneously
+- **Parallel checksums**: Fast integrity verification with xxHash3 and BLAKE3
+- **Delta sync**: Block-level updates using rsync algorithm (streaming, O(1) memory)
+- **Smart caching**: Checksum database for 10-100x faster re-syncs
+- **Compression auto-detection**: Skips already-compressed files
+- **SSH connection pooling**: Reuses connections for efficiency
+- **Sparse file optimization**: Efficient handling of sparse files
 
-**Advanced**:
-- Bidirectional sync with 6 conflict resolution strategies
-- Rsync-style filters and .gitignore support
-- Hooks, watch mode, verify-only auditing
-- Symlinks, hardlinks, ACLs, xattrs, BSD flags
-- Checksum database for 10-100x faster re-syncs
-- SSH connection pooling and sparse file transfer
-- S3/cloud storage (experimental - AWS, R2, B2, Wasabi)
+### Transports
+- **Local**: Fast local filesystem sync
+- **SSH**: Remote sync over SSH (requires sy on remote)
+- **S3/Cloud**: AWS S3, Cloudflare R2, Backblaze B2, Wasabi (experimental)
+
+### Reliability
+- **Multi-layer integrity**: xxHash3 (fast) and BLAKE3 (cryptographic) verification
+- **Atomic operations**: Safe file updates
+- **Resume support**: Automatic recovery from interruptions
+- **Dry-run mode**: Preview changes before applying
+- **Verify-only mode**: Audit backups without modifying files
+
+### Advanced Features
+- **Bidirectional sync**: 6 conflict resolution strategies
+- **Watch mode**: Continuous sync with file monitoring
+- **Filters**: Rsync-style patterns and .gitignore support
+- **Hooks**: Pre/post sync automation
+- **Metadata preservation**: Symlinks, hardlinks, ACLs, xattrs, BSD flags
+- **JSON output**: Machine-readable progress and statistics
+- **Config profiles**: Reusable sync configurations
+- **Modern UX**: Beautiful progress bars and clear error messages
 
 See [docs/FEATURES.md](docs/FEATURES.md) for detailed feature documentation.
 
@@ -131,81 +141,34 @@ sy /source /dest --perf
 sy ~/backup ~/original --verify-only
 ```
 
-## Status
-
-**Current Version: v0.0.56** - Production-ready for early adopters
-
-Phases 1-11 complete (484 tests passing):
-- Local & remote sync with delta algorithm
-- Bidirectional sync with conflict resolution
-- Parallel transfers, compression, sparse files
-- Verification, integrity checking, resume support
-- Advanced features: hooks, watch mode, filters
-- S3/cloud storage (experimental - needs more testing)
-
-See [CHANGELOG.md](CHANGELOG.md) for release history.
-
-## Documentation
-
-- [Usage Guide](docs/USAGE.md) - Comprehensive usage examples
-- [Features](docs/FEATURES.md) - Detailed feature documentation
-- [Design](DESIGN.md) - Technical design and architecture (2,400+ lines)
-- [Performance](docs/PERFORMANCE.md) - Performance analysis and benchmarks
-- [Contributing](CONTRIBUTING.md) - Development setup and guidelines
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
-
-Platform-specific guides:
-- [Linux Support](docs/LINUX_SUPPORT.md)
-- [macOS Support](docs/MACOS_SUPPORT.md)
-- [Windows Support](docs/WINDOWS_SUPPORT.md) ⚠️ **OUTDATED** - Windows is currently untested
-
-## Comparison with rsync
-
-| Feature | rsync | sy |
-|---------|-------|-----|
-| **Performance (local)** | baseline | **2-11x faster** |
-| Parallel transfers | ❌ | ✅ |
-| Parallel checksums | ❌ | ✅ |
-| SSH connection pooling | ❌ | ✅ |
-| Delta sync | ✅ | ✅ |
-| Streaming delta (O(1) memory) | ❌ | ✅ |
-| Cryptographic verification | ✅ MD5 | ✅ BLAKE3 |
-| Compression auto-detection | ❌ | ✅ |
-| S3/Cloud storage | ❌ | ✅ (experimental) |
-| Bidirectional sync | ❌ | ✅ |
-| Checksum database | ❌ | ✅ |
-| Watch mode | ❌ | ✅ |
-| JSON output | ❌ | ✅ |
-| Modern UX | ❌ | ✅ |
-
-See [docs/FEATURES.md](docs/FEATURES.md) for complete feature comparison.
-
 ## Platform Support
 
 - ✅ **macOS**: Fully tested and supported
 - ✅ **Linux**: Fully tested and supported (Fedora, Ubuntu, etc.)
 - ⚠️ **Windows**: Untested - should compile but not officially supported
-  - Some features unavailable (e.g., sparse file detection)
+  - Some features unavailable (sparse file detection)
   - CI testing currently macOS and Linux only
 
 See [docs/FEATURES.md](docs/FEATURES.md) for platform-specific feature details.
 
+## Documentation
+
+- [Usage Guide](docs/USAGE.md) - Comprehensive usage examples
+- [Features](docs/FEATURES.md) - Detailed feature documentation
+- [Design](DESIGN.md) - Technical design and architecture
+- [Performance](docs/PERFORMANCE.md) - Performance analysis and benchmarks
+- [Contributing](CONTRIBUTING.md) - Development setup and guidelines
+- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
+
 ## Contributing
 
-Interested in contributing? We'd love help with:
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+Especially interested in:
 - Windows testing and support
 - Performance profiling for large datasets
 - Real-world testing and feedback
-- Documentation and tutorials
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
 
 ## License
 
-MIT
-
-## Acknowledgments
-
-Inspired by **rsync**, **eza**, **fd**, **ripgrep**, and **Syncthing**.
-
-Research: Jeff Geerling (2025) benchmarks, ACM 2024 QUIC analysis, ScienceDirect 2021 corruption studies.
+MIT License - see [LICENSE](LICENSE) file for details.

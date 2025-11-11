@@ -181,30 +181,31 @@ sy/
 
 **Deliverable**: ✅ Modern CLI features for scripting and automation
 
-### Phase 5: Reliability (v0.5.0)
-**Goal**: Multi-layer integrity
+### ✅ Phases 5-11: Reliability & Advanced Features - **COMPLETE** (v0.0.14-v0.0.57)
+**Goals**: Multi-layer integrity, advanced features, scale to millions of files
 
-- [ ] Block-level checksums (xxHash3)
-- [ ] End-to-end verification (BLAKE3)
-- [ ] Verification modes
-- [ ] Atomic operations
-- [ ] Crash recovery
+- [x] Block-level checksums (xxHash3)
+- [x] End-to-end verification (BLAKE3)
+- [x] Verification modes (verify-only, --verify)
+- [x] Atomic operations
+- [x] Resume support
+- [x] Bidirectional sync with conflict resolution
+- [x] Watch mode, hooks, filters
+- [x] Checksum database for fast re-syncs
+- [x] SSH connection pooling
+- [x] S3/cloud storage (experimental)
+- [x] Metadata preservation (ACLs, xattrs, symlinks, hardlinks)
+- [x] Scale testing (millions of files)
 
-**Deliverable**: Verifiable integrity
+**Deliverable**: ✅ Production-ready feature-complete sync tool
 
-### Phases 6-10
-See [DESIGN.md](DESIGN.md) for:
-- Phase 6: Edge cases & advanced features
-- Phase 7: Scale to millions of files
-- Phase 8: UX polish
-- Phase 9: Testing & documentation
-- Phase 10: v1.0 release
+See [DESIGN.md](DESIGN.md) and [CHANGELOG.md](CHANGELOG.md) for detailed implementation history.
 
 ## Testing Strategy
 
-**Current Status**: 111 tests across unit, integration, and performance categories.
+**Current Status**: 484 tests across unit, integration, and performance categories.
 
-### Unit Tests (83 tests)
+### Unit Tests
 Located in `src/*/tests.rs` modules:
 ```bash
 cargo test --lib
@@ -218,7 +219,7 @@ Tests include:
 - CLI argument validation
 - Scanner and strategy modules
 
-### Integration Tests (36 tests)
+### Integration Tests
 Located in `tests/*.rs`:
 ```bash
 cargo test --test integration_test    # Full sync scenarios
@@ -234,7 +235,7 @@ Tests include:
 - Property-based tests (idempotency, correctness)
 - Single file sync
 
-### Performance Regression Tests (7 tests)
+### Performance Regression Tests
 ```bash
 cargo test --release --test performance_test
 ```
