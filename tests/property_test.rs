@@ -31,7 +31,7 @@ proptest! {
         // Run sync
         let output = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -64,7 +64,7 @@ proptest! {
         // First sync
         let output1 = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -74,7 +74,7 @@ proptest! {
         // Second sync
         let output2 = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -112,7 +112,7 @@ proptest! {
         // Sync with --delete and --force-delete to bypass safety thresholds
         let output = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
                 "--delete",
                 "--force-delete",
@@ -158,7 +158,7 @@ proptest! {
         // Sync
         let output = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -196,7 +196,7 @@ proptest! {
         // Dry run
         let output = Command::new(sy_bin())
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
                 "--dry-run",
             ])
