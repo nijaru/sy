@@ -67,7 +67,7 @@ fastbloom = "0.7"  # Bloom filters for efficient deletion checks
 rusqlite = { version = "0.31", features = ["bundled"] }  # Checksum database for persistent storage
 
 # SSH (Phase 2)
-ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+ssh2 = "0.9"
 whoami = "1"
 dirs = "5"
 regex = "1"
