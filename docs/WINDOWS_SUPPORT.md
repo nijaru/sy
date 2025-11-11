@@ -1,23 +1,19 @@
 # Windows Support
 
-> ⚠️ **WARNING: This documentation is OUTDATED as of v0.0.57**
+> ⚠️ **Status: WIP / Unsupported**
 >
-> **Current Status**: Windows is **UNTESTED** and not officially supported
-> - Should compile but has not been tested on Windows
+> Windows support is currently **untested** and not officially supported:
+> - Should compile but has not been tested
+> - Some features unavailable (e.g., sparse file detection uses Unix-only APIs)
 > - CI testing currently limited to macOS and Linux
-> - Some features unavailable on Windows (e.g., sparse file detection)
-> - This document describes intended behavior, not verified functionality
 >
-> Windows support may be restored in future versions if testing resources become available.
+> Windows support is a work in progress and may be added in future versions.
 
 ---
 
-**Previous Status** (as of v0.0.26 - no longer maintained):
-**Platforms**: Windows 10, Windows 11, Windows Server 2019+
+## Planned Features
 
-## Overview (Historical)
-
-`sy` was designed to support Windows with automatic platform detection and appropriate fallbacks. Performance on Windows was optimized for NTFS, with future ReFS support planned. However, this has not been maintained or tested since v0.0.26.
+The following features are planned for Windows support:
 
 ## Platform-Specific Behavior
 
