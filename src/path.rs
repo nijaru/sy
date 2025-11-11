@@ -35,7 +35,16 @@ impl SyncPath {
     /// - `/path/to/dir/` (with slash): Copy directory contents to destination
     pub fn parse(s: &str) -> Self {
         // Detect trailing slash (before parsing)
-        let has_trailing_slash = s.ends_with('/') || s.ends_with('\\');
+        // For S3 paths with query parameters, check the path portion before '?'
+        let has_trailing_slash = if s.starts_with("s3://") {
+            if let Some(q_pos) = s.find('?') {
+                s[..q_pos].ends_with('/')
+            } else {
+                s.ends_with('/')
+            }
+        } else {
+            s.ends_with('/') || s.ends_with('\\')
+        };
         // Check for S3 URL format
         if let Some(remainder) = s.strip_prefix("s3://") {
             // Split on ? to separate path from query params

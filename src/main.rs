@@ -35,28 +35,29 @@ use transport::router::TransportRouter;
 
 /// Compute effective destination path based on rsync trailing slash semantics
 ///
-/// Only applies to directory sources:
+/// Trailing slash behavior (applies to directories):
 /// - Source without trailing slash (`/a/dir`): Copy directory itself → `dest/dir/`
 /// - Source with trailing slash (`/a/dir/`): Copy contents only → `dest/`
-/// - Files: Always use destination as-is
+///
+/// For files, trailing slash semantics don't apply - the sync engine handles them
+/// by using the destination path directly or appending the filename as needed.
+///
+/// Note: This function works with path strings and doesn't check the filesystem,
+/// so it works correctly for local, remote (SSH), and S3 sources.
 fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBuf {
     let source_path = source.path();
 
-    // For files, always use destination as-is
-    if source_path.is_file() {
-        return destination.path().to_path_buf();
-    }
-
-    // For directories with trailing slash, use destination as-is (copy contents)
+    // For sources with trailing slash, use destination as-is (copy contents)
     if source.has_trailing_slash() {
         return destination.path().to_path_buf();
     }
 
-    // For directories without trailing slash, append directory name to destination
-    if let Some(dir_name) = source_path.file_name() {
-        destination.path().join(dir_name)
+    // For sources without trailing slash, append source name to destination
+    // (copies the directory/file itself)
+    if let Some(name) = source_path.file_name() {
+        destination.path().join(name)
     } else {
-        // Fallback: use destination as-is
+        // Fallback: use destination as-is (e.g., root paths)
         destination.path().to_path_buf()
     }
 }
@@ -655,6 +656,10 @@ async fn main() -> Result<()> {
         };
 
         // Compute effective destination path based on trailing slash semantics
+        // For bidirectional sync, trailing slash determines directory structure:
+        //   - `sy /a/dir /b/` → syncs /a/dir/ ↔ /b/dir/ (creates dir/ in destination)
+        //   - `sy /a/dir/ /b/` → syncs /a/dir/ ↔ /b/ (copies contents directly)
+        // This matches rsync behavior and ensures consistent directory structure on both sides.
         let effective_dest = compute_destination_path(&source, &destination);
 
         let bisync_result = bisync_engine
