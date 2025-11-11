@@ -19,7 +19,14 @@ See [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) for detailed benchmar
 
 ## Installation
 
-### From crates.io (Recommended)
+### Homebrew (macOS)
+
+```bash
+brew tap nijaru/tap
+brew install sy
+```
+
+### From crates.io
 
 ```bash
 # Install sy (local + SSH sync)
