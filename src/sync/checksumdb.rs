@@ -55,6 +55,12 @@ impl ChecksumDatabase {
     }
 
     /// Convert path to database key (UTF-8 lossy bytes)
+    ///
+    /// Note: Paths with invalid UTF-8 sequences are converted lossily (replacement
+    /// characters) on both encoding and decoding. This is consistent with Rust's
+    /// `Path::to_string_lossy()` semantics. Since database operations only use
+    /// paths reconstructed from stored keys via the same function, round-tripping
+    /// is consistent within a session. Non-UTF-8 paths are not officially supported.
     fn path_to_key(path: &Path) -> Vec<u8> {
         path.to_string_lossy().as_bytes().to_vec()
     }
@@ -186,12 +192,16 @@ impl ChecksumDatabase {
     ///
     /// Takes a set of existing file paths and removes database entries
     /// for paths not in the set.
+    ///
+    /// Note: Uses the same lossy UTF-8 conversion as path_to_key() for consistency.
+    /// Paths are matched against the set after round-tripping through to_string_lossy().
     pub fn prune(&self, existing_files: &HashSet<PathBuf>) -> Result<usize> {
         // Collect paths to delete
         let mut to_delete = Vec::new();
 
         for item in self.partition.iter() {
             let (key, _) = item?;
+            // Use same lossy conversion as path_to_key() for consistent matching
             let path_str = String::from_utf8_lossy(&key);
             let path = PathBuf::from(path_str.as_ref());
 
