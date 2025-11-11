@@ -29,11 +29,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Parse arguments
-if [[ "${1:-}" == "--verbose" ]]; then
-    VERBOSE=true
-fi
-
 # Logging functions
 log_info() {
     echo -e "${BLUE}ℹ${NC} $*"
@@ -56,6 +51,17 @@ log_verbose() {
         echo -e "${NC}  $*${NC}"
     fi
 }
+
+# Parse arguments
+if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "--verbose" ]]; then
+        VERBOSE=true
+    else
+        log_error "Invalid argument: $1"
+        echo "Usage: $0 [--verbose]"
+        exit 1
+    fi
+fi
 
 # Run command with optional verbose logging
 run_cmd() {

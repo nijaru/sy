@@ -23,7 +23,9 @@ struct ChecksumEntry {
 /// Uses fjall LSM-tree for efficient key-value storage.
 #[allow(dead_code)] // Integration with SyncEngine pending
 pub struct ChecksumDatabase {
-    /// Keyspace owns the underlying storage - must be kept alive for partition validity
+    /// Keyspace owns the underlying storage - serves as lifetime anchor for partition.
+    /// The partition handle holds references into the keyspace's memory; dropping keyspace
+    /// invalidates the partition. Rust's ownership rules (keyspace field) ensure this never happens.
     keyspace: Keyspace,
     partition: PartitionHandle,
 }
@@ -83,7 +85,13 @@ impl ChecksumDatabase {
         };
 
         // Deserialize entry
-        let entry: ChecksumEntry = bincode::deserialize(&value)?;
+        let entry: ChecksumEntry = bincode::deserialize(&value).map_err(|e| {
+            crate::error::SyncError::Database(format!(
+                "Failed to deserialize checksum entry for {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
 
         // Verify metadata matches
         if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
@@ -215,8 +223,14 @@ impl ChecksumDatabase {
         let mut crypto_count = 0;
 
         for item in self.partition.iter() {
-            let (_, value) = item?;
-            let entry: ChecksumEntry = bincode::deserialize(&value)?;
+            let (key, value) = item?;
+            let entry: ChecksumEntry = bincode::deserialize(&value).map_err(|e| {
+                crate::error::SyncError::Database(format!(
+                    "Failed to deserialize checksum entry for {}: {}",
+                    String::from_utf8_lossy(&key),
+                    e
+                ))
+            })?;
 
             total_entries += 1;
             match entry.checksum_type.as_str() {
