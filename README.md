@@ -91,6 +91,28 @@ sy /a/myproject/ /target
 
 See [docs/USAGE.md](docs/USAGE.md) for comprehensive examples.
 
+## Common Use Cases
+
+```bash
+# Backup with verification
+sy ~/project ~/backups/project --verify
+
+# Sync with filters
+sy ~/src ~/dest --exclude "*.log" --exclude "node_modules"
+
+# Bandwidth-limited remote sync (sy must be installed on remote)
+sy /large user@host:/backup --bwlimit 1MB
+
+# Watch mode for continuous sync
+sy ~/dev /backup --watch
+
+# Performance monitoring
+sy /source /dest --perf
+
+# Verify backup integrity (read-only)
+sy ~/backup ~/original --verify-only
+```
+
 ## Features
 
 ### Core Performance
@@ -125,28 +147,6 @@ See [docs/USAGE.md](docs/USAGE.md) for comprehensive examples.
 - **Modern UX**: Beautiful progress bars and clear error messages
 
 See [docs/FEATURES.md](docs/FEATURES.md) for detailed feature documentation.
-
-## Common Use Cases
-
-```bash
-# Backup with verification
-sy ~/project ~/backups/project --verify
-
-# Sync with filters
-sy ~/src ~/dest --exclude "*.log" --exclude "node_modules"
-
-# Bandwidth-limited remote sync (sy must be installed on remote)
-sy /large user@host:/backup --bwlimit 1MB
-
-# Watch mode for continuous sync
-sy ~/dev /backup --watch
-
-# Performance monitoring
-sy /source /dest --perf
-
-# Verify backup integrity (read-only)
-sy ~/backup ~/original --verify-only
-```
 
 ## Platform Support
 
