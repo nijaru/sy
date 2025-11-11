@@ -5,9 +5,6 @@ on:
     tags:
       - 'v*'
 
-env:
-  CARGO_TERM_COLOR: always
-
 permissions:
   contents: write
 
@@ -15,8 +12,6 @@ jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    outputs:
-      tag_name: ${{ steps.get_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,82 +23,18 @@ jobs:
         run: |
           gh release create ${{ steps.get_tag.outputs.tag }} \
             --title "${{ steps.get_tag.outputs.tag }}" \
-            --generate-notes
+            --generate-notes \
+            --notes "
+
+            ## Installation
+
+            Build from source on your platform:
+            \`\`\`bash
+            cargo install sy
+            # Or with S3 support
+            cargo install sy --features s3
+            \`\`\`
+
+            Binaries can be built locally and uploaded manually if needed."
         env:
           GH_TOKEN: ${{ github.token }}
-
-  build:
-    name: Build Release
-    needs: create-release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl-tools (Linux musl only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare binary (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          strip sy sy-remote || true
-          tar czf sy-${{ matrix.target }}.tar.gz sy sy-remote
-          cd -
-
-      - name: Prepare binary (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a sy-${{ matrix.target }}.zip sy.exe
-          cd -
-
-      - name: Upload Release Asset
-        run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            gh release upload ${{ needs.create-release.outputs.tag_name }} target/${{ matrix.target }}/release/sy-${{ matrix.target }}.zip
-          else
-            gh release upload ${{ needs.create-release.outputs.tag_name }} target/${{ matrix.target }}/release/sy-${{ matrix.target }}.tar.gz
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-
-  update-homebrew:
-    name: Update Homebrew Tap
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Update Homebrew formula
-        uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: sy
-          formula-path: Formula/sy.rb
-          homebrew-tap: nijaru/homebrew-tap
-          download-url: https://github.com/nijaru/sy/releases/download/${{ needs.create-release.outputs.tag_name }}/sy-aarch64-apple-darwin.tar.gz
-          commit-message: |
-            chore: update sy to ${{ needs.create-release.outputs.tag_name }}
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
