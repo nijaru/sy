@@ -12,29 +12,158 @@ jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      tag: ${{ steps.get_tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Get tag name
         id: get_tag
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
       - name: Create Release
+        id: create_release
         run: |
           gh release create ${{ steps.get_tag.outputs.tag }} \
             --title "${{ steps.get_tag.outputs.tag }}" \
             --generate-notes \
+            --draft \
             --notes "
-
             ## Installation
 
-            Build from source on your platform:
+            ### Homebrew (macOS)
+            \`\`\`bash
+            brew tap nijaru/tap
+            brew install sy
+            \`\`\`
+
+            ### From crates.io
             \`\`\`bash
             cargo install sy
             # Or with S3 support
             cargo install sy --features s3
             \`\`\`
 
-            Binaries can be built locally and uploaded manually if needed."
+            ### From Binary
+            Download the appropriate binary for your platform below, extract and add to PATH.
+
+            ### From Source
+            \`\`\`bash
+            git clone https://github.com/nijaru/sy.git
+            cd sy
+            cargo build --release
+            \`\`\`
+            "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: sy-aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: sy-x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: sy-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/sy dist/
+          cp target/${{ matrix.target }}/release/sy-remote dist/
+
+      - name: Create tarball
+        run: |
+          cd dist
+          tar czf ${{ matrix.artifact_name }}.tar.gz sy sy-remote
+          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+          cd ..
+
+      - name: Upload binaries to release
+        run: |
+          gh release upload ${{ needs.create-release.outputs.tag }} \
+            dist/${{ matrix.artifact_name }}.tar.gz \
+            dist/${{ matrix.artifact_name }}.tar.gz.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    needs: [create-release, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: nijaru/homebrew-tap
+          token: ${{ secrets.TAP_UPDATE_TOKEN }}
+
+      - name: Download checksums
+        run: |
+          gh release download ${{ needs.create-release.outputs.tag }} \
+            --repo nijaru/sy \
+            --pattern '*.sha256'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Update formula
+        run: |
+          TAG=${{ needs.create-release.outputs.tag }}
+          VERSION=${TAG#v}
+
+          # Extract SHA256 checksums
+          ARM64_SHA=$(cat sy-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          INTEL_SHA=$(cat sy-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+
+          # Update Formula/sy.rb
+          sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/sy.rb
+          sed -i "s|url \"https://github.com/nijaru/sy/releases/download/v.*/sy-aarch64-apple-darwin.tar.gz\"|url \"https://github.com/nijaru/sy/releases/download/$TAG/sy-aarch64-apple-darwin.tar.gz\"|" Formula/sy.rb
+          sed -i "/on_arm do/,/end/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/sy.rb
+          sed -i "s|url \"https://github.com/nijaru/sy/archive/refs/tags/v.*.tar.gz\"|url \"https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz\"|" Formula/sy.rb
+          sed -i "/on_intel do/,/depends_on/ s/sha256 \".*\"/sha256 \"$INTEL_SHA\"/" Formula/sy.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sy.rb
+          git commit -m "chore: update sy to ${{ needs.create-release.outputs.tag }}"
+          git push
+
+  publish-release:
+    name: Publish Release
+    needs: [create-release, build-binaries, update-homebrew-tap]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Publish release
+        run: |
+          gh release edit ${{ needs.create-release.outputs.tag }} --draft=false
+          echo "✅ Release published: https://github.com/nijaru/sy/releases/tag/${{ needs.create-release.outputs.tag }}"
+          echo "🍺 Homebrew tap updated"
+          echo ""
+          echo "📦 Next step: Publish to crates.io"
+          echo "Run: cargo publish"
         env:
           GH_TOKEN: ${{ github.token }}
