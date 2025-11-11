@@ -23,6 +23,22 @@ _Last Updated: 2025-11-10_
 
 ### Medium Priority
 
+- [ ] **Auto-deploy sy-remote on SSH connections** (Future PR)
+  - **Problem**: sy fails with "command not found" if sy-remote isn't installed on remote server
+  - **Current**: User must manually `cargo install sy` on every remote server first
+  - **Solution**: Auto-deploy sy-remote binary over SSH (copy from local machine)
+  - **Edge cases to handle**:
+    - Remote OS detection (Linux/macOS/BSD)
+    - Architecture detection (x86_64/arm64/etc)
+    - PATH setup (~/.cargo/bin)
+    - Binary compatibility verification
+    - Permission handling
+  - **Alternative approaches**:
+    1. Pre-flight check with helpful error message
+    2. Auto-deploy prebuilt binaries (best UX, like rsync)
+    3. Auto-build on remote (slow, requires Rust toolchain)
+  - **Ref**: src/transport/ssh.rs:268-271 (error handling location)
+
 - [ ] **russh Migration** (v0.0.59) - WIP on `feature/russh-migration` branch
   - [x] Dependencies updated (ssh2 → russh + russh-sftp + russh-keys)
   - [x] Connection handling rewritten
