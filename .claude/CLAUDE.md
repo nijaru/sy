@@ -15,11 +15,13 @@ The sy project follows standardized AI agent organization patterns:
 
 - **AGENTS.md** - Main AI entry point (project context, structure, conventions)
 - **ai/** - AI working context
-  - `TODO.md` - Active tasks and priorities
   - `STATUS.md` - Current project state, what worked/didn't
+  - `TODO.md` - Active tasks and priorities
   - `DECISIONS.md` - Architectural decisions with rationale
-  - `RESEARCH.md` - External research findings index
-- **docs/** - Project documentation (user and developer facing)
+  - `RESEARCH.md` - Research findings index
+  - `research/` - Research documents
+- **README.md** - User-facing documentation
+- **CONTRIBUTING.md** - Development guidelines
 - **src/** - Rust source code
 - **tests/** - Integration tests
 - **benches/** - Performance benchmarks
@@ -27,19 +29,17 @@ The sy project follows standardized AI agent organization patterns:
 ## For New Sessions
 
 1. Load `@AGENTS.md` for project overview and structure
-2. Check `ai/TODO.md` for active work
-3. Check `ai/STATUS.md` for current state
+2. Check `ai/STATUS.md` for current state
+3. Check `ai/TODO.md` for active work
 4. Reference `ai/DECISIONS.md` for architectural context
-5. See `DESIGN.md` for comprehensive technical design
 
 ## Organization Patterns
 
 This project follows the patterns defined in [@external/agent-contexts/PRACTICES.md](https://github.com/nijaru/agent-contexts):
 
-- **ai/** directory for agent working context (not project docs)
-- **docs/** directory for project documentation
+- **ai/** directory for agent working context
 - **AGENTS.md** as the AI entry point
-- Separation of agent context from user-facing documentation
+- Minimal, maintainable documentation (README, CONTRIBUTING, CHANGELOG only)
 
 ## Release Versioning Strategy
 
