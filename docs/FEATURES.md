@@ -582,6 +582,14 @@ sy /src /dst --dry-run --diff --delete
 
 ## Platform Support
 
+**Supported Platforms:**
+- ✅ **macOS**: Fully tested and supported
+- ✅ **Linux**: Fully tested and supported (Fedora, Ubuntu, etc.)
+- ⚠️ **Windows**: Untested - should compile but not officially tested or supported
+  - Sparse file detection unavailable (Unix-only `SEEK_HOLE`/`SEEK_DATA` APIs)
+  - Some features may use fallback implementations
+  - CI testing currently limited to macOS and Linux
+
 ### Symlink Handling (v0.0.15)
 
 Three modes:
@@ -615,7 +623,8 @@ sy /source /destination  # Automatic
 - Efficient transfer: only allocated blocks copied
 - Critical for VM disk images, database files
 - Zero configuration: works transparently
-- Cross-platform (Unix/Linux/macOS)
+- **Platform:** Unix/Linux/macOS only (uses SEEK_HOLE/SEEK_DATA)
+- **Windows:** Falls back to regular file copy
 
 ### Extended Attributes (v0.0.16)
 

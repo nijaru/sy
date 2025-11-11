@@ -155,7 +155,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 Platform-specific guides:
 - [Linux Support](docs/LINUX_SUPPORT.md)
 - [macOS Support](docs/MACOS_SUPPORT.md)
-- [Windows Support](docs/WINDOWS_SUPPORT.md)
+- [Windows Support](docs/WINDOWS_SUPPORT.md) ⚠️ **OUTDATED** - Windows is currently untested
 
 ## Comparison with rsync
 
@@ -178,10 +178,20 @@ Platform-specific guides:
 
 See [docs/FEATURES.md](docs/FEATURES.md) for complete feature comparison.
 
+## Platform Support
+
+- ✅ **macOS**: Fully tested and supported
+- ✅ **Linux**: Fully tested and supported (Fedora, Ubuntu, etc.)
+- ⚠️ **Windows**: Untested - should compile but not officially supported
+  - Some features unavailable (e.g., sparse file detection)
+  - CI testing currently macOS and Linux only
+
+See [docs/FEATURES.md](docs/FEATURES.md) for platform-specific feature details.
+
 ## Contributing
 
 Interested in contributing? We'd love help with:
-- Cross-platform testing (Windows, Linux, macOS)
+- Windows testing and support
 - Performance profiling for large datasets
 - Real-world testing and feedback
 - Documentation and tutorials
