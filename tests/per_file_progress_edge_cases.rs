@@ -13,7 +13,7 @@ async fn test_progress_with_empty_file() {
 
     // Create an empty file
     let empty_file = source.path().join("empty.dat");
-    fs::write(&empty_file, &[]).unwrap();
+    fs::write(&empty_file, []).unwrap();
 
     use sy::transport::local::LocalTransport;
     use sy::transport::Transport;

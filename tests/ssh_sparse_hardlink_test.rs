@@ -69,7 +69,7 @@ async fn test_ssh_detect_sparse_file_via_scan() {
 
     // Scan directory to get file entries
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -129,7 +129,7 @@ async fn test_ssh_regular_file_not_sparse() {
     let transport = SshTransport::new(&config).await.expect("Failed to connect");
 
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -172,7 +172,7 @@ async fn test_ssh_detect_hardlink_via_scan() {
     let transport = SshTransport::new(&config).await.expect("Failed to connect");
 
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -234,7 +234,7 @@ async fn test_ssh_single_file_nlink() {
     let transport = SshTransport::new(&config).await.expect("Failed to connect");
 
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -284,7 +284,7 @@ async fn test_ssh_transfer_large_file() {
     let start = std::time::Instant::now();
 
     let result = transport
-        .copy_file_streaming(&std::path::Path::new(&remote_source), &dest_file, None)
+        .copy_file_streaming(std::path::Path::new(&remote_source), &dest_file, None)
         .await
         .expect("Transfer failed");
 
@@ -317,14 +317,14 @@ async fn test_ssh_create_and_verify_hardlink() {
 
     // Create directory
     transport
-        .create_dir_all(&std::path::Path::new(&remote_base))
+        .create_dir_all(std::path::Path::new(&remote_base))
         .await
         .expect("create_dir_all failed");
 
     // Create original file
     transport
         .write_file(
-            &std::path::Path::new(&remote_original),
+            std::path::Path::new(&remote_original),
             b"hardlink test",
             SystemTime::now(),
         )
@@ -334,19 +334,19 @@ async fn test_ssh_create_and_verify_hardlink() {
     // Create hard link
     transport
         .create_hardlink(
-            &std::path::Path::new(&remote_original),
-            &std::path::Path::new(&remote_link),
+            std::path::Path::new(&remote_original),
+            std::path::Path::new(&remote_link),
         )
         .await
         .expect("create_hardlink failed");
 
     // Verify both files exist
     let original_exists = transport
-        .exists(&std::path::Path::new(&remote_original))
+        .exists(std::path::Path::new(&remote_original))
         .await
         .expect("exists check failed");
     let link_exists = transport
-        .exists(&std::path::Path::new(&remote_link))
+        .exists(std::path::Path::new(&remote_link))
         .await
         .expect("exists check failed");
 
@@ -355,11 +355,11 @@ async fn test_ssh_create_and_verify_hardlink() {
 
     // Verify content is the same
     let original_content = transport
-        .read_file(&std::path::Path::new(&remote_original))
+        .read_file(std::path::Path::new(&remote_original))
         .await
         .expect("read_file failed");
     let link_content = transport
-        .read_file(&std::path::Path::new(&remote_link))
+        .read_file(std::path::Path::new(&remote_link))
         .await
         .expect("read_file failed");
 
@@ -370,7 +370,7 @@ async fn test_ssh_create_and_verify_hardlink() {
 
     // Verify nlink count via scan
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 

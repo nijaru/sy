@@ -16,6 +16,10 @@ _Last Updated: 2025-11-10_
 ### Medium Priority
 
 - [ ] **S3 Testing & Stabilization** (Future)
+  - [ ] Migrate to `object_store` crate (Apache Arrow project)
+    - Unified API for S3, GCS, Azure Blob Storage
+    - Better abstraction than raw aws-sdk-s3
+    - Battle-tested (used by DataFusion, Delta Lake, InfluxDB)
   - [ ] Add integration tests for S3 sync
   - [ ] Test with AWS, Cloudflare R2, Backblaze B2, Wasabi
   - [ ] Document authentication patterns

@@ -83,7 +83,7 @@ async fn test_remote_to_local_with_progress() {
     // Download with progress
     let result = transport
         .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             &local_dest,
             Some(progress_callback),
         )
@@ -133,7 +133,7 @@ async fn test_remote_to_local_large_file() {
 
     let result = transport
         .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             &local_dest,
             Some(progress_callback),
         )
@@ -184,7 +184,7 @@ async fn test_remote_to_local_progress_monotonic() {
 
     let _ = transport
         .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             &local_dest,
             Some(progress_callback),
         )
@@ -242,7 +242,7 @@ async fn test_remote_to_local_connection_pool() {
 
         let result = t1
             .copy_file_streaming(
-                &std::path::Path::new(&remote1_clone),
+                std::path::Path::new(&remote1_clone),
                 &local_dest,
                 Some(progress_callback),
             )
@@ -264,7 +264,7 @@ async fn test_remote_to_local_connection_pool() {
 
         let result = t2
             .copy_file_streaming(
-                &std::path::Path::new(&remote2_clone),
+                std::path::Path::new(&remote2_clone),
                 &local_dest,
                 Some(progress_callback),
             )

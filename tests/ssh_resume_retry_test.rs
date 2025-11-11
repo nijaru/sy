@@ -68,7 +68,7 @@ async fn test_retry_basic_operation() {
     // Create file
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             b"test content",
             std::time::SystemTime::now(),
         )
@@ -77,7 +77,7 @@ async fn test_retry_basic_operation() {
 
     // Verify file exists
     let exists = transport
-        .exists(&std::path::Path::new(&remote_path))
+        .exists(std::path::Path::new(&remote_path))
         .await
         .expect("exists should succeed");
 
@@ -85,7 +85,7 @@ async fn test_retry_basic_operation() {
 
     // Read file (tests retry on read operations)
     let content = transport
-        .read_file(&std::path::Path::new(&remote_path))
+        .read_file(std::path::Path::new(&remote_path))
         .await
         .expect("read_file should succeed");
 
@@ -123,13 +123,13 @@ async fn test_retry_with_aggressive_backoff() {
     // Perform operation (will use backoff if retries needed)
     let remote_base = create_remote_test_path("retry_dir");
     transport
-        .create_dir_all(&std::path::Path::new(&remote_base))
+        .create_dir_all(std::path::Path::new(&remote_base))
         .await
         .expect("create_dir_all should succeed");
 
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             b"backoff test",
             std::time::SystemTime::now(),
         )
@@ -140,7 +140,7 @@ async fn test_retry_with_aggressive_backoff() {
 
     // Verify success
     let content = transport
-        .read_file(&std::path::Path::new(&remote_path))
+        .read_file(std::path::Path::new(&remote_path))
         .await
         .expect("read_file failed");
 
@@ -232,7 +232,7 @@ async fn test_connection_pool_with_retry() {
         let local_dest = dest_dir.path().join(format!("file{}.dat", i));
 
         let handle = tokio::spawn(async move {
-            t.copy_file_streaming(&std::path::Path::new(&remote_file), &local_dest, None)
+            t.copy_file_streaming(std::path::Path::new(&remote_file), &local_dest, None)
                 .await
                 .unwrap()
         });
@@ -301,7 +301,7 @@ async fn test_large_file_transfer_with_retry() {
     let start = std::time::Instant::now();
 
     let result = transport
-        .copy_file_streaming(&std::path::Path::new(&remote_source), &dest_file, None)
+        .copy_file_streaming(std::path::Path::new(&remote_source), &dest_file, None)
         .await
         .expect("Transfer failed");
 

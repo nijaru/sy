@@ -75,7 +75,7 @@ async fn test_ssh_scan_directory() {
 
     // Test scan
     let entries = transport
-        .scan(&std::path::Path::new(&remote_path))
+        .scan(std::path::Path::new(&remote_path))
         .await
         .expect("Scan failed");
 
@@ -130,7 +130,7 @@ async fn test_ssh_exists() {
 
     // Test exists (file that exists)
     let exists = transport
-        .exists(&std::path::Path::new(&remote_path))
+        .exists(std::path::Path::new(&remote_path))
         .await
         .expect("exists() failed");
     assert!(exists, "File should exist");
@@ -138,7 +138,7 @@ async fn test_ssh_exists() {
     // Test exists (file that doesn't exist)
     let nonexistent = format!("{}_nonexistent", remote_path);
     let exists = transport
-        .exists(&std::path::Path::new(&nonexistent))
+        .exists(std::path::Path::new(&nonexistent))
         .await
         .expect("exists() failed");
     assert!(!exists, "Nonexistent file should not exist");
@@ -162,13 +162,13 @@ async fn test_ssh_create_dir_all() {
 
     // Test create_dir_all (nested directories)
     transport
-        .create_dir_all(&std::path::Path::new(&nested_path))
+        .create_dir_all(std::path::Path::new(&nested_path))
         .await
         .expect("create_dir_all failed");
 
     // Verify directory exists
     let exists = transport
-        .exists(&std::path::Path::new(&nested_path))
+        .exists(std::path::Path::new(&nested_path))
         .await
         .expect("exists check failed");
     assert!(exists, "Nested directory should exist");
@@ -193,7 +193,7 @@ async fn test_ssh_read_write_file() {
     let test_data = b"Hello from SSH write_file test!\nLine 2\nLine 3";
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             test_data,
             SystemTime::now(),
         )
@@ -202,7 +202,7 @@ async fn test_ssh_read_write_file() {
 
     // Test read_file
     let read_data = transport
-        .read_file(&std::path::Path::new(&remote_path))
+        .read_file(std::path::Path::new(&remote_path))
         .await
         .expect("read_file failed");
 
@@ -228,7 +228,7 @@ async fn test_ssh_remove() {
     // Create file
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             b"test",
             SystemTime::now(),
         )
@@ -237,20 +237,20 @@ async fn test_ssh_remove() {
 
     // Verify exists
     let exists = transport
-        .exists(&std::path::Path::new(&remote_path))
+        .exists(std::path::Path::new(&remote_path))
         .await
         .expect("exists check failed");
     assert!(exists, "File should exist before removal");
 
     // Test remove
     transport
-        .remove(&std::path::Path::new(&remote_path), false)
+        .remove(std::path::Path::new(&remote_path), false)
         .await
         .expect("remove failed");
 
     // Verify deleted
     let exists = transport
-        .exists(&std::path::Path::new(&remote_path))
+        .exists(std::path::Path::new(&remote_path))
         .await
         .expect("exists check failed");
     assert!(!exists, "File should not exist after removal");
@@ -273,13 +273,13 @@ async fn test_ssh_get_mtime() {
     // Create file with known mtime
     let known_time = SystemTime::now() - Duration::from_secs(3600); // 1 hour ago
     transport
-        .write_file(&std::path::Path::new(&remote_path), b"test", known_time)
+        .write_file(std::path::Path::new(&remote_path), b"test", known_time)
         .await
         .expect("write_file failed");
 
     // Get mtime
     let mtime = transport
-        .get_mtime(&std::path::Path::new(&remote_path))
+        .get_mtime(std::path::Path::new(&remote_path))
         .await
         .expect("get_mtime failed");
 
@@ -314,7 +314,7 @@ async fn test_ssh_file_info() {
     let test_data = b"test file info content";
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             test_data,
             SystemTime::now(),
         )
@@ -323,7 +323,7 @@ async fn test_ssh_file_info() {
 
     // Get file info
     let info = transport
-        .file_info(&std::path::Path::new(&remote_path))
+        .file_info(std::path::Path::new(&remote_path))
         .await
         .expect("file_info failed");
 
@@ -354,7 +354,7 @@ async fn test_ssh_copy_file_basic() {
     let test_data = vec![0x42u8; 1024 * 1024]; // 1MB
     transport
         .write_file(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             &test_data,
             SystemTime::now(),
         )
@@ -367,7 +367,7 @@ async fn test_ssh_copy_file_basic() {
 
     // Remote → Local
     let result = transport
-        .copy_file_streaming(&std::path::Path::new(&remote_source), &local_file, None)
+        .copy_file_streaming(std::path::Path::new(&remote_source), &local_file, None)
         .await
         .expect("copy_file_streaming failed");
 
@@ -422,7 +422,7 @@ async fn test_ssh_copy_file_with_progress() {
     // Download with progress
     let result = transport
         .copy_file_streaming(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             &local_dest,
             Some(progress_callback),
         )
@@ -460,7 +460,7 @@ async fn test_ssh_copy_empty_file() {
     // Create empty file
     transport
         .write_file(
-            &std::path::Path::new(&remote_source),
+            std::path::Path::new(&remote_source),
             b"",
             SystemTime::now(),
         )
@@ -471,7 +471,7 @@ async fn test_ssh_copy_empty_file() {
 
     // Copy empty file
     let result = transport
-        .copy_file_streaming(&std::path::Path::new(&remote_source), &local_dest, None)
+        .copy_file_streaming(std::path::Path::new(&remote_source), &local_dest, None)
         .await
         .expect("Copy failed");
 
@@ -502,14 +502,14 @@ async fn test_ssh_create_symlink() {
 
     // Create base directory
     transport
-        .create_dir_all(&std::path::Path::new(&remote_base))
+        .create_dir_all(std::path::Path::new(&remote_base))
         .await
         .expect("create_dir_all failed");
 
     // Create target file
     transport
         .write_file(
-            &std::path::Path::new(&remote_target),
+            std::path::Path::new(&remote_target),
             b"target content",
             SystemTime::now(),
         )
@@ -519,15 +519,15 @@ async fn test_ssh_create_symlink() {
     // Create symlink
     transport
         .create_symlink(
-            &std::path::Path::new("target.txt"),
-            &std::path::Path::new(&remote_link),
+            std::path::Path::new("target.txt"),
+            std::path::Path::new(&remote_link),
         )
         .await
         .expect("create_symlink failed");
 
     // Verify symlink exists by scanning directory
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -560,7 +560,7 @@ async fn test_ssh_read_nonexistent_file() {
 
     // Try to read nonexistent file
     let result = transport
-        .read_file(&std::path::Path::new(&remote_path))
+        .read_file(std::path::Path::new(&remote_path))
         .await;
 
     assert!(result.is_err(), "Reading nonexistent file should fail");
@@ -582,7 +582,7 @@ async fn test_ssh_remove_nonexistent_file() {
 
     // Try to remove nonexistent file (should not error, just succeed silently)
     let result = transport
-        .remove(&std::path::Path::new(&remote_path), false)
+        .remove(std::path::Path::new(&remote_path), false)
         .await;
 
     // Some implementations error, some succeed - either is acceptable
@@ -619,7 +619,7 @@ async fn test_ssh_write_to_readonly_parent() {
     // Try to write file to readonly directory
     let result = transport
         .write_file(
-            &std::path::Path::new(&remote_file),
+            std::path::Path::new(&remote_file),
             b"test",
             SystemTime::now(),
         )
@@ -659,14 +659,14 @@ async fn test_ssh_special_characters_in_filename() {
 
     // Create directory
     transport
-        .create_dir_all(&std::path::Path::new(&remote_base))
+        .create_dir_all(std::path::Path::new(&remote_base))
         .await
         .expect("create_dir_all failed");
 
     // Write file with special characters in name
     let result = transport
         .write_file(
-            &std::path::Path::new(&remote_file),
+            std::path::Path::new(&remote_file),
             b"special content",
             SystemTime::now(),
         )
@@ -676,7 +676,7 @@ async fn test_ssh_special_characters_in_filename() {
     if result.is_ok() {
         // Verify we can read it back
         let read_data = transport
-            .read_file(&std::path::Path::new(&remote_file))
+            .read_file(std::path::Path::new(&remote_file))
             .await
             .expect("read_file failed");
 
@@ -717,7 +717,7 @@ async fn test_ssh_deep_directory_hierarchy() {
     // Write file at deep level
     transport
         .write_file(
-            &std::path::Path::new(&deep_path),
+            std::path::Path::new(&deep_path),
             b"deep file",
             SystemTime::now(),
         )
@@ -726,7 +726,7 @@ async fn test_ssh_deep_directory_hierarchy() {
 
     // Verify we can read it
     let read_data = transport
-        .read_file(&std::path::Path::new(&deep_path))
+        .read_file(std::path::Path::new(&deep_path))
         .await
         .expect("read_file failed at deep level");
 
@@ -757,7 +757,7 @@ async fn test_ssh_binary_data_integrity() {
     // Write binary data
     transport
         .write_file(
-            &std::path::Path::new(&remote_path),
+            std::path::Path::new(&remote_path),
             &binary_data,
             SystemTime::now(),
         )
@@ -766,7 +766,7 @@ async fn test_ssh_binary_data_integrity() {
 
     // Read back
     let read_data = transport
-        .read_file(&std::path::Path::new(&remote_path))
+        .read_file(std::path::Path::new(&remote_path))
         .await
         .expect("read_file failed");
 
@@ -816,7 +816,7 @@ async fn test_ssh_large_file_100mb() {
     let start = std::time::Instant::now();
 
     let result = transport
-        .copy_file_streaming(&std::path::Path::new(&remote_source), &local_dest, None)
+        .copy_file_streaming(std::path::Path::new(&remote_source), &local_dest, None)
         .await
         .expect("Download failed");
 
@@ -848,7 +848,7 @@ async fn test_ssh_many_small_files() {
 
     // Create directory
     transport
-        .create_dir_all(&std::path::Path::new(&remote_base))
+        .create_dir_all(std::path::Path::new(&remote_base))
         .await
         .expect("create_dir_all failed");
 
@@ -861,7 +861,7 @@ async fn test_ssh_many_small_files() {
         let content = format!("File number {}", i);
         transport
             .write_file(
-                &std::path::Path::new(&file_path),
+                std::path::Path::new(&file_path),
                 content.as_bytes(),
                 SystemTime::now(),
             )
@@ -873,7 +873,7 @@ async fn test_ssh_many_small_files() {
 
     // Verify by scanning
     let entries = transport
-        .scan(&std::path::Path::new(&remote_base))
+        .scan(std::path::Path::new(&remote_base))
         .await
         .expect("scan failed");
 
@@ -936,7 +936,7 @@ async fn test_ssh_connection_pool_concurrent_transfers() {
         let local_dest = dest_dir.path().join(format!("file{}.dat", i));
 
         let handle = tokio::spawn(async move {
-            t.copy_file_streaming(&std::path::Path::new(&remote_file), &local_dest, None)
+            t.copy_file_streaming(std::path::Path::new(&remote_file), &local_dest, None)
                 .await
                 .unwrap()
         });
