@@ -223,7 +223,7 @@ sy /data s3://my-bucket/data?endpoint=https://s3.wasabisys.com
 
 ### S3 Authentication
 
-Automatic via AWS SDK (in priority order):
+Uses standard AWS credentials (in priority order):
 
 1. Environment variables:
    ```bash
