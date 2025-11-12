@@ -368,6 +368,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Validate ACL feature
+    #[cfg(not(all(unix, feature = "acl")))]
+    if cli.preserve_acls {
+        anyhow::bail!(
+            r#"ACL preservation requires the 'acl' feature.
+Install sy from crates.io with: cargo install sy --features acl
+Or install from local source with: cargo install --path . --features acl"#
+        );
+    }
+
     let engine = SyncEngine::new(
         transport,
         cli.dry_run,

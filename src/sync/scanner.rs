@@ -109,7 +109,7 @@ fn read_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>> {
 /// Read ACLs from a file
 /// Returns None if ACLs are not supported or if reading fails
 /// The ACLs are stored as text representation (Display format) for portability
-#[cfg(unix)]
+#[cfg(all(unix, feature = "acl"))]
 fn read_acls(path: &Path) -> Option<Vec<u8>> {
     use exacl::getfacl;
 
@@ -136,8 +136,10 @@ fn read_acls(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// Non-Unix platforms don't support ACLs
-#[cfg(not(unix))]
+/// ACLs not available
+/// - Feature 'acl' is disabled, or
+/// - Platform doesn't support ACLs (non-Unix)
+#[cfg(not(all(unix, feature = "acl")))]
 fn read_acls(_path: &Path) -> Option<Vec<u8>> {
     None
 }
