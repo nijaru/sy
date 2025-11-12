@@ -29,8 +29,10 @@ brew install sy
 ```bash
 cargo install sy
 
-# Or with S3 support (experimental)
-cargo install sy --features s3
+# With optional features
+cargo install sy --features acl         # ACL preservation (requires libacl on Linux)
+cargo install sy --features s3          # S3 support (experimental)
+cargo install sy --features acl,s3      # Both features
 ```
 
 ### From Source
@@ -41,7 +43,10 @@ cd sy
 cargo install --path .
 ```
 
-**Requirements:** Rust 1.70+
+**Build requirements:**
+- Rust toolchain (any recent stable version)
+- Linux only: For ACL support (`--features acl`), install `libacl1-dev` (Debian/Ubuntu) or `libacl-devel` (Fedora/RHEL)
+- macOS: ACL support works out of the box (native support)
 
 **For SSH sync:** Install sy on both local and remote machines.
 

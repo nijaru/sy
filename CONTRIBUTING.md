@@ -2,13 +2,33 @@
 
 ## Development Setup
 
+**System Dependencies (optional):**
+
+For ACL support on Linux:
+```bash
+# Debian/Ubuntu
+sudo apt install libacl1-dev
+
+# Fedora/RHEL
+sudo dnf install libacl-devel
+
+# Arch Linux
+sudo pacman -S acl
+```
+
+**Build:**
 ```bash
 git clone https://github.com/nijaru/sy.git
 cd sy
 
-# Build and test
+# Build and test (no optional features)
 cargo build
 cargo test
+
+# Or with optional features
+cargo build --features acl         # ACL preservation
+cargo build --features s3          # S3 support
+cargo build --all-features         # All features
 
 # Run locally
 cargo run -- /source /dest --dry-run
