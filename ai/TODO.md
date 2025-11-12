@@ -1,19 +1,23 @@
 # TODO
 
-_Last Updated: 2025-11-11_
+_Last Updated: 2025-11-12_
 
 ## Active Work
 
 ### High Priority
 
-- [ ] **Release v0.0.58** (Ready)
-  - [x] fjall migration complete
-  - [x] object_store migration complete
-  - [x] All tests passing
+- [ ] **Release v0.0.59** (Ready)
+  - [x] ACL optional feature complete
+  - [x] All tests passing (465 tests)
+  - [x] Docker portability tests passing
+  - [x] Documentation updated (README, CONTRIBUTING)
+  - [ ] Create PR for `feat/optional-acls`
+  - [ ] Wait for CI to pass
+  - [ ] Merge PR
   - [ ] Update CHANGELOG.md
   - [ ] Tag and release
 
-- [ ] **CI/CD Infrastructure** (v0.0.59)
+- [ ] **CI/CD Infrastructure** (v0.0.60)
   - [ ] Create simplified CI workflow for macOS + Linux
   - [ ] Run tests on 2 platforms (ubuntu-latest, macos-latest)
   - [ ] Add clippy and rustfmt checks
@@ -22,6 +26,19 @@ _Last Updated: 2025-11-11_
   - **Goal**: Catch cross-platform regressions automatically
 
 ### Medium Priority
+
+- [ ] **Optional Features for Portability** (v0.0.60)
+  - [ ] SSH optional but default (`default = ["ssh"]`)
+    - Makes local-only builds possible with zero system deps
+    - Requires libssh2 on Linux when enabled
+    - Effort: 2-3 hours (similar to ACLs)
+  - [ ] notify optional but default (`default = ["ssh", "watch"]`)
+    - Pure Rust, no system deps, but allows minimal builds
+    - For `--watch` mode continuous sync
+    - Effort: 1-2 hours
+  - **Goal**: Minimal builds possible, but default includes all common features
+
+
 
 - [ ] **Auto-deploy sy-remote on SSH connections** (Future PR)
   - **Problem**: sy fails with "command not found" if sy-remote isn't installed on remote server
@@ -71,15 +88,31 @@ _Last Updated: 2025-11-11_
   - [ ] Test NTFS-specific features
   - [ ] Verify extended attributes work correctly
 
+## Recently Completed (v0.0.59)
+
+- [x] **Optional ACL Feature** ✅ (GitHub Issue #7)
+  - [x] Made ACL preservation optional via `--features acl`
+  - [x] Eliminated libacl system dependency for default builds
+  - [x] Platform support: Linux (build-time libacl), macOS (native)
+  - [x] Created Docker portability test suite (`scripts/test-acl-portability.sh`)
+  - [x] Updated documentation (README, CONTRIBUTING)
+  - [x] Clear runtime error messages for missing feature
+  - **Impact**: `cargo install sy` now works on all Linux systems without libacl
+  - **Branch**: `feat/optional-acls`
+
+- [x] **AI Context Cleanup** ✅
+  - [x] Deleted 13 obsolete research docs (completed features)
+  - [x] Kept 2 current docs (library-migration-summary, database-comparisons)
+  - [x] Updated STATUS.md, TODO.md, DECISIONS.md with ACL work
+  - **Result**: Cleaner, more maintainable ai/ directory
+
 ## Recently Completed (v0.0.58)
 
 - [x] **Pure Rust Library Migrations** ✅
-  - [x] rusqlite → fjall (pure Rust LSM-tree database)
-  - [x] aws-sdk-s3 → object_store (unified cloud API)
-  - [x] Remove walkdir dependency
-  - [x] Fix SyncPath patterns (S3 feature now compiles)
-  - [x] Net: 4 dependencies removed, 2 added
-  - **See**: `ai/library-migration-summary.md`
+  - [x] rusqlite → fjall (56% faster writes)
+  - [x] aws-sdk-s3 → object_store (multi-cloud support)
+  - [x] Removed walkdir dependency
+  - **See**: `ai/research/library-migration-summary.md`
 
 ## Recently Completed (v0.0.57)
 

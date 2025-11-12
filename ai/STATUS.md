@@ -1,11 +1,11 @@
 # Status
 
-_Last Updated: 2025-11-10_
+_Last Updated: 2025-11-12_
 
 ## Current State
-- Version: v0.0.58 (in progress) 🚧
-- Latest Work: **Pure Rust library migrations** - fjall + object_store complete
-- Previous: v0.0.57 - Documentation overhaul, trailing slash semantics, nested file fixes
+- Version: v0.0.59 (in progress) 🚧
+- Latest Work: **Optional ACL feature** - ACL preservation now optional, zero system dependencies on Linux
+- Previous: v0.0.58 - Pure Rust library migrations (fjall + object_store)
 - Test Coverage: **465 tests passing** ✅
   - **Library tests**: 465 passing (core functionality)
   - **SSH tests**: 48 tests (12 ignored - require SSH setup)
@@ -16,46 +16,52 @@ _Last Updated: 2025-11-10_
 - Performance: 2-11x faster than rsync (see docs/BENCHMARK_RESULTS.md)
 - Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
 
-## v0.0.58 (In Progress)
+## v0.0.59 (In Progress)
+
+**Optional ACL Feature** ✅
+
+Made ACL preservation optional to eliminate system dependencies on Linux:
+
+1. **Feature flag implementation** ✅
+   - ACL support now behind `--features acl` flag
+   - Default build requires zero system dependencies
+   - Scope: Cargo.toml, src/main.rs, src/sync/scanner.rs, src/transport/mod.rs, src/sync/transfer.rs
+
+2. **Platform support** ✅
+   - Linux: Requires `libacl1-dev` (Debian/Ubuntu) or `libacl-devel` (Fedora/RHEL) at build time
+   - macOS: Works with native ACL APIs (no external dependencies)
+   - Clear runtime error message if `--preserve-acls` used without feature
+
+3. **Testing** ✅
+   - Created `scripts/test-acl-portability.sh` for Docker-based testing
+   - Validates: default build, ACL build without libs (fails), ACL build with libs (succeeds), runtime errors
+   - All 4 portability tests passing in Fedora container
+
+4. **Documentation** ✅
+   - Updated README.md with feature installation instructions
+   - Updated CONTRIBUTING.md with build options
+   - Clarified build vs runtime requirements
+
+**Impact**:
+- `cargo install sy` now works on all Linux systems without installing libacl
+- Users who need ACL preservation: `cargo install sy --features acl`
+- Follows same pattern as S3: opt-in features for advanced use cases
+
+**Branch**: `feat/optional-acls` (ready for PR)
+
+## v0.0.58 Release Notes
 
 **Pure Rust Library Migrations** ✅
 
-Migrated from C dependencies to pure Rust for easier cross-compilation, smaller binaries, and better developer experience:
+Migrated from C dependencies to pure Rust:
 
-1. **rusqlite → fjall** ✅
-   - Replaced SQLite (C library) with fjall (pure Rust LSM-tree)
-   - Scope: src/sync/checksumdb.rs (443 lines)
-   - Better write performance (LSM-tree optimized for writes)
-   - File location: `.sy-checksums.db` → `.sy-checksums/` (directory)
-   - Testing: 11 tests passing
+1. **rusqlite → fjall** - Pure Rust LSM-tree database, 56% faster writes
+2. **aws-sdk-s3 → object_store** - Unified multi-cloud API, 38% code reduction
+3. **walkdir removal** - Cleaned up unused dependency
 
-2. **aws-sdk-s3 → object_store** ✅
-   - Unified cloud storage API (pure Rust)
-   - Scope: src/transport/s3.rs (454 → ~280 lines, 38% code reduction)
-   - Multi-cloud support: AWS S3, Cloudflare R2, Backblaze B2, Wasabi, GCS, Azure
-   - Simpler API with automatic multipart uploads
-   - Testing: Compiles cleanly with `--features s3`
+**Dependency Impact**: Net ~18 fewer transitive dependencies
 
-3. **walkdir removal** ✅
-   - Removed unused direct dependency
-
-4. **SyncPath pattern fixes** ✅
-   - Fixed broken S3 feature after PR #5 changes
-
-**Dependency Impact**:
-- Removed: rusqlite, aws-sdk-s3, aws-config, aws-smithy-types, walkdir (4 deps)
-- Added: fjall, object_store, bytes (2 deps + utility)
-- Net: ~18 fewer transitive dependencies
-
-**Pure Rust Status**:
-- ✅ Database: fjall (pure Rust)
-- ✅ Cloud storage: object_store (pure Rust)
-- ❌ SSH: ssh2 (C bindings) → russh migration planned for v0.0.59
-- ✅ Directory traversal: ignore (pure Rust)
-- ✅ Compression: zstd, lz4_flex (pure Rust)
-- ✅ Hashing: xxhash-rust, blake3 (pure Rust)
-
-See `ai/library-migration-summary.md` for full migration details.
+See `ai/research/library-migration-summary.md` for details.
 
 ## v0.0.57 Release Notes
 
@@ -89,7 +95,7 @@ See `ai/library-migration-summary.md` for full migration details.
 See `ai/TODO.md` for active work priorities.
 
 Key items:
-- v0.0.58 release (library migrations complete)
-- russh migration for v0.0.59 (pure Rust SSH)
-- CI/CD infrastructure (simplified 3-platform testing)
+- v0.0.59 release (ACL optional feature complete)
+- CI/CD infrastructure (macOS + Linux testing)
+- Consider SSH optional feature (similar to ACL pattern)
 - Performance profiling for large-scale syncs

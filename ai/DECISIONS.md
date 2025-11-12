@@ -1,5 +1,35 @@
 # Decisions
 
+## 2025-11-12: Optional ACL Feature (GitHub Issue #7)
+
+**Context**: User reported `cargo install sy` failed on Linux due to missing libacl system dependency
+
+**Decision**: Make ACL preservation optional via `--features acl` flag
+
+**Rationale**:
+- Default build should work everywhere with zero system dependencies
+- Most users don't need ACL preservation (rare use case, like rsync's `-A` flag)
+- Traditional Unix permissions (user/group/other) still preserved by default
+- Users who need ACLs can opt-in: `cargo install sy --features acl`
+
+**Implementation**:
+- Feature flag: `acl = ["exacl"]` in Cargo.toml (singular, matching `s3` pattern)
+- Conditional compilation: `#[cfg(all(unix, feature = "acl"))]`
+- Runtime validation: Clear error if `--preserve-acls` used without feature
+- Platform differences:
+  - Linux: Requires libacl-devel at build time (not runtime)
+  - macOS: Uses native ACL APIs (no external dependencies)
+
+**Testing**: Created `scripts/test-acl-portability.sh` for Docker-based validation
+
+**Impact**: Eliminates installation friction for 95%+ of users who don't use ACLs
+
+**Future Pattern**: Same approach for SSH and notify features (optional but included by default)
+
+**References**: Issue #7, branch feat/optional-acls
+
+---
+
 ## 2025-10-27: Release Versioning Strategy
 
 **Context**: Planning version progression for a file synchronization tool where data safety is critical
