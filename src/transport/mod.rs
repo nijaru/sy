@@ -281,7 +281,7 @@ pub trait Transport: Send + Sync {
     /// For remote transports, executes setfacl via SSH.
     async fn set_acls(&self, path: &Path, acls_text: &str) -> Result<()> {
         // Default implementation: use local exacl crate
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "acl"))]
         {
             use exacl::{setfacl, AclEntry};
             use std::str::FromStr;
@@ -319,7 +319,7 @@ pub trait Transport: Send + Sync {
             .await
             .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?;
         }
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, feature = "acl")))]
         {
             let _ = (path, acls_text);
         }

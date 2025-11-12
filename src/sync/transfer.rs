@@ -1667,7 +1667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "acl"))]
     async fn test_acl_preservation_integration() {
         use exacl::getfacl;
 
