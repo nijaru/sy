@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.59] - 2025-11-12
+
+### Changed
+- **ACL preservation now optional** (issue #7)
+  - Made ACL support optional via `--features acl` flag
+  - Default build requires zero system dependencies on Linux
+  - `cargo install sy` now works without installing libacl
+  - Users who need ACLs: `cargo install sy --features acl`
+  - Linux: Requires libacl-devel at build time when feature enabled
+  - macOS: Uses native ACL APIs (no external dependencies)
+  - Traditional Unix permissions (user/group/other) still preserved by default
+
+### Added
+- Docker-based portability test suite (`scripts/test-acl-portability.sh`)
+  - Validates default build works without system dependencies
+  - Validates ACL feature requires and works with libacl-devel
+  - Tests runtime error messages for missing feature
+
+### Testing
+- 464 tests passing (12 ignored - SSH setup required)
+- All portability tests passing in Fedora container
+
+## [0.0.58] - 2025-11-11
+
+### Changed
+- **Pure Rust library migrations**
+  - Migrated from rusqlite to fjall (pure Rust LSM-tree database)
+  - 56% faster writes for checksumdb workload
+  - Migrated from aws-sdk-s3 to object_store (unified multi-cloud API)
+  - 38% code reduction in S3 transport
+  - Removed unused walkdir dependency
+  - Net reduction of ~18 transitive dependencies
+
+### Performance
+- Checksumdb writes: 56.8% faster (fjall: 340ms vs rusqlite: 534ms for 1K checksums)
+- See ai/research/database-comparisons.md for detailed benchmarks
+
 ## [0.0.57] - 2025-11-10
 
 ### Fixed
