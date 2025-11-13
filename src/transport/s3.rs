@@ -3,6 +3,7 @@ use crate::error::{Result, SyncError};
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::StreamExt; // For scan() async stream
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -183,22 +184,63 @@ impl Transport for S3Transport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
+        use tokio::io::AsyncReadExt;
+
         let metadata = tokio::fs::metadata(source).await?;
         let size = metadata.len();
-
-        // object_store handles multipart upload automatically
-        let data = tokio::fs::read(source).await?;
         let object_path = self.path_to_object_path(dest);
 
-        self.store
-            .put(&object_path, Bytes::from(data).into())
-            .await
-            .map_err(|e| {
+        // Use streaming multipart upload for large files to avoid loading into memory
+        // For small files (<5MB), use simple put for efficiency
+        const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
+
+        if size < MULTIPART_THRESHOLD {
+            // Small file: use simple put (one API call)
+            let data = tokio::fs::read(source).await?;
+            self.store
+                .put(&object_path, Bytes::from(data).into())
+                .await
+                .map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!(
+                        "Failed to upload to S3: {}",
+                        e
+                    )))
+                })?;
+        } else {
+            // Large file: use multipart upload (streaming, no memory buffering)
+            use object_store::WriteMultipart;
+
+            let mut file = tokio::fs::File::open(source).await?;
+            let upload = self.store.put_multipart(&object_path).await.map_err(|e| {
                 SyncError::Io(std::io::Error::other(format!(
-                    "Failed to upload to S3: {}",
+                    "Failed to initiate multipart upload: {}",
                     e
                 )))
             })?;
+
+            // WriteMultipart handles chunking automatically (5MB chunks)
+            let mut writer = WriteMultipart::new(upload);
+
+            // Stream file in chunks
+            const BUFFER_SIZE: usize = 5 * 1024 * 1024;
+            let mut buffer = vec![0u8; BUFFER_SIZE];
+
+            loop {
+                let bytes_read = file.read(&mut buffer).await?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                writer.write(&buffer[..bytes_read]);
+            }
+
+            writer.finish().await.map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to complete multipart upload: {}",
+                    e
+                )))
+            })?;
+        }
 
         Ok(TransferResult::new(size))
     }
