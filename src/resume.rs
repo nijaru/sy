@@ -188,6 +188,53 @@ impl TransferState {
         Ok(())
     }
 
+    /// Clear stale resume states (older than max_age)
+    ///
+    /// Automatically cleans up resume states that haven't been updated for a long time.
+    /// This prevents accumulation of abandoned resume states from failed/interrupted syncs.
+    pub fn clear_stale_states(max_age: std::time::Duration) -> Result<usize> {
+        let resume_dir = Self::get_resume_dir()?;
+        let mut cleared_count = 0;
+
+        if !resume_dir.exists() {
+            return Ok(0);
+        }
+
+        let now = SystemTime::now();
+
+        for entry in fs::read_dir(&resume_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
+                // Check file modification time
+                if let Ok(metadata) = fs::metadata(&path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age > max_age {
+                                // State file is older than max_age, remove it
+                                if fs::remove_file(&path).is_ok() {
+                                    cleared_count += 1;
+                                    tracing::debug!(
+                                        "Cleaned up stale resume state: {} (age: {:?})",
+                                        path.display(),
+                                        age
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if cleared_count > 0 {
+            tracing::info!("Cleaned up {} stale resume state(s)", cleared_count);
+        }
+
+        Ok(cleared_count)
+    }
+
     /// Get number of chunks needed for this transfer
     #[allow(dead_code)] // Future use for parallel chunk transfers
     pub fn total_chunks(&self) -> usize {

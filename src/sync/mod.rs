@@ -224,6 +224,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
             destination.display()
         );
 
+        // Clean up stale resume states (older than 7 days)
+        // This prevents accumulation of abandoned resume states from failed/interrupted syncs
+        if let Err(e) = crate::resume::TransferState::clear_stale_states(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60)
+        ) {
+            tracing::warn!("Failed to clean up stale resume states: {}", e);
+        }
+
         // Ensure destination directory exists before any operations
         // This is critical for remote syncs where the destination path may not exist yet
         if !self.dry_run {
@@ -550,14 +558,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let deletions = planner.plan_deletions(&source_files, destination);
 
             // Apply deletion safety checks
-            if !deletions.is_empty() && !self.force_delete {
+            if !deletions.is_empty() {
                 let dest_file_count = scanner::Scanner::new(destination)
                     .scan()
                     .map(|files| files.len())
                     .unwrap_or(0);
 
                 // Check threshold: prevent mass deletion
-                if dest_file_count > 0 {
+                if dest_file_count > 0 && !self.force_delete {
                     let delete_percentage =
                         (deletions.len() as f64 / dest_file_count as f64) * 100.0;
 
@@ -587,8 +595,45 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     }
                 }
 
-                // Check count threshold: warn if deleting many files
-                if deletions.len() > 1000 && !self.quiet && !self.json {
+                // CRITICAL SAFETY NET: Even with --force-delete, require confirmation for catastrophic deletions
+                // This prevents accidental destruction of large amounts of data
+                const CATASTROPHIC_THRESHOLD: usize = 10000;
+                if deletions.len() > CATASTROPHIC_THRESHOLD && !self.quiet && !self.json && !self.dry_run {
+                    let warning_msg = if self.force_delete {
+                        format!(
+                            "🚨 CRITICAL WARNING: About to delete {} files with --force-delete!\n\
+                             This will PERMANENTLY DELETE a large amount of data.\n\
+                             Type 'DELETE {}' to confirm (case-sensitive): ",
+                            deletions.len(),
+                            deletions.len()
+                        )
+                    } else {
+                        format!(
+                            "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
+                            deletions.len()
+                        )
+                    };
+
+                    eprintln!("{}", warning_msg);
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+
+                    let confirmed = if self.force_delete {
+                        // Require exact confirmation string for catastrophic deletions
+                        input.trim() == format!("DELETE {}", deletions.len())
+                    } else {
+                        input.trim().eq_ignore_ascii_case("y")
+                    };
+
+                    if !confirmed {
+                        tracing::info!("Deletion cancelled by user");
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Deletion cancelled by user",
+                        )));
+                    }
+                } else if deletions.len() > 1000 && !self.force_delete && !self.quiet && !self.json {
+                    // Standard confirmation for large deletions (without --force-delete)
                     eprintln!(
                         "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
                         deletions.len()
