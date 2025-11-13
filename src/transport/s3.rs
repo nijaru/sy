@@ -3,7 +3,6 @@ use crate::error::{Result, SyncError};
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::StreamExt; // For scan() async stream
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;

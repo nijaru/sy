@@ -50,6 +50,7 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 ///
 /// This avoids loading the entire file into memory by compressing in chunks.
 /// Suitable for large files that would otherwise cause OOM.
+#[allow(dead_code)] // Reserved for future use if sy-remote protocol is redesigned
 pub fn compress_streaming<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
