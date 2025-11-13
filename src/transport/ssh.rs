@@ -677,31 +677,40 @@ impl Transport for SshTransport {
         {
             use std::os::unix::fs::MetadataExt;
 
-            if let Ok(metadata) = std::fs::metadata(source) {
-                let file_size = metadata.len();
-                let allocated_size = metadata.blocks() * 512;
-                let is_sparse = allocated_size < file_size && file_size > 0;
+            // Check if source is sparse (requires blocking I/O)
+            let source_buf = source.to_path_buf();
+            let sparse_check = tokio::task::spawn_blocking(move || {
+                std::fs::metadata(&source_buf).ok().and_then(|metadata| {
+                    let file_size = metadata.len();
+                    let allocated_size = metadata.blocks() * 512;
+                    let is_sparse = allocated_size < file_size && file_size > 0;
+                    if is_sparse {
+                        Some(file_size)
+                    } else {
+                        None
+                    }
+                })
+            }).await.ok().flatten();
 
-                if is_sparse {
-                    // Try sparse transfer
-                    match self.copy_sparse_file(source, dest).await {
-                        Ok(result) => {
-                            tracing::info!(
-                                "Sparse transfer succeeded for {} ({} file size, {} transferred)",
-                                source.display(),
-                                file_size,
-                                result.transferred_bytes.unwrap_or(file_size)
-                            );
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Sparse transfer failed for {}, falling back to regular copy: {}",
-                                source.display(),
-                                e
-                            );
-                            // Fall through to regular transfer
-                        }
+            if let Some(file_size) = sparse_check {
+                // Try sparse transfer
+                match self.copy_sparse_file(source, dest).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Sparse transfer succeeded for {} ({} file size, {} transferred)",
+                            source.display(),
+                            file_size,
+                            result.transferred_bytes.unwrap_or(file_size)
+                        );
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Sparse transfer failed for {}, falling back to regular copy: {}",
+                            source.display(),
+                            e
+                        );
+                        // Fall through to regular transfer
                     }
                 }
             }
