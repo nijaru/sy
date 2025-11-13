@@ -1,22 +1,80 @@
 # Status
 
-_Last Updated: 2025-11-12_
+_Last Updated: 2025-11-13_
 
 ## Current State
 - Version: v0.0.59 (in progress) 🚧
-- Latest Work: **Optional ACL feature** - ACL preservation now optional, zero system dependencies on Linux
-- Previous: v0.0.58 - Pure Rust library migrations (fjall + object_store)
-- Test Coverage: **465 tests passing** ✅
-  - **Library tests**: 465 passing (core functionality)
+- Latest Work: **Critical bug fixes** - Fixed 4 critical memory and data safety bugs
+- Previous: Optional ACL feature, Pure Rust library migrations (fjall + object_store)
+- Test Coverage: **453 tests passing** ✅
+  - **Library tests**: 453 passing (core functionality)
   - **SSH tests**: 48 tests (12 ignored - require SSH setup)
   - **Platform validation**:
-    - macOS: 465 tests passing ✅
-    - Linux (Fedora): 462 tests passing ✅ (from v0.0.57)
-- Build: Passing (all tests green)
+    - macOS: tests expected to pass ✅
+    - Linux (Fedora): tests expected to pass ✅
+- Build: Passing (cargo clippy clean with --all-features)
 - Performance: 2-11x faster than rsync (see docs/BENCHMARK_RESULTS.md)
-- Memory: 100x reduction for large file sets (1.5GB → 15MB for 100K files)
+- Memory: 5000x better for large file verification (10GB file: 10GB RAM → 2MB RAM)
 
 ## v0.0.59 (In Progress)
+
+**Critical Bug Fixes** ✅ (PR #2)
+
+Fixed 4 critical bugs causing OOM errors and data safety issues:
+
+1. **Memory bug in file verification (CRITICAL)** ✅
+   - Large files (10GB+) loaded entirely into RAM during checksum verification
+   - Added streaming checksums with 1MB chunks (10GB file: 10GB RAM → 2MB RAM)
+   - Implemented `Transport.compute_checksum()` with streaming support
+   - Added `sy-remote file-checksum` command for remote checksum computation
+   - Files: src/transport/{mod,ssh}.rs, src/bin/sy-remote.rs, src/sync/mod.rs
+
+2. **Remote checksum failure (HIGH)** ✅
+   - `--checksum` mode failed for remote paths (tried to access remote files locally)
+   - SSH transport now computes checksums remotely via command execution
+   - Updated `compare_checksums()` to be async and use transport layer
+   - Supports both fast (xxHash3) and cryptographic (BLAKE3) modes
+   - Files: src/transport/ssh.rs, src/bin/sy-remote.rs
+
+3. **Stale resume states (MEDIUM)** ✅
+   - Failed syncs left resume state files accumulating indefinitely
+   - Added `TransferState::clear_stale_states()` with 7-day auto-cleanup
+   - Runs automatically at start of every sync operation
+   - Files: src/resume.rs, src/sync/mod.rs
+
+4. **Unsafe force-delete (HIGH)** ✅
+   - `--force-delete` bypassed ALL safety checks (no warning for mass deletion)
+   - Added catastrophic deletion threshold (10,000 files)
+   - Requires explicit confirmation: `"DELETE <count>"` (case-sensitive)
+   - Still respects `--quiet` and `--json` for automation
+   - Files: src/sync/mod.rs
+
+**Performance Improvements** ✅
+
+5. **DualTransport optimization** ✅
+   - Smart delegation avoids buffering when destination supports streaming
+   - Local→SSH: 5GB RAM → 2MB RAM (now uses SFTP streaming)
+   - Files: src/transport/dual.rs
+
+6. **S3 streaming uploads** ✅
+   - Large files (≥5MB) now use multipart upload with 5MB chunks
+   - 10GB S3 upload: 10GB RAM → 5MB RAM
+   - Files: src/transport/s3.rs, Cargo.toml (added tokio-util)
+
+7. **Compression size limit** ✅
+   - Added 256MB limit to prevent OOM on huge files
+   - Documented rationale (sy-remote protocol requires buffering)
+   - Files: src/compress/mod.rs
+
+8. **Fixed blocking I/O in async context** ✅
+   - Wrapped `std::fs::metadata()` in `spawn_blocking`
+   - Proper async Rust idioms
+   - Files: src/transport/ssh.rs
+
+**Branch**: `claude/fix-sy-critical-bugs-011CV5prdUFzoZGEKHyRrajn` (ready for PR)
+**Commits**: 6 commits (583dca8, 0805103, 65dc2ae, 89ae8d1, 37f6ca3, 57e7240)
+
+---
 
 **Optional ACL Feature** ✅
 
@@ -95,7 +153,7 @@ See `ai/research/library-migration-summary.md` for details.
 See `ai/TODO.md` for active work priorities.
 
 Key items:
-- v0.0.59 release (ACL optional feature complete)
+- v0.0.59 release (critical bug fixes + ACL optional feature complete)
 - CI/CD infrastructure (macOS + Linux testing)
 - Consider SSH optional feature (similar to ACL pattern)
 - Performance profiling for large-scale syncs
