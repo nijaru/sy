@@ -758,7 +758,7 @@ impl Transport for SshTransport {
                                 compression_mode.as_str()
                             );
 
-                            // Read entire file (compression only used for smaller files)
+                            // Read entire file (compression limited to files <256MB by should_compress_smart)
                             let file_data = std::fs::read(&source_path).map_err(|e| {
                                 SyncError::Io(std::io::Error::new(
                                     e.kind(),
@@ -1437,6 +1437,62 @@ impl Transport for SshTransport {
             }
         })
         .await
+    }
+
+    async fn compute_checksum(
+        &self,
+        path: &Path,
+        verifier: &crate::integrity::IntegrityVerifier,
+    ) -> Result<crate::integrity::Checksum> {
+        use crate::integrity::{Checksum, ChecksumType};
+
+        // Determine checksum type string for sy-remote
+        let checksum_type_str = match verifier.checksum_type() {
+            ChecksumType::None => return Ok(Checksum::None),
+            ChecksumType::Fast => "fast",
+            ChecksumType::Cryptographic => "cryptographic",
+        };
+
+        // Execute sy-remote file-checksum command remotely
+        let path_str = path.display().to_string();
+        // Escape path for shell by using single quotes (handles most special chars)
+        let escaped_path = format!("'{}'", path_str.replace('\'', r"'\''"));
+        let command = format!(
+            "sy-remote file-checksum {} --checksum-type {}",
+            escaped_path,
+            checksum_type_str
+        );
+
+        tracing::debug!("Computing remote checksum: {}", command);
+
+        let session_arc = self.connection_pool.get_session();
+        let output = self.execute_command_with_retry(session_arc, &command).await?;
+        let hex_checksum = output.trim();
+
+        // Parse hex string back to checksum
+        match verifier.checksum_type() {
+            ChecksumType::None => Ok(Checksum::None),
+            ChecksumType::Fast => {
+                // xxHash3 produces 8-byte (64-bit) hash
+                let bytes = hex::decode(hex_checksum).map_err(|e| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Failed to parse fast checksum '{}': {}",
+                        hex_checksum, e
+                    )))
+                })?;
+                Ok(Checksum::Fast(bytes))
+            }
+            ChecksumType::Cryptographic => {
+                // BLAKE3 produces 32-byte hash
+                let bytes = hex::decode(hex_checksum).map_err(|e| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Failed to parse cryptographic checksum '{}': {}",
+                        hex_checksum, e
+                    )))
+                })?;
+                Ok(Checksum::Cryptographic(bytes))
+            }
+        }
     }
 
     async fn write_file(

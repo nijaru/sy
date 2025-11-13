@@ -129,6 +129,13 @@ pub fn should_compress_adaptive(
         return Compression::None;
     }
 
+    // Skip very large files (would load entire file into RAM)
+    // Max 256MB for compression to avoid OOM on large files
+    const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
+    if file_size > MAX_COMPRESSIBLE_SIZE {
+        return Compression::None;
+    }
+
     // Skip already-compressed formats (jpg, mp4, zip, etc.)
     if is_compressed_extension(filename) {
         return Compression::None;
@@ -235,6 +242,13 @@ pub fn should_compress_smart(
 
     // Skip small files (overhead > benefit)
     if file_size < 1024 * 1024 {
+        return Compression::None;
+    }
+
+    // Skip very large files (would load entire file into RAM)
+    // Max 256MB for compression to avoid OOM on large files
+    const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
+    if file_size > MAX_COMPRESSIBLE_SIZE {
         return Compression::None;
     }
 

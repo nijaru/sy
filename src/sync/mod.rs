@@ -823,31 +823,20 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // For remote files, use transport layer to read and verify
+                                        // For remote files, use transport layer's streaming checksum
                                         let verification_result = if !dest_path.exists() {
-                                            // Remote destination - read via transport and verify
+                                            // Remote destination - use streaming checksum (no memory loading)
                                             tracing::debug!(
-                                                "Verifying remote file {} via transport layer",
+                                                "Verifying remote file {} via streaming checksum",
                                                 dest_path.display()
                                             );
 
-                                            match transport.read_file(dest_path).await {
-                                                Ok(dest_data) => {
-                                                    // Compute source checksum
-                                                    match verifier
-                                                        .compute_file_checksum(source_path)
-                                                    {
-                                                        Ok(source_checksum) => {
-                                                            // Compute dest checksum from data
-                                                            match verifier
-                                                                .compute_data_checksum(&dest_data)
-                                                            {
-                                                                Ok(dest_checksum) => {
-                                                                    Ok(source_checksum
-                                                                        == dest_checksum)
-                                                                }
-                                                                Err(e) => Err(e),
-                                                            }
+                                            // Compute checksums using streaming (avoids loading files into RAM)
+                                            match transport.compute_checksum(source_path, &verifier).await {
+                                                Ok(source_checksum) => {
+                                                    match transport.compute_checksum(dest_path, &verifier).await {
+                                                        Ok(dest_checksum) => {
+                                                            Ok(source_checksum == dest_checksum)
                                                         }
                                                         Err(e) => Err(e),
                                                     }
@@ -1001,31 +990,20 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // For remote files, use transport layer to read and verify
+                                        // For remote files, use transport layer's streaming checksum
                                         let verification_result = if !dest_path.exists() {
-                                            // Remote destination - read via transport and verify
+                                            // Remote destination - use streaming checksum (no memory loading)
                                             tracing::debug!(
-                                                "Verifying remote file {} via transport layer",
+                                                "Verifying remote file {} via streaming checksum",
                                                 dest_path.display()
                                             );
 
-                                            match transport.read_file(dest_path).await {
-                                                Ok(dest_data) => {
-                                                    // Compute source checksum
-                                                    match verifier
-                                                        .compute_file_checksum(source_path)
-                                                    {
-                                                        Ok(source_checksum) => {
-                                                            // Compute dest checksum from data
-                                                            match verifier
-                                                                .compute_data_checksum(&dest_data)
-                                                            {
-                                                                Ok(dest_checksum) => {
-                                                                    Ok(source_checksum
-                                                                        == dest_checksum)
-                                                                }
-                                                                Err(e) => Err(e),
-                                                            }
+                                            // Compute checksums using streaming (avoids loading files into RAM)
+                                            match transport.compute_checksum(source_path, &verifier).await {
+                                                Ok(source_checksum) => {
+                                                    match transport.compute_checksum(dest_path, &verifier).await {
+                                                        Ok(dest_checksum) => {
+                                                            Ok(source_checksum == dest_checksum)
                                                         }
                                                         Err(e) => Err(e),
                                                     }
@@ -1528,7 +1506,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Check if file exists in destination
             if let Some(dest_file) = dest_map.get(&rel_path) {
                 // File exists in both - compare checksums
-                match self.compare_checksums(&source_file.path, &dest_file.path, &verifier) {
+                match self.compare_checksums(&source_file.path, &dest_file.path, &verifier).await {
                     Ok(true) => {
                         // Checksums match
                         files_matched += 1;
@@ -1600,14 +1578,16 @@ impl<T: Transport + 'static> SyncEngine<T> {
     }
 
     /// Compare checksums of two files
-    fn compare_checksums(
+    async fn compare_checksums(
         &self,
         source_path: &Path,
         dest_path: &Path,
         verifier: &IntegrityVerifier,
     ) -> Result<bool> {
-        let source_checksum = verifier.compute_file_checksum(source_path)?;
-        let dest_checksum = verifier.compute_file_checksum(dest_path)?;
+        // Use transport's streaming checksum to avoid loading files into RAM
+        // Works correctly for both local and remote files
+        let source_checksum = self.transport.compute_checksum(source_path, verifier).await?;
+        let dest_checksum = self.transport.compute_checksum(dest_path, verifier).await?;
         Ok(source_checksum == dest_checksum)
     }
 
