@@ -690,7 +690,10 @@ impl Transport for SshTransport {
                         None
                     }
                 })
-            }).await.ok().flatten();
+            })
+            .await
+            .ok()
+            .flatten();
 
             if let Some(file_size) = sparse_check {
                 // Try sparse transfer
@@ -1468,14 +1471,15 @@ impl Transport for SshTransport {
         let escaped_path = format!("'{}'", path_str.replace('\'', r"'\''"));
         let command = format!(
             "sy-remote file-checksum {} --checksum-type {}",
-            escaped_path,
-            checksum_type_str
+            escaped_path, checksum_type_str
         );
 
         tracing::debug!("Computing remote checksum: {}", command);
 
         let session_arc = self.connection_pool.get_session();
-        let output = self.execute_command_with_retry(session_arc, &command).await?;
+        let output = self
+            .execute_command_with_retry(session_arc, &command)
+            .await?;
         let hex_checksum = output.trim();
 
         // Parse hex string back to checksum

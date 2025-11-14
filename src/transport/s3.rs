@@ -230,9 +230,12 @@ impl Transport for S3Transport {
                     break;
                 }
 
+                // write() is synchronous by design - it buffers data and starts uploads automatically
+                // Errors are reported via finish()
                 writer.write(&buffer[..bytes_read]);
             }
 
+            // finish() waits for all uploads to complete and reports any errors
             writer.finish().await.map_err(|e| {
                 SyncError::Io(std::io::Error::other(format!(
                     "Failed to complete multipart upload: {}",

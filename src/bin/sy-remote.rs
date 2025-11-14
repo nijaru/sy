@@ -154,13 +154,19 @@ fn main() -> anyhow::Result<()> {
             let checksums = compute_checksums(&path, block_size)?;
             println!("{}", serde_json::to_string(&checksums)?);
         }
-        Commands::FileChecksum { path, checksum_type } => {
+        Commands::FileChecksum {
+            path,
+            checksum_type,
+        } => {
             use sy::integrity::{ChecksumType, IntegrityVerifier};
 
             let csum_type = match checksum_type.as_str() {
                 "fast" => ChecksumType::Fast,
                 "cryptographic" => ChecksumType::Cryptographic,
-                _ => anyhow::bail!("Invalid checksum type: {}. Use 'fast' or 'cryptographic'", checksum_type),
+                _ => anyhow::bail!(
+                    "Invalid checksum type: {}. Use 'fast' or 'cryptographic'",
+                    checksum_type
+                ),
             };
 
             let verifier = IntegrityVerifier::new(csum_type, false);

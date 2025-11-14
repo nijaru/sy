@@ -227,7 +227,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // Clean up stale resume states (older than 7 days)
         // This prevents accumulation of abandoned resume states from failed/interrupted syncs
         if let Err(e) = crate::resume::TransferState::clear_stale_states(
-            std::time::Duration::from_secs(7 * 24 * 60 * 60)
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
         ) {
             tracing::warn!("Failed to clean up stale resume states: {}", e);
         }
@@ -598,7 +598,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 // CRITICAL SAFETY NET: Even with --force-delete, require confirmation for catastrophic deletions
                 // This prevents accidental destruction of large amounts of data
                 const CATASTROPHIC_THRESHOLD: usize = 10000;
-                if deletions.len() > CATASTROPHIC_THRESHOLD && !self.quiet && !self.json && !self.dry_run {
+                if deletions.len() > CATASTROPHIC_THRESHOLD
+                    && !self.quiet
+                    && !self.json
+                    && !self.dry_run
+                {
                     let warning_msg = if self.force_delete {
                         format!(
                             "🚨 CRITICAL WARNING: About to delete {} files with --force-delete!\n\
@@ -632,7 +636,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             "Deletion cancelled by user",
                         )));
                     }
-                } else if deletions.len() > 1000 && !self.force_delete && !self.quiet && !self.json {
+                } else if deletions.len() > 1000
+                    && !self.force_delete
+                    && !self.quiet
+                    && !self.json
+                    && !self.dry_run
+                {
                     // Standard confirmation for large deletions (without --force-delete)
                     eprintln!(
                         "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
@@ -877,9 +886,15 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             );
 
                                             // Compute checksums using streaming (avoids loading files into RAM)
-                                            match transport.compute_checksum(source_path, &verifier).await {
+                                            match transport
+                                                .compute_checksum(source_path, &verifier)
+                                                .await
+                                            {
                                                 Ok(source_checksum) => {
-                                                    match transport.compute_checksum(dest_path, &verifier).await {
+                                                    match transport
+                                                        .compute_checksum(dest_path, &verifier)
+                                                        .await
+                                                    {
                                                         Ok(dest_checksum) => {
                                                             Ok(source_checksum == dest_checksum)
                                                         }
@@ -1044,9 +1059,15 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             );
 
                                             // Compute checksums using streaming (avoids loading files into RAM)
-                                            match transport.compute_checksum(source_path, &verifier).await {
+                                            match transport
+                                                .compute_checksum(source_path, &verifier)
+                                                .await
+                                            {
                                                 Ok(source_checksum) => {
-                                                    match transport.compute_checksum(dest_path, &verifier).await {
+                                                    match transport
+                                                        .compute_checksum(dest_path, &verifier)
+                                                        .await
+                                                    {
                                                         Ok(dest_checksum) => {
                                                             Ok(source_checksum == dest_checksum)
                                                         }
@@ -1551,7 +1572,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Check if file exists in destination
             if let Some(dest_file) = dest_map.get(&rel_path) {
                 // File exists in both - compare checksums
-                match self.compare_checksums(&source_file.path, &dest_file.path, &verifier).await {
+                match self
+                    .compare_checksums(&source_file.path, &dest_file.path, &verifier)
+                    .await
+                {
                     Ok(true) => {
                         // Checksums match
                         files_matched += 1;
@@ -1631,7 +1655,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
     ) -> Result<bool> {
         // Use transport's streaming checksum to avoid loading files into RAM
         // Works correctly for both local and remote files
-        let source_checksum = self.transport.compute_checksum(source_path, verifier).await?;
+        let source_checksum = self
+            .transport
+            .compute_checksum(source_path, verifier)
+            .await?;
         let dest_checksum = self.transport.compute_checksum(dest_path, verifier).await?;
         Ok(source_checksum == dest_checksum)
     }
