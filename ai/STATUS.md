@@ -3,22 +3,21 @@
 _Last Updated: 2025-11-13_
 
 ## Current State
-- Version: v0.0.59 (in progress) 🚧
-- Latest Work: **Critical bug fixes** - Fixed 4 critical memory and data safety bugs
-- Previous: Optional ACL feature, Pure Rust library migrations (fjall + object_store)
-- Test Coverage: **453 tests passing** ✅
-  - **Library tests**: 453 passing (core functionality)
-  - **SSH tests**: 48 tests (12 ignored - require SSH setup)
+- Version: v0.0.60 ✅
+- Latest Release: **v0.0.60** - Critical memory bug fixes + Optional ACL feature
+- Test Coverage: **464 tests passing** ✅
+  - **Library tests**: 464 passing (core functionality)
+  - **SSH tests**: 12 ignored (require SSH setup)
   - **Platform validation**:
-    - macOS: tests expected to pass ✅
-    - Linux (Fedora): tests expected to pass ✅
+    - macOS: tests passing ✅
+    - Linux (Fedora): tests passing ✅
 - Build: Passing (cargo clippy clean with --all-features)
-- Performance: 2-11x faster than rsync (see docs/BENCHMARK_RESULTS.md)
+- Performance: 2-11x faster than rsync
 - Memory: 5000x better for large file verification (10GB file: 10GB RAM → 2MB RAM)
 
-## v0.0.59 (In Progress)
+## v0.0.60 Release Notes
 
-**Critical Bug Fixes** ✅ (PR #2)
+**Critical Bug Fixes** ✅ (PR #2 - Merged)
 
 Fixed 4 critical bugs causing OOM errors and data safety issues:
 
@@ -71,12 +70,11 @@ Fixed 4 critical bugs causing OOM errors and data safety issues:
    - Proper async Rust idioms
    - Files: src/transport/ssh.rs
 
-**Branch**: `claude/fix-sy-critical-bugs-011CV5prdUFzoZGEKHyRrajn` (ready for PR)
-**Commits**: 6 commits (583dca8, 0805103, 65dc2ae, 89ae8d1, 37f6ca3, 57e7240)
+**Merged**: PR #2 (commit 5d3ce3d)
 
 ---
 
-**Optional ACL Feature** ✅
+**Optional ACL Feature** ✅ (PR #8 - Merged)
 
 Made ACL preservation optional to eliminate system dependencies on Linux:
 
@@ -105,7 +103,7 @@ Made ACL preservation optional to eliminate system dependencies on Linux:
 - Users who need ACL preservation: `cargo install sy --features acl`
 - Follows same pattern as S3: opt-in features for advanced use cases
 
-**Branch**: `feat/optional-acls` (ready for PR)
+**Merged**: PR #8 (commit fb94264)
 
 ## v0.0.58 Release Notes
 
@@ -153,7 +151,7 @@ See `ai/research/library-migration-summary.md` for details.
 See `ai/TODO.md` for active work priorities.
 
 Key items:
-- v0.0.59 release (critical bug fixes + ACL optional feature complete)
-- CI/CD infrastructure (macOS + Linux testing)
+- CI/CD infrastructure (macOS + Linux testing) - Next priority
 - Consider SSH optional feature (similar to ACL pattern)
 - Performance profiling for large-scale syncs
+- Auto-deploy sy-remote on SSH connections

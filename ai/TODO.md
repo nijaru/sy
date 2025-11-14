@@ -6,35 +6,18 @@ _Last Updated: 2025-11-13_
 
 ### High Priority
 
-- [ ] **Release v0.0.59** (Blocked on PRs)
-  - [ ] Merge PR #2 (critical bug fixes)
-    - [x] Critical bug fixes complete (memory, checksums, resume, force-delete)
-    - [x] Performance improvements (DualTransport, S3, compression limit)
-    - [x] All clippy warnings resolved
-    - [ ] Wait for CI to pass
-    - [ ] Merge PR
-  - [ ] Merge PR for ACL feature
-    - [x] ACL optional feature complete
-    - [x] All tests passing (465 tests)
-    - [x] Docker portability tests passing
-    - [x] Documentation updated (README, CONTRIBUTING)
-    - [ ] Create PR for `feat/optional-acls`
-    - [ ] Wait for CI to pass
-    - [ ] Merge PR
-  - [ ] Update CHANGELOG.md
-  - [ ] Tag and release
-
-- [ ] **CI/CD Infrastructure** (v0.0.60)
+- [ ] **CI/CD Infrastructure** (Next release)
   - [ ] Create simplified CI workflow for macOS + Linux
   - [ ] Run tests on 2 platforms (ubuntu-latest, macos-latest)
   - [ ] Add clippy and rustfmt checks
   - [ ] Keep it simple - no multi-version testing, no coverage reports
   - [ ] Document Windows as untested (experimental support)
   - **Goal**: Catch cross-platform regressions automatically
+  - **Context**: Currently no CI - all testing is manual
 
 ### Medium Priority
 
-- [ ] **Optional Features for Portability** (v0.0.60)
+- [ ] **Optional Features for Portability** (Next release)
   - [ ] SSH optional but default (`default = ["ssh"]`)
     - Makes local-only builds possible with zero system deps
     - Requires libssh2 on Linux when enabled
@@ -95,9 +78,16 @@ _Last Updated: 2025-11-13_
   - [ ] Test NTFS-specific features
   - [ ] Verify extended attributes work correctly
 
-## Recently Completed (v0.0.59)
+## Recently Completed (v0.0.60)
 
-- [x] **Critical Bug Fixes** ✅ (PR #2, branch: `claude/fix-sy-critical-bugs-011CV5prdUFzoZGEKHyRrajn`)
+- [x] **Release v0.0.60** ✅
+  - [x] Merged PR #2 (critical bug fixes)
+  - [x] Merged PR #8 (optional ACL feature)
+  - [x] Updated CHANGELOG.md
+  - [x] Tagged and released v0.0.60
+  - **Released**: 2025-11-13
+
+- [x] **Critical Bug Fixes** ✅ (PR #2 - Merged commit 5d3ce3d)
   - [x] Fixed memory bug in file verification (10GB RAM → 2MB RAM)
   - [x] Fixed remote checksum failure (added sy-remote file-checksum)
   - [x] Fixed stale resume states (7-day auto-cleanup)
@@ -108,21 +98,15 @@ _Last Updated: 2025-11-13_
   - [x] Fixed blocking I/O in async context
   - **Impact**: Production-ready for large files (GB+ sizes)
 
-- [x] **Optional ACL Feature** ✅ (GitHub Issue #7)
+- [x] **Optional ACL Feature** ✅ (PR #8 - Merged commit fb94264)
   - [x] Made ACL preservation optional via `--features acl`
   - [x] Eliminated libacl system dependency for default builds
   - [x] Platform support: Linux (build-time libacl), macOS (native)
   - [x] Created Docker portability test suite (`scripts/test-acl-portability.sh`)
   - [x] Updated documentation (README, CONTRIBUTING)
   - [x] Clear runtime error messages for missing feature
+  - [x] Merged to main
   - **Impact**: `cargo install sy` now works on all Linux systems without libacl
-  - **Branch**: `feat/optional-acls`
-
-- [x] **AI Context Cleanup** ✅
-  - [x] Deleted 13 obsolete research docs (completed features)
-  - [x] Kept 2 current docs (library-migration-summary, database-comparisons)
-  - [x] Updated STATUS.md, TODO.md, DECISIONS.md with ACL work
-  - **Result**: Cleaner, more maintainable ai/ directory
 
 ## Recently Completed (v0.0.58)
 

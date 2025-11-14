@@ -17,9 +17,9 @@
 **sy** (pronounced "sigh") is a fast, modern file synchronization tool written in Rust - a reimagining of rsync with adaptive performance and verifiable integrity.
 
 - **Language**: Rust (edition 2021)
-- **Status**: v0.0.58 (released 2025-11-11)
+- **Status**: v0.0.60 (released 2025-11-13)
 - **Performance**: 2-11x faster than rsync for local operations
-- **Tests**: 465 passing, 12 ignored (SSH agent tests)
+- **Tests**: 464 passing, 12 ignored (SSH agent tests)
 - **License**: MIT
 - **Key Features**: Delta sync, parallel transfers, SSH, sparse files, bidirectional sync, S3/cloud storage (experimental)
 
@@ -117,15 +117,15 @@ cargo build --release
 
 ## Current Focus
 
-**Active**: v0.0.58 pure Rust migrations complete
-- ✅ fjall (pure Rust LSM-tree database)
-- ✅ object_store (multi-cloud API)
-- ✅ 465 tests passing
+**Latest**: v0.0.60 released (2025-11-13)
+- ✅ Critical memory bug fixes (5000x better for large files)
+- ✅ Optional ACL feature (zero system dependencies by default)
+- ✅ 464 tests passing
 
 **Next**: See `ai/TODO.md` for priorities
-- v0.0.58 release
 - CI/CD infrastructure (macOS + Linux)
-- russh migration evaluation (on hold - SSH agent auth issues)
+- Optional SSH feature (similar to ACL pattern)
+- Performance profiling for large-scale syncs
 
 ## Known Issues & Gotchas
 
@@ -204,5 +204,5 @@ All tests must pass before merge: `cargo test && cargo clippy -- -D warnings`
 
 ---
 
-**Version**: v0.0.58 (Last updated: 2025-11-11)
+**Version**: v0.0.60 (Last updated: 2025-11-13)
 **Follows**: [agent-contexts v0.1.1](https://github.com/nijaru/agent-contexts)
