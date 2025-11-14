@@ -224,6 +224,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
             destination.display()
         );
 
+        // Clean up stale resume states (older than 7 days)
+        // This prevents accumulation of abandoned resume states from failed/interrupted syncs
+        if let Err(e) = crate::resume::TransferState::clear_stale_states(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        ) {
+            tracing::warn!("Failed to clean up stale resume states: {}", e);
+        }
+
         // Ensure destination directory exists before any operations
         // This is critical for remote syncs where the destination path may not exist yet
         if !self.dry_run {
@@ -550,14 +558,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let deletions = planner.plan_deletions(&source_files, destination);
 
             // Apply deletion safety checks
-            if !deletions.is_empty() && !self.force_delete {
+            if !deletions.is_empty() {
                 let dest_file_count = scanner::Scanner::new(destination)
                     .scan()
                     .map(|files| files.len())
                     .unwrap_or(0);
 
                 // Check threshold: prevent mass deletion
-                if dest_file_count > 0 {
+                if dest_file_count > 0 && !self.force_delete {
                     let delete_percentage =
                         (deletions.len() as f64 / dest_file_count as f64) * 100.0;
 
@@ -587,12 +595,74 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     }
                 }
 
-                // Check count threshold: warn if deleting many files
-                if deletions.len() > 1000 && !self.quiet && !self.json {
+                // CRITICAL SAFETY NET: Even with --force-delete, require confirmation for catastrophic deletions
+                // This prevents accidental destruction of large amounts of data
+                const CATASTROPHIC_THRESHOLD: usize = 10000;
+                if deletions.len() > CATASTROPHIC_THRESHOLD
+                    && !self.quiet
+                    && !self.json
+                    && !self.dry_run
+                {
+                    let warning_msg = if self.force_delete {
+                        format!(
+                            "🚨 CRITICAL WARNING: About to delete {} files with --force-delete!\n\
+                             This will PERMANENTLY DELETE a large amount of data.\n\
+                             Type 'DELETE {}' to confirm (case-sensitive): ",
+                            deletions.len(),
+                            deletions.len()
+                        )
+                    } else {
+                        format!(
+                            "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
+                            deletions.len()
+                        )
+                    };
+
+                    eprintln!("{}", warning_msg);
+
+                    // Check if stdin is a TTY before prompting to avoid hanging on non-interactive input
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Cannot prompt for deletion confirmation: stdin is not a terminal",
+                        )));
+                    }
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+
+                    let confirmed = if self.force_delete {
+                        // Require exact confirmation string for catastrophic deletions
+                        input.trim() == format!("DELETE {}", deletions.len())
+                    } else {
+                        input.trim().eq_ignore_ascii_case("y")
+                    };
+
+                    if !confirmed {
+                        tracing::info!("Deletion cancelled by user");
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Deletion cancelled by user",
+                        )));
+                    }
+                } else if deletions.len() > 1000
+                    && !self.force_delete
+                    && !self.quiet
+                    && !self.json
+                    && !self.dry_run
+                {
+                    // Standard confirmation for large deletions (without --force-delete)
                     eprintln!(
                         "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
                         deletions.len()
                     );
+
+                    // Check if stdin is a TTY before prompting to avoid hanging on non-interactive input
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Cannot prompt for deletion confirmation: stdin is not a terminal",
+                        )));
+                    }
 
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
@@ -823,31 +893,26 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // For remote files, use transport layer to read and verify
+                                        // For remote files, use transport layer's streaming checksum
                                         let verification_result = if !dest_path.exists() {
-                                            // Remote destination - read via transport and verify
+                                            // Remote destination - use streaming checksum (no memory loading)
                                             tracing::debug!(
-                                                "Verifying remote file {} via transport layer",
+                                                "Verifying remote file {} via streaming checksum",
                                                 dest_path.display()
                                             );
 
-                                            match transport.read_file(dest_path).await {
-                                                Ok(dest_data) => {
-                                                    // Compute source checksum
-                                                    match verifier
-                                                        .compute_file_checksum(source_path)
+                                            // Compute checksums using streaming (avoids loading files into RAM)
+                                            match transport
+                                                .compute_checksum(source_path, &verifier)
+                                                .await
+                                            {
+                                                Ok(source_checksum) => {
+                                                    match transport
+                                                        .compute_checksum(dest_path, &verifier)
+                                                        .await
                                                     {
-                                                        Ok(source_checksum) => {
-                                                            // Compute dest checksum from data
-                                                            match verifier
-                                                                .compute_data_checksum(&dest_data)
-                                                            {
-                                                                Ok(dest_checksum) => {
-                                                                    Ok(source_checksum
-                                                                        == dest_checksum)
-                                                                }
-                                                                Err(e) => Err(e),
-                                                            }
+                                                        Ok(dest_checksum) => {
+                                                            Ok(source_checksum == dest_checksum)
                                                         }
                                                         Err(e) => Err(e),
                                                     }
@@ -1001,31 +1066,26 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         let source_path = &source.path;
                                         let dest_path = &task.dest_path;
 
-                                        // For remote files, use transport layer to read and verify
+                                        // For remote files, use transport layer's streaming checksum
                                         let verification_result = if !dest_path.exists() {
-                                            // Remote destination - read via transport and verify
+                                            // Remote destination - use streaming checksum (no memory loading)
                                             tracing::debug!(
-                                                "Verifying remote file {} via transport layer",
+                                                "Verifying remote file {} via streaming checksum",
                                                 dest_path.display()
                                             );
 
-                                            match transport.read_file(dest_path).await {
-                                                Ok(dest_data) => {
-                                                    // Compute source checksum
-                                                    match verifier
-                                                        .compute_file_checksum(source_path)
+                                            // Compute checksums using streaming (avoids loading files into RAM)
+                                            match transport
+                                                .compute_checksum(source_path, &verifier)
+                                                .await
+                                            {
+                                                Ok(source_checksum) => {
+                                                    match transport
+                                                        .compute_checksum(dest_path, &verifier)
+                                                        .await
                                                     {
-                                                        Ok(source_checksum) => {
-                                                            // Compute dest checksum from data
-                                                            match verifier
-                                                                .compute_data_checksum(&dest_data)
-                                                            {
-                                                                Ok(dest_checksum) => {
-                                                                    Ok(source_checksum
-                                                                        == dest_checksum)
-                                                                }
-                                                                Err(e) => Err(e),
-                                                            }
+                                                        Ok(dest_checksum) => {
+                                                            Ok(source_checksum == dest_checksum)
                                                         }
                                                         Err(e) => Err(e),
                                                     }
@@ -1528,7 +1588,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Check if file exists in destination
             if let Some(dest_file) = dest_map.get(&rel_path) {
                 // File exists in both - compare checksums
-                match self.compare_checksums(&source_file.path, &dest_file.path, &verifier) {
+                match self
+                    .compare_checksums(&source_file.path, &dest_file.path, &verifier)
+                    .await
+                {
                     Ok(true) => {
                         // Checksums match
                         files_matched += 1;
@@ -1600,14 +1663,19 @@ impl<T: Transport + 'static> SyncEngine<T> {
     }
 
     /// Compare checksums of two files
-    fn compare_checksums(
+    async fn compare_checksums(
         &self,
         source_path: &Path,
         dest_path: &Path,
         verifier: &IntegrityVerifier,
     ) -> Result<bool> {
-        let source_checksum = verifier.compute_file_checksum(source_path)?;
-        let dest_checksum = verifier.compute_file_checksum(dest_path)?;
+        // Use transport's streaming checksum to avoid loading files into RAM
+        // Works correctly for both local and remote files
+        let source_checksum = self
+            .transport
+            .compute_checksum(source_path, verifier)
+            .await?;
+        let dest_checksum = self.transport.compute_checksum(dest_path, verifier).await?;
         Ok(source_checksum == dest_checksum)
     }
 

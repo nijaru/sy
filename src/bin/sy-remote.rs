@@ -30,6 +30,14 @@ enum Commands {
         #[arg(long)]
         block_size: usize,
     },
+    /// Compute file checksum (for verification)
+    FileChecksum {
+        /// File to compute checksum for
+        path: PathBuf,
+        /// Checksum type: "fast" (xxHash3) or "cryptographic" (BLAKE3)
+        #[arg(long, default_value = "fast")]
+        checksum_type: String,
+    },
     /// Apply delta operations to a file (reads delta JSON from stdin)
     ApplyDelta {
         /// Existing file to apply delta to
@@ -145,6 +153,27 @@ fn main() -> anyhow::Result<()> {
         Commands::Checksums { path, block_size } => {
             let checksums = compute_checksums(&path, block_size)?;
             println!("{}", serde_json::to_string(&checksums)?);
+        }
+        Commands::FileChecksum {
+            path,
+            checksum_type,
+        } => {
+            use sy::integrity::{ChecksumType, IntegrityVerifier};
+
+            let csum_type = match checksum_type.as_str() {
+                "fast" => ChecksumType::Fast,
+                "cryptographic" => ChecksumType::Cryptographic,
+                _ => anyhow::bail!(
+                    "Invalid checksum type: {}. Use 'fast' or 'cryptographic'",
+                    checksum_type
+                ),
+            };
+
+            let verifier = IntegrityVerifier::new(csum_type, false);
+            let checksum = verifier.compute_file_checksum(&path)?;
+
+            // Output checksum as hex string
+            println!("{}", checksum.to_hex());
         }
         Commands::ApplyDelta {
             base_file,

@@ -1,19 +1,26 @@
 # TODO
 
-_Last Updated: 2025-11-12_
+_Last Updated: 2025-11-13_
 
 ## Active Work
 
 ### High Priority
 
-- [ ] **Release v0.0.59** (Ready)
-  - [x] ACL optional feature complete
-  - [x] All tests passing (465 tests)
-  - [x] Docker portability tests passing
-  - [x] Documentation updated (README, CONTRIBUTING)
-  - [ ] Create PR for `feat/optional-acls`
-  - [ ] Wait for CI to pass
-  - [ ] Merge PR
+- [ ] **Release v0.0.59** (Blocked on PRs)
+  - [ ] Merge PR #2 (critical bug fixes)
+    - [x] Critical bug fixes complete (memory, checksums, resume, force-delete)
+    - [x] Performance improvements (DualTransport, S3, compression limit)
+    - [x] All clippy warnings resolved
+    - [ ] Wait for CI to pass
+    - [ ] Merge PR
+  - [ ] Merge PR for ACL feature
+    - [x] ACL optional feature complete
+    - [x] All tests passing (465 tests)
+    - [x] Docker portability tests passing
+    - [x] Documentation updated (README, CONTRIBUTING)
+    - [ ] Create PR for `feat/optional-acls`
+    - [ ] Wait for CI to pass
+    - [ ] Merge PR
   - [ ] Update CHANGELOG.md
   - [ ] Tag and release
 
@@ -89,6 +96,17 @@ _Last Updated: 2025-11-12_
   - [ ] Verify extended attributes work correctly
 
 ## Recently Completed (v0.0.59)
+
+- [x] **Critical Bug Fixes** ✅ (PR #2, branch: `claude/fix-sy-critical-bugs-011CV5prdUFzoZGEKHyRrajn`)
+  - [x] Fixed memory bug in file verification (10GB RAM → 2MB RAM)
+  - [x] Fixed remote checksum failure (added sy-remote file-checksum)
+  - [x] Fixed stale resume states (7-day auto-cleanup)
+  - [x] Fixed unsafe force-delete (10K file threshold + explicit confirmation)
+  - [x] Optimized DualTransport (5GB RAM → 2MB RAM for Local→SSH)
+  - [x] Added S3 streaming uploads (10GB RAM → 5MB RAM)
+  - [x] Added compression size limit (256MB)
+  - [x] Fixed blocking I/O in async context
+  - **Impact**: Production-ready for large files (GB+ sizes)
 
 - [x] **Optional ACL Feature** ✅ (GitHub Issue #7)
   - [x] Made ACL preservation optional via `--features acl`

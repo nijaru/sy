@@ -46,6 +46,39 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Compress data from a reader to a writer (streaming)
+///
+/// This avoids loading the entire file into memory by compressing in chunks.
+/// Suitable for large files that would otherwise cause OOM.
+#[allow(dead_code)] // Reserved for future use if sy-remote protocol is redesigned
+pub fn compress_streaming<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    compression: Compression,
+) -> io::Result<()> {
+    match compression {
+        Compression::None => {
+            // No compression, just copy
+            std::io::copy(reader, writer)?;
+            Ok(())
+        }
+        Compression::Lz4 => {
+            // LZ4 frame format supports streaming
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(writer);
+            std::io::copy(reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(())
+        }
+        Compression::Zstd => {
+            // Zstd supports streaming natively
+            let mut encoder = zstd::Encoder::new(writer, 3)?;
+            std::io::copy(reader, &mut encoder)?;
+            encoder.finish()?;
+            Ok(())
+        }
+    }
+}
+
 /// Decompress data (used by sy-remote binary)
 #[allow(dead_code)] // Used by sy-remote binary, not library code
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
@@ -126,6 +159,21 @@ pub fn should_compress_adaptive(
 
     // Skip small files (overhead > benefit)
     if file_size < 1024 * 1024 {
+        return Compression::None;
+    }
+
+    // Skip very large files (would load entire file into RAM)
+    // Max 256MB for compression to avoid OOM on large files
+    //
+    // WHY THIS LIMIT:
+    // - sy-remote receive-file protocol requires buffering entire compressed data
+    // - Files >256MB use SFTP instead (already efficient, chunks internally)
+    // - True streaming compression would require protocol redesign
+    // - 256MB covers 99% of compressible files (logs, code, text files)
+    //
+    // NOTE: compress_streaming() exists for future use if protocol supports it
+    const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
+    if file_size > MAX_COMPRESSIBLE_SIZE {
         return Compression::None;
     }
 
@@ -235,6 +283,21 @@ pub fn should_compress_smart(
 
     // Skip small files (overhead > benefit)
     if file_size < 1024 * 1024 {
+        return Compression::None;
+    }
+
+    // Skip very large files (would load entire file into RAM)
+    // Max 256MB for compression to avoid OOM on large files
+    //
+    // WHY THIS LIMIT:
+    // - sy-remote receive-file protocol requires buffering entire compressed data
+    // - Files >256MB use SFTP instead (already efficient, chunks internally)
+    // - True streaming compression would require protocol redesign
+    // - 256MB covers 99% of compressible files (logs, code, text files)
+    //
+    // NOTE: compress_streaming() exists for future use if protocol supports it
+    const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
+    if file_size > MAX_COMPRESSIBLE_SIZE {
         return Compression::None;
     }
 

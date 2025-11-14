@@ -677,31 +677,43 @@ impl Transport for SshTransport {
         {
             use std::os::unix::fs::MetadataExt;
 
-            if let Ok(metadata) = std::fs::metadata(source) {
-                let file_size = metadata.len();
-                let allocated_size = metadata.blocks() * 512;
-                let is_sparse = allocated_size < file_size && file_size > 0;
+            // Check if source is sparse (requires blocking I/O)
+            let source_buf = source.to_path_buf();
+            let sparse_check = tokio::task::spawn_blocking(move || {
+                std::fs::metadata(&source_buf).ok().and_then(|metadata| {
+                    let file_size = metadata.len();
+                    let allocated_size = metadata.blocks() * 512;
+                    let is_sparse = allocated_size < file_size && file_size > 0;
+                    if is_sparse {
+                        Some(file_size)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .await
+            .ok()
+            .flatten();
 
-                if is_sparse {
-                    // Try sparse transfer
-                    match self.copy_sparse_file(source, dest).await {
-                        Ok(result) => {
-                            tracing::info!(
-                                "Sparse transfer succeeded for {} ({} file size, {} transferred)",
-                                source.display(),
-                                file_size,
-                                result.transferred_bytes.unwrap_or(file_size)
-                            );
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Sparse transfer failed for {}, falling back to regular copy: {}",
-                                source.display(),
-                                e
-                            );
-                            // Fall through to regular transfer
-                        }
+            if let Some(file_size) = sparse_check {
+                // Try sparse transfer
+                match self.copy_sparse_file(source, dest).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Sparse transfer succeeded for {} ({} file size, {} transferred)",
+                            source.display(),
+                            file_size,
+                            result.transferred_bytes.unwrap_or(file_size)
+                        );
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Sparse transfer failed for {}, falling back to regular copy: {}",
+                            source.display(),
+                            e
+                        );
+                        // Fall through to regular transfer
                     }
                 }
             }
@@ -758,7 +770,7 @@ impl Transport for SshTransport {
                                 compression_mode.as_str()
                             );
 
-                            // Read entire file (compression only used for smaller files)
+                            // Read entire file (compression limited to files <256MB by should_compress_smart)
                             let file_data = std::fs::read(&source_path).map_err(|e| {
                                 SyncError::Io(std::io::Error::new(
                                     e.kind(),
@@ -1437,6 +1449,75 @@ impl Transport for SshTransport {
             }
         })
         .await
+    }
+
+    async fn compute_checksum(
+        &self,
+        path: &Path,
+        verifier: &crate::integrity::IntegrityVerifier,
+    ) -> Result<crate::integrity::Checksum> {
+        use crate::integrity::{Checksum, ChecksumType};
+
+        // Determine checksum type string for sy-remote
+        let checksum_type_str = match verifier.checksum_type() {
+            ChecksumType::None => return Ok(Checksum::None),
+            ChecksumType::Fast => "fast",
+            ChecksumType::Cryptographic => "cryptographic",
+        };
+
+        // Execute sy-remote file-checksum command remotely
+        let path_str = path.display().to_string();
+        // Escape path for shell by using single quotes (handles most special chars)
+        let escaped_path = format!("'{}'", path_str.replace('\'', r"'\''"));
+        let command = format!(
+            "sy-remote file-checksum {} --checksum-type {}",
+            escaped_path, checksum_type_str
+        );
+
+        tracing::debug!("Computing remote checksum: {}", command);
+
+        let session_arc = self.connection_pool.get_session();
+        let output = self
+            .execute_command_with_retry(session_arc, &command)
+            .await?;
+        let hex_checksum = output.trim();
+
+        // Parse hex string back to checksum
+        match verifier.checksum_type() {
+            ChecksumType::None => Ok(Checksum::None),
+            ChecksumType::Fast => {
+                // xxHash3 produces 8-byte (64-bit) hash
+                let bytes = hex::decode(hex_checksum).map_err(|e| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Failed to parse fast checksum '{}': {}",
+                        hex_checksum, e
+                    )))
+                })?;
+                if bytes.len() != 8 {
+                    return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid fast checksum length: expected 8 bytes, got {}",
+                        bytes.len()
+                    ))));
+                }
+                Ok(Checksum::Fast(bytes))
+            }
+            ChecksumType::Cryptographic => {
+                // BLAKE3 produces 32-byte hash
+                let bytes = hex::decode(hex_checksum).map_err(|e| {
+                    crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Failed to parse cryptographic checksum '{}': {}",
+                        hex_checksum, e
+                    )))
+                })?;
+                if bytes.len() != 32 {
+                    return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid cryptographic checksum length: expected 32 bytes, got {}",
+                        bytes.len()
+                    ))));
+                }
+                Ok(Checksum::Cryptographic(bytes))
+            }
+        }
     }
 
     async fn write_file(

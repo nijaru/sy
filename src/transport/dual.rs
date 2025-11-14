@@ -51,8 +51,15 @@ impl Transport for DualTransport {
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
-        // Cross-transport copy: read from source transport, write to dest transport
-        // This is the proper way to handle cross-transport file copies
+        // Cross-transport copy
+        //
+        // OPTIMIZATION: For many transports (especially SSH), they have efficient
+        // implementations that can transfer directly from local filesystem to remote
+        // without loading entire file into memory.
+        //
+        // Try destination transport's copy_file first (works for local→remote where
+        // dest is SSH and can read source directly from local filesystem via SFTP).
+        // Fall back to read_file + write_file if that fails.
 
         tracing::debug!(
             "DualTransport: copying {} to {}",
@@ -60,14 +67,37 @@ impl Transport for DualTransport {
             dest.display()
         );
 
-        // Read file from source transport
+        // Try destination transport's copy_file first
+        // This works for local→remote where SshTransport can efficiently
+        // read from local filesystem and stream via SFTP
+        match self.dest.copy_file(source, dest).await {
+            Ok(result) => {
+                tracing::debug!(
+                    "DualTransport: copy succeeded via destination transport (efficient path)"
+                );
+                return Ok(result);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "DualTransport: destination transport copy failed ({}), falling back to read+write",
+                    e
+                );
+                // Fall through to read+write approach
+            }
+        }
+
+        // Fallback: Read from source, write to dest (loads entire file into memory)
+        // This is needed for:
+        // - Remote→Local (source is remote, must download first)
+        // - Remote→Remote (unavoidable buffering)
+        tracing::debug!(
+            "DualTransport: using memory-buffered copy for {} (may be slow for large files)",
+            source.display()
+        );
+
         let data = self.source.read_file(source).await?;
         let bytes_written = data.len() as u64;
-
-        // Get modification time from source
         let mtime = self.source.get_mtime(source).await?;
-
-        // Write to destination transport (write_file handles parent directory creation)
         self.dest.write_file(dest, &data, mtime).await?;
 
         Ok(TransferResult::new(bytes_written))

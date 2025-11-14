@@ -361,7 +361,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         {
             // BSD flags only supported on macOS
             let _ = (file_entry, dest_path);
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(target_os = "macos")]

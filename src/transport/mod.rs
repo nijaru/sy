@@ -167,6 +167,27 @@ pub trait Transport: Send + Sync {
         })
     }
 
+    /// Compute checksum of a file using streaming (avoids loading entire file into memory)
+    ///
+    /// This method allows each transport to implement efficient checksum computation
+    /// without loading the entire file into RAM. For local files, reads in chunks.
+    /// For remote files, can use remote commands or streaming transfer.
+    ///
+    /// Default implementation uses the IntegrityVerifier's compute_file_checksum,
+    /// which already uses streaming for local files.
+    async fn compute_checksum(
+        &self,
+        path: &Path,
+        verifier: &crate::integrity::IntegrityVerifier,
+    ) -> Result<crate::integrity::Checksum> {
+        // Default implementation: use IntegrityVerifier (works for local files)
+        let path = path.to_path_buf();
+        let verifier = verifier.clone();
+        tokio::task::spawn_blocking(move || verifier.compute_file_checksum(&path))
+            .await
+            .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
+
     /// Write file contents from a vector
     ///
     /// This is used for cross-transport operations (e.g., remote→local).

@@ -28,6 +28,7 @@ pub struct FileEntry {
     pub inode: Option<u64>,                       // Inode number (Unix only)
     pub nlink: u64,                               // Number of hard links to this file
     pub acls: Option<Vec<u8>>,                    // Serialized ACLs (if enabled)
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Only read on macOS
     pub bsd_flags: Option<u32>, // BSD file flags (hidden, immutable, etc.) - macOS only, None on other platforms
 }
 
