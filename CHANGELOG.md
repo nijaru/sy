@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.60] - 2025-11-13
+
+### Fixed
+- **Critical memory bugs** - Streaming fixes for large file operations
+  - File verification OOM: Large files loaded entirely into RAM during checksum verification. Now uses streaming with 1MB chunks (10GB file: 10GB RAM → 2MB RAM)
+  - Remote checksum failure: `--checksum` mode didn't work for remote paths. Added `sy-remote file-checksum` command for SSH
+  - DualTransport optimization: Smart delegation avoids buffering when destination supports streaming (Local→SSH: 5GB RAM → 2MB RAM)
+  - S3 streaming uploads: Large files now use multipart uploads with 5MB chunks instead of loading entire file
+  - Fixed blocking I/O: Wrapped `std::fs` calls in `spawn_blocking` for proper async behavior
+
+### Added
+- **Data safety improvements**
+  - Stale resume state cleanup: Failed syncs left resume state files accumulating. Auto-cleanup after 7 days
+  - Catastrophic deletion safeguard: `--force-delete` now requires explicit confirmation for >10K files: `"DELETE <count>"`
+  - stdin TTY checks: Prevents hanging on non-interactive input (CI/CD environments)
+  - Checksum validation: xxHash3 (8 bytes) and BLAKE3 (32 bytes) length validation
+
+### Changed
+- Compression size limit: Added 256MB limit to prevent OOM on huge files
+- Reduced log noise: DualTransport fallback changed from warn to debug level
+- Removed unused tokio-util dependency
+
+### Testing
+- 465 tests passing (12 ignored - SSH agent setup required)
+
 ## [0.0.59] - 2025-11-12
 
 ### Changed
