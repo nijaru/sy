@@ -90,7 +90,7 @@ impl Transport for DualTransport {
         // This is needed for:
         // - Remote→Local (source is remote, must download first)
         // - Remote→Remote (unavoidable buffering)
-        tracing::warn!(
+        tracing::debug!(
             "DualTransport: using memory-buffered copy for {} (may be slow for large files)",
             source.display()
         );

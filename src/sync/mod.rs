@@ -620,6 +620,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                     eprintln!("{}", warning_msg);
 
+                    // Check if stdin is a TTY before prompting to avoid hanging on non-interactive input
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Cannot prompt for deletion confirmation: stdin is not a terminal",
+                        )));
+                    }
+
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
 
@@ -647,6 +655,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         "⚠️  WARNING: About to delete {} files. Continue? [y/N] ",
                         deletions.len()
                     );
+
+                    // Check if stdin is a TTY before prompting to avoid hanging on non-interactive input
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        return Err(crate::error::SyncError::Io(std::io::Error::other(
+                            "Cannot prompt for deletion confirmation: stdin is not a terminal",
+                        )));
+                    }
 
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;

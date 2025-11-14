@@ -1493,6 +1493,12 @@ impl Transport for SshTransport {
                         hex_checksum, e
                     )))
                 })?;
+                if bytes.len() != 8 {
+                    return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid fast checksum length: expected 8 bytes, got {}",
+                        bytes.len()
+                    ))));
+                }
                 Ok(Checksum::Fast(bytes))
             }
             ChecksumType::Cryptographic => {
@@ -1503,6 +1509,12 @@ impl Transport for SshTransport {
                         hex_checksum, e
                     )))
                 })?;
+                if bytes.len() != 32 {
+                    return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
+                        "Invalid cryptographic checksum length: expected 32 bytes, got {}",
+                        bytes.len()
+                    ))));
+                }
                 Ok(Checksum::Cryptographic(bytes))
             }
         }

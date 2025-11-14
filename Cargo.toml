@@ -24,7 +24,6 @@ chrono = "0.4"
 
 # Async runtime (Phase 2: used for transport abstraction)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
-tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # Filesystem
