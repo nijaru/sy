@@ -61,6 +61,24 @@ sy/
 
 If users need it, put it in README or --help. Everything else goes stale.
 
+## AI Context Organization
+
+**Purpose:** AI maintains project context between sessions using ai/
+
+**Session files** (read every session):
+- **ai/STATUS.md** — Current state, metrics, blockers (read FIRST)
+- **ai/TODO.md** — Active tasks only
+- **ai/DECISIONS.md** — Architectural decisions
+- **ai/RESEARCH.md** — Research index
+
+**Reference files** (loaded on demand):
+- **ai/research/** — Detailed research findings
+- **ai/design/** — Design specifications
+- **ai/decisions/** — Archived decisions
+- **ai/tmp/** — Temporary artifacts (gitignored)
+
+**Token efficiency:** Session files = current work only. Details in subdirs. Trust git history for historical context.
+
 ## Key Documents
 
 Read these in order:
@@ -69,6 +87,17 @@ Read these in order:
 2. **ai/TODO.md** - Active tasks and backlog
 3. **ai/DECISIONS.md** - Key architectural decisions
 4. **ai/RESEARCH.md** - Research findings index
+
+## Claude Code Integration
+
+**Slash Commands:**
+- `.claude/commands/release.md` — Release workflow helper
+
+**MCP Servers:** None currently configured
+
+**Hooks:** None currently configured
+
+See [Claude Code documentation](https://github.com/anthropics/claude-code) for custom slash commands, MCP servers, and hooks.
 
 ## Development Setup
 
