@@ -19,11 +19,9 @@
   - [ ] SSH optional but default (`default = ["ssh"]`)
     - Makes local-only builds possible with zero system deps
     - Requires libssh2 on Linux when enabled
-    - Effort: 2-3 hours (similar to ACLs)
   - [ ] notify optional but default (`default = ["ssh", "watch"]`)
     - Pure Rust, no system deps, but allows minimal builds
     - For `--watch` mode continuous sync
-    - Effort: 1-2 hours
   - **Goal**: Minimal builds possible, but default includes all common features
 
 
