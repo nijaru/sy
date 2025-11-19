@@ -103,47 +103,6 @@ Made ACL preservation optional to eliminate system dependencies on Linux:
 
 **Merged**: PR #8 (commit fb94264)
 
-## v0.0.58 Release Notes
-
-**Pure Rust Library Migrations** ✅
-
-Migrated from C dependencies to pure Rust:
-
-1. **rusqlite → fjall** - Pure Rust LSM-tree database, 56% faster writes
-2. **aws-sdk-s3 → object_store** - Unified multi-cloud API, 38% code reduction
-3. **walkdir removal** - Cleaned up unused dependency
-
-**Dependency Impact**: Net ~18 fewer transitive dependencies
-
-See `ai/research/library-migration-summary.md` for details.
-
-## v0.0.57 Release Notes
-
-**Fixed**:
-1. **Rsync-compatible trailing slash semantics** (Issue #2, PR #5)
-   - Without trailing slash: copies directory itself (e.g., `sy /a/dir /target` → `/target/dir/`)
-   - With trailing slash: copies contents only (e.g., `sy /a/dir/ /target` → `/target/`)
-   - Works consistently across local, SSH, and S3 transports
-   - Added comprehensive tests for detection and destination computation
-
-2. **Remote sync nested file creation** (Issue #4, PR #4)
-   - Fixed remote sync failures when creating files in nested directories
-   - Ensures parent directories exist before file creation on remote destinations
-   - Tested with SSH sync to verify proper directory hierarchy creation
-
-**Changed**:
-- **Documentation overhaul**
-  - Rewrote README.md from 1161 lines to 198 lines (83% reduction)
-  - Created comprehensive docs/FEATURES.md (861 lines) with feature categorization
-  - Created comprehensive docs/USAGE.md (1139 lines) with real-world examples
-  - Simplified comparison tables to only compare against rsync
-  - Marked S3/cloud storage as experimental throughout documentation
-
-- **OpenSSL compatibility**
-  - Reverted to system OpenSSL for better cross-platform compatibility
-  - Vendored OpenSSL broke on Linux builds
-  - Tested on macOS (465 tests) and Fedora (462 tests)
-
 ## Next Up
 
 See `ai/TODO.md` for active work priorities.
