@@ -1,7 +1,5 @@
 # Status
 
-_Last Updated: 2025-11-13_
-
 ## Current State
 - Version: v0.0.60 ✅
 - Latest Release: **v0.0.60** - Critical memory bug fixes + Optional ACL feature

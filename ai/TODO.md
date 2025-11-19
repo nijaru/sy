@@ -1,7 +1,5 @@
 # TODO
 
-_Last Updated: 2025-11-13_
-
 ## Active Work
 
 ### High Priority
