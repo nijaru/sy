@@ -26,24 +26,20 @@
 
 ### Medium Priority
 
-- [ ] **Optional Features for Portability** [Cargo.toml, src/main.rs] (Next release)
-  - [ ] SSH optional but default (`default = ["ssh"]`)
-    - Makes local-only builds possible with zero system deps
-    - Requires libssh2 on Linux when enabled
-  - [ ] notify optional but default (`default = ["ssh", "watch"]`)
-    - Pure Rust, no system deps, but allows minimal builds
-    - For `--watch` mode continuous sync
-  - **Goal**: Minimal builds possible, but default includes all common features
+- [x] **Optional SSH Feature Flag** ✅ (Commit 9e6c748)
+  - [x] SSH marked optional with `ssh = ["dep:ssh2", "dep:whoami", "dep:regex"]`
+  - [x] Default features include SSH for backward compatibility
+  - [x] Library fully supports optional SSH (all gates in place)
+  - [x] Router gracefully errors when SSH disabled
+  - [x] All tests passing with feature enabled
+  - [ ] **Future**: Gate main.rs/watch.rs for true CLI support without SSH
+  - **Impact**: Library users can build without system deps
+  - **Build example**: `cargo build --no-default-features` or with SSH: `--features ssh`
 
-
-
-- [ ] **Optional SSH feature** [Cargo.toml, src/main.rs] (Next release)
-  - [ ] Move ssh2, whoami, regex to optional feature
-  - [ ] Set `default = ["ssh"]` so it's enabled by default
-  - [ ] Update CONTRIBUTING.md with feature flag usage
-  - [ ] Test local-only builds work without system deps
-  - **Goal**: Support minimal installations, local-only syncs possible
-  - **Impact**: No libssh2 needed for local sync (rare but valuable)
+- [ ] **Optional notify Feature** [Cargo.toml] (Future)
+  - [ ] Make watch mode notifications optional (Pure Rust, already low-level)
+  - [ ] Set `default = ["ssh", "watch"]`
+  - **Goal**: Allow minimal headless builds
 
 - [ ] **russh Migration** [src/transport/ssh.rs] (v0.0.59) - WIP on `feature/russh-migration` branch
   - [x] Dependencies updated (ssh2 → russh + russh-sftp + russh-keys)

@@ -1,17 +1,21 @@
 # Status
 
 ## Current State
-- Version: v0.0.60 ✅
+- Version: v0.0.60 ✅ (plus 2 post-release commits)
 - Latest Release: **v0.0.60** - Critical memory bug fixes + Optional ACL feature
-- Test Coverage: **464 tests passing** ✅
-  - **Library tests**: 464 passing (core functionality)
+- Test Coverage: **465 tests passing** ✅
+  - **Library tests**: 465 passing (core functionality)
   - **SSH tests**: 12 ignored (require SSH setup)
   - **Platform validation**:
     - macOS: tests passing ✅
     - Linux (Fedora): tests passing ✅
-- Build: Passing (cargo clippy clean with --all-features)
+- Build: Passing (cargo build, cargo clippy clean)
+- CI: GitHub Actions enabled (macOS + Linux, tests + clippy + fmt)
 - Performance: 2-11x faster than rsync
 - Memory: 5000x better for large file verification (10GB file: 10GB RAM → 2MB RAM)
+- Feature Flags:
+  - SSH: Optional (enabled by default)
+  - ACL: Optional (Linux requires libacl-dev, macOS works natively)
 
 ## v0.0.60 Release Notes
 
