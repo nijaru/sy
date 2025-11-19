@@ -731,7 +731,17 @@ Or install from local source with: cargo install --path . --features acl"#
     } else {
         // Compute effective destination path based on trailing slash semantics
         let effective_dest = compute_destination_path(source, destination);
-        engine.sync(source.path(), &effective_dest).await?
+
+        if cli.stream {
+            if !cli.quiet && !cli.json {
+                println!("Mode: Streaming sync (experimental)\n");
+            }
+            engine
+                .sync_streaming(source.path(), &effective_dest)
+                .await?
+        } else {
+            engine.sync(source.path(), &effective_dest).await?
+        }
     };
 
     // Execute post-sync hook

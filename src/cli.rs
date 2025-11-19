@@ -245,6 +245,10 @@ pub struct Cli {
     #[arg(long)]
     pub clear_resume_state: bool,
 
+    /// Use streaming mode for massive directories (experimental)
+    #[arg(long)]
+    pub stream: bool,
+
     /// Checkpoint every N files (default: 10)
     #[arg(long, default_value = "10")]
     pub checkpoint_files: usize,

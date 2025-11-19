@@ -9,6 +9,7 @@ pub mod ssh;
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -95,6 +96,18 @@ pub trait Transport: Send + Sync {
     /// This recursively scans the directory, respecting .gitignore patterns
     /// and excluding .git directories.
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>>;
+
+    /// Scan a directory and return a stream of entries
+    ///
+    /// This recursively scans the directory, respecting .gitignore patterns
+    /// and excluding .git directories.
+    ///
+    /// The stream yields `Result<FileEntry>`.
+    async fn scan_streaming(&self, path: &Path) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        // Default implementation: collect vector and stream it (inefficient but compatible)
+        let entries = self.scan(path).await?;
+        Ok(futures::stream::iter(entries.into_iter().map(Ok)).boxed())
+    }
 
     /// Check if a path exists
     async fn exists(&self, path: &Path) -> Result<bool>;
@@ -393,6 +406,10 @@ pub trait Transport: Send + Sync {
 impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
         (**self).scan(path).await
+    }
+
+    async fn scan_streaming(&self, path: &Path) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        (**self).scan_streaming(path).await
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {

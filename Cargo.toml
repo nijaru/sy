@@ -119,3 +119,11 @@ harness = false
 [[bin]]
 name = "sy-remote"
 path = "src/bin/sy-remote.rs"
+
+[[bin]]
+name = "sy-bench-gen"
+path = "src/bin/sy-bench-gen.rs"
+
+[[bin]]
+name = "sy-scan"
+path = "src/bin/sy-scan.rs"

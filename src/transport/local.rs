@@ -5,11 +5,28 @@ use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::sync::scanner::{FileEntry, Scanner};
 use crate::temp_file::TempFileGuard;
 use async_trait::async_trait;
+use futures::stream::{BoxStream, Stream, StreamExt};
 use std::fs::{self, File};
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+/// Stream wrapper for mpsc::Receiver
+struct ReceiverStream<T> {
+    rx: mpsc::Receiver<T>,
+}
+
+impl<T> Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
 
 /// Check if a file is sparse by comparing allocated blocks to file size
 #[cfg(unix)]
@@ -213,6 +230,30 @@ impl Transport for LocalTransport {
         })
         .await
         .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn scan_streaming(&self, path: &Path) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        let path = path.to_path_buf();
+        let (tx, rx) = mpsc::channel(1000);
+
+        // Spawn blocking task to run the scanner
+        tokio::task::spawn_blocking(move || {
+            let scanner = Scanner::new(&path);
+            if let Ok(iter) = scanner.scan_streaming() {
+                for entry in iter {
+                    if tx.blocking_send(entry).is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            } else {
+                // Handle scanner creation error
+                let _ = tx.blocking_send(Err(SyncError::Io(std::io::Error::other(
+                    "Failed to start scanner",
+                ))));
+            }
+        });
+
+        Ok(ReceiverStream { rx }.boxed())
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
