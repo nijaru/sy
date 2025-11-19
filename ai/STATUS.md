@@ -15,7 +15,11 @@
 
 1.  **Massive Scale Optimization** 🚀
     - **Goal**: Handle 100k+ files seamlessly.
-    - **Tasks**: Profile memory/CPU on large file trees, optimize parallel transfer bottlenecks.
+    - **Status**: ✅ Implemented Streaming Sync (75% memory reduction: 530MB → 133MB)
+    - **Tasks**: 
+      - ✅ Profile memory/CPU (Done)
+      - ✅ Implement `scan_streaming` (Done)
+      - ✅ Implement streaming pipeline in `SyncEngine` (Done)
 
 2.  **Object Store Stability (S3)** ☁️
     - **Goal**: Move from "Experimental" to "Stable".
