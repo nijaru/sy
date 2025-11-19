@@ -10,9 +10,10 @@ keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 
 [features]
-default = []
+default = ["ssh"]
 acl = ["exacl"]
 s3 = ["object_store"]
+ssh = ["dep:ssh2", "dep:whoami", "dep:regex"]
 
 [dependencies]
 # CLI & Config
@@ -63,11 +64,11 @@ num_cpus = "1.16"  # CPU count detection for parallel scanning
 # Scale (Phase 11)
 fastbloom = "0.7"  # Bloom filters for efficient deletion checks
 
-# SSH (Phase 2)
-ssh2 = "0.9"
-whoami = "1"
+# SSH (Phase 2) - Optional feature
+ssh2 = { version = "0.9", optional = true }
+whoami = { version = "1", optional = true }
 dirs = "5"
-regex = "1"
+regex = { version = "1", optional = true }
 futures = "0.3.31"
 
 # Database (Phase 5b)

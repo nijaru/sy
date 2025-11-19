@@ -1,12 +1,13 @@
 #[cfg(feature = "s3")]
 use super::s3::S3Transport;
-use super::{
-    dual::DualTransport, local::LocalTransport, ssh::SshTransport, TransferResult, Transport,
-};
+#[cfg(feature = "ssh")]
+use super::ssh::SshTransport;
+use super::{dual::DualTransport, local::LocalTransport, TransferResult, Transport};
 use crate::error::Result;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::path::SyncPath;
 use crate::retry::RetryConfig;
+#[cfg(feature = "ssh")]
 use crate::ssh::config::{parse_ssh_config, SshConfig};
 use async_trait::async_trait;
 use std::path::Path;
@@ -51,6 +52,7 @@ impl TransportRouter {
                     verifier,
                 )))
             }
+            #[cfg(feature = "ssh")]
             (SyncPath::Local { .. }, SyncPath::Remote { host, user, .. }) => {
                 // Local → Remote: use DualTransport
                 let config = if let Some(user) = user {
@@ -71,6 +73,7 @@ impl TransportRouter {
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
+            #[cfg(feature = "ssh")]
             (SyncPath::Remote { host, user, .. }, SyncPath::Local { .. }) => {
                 // Remote → Local: use DualTransport
                 let config = if let Some(user) = user {
@@ -91,6 +94,7 @@ impl TransportRouter {
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
             }
+            #[cfg(feature = "ssh")]
             (
                 SyncPath::Remote {
                     host: source_host,
@@ -138,6 +142,13 @@ impl TransportRouter {
                 );
                 let dual = DualTransport::new(source_transport, dest_transport);
                 Ok(TransportRouter::Dual(dual))
+            }
+            #[cfg(not(feature = "ssh"))]
+            (SyncPath::Remote { .. }, _) | (_, SyncPath::Remote { .. }) => {
+                Err(crate::error::SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "SSH support is disabled. Install with: cargo install sy --features ssh",
+                )))
             }
             #[cfg(feature = "s3")]
             (

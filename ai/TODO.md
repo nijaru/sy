@@ -4,14 +4,25 @@
 
 ### High Priority
 
-- [ ] **CI/CD Infrastructure** (Next release)
-  - [ ] Create simplified CI workflow for macOS + Linux
-  - [ ] Run tests on 2 platforms (ubuntu-latest, macos-latest)
-  - [ ] Add clippy and rustfmt checks
-  - [ ] Keep it simple - no multi-version testing, no coverage reports
-  - [ ] Document Windows as untested (experimental support)
+- [x] **CI/CD Infrastructure** ✅ (Released v0.0.60)
+  - [x] Create simplified CI workflow for macOS + Linux
+  - [x] Run tests on 2 platforms (ubuntu-latest, macos-latest)
+  - [x] Add clippy and rustfmt checks
+  - [x] Keep it simple - no multi-version testing, no coverage reports
+  - [x] Document Windows as untested (experimental support)
   - **Goal**: Catch cross-platform regressions automatically
-  - **Context**: Currently no CI - all testing is manual
+  - **Context**: CI pipeline active on push/PR to main
+
+- [x] **Auto-deploy sy-remote on SSH connections** ✅ (Commit e8036ff)
+  - [x] Create binary::find_sy_remote_binary() with fallback search
+  - [x] Implement binary::read_sy_remote_binary() for in-memory loading
+  - [x] Add SshTransport::deploy_sy_remote_locked() for deployment
+  - [x] Detect exit code 127 and auto-retry with deployed path
+  - [x] Create ~/.sy/bin on remote with proper permissions
+  - [x] Upload via SFTP and set 0o755 permissions
+  - [x] Test: All 465 tests passing
+  - **Impact**: Zero-setup UX for remote servers (no pre-install needed)
+  - **Performance**: ~4MB, ~200ms on LAN
 
 ### Medium Priority
 
@@ -26,21 +37,13 @@
 
 
 
-- [ ] **Auto-deploy sy-remote on SSH connections** (Future PR)
-  - **Problem**: sy fails with "command not found" if sy-remote isn't installed on remote server
-  - **Current**: User must manually `cargo install sy` on every remote server first
-  - **Solution**: Auto-deploy sy-remote binary over SSH (copy from local machine)
-  - **Edge cases to handle**:
-    - Remote OS detection (Linux/macOS/BSD)
-    - Architecture detection (x86_64/arm64/etc)
-    - PATH setup (~/.cargo/bin)
-    - Binary compatibility verification
-    - Permission handling
-  - **Alternative approaches**:
-    1. Pre-flight check with helpful error message
-    2. Auto-deploy prebuilt binaries (best UX, like rsync)
-    3. Auto-build on remote (slow, requires Rust toolchain)
-  - **Ref**: src/transport/ssh.rs:268-271 (error handling location)
+- [ ] **Optional SSH feature** [Cargo.toml, src/main.rs] (Next release)
+  - [ ] Move ssh2, whoami, regex to optional feature
+  - [ ] Set `default = ["ssh"]` so it's enabled by default
+  - [ ] Update CONTRIBUTING.md with feature flag usage
+  - [ ] Test local-only builds work without system deps
+  - **Goal**: Support minimal installations, local-only syncs possible
+  - **Impact**: No libssh2 needed for local sync (rare but valuable)
 
 - [ ] **russh Migration** [src/transport/ssh.rs] (v0.0.59) - WIP on `feature/russh-migration` branch
   - [x] Dependencies updated (ssh2 → russh + russh-sftp + russh-keys)

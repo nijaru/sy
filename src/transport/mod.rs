@@ -3,6 +3,7 @@ pub mod local;
 pub mod router;
 #[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(feature = "ssh")]
 pub mod ssh;
 
 use crate::error::Result;

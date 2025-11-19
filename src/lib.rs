@@ -15,6 +15,7 @@ pub mod resource;
 pub mod resume;
 pub mod retry;
 pub mod sparse;
+#[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod sync;
 pub mod temp_file;
