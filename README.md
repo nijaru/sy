@@ -31,7 +31,7 @@ cargo install sy
 
 # With optional features
 cargo install sy --features acl         # ACL preservation (requires libacl on Linux)
-cargo install sy --features s3          # S3 support (experimental)
+cargo install sy --features s3          # S3 support
 cargo install sy --features acl,s3      # Both features
 ```
 
@@ -74,7 +74,7 @@ sy /source /dest --dry-run               # Preview changes
 ```bash
 sy /local user@host:/remote              # SSH sync
 sy /large user@host:/backup --bwlimit 1MB
-sy /local s3://bucket/path               # S3 (experimental)
+sy /local s3://bucket/path               # S3 sync
 ```
 
 ### Advanced
@@ -82,6 +82,30 @@ sy /local s3://bucket/path               # S3 (experimental)
 sy ~/src ~/dest --exclude "*.log"        # With filters
 sy ~/dev /backup --watch                 # Continuous sync
 sy --bidirectional /laptop /backup       # Two-way sync
+```
+
+### S3 & Cloud Storage
+
+sy supports AWS S3 and compatible services (Cloudflare R2, Backblaze B2, Wasabi, MinIO).
+
+**Authentication:**
+Standard AWS environment variables are supported:
+```bash
+export AWS_ACCESS_KEY_ID="your-key-id"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_REGION="us-east-1"
+```
+
+**Usage:**
+```bash
+# Basic S3 sync
+sy /local/path s3://my-bucket/backups
+
+# With custom region
+sy /local/path s3://my-bucket/backups?region=eu-central-1
+
+# With custom endpoint (e.g., Cloudflare R2)
+sy /local/path s3://my-bucket/backups?endpoint=https://<accountid>.r2.cloudflarestorage.com
 ```
 
 ## Features
@@ -96,7 +120,7 @@ sy --bidirectional /laptop /backup       # Two-way sync
 **Transports:**
 - Local filesystem
 - SSH (requires sy on remote)
-- S3/cloud storage (experimental)
+- S3/cloud storage support (AWS S3, Cloudflare R2, Backblaze B2)
 
 **Reliability:**
 - Multi-layer integrity (xxHash3 + BLAKE3)

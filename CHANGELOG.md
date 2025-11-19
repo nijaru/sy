@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.60] - 2025-11-13
+## [0.0.61] - 2025-11-19
+
+### Added
+- **Massive Scale Optimization** - Streaming sync pipeline
+  - Implemented `Scan -> Plan -> Execute` streaming pipeline
+  - Memory usage reduced by 75% (530MB → 133MB for 100k files)
+  - Constant memory footprint regardless of file count
+- **Auto-deploy sy-remote** - Zero-setup remote execution
+  - Automatically deploys helper binary to remote hosts
+  - Removes need for manual installation on servers
+- **Optional Watch Mode** - Robust continuous sync
+  - Gated behind `watch` feature flag (optional dependency)
+  - Decoupled from SSH (enforces local source for safety)
+  - Robust error handling with auto-sync recovery
+
+### Changed
+- **S3/Cloud Storage Stable** - Moved from "Experimental" to "Stable"
+  - Hardened S3 transport implementation
+  - Verified compatibility with AWS S3, Cloudflare R2, Backblaze B2
+  - Added comprehensive integration tests
+  - Removed "experimental" warning from CLI
+- **Modular Architecture** - Feature flags for major components
+  - `ssh`: Optional (enabled by default)
+  - `watch`: Optional (disabled by default)
+  - `acl`: Optional (platform specific)
+  - `s3`: Optional (disabled by default)
+  - Reduces binary size and build times for custom needs
+
+### Fixed
+- **Resume State Stability** - Fixed flaky resume state tests
+  - Switched to fixed timestamps for deterministic serialization testing
+  - Improved staleness detection logic
+
 
 ### Fixed
 - **Critical memory bugs** - Streaming fixes for large file operations

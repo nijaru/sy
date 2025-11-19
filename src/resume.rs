@@ -377,7 +377,8 @@ mod tests {
     fn test_save_and_load() -> Result<()> {
         let source = PathBuf::from("/tmp/test_source.txt");
         let dest = PathBuf::from("/tmp/test_dest.txt");
-        let mtime = SystemTime::now();
+        // Use a fixed time to avoid precision issues during serialization roundtrip
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1600000000);
         let mut state = TransferState::new(&source, &dest, 5000, mtime, DEFAULT_CHUNK_SIZE);
         state.update_progress(2500);
         state.checksum = Some("abc123".to_string());
@@ -404,14 +405,15 @@ mod tests {
     fn test_load_stale_state() -> Result<()> {
         let source = PathBuf::from("/tmp/test_stale_source.txt");
         let dest = PathBuf::from("/tmp/test_stale_dest.txt");
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1600000000);
+        let old_mtime = base_time - Duration::from_secs(3600);
         let state = TransferState::new(&source, &dest, 1000, old_mtime, DEFAULT_CHUNK_SIZE);
 
         // Save with old mtime
         state.save()?;
 
         // Try to load with new mtime (simulates file modification)
-        let new_mtime = SystemTime::now();
+        let new_mtime = base_time;
         let loaded = TransferState::load(&source, &dest, new_mtime)?;
         assert!(loaded.is_none()); // Should be rejected as stale
 

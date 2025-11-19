@@ -79,6 +79,8 @@ impl<T: Transport + 'static> WatchMode<T> {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Watch error: {}", e);
+                    // Force sync on error to ensure consistency
+                    pending_changes.push(Event::new(notify::EventKind::Other));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Check if we should sync (debounce timeout reached)
@@ -100,7 +102,9 @@ impl<T: Transport + 'static> WatchMode<T> {
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    break; // Watcher dropped
+                    tracing::error!("File watcher disconnected unexpectedly");
+                    eprintln!("❌ File watcher stopped. Exiting.");
+                    break;
                 }
             }
         }
@@ -113,7 +117,10 @@ impl<T: Transport + 'static> WatchMode<T> {
 
         match event.kind {
             // File created, modified, or removed
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => true,
+            EventKind::Create(_)
+            | EventKind::Modify(_)
+            | EventKind::Remove(_)
+            | EventKind::Other => true,
             // Ignore metadata-only changes (access time, etc.)
             _ => false,
         }

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 ///
 /// False positives mean we might check a file that doesn't exist,
 /// but we'll never miss a file that does exist (no false negatives).
+#[derive(Clone)]
 pub struct FileSetBloom {
     bloom: BloomFilter,
     #[allow(dead_code)] // Tracking for capacity planning

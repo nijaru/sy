@@ -29,8 +29,9 @@ use filter::FilterEngine;
 use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
 use std::path::PathBuf;
-use std::time::Duration;
-use sync::{watch::WatchMode, SyncEngine};
+#[cfg(feature = "watch")]
+use sync::watch::WatchMode;
+use sync::SyncEngine;
 use tracing_subscriber::{fmt, EnvFilter};
 use transport::router::TransportRouter;
 
@@ -535,16 +536,29 @@ Or install from local source with: cargo install --path . --features acl"#
 
     // Watch mode or regular sync
     if cli.watch {
-        // Watch mode - continuous sync on file changes
-        let watch_mode = WatchMode::new(
-            engine,
-            source.path().to_path_buf(),
-            destination.path().to_path_buf(),
-            Duration::from_millis(500), // 500ms debounce
-        );
+        #[cfg(feature = "watch")]
+        {
+            if !source.is_local() {
+                anyhow::bail!("Watch mode currently only supports local sources.");
+            }
 
-        watch_mode.watch().await?;
-        return Ok(()); // Watch mode handles its own output
+            // Watch mode - continuous sync on file changes
+            let watch_mode = WatchMode::new(
+                engine,
+                source.path().to_path_buf(),
+                destination.path().to_path_buf(),
+                std::time::Duration::from_millis(500), // 500ms debounce
+            );
+
+            watch_mode.watch().await?;
+            return Ok(()); // Watch mode handles its own output
+        }
+        #[cfg(not(feature = "watch"))]
+        {
+            anyhow::bail!(
+                "Watch mode requires the 'watch' feature. Enable it with --features watch"
+            );
+        }
     }
 
     // Run sync (single file, directory, or bidirectional)

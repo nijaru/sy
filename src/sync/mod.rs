@@ -8,6 +8,7 @@ pub mod scale;
 pub mod scanner;
 pub mod strategy;
 pub mod transfer;
+#[cfg(feature = "watch")]
 pub mod watch;
 
 use crate::cli::SymlinkMode;
@@ -23,6 +24,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
 use resume::{ResumeState, SyncFlags};
+use scale::FileSetBloom;
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1593,6 +1595,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .bwlimit
             .map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
 
+        // Create Bloom filter for deletions (capacity: 1M files)
+        let bloom_filter = Arc::new(Mutex::new(FileSetBloom::new(1_000_000)));
+
+        // Concurrency settings
+        let plan_concurrency = self.max_concurrent * 2;
+        let transfer_concurrency = self.max_concurrent;
+
         // STAGE 1: SOURCE STREAM (Scan -> Filter -> Plan -> Execute)
         let source_stream = self.transport.scan_streaming(source).await?;
 
@@ -1710,7 +1719,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         per_file_progress,
                         hardlink_map,
                     );
-                    let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
+                    let _verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
 
                     let filename = task
                         .dest_path
@@ -1905,14 +1914,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Scan destination streaming
             // Note: We ignore errors during scan to attempt best-effort cleanup
             if let Ok(dest_stream) = self.transport.scan_streaming(destination).await {
-                let bloom = bloom_filter.lock().unwrap();
+                let bloom = bloom_filter.lock().unwrap().clone();
                 let transport = self.transport.clone();
                 let stats = stats.clone();
                 let pb = pb.clone();
                 let dry_run = self.dry_run;
                 let json = self.json;
-                let force_delete = self.force_delete;
-                let delete_threshold = self.delete_threshold;
+                let _force_delete = self.force_delete;
+                let _delete_threshold = self.delete_threshold;
 
                 // We need to count deletions to check threshold (which requires buffering or estimation)
                 // In streaming mode, strict threshold enforcement is hard before starting.

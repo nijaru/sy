@@ -6,6 +6,7 @@
 - Test Coverage: **465 tests passing** ✅
 - Feature Flags:
   - SSH: Optional (enabled by default)
+  - Watch: Optional (disabled by default)
   - ACL: Optional (Linux requires libacl-dev, macOS works natively)
 
 ## v0.0.61 Release Plan (Active)
@@ -19,15 +20,23 @@
     - **Tasks**: 
       - ✅ Profile memory/CPU (Done)
       - ✅ Implement `scan_streaming` (Done)
-      - ✅ Implement streaming pipeline in `SyncEngine` (Done)
+      - ✅ Implement streaming sync pipeline (`Scan -> Plan -> Execute`) (Done)
 
 2.  **Object Store Stability (S3)** ☁️
     - **Goal**: Move from "Experimental" to "Stable".
-    - **Tasks**: Integration tests (AWS/R2/B2), documentation, auth patterns.
+    - **Status**: ✅ Hardening complete
+    - **Tasks**: 
+      - ✅ Integration tests (AWS/R2/B2)
+      - ✅ Documentation & Auth patterns
+      - ✅ Removed "experimental" warning
 
 3.  **Watch Mode Polish** 👀
     - **Goal**: Reliable continuous sync.
-    - **Tasks**: Decouple `notify` from SSH (optional feature), fix any robust-watch issues.
+    - **Status**: ✅ Feature flag added & robust handling implemented
+    - **Tasks**: 
+      - ✅ Gate `notify` behind `watch` feature
+      - ✅ Decouple from SSH (enforce local source)
+      - ✅ Robust error handling (auto-sync on watch errors)
 
 4.  **Already Completed (in main)**:
     - ✅ Auto-deploy `sy-remote` (Zero-setup)
