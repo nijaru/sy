@@ -1,3 +1,4 @@
+mod binary;
 mod bisync;
 mod cli;
 mod compress;

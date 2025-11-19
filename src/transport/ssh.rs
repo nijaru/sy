@@ -1,4 +1,5 @@
 use super::{TransferResult, Transport};
+use crate::binary;
 use crate::compress::{compress, should_compress_smart, Compression, CompressionDetection};
 use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum, DeltaOp};
 use crate::error::{Result, SyncError};
@@ -229,13 +230,97 @@ impl SshTransport {
         }
     }
 
+    /// Deploy sy-remote binary to remote server at ~/.sy/bin/sy-remote
+    /// Takes a locked session guard and deploys the binary
+    /// Returns the full path to the deployed binary
+    fn deploy_sy_remote_locked(session_guard: &ssh2::Session) -> Result<String> {
+        let binary_data = binary::read_sy_remote_binary().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!(
+                "Failed to read sy-remote binary: {}",
+                e
+            )))
+        })?;
+
+        // Create ~/.sy/bin directory on remote
+        let mkdir_cmd = "mkdir -p ~/.sy/bin";
+        {
+            let mut channel = session_guard.channel_session().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "SSH channel creation: {}",
+                    e
+                )))
+            })?;
+            channel.exec(mkdir_cmd).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "SSH command execution: {}",
+                    e
+                )))
+            })?;
+            channel.wait_close().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("SSH channel close: {}", e)))
+            })?;
+        }
+
+        // Upload binary via SFTP
+        let sftp = session_guard.sftp().map_err(|e| {
+            SyncError::Io(std::io::Error::other(format!("SFTP initialization: {}", e)))
+        })?;
+
+        let remote_path = "~/.sy/bin/sy-remote";
+
+        // Write binary to remote file
+        {
+            let mut file = sftp.create(Path::new(remote_path)).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create remote file: {}",
+                    e
+                )))
+            })?;
+            file.write_all(&binary_data).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to write binary to remote: {}",
+                    e
+                )))
+            })?;
+            drop(file);
+        }
+
+        // Set executable permissions (0o755)
+        let chmod_cmd = "chmod 755 ~/.sy/bin/sy-remote";
+        {
+            let mut channel = session_guard.channel_session().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "SSH channel creation: {}",
+                    e
+                )))
+            })?;
+            channel.exec(chmod_cmd).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "SSH command execution: {}",
+                    e
+                )))
+            })?;
+            channel.wait_close().map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!("SSH channel close: {}", e)))
+            })?;
+        }
+
+        tracing::info!(
+            "Auto-deployed sy-remote binary ({}) to remote server at {}",
+            Self::format_bytes(binary_data.len() as u64),
+            remote_path
+        );
+
+        Ok("~/.sy/bin/sy-remote".to_string())
+    }
+
     fn execute_command(session: Arc<Mutex<Session>>, command: &str) -> Result<String> {
-        let session = session.lock().map_err(|e| {
+        let session_lock = session.lock().map_err(|e| {
             let io_err = std::io::Error::other(format!("Failed to lock session: {}", e));
             SyncError::from_ssh_io_error(io_err, "SSH session lock")
         })?;
 
-        let mut channel = session.channel_session().map_err(|e| {
+        let mut channel = session_lock.channel_session().map_err(|e| {
             let io_err = std::io::Error::other(format!("Failed to create channel: {}", e));
             SyncError::from_ssh_io_error(io_err, "SSH channel creation")
         })?;
@@ -264,10 +349,31 @@ impl SshTransport {
         })?;
 
         if exit_status != 0 {
-            // TODO: Detect "command not found" errors (exit code 127) and auto-deploy sy-remote
-            // See ai/TODO.md: "Auto-deploy sy-remote on SSH connections"
-            // Current UX: User gets cryptic "bash: sy-remote: command not found" error
-            // Desired UX: sy auto-copies sy-remote binary to remote server on first use
+            // Handle exit code 127: "command not found" - try auto-deploying sy-remote
+            if exit_status == 127 && command.contains("sy-remote") {
+                tracing::warn!(
+                    "sy-remote not found on remote server, attempting auto-deployment..."
+                );
+
+                // Try to deploy sy-remote using the locked session
+                match Self::deploy_sy_remote_locked(&session_lock) {
+                    Ok(deployed_path) => {
+                        drop(session_lock); // Release lock before retrying
+                                            // Reconstruct command using deployed binary path
+                        let modified_command = command.replace("sy-remote", &deployed_path);
+                        tracing::info!(
+                            "Retrying command with deployed binary: {}",
+                            modified_command
+                        );
+                        return Self::execute_command(session, &modified_command);
+                    }
+                    Err(deploy_err) => {
+                        // Fall through to original error reporting
+                        tracing::error!("Failed to auto-deploy sy-remote: {}", deploy_err);
+                    }
+                }
+            }
+
             let io_err = std::io::Error::other(format!(
                 "Command '{}' failed with exit code {}\nstdout: {}\nstderr: {}",
                 command, exit_status, output, stderr
