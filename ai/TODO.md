@@ -15,7 +15,7 @@
 
 ### Medium Priority
 
-- [ ] **Optional Features for Portability** (Next release)
+- [ ] **Optional Features for Portability** [Cargo.toml, src/main.rs] (Next release)
   - [ ] SSH optional but default (`default = ["ssh"]`)
     - Makes local-only builds possible with zero system deps
     - Requires libssh2 on Linux when enabled
@@ -42,7 +42,7 @@
     3. Auto-build on remote (slow, requires Rust toolchain)
   - **Ref**: src/transport/ssh.rs:268-271 (error handling location)
 
-- [ ] **russh Migration** (v0.0.59) - WIP on `feature/russh-migration` branch
+- [ ] **russh Migration** [src/transport/ssh.rs] (v0.0.59) - WIP on `feature/russh-migration` branch
   - [x] Dependencies updated (ssh2 → russh + russh-sftp + russh-keys)
   - [x] Connection handling rewritten
   - [x] Simple SFTP operations converted
@@ -59,14 +59,14 @@
 
 ### Low Priority
 
-- [ ] **S3/Cloud Testing** (Future)
+- [ ] **S3/Cloud Testing** [src/transport/s3.rs, tests/] (Future)
   - [x] Migrate to `object_store` crate ✅
   - [ ] Add integration tests for S3 sync
   - [ ] Test with AWS, Cloudflare R2, Backblaze B2, Wasabi
   - [ ] Document authentication patterns
   - [ ] Remove "experimental" tag once proven stable
 
-- [ ] **Windows Platform Support** (Future)
+- [ ] **Windows Platform Support** [src/transport/local.rs] (Future)
   - [ ] Implement sparse file detection on Windows
     - Use `DeviceIoControl` with `FSCTL_QUERY_ALLOCATED_RANGES`
     - Currently falls back to regular copy (Unix-only implementation)
