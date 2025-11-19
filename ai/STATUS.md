@@ -10,6 +10,7 @@
     - macOS: tests passing ✅
     - Linux (Fedora): tests passing ✅
 - Build: Passing (cargo clippy clean with --all-features)
+- CI: GitHub Actions enabled (macOS + Linux, tests + clippy + fmt)
 - Performance: 2-11x faster than rsync
 - Memory: 5000x better for large file verification (10GB file: 10GB RAM → 2MB RAM)
 

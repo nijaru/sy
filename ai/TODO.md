@@ -4,14 +4,14 @@
 
 ### High Priority
 
-- [ ] **CI/CD Infrastructure** (Next release)
-  - [ ] Create simplified CI workflow for macOS + Linux
-  - [ ] Run tests on 2 platforms (ubuntu-latest, macos-latest)
-  - [ ] Add clippy and rustfmt checks
-  - [ ] Keep it simple - no multi-version testing, no coverage reports
-  - [ ] Document Windows as untested (experimental support)
+- [x] **CI/CD Infrastructure** (Next release)
+  - [x] Create simplified CI workflow for macOS + Linux
+  - [x] Run tests on 2 platforms (ubuntu-latest, macos-latest)
+  - [x] Add clippy and rustfmt checks
+  - [x] Keep it simple - no multi-version testing, no coverage reports
+  - [x] Document Windows as untested (experimental support)
   - **Goal**: Catch cross-platform regressions automatically
-  - **Context**: Currently no CI - all testing is manual
+  - **Context**: CI pipeline active on push/PR to main
 
 ### Medium Priority
 
