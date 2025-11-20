@@ -75,6 +75,7 @@ impl TransferResult {
 
     /// Calculate compression ratio (percentage of file that was literal data)
     /// Returns None if full file copy
+    #[allow(dead_code)]
     pub fn compression_ratio(&self) -> Option<f64> {
         if let (Some(literal), true) = (self.literal_bytes, self.bytes_written > 0) {
             Some((literal as f64 / self.bytes_written as f64) * 100.0)

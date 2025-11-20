@@ -16,6 +16,7 @@
 pub struct Adler32 {
     a: u32,
     b: u32,
+    #[allow(dead_code)]
     block_size: usize,
     // Precomputed table for (block_size * byte) % MOD_ADLER
     // Index is the byte value [0..255]
