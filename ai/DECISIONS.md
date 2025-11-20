@@ -1,5 +1,65 @@
 # Decisions
 
+## 2025-11-19: Streaming Sync Pipeline (Massive Scale Optimization)
+
+**Context**: Profiling revealed O(N) memory scaling with file count. Syncing 100k files consumed ~530MB RAM, largely due to collecting all `FileEntry` objects before planning.
+
+**Decision**: Implement a fully streaming pipeline: `Scan (Stream) -> Plan (Stream) -> Execute`.
+
+**Rationale**:
+- Decouples memory usage from total file count
+- Enables processing of millions of files with constant memory footprint
+- Reduces time-to-first-byte (transfer starts while scan continues)
+
+**Implementation**:
+- `Scanner::scan_streaming()` returns an Iterator instead of `Vec<FileEntry>`
+- `SyncEngine` consumes the iterator, plans tasks on-the-fly, and dispatches to thread pool
+- `FilterEngine` applied during stream
+
+**Impact**:
+- 100k files memory usage: 530MB → 133MB (75% reduction)
+- Initial transfer start time: Immediate vs 5-10s delay
+
+**References**: ai/TODO.md (v0.0.61 Scale & Stability)
+
+---
+
+## 2025-11-19: Auto-deploy sy-remote
+
+**Context**: User friction when syncing to new remote hosts; required manual installation of `sy-remote`.
+
+**Decision**: Automatically deploy `sy-remote` binary to remote host if missing or outdated.
+
+**Rationale**:
+- "Zero-setup" experience is a key competitive advantage
+- SSH transport already has execution capability
+- Binary size is small enough (~5-10MB) for quick transfer
+
+**Mechanism**:
+- Check remote `sy-remote --version`
+- If missing or mismatch: `scp` local binary to `~/.sy/sy-remote`, `chmod +x`
+- Update PATH for session
+
+**Tradeoffs**:
+- Initial connection slightly slower (once per version update)
+- Assumes architecture compatibility (same arch as local, or cross-compiled binary available - currently assumes same arch)
+
+---
+
+## 2025-11-19: Watch Mode Architecture
+
+**Context**: Implementing continuous synchronization feature.
+
+**Decisions**:
+1. **Feature Gating**: Gate `notify` dependency behind `watch` feature flag.
+   - **Rationale**: `notify` pulls in system dependencies; keep core binary minimal.
+2. **Local Source Only**: Restrict watch mode to local source paths.
+   - **Rationale**: Watching remote files requires a persistent remote daemon/agent, significantly increasing complexity. Local watching covers 90% of "dev-sync" use cases.
+
+**Implementation**: src/sync/watch.rs, Cargo.toml
+
+---
+
 ## 2025-11-13: Critical Bug Fixes - Memory Safety and Data Protection (PR #2)
 
 **Context**: Production readiness audit revealed 4 critical bugs causing OOM errors and data safety issues

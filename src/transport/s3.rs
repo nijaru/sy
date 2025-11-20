@@ -3,6 +3,7 @@ use crate::error::{Result, SyncError};
 use crate::sync::scanner::FileEntry;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -129,6 +130,66 @@ impl Transport for S3Transport {
         }
 
         Ok(entries)
+    }
+
+    async fn scan_streaming(&self, _path: &Path) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        use futures::stream::StreamExt;
+
+        let prefix = if self.prefix.is_empty() {
+            None
+        } else {
+            Some(ObjectPath::from(self.prefix.clone()))
+        };
+
+        // Clone for closure
+        let prefix_str = self.prefix.clone();
+
+        let stream = self.store.list(prefix.as_ref());
+
+        let mapped = stream.map(move |meta_res| {
+            let meta = meta_res.map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to retrieve object metadata: {}",
+                    e
+                )))
+            })?;
+
+            let key = meta.location.as_ref();
+            let size = meta.size;
+            let modified = meta.last_modified.into();
+
+            // Check if this is a directory marker (ends with /)
+            let is_dir = key.ends_with('/');
+
+            // Replicate object_path_to_path logic locally to avoid self capture
+            let relative_key = if !prefix_str.is_empty() {
+                key.strip_prefix(&prefix_str)
+                    .unwrap_or(key)
+                    .trim_start_matches('/')
+            } else {
+                key
+            };
+            let relative_path = PathBuf::from(relative_key);
+
+            Ok(FileEntry {
+                path: Arc::new(PathBuf::from(key)),
+                relative_path: Arc::new(relative_path),
+                size,
+                modified,
+                is_dir,
+                is_symlink: false, // S3 doesn't have symlinks
+                symlink_target: None,
+                is_sparse: false,
+                allocated_size: size,
+                xattrs: None,
+                inode: None,
+                nlink: 1,
+                acls: None,
+                bsd_flags: None,
+            })
+        });
+
+        Ok(mapped.boxed())
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {

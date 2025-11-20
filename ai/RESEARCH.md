@@ -142,6 +142,24 @@
 
 ---
 
+## Massive Scale Profiling (researched 2025-11)
+
+**Sources**: Local profiling of sy v0.0.60 with 100k small files
+
+**Key Findings**:
+- **Memory Bottleneck**: Accumulating `Vec<FileEntry>` for 100k files consumed ~400MB heap.
+- **Path Allocations**: `PathBuf` overhead is significant per file.
+- **Execution Latency**: Planning phase blocked execution until full scan completed.
+
+**Applied**:
+- **Streaming Pipeline**: `scan_streaming()` iterator feeds directly into planner.
+- **Memory Reduction**: 530MB → 133MB (75% reduction) for 100k file dataset.
+- **Constant Footprint**: Memory usage now effectively constant regardless of file count (bounded by channel capacity).
+
+**References**: ai/STATUS.md (v0.0.61)
+
+---
+
 ## Open Questions
 
 - [ ] Optimal cache eviction strategy for large syncs

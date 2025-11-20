@@ -30,6 +30,14 @@ impl Transport for DualTransport {
         self.source.scan(path).await
     }
 
+    async fn scan_streaming(
+        &self,
+        path: &Path,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileEntry>>> {
+        // Always scan from source
+        self.source.scan_streaming(path).await
+    }
+
     async fn exists(&self, path: &Path) -> Result<bool> {
         // Check existence on destination
         self.dest.exists(path).await

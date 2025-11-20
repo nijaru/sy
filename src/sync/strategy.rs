@@ -19,7 +19,7 @@ pub enum SyncAction {
     Delete,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SyncTask {
     pub source: Option<Arc<FileEntry>>,
     pub dest_path: std::path::PathBuf,

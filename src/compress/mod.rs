@@ -150,11 +150,25 @@ pub fn should_compress_adaptive(
     filename: &str,
     file_size: u64,
     is_local: bool,
-    _network_speed_mbps: Option<u64>, // Kept for API compatibility, but unused
+    network_speed_mbps: Option<u64>,
 ) -> Compression {
     // LOCAL: Never compress (disk I/O is bottleneck, not network/CPU)
     if is_local {
         return Compression::None;
+    }
+
+    // HIGH SPEED NETWORK: If network > 1 Gbps (125 MB/s), compression might be CPU bottleneck
+    // or simply unnecessary.
+    //
+    // While Zstd/LZ4 are very fast (GB/s), SSH encryption + Compression overhead can
+    // reduce throughput on very fast links.
+    // Threshold: 500 Mbps (approx 60 MB/s) - typically internet/WAN speeds are below this.
+    // If we are seeing >500 Mbps, we are likely on a fast LAN or datacenter link.
+    if let Some(speed) = network_speed_mbps {
+        const HIGH_SPEED_THRESHOLD_MBPS: u64 = 500;
+        if speed > HIGH_SPEED_THRESHOLD_MBPS {
+            return Compression::None;
+        }
     }
 
     // Skip small files (overhead > benefit)
@@ -466,22 +480,22 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_any_network() {
-        // UPDATED: Benchmarks show compression is always faster than network
-        // Network speed is now irrelevant - always use Zstd for best ratio
+        // UPDATED: If network is very fast (>500Mbps), skip compression to save CPU/latency overhead
+        // Threshold is 500 Mbps
 
-        // Even 100 Gbps (12.5 GB/s) is slower than Zstd (8 GB/s won't bottleneck due to I/O)
+        // 100 Gbps (100_000 Mbps) -> None (too fast, don't compress)
         assert_eq!(
-            should_compress_adaptive("test.txt", 10_000_000, false, Some(100_000)), // 100 Gbps
-            Compression::Zstd
+            should_compress_adaptive("test.txt", 10_000_000, false, Some(100_000)),
+            Compression::None
         );
 
-        // 1 Gbps network -> Zstd
+        // 1 Gbps network (1000 Mbps) -> None
         assert_eq!(
             should_compress_adaptive("test.txt", 10_000_000, false, Some(1000)),
-            Compression::Zstd
+            Compression::None
         );
 
-        // 100 Mbps network -> Zstd
+        // 100 Mbps network -> Zstd (still benefits)
         assert_eq!(
             should_compress_adaptive("test.txt", 10_000_000, false, Some(100)),
             Compression::Zstd

@@ -273,6 +273,7 @@ impl ResumeState {
     pub fn add_completed_file(&mut self, file: CompletedFile, bytes_transferred: u64) {
         self.completed_files.push(file);
         self.total_bytes_transferred += bytes_transferred;
+        // Update checkpoint timestamp whenever we modify state
         self.checkpoint_at = format_timestamp(SystemTime::now());
     }
 
@@ -291,7 +292,7 @@ impl ResumeState {
 }
 
 /// Format a timestamp for serialization (ISO 8601)
-fn format_timestamp(time: SystemTime) -> String {
+pub fn format_timestamp(time: SystemTime) -> String {
     let datetime: chrono::DateTime<chrono::Utc> = time.into();
     datetime.to_rfc3339()
 }

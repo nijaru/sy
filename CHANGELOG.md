@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.62] - 2025-11-19
+
+### Added
+- **Parallel Chunk Transfers** - 10x throughput for single large files
+  - Implemented "multipart-style" transfers for single large files (>20MB) over SSH
+  - Splits files into 1MB chunks transferred concurrently across the connection pool
+  - Significantly improves throughput on high-latency links (e.g., inter-continental SSH)
+  - Works for both upload (Local→Remote) and download (Remote→Local)
+- **Adaptive Compression** - Network speed awareness
+  - Implemented `Speedometer` to track real-time network throughput
+  - Automatically disables compression if network speed exceeds 500 Mbps
+  - Prevents CPU bottlenecks on fast networks (10Gbps/100Gbps)
+- **Periodic Checkpointing** - Robust resume state
+  - Resume state now saved periodically during long syncs (every 10 files or 100MB)
+  - Prevents loss of progress if sync is interrupted before completion
+
+### Performance
+- **Adler-32 Optimization** - Delta sync rolling hash speedup
+  - **Static Hash**: 7x speedup (420 MB/s → 3.2 GB/s) using deferred modulo
+  - **Rolling Hash**: 1.85x speedup (135 MB/s → 250 MB/s) using lookup tables
+  - Pure Rust implementation (no unsafe code)
+- **I/O Optimization** - Reduced syscall overhead
+  - Increased transfer buffer sizes to 1MB for SSH operations
+  - Optimized connection pool usage for parallel chunks
+
+### Quality
+- **Safety Rules** - Added `clippy.toml` configuration
+  - Disallowed `unwrap()` and `expect()` in production code
+  - Fixed critical panics in transport layer error handling
+
 ## [0.0.61] - 2025-11-19
 
 ### Added

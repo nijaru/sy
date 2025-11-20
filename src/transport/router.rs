@@ -228,6 +228,18 @@ impl Transport for TransportRouter {
         }
     }
 
+    async fn scan_streaming(
+        &self,
+        path: &Path,
+    ) -> Result<futures::stream::BoxStream<'static, Result<crate::sync::scanner::FileEntry>>> {
+        match self {
+            TransportRouter::Local(t) => t.scan_streaming(path).await,
+            TransportRouter::Dual(t) => t.scan_streaming(path).await,
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.scan_streaming(path).await,
+        }
+    }
+
     async fn exists(&self, path: &Path) -> Result<bool> {
         match self {
             TransportRouter::Local(t) => t.exists(path).await,

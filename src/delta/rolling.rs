@@ -17,6 +17,9 @@ pub struct Adler32 {
     a: u32,
     b: u32,
     block_size: usize,
+    // Precomputed table for (block_size * byte) % MOD_ADLER
+    // Index is the byte value [0..255]
+    n_mod_table: [u32; 256],
 }
 
 const MOD_ADLER: u32 = 65521; // Largest prime < 2^16
@@ -24,10 +27,18 @@ const MOD_ADLER: u32 = 65521; // Largest prime < 2^16
 impl Adler32 {
     /// Create a new Adler-32 hasher
     pub fn new(block_size: usize) -> Self {
+        // Precompute lookup table for (block_size * i) % MOD_ADLER
+        let mut n_mod_table = [0u32; 256];
+        let n = block_size as u32;
+        for i in 0..256 {
+            n_mod_table[i] = (n * (i as u32)) % MOD_ADLER;
+        }
+
         Self {
             a: 1,
             b: 0,
             block_size,
+            n_mod_table,
         }
     }
 
@@ -36,9 +47,18 @@ impl Adler32 {
         let mut a: u32 = 1;
         let mut b: u32 = 0;
 
-        for &byte in data {
-            a = (a + byte as u32) % MOD_ADLER;
-            b = (b + a) % MOD_ADLER;
+        // Process in chunks to defer modulo
+        // N=5552: largest n such that 255 * n * (n+1) / 2 + (n+1) * (MOD_ADLER-1) <= 2^32 - 1
+        // Safe value is 3800 to be conservative with B accumulation starting from non-zero
+        const CHUNK_SIZE: usize = 3800;
+
+        for chunk in data.chunks(CHUNK_SIZE) {
+            for &byte in chunk {
+                a += byte as u32;
+                b += a;
+            }
+            a %= MOD_ADLER;
+            b %= MOD_ADLER;
         }
 
         (b << 16) | a
@@ -49,33 +69,74 @@ impl Adler32 {
         self.a = 1;
         self.b = 0;
 
-        for &byte in block {
-            self.a = (self.a + byte as u32) % MOD_ADLER;
-            self.b = (self.b + self.a) % MOD_ADLER;
+        const CHUNK_SIZE: usize = 3800;
+
+        for chunk in block.chunks(CHUNK_SIZE) {
+            for &byte in chunk {
+                self.a += byte as u32;
+                self.b += self.a;
+            }
+            self.a %= MOD_ADLER;
+            self.b %= MOD_ADLER;
         }
     }
 
     /// Roll the hash: remove old byte, add new byte
     /// This is the key operation for rsync algorithm
     ///
-    /// True O(1) incremental update using Adler-32 rolling formula:
-    /// - A_new = (A_old - old_byte + new_byte) mod M
-    /// - B_new = (B_old - block_size * old_byte + A_new - 1) mod M
-    ///
-    /// No window maintenance needed - hash state (a, b) is sufficient.
+    /// Optimized implementation using lookup table and conditional subtraction
+    /// to avoid expensive division/modulo operations.
+    #[inline]
     pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
         let old = old_byte as u32;
         let new = new_byte as u32;
-        let n = self.block_size as u32;
 
         // Update A: remove old byte, add new byte
-        // Add MOD_ADLER*2 to avoid underflow in modular arithmetic
-        self.a = (self.a + MOD_ADLER * 2 - old + new) % MOD_ADLER;
+        // Formula: A = (A - old + new) % M
+        // Logic:
+        // 1. A + new can overflow 65521 slightly (max 65520 + 255 = 65775)
+        // 2. Subtract old.
+        // 3. If negative (wrapped), add MOD_ADLER.
+
+        let mut a = self.a + new;
+        if old > a {
+            // Handle wrap-around conceptually (a - old < 0)
+            a += MOD_ADLER;
+        }
+        a -= old;
+        if a >= MOD_ADLER {
+            a -= MOD_ADLER;
+        }
+        self.a = a;
 
         // Update B: remove contribution of old byte across all positions
-        // Add MOD_ADLER*3 to handle larger potential underflow from n*old
-        let n_old = (n * old) % MOD_ADLER;
-        self.b = (self.b + MOD_ADLER * 3 - n_old + self.a - 1) % MOD_ADLER;
+        // Formula: B = (B - n*old + A - 1) % M
+        //
+        // 1. B + A - 1. Max ~131000.
+        // 2. Subtract (n*old)%M from lookup table.
+        // 3. Normalize.
+
+        let n_old_mod = unsafe { *self.n_mod_table.get_unchecked(old_byte as usize) };
+
+        let mut b = self.b + self.a;
+        // b + a can be up to ~131040.
+        // We want to subtract (n_old_mod + 1).
+        // n_old_mod is < 65521. 1 is 1.
+        // So we subtract up to 65522.
+
+        let sub = n_old_mod + 1;
+        if sub > b {
+            b += MOD_ADLER * 2; // Add enough multiples to ensure positivity
+        }
+        b -= sub;
+
+        // Now b is positive. Normalize.
+        // Since we added at most 2*M, and original sum was ~2*M, result is ~4*M max.
+        // Fast modulo by subtraction loop (at most 3-4 iterations)
+        while b >= MOD_ADLER {
+            b -= MOD_ADLER;
+        }
+        self.b = b;
     }
 
     /// Get the current hash value
