@@ -70,6 +70,7 @@ If users need it, put it in README or --help. Everything else goes stale.
 - **ai/TODO.md** — Active tasks only
 - **ai/DECISIONS.md** — Architectural decisions
 - **ai/RESEARCH.md** — Research index
+- **ai/KNOWLEDGE.md** — Permanent codebase quirks and gotchas
 
 **Reference files** (loaded on demand):
 - **ai/research/** — Detailed research findings
@@ -87,6 +88,7 @@ Read these in order:
 2. **ai/TODO.md** - Active tasks and backlog
 3. **ai/DECISIONS.md** - Key architectural decisions
 4. **ai/RESEARCH.md** - Research findings index
+5. **ai/KNOWLEDGE.md** - Permanent codebase quirks and gotchas
 
 ## Claude Code Integration
 
@@ -157,27 +159,13 @@ cargo build --release
 - Optional SSH feature (similar to ACL pattern)
 - Performance profiling for large-scale syncs
 
-## Known Issues & Gotchas
+## Codebase Quirks
 
-1. **xxHash3 is NOT a rolling hash**
-   - Cannot replace Adler-32 in delta sync algorithm
-   - Different purposes: xxHash3 for blocks, Adler-32 for rolling window
-
-2. **QUIC is slower on fast networks**
-   - 45% performance regression on >600 Mbps
-   - Use TCP with BBR instead
-
-3. **Compression overhead**
-   - CPU bottleneck on >4Gbps connections
-   - Never compress local sync
-
-4. **COW and hard links**
-   - Hard links MUST use in-place strategy
-   - COW cloning breaks link semantics (nlink > 1)
-
-5. **Sparse file support**
-   - Filesystem-dependent (not all FSes support SEEK_HOLE/SEEK_DATA)
-   - Tests verify correctness, log whether sparseness preserved
+See `ai/KNOWLEDGE.md` for permanent quirks and gotchas:
+- Hash function limitations (xxHash3 vs Adler-32)
+- Network protocol tradeoffs (QUIC, compression)
+- Filesystem edge cases (COW, hard links, sparse files)
+- Platform-specific constraints (S3, SSH)
 
 ## Testing Strategy
 
@@ -229,6 +217,7 @@ All tests must pass before merge: `cargo test && cargo clippy -- -D warnings`
 - Active tasks → ai/TODO.md
 - Past decisions → ai/DECISIONS.md
 - Research findings → ai/RESEARCH.md
+- Codebase quirks → ai/KNOWLEDGE.md
 - User docs → README.md
 - Command-line → `sy --help`
 
