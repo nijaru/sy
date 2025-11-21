@@ -1,29 +1,31 @@
-# Release Plan: v0.0.61
+# Release Plan: v0.1.0 (Production Readiness)
 
-**Theme**: Scale, Cloud, and Polish
-**Status**: Active Development
+**Status**: Planning
 
 ## Goals
-1. **Scale**: Prove and optimize performance for 100,000+ file repositories.
-2. **Cloud**: Stabilize S3 support for production use.
-3. **UX**: Zero-setup remote sync (Auto-deploy) + Flexible builds (Optional features).
+1. **Quality**: Zero Clippy warnings, comprehensive error handling
+2. **Platform**: Windows support (sparse files, ACLs, path handling)
+3. **Stability**: Production validation period
 
-## Scope
+## Completed (v0.0.61-v0.0.62)
+- ✅ Auto-deploy `sy-remote` (zero-config remote sync)
+- ✅ Optional SSH feature (minimal dependencies)
+- ✅ Massive scale optimization (streaming pipeline, 75% memory reduction)
+- ✅ S3 stability hardening
+- ✅ Watch mode (optional feature)
+- ✅ Parallel chunk transfers over SSH
+- ✅ Adaptive compression (auto-disable on fast networks)
+- ✅ Adler32 optimizations (7x faster)
 
-| Feature | Status | Priority | Notes |
-|---------|--------|----------|-------|
-| **Auto-Deploy `sy-remote`** | ✅ Done | P0 | Merged in main. Zero config for remote servers. |
-| **Optional SSH** | ✅ Done | P1 | Merged in main. Smaller binaries, fewer deps. |
-| **Massive Scale Profiling** | 🔄 Todo | P1 | Target: 100k files. Optimize scan/schedule. |
-| **S3 Stability** | 🔄 Todo | P1 | Validate R2/B2. Add integration tests. |
-| **Watch Mode Polish** | 🔄 Todo | P2 | Make `notify` optional. Local-only watch. |
+## Active Work (v0.1.0)
 
-## Non-Goals
-- **russh Migration**: Postponed indefinitely due to complexity.
-- **Windows Support**: Still best-effort/experimental.
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| **Clippy Cleanup** | P0 | Address remaining unwrap/expect in non-critical paths |
+| **Error Handling Audit** | P0 | Ensure all errors have actionable suggestions |
+| **Windows Support** | P1 | Sparse files (DeviceIoControl), ACL mapping, path edge cases |
 
-## Timeline
-- **Phase 1**: Profiling & Benchmarks (Current)
-- **Phase 2**: S3 Hardening
-- **Phase 3**: Feature cleanup (Watch mode)
-- **Release**: v0.0.61
+## Future (Post-v0.1.0)
+- SIMD optimization (if bottlenecks reappear)
+- russh migration (blocked on SSH agent complexity)
+- S3 bidirectional sync
