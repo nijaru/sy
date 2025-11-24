@@ -166,7 +166,11 @@ impl ConnectionPool {
         use futures::future::join_all;
 
         let target = target_size.min(self.max_size);
-        let current_size = self.sessions.read().unwrap().len();
+        let current_size = self
+            .sessions
+            .read()
+            .expect("SSH connection pool lock poisoned during read")
+            .len();
 
         if current_size >= target {
             return Ok(()); // Already have enough connections
@@ -215,7 +219,10 @@ impl ConnectionPool {
         }
 
         if !new_sessions.is_empty() {
-            let mut sessions = self.sessions.write().unwrap();
+            let mut sessions = self
+                .sessions
+                .write()
+                .expect("SSH connection pool lock poisoned during write");
             sessions.extend(new_sessions);
             tracing::info!(
                 "SSH connection pool expanded to {} connections",
@@ -227,13 +234,19 @@ impl ConnectionPool {
     }
 
     fn get_session(&self) -> Arc<Mutex<Session>> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = self
+            .sessions
+            .read()
+            .expect("SSH connection pool lock poisoned");
         let index = self.next_index.fetch_add(1, Ordering::Relaxed) % sessions.len();
         Arc::clone(&sessions[index])
     }
 
     fn size(&self) -> usize {
-        self.sessions.read().unwrap().len()
+        self.sessions
+            .read()
+            .expect("SSH connection pool lock poisoned")
+            .len()
     }
 }
 

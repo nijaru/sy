@@ -224,17 +224,7 @@ impl TransportRouter {
                 t.set_scan_options(options);
                 TransportRouter::Local(t)
             }
-            TransportRouter::Dual(t) => {
-                // Dual transport handles options by delegating to source
-                // Since DualTransport::source is Box<dyn Transport>, and Transport has set_scan_options...
-                // We can't call it directly on DualTransport because DualTransport struct doesn't expose it easily
-                // without modifying DualTransport to implement set_scan_options properly.
-                // Let's update DualTransport to propagate this.
-                // For now, we can assume DualTransport needs set_scan_options in its impl.
-                // Wait, I can't modify t (DualTransport) easily here if it's opaque.
-                // But Transport trait now has set_scan_options.
-                // So I can just call t.set_scan_options(options).
-                let mut t = t;
+            TransportRouter::Dual(mut t) => {
                 t.set_scan_options(options);
                 TransportRouter::Dual(t)
             }

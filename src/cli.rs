@@ -2431,4 +2431,124 @@ mod tests {
         assert!(cli.validate().is_ok());
         assert!(cli.checksum);
     }
+
+    #[test]
+    fn test_scan_options_default() {
+        // Default: respect gitignore, exclude .git
+        let cli = create_test_cli();
+        let options = cli.scan_options();
+        assert!(options.respect_gitignore);
+        assert!(!options.include_git_dir);
+    }
+
+    #[test]
+    fn test_scan_options_archive_mode() {
+        // Archive mode: don't respect gitignore, include .git
+        let mut cli = create_test_cli();
+        cli.archive = true;
+        let options = cli.scan_options();
+        assert!(!options.respect_gitignore);
+        assert!(options.include_git_dir);
+    }
+
+    #[test]
+    fn test_scan_options_explicit_flags() {
+        // Explicit flags work independently
+        let mut cli = create_test_cli();
+        cli.no_gitignore = true;
+        cli.include_vcs = false;
+        let options = cli.scan_options();
+        assert!(!options.respect_gitignore);
+        assert!(!options.include_git_dir);
+
+        let mut cli = create_test_cli();
+        cli.no_gitignore = false;
+        cli.include_vcs = true;
+        let options = cli.scan_options();
+        assert!(options.respect_gitignore);
+        assert!(options.include_git_dir);
+    }
+
+    // Helper to create a minimal test CLI
+    fn create_test_cli() -> Cli {
+        Cli {
+            source: Some(SyncPath::Local {
+                path: PathBuf::from("/tmp/src"),
+                has_trailing_slash: false,
+            }),
+            destination: Some(SyncPath::Local {
+                path: PathBuf::from("/tmp/dest"),
+                has_trailing_slash: false,
+            }),
+            dry_run: false,
+            diff: false,
+            delete: false,
+            delete_threshold: 50,
+            trash: false,
+            force_delete: false,
+            verbose: 0,
+            quiet: false,
+            perf: false,
+            per_file_progress: false,
+            parallel: 10,
+            max_errors: 100,
+            exclude: vec![],
+            include: vec![],
+            filter: vec![],
+            exclude_from: None,
+            include_from: None,
+            ignore_template: vec![],
+            bwlimit: None,
+            compress: false,
+            compression_detection: CompressionDetection::Auto,
+            mode: VerificationMode::Standard,
+            verify: false,
+            resume: true,
+            checkpoint_files: 10,
+            checkpoint_bytes: 104857600,
+            clean_state: false,
+            links: SymlinkMode::Preserve,
+            copy_links: false,
+            preserve_xattrs: false,
+            preserve_hardlinks: false,
+            preserve_acls: false,
+            preserve_flags: false,
+            preserve_permissions: false,
+            preserve_times: false,
+            preserve_group: false,
+            preserve_owner: false,
+            preserve_devices: false,
+            archive: false,
+            no_gitignore: false,
+            include_vcs: false,
+            ignore_times: false,
+            size_only: false,
+            checksum: false,
+            verify_only: false,
+            json: false,
+            stream: false,
+            watch: false,
+            no_hooks: false,
+            abort_on_hook_failure: false,
+            profile: None,
+            list_profiles: false,
+            show_profile: None,
+            bidirectional: false,
+            conflict_resolve: "newer".to_string(),
+            max_delete: 50,
+            clear_bisync_state: false,
+            force_resync: false,
+            use_cache: false,
+            clear_cache: false,
+            checksum_db: false,
+            clear_checksum_db: false,
+            prune_checksum_db: false,
+            min_size: None,
+            max_size: None,
+            retry: 3,
+            retry_delay: 1,
+            resume_only: false,
+            clear_resume_state: false,
+        }
+    }
 }
