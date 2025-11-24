@@ -21,17 +21,21 @@
 
 ### Medium Priority
 
-- [ ] **Sequential scanner** (`src/sync/scanner.rs`)
-  - Uses serial `ignore::WalkBuilder`; could use parallel walking for large dirs
+- [ ] **Parallel scanner** (`src/sync/scanner.rs`) - DEFERRED
+  - Current: Uses `WalkBuilder::build()` (serial iterator)
+  - Need: `build_parallel()` with visitor pattern - significant refactor
+  - Benefit: 2-4x speedup on directories with many subdirectories
+  - Complexity: High - requires changing StreamingScanner from Iterator to channel-based
 
-- [ ] **Sequential filter loading** (`src/main.rs:248-340`)
-  - Pattern processing is sequential; could parallelize for large filter files
+- [ ] **Sequential filter loading** (`src/main.rs:248-340`) - LOW VALUE
+  - Filter files are typically small (dozens of patterns)
+  - Parallelization would add complexity with minimal benefit
 
-- [ ] **Archive mode docs** (`src/cli.rs:356-372`)
-  - Flag interactions (`-a` implies `--no-gitignore` + `--include-vcs`) not clear in help
+- [x] ~~**Archive mode docs** (`src/cli.rs:356-372`)~~ Fixed
+  - ~~Flag interactions now documented in help text~~
 
-- [ ] **S3 validation timing** (`src/main.rs:674`)
-  - S3 bidirectional check is runtime; could validate earlier in CLI
+- [x] ~~**S3 validation timing**~~ Fixed
+  - ~~Moved S3+bidirectional check to CLI validation~~
 
 - [ ] **Incomplete features with TODOs**
   - `src/sync/mod.rs:106` - `verify_only` field unused

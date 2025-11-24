@@ -361,21 +361,26 @@ pub struct Cli {
     #[arg(short = 'D', long)]
     pub preserve_devices: bool,
 
-    /// Archive mode (equivalent to -rlptgoD: recursive, links, perms, times, group, owner, devices)
-    /// Note: Does NOT include -X (xattrs), -A (ACLs), or -H (hardlinks) - use those flags separately
-    /// Implies --no-gitignore and --include-vcs (copies everything including .git)
+    /// Archive mode: preserve all metadata (-rlptgoD) and copy everything
+    ///
+    /// Equivalent to rsync's -rlptgoD (recursive, links, perms, times, group, owner, devices).
+    /// Also implies --no-gitignore and --include-vcs to ensure complete backups.
+    ///
+    /// Does NOT include: -X (xattrs), -A (ACLs), -H (hardlinks) - add those flags separately.
     #[arg(short = 'a', long)]
     pub archive: bool,
 
     /// Don't filter files based on .gitignore rules
+    ///
     /// By default, sy respects .gitignore for developer-friendly syncs.
-    /// Use this flag to sync all files regardless of .gitignore patterns.
+    /// Use this flag (or -a/--archive) to sync all files regardless of .gitignore.
     #[arg(long)]
     pub no_gitignore: bool,
 
-    /// Include .git directories and other VCS directories in the sync
+    /// Include .git directories in the sync
+    ///
     /// By default, sy excludes .git directories for faster syncs.
-    /// Use this flag to include version control directories.
+    /// Use this flag (or -a/--archive) to include version control directories.
     #[arg(long)]
     pub include_vcs: bool,
 
@@ -530,6 +535,15 @@ impl Cli {
             }
             if self.watch {
                 anyhow::bail!("--bidirectional with --watch is not yet supported (deferred to future version)");
+            }
+
+            // Bidirectional sync doesn't support S3 paths
+            let source_is_s3 = self.source.as_ref().is_some_and(|p| p.is_s3());
+            let dest_is_s3 = self.destination.as_ref().is_some_and(|p| p.is_s3());
+            if source_is_s3 || dest_is_s3 {
+                anyhow::bail!(
+                    "--bidirectional does not support S3 paths (use unidirectional sync instead)"
+                );
             }
         }
 
