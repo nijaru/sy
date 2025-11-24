@@ -117,6 +117,7 @@ impl Adler32 {
         // 2. Subtract (n*old)%M from lookup table.
         // 3. Normalize.
 
+        // SAFETY: old_byte is u8 (0-255), n_mod_table is [u32; 256], so index is always valid
         let n_old_mod = unsafe { *self.n_mod_table.get_unchecked(old_byte as usize) };
 
         let mut b = self.b + self.a;

@@ -103,8 +103,7 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
-    #[allow(dead_code)] // TODO: Use verify_only field in sync logic
-    verify_only: bool,
+    // Note: verify_only is handled at CLI level (main.rs) before sync runs
     use_cache: bool,
     clear_cache: bool,
     checksum_db: bool,
@@ -145,7 +144,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
-        verify_only: bool,
         use_cache: bool,
         clear_cache: bool,
         checksum_db: bool,
@@ -189,7 +187,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             ignore_times,
             size_only,
             checksum,
-            verify_only,
             use_cache,
             clear_cache,
             checksum_db,
@@ -2371,7 +2368,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache (disabled in tests to avoid side effects)
             false, // clear_cache
             false, // checksum_db
@@ -2481,7 +2477,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2831,7 +2826,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2910,7 +2904,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2991,7 +2984,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -3069,7 +3061,6 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
-            false, // verify_only
             false, // use_cache
             false, // clear_cache
             false, // checksum_db

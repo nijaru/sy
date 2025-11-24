@@ -24,7 +24,7 @@ pub struct Transferrer<'a, T: Transport> {
     preserve_xattrs: bool,
     preserve_hardlinks: bool,
     preserve_acls: bool,
-    #[allow(dead_code)] // macOS only, no-op on other platforms - TODO: implement
+    #[allow(dead_code)] // Only used on macOS, suppress warning on other platforms
     preserve_flags: bool,
     per_file_progress: bool, // Show progress bar for large files
     hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>, // inode -> state
@@ -93,7 +93,7 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                     // Loop until we either create a hardlink or copy the file
                     loop {
                         let state = {
-                            let map = self.hardlink_map.lock().unwrap();
+                            let map = self.hardlink_map.lock().expect("hardlink map poisoned");
                             map.get(&inode).cloned()
                         }; // Lock dropped
 
@@ -133,7 +133,8 @@ impl<'a, T: Transport> Transferrer<'a, T> {
                                 // First task to encounter this inode, claim it
                                 let notify = Arc::new(Notify::new());
                                 {
-                                    let mut map = self.hardlink_map.lock().unwrap();
+                                    let mut map =
+                                        self.hardlink_map.lock().expect("hardlink map poisoned");
                                     // Double-check another task didn't claim it while we released the lock
                                     if map.contains_key(&inode) {
                                         continue; // Loop back to check state again
@@ -163,7 +164,8 @@ impl<'a, T: Transport> Transferrer<'a, T> {
 
                                 // Mark as completed and notify waiters
                                 {
-                                    let mut map = self.hardlink_map.lock().unwrap();
+                                    let mut map =
+                                        self.hardlink_map.lock().expect("hardlink map poisoned");
                                     map.insert(
                                         inode,
                                         InodeState::Completed(dest_path.to_path_buf()),

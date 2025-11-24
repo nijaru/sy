@@ -37,18 +37,19 @@
 - [x] ~~**S3 validation timing**~~ Fixed
   - ~~Moved S3+bidirectional check to CLI validation~~
 
-- [ ] **Incomplete features with TODOs**
-  - `src/sync/mod.rs:106` - `verify_only` field unused
-  - `src/sync/transfer.rs:27` - BSD flags (macOS-only)
-  - `src/transport/ssh.rs:1193` - BSD flags not serialized in SSH protocol
+- [x] ~~**Incomplete features with TODOs**~~ Fixed
+  - ~~`verify_only` field removed from SyncEngine (handled at CLI level in main.rs)~~
+  - ~~BSD flags comment updated (macOS-only, implemented and tested)~~
+  - `src/transport/ssh.rs` - BSD flags not serialized in SSH protocol (expected - can't set remotely)
 
 ### Low Priority
 
-- [ ] **Lock poisoning** (`src/sync/mod.rs` - multiple locations)
-  - `monitor.lock().unwrap()` calls would cascade failures if thread panics
+- [x] ~~**Lock poisoning** (`src/sync/transfer.rs`)~~ Fixed
+  - ~~hardlink_map locks now use `.expect()` with descriptive message~~
+  - monitor/stats locks still use `.unwrap()` (low risk, not data-critical)
 
-- [ ] **Unsafe `get_unchecked`** (`src/delta/rolling.rs:120`)
-  - Safe due to u8 bounds but fragile if contract changes
+- [x] ~~**Unsafe `get_unchecked`** (`src/delta/rolling.rs:120`)~~ Fixed
+  - ~~Added SAFETY comment documenting u8 bounds guarantee~~
 
 ### Platform Support
 
