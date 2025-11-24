@@ -338,13 +338,18 @@ impl BisyncStateDb {
 
             let path = PathBuf::from(path_unescaped);
 
+            // Convert i64 nanoseconds to SystemTime (clamp negative to 0)
+            let mtime = UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns.max(0) as u64);
+            let last_sync =
+                UNIX_EPOCH + std::time::Duration::from_nanos(last_sync_ns.max(0) as u64);
+
             let state = SyncState {
                 path: path.clone(),
                 side,
-                mtime: UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64),
+                mtime,
                 size,
                 checksum,
-                last_sync: UNIX_EPOCH + std::time::Duration::from_nanos(last_sync_ns as u64),
+                last_sync,
             };
 
             let entry = states.entry(path).or_insert((None, None));
@@ -416,15 +421,20 @@ impl BisyncStateDb {
         result
     }
 
+    /// Convert SystemTime to nanoseconds since UNIX_EPOCH, clamped to valid i64 range
+    fn system_time_to_nanos(time: SystemTime) -> i64 {
+        time.duration_since(UNIX_EPOCH)
+            .map(|d| {
+                // Clamp to i64::MAX to avoid overflow (covers timestamps until year 2262)
+                d.as_nanos().min(i64::MAX as u128) as i64
+            })
+            .unwrap_or(0) // Pre-epoch times become 0
+    }
+
     /// Write a single state entry
     fn write_state(&self, file: &mut fs::File, state: &SyncState) -> Result<()> {
-        let mtime_ns = state.mtime.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
-
-        let last_sync_ns = state
-            .last_sync
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
+        let mtime_ns = Self::system_time_to_nanos(state.mtime);
+        let last_sync_ns = Self::system_time_to_nanos(state.last_sync);
 
         let checksum_str = if let Some(cs) = state.checksum {
             format!("{:x}", cs)

@@ -38,7 +38,11 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         _ => return Err(format!("Unknown unit '{}'. Use B, KB, MB, GB, or TB", unit)),
     };
 
-    Ok((num * multiplier as f64) as u64)
+    let result = num * multiplier as f64;
+    if result < 0.0 || result > u64::MAX as f64 {
+        return Err(format!("Size '{}' exceeds maximum (~16 exabytes)", s));
+    }
+    Ok(result as u64)
 }
 
 /// Verification mode for file integrity
@@ -240,8 +244,12 @@ pub struct Cli {
     pub bwlimit: Option<u64>,
 
     /// Enable resume support (auto-resume if state file found, default: true)
-    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-    pub resume: bool,
+    #[arg(long, overrides_with = "no_resume")]
+    resume: bool,
+
+    /// Disable resume support
+    #[arg(long, overrides_with = "resume")]
+    pub no_resume: bool,
 
     /// Only resume interrupted transfers, don't start new ones
     #[arg(long)]
@@ -589,6 +597,21 @@ impl Cli {
         }
     }
 
+    /// Get effective resume setting (default: true)
+    ///
+    /// Priority:
+    /// 1. --no-resume: disables resume (returns false)
+    /// 2. --resume: enables resume (returns true)
+    /// 3. Default: enabled (returns true)
+    pub fn resume(&self) -> bool {
+        if self.no_resume {
+            false
+        } else {
+            // Default is true, --resume flag also sets to true
+            true
+        }
+    }
+
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
         self.source
@@ -695,7 +718,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -779,7 +803,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -867,7 +892,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -956,7 +982,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1040,7 +1067,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1124,7 +1152,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1208,7 +1237,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1292,7 +1322,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1395,7 +1426,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1482,7 +1514,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1566,7 +1599,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Fast, // Set to Fast
             verify: true,                 // But --verify flag should override
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1676,7 +1710,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1760,7 +1795,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1844,7 +1880,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1928,7 +1965,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2019,7 +2057,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2109,7 +2148,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2200,7 +2240,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2291,7 +2332,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2379,7 +2421,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2503,7 +2546,8 @@ mod tests {
             compression_detection: CompressionDetection::Auto,
             mode: VerificationMode::Standard,
             verify: false,
-            resume: true,
+            resume: false,
+            no_resume: false,
             checkpoint_files: 10,
             checkpoint_bytes: 104857600,
             clean_state: false,

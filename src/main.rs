@@ -151,7 +151,10 @@ async fn main() -> Result<()> {
             }
         }
         if let Some(resume) = profile.resume {
-            cli.resume = resume;
+            // Profile sets resume=false means --no-resume
+            if !resume {
+                cli.no_resume = true;
+            }
         }
     }
 
@@ -396,7 +399,7 @@ Or install from local source with: cargo install --path . --features acl"#
         cli.max_size,
         filter_engine,
         cli.bwlimit,
-        cli.resume,
+        cli.resume(),
         cli.checkpoint_files,
         cli.checkpoint_bytes,
         cli.json,

@@ -16,6 +16,7 @@
 - **Refinement**: Completed major performance passes (Adler32, Parallel SSH, Adaptive Compression).
 - **Archive Mode (Issue #11)**: ✅ Fixed - Added `--no-gitignore` and `--include-vcs` flags for idiomatic control.
 - **SSH Performance**: Parallel connection pool creation + adaptive pool sizing (starts with 1, expands based on file count).
+- **Code Review**: Completed thorough review - see `ai/TODO.md` for prioritized issues.
 
 ## Recent Releases
 

@@ -347,25 +347,6 @@ impl SshTransport {
         self.connection_pool.size()
     }
 
-    fn format_bytes(bytes: u64) -> String {
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        const GB: u64 = MB * 1024;
-        const TB: u64 = GB * 1024;
-
-        if bytes >= TB {
-            format!("{:.2} TB", bytes as f64 / TB as f64)
-        } else if bytes >= GB {
-            format!("{:.2} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.2} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.2} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
-
     /// Deploy sy-remote binary to remote server at ~/.sy/bin/sy-remote
     /// Takes a locked session guard and deploys the binary
     /// Returns the full path to the deployed binary
@@ -443,7 +424,7 @@ impl SshTransport {
 
         tracing::info!(
             "Auto-deployed sy-remote binary ({}) to remote server at {}",
-            Self::format_bytes(binary_data.len() as u64),
+            crate::resource::format_bytes(binary_data.len() as u64),
             remote_path
         );
 
@@ -2640,15 +2621,15 @@ impl Transport for SshTransport {
             tracing::warn!(
                 "Low disk space on remote {}: {} available, {} needed (plus buffer)",
                 path.display(),
-                Self::format_bytes(available),
-                Self::format_bytes(bytes_needed)
+                crate::resource::format_bytes(available),
+                crate::resource::format_bytes(bytes_needed)
             );
         }
 
         tracing::debug!(
             "Remote disk space check passed: {} available for {} needed",
-            Self::format_bytes(available),
-            Self::format_bytes(bytes_needed)
+            crate::resource::format_bytes(available),
+            crate::resource::format_bytes(bytes_needed)
         );
 
         Ok(())
