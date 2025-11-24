@@ -4,20 +4,20 @@
 
 ### Critical
 
-- [ ] **Bisync timestamp overflow** (`src/bisync/state.rs:421-427`)
-  - `as_nanos() as i64` silently truncates timestamps, corrupting state files
-  - Also `.unwrap()` on `duration_since(UNIX_EPOCH)` panics on pre-epoch times
+- [x] ~~**Bisync timestamp overflow** (`src/bisync/state.rs:421-427`)~~ Fixed in 61f450c
+  - ~~`as_nanos() as i64` silently truncates timestamps, corrupting state files~~
+  - ~~Also `.unwrap()` on `duration_since(UNIX_EPOCH)` panics on pre-epoch times~~
 
 ### High Priority
 
-- [ ] **Duplicate `format_bytes()` function** (`src/resource.rs:170`, `src/transport/ssh.rs:350`)
-  - Two identical implementations - extract to shared utility
+- [x] ~~**Duplicate `format_bytes()` function**~~ Fixed in 61f450c
+  - ~~Two identical implementations - extracted to `resource::format_bytes()`~~
 
-- [ ] **CLI flag design: `--resume`** (`src/cli.rs:243`)
-  - No `--no-resume` flag; users must use `--resume false` (non-idiomatic)
+- [x] ~~**CLI flag design: `--resume`**~~ Fixed in 61f450c
+  - ~~Added `--no-resume` flag (idiomatic)~~
 
-- [ ] **Size parsing overflow** (`src/cli.rs:41`)
-  - Parsing large values like "999999999TB" silently overflows u64
+- [x] ~~**Size parsing overflow** (`src/cli.rs:41`)~~ Fixed in 61f450c
+  - ~~Added overflow check for values exceeding u64::MAX~~
 
 ### Medium Priority
 
