@@ -117,7 +117,6 @@ impl Adler32 {
         // 2. Subtract (n*old)%M from lookup table.
         // 3. Normalize.
 
-        // u8 indexing into [u32; 256] - compiler proves bounds safety, no runtime check
         let n_old_mod = self.n_mod_table[old_byte as usize];
 
         let mut b = self.b + self.a;
