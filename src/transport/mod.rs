@@ -103,6 +103,16 @@ pub trait Transport: Send + Sync {
         // Default: no-op for transports that don't support scan options
     }
 
+    /// Prepare the transport for transferring a known number of files
+    ///
+    /// Called after scanning to allow transports to optimize for the workload.
+    /// For example, SSH transport can expand its connection pool based on file count.
+    ///
+    /// Default implementation does nothing (for transports that don't need preparation).
+    async fn prepare_for_transfer(&self, _file_count: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Scan a directory and return all entries
     ///
     /// This recursively scans the directory. Behavior is controlled by scan options:

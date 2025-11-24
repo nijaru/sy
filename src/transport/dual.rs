@@ -29,6 +29,14 @@ impl Transport for DualTransport {
         self.source.set_scan_options(options);
     }
 
+    async fn prepare_for_transfer(&self, file_count: usize) -> Result<()> {
+        // Prepare both source and destination transports
+        // (both might be SSH and need pool expansion)
+        self.source.prepare_for_transfer(file_count).await?;
+        self.dest.prepare_for_transfer(file_count).await?;
+        Ok(())
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
         // Always scan from source
         self.source.scan(path).await

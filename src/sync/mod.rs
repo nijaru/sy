@@ -348,6 +348,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
             tracing::info!("Found {} items in source", total_scanned);
         }
 
+        // Prepare transport for the workload (e.g., expand SSH connection pool)
+        self.transport.prepare_for_transfer(total_scanned).await?;
+
         // Update cache with scanned directory mtimes and file entries (for future incremental scans)
         if let Some(ref mut cache) = dir_cache {
             use crate::sync::dircache::CachedFile;

@@ -258,6 +258,15 @@ impl Transport for TransportRouter {
         }
     }
 
+    async fn prepare_for_transfer(&self, file_count: usize) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.prepare_for_transfer(file_count).await,
+            TransportRouter::Dual(t) => t.prepare_for_transfer(file_count).await,
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.prepare_for_transfer(file_count).await,
+        }
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<crate::sync::scanner::FileEntry>> {
         match self {
             TransportRouter::Local(t) => t.scan(path).await,

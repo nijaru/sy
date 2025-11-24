@@ -115,29 +115,80 @@ struct FileEntryJson {
 }
 
 /// Connection pool for parallel SSH operations
+///
+/// Supports adaptive sizing - starts with minimal connections and expands on demand.
 struct ConnectionPool {
-    sessions: Vec<Arc<Mutex<Session>>>,
+    sessions: std::sync::RwLock<Vec<Arc<Mutex<Session>>>>,
     next_index: AtomicUsize,
+    config: SshConfig,
+    max_size: usize,
 }
 
 impl ConnectionPool {
-    async fn new(config: &SshConfig, pool_size: usize) -> Result<Self> {
-        use futures::future::join_all;
-
-        if pool_size == 0 {
+    /// Create a new connection pool with a single initial connection
+    ///
+    /// The pool starts small and can be expanded via `expand_to()` after
+    /// scanning determines how many connections are actually needed.
+    async fn new(config: &SshConfig, max_size: usize) -> Result<Self> {
+        if max_size == 0 {
             return Err(SyncError::Io(std::io::Error::other(
-                "Connection pool size must be at least 1",
+                "Connection pool max size must be at least 1",
             )));
         }
 
-        tracing::debug!("Creating {} SSH connections in parallel", pool_size);
+        // Start with just 1 connection for scanning
+        tracing::debug!(
+            "Creating initial SSH connection (max pool size: {})",
+            max_size
+        );
+        let session = connect::connect(config).await?;
 
-        // Create all connections in parallel for faster startup
-        let connection_futures: Vec<_> = (0..pool_size)
+        let sessions = vec![Arc::new(Mutex::new(session))];
+
+        tracing::info!(
+            "SSH connection pool initialized with 1 connection (max: {})",
+            max_size
+        );
+
+        Ok(Self {
+            sessions: std::sync::RwLock::new(sessions),
+            next_index: AtomicUsize::new(0),
+            config: config.clone(),
+            max_size,
+        })
+    }
+
+    /// Expand the pool to the target size (capped at max_size)
+    ///
+    /// Creates additional connections in parallel if needed.
+    /// Safe to call multiple times - will only add connections if current size < target.
+    async fn expand_to(&self, target_size: usize) -> Result<()> {
+        use futures::future::join_all;
+
+        let target = target_size.min(self.max_size);
+        let current_size = self.sessions.read().unwrap().len();
+
+        if current_size >= target {
+            return Ok(()); // Already have enough connections
+        }
+
+        let to_add = target - current_size;
+        tracing::info!(
+            "Expanding SSH connection pool: {} → {} connections",
+            current_size,
+            target
+        );
+
+        // Create new connections in parallel
+        let connection_futures: Vec<_> = (0..to_add)
             .map(|i| {
-                let config = config.clone();
+                let config = self.config.clone();
                 async move {
-                    tracing::debug!("Creating SSH connection {}/{}", i + 1, pool_size);
+                    tracing::debug!(
+                        "Creating SSH connection {}/{}",
+                        current_size + i + 1,
+                        target
+                    );
                     connect::connect(&config).await
                 }
             })
@@ -145,36 +196,44 @@ impl ConnectionPool {
 
         let results = join_all(connection_futures).await;
 
-        // Collect successful connections, fail if any connection failed
-        let mut sessions = Vec::with_capacity(pool_size);
+        // Collect successful connections
+        let mut new_sessions = Vec::with_capacity(to_add);
         for (i, result) in results.into_iter().enumerate() {
             match result {
-                Ok(session) => sessions.push(Arc::new(Mutex::new(session))),
+                Ok(session) => new_sessions.push(Arc::new(Mutex::new(session))),
                 Err(e) => {
-                    tracing::error!("Failed to create SSH connection {}: {}", i + 1, e);
-                    return Err(e);
+                    tracing::warn!(
+                        "Failed to create SSH connection {}: {} (continuing with {} connections)",
+                        current_size + i + 1,
+                        e,
+                        current_size + new_sessions.len()
+                    );
+                    // Don't fail - use what we have
+                    break;
                 }
             }
         }
 
-        tracing::info!(
-            "SSH connection pool initialized with {} connections",
-            pool_size
-        );
+        if !new_sessions.is_empty() {
+            let mut sessions = self.sessions.write().unwrap();
+            sessions.extend(new_sessions);
+            tracing::info!(
+                "SSH connection pool expanded to {} connections",
+                sessions.len()
+            );
+        }
 
-        Ok(Self {
-            sessions,
-            next_index: AtomicUsize::new(0),
-        })
+        Ok(())
     }
 
     fn get_session(&self) -> Arc<Mutex<Session>> {
-        let index = self.next_index.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
-        Arc::clone(&self.sessions[index])
+        let sessions = self.sessions.read().unwrap();
+        let index = self.next_index.fetch_add(1, Ordering::Relaxed) % sessions.len();
+        Arc::clone(&sessions[index])
     }
 
     fn size(&self) -> usize {
-        self.sessions.len()
+        self.sessions.read().unwrap().len()
     }
 }
 
@@ -1033,6 +1092,21 @@ impl SshTransport {
 impl Transport for SshTransport {
     fn set_scan_options(&mut self, options: ScanOptions) {
         self.scan_options = options;
+    }
+
+    async fn prepare_for_transfer(&self, file_count: usize) -> Result<()> {
+        // Expand connection pool based on actual workload
+        // For small syncs (1-5 files), keep 1 connection
+        // For larger syncs, scale up to min(file_count, max_pool_size)
+        let optimal_connections = if file_count <= 5 {
+            1 // Small sync - 1 connection is enough
+        } else if file_count <= 50 {
+            file_count.min(4) // Medium sync - up to 4 connections
+        } else {
+            file_count.min(self.connection_pool.max_size) // Large sync - use max
+        };
+
+        self.connection_pool.expand_to(optimal_connections).await
     }
 
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
@@ -2676,10 +2750,12 @@ mod tests {
 
     // Helper to create a dummy connection pool for testing logic
     // Uses empty sessions list for logic tests that don't need real sessions
-    fn create_test_pool(size: usize) -> ConnectionPool {
+    fn create_test_pool(max_size: usize) -> ConnectionPool {
         ConnectionPool {
-            sessions: Vec::with_capacity(size),
+            sessions: std::sync::RwLock::new(Vec::new()),
             next_index: AtomicUsize::new(0),
+            config: SshConfig::default(),
+            max_size,
         }
     }
 
@@ -2697,10 +2773,7 @@ mod tests {
     #[test]
     fn test_connection_pool_round_robin_logic() {
         // Test round-robin index calculation without real sessions
-        let pool = ConnectionPool {
-            sessions: vec![],
-            next_index: AtomicUsize::new(0),
-        };
+        let pool = create_test_pool(10);
 
         // Simulate the round-robin logic
         for i in 0..15 {
@@ -2716,10 +2789,7 @@ mod tests {
     fn test_connection_pool_concurrent_counter() {
         use std::thread;
 
-        let pool = Arc::new(ConnectionPool {
-            sessions: vec![],
-            next_index: AtomicUsize::new(0),
-        });
+        let pool = Arc::new(create_test_pool(10));
 
         // Spawn 10 threads that each increment 100 times
         let mut handles = vec![];
