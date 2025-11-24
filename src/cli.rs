@@ -7,6 +7,8 @@ use crate::integrity::ChecksumType;
 // Import compression types for detection modes
 use crate::compress::CompressionDetection;
 
+use crate::sync::scanner::ScanOptions;
+
 fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
@@ -353,8 +355,21 @@ pub struct Cli {
 
     /// Archive mode (equivalent to -rlptgoD: recursive, links, perms, times, group, owner, devices)
     /// Note: Does NOT include -X (xattrs), -A (ACLs), or -H (hardlinks) - use those flags separately
+    /// Implies --no-gitignore and --include-vcs (copies everything including .git)
     #[arg(short = 'a', long)]
     pub archive: bool,
+
+    /// Don't filter files based on .gitignore rules
+    /// By default, sy respects .gitignore for developer-friendly syncs.
+    /// Use this flag to sync all files regardless of .gitignore patterns.
+    #[arg(long)]
+    pub no_gitignore: bool,
+
+    /// Include .git directories and other VCS directories in the sync
+    /// By default, sy excludes .git directories for faster syncs.
+    /// Use this flag to include version control directories.
+    #[arg(long)]
+    pub include_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
     #[arg(long)]
@@ -552,6 +567,28 @@ impl Cli {
         }
     }
 
+    /// Get scan options based on CLI flags
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Explicit flags: --no-gitignore, --include-vcs
+    /// 2. Archive mode (-a): implies both --no-gitignore and --include-vcs
+    /// 3. Default: respect .gitignore, exclude .git (developer-friendly)
+    pub fn scan_options(&self) -> ScanOptions {
+        // Archive mode sets both, but explicit flags can override
+        let archive_mode = self.archive;
+
+        // respect_gitignore: false if --no-gitignore OR archive mode
+        let respect_gitignore = !(self.no_gitignore || archive_mode);
+
+        // include_git_dir: true if --include-vcs OR archive mode
+        let include_git_dir = self.include_vcs || archive_mode;
+
+        ScanOptions {
+            respect_gitignore,
+            include_git_dir,
+        }
+    }
+
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
         self.source
@@ -674,6 +711,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -756,6 +795,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -842,6 +883,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -929,6 +972,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1011,6 +1056,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1093,6 +1140,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1175,6 +1224,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1257,6 +1308,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1358,6 +1411,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1443,6 +1498,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1525,6 +1582,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1633,6 +1692,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1715,6 +1776,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1797,6 +1860,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1879,6 +1944,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true, // Archive mode enabled
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1968,6 +2035,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2056,6 +2125,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true, // Archive mode also enabled
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2145,6 +2216,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: true, // Both enabled - should fail
             size_only: true,
             checksum: false,
@@ -2234,6 +2307,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: true, // Only this flag enabled
             size_only: false,
             checksum: false,
@@ -2320,6 +2395,8 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
+            no_gitignore: false,
+            include_vcs: false,
             ignore_times: false,
             size_only: false,
             checksum: true, // Only this flag enabled

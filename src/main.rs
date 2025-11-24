@@ -239,7 +239,8 @@ async fn main() -> Result<()> {
         cli.parallel, // SSH connection pool size = number of workers
         retry_config,
     )
-    .await?;
+    .await?
+    .with_scan_options(cli.scan_options());
 
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();

@@ -2,7 +2,7 @@ use super::{TransferResult, Transport};
 use crate::error::{format_bytes, Result, SyncError};
 use crate::fs_util::{has_hard_links, same_filesystem, supports_cow_reflinks};
 use crate::integrity::{ChecksumType, IntegrityVerifier};
-use crate::sync::scanner::{FileEntry, Scanner};
+use crate::sync::scanner::{FileEntry, ScanOptions, Scanner};
 use crate::temp_file::TempFileGuard;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, Stream, StreamExt};
@@ -198,6 +198,7 @@ fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
 /// This wraps the existing Phase 1 implementation in the async Transport interface.
 pub struct LocalTransport {
     verifier: IntegrityVerifier,
+    scan_options: ScanOptions,
 }
 
 impl LocalTransport {
@@ -205,11 +206,20 @@ impl LocalTransport {
         // Default: no verification
         Self {
             verifier: IntegrityVerifier::new(ChecksumType::None, false),
+            scan_options: ScanOptions::default(),
         }
     }
 
     pub fn with_verifier(verifier: IntegrityVerifier) -> Self {
-        Self { verifier }
+        Self {
+            verifier,
+            scan_options: ScanOptions::default(),
+        }
+    }
+
+    pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
+        self.scan_options = options;
+        self
     }
 }
 
@@ -221,11 +231,16 @@ impl Default for LocalTransport {
 
 #[async_trait]
 impl Transport for LocalTransport {
+    fn set_scan_options(&mut self, options: ScanOptions) {
+        self.scan_options = options;
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
         // Use existing scanner (runs synchronously, wrapped in async)
         let path = path.to_path_buf();
+        let options = self.scan_options;
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::new(&path);
+            let scanner = Scanner::new(&path).with_options(options);
             scanner.scan()
         })
         .await
@@ -234,11 +249,12 @@ impl Transport for LocalTransport {
 
     async fn scan_streaming(&self, path: &Path) -> Result<BoxStream<'static, Result<FileEntry>>> {
         let path = path.to_path_buf();
+        let options = self.scan_options;
         let (tx, rx) = mpsc::channel(1000);
 
         // Spawn blocking task to run the scanner
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::new(&path);
+            let scanner = Scanner::new(&path).with_options(options);
             if let Ok(iter) = scanner.scan_streaming() {
                 for entry in iter {
                     if tx.blocking_send(entry).is_err() {

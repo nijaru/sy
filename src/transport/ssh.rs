@@ -7,7 +7,7 @@ use crate::resume::{TransferState, DEFAULT_CHUNK_SIZE};
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
-use crate::sync::scanner::FileEntry;
+use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
@@ -205,6 +205,7 @@ pub struct SshTransport {
     remote_binary_path: String,
     retry_config: RetryConfig,
     speedometer: Arc<Speedometer>,
+    scan_options: ScanOptions,
 }
 
 impl SshTransport {
@@ -236,7 +237,13 @@ impl SshTransport {
             remote_binary_path: "sy-remote".to_string(),
             retry_config,
             speedometer: Arc::new(Speedometer::new()),
+            scan_options: ScanOptions::default(),
         })
+    }
+
+    pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
+        self.scan_options = options;
+        self
     }
 
     /// Get the number of connections in the pool
@@ -1002,9 +1009,20 @@ impl SshTransport {
 
 #[async_trait]
 impl Transport for SshTransport {
+    fn set_scan_options(&mut self, options: ScanOptions) {
+        self.scan_options = options;
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
         let path_str = path.to_string_lossy();
-        let command = format!("{} scan {}", self.remote_binary_path, path_str);
+        let mut command = format!("{} scan {}", self.remote_binary_path, path_str);
+
+        if !self.scan_options.respect_gitignore {
+            command.push_str(" --no-git-ignore");
+        }
+        if self.scan_options.include_git_dir {
+            command.push_str(" --include-git");
+        }
 
         let output = self
             .execute_command_with_retry(self.connection_pool.get_session(), &command)

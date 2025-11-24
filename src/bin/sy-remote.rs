@@ -21,6 +21,12 @@ enum Commands {
     Scan {
         /// Directory to scan
         path: PathBuf,
+        /// Disable .gitignore respect
+        #[arg(long)]
+        no_git_ignore: bool,
+        /// Include .git directory
+        #[arg(long, default_value_t = false)]
+        include_git: bool,
     },
     /// Compute block checksums for a file
     Checksums {
@@ -97,8 +103,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan { path } => {
-            let scanner = Scanner::new(&path);
+        Commands::Scan {
+            path,
+            no_git_ignore,
+            include_git,
+        } => {
+            let scanner = Scanner::new(&path)
+                .respect_gitignore(!no_git_ignore)
+                .include_git_dir(include_git);
             let entries = scanner.scan()?;
 
             let json_entries: Vec<FileEntryJson> = entries

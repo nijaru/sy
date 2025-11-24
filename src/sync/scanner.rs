@@ -158,10 +158,26 @@ fn read_bsd_flags(_metadata: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScanOptions {
+    pub respect_gitignore: bool,
+    pub include_git_dir: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            include_git_dir: false,
+        }
+    }
+}
+
 pub struct Scanner {
     root: PathBuf,
     threads: usize,
     follow_links: bool,
+    options: ScanOptions,
 }
 
 impl Scanner {
@@ -171,6 +187,7 @@ impl Scanner {
             root: root.into(),
             threads: num_cpus::get(),
             follow_links: false,
+            options: ScanOptions::default(),
         }
     }
 
@@ -184,6 +201,7 @@ impl Scanner {
             root: root.into(),
             threads,
             follow_links: false,
+            options: ScanOptions::default(),
         }
     }
 
@@ -197,6 +215,24 @@ impl Scanner {
     #[allow(dead_code)] // Public API for symlink following control
     pub fn follow_links(mut self, follow: bool) -> Self {
         self.follow_links = follow;
+        self
+    }
+
+    /// Set scanning options
+    pub fn with_options(mut self, options: ScanOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set whether to respect .gitignore files
+    pub fn respect_gitignore(mut self, respect: bool) -> Self {
+        self.options.respect_gitignore = respect;
+        self
+    }
+
+    /// Set whether to include .git directories
+    pub fn include_git_dir(mut self, include: bool) -> Self {
+        self.options.include_git_dir = include;
         self
     }
 
@@ -229,21 +265,26 @@ impl Scanner {
         let mut walker = WalkBuilder::new(&self.root);
         walker
             .hidden(false) // Don't skip hidden files by default
-            .git_ignore(true) // Respect .gitignore (in git repos)
-            .git_global(true) // Respect global gitignore
-            .git_exclude(true) // Respect .git/info/exclude
+            .git_ignore(self.options.respect_gitignore) // Respect .gitignore (in git repos)
+            .git_global(self.options.respect_gitignore) // Respect global gitignore
+            .git_exclude(self.options.respect_gitignore) // Respect .git/info/exclude
             .threads(self.threads) // Parallel walking if threads > 1
-            .follow_links(self.follow_links) // Follow symlinks with automatic loop detection
-            .filter_entry(|entry| {
+            .follow_links(self.follow_links); // Follow symlinks with automatic loop detection
+
+        if !self.options.include_git_dir {
+            walker.filter_entry(|entry| {
                 // Skip .git directories
                 entry.file_name() != ".git"
             });
+        }
 
         // Also respect .gitignore files even outside git repos
         // This allows .gitignore to work in non-git directories
-        let gitignore_path = self.root.join(".gitignore");
-        if gitignore_path.exists() {
-            walker.add_ignore(&gitignore_path);
+        if self.options.respect_gitignore {
+            let gitignore_path = self.root.join(".gitignore");
+            if gitignore_path.exists() {
+                walker.add_ignore(&gitignore_path);
+            }
         }
 
         Ok(StreamingScanner {

@@ -9,6 +9,7 @@ use crate::path::SyncPath;
 use crate::retry::RetryConfig;
 #[cfg(feature = "ssh")]
 use crate::ssh::config::{parse_ssh_config, SshConfig};
+use crate::sync::scanner::ScanOptions;
 use async_trait::async_trait;
 use std::path::Path;
 
@@ -215,10 +216,48 @@ impl TransportRouter {
             }
         }
     }
+
+    /// Apply scan options to the underlying transport
+    pub fn with_scan_options(self, options: ScanOptions) -> Self {
+        match self {
+            TransportRouter::Local(mut t) => {
+                t.set_scan_options(options);
+                TransportRouter::Local(t)
+            }
+            TransportRouter::Dual(t) => {
+                // Dual transport handles options by delegating to source
+                // Since DualTransport::source is Box<dyn Transport>, and Transport has set_scan_options...
+                // We can't call it directly on DualTransport because DualTransport struct doesn't expose it easily
+                // without modifying DualTransport to implement set_scan_options properly.
+                // Let's update DualTransport to propagate this.
+                // For now, we can assume DualTransport needs set_scan_options in its impl.
+                // Wait, I can't modify t (DualTransport) easily here if it's opaque.
+                // But Transport trait now has set_scan_options.
+                // So I can just call t.set_scan_options(options).
+                let mut t = t;
+                t.set_scan_options(options);
+                TransportRouter::Dual(t)
+            }
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(mut t) => {
+                t.set_scan_options(options);
+                TransportRouter::S3(t)
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Transport for TransportRouter {
+    fn set_scan_options(&mut self, options: ScanOptions) {
+        match self {
+            TransportRouter::Local(t) => t.set_scan_options(options),
+            TransportRouter::Dual(t) => t.set_scan_options(options),
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.set_scan_options(options),
+        }
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<crate::sync::scanner::FileEntry>> {
         match self {
             TransportRouter::Local(t) => t.scan(path).await,

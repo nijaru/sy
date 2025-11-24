@@ -25,6 +25,10 @@ impl DualTransport {
 
 #[async_trait]
 impl Transport for DualTransport {
+    fn set_scan_options(&mut self, options: crate::sync::scanner::ScanOptions) {
+        self.source.set_scan_options(options);
+    }
+
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>> {
         // Always scan from source
         self.source.scan(path).await

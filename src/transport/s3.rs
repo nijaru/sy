@@ -1,6 +1,6 @@
 use super::{FileInfo, TransferResult, Transport};
 use crate::error::{Result, SyncError};
-use crate::sync::scanner::FileEntry;
+use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -84,6 +84,10 @@ impl S3Transport {
 
 #[async_trait]
 impl Transport for S3Transport {
+    fn set_scan_options(&mut self, _options: ScanOptions) {
+        // S3 transport currently ignores scan options
+    }
+
     async fn scan(&self, _path: &Path) -> Result<Vec<FileEntry>> {
         use futures::stream::StreamExt;
 

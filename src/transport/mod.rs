@@ -92,10 +92,22 @@ impl TransferResult {
 #[async_trait]
 #[allow(dead_code)] // Methods will be used when we implement SSH transport
 pub trait Transport: Send + Sync {
+    /// Set scanning options (respect gitignore, include .git)
+    ///
+    /// This configures how the transport scans directories. Options include:
+    /// - `respect_gitignore`: Whether to filter files based on .gitignore rules
+    /// - `include_git_dir`: Whether to include .git directories in scans
+    ///
+    /// Default implementation does nothing (for transports that don't support it).
+    fn set_scan_options(&mut self, _options: crate::sync::scanner::ScanOptions) {
+        // Default: no-op for transports that don't support scan options
+    }
+
     /// Scan a directory and return all entries
     ///
-    /// This recursively scans the directory, respecting .gitignore patterns
-    /// and excluding .git directories.
+    /// This recursively scans the directory. Behavior is controlled by scan options:
+    /// - By default: respects .gitignore patterns and excludes .git directories
+    /// - With archive mode: includes all files including .git
     async fn scan(&self, path: &Path) -> Result<Vec<FileEntry>>;
 
     /// Scan a directory and return a stream of entries
