@@ -122,17 +122,39 @@ struct ConnectionPool {
 
 impl ConnectionPool {
     async fn new(config: &SshConfig, pool_size: usize) -> Result<Self> {
+        use futures::future::join_all;
+
         if pool_size == 0 {
             return Err(SyncError::Io(std::io::Error::other(
                 "Connection pool size must be at least 1",
             )));
         }
 
+        tracing::debug!("Creating {} SSH connections in parallel", pool_size);
+
+        // Create all connections in parallel for faster startup
+        let connection_futures: Vec<_> = (0..pool_size)
+            .map(|i| {
+                let config = config.clone();
+                async move {
+                    tracing::debug!("Creating SSH connection {}/{}", i + 1, pool_size);
+                    connect::connect(&config).await
+                }
+            })
+            .collect();
+
+        let results = join_all(connection_futures).await;
+
+        // Collect successful connections, fail if any connection failed
         let mut sessions = Vec::with_capacity(pool_size);
-        for i in 0..pool_size {
-            tracing::debug!("Creating SSH connection {}/{} for pool", i + 1, pool_size);
-            let session = connect::connect(config).await?;
-            sessions.push(Arc::new(Mutex::new(session)));
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(session) => sessions.push(Arc::new(Mutex::new(session))),
+                Err(e) => {
+                    tracing::error!("Failed to create SSH connection {}: {}", i + 1, e);
+                    return Err(e);
+                }
+            }
         }
 
         tracing::info!(
