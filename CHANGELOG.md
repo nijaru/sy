@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.63] - 2025-11-24
+
+### Fixed
+- **Bisync timestamp overflow** - Fixed silent truncation in `as_nanos() as i64` and panic on pre-epoch times
+- **Size parsing overflow** - Added bounds check for size values exceeding u64::MAX (~16 exabytes)
+- **CLI flag design** - Added `--no-resume` flag for idiomatic disable pattern
+- **Archive mode help** - Clarified that `-X`, `-A`, `-H` flags need to be added separately
+- **S3 validation timing** - Moved S3+bidirectional check to CLI validation for earlier feedback
+
+### Changed
+- **Code cleanup** - Removed unused `verify_only` field from SyncEngine (handled at CLI level)
+- **Safety improvements** - Added SAFETY comments for unsafe code, descriptive `.expect()` for critical locks
+
 ## [0.0.62] - 2025-11-19
 
 ### Added
