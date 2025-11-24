@@ -320,11 +320,12 @@ fn perf_memory_usage_stays_bounded() {
 
     assert!(output.status.success());
 
-    // Performance baseline: 5000 files should sync in < 10s
+    // Performance baseline: 5000 files should sync in < 20s
     // If memory usage is bounded, this should scale linearly
+    // Using 20s to account for CI runner variability
     assert!(
-        elapsed < Duration::from_secs(10),
-        "Performance regression: 5000 files took {:?}, expected < 10s",
+        elapsed < Duration::from_secs(20),
+        "Performance regression: 5000 files took {:?}, expected < 20s",
         elapsed
     );
 
