@@ -162,7 +162,7 @@ fn test_sync_1gb_sparse_file() {
     let dest_dir = TempDir::new().unwrap();
 
     let source_file = source_dir.path().join("sparse.dat");
-    let size = 1 * GB;
+    let size = GB;
 
     println!("Creating 1GB sparse file...");
 
