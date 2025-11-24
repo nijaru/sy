@@ -335,6 +335,7 @@ impl SshTransport {
         })
     }
 
+    #[allow(dead_code)] // Public API
     pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
         self.scan_options = options;
         self
@@ -840,7 +841,7 @@ impl SshTransport {
         // Aim for chunks of at least 10MB, but divide work evenly if possible
         let min_chunk_size = 10 * 1024 * 1024;
         let chunk_size = std::cmp::max(min_chunk_size, file_size / pool_size as u64);
-        let num_chunks = (file_size + chunk_size - 1) / chunk_size;
+        let num_chunks = file_size.div_ceil(chunk_size);
 
         let source_buf = source.to_path_buf();
         let dest_buf = dest.to_path_buf();
@@ -982,15 +983,15 @@ impl SshTransport {
 
         let min_chunk_size = 10 * 1024 * 1024;
         let chunk_size = std::cmp::max(min_chunk_size, file_size / pool_size as u64);
-        let num_chunks = (file_size + chunk_size - 1) / chunk_size;
+        let num_chunks = file_size.div_ceil(chunk_size);
 
         let source_buf = source.to_path_buf();
         let dest_buf = dest.to_path_buf();
 
         // Create local file with fixed size
         {
-            let file = std::fs::File::create(&dest_buf).map_err(|e| SyncError::Io(e))?;
-            file.set_len(file_size).map_err(|e| SyncError::Io(e))?;
+            let file = std::fs::File::create(&dest_buf).map_err(SyncError::Io)?;
+            file.set_len(file_size).map_err(SyncError::Io)?;
         }
 
         let progress = Arc::new(AtomicUsize::new(0));
@@ -1095,7 +1096,7 @@ impl SshTransport {
         // Get mtime from source and set on dest
         let mtime = self.get_mtime(source).await?;
         filetime::set_file_mtime(&dest_buf, filetime::FileTime::from_system_time(mtime))
-            .map_err(|e| SyncError::Io(e))?;
+            .map_err(SyncError::Io)?;
 
         Ok(TransferResult::new(file_size))
     }

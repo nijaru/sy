@@ -225,12 +225,14 @@ impl Scanner {
     }
 
     /// Set whether to respect .gitignore files
+    #[allow(dead_code)] // Public API
     pub fn respect_gitignore(mut self, respect: bool) -> Self {
         self.options.respect_gitignore = respect;
         self
     }
 
     /// Set whether to include .git directories
+    #[allow(dead_code)] // Public API
     pub fn include_git_dir(mut self, include: bool) -> Self {
         self.options.include_git_dir = include;
         self

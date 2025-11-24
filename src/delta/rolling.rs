@@ -31,8 +31,8 @@ impl Adler32 {
         // Precompute lookup table for (block_size * i) % MOD_ADLER
         let mut n_mod_table = [0u32; 256];
         let n = block_size as u32;
-        for i in 0..256 {
-            n_mod_table[i] = (n * (i as u32)) % MOD_ADLER;
+        for (i, entry) in n_mod_table.iter_mut().enumerate() {
+            *entry = (n * (i as u32)) % MOD_ADLER;
         }
 
         Self {

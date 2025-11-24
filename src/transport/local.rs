@@ -217,6 +217,7 @@ impl LocalTransport {
         }
     }
 
+    #[allow(dead_code)] // Public API
     pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
         self.scan_options = options;
         self
