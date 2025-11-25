@@ -57,18 +57,55 @@ REMOVED (no deprecation, just remove):
 --include-vcs   (now default behavior)
 ```
 
-### Migration Guide
+### CHANGELOG Draft
 
 ```markdown
-## v0.1.0 Breaking Changes
+## v0.1.0 - Breaking Changes (rsync Compatibility)
 
-### Default Behavior Changed (rsync-compatible)
+### BREAKING: Default Behavior Changes
 
-**Before**: sy respected .gitignore and excluded .git by default
-**After**: sy copies all files by default (like rsync)
+sy now copies all files by default, matching rsync behavior:
 
-**If you need the old behavior**:
-  sy source dest --gitignore --exclude .git
+| Behavior | v0.0.x | v0.1.0 |
+|----------|--------|--------|
+| `.gitignore` rules | Respected (files skipped) | **Ignored (all files copied)** |
+| `.git/` directories | Excluded | **Included** |
+
+**Migration**: If you relied on the old behavior:
+```bash
+# Old (v0.0.x): sy copied only non-ignored files
+sy /src /dest
+
+# New (v0.1.0): Use explicit flags for old behavior
+sy /src /dest --gitignore --exclude-vcs
+```
+
+### BREAKING: Flag Changes
+
+**Removed flags** (no longer needed):
+- `--no-gitignore` → Now default behavior
+- `--include-vcs` → Now default behavior
+- `-b` short flag → Use `--bidirectional` (conflicts with rsync `-b`=backup)
+
+**New flags**:
+- `--gitignore` — Opt-in to respect .gitignore rules
+- `--exclude-vcs` — Opt-in to exclude .git directories
+- `-z` — Short for `--compress` (rsync compatible)
+- `-u` / `--update` — Skip files where destination is newer
+- `--ignore-existing` — Skip files that already exist in destination
+
+### rsync Compatibility Notes
+
+sy is intentionally NOT a drop-in rsync replacement. Key differences:
+
+| Feature | rsync | sy | Rationale |
+|---------|-------|-----|-----------|
+| Verification | size+mtime | xxHash3 | Catches silent corruption |
+| Recursion | Requires `-r` | Implicit | Better UX |
+| Resume | Manual | Automatic | Handles interruptions |
+| `-b` flag | Backup | (removed) | Conflict avoidance |
+
+For rsync-like speed without verification: `sy --mode fast`
 ```
 
 ## Completed (v0.0.61-v0.0.65)
@@ -175,8 +212,13 @@ Users who want rsync-speed can use `--mode fast`.
 
 ### Documentation
 - [ ] Update README.md (default behavior section)
-- [ ] Update CHANGELOG.md (breaking changes + migration)
 - [ ] Update --help text in cli.rs
+- [ ] **CHANGELOG.md** - Comprehensive breaking changes section:
+  - [ ] Default behavior changes (gitignore, .git)
+  - [ ] Removed flags (--no-gitignore, --include-vcs, -b short flag)
+  - [ ] New flags (--gitignore, --exclude-vcs, -z, -u, --update, --ignore-existing)
+  - [ ] Migration guide with before/after examples
+  - [ ] Intentional differences from rsync (and why)
 
 ### Release
 - [ ] Bump version to 0.1.0 in Cargo.toml
