@@ -1415,11 +1415,11 @@ mod tests {
         // Same sizes
         let mut seq_sizes: Vec<_> = seq_entries
             .iter()
-            .map(|e| (&*e.relative_path, e.size))
+            .map(|e| (e.relative_path.clone(), e.size))
             .collect();
         let mut par_sizes: Vec<_> = par_entries
             .iter()
-            .map(|e| (&*e.relative_path, e.size))
+            .map(|e| (e.relative_path.clone(), e.size))
             .collect();
         seq_sizes.sort_by_key(|(p, _)| p.clone());
         par_sizes.sort_by_key(|(p, _)| p.clone());
