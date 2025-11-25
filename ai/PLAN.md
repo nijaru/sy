@@ -49,9 +49,12 @@
 ```
 Default:        Copy all files (rsync-compatible)
 --gitignore     Respect .gitignore rules (opt-in for dev workflows)
---no-gitignore  DEPRECATED (now default)
---include-vcs   DEPRECATED (now default)
+--exclude-vcs   Exclude .git directories (opt-in)
 -a/--archive    Unchanged (already copies everything)
+
+REMOVED (no deprecation, just remove):
+--no-gitignore  (now default behavior)
+--include-vcs   (now default behavior)
 ```
 
 ### Migration Guide
@@ -96,23 +99,48 @@ Default:        Copy all files (rsync-compatible)
 - russh migration (SSH agent blocker)
 - S3 bidirectional sync
 
-## Open Questions
+## Intentional Differences from rsync (Keep)
 
-1. Should deprecated flags emit warnings? → Recommend: yes, for 1-2 releases
-2. Archive mode (`-a`) unchanged? → Yes, already copies everything
-3. Remove deprecated flags in v0.2.0? → Discuss after user feedback
+| Behavior | rsync | sy | Rationale |
+|----------|-------|-----|-----------|
+| Verification | size+mtime | xxHash3 | sy's value prop: "verification-first" |
+| Recursion | Explicit `-r` | Implicit | Better UX, less confusing |
+| Resume | None | Auto-enabled | Enhancement over rsync |
+| Error limit | Implicit | Configurable `--max-errors` | Better control |
+
+Users who want rsync-speed can use `--mode fast`.
+
+## Resolved Questions
+
+1. ~~Deprecation warnings?~~ → **No.** Remove flags entirely (0.0.x → 0.1.0 expects breaking changes)
+2. Archive mode (`-a`)? → **Unchanged** (already copies everything)
+3. Verification default? → **Keep Standard** (xxHash3 is sy's differentiator)
 
 ## Checklist
 
-- [ ] Review all affected code (scanner.rs, cli.rs)
-- [ ] Implement `--gitignore` flag
-- [ ] Update `ScanOptions::default()`
-- [ ] Update `scan_options()` logic
-- [ ] Update help text
-- [ ] Update unit tests
-- [ ] Update integration tests
-- [ ] Run full test suite
-- [ ] Update README.md
-- [ ] Update CHANGELOG.md
-- [ ] Bump version to 0.1.0
+### Code Changes
+- [ ] Flip `ScanOptions::default()` in `src/sync/scanner.rs:168-175`
+- [ ] Add `--gitignore` flag (opt-in to respect .gitignore)
+- [ ] Add `--exclude-vcs` flag (opt-in to exclude .git)
+- [ ] Remove `--no-gitignore` flag
+- [ ] Remove `--include-vcs` flag
+- [ ] Update `scan_options()` logic in `src/cli.rs`
+- [ ] Update archive mode (`-a`) - may need adjustment
+
+### Tests
+- [ ] Update `test_scan_options_default` (flip assertions)
+- [ ] Update `test_scan_options_archive_mode`
+- [ ] Update `tests/archive_mode_test.rs` tests
+- [ ] Add tests for new `--gitignore` flag
+- [ ] Add tests for new `--exclude-vcs` flag
+- [ ] Run full test suite: `cargo test`
+
+### Documentation
+- [ ] Update README.md (default behavior section)
+- [ ] Update CHANGELOG.md (breaking changes + migration)
+- [ ] Update --help text in cli.rs
+
+### Release
+- [ ] Bump version to 0.1.0 in Cargo.toml
+- [ ] Final `cargo test && cargo clippy`
 - [ ] Tag and release
