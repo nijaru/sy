@@ -99,6 +99,35 @@ REMOVED (no deprecation, just remove):
 - russh migration (SSH agent blocker)
 - S3 bidirectional sync
 
+## Critical: `-b` Flag Conflict
+
+| Tool | `-b` means |
+|------|-----------|
+| rsync | `--backup` (make backups before overwrite) |
+| sy | `--bidirectional` (two-way sync) |
+
+**Risk**: User runs `sy -avb /src /dest` expecting rsync behavior, gets bidirectional sync.
+
+**Decision**: Change `-b` to `-B` or remove short flag entirely.
+
+## Missing Short Flags (Add for v0.1.0)
+
+| rsync | sy current | v0.1.0 |
+|-------|------------|--------|
+| `-z` (compress) | `--compress` only | Add `-z` |
+| `-l` (symlinks) | `--links preserve` | Consider `-l` |
+| `-P` (progress) | `--per-file-progress` | Consider `-P` |
+
+## Missing Features (Document, Don't Add)
+
+| rsync flag | Purpose | sy status |
+|------------|---------|-----------|
+| `--update` | Skip newer files in dest | Not implemented |
+| `--ignore-existing` | Skip existing files | Not implemented |
+| `--backup` | Make backups | Not implemented (and `-b` conflict!) |
+
+**Decision**: Document these as "not supported" rather than adding for v0.1.0.
+
 ## Intentional Differences from rsync (Keep)
 
 | Behavior | rsync | sy | Rationale |
@@ -118,14 +147,19 @@ Users who want rsync-speed can use `--mode fast`.
 
 ## Checklist
 
-### Code Changes
+### Code Changes - Defaults
 - [ ] Flip `ScanOptions::default()` in `src/sync/scanner.rs:168-175`
 - [ ] Add `--gitignore` flag (opt-in to respect .gitignore)
 - [ ] Add `--exclude-vcs` flag (opt-in to exclude .git)
 - [ ] Remove `--no-gitignore` flag
 - [ ] Remove `--include-vcs` flag
 - [ ] Update `scan_options()` logic in `src/cli.rs`
-- [ ] Update archive mode (`-a`) - may need adjustment
+
+### Code Changes - CLI Compatibility
+- [ ] Change `-b` short flag (bidirectional) → `-B` or remove
+- [ ] Add `-z` short flag for `--compress`
+- [ ] Consider `-l` for symlinks (complex: --links takes value)
+- [ ] Consider `-P` for progress
 
 ### Tests
 - [ ] Update `test_scan_options_default` (flip assertions)

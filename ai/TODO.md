@@ -6,22 +6,36 @@
 
 [Issue #11](https://github.com/nijaru/sy/issues/11) - Defaults differ from rsync
 
-- [ ] **Phase 1: Code Changes**
-  - [ ] Flip `ScanOptions::default()` in `src/sync/scanner.rs:168-175`
-  - [ ] Add `--gitignore` flag to `src/cli.rs`
-  - [ ] Update `scan_options()` logic in `src/cli.rs:598-612`
-  - [ ] Update help text for deprecated flags
+- [ ] Flip `ScanOptions::default()` in `src/sync/scanner.rs:168-175`
+- [ ] Add `--gitignore` flag (opt-in)
+- [ ] Add `--exclude-vcs` flag (opt-in)
+- [ ] Remove `--no-gitignore` and `--include-vcs` flags
+- [ ] Update `scan_options()` logic
 
-- [ ] **Phase 2: Test Updates**
-  - [ ] Update `test_scan_options_default` in `src/cli.rs`
-  - [ ] Update `test_scan_options_archive_mode` in `src/cli.rs`
-  - [ ] Update tests in `tests/archive_mode_test.rs`
-  - [ ] Add tests for new `--gitignore` flag
+### Breaking Change: `-b` Flag Conflict
 
-- [ ] **Phase 3: Documentation**
-  - [ ] Update README.md
-  - [ ] Update CHANGELOG.md with migration guide
-  - [ ] Bump version to 0.1.0
+**CRITICAL**: rsync `-b` = backup, sy `-b` = bidirectional
+
+- [ ] Change `-b` → `-B` (or remove short flag)
+- [ ] Document in migration guide
+
+### CLI Compatibility
+
+- [ ] Add `-z` short flag for `--compress`
+- [ ] Consider `-l` for symlinks
+- [ ] Consider `-P` for progress
+
+### Tests
+
+- [ ] Update default behavior tests
+- [ ] Add tests for new flags
+- [ ] Run full test suite
+
+### Documentation
+
+- [ ] Update README.md
+- [ ] Update CHANGELOG.md with migration guide
+- [ ] Bump version to 0.1.0
 
 See `ai/PLAN.md` for full implementation details.
 
