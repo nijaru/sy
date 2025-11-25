@@ -78,6 +78,7 @@ fjall = "2.11.2"
 # S3 / Cloud Storage (Phase 10) - Optional feature
 object_store = { version = "0.12.4", features = ["aws"], optional = true }
 bytes = "1.10.1"
+crossbeam-channel = "0.5.15"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]

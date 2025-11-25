@@ -1,5 +1,6 @@
 use crate::error::{Result, SyncError};
-use ignore::WalkBuilder;
+use crossbeam_channel::{bounded, Receiver};
+use ignore::{WalkBuilder, WalkState};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -173,6 +174,71 @@ impl Default for ScanOptions {
     }
 }
 
+/// Process a directory entry into a FileEntry
+/// Extracted to share between sequential and parallel scanners
+fn process_dir_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> {
+    let path = entry.path().to_path_buf();
+
+    let metadata = entry.metadata().map_err(|e| SyncError::ReadDirError {
+        path: path.clone(),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+
+    let relative_path = path
+        .strip_prefix(root)
+        .map(|p| p.to_path_buf())
+        .map_err(|_| SyncError::InvalidPath { path: path.clone() })?;
+
+    // Check if this is a symlink
+    let is_symlink = metadata.is_symlink();
+    let symlink_target = if is_symlink {
+        std::fs::read_link(&path).ok()
+    } else {
+        None
+    };
+
+    // Detect sparse files (only for regular files, not directories or symlinks)
+    let (is_sparse, allocated_size) = if !metadata.is_dir() && !is_symlink {
+        detect_sparse_file(&path, &metadata)
+    } else {
+        (false, 0)
+    };
+
+    // Detect hardlink information (inode and link count)
+    let (inode, nlink) = detect_hardlink_info(&metadata);
+
+    // Read extended attributes (always scan them, writing is conditional)
+    let xattrs = read_xattrs(&path);
+
+    // Read ACLs (always scan them, writing is conditional)
+    let acls = read_acls(&path);
+
+    // Read BSD file flags (macOS only, None on other platforms)
+    let bsd_flags = read_bsd_flags(&metadata);
+
+    let modified = metadata.modified().map_err(|e| SyncError::ReadDirError {
+        path: path.clone(),
+        source: e,
+    })?;
+
+    Ok(FileEntry {
+        path: Arc::new(path),
+        relative_path: Arc::new(relative_path),
+        size: metadata.len(),
+        modified,
+        is_dir: metadata.is_dir(),
+        is_symlink,
+        symlink_target: symlink_target.map(Arc::new),
+        is_sparse,
+        allocated_size,
+        xattrs,
+        inode,
+        nlink,
+        acls,
+        bsd_flags,
+    })
+}
+
 pub struct Scanner {
     root: PathBuf,
     threads: usize,
@@ -252,7 +318,7 @@ impl Scanner {
     /// all entries into memory at once. Memory usage is O(1) regardless
     /// of directory size.
     ///
-    /// Uses parallel directory walking if threads > 0, which can provide
+    /// Uses parallel directory walking if threads > 1, which can provide
     /// 2-4x speedup on directories with many subdirectories.
     ///
     /// # Example
@@ -263,7 +329,7 @@ impl Scanner {
     ///     println!("{}", entry.path.display());
     /// }
     /// ```
-    pub fn scan_streaming(&self) -> Result<StreamingScanner> {
+    pub fn scan_streaming(&self) -> Result<Box<dyn Iterator<Item = Result<FileEntry>> + Send>> {
         let mut walker = WalkBuilder::new(&self.root);
         walker
             .hidden(false) // Don't skip hidden files by default
@@ -289,14 +355,22 @@ impl Scanner {
             }
         }
 
-        Ok(StreamingScanner {
-            root: self.root.clone(),
-            walker: walker.build(),
-        })
+        // Use parallel scanning for threads > 1
+        if self.threads > 1 {
+            Ok(Box::new(ParallelStreamingScanner::new(
+                self.root.clone(),
+                walker.build_parallel(),
+            )))
+        } else {
+            Ok(Box::new(StreamingScanner {
+                root: self.root.clone(),
+                walker: walker.build(),
+            }))
+        }
     }
 }
 
-/// Streaming iterator over FileEntry items
+/// Sequential streaming iterator over FileEntry items
 ///
 /// This iterator processes files one at a time, making it suitable for
 /// very large directories (millions of files) without consuming excessive memory.
@@ -317,82 +391,77 @@ impl Iterator for StreamingScanner {
                 Err(e) => return Some(Err(SyncError::Io(std::io::Error::other(e.to_string())))),
             };
 
-            let path = entry.path().to_path_buf();
-
             // Skip the root directory itself
-            if path == self.root {
+            if entry.path() == self.root {
                 continue;
             }
 
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    return Some(Err(SyncError::ReadDirError {
-                        path: path.clone(),
-                        source: std::io::Error::other(e.to_string()),
-                    }))
-                }
-            };
-
-            let relative_path = match path.strip_prefix(&self.root) {
-                Ok(p) => p.to_path_buf(),
-                Err(_) => return Some(Err(SyncError::InvalidPath { path: path.clone() })),
-            };
-
-            // Check if this is a symlink
-            let is_symlink = metadata.is_symlink();
-            let symlink_target = if is_symlink {
-                std::fs::read_link(&path).ok()
-            } else {
-                None
-            };
-
-            // Detect sparse files (only for regular files, not directories or symlinks)
-            let (is_sparse, allocated_size) = if !metadata.is_dir() && !is_symlink {
-                detect_sparse_file(&path, &metadata)
-            } else {
-                (false, 0)
-            };
-
-            // Detect hardlink information (inode and link count)
-            let (inode, nlink) = detect_hardlink_info(&metadata);
-
-            // Read extended attributes (always scan them, writing is conditional)
-            let xattrs = read_xattrs(&path);
-
-            // Read ACLs (always scan them, writing is conditional)
-            let acls = read_acls(&path);
-
-            // Read BSD file flags (macOS only, None on other platforms)
-            let bsd_flags = read_bsd_flags(&metadata);
-
-            let modified = match metadata.modified() {
-                Ok(m) => m,
-                Err(e) => {
-                    return Some(Err(SyncError::ReadDirError {
-                        path: path.clone(),
-                        source: e,
-                    }))
-                }
-            };
-
-            return Some(Ok(FileEntry {
-                path: Arc::new(path.clone()),
-                relative_path: Arc::new(relative_path),
-                size: metadata.len(),
-                modified,
-                is_dir: metadata.is_dir(),
-                is_symlink,
-                symlink_target: symlink_target.map(Arc::new),
-                is_sparse,
-                allocated_size,
-                xattrs,
-                inode,
-                nlink,
-                acls,
-                bsd_flags,
-            }));
+            return Some(process_dir_entry(&self.root, entry));
         }
+    }
+}
+
+// StreamingScanner is Send because it only contains Send types
+unsafe impl Send for StreamingScanner {}
+
+/// Parallel streaming iterator over FileEntry items
+///
+/// Uses multiple threads to scan directories in parallel, providing 2-4x speedup
+/// on directories with many subdirectories. Results are delivered through a channel.
+pub struct ParallelStreamingScanner {
+    receiver: Receiver<Result<FileEntry>>,
+    // Handle kept to ensure walker thread completes
+    _handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParallelStreamingScanner {
+    fn new(root: PathBuf, walker: ignore::WalkParallel) -> Self {
+        // Bounded channel prevents memory blowup if consumer is slow
+        let (sender, receiver) = bounded(1024);
+
+        let handle = std::thread::spawn(move || {
+            walker.run(|| {
+                let sender = sender.clone();
+                let root = root.clone();
+                Box::new(move |result| {
+                    match result {
+                        Ok(entry) => {
+                            // Skip the root directory itself
+                            if entry.path() == root {
+                                return WalkState::Continue;
+                            }
+
+                            let file_entry = process_dir_entry(&root, entry);
+                            // If send fails, receiver dropped - stop walking
+                            if sender.send(file_entry).is_err() {
+                                return WalkState::Quit;
+                            }
+                        }
+                        Err(e) => {
+                            let err = SyncError::Io(std::io::Error::other(e.to_string()));
+                            if sender.send(Err(err)).is_err() {
+                                return WalkState::Quit;
+                            }
+                        }
+                    }
+                    WalkState::Continue
+                })
+            });
+            // sender drops here when walker completes, closing channel
+        });
+
+        Self {
+            receiver,
+            _handle: Some(handle),
+        }
+    }
+}
+
+impl Iterator for ParallelStreamingScanner {
+    type Item = Result<FileEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.recv().ok()
     }
 }
 
@@ -1085,5 +1154,121 @@ mod tests {
 
         assert_eq!(files.len(), 3, "Should find 3 files");
         assert_eq!(dirs.len(), 2, "Should find 2 directories");
+    }
+
+    // === Parallel Scanner Tests ===
+
+    #[test]
+    fn test_parallel_scanner_basic() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create test structure with multiple subdirs (benefits from parallelism)
+        for i in 0..5 {
+            let dir = root.join(format!("dir{}", i));
+            fs::create_dir(&dir).unwrap();
+            for j in 0..10 {
+                fs::write(
+                    dir.join(format!("file{}.txt", j)),
+                    format!("content{}{}", i, j),
+                )
+                .unwrap();
+            }
+        }
+
+        // Test with explicit parallel scanning (4 threads)
+        let scanner = Scanner::with_threads(root, 4);
+        let entries = scanner.scan().unwrap();
+
+        // Should find 5 directories + 50 files
+        assert_eq!(entries.len(), 55, "Should find all 55 entries");
+
+        let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+        let dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).collect();
+
+        assert_eq!(files.len(), 50, "Should find 50 files");
+        assert_eq!(dirs.len(), 5, "Should find 5 directories");
+    }
+
+    #[test]
+    fn test_parallel_scanner_large() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create 10 subdirectories with 100 files each
+        for i in 0..10 {
+            let dir = root.join(format!("subdir{:02}", i));
+            fs::create_dir(&dir).unwrap();
+            for j in 0..100 {
+                fs::write(
+                    dir.join(format!("file{:03}.txt", j)),
+                    format!("content{}", j),
+                )
+                .unwrap();
+            }
+        }
+
+        // Compare sequential vs parallel results
+        let sequential = Scanner::with_threads(root, 0).scan().unwrap();
+        let parallel = Scanner::with_threads(root, 4).scan().unwrap();
+
+        assert_eq!(
+            sequential.len(),
+            parallel.len(),
+            "Sequential and parallel should find same count"
+        );
+
+        // Both should find 10 dirs + 1000 files
+        assert_eq!(sequential.len(), 1010);
+    }
+
+    #[test]
+    fn test_parallel_scanner_preserves_metadata() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create file with specific content
+        let file_path = root.join("test.txt");
+        let content = "test content for metadata";
+        fs::write(&file_path, content).unwrap();
+
+        let scanner = Scanner::with_threads(root, 4);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+
+        assert_eq!(*entry.relative_path, PathBuf::from("test.txt"));
+        assert_eq!(entry.size, content.len() as u64);
+        assert!(!entry.is_dir);
+        assert!(!entry.is_symlink);
+    }
+
+    #[test]
+    fn test_sequential_fallback_single_thread() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("file.txt"), "content").unwrap();
+
+        // threads=1 should use sequential scanner
+        let scanner = Scanner::with_threads(root, 1);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_sequential_fallback_zero_threads() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("file.txt"), "content").unwrap();
+
+        // threads=0 should use sequential scanner
+        let scanner = Scanner::with_threads(root, 0);
+        let entries = scanner.scan().unwrap();
+
+        assert_eq!(entries.len(), 1);
     }
 }

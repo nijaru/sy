@@ -2383,6 +2383,7 @@ dependencies = [
  "clap",
  "colored",
  "criterion",
+ "crossbeam-channel",
  "dirs",
  "exacl",
  "fastbloom",
