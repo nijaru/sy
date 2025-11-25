@@ -2,13 +2,22 @@
 
 ## Current State
 - Version: v0.0.65 (released 2025-11-25)
-- **Next Release Goal**: v0.1.0 (Production Readiness)
-- Test Coverage: **527+ tests passing** ✅ (38 new integration tests)
+- **Next Release Goal**: v0.1.0 (Breaking Changes)
+- Test Coverage: **527+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
-## Current Work: Integration Test Coverage ✅ COMPLETE
+## Current Work: v0.1.0 Breaking Changes
 
-Issue #11 revealed gap: we test **flag state** not **actual behavior**. Added 38 new integration tests.
+[Issue #11 feedback](https://github.com/nijaru/sy/issues/11#issuecomment-3573509820): defaults differ from rsync.
+
+**Decision**: Flip gitignore defaults to match rsync behavior.
+
+| Behavior | v0.0.x | v0.1.0 |
+|----------|--------|--------|
+| `.gitignore` | Respected (skip) | Ignored (copy all) |
+| `.git/` dirs | Excluded | Included |
+
+See `ai/PLAN.md` for implementation details.
 
 ### New Test Files
 | File | Tests | Coverage |
