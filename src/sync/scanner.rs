@@ -1360,4 +1360,112 @@ mod tests {
         // 50 dirs + 50 files
         assert_eq!(entries.len(), 100);
     }
+
+    #[test]
+    fn test_threshold_boundary() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create exactly 30 subdirs (at threshold boundary)
+        for i in 0..30 {
+            fs::create_dir(root.join(format!("dir{:02}", i))).unwrap();
+        }
+
+        // At threshold (30), should NOT trigger parallel (need > 30)
+        assert!(!super::should_use_parallel(root));
+
+        // Add one more to cross threshold
+        fs::create_dir(root.join("dir30")).unwrap();
+        assert!(super::should_use_parallel(root));
+    }
+
+    #[test]
+    fn test_parallel_sequential_identical_results() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create structure that triggers parallel
+        for i in 0..50 {
+            let subdir = root.join(format!("dir{:02}", i));
+            fs::create_dir(&subdir).unwrap();
+            fs::write(subdir.join("file.txt"), format!("content{}", i)).unwrap();
+        }
+
+        // Scan with sequential
+        let seq_entries = Scanner::with_threads(root, 1).scan().unwrap();
+        // Scan with parallel
+        let par_entries = Scanner::with_threads(root, 4).scan().unwrap();
+
+        // Same count
+        assert_eq!(seq_entries.len(), par_entries.len());
+
+        // Same paths (sorted for comparison)
+        let mut seq_paths: Vec<_> = seq_entries
+            .iter()
+            .map(|e| e.relative_path.clone())
+            .collect();
+        let mut par_paths: Vec<_> = par_entries
+            .iter()
+            .map(|e| e.relative_path.clone())
+            .collect();
+        seq_paths.sort();
+        par_paths.sort();
+        assert_eq!(seq_paths, par_paths);
+
+        // Same sizes
+        let mut seq_sizes: Vec<_> = seq_entries
+            .iter()
+            .map(|e| (&*e.relative_path, e.size))
+            .collect();
+        let mut par_sizes: Vec<_> = par_entries
+            .iter()
+            .map(|e| (&*e.relative_path, e.size))
+            .collect();
+        seq_sizes.sort_by_key(|(p, _)| p.clone());
+        par_sizes.sort_by_key(|(p, _)| p.clone());
+        assert_eq!(seq_sizes, par_sizes);
+    }
+
+    #[test]
+    fn test_mixed_files_and_subdirs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create mixed structure: files and subdirs at root
+        for i in 0..20 {
+            fs::write(root.join(format!("rootfile{}.txt", i)), "content").unwrap();
+        }
+        for i in 0..40 {
+            let subdir = root.join(format!("subdir{:02}", i));
+            fs::create_dir(&subdir).unwrap();
+            fs::write(subdir.join("nested.txt"), "nested").unwrap();
+        }
+
+        // 40 subdirs > 30 threshold, should use parallel
+        assert!(super::should_use_parallel(root));
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+
+        // 20 root files + 40 subdirs + 40 nested files = 100
+        assert_eq!(entries.len(), 100);
+    }
+
+    #[test]
+    fn test_flat_dir_no_parallel() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create flat directory with many files but no subdirs
+        for i in 0..1000 {
+            fs::write(root.join(format!("file{:04}.txt", i)), "content").unwrap();
+        }
+
+        // No subdirs, should not trigger parallel
+        assert!(!super::should_use_parallel(root));
+
+        let scanner = Scanner::new(root);
+        let entries = scanner.scan().unwrap();
+        assert_eq!(entries.len(), 1000);
+    }
 }
