@@ -118,6 +118,10 @@ harness = false
 name = "checksumdb_bench"
 harness = false
 
+[[bench]]
+name = "scanner_bench"
+harness = false
+
 [[bin]]
 name = "sy-remote"
 path = "src/bin/sy-remote.rs"
