@@ -1,7 +1,7 @@
 # Status
 
 ## Current State
-- Version: v0.0.64 (released 2025-11-25)
+- Version: v0.0.65 (released 2025-11-25)
 - **Next Release Goal**: v0.1.0 (Production Readiness)
 - Test Coverage: **527+ tests passing** ✅ (38 new integration tests)
 - **Current Build**: 🟢 PASSING
@@ -43,6 +43,10 @@ Issue #11 revealed gap: we test **flag state** not **actual behavior**. Added 38
 | 10,000 files / 200 subdirs | 42.2ms | 24.3ms | **1.74x** |
 
 ## Recent Releases
+
+### v0.0.65 (Testing & Bug Fix)
+- Fixed `--filter` flag to accept rsync-style patterns (e.g., `--filter "- *.log"`)
+- 38 new integration tests for CLI flag behavior
 
 ### v0.0.64 (Performance)
 - Parallel directory scanning with dynamic optimization
