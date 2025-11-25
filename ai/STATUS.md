@@ -3,7 +3,7 @@
 ## Current State
 - Version: v0.0.63 (released 2025-11-24)
 - **Next Release Goal**: v0.1.0 (Production Readiness)
-- Test Coverage: **475 tests passing** ✅ (Cross-platform verified)
+- Test Coverage: **480 tests passing** ✅ (Cross-platform verified)
 - **Current Build**: 🟢 PASSING
 
 ## Feature Flags
@@ -12,15 +12,16 @@
 - ACL: Optional (Linux requires libacl-dev, macOS works natively)
 - S3: Optional (disabled by default)
 
-## Recent Work (v0.0.63)
-- **Code Review Fixes**: Bisync timestamp overflow, size parsing, CLI flags
-- **Safety**: Removed unnecessary unsafe code (Adler-32 safe indexing identical perf)
-- **Cleanup**: Removed dead code (verify_only field), updated comments
+## Recent Work
+- **Parallel Scanner** (5befa94): Implemented parallel directory scanning
+  - Uses `ignore::WalkParallel` with `crossbeam-channel` bridge
+  - Automatically parallel when threads > 1 (default: num_cpus)
+  - Sequential fallback for threads=0/1
+  - 5 new tests for correctness
 
 ## Next Up
-- **Parallel Scanner**: Use `ignore` crate's `build_parallel()` with channel adapter
-  - Plan: crossbeam-channel to bridge push→pull (already transitive dep)
-  - Estimated: 2-4x speedup on multi-core with many subdirs
+- Performance benchmarking of parallel scanner
+- Consider version bump for parallel scanner feature
 
 ## Recent Releases
 

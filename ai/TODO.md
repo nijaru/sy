@@ -2,13 +2,11 @@
 
 ## Active: v0.1.0 (Production Readiness)
 
-### High Priority
+### Completed
 
-- [ ] **Parallel scanner** (`src/sync/scanner.rs`)
-  - Use `ignore` crate's `build_parallel()` with `crossbeam-channel`
-  - Bridge push-based visitor to pull-based iterator
-  - Benefit: 2-4x speedup on multi-core with many subdirectories
-  - Deps: Both already transitive (promote to direct)
+- [x] **Parallel scanner** (`src/sync/scanner.rs`) - 5befa94
+  - Uses `ignore::WalkParallel` with `crossbeam-channel` bridge
+  - Automatic parallel when threads > 1, sequential fallback otherwise
 
 ### Low Priority
 
