@@ -364,7 +364,7 @@ pub struct Cli {
     /// Archive mode: preserve all metadata (-rlptgoD) and copy everything
     ///
     /// Equivalent to rsync's -rlptgoD (recursive, links, perms, times, group, owner, devices).
-    /// Also implies --no-gitignore and --include-vcs to ensure complete backups.
+    /// All files are copied by default (no .gitignore filtering, .git directories included).
     ///
     /// Does NOT include: -X (xattrs), -A (ACLs), -H (hardlinks) - add those flags separately.
     #[arg(short = 'a', long)]

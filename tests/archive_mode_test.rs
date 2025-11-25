@@ -149,7 +149,7 @@ fn test_archive_preserves_permissions() {
 
 #[test]
 fn test_archive_syncs_gitignored_files() {
-    // -a implies --no-gitignore, so ignored files should be synced
+    // -a syncs all files including gitignored ones (default v0.1.0+ behavior)
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
