@@ -168,8 +168,8 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            respect_gitignore: true,
-            include_git_dir: false,
+            respect_gitignore: false,
+            include_git_dir: true,
         }
     }
 }
@@ -559,7 +559,11 @@ mod tests {
         fs::write(root.join("ignored.txt"), "should be ignored").unwrap();
         fs::write(root.join("included.txt"), "should be included").unwrap();
 
-        let scanner = Scanner::new(root);
+        // Use respect_gitignore: true to enable .gitignore filtering
+        let scanner = Scanner::new(root).with_options(ScanOptions {
+            respect_gitignore: true,
+            include_git_dir: false,
+        });
         let entries = scanner.scan().unwrap();
 
         // ignored.txt should not appear
@@ -586,7 +590,7 @@ mod tests {
         )
         .unwrap();
 
-        // Create files matching patterns (should be ignored)
+        // Create files matching patterns (should be ignored with respect_gitignore: true)
         fs::write(root.join("test.tmp"), "should be ignored").unwrap();
         fs::write(root.join("debug.log"), "should be ignored").unwrap();
         fs::create_dir(root.join("node_modules")).unwrap();
@@ -600,7 +604,11 @@ mod tests {
         fs::write(root.join("normal.txt"), "should be included").unwrap();
         fs::write(root.join("important.rs"), "should be included").unwrap();
 
-        let scanner = Scanner::new(root);
+        // Use respect_gitignore: true to enable .gitignore filtering
+        let scanner = Scanner::new(root).with_options(ScanOptions {
+            respect_gitignore: true,
+            include_git_dir: true,
+        });
         let entries = scanner.scan().unwrap();
 
         // Ignored files should NOT appear

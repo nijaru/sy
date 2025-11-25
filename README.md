@@ -82,6 +82,10 @@ sy /local s3://bucket/path               # S3 sync
 sy ~/src ~/dest --exclude "*.log"        # With filters
 sy ~/dev /backup --watch                 # Continuous sync
 sy --bidirectional /laptop /backup       # Two-way sync
+sy ~/src ~/dest -u                       # Skip files where dest is newer
+sy ~/src ~/dest --ignore-existing        # Skip files that already exist
+sy ~/src ~/dest --gitignore              # Respect .gitignore rules
+sy ~/src ~/dest --gitignore --exclude-vcs # Developer workflow (no .git, respect .gitignore)
 ```
 
 ### S3 & Cloud Storage

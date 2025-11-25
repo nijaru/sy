@@ -306,7 +306,7 @@ pub struct Cli {
     pub verify: bool,
 
     /// Enable compression for network transfers (auto-detects based on file type)
-    #[arg(long)]
+    #[arg(short = 'z', long)]
     pub compress: bool,
 
     /// Compression detection mode (auto, extension, always, never)
@@ -370,19 +370,19 @@ pub struct Cli {
     #[arg(short = 'a', long)]
     pub archive: bool,
 
-    /// Don't filter files based on .gitignore rules
+    /// Filter files based on .gitignore rules (opt-in)
     ///
-    /// By default, sy respects .gitignore for developer-friendly syncs.
-    /// Use this flag (or -a/--archive) to sync all files regardless of .gitignore.
+    /// By default, sy copies all files like rsync/cp.
+    /// Use this flag to respect .gitignore rules for developer-friendly syncs.
     #[arg(long)]
-    pub no_gitignore: bool,
+    pub gitignore: bool,
 
-    /// Include .git directories in the sync
+    /// Exclude .git directories from the sync (opt-in)
     ///
-    /// By default, sy excludes .git directories for faster syncs.
-    /// Use this flag (or -a/--archive) to include version control directories.
+    /// By default, sy copies .git directories like rsync/cp.
+    /// Use this flag to skip version control directories for faster syncs.
     #[arg(long)]
-    pub include_vcs: bool,
+    pub exclude_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
     #[arg(long)]
@@ -396,6 +396,14 @@ pub struct Cli {
     #[arg(short = 'c', long)]
     pub checksum: bool,
 
+    /// Skip files where destination is newer than source (rsync --update)
+    #[arg(short = 'u', long)]
+    pub update: bool,
+
+    /// Skip files that already exist in destination (rsync --ignore-existing)
+    #[arg(long)]
+    pub ignore_existing: bool,
+
     /// Verify-only mode: audit file integrity without modifying anything
     /// Compares source and destination checksums and reports mismatches
     /// Returns exit code 0 if all match, 1 if mismatches found, 2 on error
@@ -407,7 +415,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Watch mode - continuously monitor source for changes
-    #[arg(long)]
+    #[arg(short = 'w', long)]
     pub watch: bool,
 
     /// Disable hook execution (skip pre-sync and post-sync hooks)
@@ -432,7 +440,7 @@ pub struct Cli {
 
     /// Bidirectional sync mode - sync changes in both directions
     /// Detects and resolves conflicts automatically based on --conflict-resolve strategy
-    #[arg(short = 'b', long)]
+    #[arg(long)]
     pub bidirectional: bool,
 
     /// Conflict resolution strategy for bidirectional sync
@@ -464,6 +472,11 @@ pub struct Cli {
     /// Delay increases exponentially with each retry (1s, 2s, 4s, ...)
     #[arg(long, default_value = "1")]
     pub retry_delay: u64,
+
+    // === rsync compatibility flags (hidden, no-op) ===
+    /// Recursive (no-op: sy is always recursive, for rsync compatibility)
+    #[arg(short = 'r', hide = true)]
+    pub recursive: bool,
 }
 
 impl Cli {
@@ -591,19 +604,16 @@ impl Cli {
 
     /// Get scan options based on CLI flags
     ///
-    /// Priority (highest to lowest):
-    /// 1. Explicit flags: --no-gitignore, --include-vcs
-    /// 2. Archive mode (-a): implies both --no-gitignore and --include-vcs
-    /// 3. Default: respect .gitignore, exclude .git (developer-friendly)
+    /// Default behavior (rsync-compatible): Copy all files including .git
+    /// Explicit flags for developer workflows:
+    /// - --gitignore: Opt-in to respect .gitignore rules
+    /// - --exclude-vcs: Opt-in to exclude .git directories
     pub fn scan_options(&self) -> ScanOptions {
-        // Archive mode sets both, but explicit flags can override
-        let archive_mode = self.archive;
+        // respect_gitignore: true only if --gitignore flag is set (opt-in)
+        let respect_gitignore = self.gitignore;
 
-        // respect_gitignore: false if --no-gitignore OR archive mode
-        let respect_gitignore = !(self.no_gitignore || archive_mode);
-
-        // include_git_dir: true if --include-vcs OR archive mode
-        let include_git_dir = self.include_vcs || archive_mode;
+        // include_git_dir: false only if --exclude-vcs flag is set (opt-out)
+        let include_git_dir = !self.exclude_vcs;
 
         ScanOptions {
             respect_gitignore,
@@ -749,8 +759,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -777,6 +789,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -834,8 +847,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -862,6 +877,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -923,8 +939,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -953,6 +971,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -1013,8 +1032,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1043,6 +1064,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -1098,8 +1120,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1128,6 +1152,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1183,8 +1208,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1213,6 +1240,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1268,8 +1296,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1298,6 +1328,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -1353,8 +1384,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1383,6 +1416,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1457,8 +1491,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1487,6 +1523,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         let result = cli.validate();
@@ -1545,8 +1582,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1575,6 +1614,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::Standard);
     }
@@ -1630,8 +1670,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1660,6 +1702,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
@@ -1741,8 +1784,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1771,6 +1816,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1826,8 +1872,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1856,6 +1904,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -1911,8 +1960,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -1941,6 +1992,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -1996,8 +2048,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true, // Archive mode enabled
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2026,6 +2080,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         // Archive mode should enable all these flags
@@ -2088,8 +2143,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2118,6 +2175,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         // Only permissions should be enabled
@@ -2179,8 +2237,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: true, // Archive mode also enabled
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2209,6 +2269,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         // All should be enabled (archive mode OR individual flags)
@@ -2271,8 +2332,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: true, // Both enabled - should fail
             size_only: true,
             checksum: false,
@@ -2301,6 +2364,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         let result = cli.validate();
@@ -2363,8 +2427,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: true, // Only this flag enabled
             size_only: false,
             checksum: false,
@@ -2393,6 +2459,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2452,8 +2519,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: true, // Only this flag enabled
@@ -2482,6 +2551,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2491,16 +2561,16 @@ mod tests {
 
     #[test]
     fn test_scan_options_default() {
-        // Default: respect gitignore, exclude .git
+        // Default: copy all files including .git (rsync-compatible)
         let cli = create_test_cli();
         let options = cli.scan_options();
-        assert!(options.respect_gitignore);
-        assert!(!options.include_git_dir);
+        assert!(!options.respect_gitignore); // Don't respect .gitignore by default
+        assert!(options.include_git_dir); // Include .git by default
     }
 
     #[test]
     fn test_scan_options_archive_mode() {
-        // Archive mode: don't respect gitignore, include .git
+        // Archive mode: same as defaults (rsync-compatible)
         let mut cli = create_test_cli();
         cli.archive = true;
         let options = cli.scan_options();
@@ -2510,20 +2580,27 @@ mod tests {
 
     #[test]
     fn test_scan_options_explicit_flags() {
-        // Explicit flags work independently
+        // --gitignore flag enables .gitignore filtering
         let mut cli = create_test_cli();
-        cli.no_gitignore = true;
-        cli.include_vcs = false;
-        let options = cli.scan_options();
-        assert!(!options.respect_gitignore);
-        assert!(!options.include_git_dir);
-
-        let mut cli = create_test_cli();
-        cli.no_gitignore = false;
-        cli.include_vcs = true;
+        cli.gitignore = true;
         let options = cli.scan_options();
         assert!(options.respect_gitignore);
-        assert!(options.include_git_dir);
+        assert!(options.include_git_dir); // Still includes .git unless --exclude-vcs
+
+        // --exclude-vcs flag excludes .git directories
+        let mut cli = create_test_cli();
+        cli.exclude_vcs = true;
+        let options = cli.scan_options();
+        assert!(!options.respect_gitignore); // Still copies .gitignore files
+        assert!(!options.include_git_dir);
+
+        // Both flags for developer workflow
+        let mut cli = create_test_cli();
+        cli.gitignore = true;
+        cli.exclude_vcs = true;
+        let options = cli.scan_options();
+        assert!(options.respect_gitignore);
+        assert!(!options.include_git_dir);
     }
 
     // Helper to create a minimal test CLI
@@ -2577,8 +2654,10 @@ mod tests {
             preserve_owner: false,
             preserve_devices: false,
             archive: false,
-            no_gitignore: false,
-            include_vcs: false,
+            gitignore: false,
+            exclude_vcs: false,
+            update: false,
+            ignore_existing: false,
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -2607,6 +2686,7 @@ mod tests {
             retry_delay: 1,
             resume_only: false,
             clear_resume_state: false,
+            recursive: false,
         }
     }
 }

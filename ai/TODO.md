@@ -1,45 +1,28 @@
 # TODO
 
-## Active: v0.1.0 Breaking Changes
+## v0.1.0 Breaking Changes - COMPLETED ✅
 
-### Breaking Change: Gitignore Default Flip
+[Issue #11](https://github.com/nijaru/sy/issues/11) - Defaults now match rsync behavior.
 
-[Issue #11](https://github.com/nijaru/sy/issues/11) - Defaults differ from rsync
+### Completed
 
-- [ ] Flip `ScanOptions::default()` in `src/sync/scanner.rs:168-175`
-- [ ] Add `--gitignore` flag (opt-in)
-- [ ] Add `--exclude-vcs` flag (opt-in)
-- [ ] Remove `--no-gitignore` and `--include-vcs` flags
-- [ ] Update `scan_options()` logic
+- [x] Flip `ScanOptions::default()` in `src/sync/scanner.rs`
+- [x] Add `--gitignore` flag (opt-in)
+- [x] Add `--exclude-vcs` flag (opt-in)
+- [x] Remove `--no-gitignore` and `--include-vcs` flags
+- [x] Remove `-b` short flag (rsync conflict)
+- [x] Add `-z` short flag for `--compress`
+- [x] Add `-u` / `--update` (skip if dest newer)
+- [x] Add `--ignore-existing` (skip if dest exists)
+- [x] Update `scan_options()` logic
+- [x] Update all tests for new defaults
+- [x] Update README.md
+- [x] Update CHANGELOG.md with migration guide
+- [x] Bump version to 0.1.0
 
-### Breaking Change: `-b` Flag Conflict
+### Ready for Release
 
-**CRITICAL**: rsync `-b` = backup, sy `-b` = bidirectional
-
-- [ ] Change `-b` → `-B` (or remove short flag)
-- [ ] Document in migration guide
-
-### CLI Compatibility
-
-- [ ] Add `-z` short flag for `--compress`
-- [ ] Add `-u` / `--update` (skip if dest newer)
-- [ ] Add `--ignore-existing` (skip if dest exists)
-- [ ] Consider `-l` for symlinks
-- [ ] Consider `-P` for progress
-
-### Tests
-
-- [ ] Update default behavior tests
-- [ ] Add tests for new flags
-- [ ] Run full test suite
-
-### Documentation
-
-- [ ] Update README.md
-- [ ] Update CHANGELOG.md with migration guide
-- [ ] Bump version to 0.1.0
-
-See `ai/PLAN.md` for full implementation details.
+All breaking changes implemented. Ready for final testing and release.
 
 ### ✅ Integration Test Coverage (Complete)
 

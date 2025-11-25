@@ -41,6 +41,10 @@ pub struct StrategyPlanner {
     size_only: bool,
     /// Always compare checksums instead of size+mtime
     checksum: bool,
+    /// Skip files where destination is newer (rsync --update)
+    update_only: bool,
+    /// Skip files that already exist in destination (rsync --ignore-existing)
+    ignore_existing: bool,
     /// Integrity verifier for checksum computation
     verifier: Option<IntegrityVerifier>,
 }
@@ -52,12 +56,20 @@ impl StrategyPlanner {
             ignore_times: false,
             size_only: false,
             checksum: false,
+            update_only: false,
+            ignore_existing: false,
             verifier: None,
         }
     }
 
     /// Create a new planner with custom comparison flags
-    pub fn with_comparison_flags(ignore_times: bool, size_only: bool, checksum: bool) -> Self {
+    pub fn with_comparison_flags(
+        ignore_times: bool,
+        size_only: bool,
+        checksum: bool,
+        update_only: bool,
+        ignore_existing: bool,
+    ) -> Self {
         // Create verifier if checksum mode is enabled
         let verifier = if checksum {
             // Use Fast (xxHash3) checksums for pre-transfer comparison (faster than BLAKE3)
@@ -71,6 +83,8 @@ impl StrategyPlanner {
             ignore_times,
             size_only,
             checksum,
+            update_only,
+            ignore_existing,
             verifier,
         }
     }
@@ -98,6 +112,36 @@ impl StrategyPlanner {
             // For files, check existence and file info
             match transport.file_info(&dest_path).await {
                 Ok(dest_info) => {
+                    // --ignore-existing: Skip files that already exist in destination
+                    if self.ignore_existing {
+                        tracing::debug!(
+                            "File exists, skipping (--ignore-existing): {}",
+                            source.relative_path.display()
+                        );
+                        return Ok(SyncTask {
+                            source: Some(Arc::new(source.clone())),
+                            dest_path,
+                            action: SyncAction::Skip,
+                            source_checksum: None,
+                            dest_checksum: None,
+                        });
+                    }
+
+                    // --update: Skip files where destination is newer
+                    if self.update_only && self.dest_is_newer(source, &dest_info) {
+                        tracing::debug!(
+                            "Destination is newer, skipping (--update): {}",
+                            source.relative_path.display()
+                        );
+                        return Ok(SyncTask {
+                            source: Some(Arc::new(source.clone())),
+                            dest_path,
+                            action: SyncAction::Skip,
+                            source_checksum: None,
+                            dest_checksum: None,
+                        });
+                    }
+
                     // Compute checksums if verifier is present and files are local
                     let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
                         self.compute_checksums_local(source, &dest_path, verifier, checksum_db)?
@@ -383,6 +427,15 @@ impl StrategyPlanner {
         match source_mtime.duration_since(*dest_mtime) {
             Ok(duration) => duration.as_secs() <= self.mtime_tolerance,
             Err(e) => e.duration().as_secs() <= self.mtime_tolerance,
+        }
+    }
+
+    /// Check if destination file is newer than source (for --update flag)
+    fn dest_is_newer(&self, source: &FileEntry, dest_info: &FileInfo) -> bool {
+        // dest is newer if dest_mtime > source_mtime (outside tolerance)
+        match dest_info.modified.duration_since(source.modified) {
+            Ok(duration) => duration.as_secs() > self.mtime_tolerance,
+            Err(_) => false, // source is newer or same
         }
     }
 
@@ -720,7 +773,7 @@ mod tests {
         };
 
         // Create planner with checksum mode enabled
-        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true, false, false);
         let task = planner.plan_file(&source_file, dest_root);
 
         // Should skip because checksums match
@@ -762,7 +815,7 @@ mod tests {
         };
 
         // Create planner with checksum mode enabled
-        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true, false, false);
         let task = planner.plan_file(&source_file, &dest_dir);
 
         // Should update because checksums differ
@@ -803,7 +856,7 @@ mod tests {
         };
 
         // Create planner with checksum mode enabled
-        let planner = StrategyPlanner::with_comparison_flags(false, false, true);
+        let planner = StrategyPlanner::with_comparison_flags(false, false, true, false, false);
         let task = planner.plan_file(&source_file, &dest_dir);
 
         // Should create because dest doesn't exist

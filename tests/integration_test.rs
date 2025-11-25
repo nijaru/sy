@@ -102,11 +102,12 @@ fn test_gitignore_support() {
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
     fs::write(source.path().join("ignore.log"), "ignore").unwrap();
 
-    // Run sync
+    // Run sync with --gitignore flag to respect .gitignore patterns
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--gitignore",
         ])
         .output()
         .unwrap();
@@ -192,11 +193,12 @@ fn test_skip_unchanged_files() {
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // First sync
+    // First sync (exclude .git to get predictable file counts)
     Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--exclude-vcs",
         ])
         .output()
         .unwrap();
@@ -206,6 +208,7 @@ fn test_skip_unchanged_files() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--exclude-vcs",
         ])
         .output()
         .unwrap();
@@ -285,10 +288,12 @@ fn test_git_directory_excluded() {
     fs::write(source.path().join(".git/config"), "test").unwrap();
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
+    // Use --exclude-vcs to exclude .git directory
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--exclude-vcs",
         ])
         .output()
         .unwrap();
@@ -306,11 +311,12 @@ fn test_update_shows_correct_stats() {
     fs::write(source.path().join("file1.txt"), "initial content v1").unwrap();
     fs::write(source.path().join("file2.txt"), "initial content v2").unwrap();
 
-    // Initial sync
+    // Initial sync (exclude .git for predictable file counts)
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--exclude-vcs",
         ])
         .output()
         .unwrap();
@@ -331,6 +337,7 @@ fn test_update_shows_correct_stats() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--exclude-vcs",
         ])
         .output()
         .unwrap();

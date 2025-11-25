@@ -255,10 +255,12 @@ fn perf_regression_gitignore_filtering() {
 
     let start = Instant::now();
 
+    // Use --gitignore to respect .gitignore patterns
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
+            "--gitignore",
         ])
         .output()
         .unwrap();

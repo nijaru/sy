@@ -186,43 +186,12 @@ fn test_archive_syncs_gitignored_files() {
 }
 
 // =============================================================================
-// --include-vcs Tests
+// Default Behavior Tests (rsync-compatible)
 // =============================================================================
 
 #[test]
-fn test_include_vcs_includes_git() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
-
-    setup_git_repo(&source);
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    // Run with --include-vcs (but not full archive mode)
-    let output = Command::new(sy_bin())
-        .args([
-            "--include-vcs",
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "sy --include-vcs failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // .git should be included
-    assert!(
-        dest.path().join(".git").exists(),
-        ".git should be included with --include-vcs"
-    );
-}
-
-#[test]
-fn test_default_excludes_git() {
-    // By default (without -a or --include-vcs), .git should be excluded
+fn test_default_includes_git() {
+    // v0.1.0: By default, .git directories are included (rsync-compatible)
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
@@ -244,38 +213,27 @@ fn test_default_excludes_git() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // .git should NOT be included by default
+    // .git SHOULD be included by default (rsync-compatible)
     assert!(
-        !dest.path().join(".git").exists(),
-        ".git should be excluded by default"
+        dest.path().join(".git").exists(),
+        ".git should be included by default"
     );
     assert!(dest.path().join("file.txt").exists());
 }
 
-// =============================================================================
-// --no-gitignore Tests
-// =============================================================================
-
 #[test]
-fn test_no_gitignore_syncs_ignored_files() {
+fn test_exclude_vcs_excludes_git() {
+    // --exclude-vcs flag excludes .git directories
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
     setup_git_repo(&source);
-
-    // Create .gitignore
-    fs::write(source.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
-
-    // Create files that would be ignored
-    fs::write(source.path().join("debug.log"), "log").unwrap();
-    fs::create_dir(source.path().join("build")).unwrap();
-    fs::write(source.path().join("build/output.txt"), "output").unwrap();
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // Run with --no-gitignore
+    // Run with --exclude-vcs
     let output = Command::new(sy_bin())
         .args([
-            "--no-gitignore",
+            "--exclude-vcs",
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
@@ -284,35 +242,40 @@ fn test_no_gitignore_syncs_ignored_files() {
 
     assert!(
         output.status.success(),
-        "sy --no-gitignore failed: {}",
+        "sy --exclude-vcs failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Ignored files should be synced
+    // .git should be excluded with --exclude-vcs
     assert!(
-        dest.path().join("debug.log").exists(),
-        "*.log should be synced with --no-gitignore"
+        !dest.path().join(".git").exists(),
+        ".git should be excluded with --exclude-vcs"
     );
-    assert!(
-        dest.path().join("build").exists(),
-        "build/ should be synced with --no-gitignore"
-    );
-    assert!(dest.path().join("build/output.txt").exists());
+    assert!(dest.path().join("file.txt").exists());
 }
 
+// =============================================================================
+// --gitignore Tests (v0.1.0: opt-in behavior)
+// =============================================================================
+
 #[test]
-fn test_default_respects_gitignore() {
+fn test_default_syncs_gitignored_files() {
+    // v0.1.0: Default behavior syncs all files (rsync-compatible)
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
     setup_git_repo(&source);
 
     // Create .gitignore
-    fs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+    fs::write(source.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
+
+    // Create files that would be ignored if .gitignore was respected
     fs::write(source.path().join("debug.log"), "log").unwrap();
+    fs::create_dir(source.path().join("build")).unwrap();
+    fs::write(source.path().join("build/output.txt"), "output").unwrap();
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // Run without --no-gitignore (default behavior)
+    // Run without any flags (default behavior)
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
@@ -327,10 +290,51 @@ fn test_default_respects_gitignore() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // .log files should NOT be synced by default
+    // All files should be synced by default (rsync-compatible)
+    assert!(
+        dest.path().join("debug.log").exists(),
+        "*.log should be synced by default"
+    );
+    assert!(
+        dest.path().join("build").exists(),
+        "build/ should be synced by default"
+    );
+    assert!(dest.path().join("build/output.txt").exists());
+}
+
+#[test]
+fn test_gitignore_flag_respects_gitignore() {
+    // --gitignore flag enables .gitignore filtering (opt-in)
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    setup_git_repo(&source);
+
+    // Create .gitignore
+    fs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+    fs::write(source.path().join("debug.log"), "log").unwrap();
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Run with --gitignore (opt-in to respect .gitignore)
+    let output = Command::new(sy_bin())
+        .args([
+            "--gitignore",
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sy --gitignore failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // .log files should NOT be synced with --gitignore
     assert!(
         !dest.path().join("debug.log").exists(),
-        "*.log should be excluded by default (gitignore)"
+        "*.log should be excluded with --gitignore"
     );
     assert!(dest.path().join("file.txt").exists());
 }
@@ -388,8 +392,8 @@ fn test_archive_is_complete_backup() {
 }
 
 #[test]
-fn test_include_vcs_without_no_gitignore() {
-    // --include-vcs alone should include .git but still respect .gitignore
+fn test_gitignore_without_exclude_vcs() {
+    // --gitignore alone respects .gitignore but still includes .git (default)
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
@@ -401,7 +405,7 @@ fn test_include_vcs_without_no_gitignore() {
 
     let output = Command::new(sy_bin())
         .args([
-            "--include-vcs",
+            "--gitignore",
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
         ])
@@ -410,16 +414,70 @@ fn test_include_vcs_without_no_gitignore() {
 
     assert!(
         output.status.success(),
-        "sy --include-vcs failed: {}",
+        "sy --gitignore failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // .git should be included
-    assert!(dest.path().join(".git").exists(), ".git with --include-vcs");
+    // .git should still be included (default behavior)
+    assert!(
+        dest.path().join(".git").exists(),
+        ".git should be included by default"
+    );
 
-    // But .gitignore rules should still apply
+    // .gitignore rules should apply
     assert!(
         !dest.path().join("debug.log").exists(),
-        "gitignore should still apply with --include-vcs alone"
+        "gitignore rules should apply with --gitignore"
     );
+}
+
+#[test]
+fn test_developer_workflow_flags() {
+    // --gitignore --exclude-vcs together for developer workflow
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    setup_git_repo(&source);
+
+    fs::write(source.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
+    fs::write(source.path().join("debug.log"), "log").unwrap();
+    fs::create_dir(source.path().join("build")).unwrap();
+    fs::write(source.path().join("build/output.txt"), "output").unwrap();
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            "--gitignore",
+            "--exclude-vcs",
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sy --gitignore --exclude-vcs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // .git should be excluded
+    assert!(
+        !dest.path().join(".git").exists(),
+        ".git should be excluded with --exclude-vcs"
+    );
+
+    // Ignored files should be excluded
+    assert!(
+        !dest.path().join("debug.log").exists(),
+        "*.log should be excluded with --gitignore"
+    );
+    assert!(
+        !dest.path().join("build").exists(),
+        "build/ should be excluded with --gitignore"
+    );
+
+    // Regular files should be synced
+    assert!(dest.path().join("file.txt").exists());
+    assert!(dest.path().join(".gitignore").exists());
 }

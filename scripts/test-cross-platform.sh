@@ -2,12 +2,15 @@
 #
 # Cross-platform testing script for sy (macOS ↔ Fedora)
 #
-# Automatically tests the current branch on both macOS and Fedora.
-# Builds sy on macOS, builds/installs sy-remote on Fedora, runs SSH tests.
+# Runs local tests first (fail fast), then builds on both platforms,
+# then runs SSH comprehensive tests against Fedora.
 #
 # Usage:
-#   scripts/test-cross-platform.sh           # Basic output
-#   scripts/test-cross-platform.sh --verbose # Full logging
+#   scripts/test-cross-platform.sh              # Standard run
+#   scripts/test-cross-platform.sh -v           # Verbose output
+#   scripts/test-cross-platform.sh -l           # Include large/slow tests
+#   scripts/test-cross-platform.sh -s           # Skip builds (reuse binaries)
+#   scripts/test-cross-platform.sh -v -l -s     # All options
 #
 # Prerequisites:
 # - SSH access to fedora (nick@fedora via tailscale)
@@ -20,6 +23,8 @@ FEDORA_HOST="fedora"
 FEDORA_USER="nick"
 FEDORA_REPO_PATH="~/github/nijaru/sy"
 VERBOSE=false
+RUN_LARGE=false
+SKIP_BUILD=false
 CURRENT_BRANCH=""
 
 # Colors for output
@@ -53,15 +58,37 @@ log_verbose() {
 }
 
 # Parse arguments
-if [[ $# -gt 0 ]]; then
-    if [[ "$1" == "--verbose" ]]; then
-        VERBOSE=true
-    else
-        log_error "Invalid argument: $1"
-        echo "Usage: $0 [--verbose]"
-        exit 1
-    fi
-fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose|-v)
+            VERBOSE=true
+            shift
+            ;;
+        --large|-l)
+            RUN_LARGE=true
+            shift
+            ;;
+        --skip-build|-s)
+            SKIP_BUILD=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --verbose, -v    Show full command output"
+            echo "  --large, -l      Run large/slow tests (10k files, 100MB, etc)"
+            echo "  --skip-build, -s Skip building (use existing binaries)"
+            echo "  --help, -h       Show this help"
+            exit 0
+            ;;
+        *)
+            log_error "Invalid argument: $1"
+            echo "Usage: $0 [--verbose] [--large] [--skip-build]"
+            exit 1
+            ;;
+    esac
+done
 
 # Run command with optional verbose logging
 run_cmd() {
@@ -90,11 +117,16 @@ check_fedora_ssh() {
 
 # Build sy locally (macOS)
 build_macos() {
-    log_info "Building sy on macOS..."
-
-    # Detect current branch
+    # Detect current branch (always needed)
     CURRENT_BRANCH=$(git branch --show-current)
     log_info "Testing branch: $CURRENT_BRANCH"
+
+    if [[ "$SKIP_BUILD" == true ]]; then
+        log_info "Skipping macOS build (--skip-build)"
+        return 0
+    fi
+
+    log_info "Building sy on macOS..."
 
     # Fetch latest from origin
     log_verbose "Fetching latest from origin"
@@ -118,8 +150,70 @@ build_macos() {
     log_success "macOS build complete"
 }
 
+# Run local tests first (fail fast before SSH)
+run_local_tests() {
+    log_info "Running local tests..."
+
+    local exit_code=0
+    if [[ "$VERBOSE" == true ]]; then
+        cargo test 2>&1 || exit_code=$?
+    else
+        local test_output
+        test_output=$(cargo test 2>&1) || exit_code=$?
+        local passed=$(echo "$test_output" | grep -oE "[0-9]+ passed" | head -1 | grep -oE "[0-9]+")
+        local failed=$(echo "$test_output" | grep -oE "[0-9]+ failed" | head -1 | grep -oE "[0-9]+")
+        log_info "Local tests: ${passed:-0} passed, ${failed:-0} failed"
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Local tests failed - fix before running SSH tests"
+        return 1
+    fi
+
+    log_success "Local tests passed"
+}
+
+# Run large/slow tests
+run_large_tests() {
+    if [[ "$RUN_LARGE" != true ]]; then
+        return 0
+    fi
+
+    log_info "Running large tests (this may take a while)..."
+
+    local exit_code=0
+
+    # Run massive directory tests
+    log_info "  Running massive directory tests..."
+    if [[ "$VERBOSE" == true ]]; then
+        cargo test --test massive_directory_test -- --ignored --nocapture 2>&1 || exit_code=$?
+    else
+        cargo test --test massive_directory_test -- --ignored 2>&1 | tail -5 || exit_code=$?
+    fi
+
+    # Run large file tests
+    log_info "  Running large file tests..."
+    if [[ "$VERBOSE" == true ]]; then
+        cargo test --test large_file_test -- --ignored --nocapture 2>&1 || exit_code=$?
+    else
+        cargo test --test large_file_test -- --ignored 2>&1 | tail -5 || exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Large tests failed"
+        return 1
+    fi
+
+    log_success "Large tests passed"
+}
+
 # Setup sy on Fedora
 setup_fedora() {
+    if [[ "$SKIP_BUILD" == true ]]; then
+        log_info "Skipping Fedora build (--skip-build)"
+        return 0
+    fi
+
     log_info "Setting up sy on Fedora..."
     log_info "Using branch: $CURRENT_BRANCH"
 
@@ -225,18 +319,28 @@ cleanup() {
 main() {
     echo ""
     log_info "Cross-Platform Test Suite for sy (macOS ↔ Fedora)"
+    [[ "$RUN_LARGE" == true ]] && log_info "  (including large tests)"
+    [[ "$SKIP_BUILD" == true ]] && log_info "  (skipping builds)"
     echo ""
 
-    # Check prerequisites
-    check_fedora_ssh || exit 1
-
-    # Build on both platforms
+    # Build locally first
     build_macos
+
+    # Run local tests before SSH (fail fast)
+    run_local_tests || exit 1
+
+    # Run large tests if requested
+    run_large_tests || exit 1
+
+    echo ""
+
+    # Check SSH and setup Fedora
+    check_fedora_ssh || exit 1
     setup_fedora
 
     echo ""
 
-    # Run tests
+    # Run SSH tests
     local test_result=0
     run_tests || test_result=$?
 

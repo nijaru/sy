@@ -61,21 +61,23 @@ proptest! {
             fs::write(source.path().join(format!("file_{}.txt", i)), format!("content_{}", i)).unwrap();
         }
 
-        // First sync
+        // First sync (exclude .git for predictable file counts)
         let output1 = Command::new(sy_bin())
             .args([
                 &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
+                "--exclude-vcs",
             ])
             .output()
             .unwrap();
         prop_assert!(output1.status.success());
 
-        // Second sync
+        // Second sync (exclude .git for predictable file counts)
         let output2 = Command::new(sy_bin())
             .args([
                 &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
+                "--exclude-vcs",
             ])
             .output()
             .unwrap();

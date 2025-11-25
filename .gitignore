@@ -25,3 +25,4 @@ REVIEW.md
 SESSION_SUMMARY.md
 PERFORMANCE_ANALYSIS.md
 man/
+__pycache__

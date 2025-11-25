@@ -173,6 +173,8 @@ mod tests {
             false,                              // ignore_times
             false,                              // size_only
             false,                              // checksum
+            false,                              // update_only
+            false,                              // ignore_existing
             false,                              // use_cache
             false,                              // clear_cache
             false,                              // checksum_db
@@ -234,6 +236,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db

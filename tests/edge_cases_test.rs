@@ -195,7 +195,6 @@ fn test_large_file() {
 fn test_many_small_files() {
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
-    setup_git_repo(&source);
 
     // Create 1000 small files
     for i in 0..1000 {
@@ -233,7 +232,6 @@ fn test_many_small_files() {
 #[test]
 fn test_same_source_and_dest() {
     let source = TempDir::new().unwrap();
-    setup_git_repo(&source);
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 

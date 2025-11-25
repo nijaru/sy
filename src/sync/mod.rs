@@ -103,6 +103,8 @@ pub struct SyncEngine<T: Transport> {
     ignore_times: bool,
     size_only: bool,
     checksum: bool,
+    update_only: bool,
+    ignore_existing: bool,
     // Note: verify_only is handled at CLI level (main.rs) before sync runs
     use_cache: bool,
     clear_cache: bool,
@@ -144,6 +146,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
+        update_only: bool,
+        ignore_existing: bool,
         use_cache: bool,
         clear_cache: bool,
         checksum_db: bool,
@@ -187,6 +191,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             ignore_times,
             size_only,
             checksum,
+            update_only,
+            ignore_existing,
             use_cache,
             clear_cache,
             checksum_db,
@@ -537,6 +543,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.ignore_times,
             self.size_only,
             self.checksum,
+            self.update_only,
+            self.ignore_existing,
         );
         let mut tasks = Vec::with_capacity(source_files.len());
 
@@ -1520,6 +1528,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.ignore_times,
             self.size_only,
             self.checksum,
+            self.update_only,
+            self.ignore_existing,
         ));
 
         // Create hardlink map for tracking inodes (shared across all parallel transfers)
@@ -2368,6 +2378,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache (disabled in tests to avoid side effects)
             false, // clear_cache
             false, // checksum_db
@@ -2477,6 +2489,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2826,6 +2840,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2904,6 +2920,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -2984,6 +3002,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db
@@ -3061,6 +3081,8 @@ mod tests {
             false, // ignore_times
             false, // size_only
             false, // checksum
+            false, // update_only
+            false, // ignore_existing
             false, // use_cache
             false, // clear_cache
             false, // checksum_db

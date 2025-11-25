@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2025-11-XX
+
+### BREAKING CHANGES
+
+This release changes default behavior to match rsync/cp conventions. **If you relied on the old defaults, you may need to update your commands.**
+
+#### Default Behavior Changes
+
+| Behavior | v0.0.x | v0.1.0 |
+|----------|--------|--------|
+| `.gitignore` rules | Respected (files skipped) | **Ignored (all files copied)** |
+| `.git/` directories | Excluded | **Included** |
+
+#### Migration Guide
+
+If you relied on the old behavior:
+```bash
+# Old (v0.0.x): sy copied only non-ignored files and excluded .git
+sy /src /dest
+
+# New (v0.1.0): Use explicit flags for old behavior
+sy /src /dest --gitignore --exclude-vcs
+```
+
+#### Removed Flags
+
+These flags are no longer needed (now default behavior):
+- `--no-gitignore` → Now default behavior
+- `--include-vcs` → Now default behavior
+- `-b` short flag → Use `--bidirectional` (conflicts with rsync `-b`=backup)
+
+#### New Flags
+
+| Flag | Description |
+|------|-------------|
+| `--gitignore` | Opt-in to respect .gitignore rules |
+| `--exclude-vcs` | Opt-in to exclude .git directories |
+| `-z` | Short flag for `--compress` (rsync compatible) |
+| `-u` / `--update` | Skip files where destination is newer |
+| `--ignore-existing` | Skip files that already exist in destination |
+
+### rsync Compatibility Notes
+
+sy is intentionally NOT a drop-in rsync replacement. Key differences:
+
+| Feature | rsync | sy | Rationale |
+|---------|-------|-----|-----------|
+| Verification | size+mtime | xxHash3 | Catches silent corruption |
+| Recursion | Requires `-r` | Implicit | Better UX |
+| Resume | Manual | Automatic | Handles interruptions |
+| `-b` flag | Backup | (removed) | Conflict avoidance |
+
+For rsync-like speed without verification: `sy --mode fast`
+
 ## [0.0.65] - 2025-11-25
 
 ### Fixed

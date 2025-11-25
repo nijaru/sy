@@ -1,23 +1,39 @@
 # Status
 
 ## Current State
-- Version: v0.0.65 (released 2025-11-25)
-- **Next Release Goal**: v0.1.0 (Breaking Changes)
-- Test Coverage: **527+ tests passing** ✅
+- Version: v0.1.0 (implementing)
+- Test Coverage: **477+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
-## Current Work: v0.1.0 Breaking Changes
+## v0.1.0 Breaking Changes - IMPLEMENTED
 
-[Issue #11 feedback](https://github.com/nijaru/sy/issues/11#issuecomment-3573509820): defaults differ from rsync.
+[Issue #11 feedback](https://github.com/nijaru/sy/issues/11#issuecomment-3573509820): defaults now match rsync behavior.
 
-**Decision**: Flip gitignore defaults to match rsync behavior.
+### Changes Made
+
+| Change | Status |
+|--------|--------|
+| Flip `ScanOptions::default()` | ✅ Done |
+| Add `--gitignore` flag (opt-in) | ✅ Done |
+| Add `--exclude-vcs` flag (opt-in) | ✅ Done |
+| Remove `--no-gitignore`, `--include-vcs` | ✅ Done |
+| Remove `-b` short flag | ✅ Done |
+| Add `-z` short flag for compress | ✅ Done |
+| Add `-u`/`--update` flag | ✅ Done |
+| Add `--ignore-existing` flag | ✅ Done |
+| Update tests | ✅ Done |
+| Update README.md | ✅ Done |
+| Update CHANGELOG.md | ✅ Done |
+| Bump version to 0.1.0 | ✅ Done |
+
+### New Default Behavior
 
 | Behavior | v0.0.x | v0.1.0 |
 |----------|--------|--------|
-| `.gitignore` | Respected (skip) | Ignored (copy all) |
-| `.git/` dirs | Excluded | Included |
+| `.gitignore` | Respected (skip) | **Ignored (copy all)** |
+| `.git/` dirs | Excluded | **Included** |
 
-See `ai/PLAN.md` for implementation details.
+See `CHANGELOG.md` for migration guide.
 
 ### New Test Files
 | File | Tests | Coverage |
