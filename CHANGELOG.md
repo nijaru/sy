@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.64] - 2025-11-25
+
+### Added
+- **Parallel Directory Scanning** - 1.5-1.7x faster for large directories
+  - Uses `ignore` crate's parallel walker with crossbeam-channel bridge
+  - Dynamic selection: automatically uses parallel for 30+ subdirectories
+  - Thread count capped at min(4, num_cpus) for optimal performance
+  - Comprehensive test coverage (31 scanner tests)
+
+### Performance
+- **Smart Scanning Heuristic** - Counts subdirectories to decide parallel vs sequential
+  - Parallel: 1.45-1.74x faster for nested directory structures
+  - Sequential: Avoids overhead for flat directories (many files, few subdirs)
+
 ## [0.0.63] - 2025-11-24
 
 ### Fixed
