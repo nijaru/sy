@@ -3,8 +3,24 @@
 ## Current State
 - Version: v0.0.64 (released 2025-11-25)
 - **Next Release Goal**: v0.1.0 (Production Readiness)
-- Test Coverage: **489 tests passing** ✅ (31 scanner tests)
+- Test Coverage: **527+ tests passing** ✅ (38 new integration tests)
 - **Current Build**: 🟢 PASSING
+
+## Current Work: Integration Test Coverage ✅ COMPLETE
+
+Issue #11 revealed gap: we test **flag state** not **actual behavior**. Added 38 new integration tests.
+
+### New Test Files
+| File | Tests | Coverage |
+|------|-------|----------|
+| `tests/archive_mode_test.rs` | 10 | `-a`, `--include-vcs`, `--no-gitignore` |
+| `tests/filter_cli_test.rs` | 11 | `--exclude`, `--include`, `--filter`, `--exclude-from` |
+| `tests/comparison_modes_test.rs` | 8 | `--ignore-times`, `--size-only`, `--checksum` |
+| `tests/size_filter_test.rs` | 9 | `--min-size`, `--max-size` |
+
+### Bug Fixed
+- `--filter` flag couldn't accept values starting with `-` (e.g., `--filter "- *.log"`)
+- Added `allow_hyphen_values = true` to cli.rs
 
 ## Feature Flags
 - SSH: Optional (enabled by default)

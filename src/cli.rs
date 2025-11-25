@@ -223,7 +223,7 @@ pub struct Cli {
     /// Filter rules in rsync syntax: "+ pattern" (include) or "- pattern" (exclude)
     /// Can be repeated. Rules processed in order, first match wins.
     /// Examples: "+ *.rs", "- *.log", "- target/*"
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub filter: Vec<String>,
 
     /// Read exclude patterns from file (one pattern per line)
