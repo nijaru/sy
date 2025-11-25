@@ -118,15 +118,17 @@ REMOVED (no deprecation, just remove):
 | `-l` (symlinks) | `--links preserve` | Consider `-l` |
 | `-P` (progress) | `--per-file-progress` | Consider `-P` |
 
-## Missing Features (Document, Don't Add)
+## Missing rsync Features (Add for v0.1.0)
 
-| rsync flag | Purpose | sy status |
-|------------|---------|-----------|
-| `--update` | Skip newer files in dest | Not implemented |
-| `--ignore-existing` | Skip existing files | Not implemented |
-| `--backup` | Make backups | Not implemented (and `-b` conflict!) |
+| rsync flag | Purpose | Complexity | Add? |
+|------------|---------|------------|------|
+| `--update` / `-u` | Skip if dest is newer | Low | **Yes** |
+| `--ignore-existing` | Skip if dest exists | Low | **Yes** |
+| `--backup` | Make backups | Medium | No (v0.2.0) |
 
-**Decision**: Document these as "not supported" rather than adding for v0.1.0.
+Implementation in `src/sync/strategy.rs`:
+- Add `update_only: bool` and `ignore_existing: bool` to `StrategyPlanner`
+- Check in `plan_file_async`: if dest newer/exists → `SyncAction::Skip`
 
 ## Intentional Differences from rsync (Keep)
 
@@ -156,8 +158,10 @@ Users who want rsync-speed can use `--mode fast`.
 - [ ] Update `scan_options()` logic in `src/cli.rs`
 
 ### Code Changes - CLI Compatibility
-- [ ] Change `-b` short flag (bidirectional) → `-B` or remove
+- [ ] Change `-b` short flag (bidirectional) → remove (no short flag)
 - [ ] Add `-z` short flag for `--compress`
+- [ ] Add `-u` / `--update` flag (skip if dest newer)
+- [ ] Add `--ignore-existing` flag (skip if dest exists)
 - [ ] Consider `-l` for symlinks (complex: --links takes value)
 - [ ] Consider `-P` for progress
 

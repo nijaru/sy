@@ -22,6 +22,8 @@
 ### CLI Compatibility
 
 - [ ] Add `-z` short flag for `--compress`
+- [ ] Add `-u` / `--update` (skip if dest newer)
+- [ ] Add `--ignore-existing` (skip if dest exists)
 - [ ] Consider `-l` for symlinks
 - [ ] Consider `-P` for progress
 
