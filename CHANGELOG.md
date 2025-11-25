@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.65] - 2025-11-25
+
+### Fixed
+- **`--filter` flag** - Now accepts rsync-style patterns starting with `-` (e.g., `--filter "- *.log"`)
+
+### Added
+- **Integration test coverage** - 38 new tests for CLI flag behavior
+  - Archive mode (`-a`, `--include-vcs`, `--no-gitignore`)
+  - Filter flags (`--exclude`, `--include`, `--filter`, `--exclude-from`)
+  - Comparison modes (`--ignore-times`, `--size-only`, `--checksum`)
+  - Size filters (`--min-size`, `--max-size`)
+
 ## [0.0.64] - 2025-11-25
 
 ### Added
