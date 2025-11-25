@@ -1,11 +1,11 @@
 # Status
 
 ## Current State
-- Version: v0.1.0 (implementing)
+- Version: v0.1.0 (released 2025-11-25)
 - Test Coverage: **477+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
-## v0.1.0 Breaking Changes - IMPLEMENTED
+## v0.1.0 Breaking Changes - RELEASED
 
 [Issue #11 feedback](https://github.com/nijaru/sy/issues/11#issuecomment-3573509820): defaults now match rsync behavior.
 
