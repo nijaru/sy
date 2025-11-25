@@ -2,12 +2,6 @@
 
 ## Active: v0.1.0 (Production Readiness)
 
-### Completed
-
-- [x] **Parallel scanner** (`src/sync/scanner.rs`) - 5befa94
-  - Uses `ignore::WalkParallel` with `crossbeam-channel` bridge
-  - Automatic parallel when threads > 1, sequential fallback otherwise
-
 ### Low Priority
 
 - [ ] **Sequential filter loading** (`src/main.rs`) - LOW VALUE
