@@ -375,8 +375,10 @@ mod tests {
 
     #[test]
     fn test_save_and_load() -> Result<()> {
-        let source = PathBuf::from("/tmp/test_source.txt");
-        let dest = PathBuf::from("/tmp/test_dest.txt");
+        // Use unique paths to avoid race conditions with parallel tests
+        let test_id = std::process::id();
+        let source = PathBuf::from(format!("/tmp/test_source_{}.txt", test_id));
+        let dest = PathBuf::from(format!("/tmp/test_dest_{}.txt", test_id));
         // Use a fixed time to avoid precision issues during serialization roundtrip
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1600000000);
         let mut state = TransferState::new(&source, &dest, 5000, mtime, DEFAULT_CHUNK_SIZE);
@@ -403,8 +405,9 @@ mod tests {
 
     #[test]
     fn test_load_stale_state() -> Result<()> {
-        let source = PathBuf::from("/tmp/test_stale_source.txt");
-        let dest = PathBuf::from("/tmp/test_stale_dest.txt");
+        let test_id = std::process::id();
+        let source = PathBuf::from(format!("/tmp/test_stale_source_{}.txt", test_id));
+        let dest = PathBuf::from(format!("/tmp/test_stale_dest_{}.txt", test_id));
         let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1600000000);
         let old_mtime = base_time - Duration::from_secs(3600);
         let state = TransferState::new(&source, &dest, 1000, old_mtime, DEFAULT_CHUNK_SIZE);

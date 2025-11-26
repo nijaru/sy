@@ -32,6 +32,7 @@ pub struct SyncTask {
     pub dest_checksum: Option<Checksum>,
 }
 
+#[derive(Clone)]
 pub struct StrategyPlanner {
     /// mtime tolerance in seconds (to handle filesystem granularity)
     mtime_tolerance: u64,
@@ -380,6 +381,84 @@ impl StrategyPlanner {
             action,
             source_checksum,
             dest_checksum,
+        }
+    }
+
+    /// Plan a file using a pre-built destination file map (no network calls)
+    ///
+    /// This is much faster for remote destinations because it avoids per-file
+    /// network round trips. Instead, the destination is scanned once upfront
+    /// and the results are used for all comparisons.
+    pub fn plan_file_with_dest_map(
+        &self,
+        source: &FileEntry,
+        dest_root: &Path,
+        dest_map: &std::collections::HashMap<std::path::PathBuf, FileEntry>,
+    ) -> SyncTask {
+        let dest_path = dest_root.join(&*source.relative_path);
+
+        let action = if source.is_dir {
+            // For directories, just check existence
+            if dest_map.contains_key(&*source.relative_path) {
+                SyncAction::Skip
+            } else {
+                SyncAction::Create
+            }
+        } else {
+            // For files, check existence and metadata
+            match dest_map.get(&*source.relative_path) {
+                Some(dest_file) => {
+                    // --ignore-existing: Skip files that already exist in destination
+                    if self.ignore_existing {
+                        tracing::debug!(
+                            "File exists, skipping (--ignore-existing): {}",
+                            source.relative_path.display()
+                        );
+                        return SyncTask {
+                            source: Some(Arc::new(source.clone())),
+                            dest_path,
+                            action: SyncAction::Skip,
+                            source_checksum: None,
+                            dest_checksum: None,
+                        };
+                    }
+
+                    // --update: Skip files where destination is newer
+                    let dest_info = FileInfo {
+                        size: dest_file.size,
+                        modified: dest_file.modified,
+                    };
+                    if self.update_only && self.dest_is_newer(source, &dest_info) {
+                        tracing::debug!(
+                            "Destination is newer, skipping (--update): {}",
+                            source.relative_path.display()
+                        );
+                        return SyncTask {
+                            source: Some(Arc::new(source.clone())),
+                            dest_path,
+                            action: SyncAction::Skip,
+                            source_checksum: None,
+                            dest_checksum: None,
+                        };
+                    }
+
+                    // Compare using standard logic (no checksums for remote - too expensive)
+                    if self.needs_update(source, &dest_info) {
+                        SyncAction::Update
+                    } else {
+                        SyncAction::Skip
+                    }
+                }
+                None => SyncAction::Create,
+            }
+        };
+
+        SyncTask {
+            source: Some(Arc::new(source.clone())),
+            dest_path,
+            action,
+            source_checksum: None,
+            dest_checksum: None,
         }
     }
 

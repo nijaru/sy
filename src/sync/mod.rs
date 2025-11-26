@@ -546,22 +546,81 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.update_only,
             self.ignore_existing,
         );
-        let mut tasks = Vec::with_capacity(source_files.len());
 
         tracing::debug!("Starting to plan {} tasks", source_files.len());
 
-        for file in &source_files {
-            // Skip files that are already completed (if resuming)
-            if !completed_paths.is_empty() && completed_paths.contains(&**file.relative_path) {
-                tracing::debug!("Skipping completed file: {}", file.relative_path.display());
-                continue;
-            }
+        // Filter out already-completed files before planning
+        let files_to_plan: Vec<_> = source_files
+            .iter()
+            .filter(|file| {
+                if !completed_paths.is_empty() && completed_paths.contains(&**file.relative_path) {
+                    tracing::debug!("Skipping completed file: {}", file.relative_path.display());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
 
-            let task = planner
-                .plan_file_async(file, destination, &self.transport, checksum_db.as_ref())
-                .await?;
+        let total_to_plan = files_to_plan.len();
+
+        // Create planning progress bar (spinner for scanning destination)
+        let plan_pb = if self.quiet {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap(),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb
+        };
+
+        // OPTIMIZATION: Batch scan destination once instead of per-file network calls
+        // This reduces 531K SSH round-trips to just 1 for large syncs
+        plan_pb.set_message(format!(
+            "Scanning destination ({} source files)...",
+            total_to_plan
+        ));
+
+        let dest_files = self.transport.scan(destination).await.unwrap_or_else(|e| {
+            tracing::debug!("Destination scan failed (may not exist yet): {}", e);
+            Vec::new()
+        });
+
+        // Build HashMap for O(1) lookups during planning
+        let dest_map: std::collections::HashMap<std::path::PathBuf, scanner::FileEntry> =
+            dest_files
+                .into_iter()
+                .map(|f| ((*f.relative_path).clone(), f))
+                .collect();
+
+        plan_pb.set_message(format!(
+            "Comparing {} source files against {} destination files...",
+            total_to_plan,
+            dest_map.len()
+        ));
+
+        // Plan all files using in-memory comparison (no network calls!)
+        let mut tasks: Vec<strategy::SyncTask> = Vec::with_capacity(total_to_plan);
+        for (i, file) in files_to_plan.iter().enumerate() {
+            let task = planner.plan_file_with_dest_map(file, destination, &dest_map);
             tasks.push(task);
+
+            // Update progress every 10K files
+            if i % 10000 == 0 {
+                plan_pb.set_message(format!(
+                    "Comparing: {}/{} files ({:.0}%)",
+                    i,
+                    total_to_plan,
+                    (i as f64 / total_to_plan as f64) * 100.0
+                ));
+            }
         }
+
+        plan_pb.finish_and_clear();
 
         // Plan deletions if requested
         if self.delete {

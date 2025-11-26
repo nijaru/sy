@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2025-11-26
+
+### Performance
+
+- **Major SSH performance fix**: Batch destination scanning eliminates per-file network calls
+  - Before: 531K files → 531K SSH stat calls → ~90 minutes planning
+  - After: 531K files → 1 batch scan → ~30 seconds planning
+  - ~1000x fewer network round-trips for large syncs over SSH
+
+### Added
+
+- Progress indicator during planning phase: "Scanning destination..." and "Comparing X/Y files"
+- New `plan_file_with_dest_map()` method for O(1) file lookups during planning
+
+### Fixed
+
+- Flaky test in `resume::tests::test_save_and_load` (race condition with parallel tests)
+
 ## [0.1.0] - 2025-11-25
 
 ### BREAKING CHANGES

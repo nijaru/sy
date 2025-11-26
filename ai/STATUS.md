@@ -1,7 +1,7 @@
 # Status
 
 ## Current State
-- Version: v0.1.0 (released 2025-11-25)
+- Version: v0.1.1 (released 2025-11-26)
 - Test Coverage: **477+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
@@ -53,7 +53,25 @@ See `CHANGELOG.md` for migration guide.
 - ACL: Optional (Linux requires libacl-dev, macOS works natively)
 - S3: Optional (disabled by default)
 
-## Recent Work (v0.0.64)
+## Recent Work (Unreleased)
+
+### Planning Phase Optimization (Major SSH Performance Fix)
+- **Problem**: Syncing 531K files over SSH took ~90 min just for planning
+- **Root cause**: Sequential per-file SSH stat calls
+- **Solution**: Batch destination scan + in-memory comparison
+- **Result**: ~1000x fewer network round-trips
+
+| Before | After |
+|--------|-------|
+| 531K SSH stat calls | 1 batch scan |
+| ~90 min planning | ~30 sec planning |
+
+**Changes**:
+- `src/sync/mod.rs`: Scan destination once, build HashMap, compare in-memory
+- `src/sync/strategy.rs`: Added `plan_file_with_dest_map()` for batch planning
+- Progress indicator: Shows "Scanning destination..." and "Comparing X/Y files"
+
+## Previous Work (v0.0.64)
 - **Parallel Directory Scanning** - 1.5-1.7x faster for large directories
   - Uses `ignore::WalkParallel` with `crossbeam-channel` bridge
   - Dynamic selection: 30+ subdirs triggers parallel mode
