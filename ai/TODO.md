@@ -3,7 +3,11 @@
 ## Current
 
 - [ ] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
-  - Phase 1: HELLO, FILE_LIST, FILE_DATA streaming
+  - Design: Complete (395 lines, payload formats, error handling)
+  - **Phase 1 (MVP)**: `--server` flag, HELLO, FILE_LIST/ACK, FILE_DATA streaming
+  - Phase 2: MKDIR_BATCH, DELETE_BATCH, symlinks
+  - Phase 3: Delta sync (CHECKSUM_REQ/RESP, DELTA_DATA)
+  - Phase 4: Progress, resume, compression, xattrs
   - Target: v0.2.0
 
 ## Backlog

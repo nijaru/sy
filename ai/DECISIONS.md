@@ -1,5 +1,57 @@
 # Decisions
 
+## 2025-11-26: sy --server Mode (SSH Performance Architecture)
+
+**Context**: SSH sync via SFTP is ~3 files/sec due to per-file round-trips. Tar-based bulk transfer works but is a workaround with limitations (external dependency, no delta, no granular progress).
+
+**Decision**: Implement custom wire protocol over SSH stdin/stdout (like rsync)
+
+**Architecture**:
+- Local sy spawns `ssh user@host sy --server /dest`
+- Binary protocol: length-prefixed messages (FILE_LIST, FILE_DATA, CHECKSUM, etc.)
+- Pipelined: sender doesn't wait for acks
+- Fallback: SFTP if remote sy unavailable
+
+**Key Design Decisions**:
+1. **Compression**: Stream-level zstd (after HELLO handshake)
+2. **Parallelism**: Single multiplexed channel + pipelining (simpler than multi-channel)
+3. **Bidirectional**: Same protocol for push/pull (mode flag in HELLO)
+
+**Rationale**:
+- rsync achieves performance via same approach (custom protocol, not SFTP)
+- Full control over batching, pipelining, delta
+- No external dependencies (pure sy)
+- Graceful fallback preserves compatibility
+
+**Target**: v0.2.0, ~500-800 lines Phase 1 (MVP)
+
+**References**: ai/design/server-mode.md (395 lines, fully specified)
+
+---
+
+## 2025-11-26: SSH Batch Optimizations (Interim)
+
+**Context**: Immediate SSH performance improvements while --server mode is developed
+
+**Decisions**:
+1. **Batch mkdir**: Single SSH command creates all directories (`xargs -0 mkdir -p`)
+2. **Tar bulk transfer**: `tar cf - | ssh tar xf -` for 100+ new files
+3. **Threshold**: Bulk transfer only for ≥100 files, simple cases only
+
+**Results**:
+- Batch mkdir: 44K dirs in 0.56s (was N round-trips)
+- Tar streaming: 132 files in 0.2s (100-1000x faster)
+
+**Tradeoffs**:
+- External tar dependency
+- No delta transfer
+- No granular progress/recovery
+- Platform differences (GNU vs BSD tar)
+
+**Status**: Implemented as interim, --server mode is proper solution
+
+---
+
 ## 2025-11-19: Streaming Sync Pipeline (Massive Scale Optimization)
 
 **Context**: Profiling revealed O(N) memory scaling with file count. Syncing 100k files consumed ~530MB RAM, largely due to collecting all `FileEntry` objects before planning.

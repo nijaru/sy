@@ -73,8 +73,9 @@ See `CHANGELOG.md` for migration guide.
 - Tar approach is workaround, not SOTA
 
 **Next: sy --server mode** - Custom protocol for true rsync-like performance.
-- Design doc: `ai/design/server-mode.md`
+- Design doc: `ai/design/server-mode.md` (395 lines, fully specified)
 - Target: v0.2.0
+- Ready to implement Phase 1
 
 ### Bug Fixes (discovered via 531K file sync test)
 | Bug | Fix | File |
