@@ -2,14 +2,34 @@
 
 ## Current
 
-No active tasks.
+- [ ] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
+  - Phase 1: HELLO, FILE_LIST, FILE_DATA streaming
+  - Target: v0.2.0
 
 ## Backlog
 
 ### High Priority
+- [ ] Fix tilde (`~`) expansion in SSH paths
 - [ ] Windows support (sparse files, ACLs, path edge cases)
 - [ ] russh migration (SSH agent blocker)
 - [ ] S3 bidirectional sync
+- [ ] Improve SSH integration testing (see Testing Gap Analysis below)
+
+### Testing Gap Analysis (v0.1.2 bugs discovered)
+
+| Bug | Fix Status | Test Status |
+|-----|------------|-------------|
+| `ln -s` fails if exists (SSH) | ✅ Fixed | Tests added |
+| `ln -s` not overwriting (local) | ✅ Fixed | Tests added |
+| Checkpoint fails for SSH | ✅ Fixed | `dest_is_remote` flag added |
+| Verification fails SSH | ✅ Fixed | Unit tests added |
+| Symlinks not detected in scan | ✅ Fixed | Unit tests exist |
+| Symlink overwrite (Update action) | ✅ Fixed | 5 tests added |
+
+**Remaining gaps:**
+- SSH tests require real SSH agent, so ignored in CI
+- [ ] Add mock SSH server or parameterized tests
+- [ ] CI job with SSH tests enabled (scheduled, not PR blocking)
 
 ### Performance Optimizations (SOTA Research)
 

@@ -2,7 +2,7 @@
 
 ## Current State
 - Version: v0.1.1 (released 2025-11-26)
-- Test Coverage: **477+ tests passing** ✅
+- Test Coverage: **492+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
 ## v0.1.0 Breaking Changes - RELEASED
@@ -53,9 +53,48 @@ See `CHANGELOG.md` for migration guide.
 - ACL: Optional (Linux requires libacl-dev, macOS works natively)
 - S3: Optional (disabled by default)
 
-## Recent Work (Unreleased)
+## Recent Work (Unreleased - v0.1.2)
 
-### Planning Phase Optimization (Major SSH Performance Fix)
+### SSH Transfer Optimizations (in progress)
+
+| Optimization | Status | Impact |
+|--------------|--------|--------|
+| Batch mkdir | ✅ Done | 44K dirs in ~0.56s (was N round-trips) |
+| Tar bulk transfer | ✅ Done | 100-1000x faster for bulk new files |
+| Bulk transfer integration | ✅ Done | Auto-triggers for 100+ files |
+
+**Testing results:**
+- Batch mkdir: Working, tested
+- Tar streaming: Working (132 files in 0.2s)
+- Symlinks: Preserved correctly
+
+**Known issues:**
+- Tilde (`~`) in SSH paths not expanded (pre-existing bug)
+- Tar approach is workaround, not SOTA
+
+**Next: sy --server mode** - Custom protocol for true rsync-like performance.
+- Design doc: `ai/design/server-mode.md`
+- Target: v0.2.0
+
+### Bug Fixes (discovered via 531K file sync test)
+| Bug | Fix | File |
+|-----|-----|------|
+| Symlink `ln -s` fails if exists (SSH) | Use `ln -sf` (force) | `src/transport/ssh.rs:1941` |
+| Symlink not overwritten (local) | Remove existing before create | `src/transport/local.rs:911-914` |
+| Checkpoint save fails for SSH | Add `dest_is_remote` flag to SyncEngine | `src/sync/mod.rs:114,1300,1449` |
+| Verification fails for SSH | Add `compute_checksum` to DualTransport | `src/transport/dual.rs:212-236` |
+| Symlinks not detected in scan | Use `symlink_metadata` not `entry.metadata` | `src/sync/scanner.rs:217` |
+| Symlink overwrite not working | Return `Create` for symlinks in planner | `src/sync/strategy.rs:407-421` |
+
+**Root cause**: SSH/symlink codepaths were undertested.
+
+### New Tests
+| File | Tests | Coverage |
+|------|-------|----------|
+| `tests/symlink_overwrite_test.rs` | 5 | Symlink sync (empty, overwrite, skip identical) |
+| `src/transport/dual.rs` | 3 | DualTransport compute_checksum routing |
+
+### Planning Phase Optimization (v0.1.1 - Major SSH Performance Fix)
 - **Problem**: Syncing 531K files over SSH took ~90 min just for planning
 - **Root cause**: Sequential per-file SSH stat calls
 - **Solution**: Batch destination scan + in-memory comparison
