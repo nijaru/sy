@@ -2,7 +2,7 @@
 
 ## Current State
 - Version: v0.1.1 (released 2025-11-26)
-- Test Coverage: **492+ tests passing** ✅
+- Test Coverage: **620+ tests passing** ✅
 - **Current Build**: 🟢 PASSING
 
 ## v0.1.0 Breaking Changes - RELEASED
@@ -132,10 +132,18 @@ See `CHANGELOG.md` for migration guide.
 | Delta apply | 373ms | 103ms | **3.6x faster** |
 | **Total** | 1.1s | **0.5s** | **2x faster** |
 
-**Next Steps (Phase 4)**:
+**Phase 4: Bidirectional Server Mode (Session 2025-11-27):**
+- ✅ HELLO_FLAG_PULL protocol flag for reverse direction
+- ✅ Server PULL mode: server scans and sends files to client
+- ✅ Client PULL mode: receives files, compares, writes locally
+- ✅ Wired up remote→local SSH to use server protocol
+- ✅ Integration tests for both push and pull modes
+- ✅ Removed dead bulk_transfer code (~300 lines)
+
+**Next Steps (Phase 5)**:
 1. Progress reporting over server protocol
 2. Hardlink support
-3. Remote-to-local sync with server mode
+3. Extended attributes (xattrs) support
 
 ### SSH Transfer Optimizations (Interim)
 

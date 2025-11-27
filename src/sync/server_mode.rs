@@ -7,7 +7,7 @@ use crate::compress::{compress, is_compressed_extension, Compression};
 use crate::delta::{generate_delta_streaming, BlockChecksum as DeltaBlockChecksum};
 use crate::path::SyncPath;
 use crate::server::protocol::{
-    delta_block_size, Action, DeltaOp, FileListEntry, SymlinkEntry, DATA_FLAG_COMPRESSED,
+    delta_block_size, Action, Decision, DeltaOp, FileListEntry, SymlinkEntry, DATA_FLAG_COMPRESSED,
     DELTA_MIN_SIZE,
 };
 use crate::ssh::config::SshConfig;
@@ -472,6 +472,258 @@ async fn scan_source(source: &Path) -> Result<Vec<SourceEntry>> {
                     is_dir: entry.is_dir,
                     is_symlink: entry.is_symlink,
                     symlink_target,
+                });
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Sync from remote source to local destination using server protocol (PULL mode)
+pub async fn sync_pull_server_mode(source: &SyncPath, dest: &Path) -> Result<SyncStats> {
+    let start = Instant::now();
+
+    // Connect to server in PULL mode
+    let mut session = connect_pull(source).await?;
+    tracing::debug!("Connected to server (PULL mode)");
+
+    // Ensure local destination exists
+    if !dest.exists() {
+        std::fs::create_dir_all(dest)?;
+    }
+
+    // Scan local destination for comparison
+    let local_entries = scan_local_dest(dest).await?;
+    let local_map: std::collections::HashMap<String, (u64, i64)> = local_entries
+        .into_iter()
+        .map(|e| (e.rel_path, (e.size, e.mtime)))
+        .collect();
+
+    let mut files_created = 0u64;
+    let mut files_updated = 0u64;
+    let mut files_skipped = 0usize;
+    let mut bytes_transferred = 0u64;
+    let mut dirs_created = 0u64;
+    let mut symlinks_created = 0u64;
+
+    // Step 1: Receive and create directories
+    if let Some(mkdir_batch) = session.read_mkdir_batch().await? {
+        tracing::debug!("Received {} directories", mkdir_batch.paths.len());
+        let mut created = 0u32;
+        let mut failed: Vec<(String, String)> = Vec::new();
+
+        for dir_path in &mkdir_batch.paths {
+            let full_path = dest.join(dir_path);
+            match std::fs::create_dir_all(&full_path) {
+                Ok(_) => created += 1,
+                Err(e) => failed.push((dir_path.clone(), e.to_string())),
+            }
+        }
+        dirs_created = created as u64;
+        session.send_mkdir_batch_ack(created, failed).await?;
+    }
+
+    // Step 2: Receive file list and send decisions
+    let file_list = session.read_file_list().await?;
+    tracing::debug!("Received {} files from server", file_list.entries.len());
+
+    let mut decisions: Vec<Decision> = Vec::with_capacity(file_list.entries.len());
+    let mut files_to_receive: Vec<(u32, String)> = Vec::new();
+
+    for (idx, entry) in file_list.entries.iter().enumerate() {
+        let action = if let Some((local_size, local_mtime)) = local_map.get(&entry.path) {
+            // File exists locally - compare
+            if *local_size == entry.size && *local_mtime >= entry.mtime {
+                Action::Skip
+            } else {
+                Action::Update
+            }
+        } else {
+            Action::Create
+        };
+
+        if action != Action::Skip {
+            files_to_receive.push((idx as u32, entry.path.clone()));
+        } else {
+            files_skipped += 1;
+        }
+
+        decisions.push(Decision {
+            index: idx as u32,
+            action,
+        });
+    }
+
+    tracing::info!(
+        "{} files to receive, {} skipped",
+        files_to_receive.len(),
+        files_skipped
+    );
+    session.send_file_list_ack(decisions).await?;
+
+    // Step 3: Receive files
+    for (idx, rel_path) in &files_to_receive {
+        let file_data = match session.read_file_data().await? {
+            Some(data) => data,
+            None => break, // Server sent symlinks instead
+        };
+
+        let full_path = dest.join(rel_path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Write file
+        match std::fs::write(&full_path, &file_data.data) {
+            Ok(_) => {
+                bytes_transferred += file_data.data.len() as u64;
+                if local_map.contains_key(rel_path) {
+                    files_updated += 1;
+                } else {
+                    files_created += 1;
+                }
+                session.send_file_done(*idx, 0).await?;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to write {}: {}", full_path.display(), e);
+                session.send_file_done(*idx, 2).await?; // STATUS_WRITE_ERROR
+            }
+        }
+    }
+
+    // Step 4: Receive and create symlinks (if any)
+    // Note: The read_file_data returns None when it sees SYMLINK_BATCH
+    // We need to read the symlink batch body
+    if files_to_receive.is_empty() || files_created + files_updated < files_to_receive.len() as u64
+    {
+        // Try to read symlink batch (may have been signaled by read_file_data returning None)
+        match session.read_symlink_batch_body().await {
+            Ok(symlink_batch) => {
+                tracing::debug!("Received {} symlinks", symlink_batch.entries.len());
+                let mut created = 0u32;
+                let mut failed: Vec<(String, String)> = Vec::new();
+
+                for entry in &symlink_batch.entries {
+                    let link_path = dest.join(&entry.path);
+
+                    // Remove existing if present
+                    if link_path.exists() || link_path.symlink_metadata().is_ok() {
+                        let _ = std::fs::remove_file(&link_path);
+                    }
+
+                    // Ensure parent exists
+                    if let Some(parent) = link_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::symlink;
+                        match symlink(&entry.target, &link_path) {
+                            Ok(_) => created += 1,
+                            Err(e) => failed.push((entry.path.clone(), e.to_string())),
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        failed.push((entry.path.clone(), "Symlinks not supported".to_string()));
+                    }
+                }
+                symlinks_created = created as u64;
+                session.send_symlink_batch_ack(created, failed).await?;
+            }
+            Err(_) => {
+                // No symlinks or EOF
+            }
+        }
+    }
+
+    let duration = start.elapsed();
+    tracing::info!(
+        "Pull sync complete: {} created, {} updated, {} skipped, {} bytes in {:?}",
+        files_created,
+        files_updated,
+        files_skipped,
+        bytes_transferred,
+        duration
+    );
+
+    Ok(SyncStats {
+        files_scanned: file_list.entries.len() as u64,
+        files_created,
+        files_updated,
+        files_deleted: 0,
+        files_skipped,
+        bytes_transferred,
+        duration,
+        errors: Vec::new(),
+        dirs_created,
+        symlinks_created,
+        ..Default::default()
+    })
+}
+
+/// Connect to remote server in PULL mode
+async fn connect_pull(source: &SyncPath) -> Result<ServerSession> {
+    match source {
+        SyncPath::Local { path, .. } => ServerSession::connect_local_pull(path).await,
+        SyncPath::Remote {
+            host, user, path, ..
+        } => {
+            let config = SshConfig {
+                hostname: host.clone(),
+                user: user.clone().unwrap_or_default(),
+                ..Default::default()
+            };
+            ServerSession::connect_ssh_pull(&config, path).await
+        }
+        _ => anyhow::bail!("Unsupported source for pull mode"),
+    }
+}
+
+/// Scan local destination directory for comparison
+async fn scan_local_dest(dest: &Path) -> Result<Vec<SourceEntry>> {
+    if !dest.exists() {
+        return Ok(Vec::new());
+    }
+
+    let scan_opts = ScanOptions::default();
+    let dest_path = dest.to_path_buf();
+
+    let entries = tokio::task::spawn_blocking(move || {
+        scanner::Scanner::new(&dest_path)
+            .with_options(scan_opts)
+            .scan()
+    })
+    .await??;
+
+    let mut result = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        if let Ok(rel_path) = entry.path.strip_prefix(dest) {
+            if rel_path.as_os_str().is_empty() {
+                continue;
+            }
+
+            if let Some(path_str) = rel_path.to_str() {
+                let mtime = entry
+                    .modified
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                result.push(SourceEntry {
+                    rel_path: path_str.to_string(),
+                    abs_path: entry.path.clone(),
+                    size: entry.size,
+                    mtime,
+                    mode: 0o644,
+                    is_dir: entry.is_dir,
+                    is_symlink: entry.is_symlink,
+                    symlink_target: None,
                 });
             }
         }

@@ -252,11 +252,6 @@ impl Transport for DualTransport {
             .bulk_copy_files(source_base, dest_base, relative_paths)
             .await
     }
-
-    fn supports_bulk_transfer(&self) -> bool {
-        // DualTransport supports bulk transfer if dest does
-        self.dest.supports_bulk_transfer()
-    }
 }
 
 #[cfg(test)]

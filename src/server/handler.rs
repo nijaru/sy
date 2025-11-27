@@ -25,7 +25,7 @@ struct DestEntry {
 
 /// Handle incoming messages on the server side
 pub struct ServerHandler {
-    root_path: PathBuf,
+    pub root_path: PathBuf,
     dest_map: HashMap<String, DestEntry>,
     current_file_list: Vec<FileListEntry>,
 }

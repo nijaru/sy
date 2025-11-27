@@ -30,7 +30,7 @@ use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use strategy::{StrategyPlanner, SyncAction, SyncTask};
+use strategy::{StrategyPlanner, SyncAction};
 use transfer::Transferrer;
 
 #[derive(Debug, Clone)]
@@ -872,86 +872,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
             }
         }
-
-        // OPTIMIZATION: Bulk transfer files using tar streaming for SSH
-        // This is 100-1000x faster than individual SFTP operations for many small files
-        const BULK_TRANSFER_THRESHOLD: usize = 100;
-        let mut bulk_transferred_indices: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
-        if !self.dry_run && self.transport.supports_bulk_transfer() {
-            // Find eligible tasks: Create action, regular files only, no special handling needed
-            let eligible: Vec<(usize, &Path)> = tasks
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| {
-                    matches!(t.action, SyncAction::Create)
-                        && t.source
-                            .as_ref()
-                            .map(|s| {
-                                !s.is_dir
-                                    && !s.is_symlink
-                                    && (!self.preserve_hardlinks || s.nlink <= 1)
-                                    && (!self.preserve_xattrs || s.xattrs.is_none())
-                                    && (!self.preserve_acls || s.acls.is_none())
-                            })
-                            .unwrap_or(false)
-                })
-                .filter_map(|(idx, t)| {
-                    t.source
-                        .as_ref()
-                        .map(|s| (idx, s.relative_path.as_ref() as &Path))
-                })
-                .collect();
-
-            if eligible.len() >= BULK_TRANSFER_THRESHOLD {
-                tracing::info!(
-                    "Bulk transferring {} files via tar streaming (threshold: {})",
-                    eligible.len(),
-                    BULK_TRANSFER_THRESHOLD
-                );
-
-                let relative_paths: Vec<&Path> = eligible.iter().map(|(_, p)| *p).collect();
-
-                match self
-                    .transport
-                    .bulk_copy_files(source, destination, &relative_paths)
-                    .await
-                {
-                    Ok(bytes) => {
-                        tracing::info!(
-                            "Bulk transfer complete: {} files, {} bytes",
-                            eligible.len(),
-                            bytes
-                        );
-                        // Mark these tasks as handled - convert to Skip
-                        for (idx, _) in &eligible {
-                            bulk_transferred_indices.insert(*idx);
-                        }
-                        // Update stats
-                        if let Ok(mut s) = stats.lock() {
-                            s.files_created += eligible.len() as u64;
-                            s.bytes_transferred += bytes;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Bulk transfer failed, falling back to individual copies: {}",
-                            e
-                        );
-                        // Fall through - tasks will be processed individually
-                    }
-                }
-            }
-        }
-
-        // Filter out bulk-transferred tasks
-        let tasks: Vec<SyncTask> = tasks
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !bulk_transferred_indices.contains(idx))
-            .map(|(_, t)| t)
-            .collect();
 
         // Create counters for periodic checkpointing
         let mut files_since_checkpoint = 0;

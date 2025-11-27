@@ -435,13 +435,4 @@ impl Transport for TransportRouter {
             }
         }
     }
-
-    fn supports_bulk_transfer(&self) -> bool {
-        match self {
-            TransportRouter::Local(t) => t.supports_bulk_transfer(),
-            TransportRouter::Dual(t) => t.supports_bulk_transfer(),
-            #[cfg(feature = "s3")]
-            TransportRouter::S3(t) => t.supports_bulk_transfer(),
-        }
-    }
 }

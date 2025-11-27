@@ -2,7 +2,7 @@
 
 ## Current
 
-- [ ] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
+- [x] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
   - Design: Complete (395 lines, payload formats, error handling)
   - **Phase 1 (MVP)**: ✅ Complete
     - [x] Protocol: HELLO, FILE_LIST/ACK, FILE_DATA, FILE_DONE
@@ -16,12 +16,18 @@
     - [x] Protocol flags (is_dir, is_symlink, is_hardlink, has_xattrs)
     - [x] Proper stats (dirs_created, symlinks_created)
     - [x] 12 unit tests for protocol/handler
-  - **Phase 3** (Next): Delta sync - **KEY GAP vs rsync**
-    - [ ] CHECKSUM_REQ/RESP messages (rolling checksums)
-    - [ ] DELTA_DATA encoding (send only changed blocks)
-    - [ ] Wire up existing delta code from `src/sync/transfer.rs`
-    - **Why**: rsync wins partial updates (0.37s vs 0.46s) because it sends deltas
-  - Phase 4: Compression, progress, resume
+  - **Phase 3**: ✅ Complete
+    - [x] CHECKSUM_REQ/RESP messages (rolling checksums)
+    - [x] DELTA_DATA encoding (send only changed blocks)
+    - [x] Zstd compression for large fresh transfers
+    - **Result**: 2x faster than rsync for delta updates!
+  - **Phase 4**: ✅ Complete
+    - [x] Bidirectional server mode (PULL flag)
+    - [x] Server send mode (server scans + sends)
+    - [x] Client receive mode (compare + write)
+    - [x] Remote→local wired up in main.rs
+    - [x] Removed dead bulk_transfer code (~300 lines)
+  - **Phase 5** (Next): Progress, hardlinks, xattrs
   - Target: v0.2.0
 
 ## Backlog

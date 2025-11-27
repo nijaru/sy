@@ -468,14 +468,6 @@ pub trait Transport: Send + Sync {
         }
         Ok(total_bytes)
     }
-
-    /// Check if this transport supports efficient bulk transfers
-    ///
-    /// Returns true if bulk_copy_files is optimized (e.g., SSH with tar streaming).
-    /// The sync engine can use this to decide whether to batch file transfers.
-    fn supports_bulk_transfer(&self) -> bool {
-        false // Default: no optimized bulk transfer
-    }
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -583,9 +575,5 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
         (**self)
             .bulk_copy_files(source_base, dest_base, relative_paths)
             .await
-    }
-
-    fn supports_bulk_transfer(&self) -> bool {
-        (**self).supports_bulk_transfer()
     }
 }

@@ -10,6 +10,9 @@ pub const FLAG_IS_SYMLINK: u8 = 0x02;
 pub const FLAG_IS_HARDLINK: u8 = 0x04;
 pub const FLAG_HAS_XATTRS: u8 = 0x08;
 
+// Hello flags
+pub const HELLO_FLAG_PULL: u32 = 0x01; // Client wants to pull (server sends files)
+
 // FileData flags
 pub const DATA_FLAG_COMPRESSED: u8 = 0x01; // Data is zstd compressed
 pub const DATA_FLAG_FINAL: u8 = 0x02; // This is the final chunk for this file
@@ -459,7 +462,7 @@ impl MkdirBatchAck {
 // SYMLINK_BATCH (0x08)
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SymlinkEntry {
     pub path: String,
     pub target: String,

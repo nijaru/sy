@@ -748,9 +748,15 @@ Or install from local source with: cargo install --path . --features acl"#
     } else if source.is_local() && destination.is_remote() {
         // Use server mode for local → remote SSH (faster than SFTP)
         if !cli.quiet && !cli.json {
-            println!("Mode: Server protocol\n");
+            println!("Mode: Server protocol (push)\n");
         }
         sync::server_mode::sync_server_mode(source.path(), destination).await?
+    } else if source.is_remote() && destination.is_local() {
+        // Use server mode for remote → local SSH (faster than SFTP)
+        if !cli.quiet && !cli.json {
+            println!("Mode: Server protocol (pull)\n");
+        }
+        sync::server_mode::sync_pull_server_mode(source, destination.path()).await?
     } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
