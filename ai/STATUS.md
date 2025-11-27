@@ -100,10 +100,32 @@ See `CHANGELOG.md` for migration guide.
 - ✅ Proper stats tracking (dirs_created, symlinks_created, files_updated)
 - ✅ 12 new unit tests for protocol/handler
 
-**Next Steps (Phase 3)**:
-1. Delta sync (CHECKSUM_REQ/RESP, DELTA_DATA)
-2. Compression option
-3. Progress reporting
+**Phase 3: Delta Sync & Compression (Session 2025-11-27):**
+- ✅ CHECKSUM_REQ/RESP messages - request/return block checksums
+- ✅ DELTA_DATA message - send only changed blocks
+- ✅ Server handlers for checksum computation and delta application
+- ✅ Selective delta: files >= 64KB use delta sync
+- ✅ Compression flag support in FILE_DATA
+- ✅ Zstd compression for files >= 1MB (for fresh transfers)
+- ✅ 4 new protocol unit tests
+
+**Phase 3 Benchmark Results (100MB file, Mac → Fedora):**
+
+| Test | rsync | sy | Notes |
+|------|-------|-----|-------|
+| No-op (100MB file) | 317ms | **285ms** | sy wins |
+| Delta update (small change) | **957ms** | 1.17s | rsync ~20% faster |
+| Fresh 100MB copy | 3.4s | 3.7s | Parity (network-bound) |
+
+**Key findings:**
+- Delta sync working! 100MB file with small change → only 4KB transferred
+- No-op detection still faster (sy wins)
+- rsync still ~20% faster for delta updates (more optimized rolling checksum)
+
+**Next Steps (Phase 4)**:
+1. Progress reporting over server protocol
+2. Parallel checksum computation (server side)
+3. Hardlink support
 
 ### SSH Transfer Optimizations (Interim)
 
