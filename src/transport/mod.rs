@@ -3,6 +3,7 @@ pub mod local;
 pub mod router;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod server;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 
@@ -159,6 +160,17 @@ pub trait Transport: Send + Sync {
 
     /// Create all parent directories for a path
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
+
+    /// Create multiple directories in batch (optimization for remote transports)
+    ///
+    /// Default implementation calls create_dir_all for each path.
+    /// SSH transport overrides this with a single batched command.
+    async fn create_dirs_batch(&self, paths: &[&Path]) -> Result<()> {
+        for path in paths {
+            self.create_dir_all(path).await?;
+        }
+        Ok(())
+    }
 
     /// Copy a file from source to destination
     ///
@@ -421,6 +433,49 @@ pub trait Transport: Send + Sync {
         }
         Ok(())
     }
+
+    /// Bulk transfer multiple files efficiently using tar streaming
+    ///
+    /// This method transfers many files in a single operation, which is much faster
+    /// than individual file transfers for SSH/remote connections.
+    ///
+    /// Arguments:
+    /// - `source_base`: Base path on source (e.g., /path/to/source)
+    /// - `dest_base`: Base path on destination (e.g., /path/to/dest)
+    /// - `relative_paths`: List of relative paths to transfer (relative to source_base)
+    ///
+    /// Returns total bytes transferred.
+    ///
+    /// Default implementation falls back to individual copy_file calls.
+    /// SSH transport overrides with efficient tar streaming.
+    async fn bulk_copy_files(
+        &self,
+        source_base: &Path,
+        dest_base: &Path,
+        relative_paths: &[&Path],
+    ) -> Result<u64> {
+        // Default implementation: fall back to individual copies
+        let mut total_bytes = 0u64;
+        for rel_path in relative_paths {
+            let source = source_base.join(rel_path);
+            let dest = dest_base.join(rel_path);
+            match self.copy_file(&source, &dest).await {
+                Ok(result) => total_bytes += result.bytes_written,
+                Err(e) => {
+                    tracing::warn!("Failed to copy {}: {}", source.display(), e);
+                }
+            }
+        }
+        Ok(total_bytes)
+    }
+
+    /// Check if this transport supports efficient bulk transfers
+    ///
+    /// Returns true if bulk_copy_files is optimized (e.g., SSH with tar streaming).
+    /// The sync engine can use this to decide whether to batch file transfers.
+    fn supports_bulk_transfer(&self) -> bool {
+        false // Default: no optimized bulk transfer
+    }
 }
 
 // Implement Transport for Arc<T> where T: Transport
@@ -449,6 +504,10 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
         (**self).create_dir_all(path).await
+    }
+
+    async fn create_dirs_batch(&self, paths: &[&Path]) -> Result<()> {
+        (**self).create_dirs_batch(paths).await
     }
 
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
@@ -513,5 +572,20 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 
     async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
         (**self).set_bsd_flags(path, flags).await
+    }
+
+    async fn bulk_copy_files(
+        &self,
+        source_base: &Path,
+        dest_base: &Path,
+        relative_paths: &[&Path],
+    ) -> Result<u64> {
+        (**self)
+            .bulk_copy_files(source_base, dest_base, relative_paths)
+            .await
+    }
+
+    fn supports_bulk_transfer(&self) -> bool {
+        (**self).supports_bulk_transfer()
     }
 }

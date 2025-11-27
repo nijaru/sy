@@ -212,9 +212,11 @@ fn should_use_parallel(root: &Path) -> bool {
 fn process_dir_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> {
     let path = entry.path().to_path_buf();
 
-    let metadata = entry.metadata().map_err(|e| SyncError::ReadDirError {
+    // Use symlink_metadata to properly detect symlinks
+    // entry.metadata() follows symlinks by default, making is_symlink() always false
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| SyncError::ReadDirError {
         path: path.clone(),
-        source: std::io::Error::other(e.to_string()),
+        source: e,
     })?;
 
     let relative_path = path

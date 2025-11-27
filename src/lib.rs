@@ -14,6 +14,7 @@ pub mod perf;
 pub mod resource;
 pub mod resume;
 pub mod retry;
+pub mod server;
 pub mod sparse;
 #[cfg(feature = "ssh")]
 pub mod ssh;

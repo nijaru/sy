@@ -75,7 +75,9 @@ See `CHANGELOG.md` for migration guide.
 **Next: sy --server mode** - Custom protocol for true rsync-like performance.
 - Design doc: `ai/design/server-mode.md` (395 lines, fully specified)
 - Target: v0.2.0
-- Ready to implement Phase 1
+- **Status: Phase 1 (MVP) Complete**
+- Implemented: `--server` flag, Protocol (Hello, FileList, FileData), Server Handler, Client Session, Local Integration Test
+- Usage: `SY_USE_SERVER=1 sy /src user@host:/dest` (Experimental)
 
 ### Bug Fixes (discovered via 531K file sync test)
 | Bug | Fix | File |

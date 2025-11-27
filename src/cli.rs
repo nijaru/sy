@@ -473,6 +473,12 @@ pub struct Cli {
     #[arg(long, default_value = "1")]
     pub retry_delay: u64,
 
+    /// Run in server mode (internal use only)
+    /// This flag is used by the remote instance when spawned via SSH.
+    /// It speaks a custom binary protocol on stdin/stdout.
+    #[arg(long, hide = true)]
+    pub server: bool,
+
     // === rsync compatibility flags (hidden, no-op) ===
     /// Recursive (no-op: sy is always recursive, for rsync compatibility)
     #[arg(short = 'r', hide = true)]
@@ -561,7 +567,7 @@ impl Cli {
         }
 
         // --list-profiles and --show-profile don't need source/destination
-        if self.list_profiles || self.show_profile.is_some() {
+        if self.list_profiles || self.show_profile.is_some() || self.server {
             return Ok(());
         }
 
@@ -790,6 +796,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -878,6 +885,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -972,6 +980,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -1065,6 +1074,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -1153,6 +1163,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1241,6 +1252,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1329,6 +1341,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::DEBUG);
     }
@@ -1417,6 +1430,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1524,6 +1538,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         let result = cli.validate();
@@ -1615,6 +1630,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::Standard);
     }
@@ -1703,6 +1719,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
@@ -1817,6 +1834,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1905,6 +1923,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -1993,6 +2012,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -2081,6 +2101,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         // Archive mode should enable all these flags
@@ -2176,6 +2197,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         // Only permissions should be enabled
@@ -2270,6 +2292,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         // All should be enabled (archive mode OR individual flags)
@@ -2365,6 +2388,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         let result = cli.validate();
@@ -2460,6 +2484,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2552,6 +2577,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2687,6 +2713,7 @@ mod tests {
             resume_only: false,
             clear_resume_state: false,
             recursive: false,
+            server: false,
         }
     }
 }

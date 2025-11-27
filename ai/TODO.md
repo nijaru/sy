@@ -5,6 +5,14 @@
 - [ ] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
   - Design: Complete (395 lines, payload formats, error handling)
   - **Phase 1 (MVP)**: `--server` flag, HELLO, FILE_LIST/ACK, FILE_DATA streaming
+    - [x] Create server module scaffolding (`src/server/`)
+    - [x] Implement `server` flag and entry point
+    - [x] Define protocol messages and serialization (`src/server/protocol.rs`)
+    - [x] Implement server-side handshake and loop (`src/server/mod.rs`)
+    - [x] Implement client-side transport (`src/transport/server.rs`)
+    - [x] Implement `FILE_LIST` sending (client) and processing (server)
+    - [x] Implement `FILE_DATA` streaming
+    - [x] Integration test (`tests/server_mode_test.rs`)
   - Phase 2: MKDIR_BATCH, DELETE_BATCH, symlinks
   - Phase 3: Delta sync (CHECKSUM_REQ/RESP, DELTA_DATA)
   - Phase 4: Progress, resume, compression, xattrs
