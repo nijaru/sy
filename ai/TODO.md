@@ -16,11 +16,12 @@
     - [x] Protocol flags (is_dir, is_symlink, is_hardlink, has_xattrs)
     - [x] Proper stats (dirs_created, symlinks_created)
     - [x] 12 unit tests for protocol/handler
-  - **Phase 3** (Next): Delta sync
-    - [ ] CHECKSUM_REQ/RESP messages
-    - [ ] DELTA_DATA encoding
-    - [ ] Wire up existing delta code
-  - Phase 4: Progress, resume, compression, xattrs
+  - **Phase 3** (Next): Delta sync - **KEY GAP vs rsync**
+    - [ ] CHECKSUM_REQ/RESP messages (rolling checksums)
+    - [ ] DELTA_DATA encoding (send only changed blocks)
+    - [ ] Wire up existing delta code from `src/sync/transfer.rs`
+    - **Why**: rsync wins partial updates (0.37s vs 0.46s) because it sends deltas
+  - Phase 4: Compression, progress, resume
   - Target: v0.2.0
 
 ## Backlog

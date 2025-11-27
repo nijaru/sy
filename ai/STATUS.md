@@ -67,13 +67,19 @@ See `CHANGELOG.md` for migration guide.
 | Integration Test | ✅ Done | `tests/server_mode_test.rs` passing |
 | CLI Integration | ✅ Done | Default for local→remote SSH |
 
-**Benchmark Results (98MB / 1000 files, Mac → Fedora over Tailscale):**
+**Benchmark Results (Mac → Fedora over Tailscale, ~30 MB/s link):**
 
-| Mode | Time | vs rsync | Notes |
-|------|------|----------|-------|
-| rsync | 3.25-4.89s | baseline | High variance |
-| **sy --server** | **~3.65s** | **~same** | Consistent |
-| sy tar bulk | 15.6s | 4x slower | Legacy SSH mode |
+| Test | rsync | sy | Notes |
+|------|-------|-----|-------|
+| 98MB/1000 files fresh | 3.3-3.5s | 3.3-3.5s | Parity |
+| 488MB/5000 files fresh | 15.7s | 15.4s | Network-bound |
+| No-op (all exist) | 1.3s | **0.48s** | **sy 2.7x faster** |
+| Partial update (3 files) | **0.37s** | 0.46s | rsync wins (delta) |
+
+**Key findings:**
+- Fresh copies: parity (both hit ~31 MB/s network limit)
+- Skip detection: sy 2.7x faster (better mtime comparison)
+- Partial updates: rsync wins (delta sync sends only changes)
 
 **Optimizations Applied (Session 2025-11-26):**
 - ✅ Tilde (`~`) expansion in server root path
