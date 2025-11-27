@@ -209,7 +209,6 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
 
             for (idx, entry) in &delta_candidates {
                 let path = entry.abs_path.clone();
-                let rel_path = entry.rel_path.clone();
                 let size = entry.size;
                 let file_idx = *idx;
 
@@ -240,11 +239,11 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                 })
                 .await??;
 
-                // Convert to protocol delta ops, optionally compress literals
+                // Convert to protocol delta ops
+                // Note: We don't compress delta literals because they're usually small
+                // and the overhead of per-chunk compression isn't worth it
                 let mut ops: Vec<DeltaOp> = Vec::with_capacity(delta.ops.len());
                 let mut delta_bytes = 0u64;
-                let should_compress =
-                    size >= COMPRESS_MIN_SIZE && !is_compressed_extension(&rel_path);
 
                 for op in &delta.ops {
                     match op {
@@ -263,18 +262,14 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
 
                 bytes_transferred += delta_bytes;
 
-                // Send delta
-                let flags = if should_compress {
-                    DATA_FLAG_COMPRESSED
-                } else {
-                    0
-                };
-                session.send_delta_data(file_idx, flags, ops).await?;
+                // Send delta (no compression for delta ops - literals are small)
+                session.send_delta_data(file_idx, 0, ops).await?;
 
                 let done = session.read_file_done().await?;
                 if done.status != 0 {
                     tracing::error!(
-                        "Delta update failed: index {} status {}",
+                        "Delta update failed for {}: index {} status {}",
+                        entry.rel_path,
                         done.index,
                         done.status
                     );
