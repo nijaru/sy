@@ -1,3 +1,7 @@
+// Server mode code - used when running `sy --server` as a subprocess
+// The code appears "dead" to the compiler since it's only used at runtime
+#![allow(dead_code)]
+
 pub mod handler;
 pub mod protocol;
 
@@ -84,11 +88,7 @@ pub async fn run_server() -> Result<()> {
     stdout.flush().await?;
 
     // Main message loop
-    loop {
-        let _len = match stdin.read_u32().await {
-            Ok(n) => n,
-            Err(_) => break, // EOF
-        };
+    while let Ok(_len) = stdin.read_u32().await {
         let type_byte = stdin.read_u8().await?;
 
         match MessageType::from_u8(type_byte) {

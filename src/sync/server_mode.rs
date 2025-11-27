@@ -421,11 +421,11 @@ async fn connect(dest: &SyncPath) -> Result<ServerSession> {
         SyncPath::Remote {
             host, user, path, ..
         } => {
-            let mut config = SshConfig::default();
-            config.hostname = host.clone();
-            if let Some(u) = user {
-                config.user = u.clone();
-            }
+            let config = SshConfig {
+                hostname: host.clone(),
+                user: user.clone().unwrap_or_default(),
+                ..Default::default()
+            };
             ServerSession::connect_ssh(&config, path).await
         }
         _ => anyhow::bail!("Unsupported destination for server mode"),

@@ -59,8 +59,10 @@ pub struct SyncStats {
     pub bytes_would_add: u64,
     pub bytes_would_change: u64,
     pub bytes_would_delete: u64,
-    // Server mode statistics
+    // Server mode statistics (set by server_mode.rs, will be displayed in future)
+    #[allow(dead_code)]
     pub dirs_created: u64,
+    #[allow(dead_code)]
     pub symlinks_created: u64,
     // Error tracking
     pub errors: Vec<SyncError>,

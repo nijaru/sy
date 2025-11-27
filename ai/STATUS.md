@@ -113,19 +113,29 @@ See `CHANGELOG.md` for migration guide.
 
 | Test | rsync | sy | Notes |
 |------|-------|-----|-------|
-| No-op (100MB file) | 317ms | **285ms** | sy wins |
-| Delta update (small change) | **957ms** | 1.17s | rsync ~20% faster |
+| No-op (100MB file) | ~300ms | **~270ms** | sy wins |
+| Delta update (small change) | ~1000ms | **~500ms** | **sy 2x faster** |
 | Fresh 100MB copy | 3.4s | 3.7s | Parity (network-bound) |
 
-**Key findings:**
-- Delta sync working! 100MB file with small change → only 4KB transferred
-- No-op detection still faster (sy wins)
-- rsync still ~20% faster for delta updates (more optimized rolling checksum)
+**Key Optimizations (Session 2025-11-27):**
+- Adaptive block sizes: 2KB→64KB based on file size (16x fewer checksums)
+- BufReader (1MB) for checksum computation (reduces syscalls)
+- Memory mapping for delta source file (fast random access)
+- BufWriter (1MB) for delta output
+- xxh3_64() direct function call (avoids hasher allocation)
+
+**Before/After (100MB delta update):**
+
+| Phase | Before | After | Improvement |
+|-------|--------|-------|-------------|
+| Checksum | 377ms | 92ms | **4x faster** |
+| Delta apply | 373ms | 103ms | **3.6x faster** |
+| **Total** | 1.1s | **0.5s** | **2x faster** |
 
 **Next Steps (Phase 4)**:
 1. Progress reporting over server protocol
-2. Parallel checksum computation (server side)
-3. Hardlink support
+2. Hardlink support
+3. Remote-to-local sync with server mode
 
 ### SSH Transfer Optimizations (Interim)
 

@@ -1,3 +1,7 @@
+// Server session client - used by server_mode.rs for connecting to `sy --server`
+// Some methods are reserved for future features (chunked transfer, graceful close)
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;

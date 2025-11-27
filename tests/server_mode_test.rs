@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
     use sy::path::SyncPath;
     use sy::sync::server_mode::sync_server_mode;
     use tempfile::TempDir;

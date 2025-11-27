@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::fs;
@@ -467,7 +467,7 @@ fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<Bloc
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
-    let num_blocks = (file_size as usize + block_size - 1) / block_size;
+    let num_blocks = (file_size as usize).div_ceil(block_size);
     let mut checksums = Vec::with_capacity(num_blocks);
 
     // Use larger read buffer (1MB) to reduce syscalls
