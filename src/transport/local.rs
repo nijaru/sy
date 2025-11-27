@@ -908,6 +908,11 @@ impl Transport for LocalTransport {
                 .map_err(SyncError::Io)?;
         }
 
+        // Remove existing file/symlink if present (force behavior like ln -sf)
+        if dest.exists() || dest.is_symlink() {
+            tokio::fs::remove_file(dest).await.ok(); // Ignore errors
+        }
+
         // Create the symbolic link
         #[cfg(unix)]
         {

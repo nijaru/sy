@@ -718,7 +718,7 @@ Or install from local source with: cargo install --path . --features acl"#
             files_scanned: (bisync_result.stats.files_synced_to_source
                 + bisync_result.stats.files_synced_to_dest) as u64,
             files_created: bisync_result.stats.files_synced_to_dest as u64,
-            files_updated: bisync_result.stats.files_synced_to_source,
+            files_updated: bisync_result.stats.files_synced_to_source as u64,
             files_deleted: bisync_result.stats.files_deleted_from_source
                 + bisync_result.stats.files_deleted_from_dest,
             files_skipped: 0,
@@ -733,6 +733,8 @@ Or install from local source with: cargo install --path . --features acl"#
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            dirs_created: 0,
+            symlinks_created: 0,
             errors: bisync_result
                 .errors
                 .into_iter()
@@ -743,39 +745,12 @@ Or install from local source with: cargo install --path . --features acl"#
                 })
                 .collect(),
         }
-    } else if cli.server && source.is_local() {
-        // Client-side server mode initiator
-        // Triggered if user explicitly asks for it?
-        // Wait, cli.server is for the SERVER process.
-        // We need a new flag or auto-detect.
-        // The user runs: `sy /local user@host:/remote`
-        // We want to use server mode if possible.
-        // For now, let's say we detect it or use a flag.
-        // Design doc says "Auto-detect: try sy --server, fall back to SFTP".
-        // But for Phase 1, let's just use it if explicitly requested via env var or hidden flag?
-        // Actually, let's check if we can use `cli.stream` or a new flag `--use-server`.
-        // The `cli.server` flag is ALREADY used for the server process.
-        // Let's assume for this implementation we auto-upgrade if `destination` is remote
-        // AND we have a way to know we want server mode.
-        // Let's add `use_server` to CLI (hidden or experimental).
-        // But I can't modify CLI easily without rebuild.
-        // I'll rely on the fact that `transport::router::TransportRouter` handles selection.
-        // BUT `sync_server_mode` bypasses standard engine.
-
-        // Temporary: If env var SY_USE_SERVER=1 is set, use server mode logic.
-        if std::env::var("SY_USE_SERVER").is_ok() {
-            if !cli.quiet && !cli.json {
-                println!("Mode: Server-side optimized sync (Experimental)");
-            }
-            sync::server_mode::sync_server_mode(source.path(), destination).await?;
-
-            // Return empty stats for now as sync_server_mode doesn't return stats yet
-            sync::SyncStats::default()
-        } else {
-            // Normal path
-            let effective_dest = compute_destination_path(source, destination);
-            engine.sync(source.path(), &effective_dest).await?
+    } else if source.is_local() && destination.is_remote() {
+        // Use server mode for local → remote SSH (faster than SFTP)
+        if !cli.quiet && !cli.json {
+            println!("Mode: Server protocol\n");
         }
+        sync::server_mode::sync_server_mode(source.path(), destination).await?
     } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
@@ -807,7 +782,7 @@ Or install from local source with: cargo install --path . --features acl"#
             destination: destination.to_string(),
             files_scanned: stats.files_scanned as usize,
             files_created: stats.files_created as usize,
-            files_updated: stats.files_updated,
+            files_updated: stats.files_updated as usize,
             files_deleted: stats.files_deleted,
             files_skipped: stats.files_skipped,
             bytes_transferred: stats.bytes_transferred,

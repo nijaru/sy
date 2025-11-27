@@ -314,6 +314,15 @@ impl Transport for TransportRouter {
         }
     }
 
+    async fn create_dirs_batch(&self, paths: &[&Path]) -> Result<()> {
+        match self {
+            TransportRouter::Local(t) => t.create_dirs_batch(paths).await,
+            TransportRouter::Dual(t) => t.create_dirs_batch(paths).await,
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.create_dirs_batch(paths).await,
+        }
+    }
+
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         match self {
             TransportRouter::Local(t) => t.copy_file(source, dest).await,
@@ -401,6 +410,38 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.set_bsd_flags(path, flags).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_bsd_flags(path, flags).await,
+        }
+    }
+
+    async fn bulk_copy_files(
+        &self,
+        source_base: &Path,
+        dest_base: &Path,
+        relative_paths: &[&Path],
+    ) -> Result<u64> {
+        match self {
+            TransportRouter::Local(t) => {
+                t.bulk_copy_files(source_base, dest_base, relative_paths)
+                    .await
+            }
+            TransportRouter::Dual(t) => {
+                t.bulk_copy_files(source_base, dest_base, relative_paths)
+                    .await
+            }
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => {
+                t.bulk_copy_files(source_base, dest_base, relative_paths)
+                    .await
+            }
+        }
+    }
+
+    fn supports_bulk_transfer(&self) -> bool {
+        match self {
+            TransportRouter::Local(t) => t.supports_bulk_transfer(),
+            TransportRouter::Dual(t) => t.supports_bulk_transfer(),
+            #[cfg(feature = "s3")]
+            TransportRouter::S3(t) => t.supports_bulk_transfer(),
         }
     }
 }

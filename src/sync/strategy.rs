@@ -404,8 +404,23 @@ impl StrategyPlanner {
             } else {
                 SyncAction::Create
             }
+        } else if source.is_symlink {
+            // For symlinks, check if dest exists and matches
+            match dest_map.get(&*source.relative_path) {
+                Some(dest_file) => {
+                    // If dest is a symlink with same target, skip; otherwise recreate
+                    if dest_file.is_symlink && dest_file.symlink_target == source.symlink_target {
+                        SyncAction::Skip
+                    } else {
+                        // Dest exists but is different (different target or not a symlink)
+                        // Use Create to trigger symlink handler (which has force behavior)
+                        SyncAction::Create
+                    }
+                }
+                None => SyncAction::Create,
+            }
         } else {
-            // For files, check existence and metadata
+            // For regular files, check existence and metadata
             match dest_map.get(&*source.relative_path) {
                 Some(dest_file) => {
                     // --ignore-existing: Skip files that already exist in destination

@@ -120,6 +120,11 @@ cargo bench
 cargo build --release
 ```
 
+**IMPORTANT: Before manual/integration testing:**
+- Always run `cargo build --release` after code changes
+- The installed `sy` (in PATH) may be outdated - use `./target/release/sy` for testing
+- Check version: `./target/release/sy --version` vs `sy --version`
+
 ## Core Design Principles
 
 1. **Verifiable, Not "Perfect"**

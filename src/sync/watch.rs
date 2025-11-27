@@ -180,6 +180,7 @@ mod tests {
             false,                              // checksum_db
             false,                              // clear_checksum_db
             false,                              // prune_checksum_db
+            false,                              // dest_is_remote
             false,                              // perf
         );
 
@@ -243,6 +244,7 @@ mod tests {
             false, // checksum_db
             false, // clear_checksum_db
             false, // prune_checksum_db
+            false, // dest_is_remote
             false, // perf
         );
 

@@ -55,7 +55,51 @@ See `CHANGELOG.md` for migration guide.
 
 ## Recent Work (Unreleased - v0.1.2)
 
-### SSH Transfer Optimizations (in progress)
+### sy --server mode (Phase 1 - MVP)
+
+**Status**: Implemented (Experimental)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Protocol Definition | ✅ Done | Binary length-prefixed protocol |
+| Server Handler | ✅ Done | Scan, Compare, Receive |
+| Client Session | ✅ Done | SSH execution, Handshake, Streaming |
+| Integration Test | ✅ Done | `tests/server_mode_test.rs` passing |
+| CLI Integration | ✅ Done | Default for local→remote SSH |
+
+**Benchmark Results (98MB / 1000 files, Mac → Fedora over Tailscale):**
+
+| Mode | Time | vs rsync | Notes |
+|------|------|----------|-------|
+| rsync | 3.25-4.89s | baseline | High variance |
+| **sy --server** | **~3.65s** | **~same** | Consistent |
+| sy tar bulk | 15.6s | 4x slower | Legacy SSH mode |
+
+**Optimizations Applied (Session 2025-11-26):**
+- ✅ Tilde (`~`) expansion in server root path
+- ✅ Root directory creation on server
+- ✅ Directory entries filtered from file list
+- ✅ Server mode is now default for local→remote SSH
+- ✅ Pipelined transfers (send all files, then read acks)
+- ✅ Pre-read files with sync I/O (faster for small files)
+- ✅ Batch flush (single flush after all sends)
+- ✅ Return proper SyncStats with byte counts
+
+**Phase 2 Refactoring (Session 2025-11-26):**
+- ✅ MKDIR_BATCH protocol message for batched directory creation
+- ✅ SYMLINK_BATCH protocol message for batched symlink creation
+- ✅ Protocol flags for directory/symlink/hardlink/xattrs
+- ✅ Server handler supports MKDIR_BATCH, SYMLINK_BATCH
+- ✅ Client sends directories before files, symlinks after files
+- ✅ Proper stats tracking (dirs_created, symlinks_created, files_updated)
+- ✅ 12 new unit tests for protocol/handler
+
+**Next Steps (Phase 3)**:
+1. Delta sync (CHECKSUM_REQ/RESP, DELTA_DATA)
+2. Compression option
+3. Progress reporting
+
+### SSH Transfer Optimizations (Interim)
 
 | Optimization | Status | Impact |
 |--------------|--------|--------|
@@ -69,15 +113,8 @@ See `CHANGELOG.md` for migration guide.
 - Symlinks: Preserved correctly
 
 **Known issues:**
-- Tilde (`~`) in SSH paths not expanded (pre-existing bug)
+- Tilde (`~`) in SSH paths not expanded (pre-existing bug) - **Confirmed critical for server mode**
 - Tar approach is workaround, not SOTA
-
-**Next: sy --server mode** - Custom protocol for true rsync-like performance.
-- Design doc: `ai/design/server-mode.md` (395 lines, fully specified)
-- Target: v0.2.0
-- **Status: Phase 1 (MVP) Complete**
-- Implemented: `--server` flag, Protocol (Hello, FileList, FileData), Server Handler, Client Session, Local Integration Test
-- Usage: `SY_USE_SERVER=1 sy /src user@host:/dest` (Experimental)
 
 ### Bug Fixes (discovered via 531K file sync test)
 | Bug | Fix | File |

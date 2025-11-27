@@ -1,111 +1,292 @@
 use anyhow::Result;
-use std::path::Path;
-use tokio::fs;
-use tokio::io::AsyncReadExt;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::path::SyncPath;
-use crate::server::protocol::{Action, FileListEntry};
+use crate::server::protocol::{Action, FileListEntry, SymlinkEntry};
 use crate::ssh::config::SshConfig;
 use crate::sync::scanner::{self, ScanOptions};
+use crate::sync::SyncStats;
 use crate::transport::server::ServerSession;
 
-pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<()> {
-    // 1. Connect
-    let mut session = match dest {
-        SyncPath::Local { path, .. } => {
-            // Local -> Local via server mode (for testing mostly)
-            ServerSession::connect_local(path).await?
+/// Source entry with all info needed for transfer
+struct SourceEntry {
+    rel_path: String,
+    abs_path: Arc<PathBuf>,
+    size: u64,
+    mtime: i64,
+    mode: u32,
+    is_dir: bool,
+    is_symlink: bool,
+    symlink_target: Option<String>,
+}
+
+/// Sync from local source to remote destination using server protocol
+pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStats> {
+    let start = Instant::now();
+
+    // Connect to server
+    let mut session = connect(dest).await?;
+    tracing::debug!("Connected to server");
+
+    // Scan source
+    tracing::debug!("Scanning source...");
+    let source_entries = scan_source(source).await?;
+
+    // Separate entries by type
+    let mut directories: Vec<String> = Vec::new();
+    let mut files: Vec<SourceEntry> = Vec::new();
+    let mut symlinks: Vec<SourceEntry> = Vec::new();
+
+    for entry in source_entries {
+        if entry.is_dir {
+            directories.push(entry.rel_path);
+        } else if entry.is_symlink {
+            symlinks.push(entry);
+        } else {
+            files.push(entry);
         }
+    }
+
+    // Build protocol entries (files only for FILE_LIST comparison)
+    let proto_entries: Vec<FileListEntry> = files
+        .iter()
+        .map(|e| FileListEntry {
+            path: e.rel_path.clone(),
+            size: e.size,
+            mtime: e.mtime,
+            mode: e.mode,
+            flags: 0,
+            symlink_target: None,
+        })
+        .collect();
+
+    let total_files = proto_entries.len();
+    let total_dirs = directories.len();
+    let total_symlinks = symlinks.len();
+
+    tracing::info!(
+        "Source: {} files, {} dirs, {} symlinks",
+        total_files,
+        total_dirs,
+        total_symlinks
+    );
+
+    // Step 1: Create directories (if any)
+    let mut dirs_created = 0u64;
+    if !directories.is_empty() {
+        tracing::debug!("Creating {} directories...", directories.len());
+        session.send_mkdir_batch(directories).await?;
+        let ack = session.read_mkdir_ack().await?;
+        dirs_created = ack.created as u64;
+        if !ack.failed.is_empty() {
+            for (path, err) in &ack.failed {
+                tracing::warn!("Failed to create dir {}: {}", path, err);
+            }
+        }
+    }
+
+    // Step 2: Send file list and get decisions
+    tracing::debug!("Sending file list ({} files)...", total_files);
+    session.send_file_list(proto_entries).await?;
+
+    tracing::debug!("Waiting for server decisions...");
+    let ack = session.read_ack().await?;
+
+    // Collect files that need transfer
+    let files_to_send: Vec<(u32, &SourceEntry)> = ack
+        .decisions
+        .iter()
+        .filter_map(|d| {
+            if matches!(d.action, Action::Create | Action::Update) {
+                Some((d.index, &files[d.index as usize]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let files_to_transfer = files_to_send.len();
+    tracing::info!("{} files need transfer", files_to_transfer);
+
+    // Step 3: Transfer files (pipelined)
+    let mut bytes_transferred = 0u64;
+    let mut files_created = 0u64;
+    let mut files_updated = 0u64;
+
+    if !files_to_send.is_empty() {
+        // Pre-read all files
+        let paths: Vec<(u32, Arc<PathBuf>)> = files_to_send
+            .iter()
+            .map(|(idx, e)| (*idx, e.abs_path.clone()))
+            .collect();
+
+        let files_data: Vec<(u32, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter_map(|(idx, path)| std::fs::read(&*path).ok().map(|data| (idx, data)))
+                .collect()
+        })
+        .await?;
+
+        // Track which files are creates vs updates
+        let update_indices: HashSet<u32> = ack
+            .decisions
+            .iter()
+            .filter(|d| d.action == Action::Update)
+            .map(|d| d.index)
+            .collect();
+
+        // Send all data
+        for (idx, data) in &files_data {
+            bytes_transferred += data.len() as u64;
+            session
+                .send_file_data_no_flush(*idx, 0, data.clone())
+                .await?;
+        }
+        session.flush().await?;
+
+        tracing::debug!(
+            "Sent {} files, waiting for confirmations...",
+            files_data.len()
+        );
+
+        // Read confirmations
+        let mut errors = 0u32;
+        for (idx, _) in &files_data {
+            let done = session.read_file_done().await?;
+            if done.status != 0 {
+                tracing::error!("File index {} failed: status {}", done.index, done.status);
+                errors += 1;
+            } else if update_indices.contains(idx) {
+                files_updated += 1;
+            } else {
+                files_created += 1;
+            }
+        }
+
+        if errors > 0 {
+            tracing::warn!("{} files failed to transfer", errors);
+        }
+    }
+
+    // Step 4: Create symlinks (if any)
+    let mut symlinks_created = 0u64;
+    if !symlinks.is_empty() {
+        tracing::debug!("Creating {} symlinks...", symlinks.len());
+
+        let symlink_entries: Vec<SymlinkEntry> = symlinks
+            .iter()
+            .filter_map(|e| {
+                e.symlink_target.as_ref().map(|target| SymlinkEntry {
+                    path: e.rel_path.clone(),
+                    target: target.clone(),
+                })
+            })
+            .collect();
+
+        if !symlink_entries.is_empty() {
+            session.send_symlink_batch(symlink_entries).await?;
+            let ack = session.read_symlink_ack().await?;
+            symlinks_created = ack.created as u64;
+            if !ack.failed.is_empty() {
+                for (path, err) in &ack.failed {
+                    tracing::warn!("Failed to create symlink {}: {}", path, err);
+                }
+            }
+        }
+    }
+
+    let duration = start.elapsed();
+    tracing::info!(
+        "Server sync complete: {} files ({} created, {} updated), {} dirs, {} symlinks in {:?}",
+        files_to_transfer,
+        files_created,
+        files_updated,
+        dirs_created,
+        symlinks_created,
+        duration
+    );
+
+    Ok(SyncStats {
+        files_scanned: total_files as u64,
+        files_created,
+        files_updated,
+        files_deleted: 0,
+        files_skipped: (total_files - files_to_transfer) as usize,
+        bytes_transferred,
+        duration,
+        errors: Vec::new(),
+        dirs_created,
+        symlinks_created,
+        ..Default::default()
+    })
+}
+
+/// Connect to remote server
+async fn connect(dest: &SyncPath) -> Result<ServerSession> {
+    match dest {
+        SyncPath::Local { path, .. } => ServerSession::connect_local(path).await,
         SyncPath::Remote {
             host, user, path, ..
         } => {
-            // Local -> Remote SSH
             let mut config = SshConfig::default();
             config.hostname = host.clone();
             if let Some(u) = user {
                 config.user = u.clone();
             }
-            // TODO: Load real config
-
-            ServerSession::connect_ssh(&config, path).await?
+            ServerSession::connect_ssh(&config, path).await
         }
         _ => anyhow::bail!("Unsupported destination for server mode"),
-    };
+    }
+}
 
-    tracing::info!("Connected to server mode");
-
-    // 2. Scan Source
-    tracing::info!("Scanning source...");
+/// Scan source directory and return entries
+async fn scan_source(source: &Path) -> Result<Vec<SourceEntry>> {
     let scan_opts = ScanOptions::default();
-    let entries = tokio::task::spawn_blocking({
-        let src = source.to_path_buf();
-        move || scanner::Scanner::new(&src).with_options(scan_opts).scan()
+    let src = source.to_path_buf();
+
+    let entries = tokio::task::spawn_blocking(move || {
+        scanner::Scanner::new(&src).with_options(scan_opts).scan()
     })
     .await??;
 
-    // Convert to protocol entries
-    let mut proto_entries = Vec::with_capacity(entries.len());
-    let mut file_map = Vec::with_capacity(entries.len()); // Index -> Path map
+    let mut result = Vec::with_capacity(entries.len());
 
-    for entry in &entries {
+    for entry in entries {
         if let Ok(rel_path) = entry.path.strip_prefix(source) {
+            // Skip root directory
+            if rel_path.as_os_str().is_empty() {
+                continue;
+            }
+
             if let Some(path_str) = rel_path.to_str() {
-                proto_entries.push(FileListEntry {
-                    path: path_str.to_string(),
+                let mtime = entry
+                    .modified
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let symlink_target = entry
+                    .symlink_target
+                    .as_ref()
+                    .and_then(|t| t.to_str().map(String::from));
+
+                result.push(SourceEntry {
+                    rel_path: path_str.to_string(),
+                    abs_path: entry.path.clone(),
                     size: entry.size,
-                    mtime: entry
-                        .modified
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
-                    mode: 0o644, // TODO: Real mode
-                    flags: 0,    // TODO: Dir/Symlink
+                    mtime,
+                    mode: 0o644, // TODO: Get real mode from entry
+                    is_dir: entry.is_dir,
+                    is_symlink: entry.is_symlink,
+                    symlink_target,
                 });
-                file_map.push(entry.path.clone());
             }
         }
     }
 
-    // 3. Send File List
-    tracing::info!("Sending file list ({} files)...", proto_entries.len());
-    session.send_file_list(proto_entries).await?;
-
-    // 4. Receive ACK (Decisions)
-    tracing::info!("Waiting for server decisions...");
-    let ack = session.read_ack().await?;
-
-    // 5. Send Data
-    for decision in ack.decisions {
-        match decision.action {
-            Action::Create | Action::Update => {
-                let path = &file_map[decision.index as usize];
-                tracing::info!("Sending {}", path.display());
-
-                let mut file = fs::File::open(&**path).await?;
-                let mut buffer = Vec::new();
-                file.read_to_end(&mut buffer).await?;
-
-                session.send_file_data(decision.index, 0, buffer).await?;
-
-                // Wait for Done
-                let done = session.read_file_done().await?;
-                if done.status != 0 {
-                    tracing::error!(
-                        "Failed to send file index {}: status {}",
-                        decision.index,
-                        done.status
-                    );
-                }
-            }
-            Action::Skip => {
-                tracing::debug!("Skipping index {}", decision.index);
-            }
-            Action::Delete => {
-                // Not handled in Push mode by default yet
-            }
-        }
-    }
-
-    tracing::info!("Server sync complete");
-    Ok(())
+    Ok(result)
 }

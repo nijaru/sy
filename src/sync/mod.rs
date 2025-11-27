@@ -44,7 +44,7 @@ pub struct SyncError {
 pub struct SyncStats {
     pub files_scanned: u64,
     pub files_created: u64,
-    pub files_updated: usize,
+    pub files_updated: u64,
     pub files_skipped: usize,
     pub files_deleted: usize,
     pub bytes_transferred: u64,
@@ -59,6 +59,9 @@ pub struct SyncStats {
     pub bytes_would_add: u64,
     pub bytes_would_change: u64,
     pub bytes_would_delete: u64,
+    // Server mode statistics
+    pub dirs_created: u64,
+    pub symlinks_created: u64,
     // Error tracking
     pub errors: Vec<SyncError>,
 }
@@ -798,6 +801,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            dirs_created: 0,
+            symlinks_created: 0,
             errors: Vec::new(),
         }));
 
@@ -1500,7 +1505,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         if self.json {
             SyncEvent::Summary {
                 files_created: final_stats.files_created as usize,
-                files_updated: final_stats.files_updated,
+                files_updated: final_stats.files_updated as usize,
                 files_skipped: final_stats.files_skipped,
                 files_deleted: final_stats.files_deleted,
                 bytes_transferred: final_stats.bytes_transferred,
@@ -1697,6 +1702,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            dirs_created: 0,
+            symlinks_created: 0,
             errors: Vec::new(),
         }));
 
@@ -2329,6 +2336,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bytes_would_add: 0,
             bytes_would_change: 0,
             bytes_would_delete: 0,
+            dirs_created: 0,
+            symlinks_created: 0,
             errors: Vec::new(),
         };
 

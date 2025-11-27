@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 use crate::server::protocol::{
-    self, FileData, FileDone, FileList, FileListAck, FileListEntry, Hello, MessageType,
-    PROTOCOL_VERSION,
+    self, FileData, FileDone, FileList, FileListAck, FileListEntry, Hello, MessageType, MkdirBatch,
+    MkdirBatchAck, SymlinkBatch, SymlinkBatchAck, SymlinkEntry, PROTOCOL_VERSION,
 };
 use crate::ssh::config::SshConfig;
 
@@ -21,14 +21,11 @@ impl ServerSession {
     pub async fn connect_ssh(config: &SshConfig, remote_path: &Path) -> Result<Self> {
         let mut cmd = Command::new("ssh");
 
-        // Configure SSH options
         cmd.arg(&config.hostname);
         if !config.user.is_empty() {
             cmd.arg("-l").arg(&config.user);
         }
 
-        // Port is u16, always valid. Only add if non-standard? Or always?
-        // Let's always add it if it's not 22, or just always.
         if config.port != 22 {
             cmd.arg("-p").arg(config.port.to_string());
         }
@@ -37,19 +34,14 @@ impl ServerSession {
             cmd.arg("-i").arg(key);
         }
 
-        // Force TTY allocation? No, we want binary stream.
-        // Use compression? Yes, let SSH handle it or sy?
-        // sy --server handles compression natively if implemented.
-
         // Remote command: sy --server <remote_path>
-        // Assuming 'sy' is in PATH.
         cmd.arg("sy");
         cmd.arg("--server");
         cmd.arg(remote_path);
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit()); // Let stderr go to console for now
+        cmd.stderr(Stdio::inherit());
 
         let mut child = cmd.spawn().context("Failed to spawn SSH process")?;
 
@@ -68,7 +60,6 @@ impl ServerSession {
     }
 
     pub async fn connect_local(remote_path: &Path) -> Result<Self> {
-        // For testing/local mode: spawn sy directly
         let exe = std::env::current_exe()?;
         let mut cmd = Command::new(exe);
         cmd.arg("--server");
@@ -104,7 +95,6 @@ impl ServerSession {
         hello.write(&mut self.stdin).await?;
         self.stdin.flush().await?;
 
-        // Read response
         let _len = self.stdout.read_u32().await?;
         let type_byte = self.stdout.read_u8().await?;
 
@@ -125,6 +115,10 @@ impl ServerSession {
 
         Ok(())
     }
+
+    // =========================================================================
+    // FILE_LIST
+    // =========================================================================
 
     pub async fn send_file_list(&mut self, entries: Vec<FileListEntry>) -> Result<()> {
         let list = FileList { entries };
@@ -152,6 +146,70 @@ impl ServerSession {
         FileListAck::read(&mut self.stdout).await
     }
 
+    // =========================================================================
+    // MKDIR_BATCH
+    // =========================================================================
+
+    pub async fn send_mkdir_batch(&mut self, paths: Vec<String>) -> Result<()> {
+        let batch = MkdirBatch { paths };
+        batch.write(&mut self.stdin).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_mkdir_ack(&mut self) -> Result<MkdirBatchAck> {
+        let _len = self.stdout.read_u32().await?;
+        let type_byte = self.stdout.read_u8().await?;
+
+        if type_byte == MessageType::Error as u8 {
+            let err = protocol::ErrorMessage::read(&mut self.stdout).await?;
+            return Err(anyhow::anyhow!("Server error: {}", err.message));
+        }
+
+        if type_byte != MessageType::MkdirBatchAck as u8 {
+            return Err(anyhow::anyhow!(
+                "Expected MKDIR_BATCH_ACK, got 0x{:02X}",
+                type_byte
+            ));
+        }
+
+        MkdirBatchAck::read(&mut self.stdout).await
+    }
+
+    // =========================================================================
+    // SYMLINK_BATCH
+    // =========================================================================
+
+    pub async fn send_symlink_batch(&mut self, entries: Vec<SymlinkEntry>) -> Result<()> {
+        let batch = SymlinkBatch { entries };
+        batch.write(&mut self.stdin).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_symlink_ack(&mut self) -> Result<SymlinkBatchAck> {
+        let _len = self.stdout.read_u32().await?;
+        let type_byte = self.stdout.read_u8().await?;
+
+        if type_byte == MessageType::Error as u8 {
+            let err = protocol::ErrorMessage::read(&mut self.stdout).await?;
+            return Err(anyhow::anyhow!("Server error: {}", err.message));
+        }
+
+        if type_byte != MessageType::SymlinkBatchAck as u8 {
+            return Err(anyhow::anyhow!(
+                "Expected SYMLINK_BATCH_ACK, got 0x{:02X}",
+                type_byte
+            ));
+        }
+
+        SymlinkBatchAck::read(&mut self.stdout).await
+    }
+
+    // =========================================================================
+    // FILE_DATA
+    // =========================================================================
+
     pub async fn send_file_data(&mut self, index: u32, offset: u64, data: Vec<u8>) -> Result<()> {
         let file_data = FileData {
             index,
@@ -159,6 +217,28 @@ impl ServerSession {
             data,
         };
         file_data.write(&mut self.stdin).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send file data without flushing - use flush() after batch
+    pub async fn send_file_data_no_flush(
+        &mut self,
+        index: u32,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let file_data = FileData {
+            index,
+            offset,
+            data,
+        };
+        file_data.write(&mut self.stdin).await?;
+        Ok(())
+    }
+
+    /// Flush the write buffer
+    pub async fn flush(&mut self) -> Result<()> {
         self.stdin.flush().await?;
         Ok(())
     }
@@ -180,5 +260,16 @@ impl ServerSession {
         }
 
         FileDone::read(&mut self.stdout).await
+    }
+
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
+
+    /// Close the session gracefully
+    pub async fn close(mut self) -> Result<()> {
+        drop(self.stdin);
+        let _ = self.child.wait().await;
+        Ok(())
     }
 }

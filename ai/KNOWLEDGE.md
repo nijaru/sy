@@ -12,6 +12,7 @@
 | **Memory** | sy-remote protocol buffering | Requires buffering entire compressed payload. Files >256MB use SFTP instead (chunks internally) | src/compress/mod.rs, DECISIONS.md (Critical Bug Fixes) |
 | **S3** | Multipart threshold | AWS S3 minimum part size is 5MB. Small files use simple put, large files use multipart upload | src/transport/s3.rs |
 | **SSH** | russh migration blocker | SSH agent authentication requires ~300 LOC custom protocol implementation. Using ssh2 (libssh2) until resources allow | feature/russh-migration branch, DECISIONS.md |
+| **SSH** | Server mode bypassing shell expansion | `sy --server` spawned via `ssh exec` receives literal `~` paths. Remote shell expansion does NOT occur. Must expand `~` manually. | src/transport/server.rs, ai/research/tilde-expansion.md |
 
 ---
 

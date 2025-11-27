@@ -4,24 +4,29 @@
 
 - [ ] **sy --server mode** - Custom wire protocol for SSH (see `ai/design/server-mode.md`)
   - Design: Complete (395 lines, payload formats, error handling)
-  - **Phase 1 (MVP)**: `--server` flag, HELLO, FILE_LIST/ACK, FILE_DATA streaming
-    - [x] Create server module scaffolding (`src/server/`)
-    - [x] Implement `server` flag and entry point
-    - [x] Define protocol messages and serialization (`src/server/protocol.rs`)
-    - [x] Implement server-side handshake and loop (`src/server/mod.rs`)
-    - [x] Implement client-side transport (`src/transport/server.rs`)
-    - [x] Implement `FILE_LIST` sending (client) and processing (server)
-    - [x] Implement `FILE_DATA` streaming
-    - [x] Integration test (`tests/server_mode_test.rs`)
-  - Phase 2: MKDIR_BATCH, DELETE_BATCH, symlinks
-  - Phase 3: Delta sync (CHECKSUM_REQ/RESP, DELTA_DATA)
+  - **Phase 1 (MVP)**: ✅ Complete
+    - [x] Protocol: HELLO, FILE_LIST/ACK, FILE_DATA, FILE_DONE
+    - [x] Server handler with destination scanning
+    - [x] Client-side pipelined transfers
+    - [x] Default for local→remote SSH
+    - **Result**: ~3.65s vs rsync ~3.25-4.89s (rsync parity!)
+  - **Phase 2**: ✅ Complete
+    - [x] MKDIR_BATCH - batched directory creation
+    - [x] SYMLINK_BATCH - batched symlink creation
+    - [x] Protocol flags (is_dir, is_symlink, is_hardlink, has_xattrs)
+    - [x] Proper stats (dirs_created, symlinks_created)
+    - [x] 12 unit tests for protocol/handler
+  - **Phase 3** (Next): Delta sync
+    - [ ] CHECKSUM_REQ/RESP messages
+    - [ ] DELTA_DATA encoding
+    - [ ] Wire up existing delta code
   - Phase 4: Progress, resume, compression, xattrs
   - Target: v0.2.0
 
 ## Backlog
 
 ### High Priority
-- [ ] Fix tilde (`~`) expansion in SSH paths
+- [ ] Fix tilde (`~`) expansion in SSH paths (General issue, not just server mode)
 - [ ] Windows support (sparse files, ACLs, path edge cases)
 - [ ] russh migration (SSH agent blocker)
 - [ ] S3 bidirectional sync

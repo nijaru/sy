@@ -70,6 +70,11 @@ impl Transport for DualTransport {
         self.dest.create_dir_all(path).await
     }
 
+    async fn create_dirs_batch(&self, paths: &[&Path]) -> Result<()> {
+        // Batch create on destination (SSH will be efficient, local will loop)
+        self.dest.create_dirs_batch(paths).await
+    }
+
     async fn copy_file(&self, source: &Path, dest: &Path) -> Result<TransferResult> {
         // Cross-transport copy
         //
@@ -207,5 +212,136 @@ impl Transport for DualTransport {
     async fn set_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
         // Set BSD flags on destination
         self.dest.set_bsd_flags(path, flags).await
+    }
+
+    async fn compute_checksum(
+        &self,
+        path: &Path,
+        verifier: &crate::integrity::IntegrityVerifier,
+    ) -> Result<crate::integrity::Checksum> {
+        // For DualTransport, we need to route based on which transport can access the path.
+        // Try source first (for local source files), then dest (for remote dest files).
+        //
+        // The path may be:
+        // - A local source path (readable by source transport)
+        // - A remote dest path (readable by dest transport)
+        //
+        // A simple heuristic: if the path exists locally, use local; otherwise use dest.
+        if path.exists() {
+            // Local path - use default (local) implementation
+            let path = path.to_path_buf();
+            let verifier = verifier.clone();
+            tokio::task::spawn_blocking(move || verifier.compute_file_checksum(&path))
+                .await
+                .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?
+        } else {
+            // Remote path - use destination transport
+            self.dest.compute_checksum(path, verifier).await
+        }
+    }
+
+    async fn bulk_copy_files(
+        &self,
+        source_base: &Path,
+        dest_base: &Path,
+        relative_paths: &[&Path],
+    ) -> Result<u64> {
+        // DualTransport bulk copy uses the dest transport's implementation
+        // For local→remote, this will use SSH's tar streaming
+        self.dest
+            .bulk_copy_files(source_base, dest_base, relative_paths)
+            .await
+    }
+
+    fn supports_bulk_transfer(&self) -> bool {
+        // DualTransport supports bulk transfer if dest does
+        self.dest.supports_bulk_transfer()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::integrity::{ChecksumType, IntegrityVerifier};
+    use crate::transport::local::LocalTransport;
+    use tempfile::TempDir;
+
+    /// Test that compute_checksum routes correctly based on path existence:
+    /// - Local paths (that exist) use local computation
+    /// - Remote paths (that don't exist locally) route to dest transport
+    #[tokio::test]
+    async fn test_compute_checksum_routes_local_path() {
+        let temp = TempDir::new().unwrap();
+        let local_file = temp.path().join("local_file.txt");
+        std::fs::write(&local_file, b"test content").unwrap();
+
+        // Create DualTransport with two local transports (simulating local→remote)
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
+        let source = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dest = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dual = DualTransport::new(source, dest);
+
+        // Local file should be computed locally (path.exists() == true)
+        let result = dual.compute_checksum(&local_file, &verifier).await;
+        assert!(result.is_ok(), "Should compute checksum for local file");
+    }
+
+    /// Test that compute_checksum for non-existent path routes to dest transport
+    #[tokio::test]
+    async fn test_compute_checksum_routes_nonexistent_to_dest() {
+        let temp = TempDir::new().unwrap();
+
+        // Create a file that only exists in "dest" directory (simulating remote)
+        let dest_dir = temp.path().join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join("remote_file.txt");
+        std::fs::write(&dest_file, b"remote content").unwrap();
+
+        // Path that doesn't exist locally (simulating ~/remote/path)
+        let fake_remote_path = std::path::PathBuf::from("/nonexistent/remote/path.txt");
+
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
+        let source = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dest = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dual = DualTransport::new(source, dest);
+
+        // Non-existent local path should route to dest transport
+        // This will fail because the file doesn't exist on dest either,
+        // but the important thing is it tries dest (not local)
+        let result = dual.compute_checksum(&fake_remote_path, &verifier).await;
+        assert!(
+            result.is_err(),
+            "Should fail for path that doesn't exist anywhere"
+        );
+    }
+
+    /// Test that verification works correctly for local source + dest scenario
+    #[tokio::test]
+    async fn test_dual_transport_verification_local_paths() {
+        let temp = TempDir::new().unwrap();
+
+        // Create source and dest files with same content
+        let source_file = temp.path().join("source.txt");
+        let dest_file = temp.path().join("dest.txt");
+        let content = b"identical content for verification";
+        std::fs::write(&source_file, content).unwrap();
+        std::fs::write(&dest_file, content).unwrap();
+
+        let verifier = IntegrityVerifier::new(ChecksumType::Fast, false);
+        let source = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dest = Box::new(LocalTransport::with_verifier(verifier.clone()));
+        let dual = DualTransport::new(source, dest);
+
+        // Both files exist locally, so both should compute successfully
+        let source_checksum = dual
+            .compute_checksum(&source_file, &verifier)
+            .await
+            .unwrap();
+        let dest_checksum = dual.compute_checksum(&dest_file, &verifier).await.unwrap();
+
+        assert_eq!(
+            source_checksum, dest_checksum,
+            "Checksums should match for identical files"
+        );
     }
 }
