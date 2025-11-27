@@ -508,21 +508,20 @@ pub async fn sync_pull_server_mode(source: &SyncPath, dest: &Path) -> Result<Syn
     let mut symlinks_created = 0u64;
 
     // Step 1: Receive and create directories
-    if let Some(mkdir_batch) = session.read_mkdir_batch().await? {
-        tracing::debug!("Received {} directories", mkdir_batch.paths.len());
-        let mut created = 0u32;
-        let mut failed: Vec<(String, String)> = Vec::new();
+    let mkdir_batch = session.read_mkdir_batch().await?;
+    tracing::debug!("Received {} directories", mkdir_batch.paths.len());
+    let mut created = 0u32;
+    let mut failed: Vec<(String, String)> = Vec::new();
 
-        for dir_path in &mkdir_batch.paths {
-            let full_path = dest.join(dir_path);
-            match std::fs::create_dir_all(&full_path) {
-                Ok(_) => created += 1,
-                Err(e) => failed.push((dir_path.clone(), e.to_string())),
-            }
+    for dir_path in &mkdir_batch.paths {
+        let full_path = dest.join(dir_path);
+        match std::fs::create_dir_all(&full_path) {
+            Ok(_) => created += 1,
+            Err(e) => failed.push((dir_path.clone(), e.to_string())),
         }
-        dirs_created = created as u64;
-        session.send_mkdir_batch_ack(created, failed).await?;
     }
+    dirs_created = created as u64;
+    session.send_mkdir_batch_ack(created, failed).await?;
 
     // Step 2: Receive file list and send decisions
     let file_list = session.read_file_list().await?;

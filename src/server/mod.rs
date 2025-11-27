@@ -217,25 +217,23 @@ where
         }
     }
 
-    // Step 1: Send directories (MKDIR_BATCH)
-    if !directories.is_empty() {
-        let batch = MkdirBatch {
-            paths: directories.clone(),
-        };
-        batch.write(stdout).await?;
-        stdout.flush().await?;
+    // Step 1: Send directories (MKDIR_BATCH) - always send, even if empty
+    let batch = MkdirBatch {
+        paths: directories.clone(),
+    };
+    batch.write(stdout).await?;
+    stdout.flush().await?;
 
-        // Wait for MKDIR_BATCH_ACK
-        let _len = stdin.read_u32().await?;
-        let type_byte = stdin.read_u8().await?;
-        if type_byte != MessageType::MkdirBatchAck as u8 {
-            return Err(anyhow::anyhow!(
-                "Expected MKDIR_BATCH_ACK, got 0x{:02X}",
-                type_byte
-            ));
-        }
-        let _ack = MkdirBatchAck::read(stdin).await?;
+    // Wait for MKDIR_BATCH_ACK
+    let _len = stdin.read_u32().await?;
+    let type_byte = stdin.read_u8().await?;
+    if type_byte != MessageType::MkdirBatchAck as u8 {
+        return Err(anyhow::anyhow!(
+            "Expected MKDIR_BATCH_ACK, got 0x{:02X}",
+            type_byte
+        ));
     }
+    let _ack = MkdirBatchAck::read(stdin).await?;
 
     // Step 2: Send file list (FILE_LIST)
     let file_entries: Vec<FileListEntry> = files

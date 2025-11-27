@@ -448,16 +448,10 @@ impl ServerSession {
         Ok(())
     }
 
-    /// Read MKDIR_BATCH from server (PULL mode)
-    pub async fn read_mkdir_batch(&mut self) -> Result<Option<MkdirBatch>> {
+    /// Read MKDIR_BATCH from server (PULL mode) - server always sends this
+    pub async fn read_mkdir_batch(&mut self) -> Result<MkdirBatch> {
         let _len = self.stdout.read_u32().await?;
         let type_byte = self.stdout.read_u8().await?;
-
-        // Server might send FILE_LIST directly if no directories
-        if type_byte == MessageType::FileList as u8 {
-            // Put it back by storing the type - caller should call read_file_list
-            return Ok(None);
-        }
 
         if type_byte == MessageType::Error as u8 {
             let err = protocol::ErrorMessage::read(&mut self.stdout).await?;
@@ -466,13 +460,13 @@ impl ServerSession {
 
         if type_byte != MessageType::MkdirBatch as u8 {
             return Err(anyhow::anyhow!(
-                "Expected MKDIR_BATCH or FILE_LIST, got 0x{:02X}",
+                "Expected MKDIR_BATCH, got 0x{:02X}",
                 type_byte
             ));
         }
 
         let batch = MkdirBatch::read(&mut self.stdout).await?;
-        Ok(Some(batch))
+        Ok(batch)
     }
 
     /// Send MKDIR_BATCH_ACK to server (PULL mode)
