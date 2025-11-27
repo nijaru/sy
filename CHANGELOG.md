@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2025-11-27
+
+### Added
+
+- **Bidirectional server mode**: Both push (local→remote) and pull (remote→local) now use fast binary protocol over SSH
+  - Push mode: Client sends files to server (existing)
+  - Pull mode: Server sends files to client (new)
+  - Both directions benefit from delta sync, compression, and pipelined transfers
+
+### Performance
+
+- **Delta sync**: 2x faster than rsync for partial file updates
+- **Compression**: Zstd compression for large fresh transfers (files ≥1MB)
+- **Adaptive block sizes**: 2KB→64KB based on file size for optimal checksum efficiency
+
+### Changed
+
+- Removed ~300 lines of dead bulk_transfer code (replaced by server mode)
+
 ## [0.1.1] - 2025-11-26
 
 ### Performance
