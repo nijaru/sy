@@ -10,6 +10,14 @@ pub const FLAG_IS_SYMLINK: u8 = 0x02;
 pub const FLAG_IS_HARDLINK: u8 = 0x04;
 pub const FLAG_HAS_XATTRS: u8 = 0x08;
 
+// FileData flags
+pub const DATA_FLAG_COMPRESSED: u8 = 0x01; // Data is zstd compressed
+pub const DATA_FLAG_FINAL: u8 = 0x02; // This is the final chunk for this file
+
+// Delta sync thresholds
+pub const DELTA_MIN_SIZE: u64 = 64 * 1024; // 64KB - below this, full transfer is faster
+pub const DELTA_BLOCK_SIZE: usize = 4096; // 4KB blocks for delta checksums
+
 // FileDone status codes
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_CHECKSUM_MISMATCH: u8 = 1;
@@ -289,16 +297,18 @@ impl FileListAck {
 pub struct FileData {
     pub index: u32,
     pub offset: u64,
+    pub flags: u8, // DATA_FLAG_COMPRESSED, DATA_FLAG_FINAL
     pub data: Vec<u8>,
 }
 
 impl FileData {
     pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
-        let len = 4 + 8 + 4 + self.data.len() as u32;
+        let len = 4 + 8 + 1 + 4 + self.data.len() as u32;
         w.write_u32(len).await?;
         w.write_u8(MessageType::FileData as u8).await?;
         w.write_u32(self.index).await?;
         w.write_u64(self.offset).await?;
+        w.write_u8(self.flags).await?;
         write_bytes(w, &self.data).await?;
         Ok(())
     }
@@ -306,10 +316,12 @@ impl FileData {
     pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self> {
         let index = r.read_u32().await?;
         let offset = r.read_u64().await?;
+        let flags = r.read_u8().await?;
         let data = read_bytes(r).await?;
         Ok(FileData {
             index,
             offset,
+            flags,
             data,
         })
     }
@@ -541,6 +553,176 @@ impl ErrorMessage {
 }
 
 // ============================================================================
+// CHECKSUM_REQ (0x10)
+// ============================================================================
+
+/// Request block checksums for a file (for delta sync)
+#[derive(Debug)]
+pub struct ChecksumReq {
+    pub index: u32,      // File index from FILE_LIST
+    pub block_size: u32, // Block size for checksums
+}
+
+impl ChecksumReq {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        let len = 4 + 4;
+        w.write_u32(len).await?;
+        w.write_u8(MessageType::ChecksumReq as u8).await?;
+        w.write_u32(self.index).await?;
+        w.write_u32(self.block_size).await?;
+        Ok(())
+    }
+
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self> {
+        let index = r.read_u32().await?;
+        let block_size = r.read_u32().await?;
+        Ok(ChecksumReq { index, block_size })
+    }
+}
+
+// ============================================================================
+// CHECKSUM_RESP (0x11)
+// ============================================================================
+
+/// Block checksum for delta sync (weak Adler32 + strong xxHash3)
+#[derive(Debug, Clone)]
+pub struct BlockChecksum {
+    pub offset: u64, // Offset in file
+    pub size: u32,   // Block size (may be smaller for last block)
+    pub weak: u32,   // Adler32 rolling checksum
+    pub strong: u64, // xxHash3 strong checksum
+}
+
+/// Response with block checksums for delta sync
+#[derive(Debug)]
+pub struct ChecksumResp {
+    pub index: u32,
+    pub file_size: u64, // Total file size (for verification)
+    pub checksums: Vec<BlockChecksum>,
+}
+
+impl ChecksumResp {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        // Each checksum: 8 + 4 + 4 + 8 = 24 bytes
+        let len = 4 + 8 + 4 + (self.checksums.len() as u32 * 24);
+        w.write_u32(len).await?;
+        w.write_u8(MessageType::ChecksumResp as u8).await?;
+        w.write_u32(self.index).await?;
+        w.write_u64(self.file_size).await?;
+        w.write_u32(self.checksums.len() as u32).await?;
+        for cs in &self.checksums {
+            w.write_u64(cs.offset).await?;
+            w.write_u32(cs.size).await?;
+            w.write_u32(cs.weak).await?;
+            w.write_u64(cs.strong).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self> {
+        let index = r.read_u32().await?;
+        let file_size = r.read_u64().await?;
+        let count = r.read_u32().await? as usize;
+        let mut checksums = Vec::with_capacity(count);
+        for _ in 0..count {
+            checksums.push(BlockChecksum {
+                offset: r.read_u64().await?,
+                size: r.read_u32().await?,
+                weak: r.read_u32().await?,
+                strong: r.read_u64().await?,
+            });
+        }
+        Ok(ChecksumResp {
+            index,
+            file_size,
+            checksums,
+        })
+    }
+}
+
+// ============================================================================
+// DELTA_DATA (0x12)
+// ============================================================================
+
+/// Delta operation type
+#[derive(Debug, Clone)]
+pub enum DeltaOp {
+    /// Copy block from existing file (offset in dest, size)
+    Copy { offset: u64, size: u32 },
+    /// Insert literal data
+    Data(Vec<u8>),
+}
+
+/// Delta data for updating a file
+#[derive(Debug)]
+pub struct DeltaData {
+    pub index: u32,
+    pub flags: u8,         // DATA_FLAG_COMPRESSED applies to literal data
+    pub ops: Vec<DeltaOp>, // Delta operations
+}
+
+impl DeltaData {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        // Serialize ops to payload first
+        let mut payload = Vec::new();
+        payload.write_u32(self.index).await?;
+        payload.write_u8(self.flags).await?;
+        payload.write_u32(self.ops.len() as u32).await?;
+
+        for op in &self.ops {
+            match op {
+                DeltaOp::Copy { offset, size } => {
+                    payload.write_u8(0).await?; // 0 = Copy
+                    payload.write_u64(*offset).await?;
+                    payload.write_u32(*size).await?;
+                }
+                DeltaOp::Data(data) => {
+                    payload.write_u8(1).await?; // 1 = Data
+                    payload.write_u32(data.len() as u32).await?;
+                    payload.write_all(data).await?;
+                }
+            }
+        }
+
+        w.write_u32(payload.len() as u32).await?;
+        w.write_u8(MessageType::DeltaData as u8).await?;
+        w.write_all(&payload).await?;
+        Ok(())
+    }
+
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self> {
+        let index = r.read_u32().await?;
+        let flags = r.read_u8().await?;
+        let count = r.read_u32().await? as usize;
+        let mut ops = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let op_type = r.read_u8().await?;
+            match op_type {
+                0 => {
+                    // Copy
+                    let offset = r.read_u64().await?;
+                    let size = r.read_u32().await?;
+                    ops.push(DeltaOp::Copy { offset, size });
+                }
+                1 => {
+                    // Data
+                    let len = r.read_u32().await? as usize;
+                    let mut data = vec![0u8; len];
+                    r.read_exact(&mut data).await?;
+                    ops.push(DeltaOp::Data(data));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unknown delta op type: {}", op_type));
+                }
+            }
+        }
+
+        Ok(DeltaData { index, flags, ops })
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -646,5 +828,122 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].path, "link1");
         assert_eq!(decoded.entries[0].target, "target1");
+    }
+
+    #[tokio::test]
+    async fn test_checksum_req_roundtrip() {
+        let req = ChecksumReq {
+            index: 42,
+            block_size: 4096,
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).await.unwrap();
+
+        let mut cursor = Cursor::new(&buf[5..]);
+        let decoded = ChecksumReq::read(&mut cursor).await.unwrap();
+
+        assert_eq!(decoded.index, 42);
+        assert_eq!(decoded.block_size, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_checksum_resp_roundtrip() {
+        let resp = ChecksumResp {
+            index: 7,
+            file_size: 1024 * 1024,
+            checksums: vec![
+                BlockChecksum {
+                    offset: 0,
+                    size: 4096,
+                    weak: 0xDEADBEEF,
+                    strong: 0x123456789ABCDEF0,
+                },
+                BlockChecksum {
+                    offset: 4096,
+                    size: 4096,
+                    weak: 0xCAFEBABE,
+                    strong: 0x0FEDCBA987654321,
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        resp.write(&mut buf).await.unwrap();
+
+        let mut cursor = Cursor::new(&buf[5..]);
+        let decoded = ChecksumResp::read(&mut cursor).await.unwrap();
+
+        assert_eq!(decoded.index, 7);
+        assert_eq!(decoded.file_size, 1024 * 1024);
+        assert_eq!(decoded.checksums.len(), 2);
+        assert_eq!(decoded.checksums[0].offset, 0);
+        assert_eq!(decoded.checksums[0].weak, 0xDEADBEEF);
+        assert_eq!(decoded.checksums[1].strong, 0x0FEDCBA987654321);
+    }
+
+    #[tokio::test]
+    async fn test_delta_data_roundtrip() {
+        let delta = DeltaData {
+            index: 3,
+            flags: DATA_FLAG_COMPRESSED,
+            ops: vec![
+                DeltaOp::Copy {
+                    offset: 0,
+                    size: 4096,
+                },
+                DeltaOp::Data(vec![1, 2, 3, 4, 5]),
+                DeltaOp::Copy {
+                    offset: 8192,
+                    size: 2048,
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        delta.write(&mut buf).await.unwrap();
+
+        let mut cursor = Cursor::new(&buf[5..]);
+        let decoded = DeltaData::read(&mut cursor).await.unwrap();
+
+        assert_eq!(decoded.index, 3);
+        assert_eq!(decoded.flags, DATA_FLAG_COMPRESSED);
+        assert_eq!(decoded.ops.len(), 3);
+
+        match &decoded.ops[0] {
+            DeltaOp::Copy { offset, size } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*size, 4096);
+            }
+            _ => panic!("Expected Copy op"),
+        }
+
+        match &decoded.ops[1] {
+            DeltaOp::Data(data) => {
+                assert_eq!(data, &vec![1, 2, 3, 4, 5]);
+            }
+            _ => panic!("Expected Data op"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_data_with_flags() {
+        let data = FileData {
+            index: 5,
+            offset: 1024,
+            flags: DATA_FLAG_COMPRESSED,
+            data: vec![0xAB; 100],
+        };
+
+        let mut buf = Vec::new();
+        data.write(&mut buf).await.unwrap();
+
+        let mut cursor = Cursor::new(&buf[5..]);
+        let decoded = FileData::read(&mut cursor).await.unwrap();
+
+        assert_eq!(decoded.index, 5);
+        assert_eq!(decoded.offset, 1024);
+        assert_eq!(decoded.flags, DATA_FLAG_COMPRESSED);
+        assert_eq!(decoded.data.len(), 100);
     }
 }

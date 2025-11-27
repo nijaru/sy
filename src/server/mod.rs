@@ -3,7 +3,10 @@ pub mod protocol;
 
 use anyhow::Result;
 use handler::ServerHandler;
-use protocol::{ErrorMessage, Hello, MessageType, MkdirBatch, SymlinkBatch, PROTOCOL_VERSION};
+use protocol::{
+    ChecksumReq, DeltaData, ErrorMessage, Hello, MessageType, MkdirBatch, SymlinkBatch,
+    PROTOCOL_VERSION,
+};
 use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
@@ -107,6 +110,16 @@ pub async fn run_server() -> Result<()> {
             Some(MessageType::FileData) => {
                 let data = protocol::FileData::read(&mut stdin).await?;
                 handler.handle_file_data(data, &mut stdout).await?;
+            }
+
+            Some(MessageType::ChecksumReq) => {
+                let req = ChecksumReq::read(&mut stdin).await?;
+                handler.handle_checksum_req(req, &mut stdout).await?;
+            }
+
+            Some(MessageType::DeltaData) => {
+                let delta = DeltaData::read(&mut stdin).await?;
+                handler.handle_delta_data(delta, &mut stdout).await?;
             }
 
             Some(MessageType::Error) => {

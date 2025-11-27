@@ -1,13 +1,17 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::{AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+use crate::compress::{decompress, Compression};
+use crate::delta::Adler32;
 use crate::server::protocol::{
-    Action, Decision, FileData, FileDone, FileList, FileListAck, FileListEntry, MkdirBatch,
-    MkdirBatchAck, SymlinkBatch, SymlinkBatchAck, STATUS_OK, STATUS_WRITE_ERROR,
+    Action, BlockChecksum, ChecksumReq, ChecksumResp, Decision, DeltaData, DeltaOp, FileData,
+    FileDone, FileList, FileListAck, FileListEntry, MkdirBatch, MkdirBatchAck, SymlinkBatch,
+    SymlinkBatchAck, DATA_FLAG_COMPRESSED, STATUS_OK, STATUS_WRITE_ERROR,
 };
 use crate::sync::scanner::{self, ScanOptions};
 
@@ -352,7 +356,14 @@ impl ServerHandler {
             file.seek(std::io::SeekFrom::Start(data.offset)).await?;
         }
 
-        file.write_all(&data.data).await?;
+        // Decompress if needed
+        let write_data = if data.flags & DATA_FLAG_COMPRESSED != 0 {
+            decompress(&data.data, Compression::Zstd)?
+        } else {
+            data.data.clone()
+        };
+
+        file.write_all(&write_data).await?;
         file.flush().await?;
 
         // Check if file is complete
@@ -364,6 +375,179 @@ impl ServerHandler {
     pub fn file_list(&self) -> &[FileListEntry] {
         &self.current_file_list
     }
+
+    /// Handle CHECKSUM_REQ message: compute and return block checksums for delta sync
+    pub async fn handle_checksum_req<W: AsyncWrite + Unpin>(
+        &mut self,
+        req: ChecksumReq,
+        writer: &mut W,
+    ) -> Result<()> {
+        if (req.index as usize) >= self.current_file_list.len() {
+            return Err(anyhow::anyhow!("Invalid file index: {}", req.index));
+        }
+
+        let entry = &self.current_file_list[req.index as usize];
+        let path = self.root_path.join(&entry.path);
+
+        // Compute checksums in blocking task
+        let block_size = req.block_size as usize;
+        let checksums =
+            tokio::task::spawn_blocking(move || compute_block_checksums(&path, block_size))
+                .await??;
+
+        let file_size = checksums.iter().map(|c| c.size as u64).sum();
+
+        let resp = ChecksumResp {
+            index: req.index,
+            file_size,
+            checksums,
+        };
+        resp.write(writer).await?;
+        writer.flush().await?;
+
+        Ok(())
+    }
+
+    /// Handle DELTA_DATA message: apply delta operations to reconstruct file
+    pub async fn handle_delta_data<W: AsyncWrite + Unpin>(
+        &mut self,
+        delta: DeltaData,
+        writer: &mut W,
+    ) -> Result<()> {
+        if (delta.index as usize) >= self.current_file_list.len() {
+            return Err(anyhow::anyhow!("Invalid file index: {}", delta.index));
+        }
+
+        let entry = &self.current_file_list[delta.index as usize];
+        let path = self.root_path.join(&entry.path);
+        let is_compressed = delta.flags & DATA_FLAG_COMPRESSED != 0;
+
+        // Apply delta in blocking task
+        let root = self.root_path.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            apply_delta_ops(&path, &root, &delta.ops, is_compressed)
+        })
+        .await?;
+
+        let status = match status {
+            Ok(()) => {
+                // Set permissions
+                if entry.mode != 0 {
+                    let _ = fs::set_permissions(
+                        &self.root_path.join(&entry.path),
+                        std::fs::Permissions::from_mode(entry.mode),
+                    )
+                    .await;
+                }
+                STATUS_OK
+            }
+            Err(e) => {
+                tracing::error!("Delta apply failed for {}: {}", entry.path, e);
+                STATUS_WRITE_ERROR
+            }
+        };
+
+        let done = FileDone {
+            index: delta.index,
+            status,
+            checksum: vec![],
+        };
+        done.write(writer).await?;
+        writer.flush().await?;
+
+        Ok(())
+    }
+}
+
+/// Compute block checksums for a file (for delta sync)
+fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<BlockChecksum>> {
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    let num_blocks = (file_size as usize + block_size - 1) / block_size;
+    let mut checksums = Vec::with_capacity(num_blocks);
+
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; block_size];
+
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let block = &buf[..n];
+
+        // Weak checksum: Adler32
+        let weak = Adler32::hash(block);
+
+        // Strong checksum: xxHash3
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(block);
+        let strong = hasher.digest();
+
+        checksums.push(BlockChecksum {
+            offset,
+            size: n as u32,
+            weak,
+            strong,
+        });
+
+        offset += n as u64;
+    }
+
+    Ok(checksums)
+}
+
+/// Apply delta operations to reconstruct a file
+fn apply_delta_ops(
+    dest_path: &PathBuf,
+    _root: &PathBuf,
+    ops: &[DeltaOp],
+    is_compressed: bool,
+) -> Result<()> {
+    // Create temp file for reconstruction
+    let temp_path = dest_path.with_extension("sy-tmp");
+
+    // Open existing file for reading (for Copy ops)
+    let existing = std::fs::File::open(dest_path).ok();
+
+    // Create temp file for writing
+    let mut temp_file = std::fs::File::create(&temp_path)?;
+
+    for op in ops {
+        match op {
+            DeltaOp::Copy { offset, size } => {
+                if let Some(ref mut src) = existing.as_ref() {
+                    // Clone the file handle for seeking
+                    let mut src = src.try_clone()?;
+                    src.seek(SeekFrom::Start(*offset))?;
+                    let mut buf = vec![0u8; *size as usize];
+                    src.read_exact(&mut buf)?;
+                    temp_file.write_all(&buf)?;
+                } else {
+                    return Err(anyhow::anyhow!("Copy op but no existing file"));
+                }
+            }
+            DeltaOp::Data(data) => {
+                let write_data = if is_compressed {
+                    decompress(data, Compression::Zstd)?
+                } else {
+                    data.clone()
+                };
+                temp_file.write_all(&write_data)?;
+            }
+        }
+    }
+
+    temp_file.flush()?;
+    drop(temp_file);
+    drop(existing);
+
+    // Atomic replace
+    std::fs::rename(&temp_path, dest_path)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

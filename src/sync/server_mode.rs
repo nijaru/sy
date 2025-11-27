@@ -1,15 +1,22 @@
 use anyhow::Result;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::compress::{compress, is_compressed_extension, Compression};
+use crate::delta::{generate_delta_streaming, BlockChecksum as DeltaBlockChecksum};
 use crate::path::SyncPath;
-use crate::server::protocol::{Action, FileListEntry, SymlinkEntry};
+use crate::server::protocol::{
+    Action, DeltaOp, FileListEntry, SymlinkEntry, DATA_FLAG_COMPRESSED, DELTA_BLOCK_SIZE,
+    DELTA_MIN_SIZE,
+};
 use crate::ssh::config::SshConfig;
 use crate::sync::scanner::{self, ScanOptions};
 use crate::sync::SyncStats;
 use crate::transport::server::ServerSession;
+
+/// Minimum size for compression (1MB)
+const COMPRESS_MIN_SIZE: u64 = 1024 * 1024;
 
 /// Source entry with all info needed for transfer
 struct SourceEntry {
@@ -95,12 +102,25 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
     tracing::debug!("Waiting for server decisions...");
     let ack = session.read_ack().await?;
 
-    // Collect files that need transfer
-    let files_to_send: Vec<(u32, &SourceEntry)> = ack
+    // Count files needing transfer
+    let files_to_transfer = ack
+        .decisions
+        .iter()
+        .filter(|d| matches!(d.action, Action::Create | Action::Update))
+        .count();
+    tracing::info!("{} files need transfer", files_to_transfer);
+
+    // Step 3: Transfer files - separate creates and updates
+    let mut bytes_transferred = 0u64;
+    let mut files_created = 0u64;
+    let mut files_updated = 0u64;
+
+    // Categorize by action type
+    let creates: Vec<(u32, &SourceEntry)> = ack
         .decisions
         .iter()
         .filter_map(|d| {
-            if matches!(d.action, Action::Create | Action::Update) {
+            if d.action == Action::Create {
                 Some((d.index, &files[d.index as usize]))
             } else {
                 None
@@ -108,67 +128,220 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
         })
         .collect();
 
-    let files_to_transfer = files_to_send.len();
-    tracing::info!("{} files need transfer", files_to_transfer);
+    let updates: Vec<(u32, &SourceEntry)> = ack
+        .decisions
+        .iter()
+        .filter_map(|d| {
+            if d.action == Action::Update {
+                Some((d.index, &files[d.index as usize]))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    // Step 3: Transfer files (pipelined)
-    let mut bytes_transferred = 0u64;
-    let mut files_created = 0u64;
-    let mut files_updated = 0u64;
+    // Step 3a: Handle CREATES with full file transfer (+ compression)
+    if !creates.is_empty() {
+        tracing::debug!("Transferring {} new files...", creates.len());
 
-    if !files_to_send.is_empty() {
-        // Pre-read all files
-        let paths: Vec<(u32, Arc<PathBuf>)> = files_to_send
+        let paths: Vec<(u32, Arc<PathBuf>, String, u64)> = creates
             .iter()
-            .map(|(idx, e)| (*idx, e.abs_path.clone()))
+            .map(|(idx, e)| (*idx, e.abs_path.clone(), e.rel_path.clone(), e.size))
             .collect();
 
-        let files_data: Vec<(u32, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        // Read and optionally compress files
+        let files_data: Vec<(u32, Vec<u8>, u8)> = tokio::task::spawn_blocking(move || {
             paths
                 .into_iter()
-                .filter_map(|(idx, path)| std::fs::read(&*path).ok().map(|data| (idx, data)))
+                .filter_map(|(idx, path, rel_path, size)| {
+                    std::fs::read(&*path).ok().map(|data| {
+                        // Compress if file is large enough and not already compressed
+                        let (send_data, flags) =
+                            if size >= COMPRESS_MIN_SIZE && !is_compressed_extension(&rel_path) {
+                                match compress(&data, Compression::Zstd) {
+                                    Ok(compressed) if compressed.len() < data.len() => {
+                                        (compressed, DATA_FLAG_COMPRESSED)
+                                    }
+                                    _ => (data, 0),
+                                }
+                            } else {
+                                (data, 0)
+                            };
+                        (idx, send_data, flags)
+                    })
+                })
                 .collect()
         })
         .await?;
 
-        // Track which files are creates vs updates
-        let update_indices: HashSet<u32> = ack
-            .decisions
-            .iter()
-            .filter(|d| d.action == Action::Update)
-            .map(|d| d.index)
-            .collect();
-
-        // Send all data
-        for (idx, data) in &files_data {
+        // Send all creates
+        for (idx, data, flags) in &files_data {
             bytes_transferred += data.len() as u64;
             session
-                .send_file_data_no_flush(*idx, 0, data.clone())
+                .send_file_data_with_flags(*idx, 0, *flags, data.clone())
                 .await?;
         }
         session.flush().await?;
 
-        tracing::debug!(
-            "Sent {} files, waiting for confirmations...",
-            files_data.len()
-        );
-
         // Read confirmations
-        let mut errors = 0u32;
-        for (idx, _) in &files_data {
+        for _ in &files_data {
             let done = session.read_file_done().await?;
             if done.status != 0 {
-                tracing::error!("File index {} failed: status {}", done.index, done.status);
-                errors += 1;
-            } else if update_indices.contains(idx) {
-                files_updated += 1;
+                tracing::error!("Create failed: index {} status {}", done.index, done.status);
             } else {
                 files_created += 1;
             }
         }
+    }
 
-        if errors > 0 {
-            tracing::warn!("{} files failed to transfer", errors);
+    // Step 3b: Handle UPDATES - use delta sync for large files
+    if !updates.is_empty() {
+        let (delta_candidates, full_updates): (Vec<_>, Vec<_>) =
+            updates.iter().partition(|(_, e)| e.size >= DELTA_MIN_SIZE);
+
+        // Process delta candidates one by one (need checksums from server)
+        if !delta_candidates.is_empty() {
+            tracing::debug!(
+                "Delta syncing {} large files (>{}KB)...",
+                delta_candidates.len(),
+                DELTA_MIN_SIZE / 1024
+            );
+
+            for (idx, entry) in &delta_candidates {
+                let path = entry.abs_path.clone();
+                let rel_path = entry.rel_path.clone();
+                let size = entry.size;
+                let file_idx = *idx;
+
+                // Request checksums from server
+                session
+                    .send_checksum_req(file_idx, DELTA_BLOCK_SIZE as u32)
+                    .await?;
+                let resp = session.read_checksum_resp().await?;
+
+                // Convert protocol checksums to delta checksums
+                let dest_checksums: Vec<DeltaBlockChecksum> = resp
+                    .checksums
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| DeltaBlockChecksum {
+                        index: i as u64,
+                        offset: c.offset,
+                        size: c.size as usize,
+                        weak: c.weak,
+                        strong: c.strong,
+                    })
+                    .collect();
+
+                // Generate delta in blocking task
+                let block_size = DELTA_BLOCK_SIZE;
+                let delta = tokio::task::spawn_blocking(move || {
+                    generate_delta_streaming(&path, &dest_checksums, block_size)
+                })
+                .await??;
+
+                // Convert to protocol delta ops, optionally compress literals
+                let mut ops: Vec<DeltaOp> = Vec::with_capacity(delta.ops.len());
+                let mut delta_bytes = 0u64;
+                let should_compress =
+                    size >= COMPRESS_MIN_SIZE && !is_compressed_extension(&rel_path);
+
+                for op in &delta.ops {
+                    match op {
+                        crate::delta::DeltaOp::Copy { offset, size } => {
+                            ops.push(DeltaOp::Copy {
+                                offset: *offset,
+                                size: *size as u32,
+                            });
+                        }
+                        crate::delta::DeltaOp::Data(data) => {
+                            delta_bytes += data.len() as u64;
+                            ops.push(DeltaOp::Data(data.clone()));
+                        }
+                    }
+                }
+
+                bytes_transferred += delta_bytes;
+
+                // Send delta
+                let flags = if should_compress {
+                    DATA_FLAG_COMPRESSED
+                } else {
+                    0
+                };
+                session.send_delta_data(file_idx, flags, ops).await?;
+
+                let done = session.read_file_done().await?;
+                if done.status != 0 {
+                    tracing::error!(
+                        "Delta update failed: index {} status {}",
+                        done.index,
+                        done.status
+                    );
+                } else {
+                    files_updated += 1;
+                    tracing::debug!(
+                        "Delta sync {}: sent {}KB (file is {}KB)",
+                        entry.rel_path,
+                        delta_bytes / 1024,
+                        size / 1024
+                    );
+                }
+            }
+        }
+
+        // Process small file updates with full transfer
+        if !full_updates.is_empty() {
+            tracing::debug!(
+                "Full transfer for {} small file updates...",
+                full_updates.len()
+            );
+
+            let paths: Vec<(u32, Arc<PathBuf>, String, u64)> = full_updates
+                .iter()
+                .map(|(idx, e)| (*idx, e.abs_path.clone(), e.rel_path.clone(), e.size))
+                .collect();
+
+            let files_data: Vec<(u32, Vec<u8>, u8)> = tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .filter_map(|(idx, path, rel_path, size)| {
+                        std::fs::read(&*path).ok().map(|data| {
+                            let (send_data, flags) = if size >= COMPRESS_MIN_SIZE
+                                && !is_compressed_extension(&rel_path)
+                            {
+                                match compress(&data, Compression::Zstd) {
+                                    Ok(compressed) if compressed.len() < data.len() => {
+                                        (compressed, DATA_FLAG_COMPRESSED)
+                                    }
+                                    _ => (data, 0),
+                                }
+                            } else {
+                                (data, 0)
+                            };
+                            (idx, send_data, flags)
+                        })
+                    })
+                    .collect()
+            })
+            .await?;
+
+            for (idx, data, flags) in &files_data {
+                bytes_transferred += data.len() as u64;
+                session
+                    .send_file_data_with_flags(*idx, 0, *flags, data.clone())
+                    .await?;
+            }
+            session.flush().await?;
+
+            for _ in &files_data {
+                let done = session.read_file_done().await?;
+                if done.status != 0 {
+                    tracing::error!("Update failed: index {} status {}", done.index, done.status);
+                } else {
+                    files_updated += 1;
+                }
+            }
         }
     }
 

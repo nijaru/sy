@@ -5,8 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 use crate::server::protocol::{
-    self, FileData, FileDone, FileList, FileListAck, FileListEntry, Hello, MessageType, MkdirBatch,
-    MkdirBatchAck, SymlinkBatch, SymlinkBatchAck, SymlinkEntry, PROTOCOL_VERSION,
+    self, ChecksumReq, ChecksumResp, DeltaData, DeltaOp, FileData, FileDone, FileList, FileListAck,
+    FileListEntry, Hello, MessageType, MkdirBatch, MkdirBatchAck, SymlinkBatch, SymlinkBatchAck,
+    SymlinkEntry, PROTOCOL_VERSION,
 };
 use crate::ssh::config::SshConfig;
 
@@ -214,6 +215,7 @@ impl ServerSession {
         let file_data = FileData {
             index,
             offset,
+            flags: 0,
             data,
         };
         file_data.write(&mut self.stdin).await?;
@@ -221,7 +223,7 @@ impl ServerSession {
         Ok(())
     }
 
-    /// Send file data without flushing - use flush() after batch
+    /// Send file data with flags (e.g., compressed), without flushing - use flush() after batch
     pub async fn send_file_data_no_flush(
         &mut self,
         index: u32,
@@ -231,6 +233,25 @@ impl ServerSession {
         let file_data = FileData {
             index,
             offset,
+            flags: 0,
+            data,
+        };
+        file_data.write(&mut self.stdin).await?;
+        Ok(())
+    }
+
+    /// Send file data with explicit flags, without flushing
+    pub async fn send_file_data_with_flags(
+        &mut self,
+        index: u32,
+        offset: u64,
+        flags: u8,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let file_data = FileData {
+            index,
+            offset,
+            flags,
             data,
         };
         file_data.write(&mut self.stdin).await?;
@@ -260,6 +281,63 @@ impl ServerSession {
         }
 
         FileDone::read(&mut self.stdout).await
+    }
+
+    // =========================================================================
+    // DELTA SYNC
+    // =========================================================================
+
+    /// Request block checksums for a file (for delta sync)
+    pub async fn send_checksum_req(&mut self, index: u32, block_size: u32) -> Result<()> {
+        let req = ChecksumReq { index, block_size };
+        req.write(&mut self.stdin).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Read checksum response
+    pub async fn read_checksum_resp(&mut self) -> Result<ChecksumResp> {
+        let _len = self.stdout.read_u32().await?;
+        let type_byte = self.stdout.read_u8().await?;
+
+        if type_byte == MessageType::Error as u8 {
+            let err = protocol::ErrorMessage::read(&mut self.stdout).await?;
+            return Err(anyhow::anyhow!("Server error: {}", err.message));
+        }
+
+        if type_byte != MessageType::ChecksumResp as u8 {
+            return Err(anyhow::anyhow!(
+                "Expected CHECKSUM_RESP, got 0x{:02X}",
+                type_byte
+            ));
+        }
+
+        ChecksumResp::read(&mut self.stdout).await
+    }
+
+    /// Send delta data (for updating existing file)
+    pub async fn send_delta_data(
+        &mut self,
+        index: u32,
+        flags: u8,
+        ops: Vec<DeltaOp>,
+    ) -> Result<()> {
+        let delta = DeltaData { index, flags, ops };
+        delta.write(&mut self.stdin).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send delta data without flushing
+    pub async fn send_delta_data_no_flush(
+        &mut self,
+        index: u32,
+        flags: u8,
+        ops: Vec<DeltaOp>,
+    ) -> Result<()> {
+        let delta = DeltaData { index, flags, ops };
+        delta.write(&mut self.stdin).await?;
+        Ok(())
     }
 
     // =========================================================================
