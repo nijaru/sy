@@ -212,11 +212,20 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                 let size = entry.size;
                 let file_idx = *idx;
 
+                let t0 = Instant::now();
+
                 // Request checksums from server
                 session
                     .send_checksum_req(file_idx, DELTA_BLOCK_SIZE as u32)
                     .await?;
                 let resp = session.read_checksum_resp().await?;
+
+                let t1 = Instant::now();
+                tracing::debug!(
+                    "  Checksum request/response: {:?} ({} blocks)",
+                    t1.duration_since(t0),
+                    resp.checksums.len()
+                );
 
                 // Convert protocol checksums to delta checksums
                 let dest_checksums: Vec<DeltaBlockChecksum> = resp
@@ -238,6 +247,13 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                     generate_delta_streaming(&path, &dest_checksums, block_size)
                 })
                 .await??;
+
+                let t2 = Instant::now();
+                tracing::debug!(
+                    "  Delta generation: {:?} ({} ops)",
+                    t2.duration_since(t1),
+                    delta.ops.len()
+                );
 
                 // Convert to protocol delta ops
                 // Note: We don't compress delta literals because they're usually small
@@ -265,7 +281,13 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                 // Send delta (no compression for delta ops - literals are small)
                 session.send_delta_data(file_idx, 0, ops).await?;
 
+                let t3 = Instant::now();
+                tracing::debug!("  Delta send: {:?}", t3.duration_since(t2));
+
                 let done = session.read_file_done().await?;
+
+                let t4 = Instant::now();
+                tracing::debug!("  Delta apply (server): {:?}", t4.duration_since(t3));
                 if done.status != 0 {
                     tracing::error!(
                         "Delta update failed for {}: index {} status {}",

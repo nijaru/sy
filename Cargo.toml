@@ -79,6 +79,7 @@ fjall = "2.11.2"
 object_store = { version = "0.12.4", features = ["aws"], optional = true }
 bytes = "1.10.1"
 crossbeam-channel = "0.5.15"
+memmap2 = "0.9.9"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]

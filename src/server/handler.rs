@@ -460,18 +460,25 @@ impl ServerHandler {
 }
 
 /// Compute block checksums for a file (for delta sync)
+/// Optimized: reads in large chunks to minimize syscalls
 fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<BlockChecksum>> {
-    let mut file = std::fs::File::open(path)?;
+    use std::io::BufReader;
+
+    let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
     let num_blocks = (file_size as usize + block_size - 1) / block_size;
     let mut checksums = Vec::with_capacity(num_blocks);
 
+    // Use larger read buffer (1MB) to reduce syscalls
+    let read_buf_size = 1024 * 1024;
+    let mut reader = BufReader::with_capacity(read_buf_size, file);
+
     let mut offset = 0u64;
     let mut buf = vec![0u8; block_size];
 
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -481,10 +488,8 @@ fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<Bloc
         // Weak checksum: Adler32
         let weak = Adler32::hash(block);
 
-        // Strong checksum: xxHash3
-        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-        hasher.update(block);
-        let strong = hasher.digest();
+        // Strong checksum: xxHash3 (use direct function, not hasher)
+        let strong = xxhash_rust::xxh3::xxh3_64(block);
 
         checksums.push(BlockChecksum {
             offset,
@@ -500,31 +505,45 @@ fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<Bloc
 }
 
 /// Apply delta operations to reconstruct a file
+/// Optimized: uses memory mapping for existing file, buffered writer for output
 fn apply_delta_ops(
     dest_path: &PathBuf,
     _root: &PathBuf,
     ops: &[DeltaOp],
     is_compressed: bool,
 ) -> Result<()> {
+    use memmap2::Mmap;
+    use std::io::BufWriter;
+
     // Create temp file for reconstruction
     let temp_path = dest_path.with_extension("sy-tmp");
 
-    // Open existing file for reading (for Copy ops)
-    let existing = std::fs::File::open(dest_path).ok();
+    // Memory-map existing file for fast random access (for Copy ops)
+    let existing_file = std::fs::File::open(dest_path).ok();
+    let mmap = existing_file
+        .as_ref()
+        .and_then(|f| unsafe { Mmap::map(f).ok() });
 
-    // Create temp file for writing
-    let mut temp_file = std::fs::File::create(&temp_path)?;
+    // Create temp file with buffered writer
+    let temp_file = std::fs::File::create(&temp_path)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, temp_file);
 
     for op in ops {
         match op {
             DeltaOp::Copy { offset, size } => {
-                if let Some(ref mut src) = existing.as_ref() {
-                    // Clone the file handle for seeking
-                    let mut src = src.try_clone()?;
-                    src.seek(SeekFrom::Start(*offset))?;
-                    let mut buf = vec![0u8; *size as usize];
-                    src.read_exact(&mut buf)?;
-                    temp_file.write_all(&buf)?;
+                if let Some(ref map) = mmap {
+                    let start = *offset as usize;
+                    let end = start + *size as usize;
+                    if end <= map.len() {
+                        writer.write_all(&map[start..end])?;
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "Copy op out of bounds: {}..{} > {}",
+                            start,
+                            end,
+                            map.len()
+                        ));
+                    }
                 } else {
                     return Err(anyhow::anyhow!("Copy op but no existing file"));
                 }
@@ -535,14 +554,15 @@ fn apply_delta_ops(
                 } else {
                     data.clone()
                 };
-                temp_file.write_all(&write_data)?;
+                writer.write_all(&write_data)?;
             }
         }
     }
 
-    temp_file.flush()?;
-    drop(temp_file);
-    drop(existing);
+    writer.flush()?;
+    drop(writer);
+    drop(mmap);
+    drop(existing_file);
 
     // Atomic replace
     std::fs::rename(&temp_path, dest_path)?;
