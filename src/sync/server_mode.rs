@@ -7,7 +7,7 @@ use crate::compress::{compress, is_compressed_extension, Compression};
 use crate::delta::{generate_delta_streaming, BlockChecksum as DeltaBlockChecksum};
 use crate::path::SyncPath;
 use crate::server::protocol::{
-    Action, DeltaOp, FileListEntry, SymlinkEntry, DATA_FLAG_COMPRESSED, DELTA_BLOCK_SIZE,
+    delta_block_size, Action, DeltaOp, FileListEntry, SymlinkEntry, DATA_FLAG_COMPRESSED,
     DELTA_MIN_SIZE,
 };
 use crate::ssh::config::SshConfig;
@@ -211,13 +211,12 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                 let path = entry.abs_path.clone();
                 let size = entry.size;
                 let file_idx = *idx;
+                let block_size = delta_block_size(size);
 
                 let t0 = Instant::now();
 
                 // Request checksums from server
-                session
-                    .send_checksum_req(file_idx, DELTA_BLOCK_SIZE as u32)
-                    .await?;
+                session.send_checksum_req(file_idx, block_size).await?;
                 let resp = session.read_checksum_resp().await?;
 
                 let t1 = Instant::now();
@@ -242,9 +241,9 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
                     .collect();
 
                 // Generate delta in blocking task
-                let block_size = DELTA_BLOCK_SIZE;
+                let bs = block_size as usize;
                 let delta = tokio::task::spawn_blocking(move || {
-                    generate_delta_streaming(&path, &dest_checksums, block_size)
+                    generate_delta_streaming(&path, &dest_checksums, bs)
                 })
                 .await??;
 

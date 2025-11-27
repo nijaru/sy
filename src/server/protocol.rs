@@ -16,7 +16,25 @@ pub const DATA_FLAG_FINAL: u8 = 0x02; // This is the final chunk for this file
 
 // Delta sync thresholds
 pub const DELTA_MIN_SIZE: u64 = 64 * 1024; // 64KB - below this, full transfer is faster
-pub const DELTA_BLOCK_SIZE: usize = 4096; // 4KB blocks for delta checksums
+
+/// Compute optimal block size for delta sync based on file size
+/// Larger blocks = fewer checksums to compute/send but coarser granularity
+/// rsync uses similar adaptive sizing
+pub fn delta_block_size(file_size: u64) -> u32 {
+    if file_size < 1024 * 1024 {
+        // < 1MB: 2KB blocks
+        2048
+    } else if file_size < 10 * 1024 * 1024 {
+        // 1-10MB: 4KB blocks
+        4096
+    } else if file_size < 100 * 1024 * 1024 {
+        // 10-100MB: 16KB blocks
+        16384
+    } else {
+        // > 100MB: 64KB blocks
+        65536
+    }
+}
 
 // FileDone status codes
 pub const STATUS_OK: u8 = 0;
