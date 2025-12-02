@@ -21,13 +21,19 @@
 
 ## Active Work
 
-v0.1.2 released. Next: Server mode Phase 5 (progress reporting, hardlinks, xattrs)
+v0.1.2 released with bidirectional server mode.
+
+**Priority**: Benchmark SSH performance vs rsync before adding features. Architecture is sound but unvalidated.
+
+**Community request**: [Issue #12](https://github.com/nijaru/sy/issues/12) - `--one-file-system`, SSH args, `--numeric-ids`
 
 Tasks: `bd ready` or `bd list`
 
 ## Blockers
 
-None currently.
+| Blocker | Impact |
+|---------|--------|
+| SSH benchmark missing | Can't claim rsync parity without measurement |
 
 ## Recent Releases
 
