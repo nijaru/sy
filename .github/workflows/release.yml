@@ -3,121 +3,239 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build only, don't publish"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  create-release:
-    name: Create Release
+  # ============================================================================
+  # STAGE 1: Verify version and run checks
+  # ============================================================================
+
+  verify:
+    name: Verify Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      tag: ${{ steps.get_tag.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Get tag name
-        id: get_tag
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
+      - name: Get version from tag or Cargo.toml
+        id: version
         run: |
-          gh release create ${{ steps.get_tag.outputs.tag }} \
-            --title "${{ steps.get_tag.outputs.tag }}" \
-            --generate-notes \
-            --draft \
-            --notes "
-            ## Installation
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG#v}
+          else
+            VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+            TAG="v$VERSION"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tag: $TAG"
+          echo "Version: $VERSION"
 
-            ### Homebrew (macOS)
-            \`\`\`bash
-            brew tap nijaru/tap
-            brew install sy
-            \`\`\`
+      - name: Verify Cargo.toml version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION=${{ steps.version.outputs.version }}
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
 
-            ### From crates.io
-            \`\`\`bash
-            cargo install sy
-            # Or with S3 support
-            cargo install sy --features s3
-            \`\`\`
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo.toml version: $CARGO_VERSION"
 
-            ### From Binary
-            Download the appropriate binary for your platform below, extract and add to PATH.
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) doesn't match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version match confirmed"
 
-            ### From Source
-            \`\`\`bash
-            git clone https://github.com/nijaru/sy.git
-            cd sy
-            cargo build --release
-            \`\`\`
-            "
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check if already published to crates.io
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          CRATES_VERSION=$(curl -sf https://crates.io/api/v1/crates/sy | jq -r '.versions[0].num' || echo "0.0.0")
+
+          echo "Target version: $VERSION"
+          echo "Latest on crates.io: $CRATES_VERSION"
+
+          if [ "$VERSION" = "$CRATES_VERSION" ]; then
+            echo "WARNING: Version $VERSION already published to crates.io"
+            echo "Will skip crates.io publish step"
+            echo "ALREADY_PUBLISHED=true" >> $GITHUB_ENV
+          else
+            echo "Version $VERSION is new"
+            echo "ALREADY_PUBLISHED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+  # ============================================================================
+  # STAGE 2: Build binaries (parallel)
+  # ============================================================================
 
   build-binaries:
     name: Build ${{ matrix.target }}
-    needs: create-release
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: true
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: sy-aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: sy-x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: sy-x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install system dependencies (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libacl1-dev
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
         run: |
           cargo build --release --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sy dist/
-          cp target/${{ matrix.target }}/release/sy-remote dist/
+          if [ -f target/${{ matrix.target }}/release/sy-remote ]; then
+            cp target/${{ matrix.target }}/release/sy-remote dist/
+          fi
 
       - name: Create tarball
         run: |
           cd dist
-          tar czf ${{ matrix.artifact_name }}.tar.gz sy sy-remote
+          tar czf ${{ matrix.artifact_name }}.tar.gz sy sy-remote 2>/dev/null || tar czf ${{ matrix.artifact_name }}.tar.gz sy
           sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
-          cd ..
 
-      - name: Upload binaries to release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.tar.gz*
+
+  # ============================================================================
+  # STAGE 3: Create GitHub Release
+  # ============================================================================
+
+  create-release:
+    name: Create GitHub Release
+    needs: [verify, build-binaries]
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create Release
         run: |
-          gh release upload ${{ needs.create-release.outputs.tag }} \
-            dist/${{ matrix.artifact_name }}.tar.gz \
-            dist/${{ matrix.artifact_name }}.tar.gz.sha256
+          gh release create ${{ needs.verify.outputs.tag }} \
+            --title "${{ needs.verify.outputs.tag }}" \
+            --generate-notes \
+            --draft \
+            artifacts/*
         env:
           GH_TOKEN: ${{ github.token }}
 
-  update-homebrew-tap:
-    name: Update Homebrew Tap
-    needs: [create-release, build-binaries]
+  # ============================================================================
+  # STAGE 4: Publish to crates.io
+  # ============================================================================
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify, build-binaries]
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+
+      - name: Check if already published
+        id: check
+        run: |
+          VERSION=${{ needs.verify.outputs.version }}
+          CRATES_VERSION=$(curl -sf https://crates.io/api/v1/crates/sy | jq -r '.versions[0].num' || echo "0.0.0")
+          if [ "$VERSION" = "$CRATES_VERSION" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Version $VERSION already on crates.io, skipping"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install system dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.skip != 'true'
+
+      - name: Publish to crates.io
+        if: steps.check.outputs.skip != 'true'
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ============================================================================
+  # STAGE 5: Update Homebrew tap
+  # ============================================================================
+
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [verify, create-release]
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
           repository: nijaru/homebrew-tap
           token: ${{ secrets.TAP_UPDATE_TOKEN }}
 
       - name: Download checksums
         run: |
-          gh release download ${{ needs.create-release.outputs.tag }} \
+          gh release download ${{ needs.verify.outputs.tag }} \
             --repo nijaru/sy \
             --pattern '*.sha256'
         env:
@@ -125,16 +243,12 @@ jobs:
 
       - name: Update formula
         run: |
-          TAG=${{ needs.create-release.outputs.tag }}
-          VERSION=${TAG#v}
+          TAG=${{ needs.verify.outputs.tag }}
+          VERSION=${{ needs.verify.outputs.version }}
 
-          # Extract ARM64 binary SHA256
           ARM64_SHA=$(cat sy-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-
-          # Get source tarball SHA256
           SOURCE_SHA=$(curl -sL https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz | shasum -a 256 | awk '{print $1}')
 
-          # Update Formula/sy.rb
           sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/sy.rb
           sed -i "s|url \"https://github.com/nijaru/sy/releases/download/v.*/sy-aarch64-apple-darwin.tar.gz\"|url \"https://github.com/nijaru/sy/releases/download/$TAG/sy-aarch64-apple-darwin.tar.gz\"|" Formula/sy.rb
           sed -i "/on_arm do/,/end/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/sy.rb
@@ -146,23 +260,31 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/sy.rb
-          git commit -m "chore: update sy to ${{ needs.create-release.outputs.tag }}"
+          git commit -m "chore: update sy to ${{ needs.verify.outputs.tag }}"
           git push
 
-  publish-release:
-    name: Publish Release
-    needs: [create-release, build-binaries, update-homebrew-tap]
+  # ============================================================================
+  # STAGE 6: Finalize release
+  # ============================================================================
+
+  finalize:
+    name: Finalize Release
+    needs: [verify, create-release, publish-crates, update-homebrew]
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Publish release
-        run: |
-          gh release edit ${{ needs.create-release.outputs.tag }} --draft=false
-          echo "✅ Release published: https://github.com/nijaru/sy/releases/tag/${{ needs.create-release.outputs.tag }}"
-          echo "🍺 Homebrew tap updated"
-          echo ""
-          echo "📦 Next step: Publish to crates.io"
-          echo "Run: cargo publish"
+      - name: Publish GitHub release
+        run: gh release edit ${{ needs.verify.outputs.tag }} --draft=false
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.verify.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Release**: https://github.com/nijaru/sy/releases/tag/${{ needs.verify.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **crates.io**: https://crates.io/crates/sy/${{ needs.verify.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Homebrew**: \`brew upgrade sy\`" >> $GITHUB_STEP_SUMMARY
