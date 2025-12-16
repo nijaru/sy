@@ -8,6 +8,21 @@ repository = "https://github.com/nijaru/sy"
 license = "MIT"
 keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
+exclude = [
+    "tmp/",
+    "ai/",
+    "scripts/",
+    "man/",
+    "templates/",
+    ".beads/",
+    ".claude/",
+    ".github/",
+    "benches/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "deny.toml",
+]
 
 [features]
 default = ["ssh"]
