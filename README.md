@@ -2,28 +2,28 @@
 
 > Modern file synchronization tool - rsync, reimagined
 
-**sy** (pronounced "sigh") is a fast, modern file synchronization tool. It's not a drop-in rsync replacement—it's a reimagining of file sync with verifiable integrity, adaptive performance, and honest tradeoffs.
+**sy** (pronounced "sigh") is a fast, modern file synchronization tool with built-in integrity verification.
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## Performance
+
+**sy wins:**
+
+- Incremental/delta sync: **3x faster**
+- Large files: **8x faster** (COW reflinks on APFS/BTRFS)
+- Bulk SSH transfers: **2-4x faster**
+
+**rsync wins:**
+
+- Initial sync of many small files: ~1.5x faster
+- SSH incremental: ~1.3x faster
+
 ## Why sy?
 
-**Faster where it matters:**
-
-- **3x faster** incremental/delta sync (the common case)
-- **8x faster** large file transfers (COW reflinks on APFS/BTRFS)
-- **2-4x faster** bulk SSH transfers
-
-**Honest tradeoffs:**
-
-- rsync wins initial sync of many small files (~1.5x)
-- rsync wins SSH incremental by ~1.3x (protocol overhead)
-
-**Better UX:**
-
-- Simpler CLI with sensible defaults
 - Built-in integrity verification (xxHash3 + BLAKE3)
+- Simpler CLI with sensible defaults
 - Progress, dry-run, and resume out of the box
 
 ## Installation
