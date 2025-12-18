@@ -615,7 +615,7 @@ pub struct BlockChecksum {
 }
 
 /// Response with block checksums for delta sync
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChecksumResp {
     pub index: u32,
     pub file_size: u64, // Total file size (for verification)

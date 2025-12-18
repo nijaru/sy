@@ -299,6 +299,13 @@ impl ServerSession {
         Ok(())
     }
 
+    /// Request block checksums without flushing - use flush() after batch
+    pub async fn send_checksum_req_no_flush(&mut self, index: u32, block_size: u32) -> Result<()> {
+        let req = ChecksumReq { index, block_size };
+        req.write(&mut self.stdin).await?;
+        Ok(())
+    }
+
     /// Read checksum response
     pub async fn read_checksum_resp(&mut self) -> Result<ChecksumResp> {
         let _len = self.stdout.read_u32().await?;

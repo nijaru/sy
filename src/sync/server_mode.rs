@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +18,9 @@ use crate::transport::server::ServerSession;
 
 /// Minimum size for compression (1MB)
 const COMPRESS_MIN_SIZE: u64 = 1024 * 1024;
+
+/// Number of delta checksum requests to pipeline before reading responses
+const PIPELINE_DEPTH: usize = 8;
 
 /// Source entry with all info needed for transfer
 struct SourceEntry {
@@ -199,110 +203,45 @@ pub async fn sync_server_mode(source: &Path, dest: &SyncPath) -> Result<SyncStat
         let (delta_candidates, full_updates): (Vec<_>, Vec<_>) =
             updates.iter().partition(|(_, e)| e.size >= DELTA_MIN_SIZE);
 
-        // Process delta candidates one by one (need checksums from server)
+        // Process delta candidates with pipelined checksum requests
         if !delta_candidates.is_empty() {
             tracing::debug!(
-                "Delta syncing {} large files (>{}KB)...",
+                "Delta syncing {} large files (>{}KB) with pipeline depth {}...",
                 delta_candidates.len(),
-                DELTA_MIN_SIZE / 1024
+                DELTA_MIN_SIZE / 1024,
+                PIPELINE_DEPTH
             );
 
+            // Collect pending requests for batching
+            let mut pending: Vec<(u32, &SourceEntry, u32)> = Vec::with_capacity(PIPELINE_DEPTH);
+
             for (idx, entry) in &delta_candidates {
-                let path = entry.abs_path.clone();
-                let size = entry.size;
                 let file_idx = *idx;
-                let block_size = delta_block_size(size);
+                let block_size = delta_block_size(entry.size);
 
-                let t0 = Instant::now();
+                // Send checksum request without waiting (no flush)
+                session
+                    .send_checksum_req_no_flush(file_idx, block_size)
+                    .await?;
+                pending.push((file_idx, *entry, block_size));
 
-                // Request checksums from server
-                session.send_checksum_req(file_idx, block_size).await?;
-                let resp = session.read_checksum_resp().await?;
-
-                let t1 = Instant::now();
-                tracing::debug!(
-                    "  Checksum request/response: {:?} ({} blocks)",
-                    t1.duration_since(t0),
-                    resp.checksums.len()
-                );
-
-                // Convert protocol checksums to delta checksums
-                let dest_checksums: Vec<DeltaBlockChecksum> = resp
-                    .checksums
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| DeltaBlockChecksum {
-                        index: i as u64,
-                        offset: c.offset,
-                        size: c.size as usize,
-                        weak: c.weak,
-                        strong: c.strong,
-                    })
-                    .collect();
-
-                // Generate delta in blocking task
-                let bs = block_size as usize;
-                let delta = tokio::task::spawn_blocking(move || {
-                    generate_delta_streaming(&path, &dest_checksums, bs)
-                })
-                .await??;
-
-                let t2 = Instant::now();
-                tracing::debug!(
-                    "  Delta generation: {:?} ({} ops)",
-                    t2.duration_since(t1),
-                    delta.ops.len()
-                );
-
-                // Convert to protocol delta ops
-                // Note: We don't compress delta literals because they're usually small
-                // and the overhead of per-chunk compression isn't worth it
-                let mut ops: Vec<DeltaOp> = Vec::with_capacity(delta.ops.len());
-                let mut delta_bytes = 0u64;
-
-                for op in &delta.ops {
-                    match op {
-                        crate::delta::DeltaOp::Copy { offset, size } => {
-                            ops.push(DeltaOp::Copy {
-                                offset: *offset,
-                                size: *size as u32,
-                            });
-                        }
-                        crate::delta::DeltaOp::Data(data) => {
-                            delta_bytes += data.len() as u64;
-                            ops.push(DeltaOp::Data(data.clone()));
-                        }
-                    }
+                // Process batch when full
+                if pending.len() >= PIPELINE_DEPTH {
+                    session.flush().await?;
+                    let (updated, transferred) =
+                        process_delta_batch(&mut session, &pending).await?;
+                    files_updated += updated;
+                    bytes_transferred += transferred;
+                    pending.clear();
                 }
+            }
 
-                bytes_transferred += delta_bytes;
-
-                // Send delta (no compression for delta ops - literals are small)
-                session.send_delta_data(file_idx, 0, ops).await?;
-
-                let t3 = Instant::now();
-                tracing::debug!("  Delta send: {:?}", t3.duration_since(t2));
-
-                let done = session.read_file_done().await?;
-
-                let t4 = Instant::now();
-                tracing::debug!("  Delta apply (server): {:?}", t4.duration_since(t3));
-                if done.status != 0 {
-                    tracing::error!(
-                        "Delta update failed for {}: index {} status {}",
-                        entry.rel_path,
-                        done.index,
-                        done.status
-                    );
-                } else {
-                    files_updated += 1;
-                    tracing::debug!(
-                        "Delta sync {}: sent {}KB (file is {}KB)",
-                        entry.rel_path,
-                        delta_bytes / 1024,
-                        size / 1024
-                    );
-                }
+            // Process remaining files
+            if !pending.is_empty() {
+                session.flush().await?;
+                let (updated, transferred) = process_delta_batch(&mut session, &pending).await?;
+                files_updated += updated;
+                bytes_transferred += transferred;
             }
         }
 
@@ -729,4 +668,133 @@ async fn scan_local_dest(dest: &Path) -> Result<Vec<SourceEntry>> {
     }
 
     Ok(result)
+}
+
+/// Process a batch of delta sync candidates with full pipelining.
+/// - Reads all checksum responses
+/// - Computes all deltas in parallel
+/// - Sends all DELTA_DATA without waiting
+/// - Reads all FILE_DONE responses at the end
+/// Returns (files_updated, bytes_transferred)
+async fn process_delta_batch(
+    session: &mut ServerSession,
+    pending: &[(u32, &SourceEntry, u32)],
+) -> Result<(u64, u64)> {
+    use crate::server::protocol::ChecksumResp;
+
+    let mut files_updated = 0u64;
+    let mut bytes_transferred = 0u64;
+
+    // Step 1: Read all checksum responses (may arrive out of order)
+    let mut responses: HashMap<u32, ChecksumResp> = HashMap::with_capacity(pending.len());
+    for _ in 0..pending.len() {
+        let resp = session.read_checksum_resp().await?;
+        responses.insert(resp.index, resp);
+    }
+
+    // Step 2: Compute all deltas in parallel
+    let delta_futures: Vec<_> = pending
+        .iter()
+        .map(|(file_idx, entry, block_size)| {
+            let resp = responses.get(file_idx).cloned();
+            let path = entry.abs_path.clone();
+            let bs = *block_size as usize;
+            let idx = *file_idx;
+
+            async move {
+                let resp = resp.ok_or_else(|| {
+                    anyhow::anyhow!("Missing checksum response for index {}", idx)
+                })?;
+
+                // Convert protocol checksums to delta checksums
+                let dest_checksums: Vec<DeltaBlockChecksum> = resp
+                    .checksums
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| DeltaBlockChecksum {
+                        index: i as u64,
+                        offset: c.offset,
+                        size: c.size as usize,
+                        weak: c.weak,
+                        strong: c.strong,
+                    })
+                    .collect();
+
+                // Generate delta in blocking task
+                let delta = tokio::task::spawn_blocking(move || {
+                    generate_delta_streaming(&path, &dest_checksums, bs)
+                })
+                .await??;
+
+                // Convert to protocol delta ops
+                let mut ops: Vec<DeltaOp> = Vec::with_capacity(delta.ops.len());
+                let mut delta_bytes = 0u64;
+
+                for op in &delta.ops {
+                    match op {
+                        crate::delta::DeltaOp::Copy { offset, size } => {
+                            ops.push(DeltaOp::Copy {
+                                offset: *offset,
+                                size: *size as u32,
+                            });
+                        }
+                        crate::delta::DeltaOp::Data(data) => {
+                            delta_bytes += data.len() as u64;
+                            ops.push(DeltaOp::Data(data.clone()));
+                        }
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((idx, ops, delta_bytes))
+            }
+        })
+        .collect();
+
+    let deltas: Vec<Result<(u32, Vec<DeltaOp>, u64)>> =
+        futures::future::join_all(delta_futures).await;
+
+    // Step 3: Send all DELTA_DATA without waiting for confirmations
+    let mut sent_indices: Vec<(u32, String, u64, u64)> = Vec::with_capacity(pending.len());
+    for (i, result) in deltas.into_iter().enumerate() {
+        let (idx, ops, delta_bytes) = result?;
+        let entry = pending[i].1;
+
+        bytes_transferred += delta_bytes;
+        sent_indices.push((idx, entry.rel_path.clone(), delta_bytes, entry.size));
+
+        session.send_delta_data_no_flush(idx, 0, ops).await?;
+    }
+    session.flush().await?;
+
+    // Step 4: Read all FILE_DONE responses
+    for (idx, rel_path, delta_bytes, size) in sent_indices {
+        let done = session.read_file_done().await?;
+
+        if done.status != 0 {
+            tracing::error!(
+                "Delta update failed for {}: index {} status {}",
+                rel_path,
+                done.index,
+                done.status
+            );
+        } else {
+            files_updated += 1;
+            tracing::debug!(
+                "Delta sync {}: sent {}KB (file is {}KB)",
+                rel_path,
+                delta_bytes / 1024,
+                size / 1024
+            );
+        }
+        // Verify index matches (server processes in order)
+        if done.index != idx {
+            tracing::warn!(
+                "FILE_DONE index mismatch: expected {}, got {}",
+                idx,
+                done.index
+            );
+        }
+    }
+
+    Ok((files_updated, bytes_transferred))
 }

@@ -18,30 +18,34 @@
 | large_file (100MB) | **sy 7x**  | **sy 1.5x** | **sy 1.1x** |
 | source_code (5000) | rsync 2.1x | **sy 3.5x** | **sy 3.6x** |
 
-### SSH (Mac → Fedora via Tailscale)
+### SSH (Mac → Fedora via Tailscale) - After pipelining (2025-12-18)
 
-| Scenario           | Initial     | Incremental | Delta      |
-| ------------------ | ----------- | ----------- | ---------- |
-| small_files (1000) | rsync 1.5x  | rsync 1.5x  | rsync 1.5x |
-| large_file (100MB) | **sy 4.2x** | rsync 1.4x  | rsync 1.4x |
-| source_code (5000) | **sy 1.7x** | rsync 1.5x  | rsync 1.5x |
+| Scenario           | Initial     | Incremental | Delta       |
+| ------------------ | ----------- | ----------- | ----------- |
+| small_files (1000) | rsync 1.6x  | rsync 1.4x  | rsync 1.4x  |
+| large_file (100MB) | **sy 4.1x** | rsync 1.3x  | rsync 1.4x  |
+| mixed (505)        | **sy 2.1x** | rsync 1.4x  | **sy ~par** |
+| source_code (5000) | rsync 1.3x  | rsync 1.4x  | rsync 1.4x  |
 
 ### Key Findings
 
 1. **Local incremental/delta**: sy wins massively (3-3.6x faster)
 2. **Local large files**: sy wins 7x on initial
-3. **SSH initial**: sy wins for bulk transfers (1.7-4.2x)
-4. **SSH incremental/delta**: sy loses by ~1.5x (protocol overhead)
+3. **SSH initial**: sy wins for bulk transfers (2-4x), except many small files
+4. **SSH incremental/delta**: Still ~1.3-1.4x slower (inherent protocol overhead)
+5. **Pipelining impact**: mixed/delta improved from 1.44x slower to ~par with rsync
 
 ## Active Work
 
-**Priority**: Optimize SSH incremental/delta performance (P1 task sy-3qk)
+**Completed**: Pipelined delta checksum requests (sy-09r)
 
-Root causes identified in `ai/design/ssh-optimization.md`:
+**Remaining gap**: SSH incremental/delta still ~1.3-1.4x slower than rsync. This appears to be inherent protocol overhead - server processes requests sequentially, and we already pipeline all client-side operations.
 
-- Protocol handshake overhead
-- Sequential checksum requests for delta
-- No stream compression
+**Next options**:
+
+1. Stream-level compression (may help with large deltas)
+2. Server-side parallelism (would require server code changes)
+3. Accept the gap - sy still wins locally and on bulk SSH transfers
 
 **Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
 
@@ -51,8 +55,8 @@ Root causes identified in `ai/design/ssh-optimization.md`:
 
 ### v0.2.0 (SSH Performance)
 
-- [ ] Pipeline delta checksum requests (P0)
-- [ ] Optimize incremental protocol flow (P0)
+- [x] Pipeline delta checksum requests (P0) - done
+- [x] Parallelize delta computation in batches - done
 - [ ] Stream-level compression after HELLO (P1)
 
 ### v0.3.0 (UX Polish)
@@ -75,6 +79,7 @@ Root causes identified in `ai/design/ssh-optimization.md`:
 - Large file throughput: 7x faster than rsync locally
 - Protocol fix (66d05d5): Always send MKDIR_BATCH
 - Benchmark infrastructure: JSONL tracking, automated comparison
+- Delta pipelining: Batch CHECKSUM_REQ/RESP, parallel delta computation, batch DELTA_DATA/FILE_DONE
 
 ## What Didn't Work
 
