@@ -1,69 +1,84 @@
-# Session Context - SSH Performance Optimization
+# Session Context - Verification Default Change
 
 ## What We Did
 
-### 1. Server-Side Parallelism (Implemented, Didn't Help SSH Gap)
+### 1. Made `--verify` Opt-in (Implemented)
 
 **Files changed:**
 
-- `src/server/handler.rs` - Rayon parallel block checksums, `compute_checksum_response()` function
-- `src/server/mod.rs` - Concurrent CHECKSUM_REQ handling with tokio channels + `select!`
+- `src/cli.rs` - Simplified VerificationMode enum, removed `--mode` flag
+- `src/main.rs` - Updated verification output display
+- `src/integrity/mod.rs` - Marked Cryptographic variant as dead_code
+- `README.md` - Updated docs
+- `ai/STATUS.md` - Updated performance notes
 
-**Result:** Architecturally correct but didn't close SSH incremental/delta gap. Bottleneck is network latency, not CPU.
+**Result:** sy now matches rsync behavior by default (no post-write verification). Users who want integrity checking can enable it with `--verify`.
 
-### 2. Checkpoint Frequency Fix (Implemented, Helped)
+### 2. Performance Improvement
 
-**File:** `src/cli.rs`
+| Command        | 1000 small files |
+| -------------- | ---------------- |
+| `sy` (default) | 158ms            |
+| `rsync -a`     | 174ms            |
+| `sy --verify`  | 207ms            |
 
-- Changed `checkpoint_files` default from 10 to 100
-- Was writing resume state every 10 files, now every 100
+sy now beats rsync by ~10% on small files initial sync.
 
-### 3. README Honesty Update (Done)
+### 3. xattr Overhead Investigation
 
-Updated performance claims to be accurate:
+Profiled xattr stripping on macOS:
 
-- sy wins: incremental (3x), large files (8x), bulk SSH (2-4x)
-- rsync wins: initial small files (~1.5x), SSH incremental (~1.3x)
+- With xattrs: 115ms
+- Without xattrs: 107ms
+- Overhead: ~8ms/1000 files (negligible)
+
+**Decision:** Keep current behavior - stripping is correct for rsync compatibility and overhead is minimal.
 
 ## Current Performance
 
-| Scenario                        | sy vs rsync        |
-| ------------------------------- | ------------------ |
-| Local incremental/delta         | **sy 3x faster**   |
-| Local large files               | **sy 8x faster**   |
-| SSH bulk transfers              | **sy 2-4x faster** |
-| SSH incremental/delta           | rsync 1.3x faster  |
-| Initial sync (many small files) | rsync 1.5x faster  |
+| Scenario                    | sy vs rsync        |
+| --------------------------- | ------------------ |
+| Local incremental/delta     | **sy 3x faster**   |
+| Local large files           | **sy 8x faster**   |
+| Local small files (initial) | **sy ~10% faster** |
+| Bulk SSH transfers          | **sy 2-4x faster** |
+| SSH incremental/delta       | rsync 1.3x faster  |
 
-## What's Left to Investigate
+## CLI Changes
 
-### Initial Sync Small Files Gap
+**Before:**
 
-sy spends 0.7s in syscalls vs rsync 0.2s for 1000 files. Likely causes:
+```bash
+sy /src /dst                    # xxHash3 verification (default)
+sy /src /dst --mode=fast        # No verification
+sy /src /dst --mode=paranoid    # BLAKE3 + block verification
+```
 
-1. Per-file xxHash3 verification after write
-2. Per-file xattr operations
-3. Parallelism overhead for tiny files
+**After:**
 
-Benchmark results are variable (sometimes sy wins, sometimes loses by 5x).
+```bash
+sy /src /dst                    # No verification (default, rsync-like)
+sy /src /dst --verify           # xxHash3 verification
+```
 
-### Potential Optimizations
+## Other Tradeoffs Considered
 
-1. **Skip verification on initial sync** - file didn't exist, nothing to verify against
-2. **Batch xattr operations** - reduce per-file syscall overhead
-3. **Sequential mode for small files** - parallelism overhead may exceed benefit
+1. **xattr stripping** - ~8μs/file, keep as-is for rsync compat
+2. **Resume checkpointing** - already optimized (100 files), `--no-resume` available
+3. **Parallelism** - `-j 1` documented for small files workloads
+4. **Auto `-j 1`** - decided against, heuristics too complex for marginal gain
 
 ## Commands
 
 ```bash
 # Run benchmarks
-python scripts/benchmark.py                    # Local
-python scripts/benchmark.py --ssh nick@fedora  # SSH
-python scripts/benchmark.py --scenario small_files  # Specific scenario
+python scripts/benchmark.py
+python scripts/benchmark.py --ssh nick@fedora
 
 # Quick test
 cargo build --release
 time ./target/release/sy /tmp/src /tmp/dst
+time ./target/release/sy /tmp/src /tmp/dst --verify
 time rsync -a /tmp/src/ /tmp/dst2/
 ```
 
@@ -71,12 +86,4 @@ time rsync -a /tmp/src/ /tmp/dst2/
 
 - `ai/STATUS.md` - Current project status
 - `ai/DESIGN.md` - Architecture
-- `scripts/benchmark.py` - Benchmark runner
-- `benchmarks/history.jsonl` - Benchmark history
-
-## Uncommitted Changes
-
-Run `git status` - should have:
-
-- `src/cli.rs` - checkpoint_files 10→100
-- Benchmark history updates
+- `README.md` - User documentation

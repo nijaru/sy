@@ -101,6 +101,7 @@ sy ~/src ~/dest -u                       # Skip files where dest is newer
 sy ~/src ~/dest --ignore-existing        # Skip files that already exist
 sy ~/src ~/dest --gitignore              # Respect .gitignore rules
 sy ~/src ~/dest --gitignore --exclude-vcs # Developer workflow (no .git, respect .gitignore)
+sy ~/src ~/dest -j 1                     # Sequential mode (many tiny files)
 ```
 
 ### S3 & Cloud Storage
