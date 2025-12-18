@@ -1,6 +1,7 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::fs;
@@ -377,35 +378,32 @@ impl ServerHandler {
     }
 
     /// Handle CHECKSUM_REQ message: compute and return block checksums for delta sync
+    /// Note: Does NOT flush - caller should batch flushes for better performance
     pub async fn handle_checksum_req<W: AsyncWrite + Unpin>(
         &mut self,
         req: ChecksumReq,
         writer: &mut W,
     ) -> Result<()> {
-        if (req.index as usize) >= self.current_file_list.len() {
-            return Err(anyhow::anyhow!("Invalid file index: {}", req.index));
-        }
-
-        let entry = &self.current_file_list[req.index as usize];
-        let path = self.root_path.join(&entry.path);
-
-        // Compute checksums in blocking task
-        let block_size = req.block_size as usize;
-        let checksums =
-            tokio::task::spawn_blocking(move || compute_block_checksums(&path, block_size))
-                .await??;
-
-        let file_size = checksums.iter().map(|c| c.size as u64).sum();
-
-        let resp = ChecksumResp {
-            index: req.index,
-            file_size,
-            checksums,
-        };
+        let resp = compute_checksum_response(
+            req.index,
+            req.block_size as usize,
+            &self.current_file_list,
+            &self.root_path,
+        )
+        .await?;
         resp.write(writer).await?;
-        writer.flush().await?;
-
+        // No flush - batching handled by caller
         Ok(())
+    }
+
+    /// Get a clone of the file list for concurrent access
+    pub fn get_file_list(&self) -> Vec<FileListEntry> {
+        self.current_file_list.clone()
+    }
+
+    /// Get the root path for concurrent access
+    pub fn get_root_path(&self) -> PathBuf {
+        self.root_path.clone()
     }
 
     /// Handle DELTA_DATA message: apply delta operations to reconstruct file
@@ -459,47 +457,62 @@ impl ServerHandler {
     }
 }
 
-/// Compute block checksums for a file (for delta sync)
-/// Optimized: reads in large chunks to minimize syscalls
-fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<BlockChecksum>> {
-    use std::io::BufReader;
-
-    let file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    let num_blocks = (file_size as usize).div_ceil(block_size);
-    let mut checksums = Vec::with_capacity(num_blocks);
-
-    // Use larger read buffer (1MB) to reduce syscalls
-    let read_buf_size = 1024 * 1024;
-    let mut reader = BufReader::with_capacity(read_buf_size, file);
-
-    let mut offset = 0u64;
-    let mut buf = vec![0u8; block_size];
-
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-
-        let block = &buf[..n];
-
-        // Weak checksum: Adler32
-        let weak = Adler32::hash(block);
-
-        // Strong checksum: xxHash3 (use direct function, not hasher)
-        let strong = xxhash_rust::xxh3::xxh3_64(block);
-
-        checksums.push(BlockChecksum {
-            offset,
-            size: n as u32,
-            weak,
-            strong,
-        });
-
-        offset += n as u64;
+/// Compute checksum response for concurrent handling
+/// Takes only the data needed, avoiding borrow issues
+pub async fn compute_checksum_response(
+    index: u32,
+    block_size: usize,
+    file_list: &[FileListEntry],
+    root_path: &std::path::Path,
+) -> Result<ChecksumResp> {
+    if (index as usize) >= file_list.len() {
+        return Err(anyhow::anyhow!("Invalid file index: {}", index));
     }
+
+    let entry = &file_list[index as usize];
+    let path = root_path.join(&entry.path);
+
+    // Compute checksums in blocking task (with parallel rayon inside)
+    let checksums =
+        tokio::task::spawn_blocking(move || compute_block_checksums(&path, block_size)).await??;
+
+    let file_size = checksums.iter().map(|c| c.size as u64).sum();
+
+    Ok(ChecksumResp {
+        index,
+        file_size,
+        checksums,
+    })
+}
+
+/// Compute block checksums for a file (for delta sync)
+/// Optimized: parallel block processing using rayon
+fn compute_block_checksums(path: &PathBuf, block_size: usize) -> Result<Vec<BlockChecksum>> {
+    // Read entire file into memory for parallel processing
+    let data = std::fs::read(path)?;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = data.len().div_ceil(block_size);
+
+    // Parallel checksum computation across all blocks
+    let checksums: Vec<BlockChecksum> = (0..num_blocks)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * block_size;
+            let end = (start + block_size).min(data.len());
+            let block = &data[start..end];
+
+            BlockChecksum {
+                offset: start as u64,
+                size: (end - start) as u32,
+                weak: Adler32::hash(block),
+                strong: xxhash_rust::xxh3::xxh3_64(block),
+            }
+        })
+        .collect();
 
     Ok(checksums)
 }

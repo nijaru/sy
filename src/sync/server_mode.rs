@@ -675,6 +675,7 @@ async fn scan_local_dest(dest: &Path) -> Result<Vec<SourceEntry>> {
 /// - Computes all deltas in parallel
 /// - Sends all DELTA_DATA without waiting
 /// - Reads all FILE_DONE responses at the end
+///
 /// Returns (files_updated, bytes_transferred)
 async fn process_delta_batch(
     session: &mut ServerSession,

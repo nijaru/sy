@@ -6,14 +6,16 @@ pub mod handler;
 pub mod protocol;
 
 use anyhow::Result;
-use handler::ServerHandler;
+use handler::{compute_checksum_response, ServerHandler};
 use protocol::{
-    Action, ChecksumReq, DeltaData, ErrorMessage, FileData, FileList, FileListEntry, Hello,
-    MessageType, MkdirBatch, MkdirBatchAck, SymlinkBatch, SymlinkBatchAck, SymlinkEntry,
+    Action, ChecksumReq, ChecksumResp, DeltaData, ErrorMessage, FileData, FileList, FileListEntry,
+    Hello, MessageType, MkdirBatch, MkdirBatchAck, SymlinkBatch, SymlinkBatchAck, SymlinkEntry,
     HELLO_FLAG_PULL, PROTOCOL_VERSION,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::sync::scanner::{self, ScanOptions};
 
@@ -95,70 +97,165 @@ pub async fn run_server() -> Result<()> {
         return run_server_pull_mode(&handler.root_path, &mut stdin, &mut stdout).await;
     }
 
+    // Shared state for concurrent CHECKSUM_REQ handling
+    let mut file_list: Option<Arc<Vec<FileListEntry>>> = None;
+    let root_path = Arc::new(handler.root_path.clone());
+
+    // Channel for checksum results (spawned tasks send completed responses here)
+    let (checksum_tx, mut checksum_rx) = mpsc::channel::<ChecksumResp>(32);
+    let mut pending_checksum_count = 0usize;
+
     // Main message loop (PUSH mode - client sends files to server)
-    while let Ok(_len) = stdin.read_u32().await {
-        let type_byte = stdin.read_u8().await?;
+    loop {
+        // Use select! to handle both incoming messages and outgoing checksum responses
+        tokio::select! {
+            biased;
 
-        match MessageType::from_u8(type_byte) {
-            Some(MessageType::FileList) => {
-                let list = protocol::FileList::read(&mut stdin).await?;
-                handler.handle_file_list(list, &mut stdout).await?;
+            // Prioritize writing completed checksum responses
+            Some(resp) = checksum_rx.recv(), if pending_checksum_count > 0 => {
+                resp.write(&mut stdout).await?;
+                pending_checksum_count -= 1;
+
+                // Batch writes: only flush when channel is empty or we've written all pending
+                if pending_checksum_count == 0 || checksum_rx.is_empty() {
+                    stdout.flush().await?;
+                }
             }
 
-            Some(MessageType::MkdirBatch) => {
-                let batch = MkdirBatch::read(&mut stdin).await?;
-                handler.handle_mkdir_batch(batch, &mut stdout).await?;
-            }
-
-            Some(MessageType::SymlinkBatch) => {
-                let batch = SymlinkBatch::read(&mut stdin).await?;
-                handler.handle_symlink_batch(batch, &mut stdout).await?;
-            }
-
-            Some(MessageType::FileData) => {
-                let data = protocol::FileData::read(&mut stdin).await?;
-                handler.handle_file_data(data, &mut stdout).await?;
-            }
-
-            Some(MessageType::ChecksumReq) => {
-                let req = ChecksumReq::read(&mut stdin).await?;
-                handler.handle_checksum_req(req, &mut stdout).await?;
-            }
-
-            Some(MessageType::DeltaData) => {
-                let delta = DeltaData::read(&mut stdin).await?;
-                handler.handle_delta_data(delta, &mut stdout).await?;
-            }
-
-            Some(MessageType::Error) => {
-                let err = protocol::ErrorMessage::read(&mut stdin).await?;
-                tracing::error!("Received error: {}", err.message);
-                return Err(anyhow::anyhow!("Remote error: {}", err.message));
-            }
-
-            Some(msg_type) => {
-                tracing::warn!("Unhandled message type: {:?}", msg_type);
-                let err = ErrorMessage {
-                    code: 1,
-                    message: format!("Unhandled message type: 0x{:02X}", type_byte),
+            // Read and handle incoming messages
+            len_result = stdin.read_u32() => {
+                let _len = match len_result {
+                    Ok(len) => len,
+                    Err(_) => break, // EOF or error, exit loop
                 };
-                err.write(&mut stdout).await?;
-                stdout.flush().await?;
-            }
+                let type_byte = stdin.read_u8().await?;
 
-            None => {
-                tracing::error!("Unknown message type: 0x{:02X}", type_byte);
-                let err = ErrorMessage {
-                    code: 1,
-                    message: format!("Unknown message type: 0x{:02X}", type_byte),
-                };
-                err.write(&mut stdout).await?;
-                stdout.flush().await?;
-                break;
+                match MessageType::from_u8(type_byte) {
+                    Some(MessageType::FileList) => {
+                        // Wait for all pending checksums before processing file list
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+
+                        let list = protocol::FileList::read(&mut stdin).await?;
+                        // Store file list for concurrent checksum handling
+                        file_list = Some(Arc::new(list.entries.clone()));
+                        handler.handle_file_list(list, &mut stdout).await?;
+                    }
+
+                    Some(MessageType::MkdirBatch) => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        let batch = MkdirBatch::read(&mut stdin).await?;
+                        handler.handle_mkdir_batch(batch, &mut stdout).await?;
+                    }
+
+                    Some(MessageType::SymlinkBatch) => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        let batch = SymlinkBatch::read(&mut stdin).await?;
+                        handler.handle_symlink_batch(batch, &mut stdout).await?;
+                    }
+
+                    Some(MessageType::FileData) => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        let data = protocol::FileData::read(&mut stdin).await?;
+                        handler.handle_file_data(data, &mut stdout).await?;
+                    }
+
+                    Some(MessageType::ChecksumReq) => {
+                        let req = ChecksumReq::read(&mut stdin).await?;
+
+                        // Use concurrent handling if we have file list
+                        if let Some(ref fl) = file_list {
+                            let fl = Arc::clone(fl);
+                            let rp = Arc::clone(&root_path);
+                            let index = req.index;
+                            let block_size = req.block_size as usize;
+                            let tx = checksum_tx.clone();
+
+                            // Spawn computation task - runs concurrently
+                            pending_checksum_count += 1;
+                            tokio::spawn(async move {
+                                match compute_checksum_response(index, block_size, &fl, &rp).await {
+                                    Ok(resp) => {
+                                        let _ = tx.send(resp).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Checksum computation failed: {}", e);
+                                    }
+                                }
+                            });
+                        } else {
+                            // Fallback: sequential handling
+                            handler.handle_checksum_req(req, &mut stdout).await?;
+                        }
+                    }
+
+                    Some(MessageType::DeltaData) => {
+                        // Wait for all pending checksums before handling delta
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        let delta = DeltaData::read(&mut stdin).await?;
+                        handler.handle_delta_data(delta, &mut stdout).await?;
+                    }
+
+                    Some(MessageType::Error) => {
+                        let err = protocol::ErrorMessage::read(&mut stdin).await?;
+                        tracing::error!("Received error: {}", err.message);
+                        return Err(anyhow::anyhow!("Remote error: {}", err.message));
+                    }
+
+                    Some(msg_type) => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        tracing::warn!("Unhandled message type: {:?}", msg_type);
+                        let err = ErrorMessage {
+                            code: 1,
+                            message: format!("Unhandled message type: 0x{:02X}", type_byte),
+                        };
+                        err.write(&mut stdout).await?;
+                        stdout.flush().await?;
+                    }
+
+                    None => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        tracing::error!("Unknown message type: 0x{:02X}", type_byte);
+                        let err = ErrorMessage {
+                            code: 1,
+                            message: format!("Unknown message type: 0x{:02X}", type_byte),
+                        };
+                        err.write(&mut stdout).await?;
+                        stdout.flush().await?;
+                        break;
+                    }
+                }
             }
         }
     }
 
+    // Drain any remaining pending checksums
+    drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+
+    Ok(())
+}
+
+/// Drain all pending checksum responses from the channel
+async fn drain_pending_checksums<W: AsyncWriteExt + Unpin>(
+    rx: &mut mpsc::Receiver<ChecksumResp>,
+    pending_count: &mut usize,
+    writer: &mut W,
+) -> Result<()> {
+    if *pending_count == 0 {
+        return Ok(());
+    }
+
+    // Write all pending responses
+    while *pending_count > 0 {
+        if let Some(resp) = rx.recv().await {
+            resp.write(writer).await?;
+            *pending_count -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Single flush for the entire batch
+    writer.flush().await?;
     Ok(())
 }
 

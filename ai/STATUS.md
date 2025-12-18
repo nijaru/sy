@@ -37,15 +37,17 @@
 
 ## Active Work
 
-**Completed**: Pipelined delta checksum requests (sy-09r)
+**Completed**:
 
-**Remaining gap**: SSH incremental/delta still ~1.3-1.4x slower than rsync. This appears to be inherent protocol overhead - server processes requests sequentially, and we already pipeline all client-side operations.
+- Pipelined delta checksum requests (sy-09r)
+- Server-side parallelism (2025-12-18): rayon parallel checksums, concurrent request handling, batched flushes
 
-**Next options**:
+**Investigation result**: Server-side optimizations implemented but didn't close SSH incremental/delta gap. The ~1.3-1.4x slowdown is inherent to protocol/network latency, not server-side CPU processing. Benchmarks confirmed performance unchanged after server parallelism.
+
+**Remaining options**:
 
 1. Stream-level compression (may help with large deltas)
-2. Server-side parallelism (would require server code changes)
-3. Accept the gap - sy still wins locally and on bulk SSH transfers
+2. Accept the gap - sy wins locally (3x) and on bulk SSH transfers (2-4x)
 
 **Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
 
@@ -57,6 +59,7 @@
 
 - [x] Pipeline delta checksum requests (P0) - done
 - [x] Parallelize delta computation in batches - done
+- [x] Server-side parallelism - done (didn't close gap, inherent latency)
 - [ ] Stream-level compression after HELLO (P1)
 
 ### v0.3.0 (UX Polish)
@@ -80,11 +83,13 @@
 - Protocol fix (66d05d5): Always send MKDIR_BATCH
 - Benchmark infrastructure: JSONL tracking, automated comparison
 - Delta pipelining: Batch CHECKSUM_REQ/RESP, parallel delta computation, batch DELTA_DATA/FILE_DONE
+- Server-side: Rayon parallel checksums, concurrent request handling with channels, batched flushes
 
 ## What Didn't Work
 
-- SSH incremental: 1.5x slower than rsync (protocol overhead)
-- Initial sync for many small files: rsync wins by 1.6-2.1x
+- SSH incremental: 1.3-1.5x slower than rsync (protocol/network latency, not CPU)
+- Server-side parallelism: Implemented but didn't close gap - bottleneck is latency, not processing
+- Initial sync for many small files: rsync wins by 1.4-1.5x
 - UX: Stack traces shown on normal validation errors
 
 ## Recent Releases
