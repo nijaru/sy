@@ -19,6 +19,7 @@ pub enum ChecksumType {
 
     /// Cryptographic checksum (BLAKE3)
     /// Slower but provides cryptographic guarantees
+    #[allow(dead_code)]
     Cryptographic,
 }
 

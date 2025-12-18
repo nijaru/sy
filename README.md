@@ -2,7 +2,7 @@
 
 > Modern file synchronization tool - rsync, reimagined
 
-**sy** (pronounced "sigh") is a fast, modern file synchronization tool with built-in integrity verification.
+**sy** (pronounced "sigh") is a fast, modern file synchronization tool with optional integrity verification.
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -17,12 +17,11 @@
 
 **rsync wins:**
 
-- Initial sync of many small files: ~1.5x faster
 - SSH incremental: ~1.3x faster
 
 ## Why sy?
 
-- Built-in integrity verification (xxHash3 + BLAKE3)
+- Optional integrity verification (`--verify` for xxHash3)
 - Simpler CLI with sensible defaults
 - Progress, dry-run, and resume out of the box
 
@@ -79,7 +78,8 @@ That's it. Use `sy --help` for options.
 ```bash
 sy ~/project ~/backup                    # Basic backup
 sy ~/src ~/dest --delete                 # Mirror (delete extra files)
-sy ~/backup ~/original --verify-only     # Verify integrity
+sy ~/src ~/dest --verify                 # Verify after write (xxHash3)
+sy ~/backup ~/original --verify-only     # Audit existing files
 sy /source /dest --dry-run               # Preview changes
 ```
 
@@ -147,7 +147,7 @@ sy /local/path s3://my-bucket/backups?endpoint=https://<accountid>.r2.cloudflare
 
 **Reliability:**
 
-- Multi-layer integrity (xxHash3 + BLAKE3)
+- Optional integrity verification (xxHash3 via `--verify`)
 - Atomic operations
 - Resume support
 - Dry-run and verify-only modes

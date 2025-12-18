@@ -12,11 +12,11 @@
 
 ### Local (sy vs rsync)
 
-| Scenario           | Initial    | Incremental | Delta       |
-| ------------------ | ---------- | ----------- | ----------- |
-| small_files (1000) | rsync 1.6x | **sy 3x**   | **sy 3x**   |
-| large_file (100MB) | **sy 7x**  | **sy 1.5x** | **sy 1.1x** |
-| source_code (5000) | rsync 2.1x | **sy 3.5x** | **sy 3.6x** |
+| Scenario           | Initial     | Incremental | Delta       |
+| ------------------ | ----------- | ----------- | ----------- |
+| small_files (1000) | **sy ~par** | **sy 3x**   | **sy 3x**   |
+| large_file (100MB) | **sy 7x**   | **sy 1.5x** | **sy 1.1x** |
+| source_code (5000) | rsync 2.1x  | **sy 3.5x** | **sy 3.6x** |
 
 ### SSH (Mac → Fedora via Tailscale) - After pipelining (2025-12-18)
 
@@ -85,12 +85,12 @@
 - Delta pipelining: Batch CHECKSUM_REQ/RESP, parallel delta computation, batch DELTA_DATA/FILE_DONE
 - Server-side: Rayon parallel checksums, concurrent request handling with channels, batched flushes
 - Checkpoint default 10→100: Reduced resume state overhead for initial sync
+- Verification default flip: `--verify` now opt-in, sy matches rsync speed by default
 
 ## What Didn't Work
 
 - SSH incremental: 1.3-1.5x slower than rsync (protocol/network latency, not CPU)
 - Server-side parallelism: Implemented but didn't close gap - bottleneck is latency, not processing
-- Initial sync for many small files: rsync wins by 1.2-1.5x (sy: 0.7s sys, rsync: 0.2s sys - per-file xattr operations)
 - UX: Stack traces shown on normal validation errors
 
 ## Recent Releases

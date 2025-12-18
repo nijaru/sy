@@ -948,7 +948,7 @@ Or install from local source with: cargo install --path . --features acl"#
         }
 
         // Verification stats (if enabled)
-        if verification_mode != cli::VerificationMode::Fast {
+        if verification_mode == cli::VerificationMode::Verify {
             println!();
             if stats.verification_failures > 0 {
                 println!(
@@ -959,16 +959,9 @@ Or install from local source with: cargo install --path . --features acl"#
                 );
             } else if stats.files_verified > 0 {
                 println!(
-                    "  {}    {} files ({})",
+                    "  {}    {} files (xxHash3)",
                     "Verification:".green(),
                     stats.files_verified.to_string().green(),
-                    match verification_mode {
-                        cli::VerificationMode::Standard => "xxHash3",
-                        cli::VerificationMode::Verify => "BLAKE3",
-                        cli::VerificationMode::Paranoid => "BLAKE3+blocks",
-                        cli::VerificationMode::Fast => unreachable!(),
-                    }
-                    .bright_black()
                 );
             }
         }

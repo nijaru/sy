@@ -46,34 +46,28 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 /// Verification mode for file integrity
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VerificationMode {
-    /// Size and mtime only (fastest, least reliable)
-    Fast,
+    /// No post-write verification (default, matches rsync behavior)
+    #[default]
+    None,
 
-    /// Add xxHash3 checksums (default, good balance)
-    Standard,
-
-    /// BLAKE3 end-to-end verification (slower, cryptographic)
+    /// xxHash3 verification after write (catches corruption)
     Verify,
-
-    /// BLAKE3 + verify every block during transfer (slowest, maximum reliability)
-    Paranoid,
 }
 
 impl VerificationMode {
     /// Get the checksum type for this mode
     pub fn checksum_type(&self) -> ChecksumType {
         match self {
-            Self::Fast => ChecksumType::None,
-            Self::Standard => ChecksumType::Fast,
-            Self::Verify | Self::Paranoid => ChecksumType::Cryptographic,
+            Self::None => ChecksumType::None,
+            Self::Verify => ChecksumType::Fast,
         }
     }
 
     /// Check if this mode requires block-level verification
     pub fn verify_blocks(&self) -> bool {
-        matches!(self, Self::Paranoid)
+        false
     }
 }
 
@@ -126,9 +120,8 @@ pub enum SymlinkMode {
     sy /source /destination --bwlimit 1MB     # Limit to 1 MB/s
     sy /source user@host:/dest --bwlimit 500KB  # Limit to 500 KB/s
 
-    # Verification modes
-    sy /source /destination --verify            # BLAKE3 cryptographic verification
-    sy /source /destination --mode paranoid     # Maximum reliability
+    # Verify file integrity after write
+    sy /source /destination --verify            # xxHash3 verification
 
     # Network retry options
     sy /source user@host:/dest --retry 5        # Retry up to 5 times on network errors
@@ -297,11 +290,10 @@ pub struct Cli {
     #[arg(long)]
     pub prune_checksum_db: bool,
 
-    /// Verification mode (fast, standard, verify, paranoid)
-    #[arg(long, value_enum, default_value = "standard")]
-    pub mode: VerificationMode,
-
-    /// Enable BLAKE3 verification (shortcut for --mode verify)
+    /// Verify file integrity after write using xxHash3 checksums
+    ///
+    /// By default, sy trusts the OS like rsync does. Enable this flag
+    /// to read back and verify each file after writing.
     #[arg(long)]
     pub verify: bool,
 
@@ -590,12 +582,12 @@ impl Cli {
         Ok(())
     }
 
-    /// Get the effective verification mode (applying --verify flag override)
+    /// Get the verification mode based on --verify flag
     pub fn verification_mode(&self) -> VerificationMode {
         if self.verify {
             VerificationMode::Verify
         } else {
-            self.mode
+            VerificationMode::None
         }
     }
 
@@ -746,7 +738,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -835,7 +826,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -928,7 +918,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1022,7 +1011,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1111,7 +1099,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1200,7 +1187,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1289,7 +1275,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1378,7 +1363,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1486,7 +1470,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1578,7 +1561,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1632,11 +1614,11 @@ mod tests {
             recursive: false,
             server: false,
         };
-        assert_eq!(cli.verification_mode(), VerificationMode::Standard);
+        assert_eq!(cli.verification_mode(), VerificationMode::None);
     }
 
     #[test]
-    fn test_verification_mode_verify_flag_override() {
+    fn test_verification_mode_verify_flag_enabled() {
         let cli = Cli {
             source: Some(SyncPath::Local {
                 path: PathBuf::from("/tmp/src"),
@@ -1667,8 +1649,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Fast, // Set to Fast
-            verify: true,                 // But --verify flag should override
+            verify: true, // But --verify flag should override
             resume: false,
             no_resume: false,
             checkpoint_files: 100,
@@ -1727,27 +1708,14 @@ mod tests {
 
     #[test]
     fn test_verification_mode_checksum_type_mapping() {
-        assert_eq!(VerificationMode::Fast.checksum_type(), ChecksumType::None);
-        assert_eq!(
-            VerificationMode::Standard.checksum_type(),
-            ChecksumType::Fast
-        );
-        assert_eq!(
-            VerificationMode::Verify.checksum_type(),
-            ChecksumType::Cryptographic
-        );
-        assert_eq!(
-            VerificationMode::Paranoid.checksum_type(),
-            ChecksumType::Cryptographic
-        );
+        assert_eq!(VerificationMode::None.checksum_type(), ChecksumType::None);
+        assert_eq!(VerificationMode::Verify.checksum_type(), ChecksumType::Fast);
     }
 
     #[test]
     fn test_verification_mode_verify_blocks() {
-        assert!(!VerificationMode::Fast.verify_blocks());
-        assert!(!VerificationMode::Standard.verify_blocks());
+        assert!(!VerificationMode::None.verify_blocks());
         assert!(!VerificationMode::Verify.verify_blocks());
-        assert!(VerificationMode::Paranoid.verify_blocks());
     }
 
     #[test]
@@ -1782,7 +1750,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1871,7 +1838,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -1960,7 +1926,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2049,7 +2014,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2145,7 +2109,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2240,7 +2203,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2336,7 +2298,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2432,7 +2393,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2525,7 +2485,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
@@ -2661,7 +2620,6 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            mode: VerificationMode::Standard,
             verify: false,
             resume: false,
             no_resume: false,
