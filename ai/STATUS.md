@@ -4,7 +4,7 @@
 
 | Metric  | Value        | Updated    |
 | ------- | ------------ | ---------- |
-| Version | v0.1.2       | 2025-11-27 |
+| Version | v0.2.0       | 2025-12-18 |
 | Tests   | 620+ passing | 2025-11-27 |
 | Build   | 🟢 PASSING   | 2025-12-18 |
 
@@ -94,6 +94,13 @@
 - UX: Stack traces shown on normal validation errors
 
 ## Recent Releases
+
+### v0.2.0 (2025-12-18)
+
+- **Breaking:** `--verify` now opt-in (was default)
+- **Breaking:** Removed `--mode` flag (use `--verify` instead)
+- Performance: sy now ~10% faster than rsync on small files
+- Simplified verification to single `--verify` flag (xxHash3)
 
 ### v0.1.2 (2025-11-27)
 

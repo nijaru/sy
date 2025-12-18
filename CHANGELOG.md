@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-12-18
+
+### Breaking Changes
+
+- **Verification now opt-in**: `--verify` flag enables post-write xxHash3 verification (was enabled by default)
+- **Removed `--mode` flag**: Use `--verify` instead of `--mode=standard/verify/paranoid`
+
+### Performance
+
+- **Small files**: sy now ~10% faster than rsync on initial sync of many small files
+- Default behavior matches rsync (no post-write verification overhead)
+
+### Changed
+
+- Simplified verification to single `--verify` flag (xxHash3)
+- Removed BLAKE3 verification option from CLI (kept internally for future use)
+
 ## [0.1.2] - 2025-11-27
 
 ### Added
@@ -52,14 +69,15 @@ This release changes default behavior to match rsync/cp conventions. **If you re
 
 #### Default Behavior Changes
 
-| Behavior | v0.0.x | v0.1.0 |
-|----------|--------|--------|
-| `.gitignore` rules | Respected (files skipped) | **Ignored (all files copied)** |
-| `.git/` directories | Excluded | **Included** |
+| Behavior            | v0.0.x                    | v0.1.0                         |
+| ------------------- | ------------------------- | ------------------------------ |
+| `.gitignore` rules  | Respected (files skipped) | **Ignored (all files copied)** |
+| `.git/` directories | Excluded                  | **Included**                   |
 
 #### Migration Guide
 
 If you relied on the old behavior:
+
 ```bash
 # Old (v0.0.x): sy copied only non-ignored files and excluded .git
 sy /src /dest
@@ -71,39 +89,42 @@ sy /src /dest --gitignore --exclude-vcs
 #### Removed Flags
 
 These flags are no longer needed (now default behavior):
+
 - `--no-gitignore` → Now default behavior
 - `--include-vcs` → Now default behavior
 - `-b` short flag → Use `--bidirectional` (conflicts with rsync `-b`=backup)
 
 #### New Flags
 
-| Flag | Description |
-|------|-------------|
-| `--gitignore` | Opt-in to respect .gitignore rules |
-| `--exclude-vcs` | Opt-in to exclude .git directories |
-| `-z` | Short flag for `--compress` (rsync compatible) |
-| `-u` / `--update` | Skip files where destination is newer |
-| `--ignore-existing` | Skip files that already exist in destination |
+| Flag                | Description                                    |
+| ------------------- | ---------------------------------------------- |
+| `--gitignore`       | Opt-in to respect .gitignore rules             |
+| `--exclude-vcs`     | Opt-in to exclude .git directories             |
+| `-z`                | Short flag for `--compress` (rsync compatible) |
+| `-u` / `--update`   | Skip files where destination is newer          |
+| `--ignore-existing` | Skip files that already exist in destination   |
 
 ### rsync Compatibility Notes
 
 sy is intentionally NOT a drop-in rsync replacement. Key differences:
 
-| Feature | rsync | sy | Rationale |
-|---------|-------|-----|-----------|
-| Verification | size+mtime | xxHash3 | Catches silent corruption |
-| Recursion | Requires `-r` | Implicit | Better UX |
-| Resume | Manual | Automatic | Handles interruptions |
-| `-b` flag | Backup | (removed) | Conflict avoidance |
+| Feature      | rsync         | sy        | Rationale                 |
+| ------------ | ------------- | --------- | ------------------------- |
+| Verification | size+mtime    | xxHash3   | Catches silent corruption |
+| Recursion    | Requires `-r` | Implicit  | Better UX                 |
+| Resume       | Manual        | Automatic | Handles interruptions     |
+| `-b` flag    | Backup        | (removed) | Conflict avoidance        |
 
 For rsync-like speed without verification: `sy --mode fast`
 
 ## [0.0.65] - 2025-11-25
 
 ### Fixed
+
 - **`--filter` flag** - Now accepts rsync-style patterns starting with `-` (e.g., `--filter "- *.log"`)
 
 ### Added
+
 - **Integration test coverage** - 38 new tests for CLI flag behavior
   - Archive mode (`-a`, `--include-vcs`, `--no-gitignore`)
   - Filter flags (`--exclude`, `--include`, `--filter`, `--exclude-from`)
@@ -113,6 +134,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.64] - 2025-11-25
 
 ### Added
+
 - **Parallel Directory Scanning** - 1.5-1.7x faster for large directories
   - Uses `ignore` crate's parallel walker with crossbeam-channel bridge
   - Dynamic selection: automatically uses parallel for 30+ subdirectories
@@ -120,6 +142,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Comprehensive test coverage (31 scanner tests)
 
 ### Performance
+
 - **Smart Scanning Heuristic** - Counts subdirectories to decide parallel vs sequential
   - Parallel: 1.45-1.74x faster for nested directory structures
   - Sequential: Avoids overhead for flat directories (many files, few subdirs)
@@ -127,6 +150,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.63] - 2025-11-24
 
 ### Fixed
+
 - **Bisync timestamp overflow** - Fixed silent truncation in `as_nanos() as i64` and panic on pre-epoch times
 - **Size parsing overflow** - Added bounds check for size values exceeding u64::MAX (~16 exabytes)
 - **CLI flag design** - Added `--no-resume` flag for idiomatic disable pattern
@@ -134,12 +158,14 @@ For rsync-like speed without verification: `sy --mode fast`
 - **S3 validation timing** - Moved S3+bidirectional check to CLI validation for earlier feedback
 
 ### Changed
+
 - **Code cleanup** - Removed unused `verify_only` field from SyncEngine (handled at CLI level)
 - **Safety improvements** - Added SAFETY comments for unsafe code, descriptive `.expect()` for critical locks
 
 ## [0.0.62] - 2025-11-19
 
 ### Added
+
 - **Parallel Chunk Transfers** - 10x throughput for single large files
   - Implemented "multipart-style" transfers for single large files (>20MB) over SSH
   - Splits files into 1MB chunks transferred concurrently across the connection pool
@@ -154,6 +180,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Prevents loss of progress if sync is interrupted before completion
 
 ### Performance
+
 - **Adler-32 Optimization** - Delta sync rolling hash speedup
   - **Static Hash**: 7x speedup (420 MB/s → 3.2 GB/s) using deferred modulo
   - **Rolling Hash**: 1.85x speedup (135 MB/s → 250 MB/s) using lookup tables
@@ -163,6 +190,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Optimized connection pool usage for parallel chunks
 
 ### Quality
+
 - **Safety Rules** - Added `clippy.toml` configuration
   - Disallowed `unwrap()` and `expect()` in production code
   - Fixed critical panics in transport layer error handling
@@ -170,6 +198,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.61] - 2025-11-19
 
 ### Added
+
 - **Massive Scale Optimization** - Streaming sync pipeline
   - Implemented `Scan -> Plan -> Execute` streaming pipeline
   - Memory usage reduced by 75% (530MB → 133MB for 100k files)
@@ -183,6 +212,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Robust error handling with auto-sync recovery
 
 ### Changed
+
 - **S3/Cloud Storage Stable** - Moved from "Experimental" to "Stable"
   - Hardened S3 transport implementation
   - Verified compatibility with AWS S3, Cloudflare R2, Backblaze B2
@@ -196,12 +226,13 @@ For rsync-like speed without verification: `sy --mode fast`
   - Reduces binary size and build times for custom needs
 
 ### Fixed
+
 - **Resume State Stability** - Fixed flaky resume state tests
   - Switched to fixed timestamps for deterministic serialization testing
   - Improved staleness detection logic
 
-
 ### Fixed
+
 - **Critical memory bugs** - Streaming fixes for large file operations
   - File verification OOM: Large files loaded entirely into RAM during checksum verification. Now uses streaming with 1MB chunks (10GB file: 10GB RAM → 2MB RAM)
   - Remote checksum failure: `--checksum` mode didn't work for remote paths. Added `sy-remote file-checksum` command for SSH
@@ -210,6 +241,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Fixed blocking I/O: Wrapped `std::fs` calls in `spawn_blocking` for proper async behavior
 
 ### Added
+
 - **Data safety improvements**
   - Stale resume state cleanup: Failed syncs left resume state files accumulating. Auto-cleanup after 7 days
   - Catastrophic deletion safeguard: `--force-delete` now requires explicit confirmation for >10K files: `"DELETE <count>"`
@@ -217,16 +249,19 @@ For rsync-like speed without verification: `sy --mode fast`
   - Checksum validation: xxHash3 (8 bytes) and BLAKE3 (32 bytes) length validation
 
 ### Changed
+
 - Compression size limit: Added 256MB limit to prevent OOM on huge files
 - Reduced log noise: DualTransport fallback changed from warn to debug level
 - Removed unused tokio-util dependency
 
 ### Testing
+
 - 465 tests passing (12 ignored - SSH agent setup required)
 
 ## [0.0.59] - 2025-11-12
 
 ### Changed
+
 - **ACL preservation now optional** (issue #7)
   - Made ACL support optional via `--features acl` flag
   - Default build requires zero system dependencies on Linux
@@ -237,18 +272,21 @@ For rsync-like speed without verification: `sy --mode fast`
   - Traditional Unix permissions (user/group/other) still preserved by default
 
 ### Added
+
 - Docker-based portability test suite (`scripts/test-acl-portability.sh`)
   - Validates default build works without system dependencies
   - Validates ACL feature requires and works with libacl-devel
   - Tests runtime error messages for missing feature
 
 ### Testing
+
 - 464 tests passing (12 ignored - SSH setup required)
 - All portability tests passing in Fedora container
 
 ## [0.0.58] - 2025-11-11
 
 ### Changed
+
 - **Pure Rust library migrations**
   - Migrated from rusqlite to fjall (pure Rust LSM-tree database)
   - 56% faster writes for checksumdb workload
@@ -258,12 +296,14 @@ For rsync-like speed without verification: `sy --mode fast`
   - Net reduction of ~18 transitive dependencies
 
 ### Performance
+
 - Checksumdb writes: 56.8% faster (fjall: 340ms vs rusqlite: 534ms for 1K checksums)
 - See ai/research/database-comparisons.md for detailed benchmarks
 
 ## [0.0.57] - 2025-11-10
 
 ### Fixed
+
 - **Rsync-compatible trailing slash semantics** (issue #2)
   - Without trailing slash: copies directory itself (e.g., `sy /a/myproject /target` → `/target/myproject/`)
   - With trailing slash: copies contents only (e.g., `sy /a/myproject/ /target` → `/target/`)
@@ -276,6 +316,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Tested with SSH sync to verify proper directory hierarchy creation
 
 ### Changed
+
 - **Documentation overhaul**
   - Rewrote README.md from 1161 lines to 198 lines (83% reduction)
   - Created comprehensive docs/FEATURES.md (861 lines) with feature categorization
@@ -284,6 +325,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Marked S3/cloud storage as experimental throughout documentation
 
 ### Testing
+
 - All 484 tests passing
 - Added trailing slash behavior tests
 - Added remote nested directory creation tests
@@ -291,24 +333,28 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.56] - 2025-11-01
 
 ### Added
+
 - **Homebrew Tap Automation** - Automated release process updates Homebrew tap
   - Formula automatically updated on each release
   - GitHub Actions workflow syncs with nijaru/homebrew-tap
   - Users can install via `brew tap nijaru/tap && brew install sy`
 
 ### Fixed
+
 - **Arc<T> Transport Implementation** - Added missing methods to Arc<T> Transport impl
   - Implemented check_disk_space(), set_xattrs(), set_acls(), set_bsd_flags()
   - Arc-wrapped transports now support full metadata preservation
   - Fixes compilation errors when using Arc-wrapped transports
 
 ### Technical
+
 - All 484 tests passing
 - GitHub Actions workflow for Homebrew tap updates
 
 ## [0.0.55] - 2025-10-31
 
 ### Fixed
+
 - **Proper remote disk space checking** - Disk space checks now work for SSH destinations
   - v0.0.53/v0.0.54 skipped disk space checks for remote destinations
   - v0.0.55 properly checks via `df` command executed over SSH
@@ -333,12 +379,14 @@ For rsync-like speed without verification: `sy --mode fast`
   - Preserves macOS-specific file attributes like hidden/immutable flags
 
 ### Changed
+
 - All 465 tests passing with proper remote operations
 - Added Transport trait methods: check_disk_space(), set_xattrs(), set_acls(), set_bsd_flags()
 - SshTransport implements full remote operations via SSH commands
 - Operations gracefully warn and continue on failure (don't block sync)
 
 ### Technical Details
+
 - Remote disk space check: Executes `df -P -B1` via SSH and parses output
 - Remote xattrs: Platform detection with fallback (setfattr → xattr -w)
 - Remote ACLs: Uses stdin piping for ACL entries
@@ -348,6 +396,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.54] - 2025-10-31
 
 ### Fixed
+
 - **CRITICAL: Proper remote file verification** - Restored corruption detection for SSH syncs
   - v0.0.53 skipped verification for remote files (NO corruption detection)
   - v0.0.54 properly verifies remote files via transport layer
@@ -357,10 +406,12 @@ For rsync-like speed without verification: `sy --mode fast`
   - Tested: 10/10 files verified successfully on macOS → Linux SSH sync
 
 ### Changed
+
 - All 465 tests passing with proper remote verification
 - Remote files now verified with same checksums as local files (xxHash3/BLAKE3)
 
 ### Known Limitations (will fix in v0.0.55)
+
 - Disk space checks still skipped for remote destinations
 - Xattrs/ACLs/BSD flags still skipped for remote destinations
 - These are feature preservation issues, not data integrity issues
@@ -368,6 +419,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.53] - 2025-10-31
 
 ### Fixed
+
 - **Critical: Remote destination sync failures** - Fixed multiple bugs that caused SSH sync to fail
   - **Destination directory creation**: Ensure destination directory exists before any operations
     - Previously failed with "No such file or directory" when parent directory didn't exist
@@ -393,6 +445,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Faster installation for users who don't need cloud storage
 
 ### Changed
+
 - All 465 tests passing with remote destination fixes
 - Improved error messages for remote operations
 - Added debug logging for skipped operations on remote destinations
@@ -400,6 +453,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.52] - 2025-10-28
 
 ### Performance
+
 - **90% Reduction in Memory Allocations** for large-scale file synchronization operations
   - **Arc-based FileEntry paths** (ba302b1): Changed FileEntry path fields to Arc<PathBuf>
     - Path cloning is now O(1) atomic counter increment instead of O(n) memory allocation
@@ -417,17 +471,19 @@ For rsync-like speed without verification: `sy --mode fast`
     - 1M files: ~300MB+ memory savings from Arc optimizations
 
 ### Changed
+
 - All 444 tests passing with new Arc-based memory model
 - No API changes - full backward compatibility maintained
 
 ## [0.0.51] - 2025-10-28
 
 ### Added
+
 - **Automatic Resume for Interrupted Transfers** - Large file transfers automatically resume after interruption
   - **Bidirectional Resume Support**: Both Remote→Local and Local→Remote transfers can resume
     - Remote→Local: SFTP streaming (copy_file_streaming) with remote seek + local append
     - Local→Remote: SFTP write path (copy_file) with local seek + remote seek
-  - **Checkpoint Saves**: Progress saved every 10MB (10 * 1MB chunks) for recovery
+  - **Checkpoint Saves**: Progress saved every 10MB (10 \* 1MB chunks) for recovery
   - **Staleness Detection**: Rejects resume state if source file modified (via mtime comparison)
   - **User Feedback**: Shows resume progress percentage when resuming
   - **Atomic State Management**:
@@ -440,12 +496,14 @@ For rsync-like speed without verification: `sy --mode fast`
     - Local→Remote: local `source_file.seek()` + `sftp.open_mode(WRITE)` + remote seek
 
 ### Changed
+
 - **Removed dead_code attributes**: Resume infrastructure now actively used in production transfers
 - **Enhanced logging**: Transfer debug logs now show if transfer was resumed
 
 ## [0.0.50] - 2025-10-28
 
 ### Added
+
 - **Network Recovery Activation** - All SSH/SFTP operations now use automatic retry
   - **14 Operations with Retry**: All SSH command, SFTP, and file transfer operations now automatically retry on network failures
     - Command operations: scan, exists, create_dir_all, remove, create_hardlink, create_symlink
@@ -458,11 +516,13 @@ For rsync-like speed without verification: `sy --mode fast`
   - **Production-Ready Reliability**: All 957 tests passing, retry infrastructure fully activated
 
 ### Changed
+
 - **Improved Error Handling**: All SSH/SFTP operations now use retry-wrapped async calls instead of direct spawn_blocking
 
 ## [0.0.49] - 2025-10-27
 
 ### Added
+
 - **Network Interruption Recovery** - Comprehensive retry and resume infrastructure
   - **Error Classification**: Automatic classification of retryable vs. fatal network errors
     - NetworkTimeout, NetworkDisconnected, NetworkRetryable errors with clear user messages
@@ -489,12 +549,14 @@ For rsync-like speed without verification: `sy --mode fast`
     - Infrastructure ready for active retry in SSH commands (future enhancement)
 
 ### Fixed
+
 - SSH error handling improved with network-aware classification
   - Connection errors (refused, reset, aborted, broken pipe) → NetworkDisconnected
   - Timeout errors → NetworkTimeout with duration context
   - Other IO errors intelligently classified as retryable or fatal
 
 ### Technical
+
 - Added `src/error.rs` network error variants with 12 tests
 - Added `src/retry.rs` module with exponential backoff logic (9 tests)
 - Added `src/resume.rs` module for transfer state management (10 tests)
@@ -504,6 +566,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - All 957 tests passing (up from 938)
 
 ### Implementation Details
+
 - **Commits**:
   - Phase 1 (Error Classification): 3e533a2
   - Phase 2 (Retry Logic): 3e533a2
@@ -514,6 +577,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.48] - 2025-10-27
 
 ### Added
+
 - **Remote→Remote Bidirectional Sync** - Sync between two SSH hosts
   - Dual SSH connection pools for parallel remote→remote operations
   - Independent SSH configs for source and destination hosts
@@ -522,15 +586,17 @@ For rsync-like speed without verification: `sy --mode fast`
   - Example: `sy -b user@host1:/path user@host2:/path`
 
 ### Fixed
+
 - **.gitignore Support Outside Git Repos** - Patterns now respected everywhere
   - Root cause: `ignore` crate's `git_ignore(true)` only works in git repositories
-  - Impact: v0.0.47 synced all files (*.tmp, *.log, node_modules/) despite .gitignore
+  - Impact: v0.0.47 synced all files (_.tmp, _.log, node_modules/) despite .gitignore
   - Fix: Explicitly add .gitignore file using `WalkBuilder::add_ignore()`
   - Works in any directory, git repo or not
   - Added test: `test_scanner_gitignore_without_git_repo`
   - Verified: SSH bisync respects .gitignore patterns correctly
 
 ### Testing
+
 - Comprehensive test report: 23 scenarios, 91.3% pass rate (21/23)
 - Both previously failed tests now pass
 - 410+ unit tests passing
@@ -538,6 +604,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.47] - 2025-10-27
 
 ### Fixed
+
 - **CRITICAL: SSH Bidirectional Sync** - Implemented missing `write_file()` for SSH transport
   - Root cause: `SshTransport` didn't override `write_file()`, falling back to local filesystem writes
   - Impact: v0.0.46 bisync reported success but files never reached remote server
@@ -547,6 +614,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - **Users on v0.0.46: SSH bidirectional sync is broken, upgrade to v0.0.47 immediately**
 
 ### Testing
+
 - Added comprehensive SSH bisync test suite with 8 real-world scenarios
 - Tested Mac (M3 Max) ↔ Fedora (i9-13900KF) over Tailscale
 - All 410 unit tests passing, 0 regressions
@@ -556,6 +624,7 @@ For rsync-like speed without verification: `sy --mode fast`
 **⚠️ CRITICAL BUG: SSH bidirectional sync does not work in this version. Files are not written to remote. Upgrade to v0.0.47 immediately.**
 
 ### Added
+
 - **Conflict History Logging** - Automatic audit trail for bidirectional sync
   - Logs all resolved conflicts to `~/.cache/sy/bisync/<pair>.conflicts.log`
   - Format: `timestamp | path | conflict_type | strategy | winner`
@@ -569,6 +638,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Common patterns: `.DS_Store`, `node_modules/`, `*.tmp`
 
 ### Fixed
+
 - **Critical Bisync State Storage Bug** - Fixed deletion propagation
   - Root cause: `update_state()` only stored one side after copy operations
   - Impact: Deletions were misclassified as "new files" and copied back
@@ -582,10 +652,12 @@ For rsync-like speed without verification: `sy --mode fast`
   - Added annotations for intentional patterns
 
 ### Changed
+
 - Enhanced documentation for conflict logging in README and design docs
 - Improved error messages for conflict resolution
 
 ### Testing
+
 - Created `bisync_real_world_test.sh` with 7 comprehensive test scenarios
 - All 410 unit tests passing
 - All 11 real-world bisync tests passing
@@ -594,6 +666,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.45] - 2025-10-26
 
 ### Fixed
+
 - **Bisync State Format v2** - Fixed critical data corruption bugs in text format
   - **Proper escaping**: Handles quotes, newlines, backslashes, tabs correctly
   - **Error handling**: Parse failures now return errors instead of silent corruption
@@ -601,23 +674,27 @@ For rsync-like speed without verification: `sy --mode fast`
   - **Backward compatible**: Can still read v1 format files from v0.0.44
 
 ### Added
+
 - 8 new edge-case tests for state file format
   - Quote handling, newline handling, backslash handling
   - Round-trip testing, v1 backward compatibility
   - Parse error detection
 
 ### Changed
+
 - Format version bumped from v1 to v2
 - All paths now quoted and escaped automatically
 - Test count: 410 tests passing (up from 402)
 
 ### Migration
+
 - v0.0.44 state files (.lst) are automatically upgraded to v2
 - No user action required (format is backward compatible)
 
 ## [0.0.44] - 2025-10-26
 
 ### Changed
+
 - **Bisync State Storage Refactored** - Switched from SQLite to text-based format
   - Text-based listing files in `~/.cache/sy/bisync/` (`.lst` instead of `.db`)
   - Format inspired by rclone bisync: human-readable, debuggable
@@ -629,16 +706,19 @@ For rsync-like speed without verification: `sy --mode fast`
   - Quoted paths for special characters support
 
 ### Removed
+
 - SQLite dependency for bisync state (still used for `--checksum-db`)
 - ~100 lines of SQL code from bisync module
 
 ### Benefits
+
 - **Simplicity**: Plain text, no schema migrations needed
 - **Debuggability**: `cat ~/.cache/sy/bisync/*.lst` shows full state
 - **Proven approach**: Similar to rclone bisync text format
 - **Fewer moving parts**: One less database to manage
 
 ### Migration
+
 - **Breaking change**: Old `.db` files from v0.0.43 are ignored
 - Use `--clear-bisync-state` if upgrading from v0.0.43
 - Fresh sync will create new `.lst` files automatically
@@ -646,6 +726,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.43] - 2025-10-24
 
 ### Added
+
 - **Bidirectional Sync** - Two-way file synchronization with automatic conflict resolution
   - New `--bidirectional` / `-b` flag enables two-way sync mode
   - Detects changes on both sides and syncs in both directions
@@ -684,11 +765,13 @@ For rsync-like speed without verification: `sy --mode fast`
   - Clear error messages for invalid strategies or percentages
 
 ### Performance
+
 - Bidirectional sync: Minimal overhead vs unidirectional (<5% for no conflicts)
 - Parallel scanning: Source and dest can be scanned in parallel (future)
 - State caching: SQLite queries optimized with indexes
 
 ### Implementation
+
 - 4 new modules: state DB, change classifier, conflict resolver, sync engine
 - ~2,000 lines of production code
 - 32 new unit tests (all passing)
@@ -696,6 +779,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - Comprehensive design documentation in `docs/architecture/`
 
 ### Notes
+
 - Bidirectional sync currently supports local→local paths only
 - Remote support (SSH) deferred to future version
 - Based on rclone bisync approach (snapshot-based state tracking)
@@ -704,6 +788,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.42] - 2025-10-23
 
 ### Added
+
 - **SSH Connection Pooling** - True parallel SSH transfers
   - Connection pool with N sessions for N workers (`--parallel` flag)
   - Round-robin session distribution via atomic counter
@@ -713,7 +798,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - 5 new unit tests for atomicity and round-robin logic
 
 - **SSH Sparse File Transfer** - Automatic bandwidth optimization
-  - Auto-detection of sparse files on Unix (blocks*512 < file_size)
+  - Auto-detection of sparse files on Unix (blocks\*512 < file_size)
   - Transfers only data regions, skips holes (zeros)
   - 10x bandwidth savings for VM images (e.g., 10GB → 1GB)
   - 5x bandwidth savings for database files (e.g., 100GB → 20GB)
@@ -737,6 +822,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Test coverage increased: 355 → 385 tests (378 passing + 7 ignored)
 
 ### Performance
+
 - SSH transfers: True parallel throughput with connection pooling
 - Sparse files: Up to 10x faster transfers for VM images and databases
 - No regressions in existing functionality
@@ -744,6 +830,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.22] - 2025-10-15
 
 ### Added - Phase 9 (Developer Experience)
+
 - **Hooks system** - Pre/post sync extensibility
   - Pre-sync hook: `~/.config/sy/hooks/pre-sync.sh`
   - Post-sync hook: `~/.config/sy/hooks/post-sync.sh`
@@ -765,6 +852,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Clearer visual confirmation of what would happen
 
 ### Added - Phase 10 (Cloud Era)
+
 - **S3 transport** - Full AWS S3 and S3-compatible service support
   - Syntax: `sy /local s3://bucket/path`
   - Query params: `s3://bucket/path?region=us-west-2&endpoint=https://...`
@@ -785,6 +873,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - 7 comprehensive path parsing tests
 
 ### Added - Phase 11 (Scale)
+
 - **Incremental scanning** - Cache-based skip logic for faster re-syncs
   - Directory mtime cache to detect unchanged directories
   - File metadata cache (path, size, mtime, is_dir)
@@ -807,12 +896,14 @@ For rsync-like speed without verification: `sy --mode fast`
   - Dramatically faster re-syncs for unchanged datasets
 
 ### Performance
+
 - **Incremental scanning**: 1.67-1.84x speedup measured on small datasets
 - **Expected scaling**: 10-100x speedup on large datasets (>10k files)
 - **Memory efficiency**: Bloom filter uses ~1.2MB for 1M files vs ~100MB for HashSet
 - **S3 multipart**: Handles files of any size efficiently
 
 ### Technical
+
 - Added DirectoryCache v2 with file metadata storage
 - Added CachedFile struct (path, size, modified, is_dir)
 - Extended scale.rs with FileSetBloom for deletion planning
@@ -823,6 +914,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - Total tests: 289 passing (282 unit + 18 integration + 7 performance)
 
 ### Roadmap Status
+
 - ✅ Phase 9 complete: Developer Experience
 - ✅ Phase 10 complete: Cloud Era (S3 support)
 - ✅ Phase 11 complete: Scale optimizations
@@ -831,6 +923,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.21] - 2025-10-13
 
 ### Added
+
 - **xxHash3 wrapper for fast file verification** - Complete ChecksumType::Fast implementation
   - XxHash3Hasher module with hash_file(), hash_data(), new_hasher() methods
   - ~10x faster than BLAKE3 for non-cryptographic checksums
@@ -838,6 +931,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Full test coverage (12 new tests including known hash regression test)
 
 ### Fixed
+
 - **Remote file update detection** - CRITICAL bug fix enabling automatic delta sync
   - Problem: Remote files always treated as "create" instead of "update"
   - Root cause: SshTransport.metadata() couldn't return std::fs::Metadata for remote files
@@ -848,11 +942,13 @@ For rsync-like speed without verification: `sy --mode fast`
   - **Impact: 98% bandwidth savings** (50MB file, 1MB modified → only ~1MB transferred)
 
 ### Performance
+
 - Delta sync now automatically triggers for remote file updates
 - Test results: 50MB file with 1MB change transferred only 1MB (49MB saved)
 - xxHash3 checksums: 10x faster than BLAKE3 for fast verification mode
 
 ### Technical
+
 - Added src/integrity/xxhash3.rs module
 - FileInfo struct in transport::mod (transport-agnostic metadata)
 - SshTransport.file_info() uses SFTP stat() for remote file metadata
@@ -860,6 +956,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - Test count: 251 passing (+12 integrity tests)
 
 ### Added (Phase 6 Complete)
+
 - **Full metadata preservation over SSH** - Extended transport protocol
   - FileEntryJson now includes: symlinks, hardlinks, sparse files, xattrs, ACLs
   - sy-remote serializes complete metadata with base64 encoding for xattrs
@@ -889,6 +986,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Total tests: 210 (all passing, zero warnings on lib)
 
 ### Planned for v0.1.0
+
 - Network speed detection
 - Parallel chunk transfers (within single files)
 - Periodic checkpointing during sync (infrastructure ready)
@@ -896,6 +994,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.13] - 2025-10-06
 
 ### Added
+
 - **Resume support** - Automatic recovery from interrupted syncs
   - Loads `.sy-state.json` from destination on startup
   - Checks flag compatibility (delete, exclude, size filters)
@@ -905,10 +1004,12 @@ For rsync-like speed without verification: `sy --mode fast`
   - Example: Interrupt sync with Ctrl+C, re-run same command to resume
 
 ### Changed
+
 - `--resume` flag now functional (default: true)
 - Resume state tracks sync flags for compatibility checking
 
 ### Technical
+
 - ResumeState integration in SyncEngine
 - Thread-safe state management with Arc<Mutex>
 - Completed file filtering before task planning
@@ -916,6 +1017,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - All 111 tests passing
 
 ### Known Limitations
+
 - Periodic checkpointing (saving state during sync) not yet implemented
 - State only cleaned up on full sync completion
 - Resume infrastructure complete, periodic saves deferred to future release
@@ -923,6 +1025,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.12] - 2025-10-06
 
 ### Added
+
 - **Watch mode** - Continuous file monitoring for real-time sync
   - `--watch` flag enables watch mode
   - Initial sync on startup, then monitors for changes
@@ -933,6 +1036,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Example: `sy /src /dst --watch`
 
 ### Technical
+
 - Added notify 6.0 dependency for file watching
 - Added tokio "signal" feature for Ctrl+C handling
 - WatchMode struct in src/sync/watch.rs
@@ -940,11 +1044,13 @@ For rsync-like speed without verification: `sy --mode fast`
 - All 111 tests passing (+2 watch mode tests)
 
 ### Documentation
+
 - PHASE4_DESIGN.md includes complete watch mode spec
 
 ## [0.0.11] - 2025-10-06
 
 ### Added
+
 - **JSON output mode** - Machine-readable NDJSON format for scripting
   - `--json` flag emits newline-delimited JSON events
   - Events: start, create, update, skip, delete, summary
@@ -963,21 +1069,25 @@ For rsync-like speed without verification: `sy --mode fast`
   - Implementation deferred to future release
 
 ### Changed
+
 - Source and destination paths now optional when using `--profile`
 - Logging level ERROR when `--json` mode active
 - Enhanced CLI validation for profile-only modes
 
 ### Technical
+
 - Added toml and chrono dependencies
 - Config loading with XDG Base Directory compliance
 - Profile merging logic in main.rs
 - All 109 tests passing
 
 ### Documentation
+
 - Created PHASE4_DESIGN.md (644 lines) with complete Phase 4 spec
 - Updated MODERNIZATION_ROADMAP.md with v1.0 timeline
 
 ### Planned for v0.5.0
+
 - Multi-layer checksums (BLAKE3 end-to-end)
 - Verification modes (fast, standard, paranoid)
 - Atomic operations
@@ -986,6 +1096,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.10] - 2025-10-06
 
 ### Added
+
 - **Parallel checksum computation** - 2-4x faster on large files
   - Uses rayon for multi-threaded block processing
   - Each thread opens independent file handle for parallel I/O
@@ -1016,6 +1127,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Colors automatically disable in non-TTY environments
 
 ### Changed
+
 - Buffer sizes increased from 128KB → 256KB (20-30% improvement)
   - Applied across SSH transport, local transport, and delta generator
   - Optimized for modern network hardware
@@ -1027,6 +1139,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Updated DESIGN.md with accurate performance numbers
 
 ### Fixed
+
 - **Zero dead code warnings** - All compression helper functions now used
   - Properly marked public APIs used by binaries
   - Clean build with zero warnings
@@ -1036,6 +1149,7 @@ For rsync-like speed without verification: `sy --mode fast`
   - Impact: Only changed data transferred (1% change = 1% transfer)
 
 ### Performance
+
 - **Parallel checksums**: 2-4x faster on large files (rayon)
 - **Delta compression**: 5-10x smaller transfers (Zstd on JSON)
 - **Buffer optimization**: 20-30% throughput improvement
@@ -1043,12 +1157,14 @@ For rsync-like speed without verification: `sy --mode fast`
 - **SSH keepalive**: Prevents timeout-related failures
 
 ### Technical
+
 - Added rayon dependency for parallel processing
 - Binary-safe stdin streaming for compressed data
 - Zstd magic header detection (0x28, 0xB5, 0x2F, 0xFD)
 - All 92 tests passing with zero warnings
 
 ### Documentation
+
 - Updated PERFORMANCE_ANALYSIS.md with completed optimizations
 - Documented compression benchmarks: Zstd L3 at 8.7 GB/s
 - Added TODO markers for future full file compression
@@ -1056,6 +1172,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.9] - 2025-10-02
 
 ### Added
+
 - Delta sync metrics and progress visibility
   - Progress messages now show compression ratio (e.g., "delta: 2.4% literal")
   - TransferResult includes delta operations count and literal bytes transferred
@@ -1083,10 +1200,12 @@ For rsync-like speed without verification: `sy --mode fast`
   - Clear visual confirmation that nothing was modified
 
 ### Changed
+
 - Error messages now include helpful context and resolution steps
 - Summary output formatting improved with better alignment and visual sections
 
 ### Testing
+
 - Added comprehensive delta sync benchmarks
   - Small change benchmarks (10MB, 50MB, 100MB files)
   - Delta sync vs full copy comparison
@@ -1095,24 +1214,29 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.8] - 2025-10-02
 
 ### Added
+
 - Single file sync support (not just directories)
 - Configurable parallel workers via `-j` flag (default 10)
 - Size-based local delta heuristic (>1GB files automatically use delta sync)
 
 ### Changed
+
 - Implemented `FromStr` trait for `Compression` enum (more idiomatic)
 - Replaced `or_insert_with(Vec::new)` with `or_default()` (more idiomatic)
 - Removed redundant closures in transport layer
 - Delta sync now activates automatically for large local files (>1GB threshold)
 
 ### Fixed
+
 - All clippy warnings resolved (7 warnings → 0)
 - Code is now fully idiomatic Rust
 
 ### Performance
+
 - Local delta sync enabled for large files where benefit outweighs overhead
 
 ### Testing
+
 - Updated integration test to validate single file sync
 - All 193 tests passing
 - Zero compiler and clippy warnings
@@ -1120,15 +1244,18 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.7] - 2025-10-01
 
 ### Added
+
 - Comprehensive compression module (LZ4 + Zstd, ready for integration)
 - Smart compression heuristics (skips small files <1MB and pre-compressed formats)
 - Extension detection for 30+ pre-compressed formats (jpg, mp4, zip, pdf, etc.)
 
 ### Testing
+
 - 11 compression tests added (roundtrip validation, ratio verification)
 - Total test count: 182 tests
 
 ### Technical
+
 - LZ4 compression: ~400-500 MB/s throughput
 - Zstd compression: Better ratio (level 3, balanced)
 - Format detection prevents double-compression
@@ -1136,38 +1263,45 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.6] - 2025-10-01
 
 ### Added
+
 - Streaming delta generation with constant ~256KB memory usage
 - Delta sync now works with files of any size without memory constraints
 - Integration with SSH transport for remote delta sync
 
 ### Performance
+
 - **Memory improvement**: 10GB file uses 256KB instead of 10GB RAM (39,000x reduction)
 - Constant memory usage regardless of file size
 
 ### Testing
+
 - Streaming delta generation validated
 - Total test count: 171 tests
 
 ## [0.0.5] - 2025-09-30
 
 ### Fixed
+
 - **CRITICAL**: Fixed O(n) rolling hash bug
   - Root cause: Using `Vec::remove(0)` which is O(n), not O(1)
   - Solution: Removed unnecessary `window` field from `RollingHash` struct
   - Impact: 6124x performance improvement in rolling hash operations
 
 ### Performance
+
 - Verified true O(1) performance: 2ns per operation across all block sizes
 - Rolling hash now truly constant time (not dependent on block size)
 - Benchmarks confirm consistent 2ns for 4KB, 64KB, and 1MB blocks
 
 ### Documentation
+
 - Added detailed optimization history in `docs/OPTIMIZATIONS.md`
 - Documented the O(n) bug and its fix with benchmarks
 
 ## [0.0.4] - 2025-09-30
 
 ### Added
+
 - Parallel file transfers (5-10x speedup for multiple files)
 - Thread-safe statistics tracking with `Arc<Mutex<>>`
 - Semaphore-based concurrency control
@@ -1175,16 +1309,19 @@ For rsync-like speed without verification: `sy --mode fast`
 - `--parallel` / `-j` flag to control worker count (default: 10)
 
 ### Changed
+
 - SyncEngine now executes file operations in parallel
 - Progress bar updates from multiple threads safely
 - Statistics accumulated across parallel workers
 
 ### Performance
+
 - 5-10x speedup for syncing multiple files
 - Semaphore prevents resource exhaustion
 - Configurable parallelism for different workloads
 
 ### Testing
+
 - Validated parallel execution correctness
 - Thread-safe statistics verified
 - Total test count: 160 tests
@@ -1192,6 +1329,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ## [0.0.3] - 2025-09-29
 
 ### Added
+
 - **Delta Sync Implementation** - Full rsync algorithm for efficient file updates
   - Adler-32 rolling hash for fast block matching
   - xxHash3 strong checksums for block verification
@@ -1208,6 +1346,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - `sync_file_with_delta()` method in Transport trait
 
 ### Changed
+
 - File updates now use delta sync instead of full copy when beneficial
 - Transferrer now calls `sync_file_with_delta()` for file updates
 - SyncEngine now generic over Transport trait
@@ -1216,6 +1355,7 @@ For rsync-like speed without verification: `sy --mode fast`
 - Module structure: added `mod delta;` to binary crate
 
 ### Fixed
+
 - SSH session blocking mode issue (handshake failures)
 - Cargo module resolution issue preventing delta module access
 - Edge case: Block count calculation for partial blocks
@@ -1223,17 +1363,20 @@ For rsync-like speed without verification: `sy --mode fast`
 - Update action now properly detected for existing files
 
 ### Performance
+
 - **50MB file with 1KB change**: Delta sync transfers only changed blocks (0.0% literal data)
 - **Bandwidth savings**: Dramatically reduced for incremental updates
 - Delta sync enabled for all remote operations by default
 
 ### Testing
+
 - Added 21 delta sync tests
 - Tests cover: block size, rolling hash, checksums, delta generation, delta application
 - End-to-end validation for local and remote scenarios
 - Total test count: 64 tests
 
 ### Technical
+
 - **Delta Module Structure**:
   - `delta/mod.rs` - Block size calculation
   - `delta/rolling.rs` - Adler-32 rolling hash
@@ -1244,12 +1387,14 @@ For rsync-like speed without verification: `sy --mode fast`
 - **Hash Map Lookup**: O(1) weak hash lookup, strong hash verification on collision
 
 ### Dependencies
+
 - Added async-trait, tokio, ssh2, serde_json, tempfile
 - Added whoami, dirs, regex for SSH config parsing
 
 ## [0.0.2] - 2025-09-28
 
 ### Added
+
 - Streaming file transfers with fixed memory usage (128KB chunks)
 - xxHash3 checksum calculation for all file transfers
 - Checksum logging in debug mode for verification
@@ -1258,20 +1403,24 @@ For rsync-like speed without verification: `sy --mode fast`
 - Async Transport trait for future SSH/SFTP support
 
 ### Changed
+
 - LocalTransport now uses buffered streaming instead of `fs::copy()`
 - Memory usage is now constant regardless of file size
 
 ### Fixed
+
 - OOM issues with large files (>1GB) resolved
 - All file transfers now verifiable via checksums
 
 ### Performance
+
 - Constant memory usage for files of any size
 - Efficient streaming with 128KB buffer
 
 ## [0.0.1] - 2025-09-27
 
 ### Added
+
 - **Core Functionality**
   - Basic local directory synchronization
   - File comparison using size + mtime (1s tolerance)
@@ -1321,17 +1470,20 @@ For rsync-like speed without verification: `sy --mode fast`
   - Inline code documentation
 
 ### Performance
+
 - **100 files**: 40-79% faster than rsync/cp
 - **Large files (50MB)**: 64x faster than rsync, 7x faster than cp
 - **Idempotent sync**: 4.7x faster than rsync
 - **1000 files**: 40-47% faster than alternatives
 
 ### Technical Details
+
 - **Architecture**: Scanner → Strategy → Transfer → Engine
 - **Dependencies**: walkdir, ignore, clap, indicatif, tracing, thiserror, anyhow
 - **Code Quality**: All clippy warnings fixed, formatted with rustfmt
 
 ### Known Limitations
+
 - Phase 1 only supports local sync (no network/SSH)
 - No delta sync (copies full files)
 - No compression
@@ -1342,6 +1494,7 @@ For rsync-like speed without verification: `sy --mode fast`
 ---
 
 **Key Milestones:**
+
 - ✅ Phase 1: MVP (v0.0.1) - Basic local sync
 - ✅ Phase 2: Network + Delta (v0.0.2-v0.0.3) - SSH transport + rsync algorithm
 - ✅ Phase 3: Parallelism + Optimization (v0.0.4-v0.0.9) - Parallel transfers + UX polish
