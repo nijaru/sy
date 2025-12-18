@@ -84,12 +84,13 @@
 - Benchmark infrastructure: JSONL tracking, automated comparison
 - Delta pipelining: Batch CHECKSUM_REQ/RESP, parallel delta computation, batch DELTA_DATA/FILE_DONE
 - Server-side: Rayon parallel checksums, concurrent request handling with channels, batched flushes
+- Checkpoint default 10→100: Reduced resume state overhead for initial sync
 
 ## What Didn't Work
 
 - SSH incremental: 1.3-1.5x slower than rsync (protocol/network latency, not CPU)
 - Server-side parallelism: Implemented but didn't close gap - bottleneck is latency, not processing
-- Initial sync for many small files: rsync wins by 1.4-1.5x
+- Initial sync for many small files: rsync wins by 1.2-1.5x (sy: 0.7s sys, rsync: 0.2s sys - per-file xattr operations)
 - UX: Stack traces shown on normal validation errors
 
 ## Recent Releases
