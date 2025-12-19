@@ -2,32 +2,32 @@
 
 > Modern file synchronization tool - rsync, reimagined
 
-**sy** (pronounced "sigh") is a fast, modern file synchronization tool with optional integrity verification.
-
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Performance
+## Quick Start
 
-**sy wins:**
+```bash
+sy /source /destination
+```
 
-- Incremental/delta sync: **3x faster**
-- Large files: **40x+ faster** (COW reflinks on APFS/BTRFS)
-- Mixed workloads: **2x faster**
-- Bulk SSH transfers: **2-4x faster**
+That's it. Use `sy --help` for options.
 
-**rsync wins:**
+## When to Use sy
 
-- Initial sync of many small files: ~1.3x faster
-- SSH incremental: ~1.3x faster
+**sy excels at:**
 
-> **Note:** After the first sync, sy is 3x faster on subsequent runs. The initial overhead pays off quickly.
+- Repeated syncs (backups, deployments) — 3x faster after first run
+- Large files on APFS/BTRFS/XFS — 40x+ faster via COW reflinks
+- Mixed workloads — 2x faster
+- Bulk SSH transfers — 2-4x faster
 
-## Why sy?
+**rsync is better for:**
 
-- Optional integrity verification (`--verify` for xxHash3)
-- Simpler CLI with sensible defaults
-- Progress, dry-run, and resume out of the box
+- First-time sync of many small files — ~1.3x faster
+- SSH incremental updates — ~1.3x faster
+
+**Bottom line:** If you sync the same paths repeatedly, sy saves time. If you're doing one-off copies of thousands of tiny files, rsync is faster.
 
 ## Installation
 
@@ -43,10 +43,9 @@ brew install sy
 ```bash
 cargo install sy
 
-# With optional features
-cargo install sy --features acl         # ACL preservation (requires libacl on Linux)
-cargo install sy --features s3          # S3 support
-cargo install sy --features acl,s3      # Both features
+# Optional features
+cargo install sy --features acl    # ACL preservation (Linux: requires libacl)
+cargo install sy --features s3     # S3 support (experimental)
 ```
 
 ### From Source
@@ -57,130 +56,60 @@ cd sy
 cargo install --path .
 ```
 
-**Build requirements:**
-
-- Rust toolchain (any recent stable version)
-- Linux only: For ACL support (`--features acl`), install `libacl1-dev` (Debian/Ubuntu) or `libacl-devel` (Fedora/RHEL)
-- macOS: ACL support works out of the box (native support)
-
 **For SSH sync:** Install sy on both local and remote machines.
-
-## Quick Start
-
-```bash
-sy /source /destination
-```
-
-That's it. Use `sy --help` for options.
-
-> **Directory behavior:** sy follows rsync semantics - `/source` copies the directory, `/source/` copies contents only.
 
 ## Examples
 
-### Backup & Sync
-
 ```bash
-sy ~/project ~/backup                    # Basic backup
-sy ~/src ~/dest --delete                 # Mirror (delete extra files)
-sy ~/src ~/dest --verify                 # Verify after write (xxHash3)
-sy ~/backup ~/original --verify-only     # Audit existing files
+# Basic
+sy ~/project ~/backup                    # Local backup
+sy ~/src ~/dest --delete                 # Mirror (remove extra files)
 sy /source /dest --dry-run               # Preview changes
-```
 
-### Remote Sync
-
-```bash
+# Remote
 sy /local user@host:/remote              # SSH sync
-sy /large user@host:/backup --bwlimit 1MB
-sy /local s3://bucket/path               # S3 sync
-```
+sy /local user@host:/backup --bwlimit 1MB
 
-### Advanced
+# Verification
+sy ~/src ~/dest --verify                 # Verify writes (xxHash3)
+sy ~/backup ~/original --verify-only     # Audit existing files
 
-```bash
-sy ~/src ~/dest --exclude "*.log"        # With filters
-sy ~/dev /backup --watch                 # Continuous sync
+# Filters
+sy ~/src ~/dest --exclude "*.log"
+sy ~/src ~/dest --gitignore --exclude-vcs
+
+# Advanced
 sy --bidirectional /laptop /backup       # Two-way sync
-sy ~/src ~/dest -u                       # Skip files where dest is newer
-sy ~/src ~/dest --ignore-existing        # Skip files that already exist
-sy ~/src ~/dest --gitignore              # Respect .gitignore rules
-sy ~/src ~/dest --gitignore --exclude-vcs # Developer workflow (no .git, respect .gitignore)
-sy ~/src ~/dest -j 1                     # Sequential mode (many tiny files)
+sy ~/dev /backup --watch                 # Continuous sync
+sy ~/src ~/dest -j 1                     # Sequential (many tiny files)
 ```
 
-### S3 & Cloud Storage
-
-sy supports AWS S3 and compatible services (Cloudflare R2, Backblaze B2, Wasabi, MinIO).
-
-**Authentication:**
-Standard AWS environment variables are supported:
-
-```bash
-export AWS_ACCESS_KEY_ID="your-key-id"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export AWS_REGION="us-east-1"
-```
-
-**Usage:**
-
-```bash
-# Basic S3 sync
-sy /local/path s3://my-bucket/backups
-
-# With custom region
-sy /local/path s3://my-bucket/backups?region=eu-central-1
-
-# With custom endpoint (e.g., Cloudflare R2)
-sy /local/path s3://my-bucket/backups?endpoint=https://<accountid>.r2.cloudflarestorage.com
-```
+> **Trailing slash:** sy follows rsync semantics — `/source` copies the directory, `/source/` copies contents only.
 
 ## Features
 
-**Core Performance:**
-
-- Parallel transfers and checksums
-- Delta sync (rsync algorithm, O(1) memory)
-- Checksum database (10-100x faster re-syncs)
-- Compression auto-detection
-- Sparse file optimization
-
-**Transports:**
-
-- Local filesystem
-- SSH (requires sy on remote)
-- S3/cloud storage support (AWS S3, Cloudflare R2, Backblaze B2)
-
-**Reliability:**
-
-- Optional integrity verification (xxHash3 via `--verify`)
-- Atomic operations
-- Resume support
-- Dry-run and verify-only modes
-
-**Advanced:**
-
-- Bidirectional sync with conflict resolution
-- Watch mode for continuous sync
-- Rsync-style filters and .gitignore support
-- Hooks, JSON output, config profiles
-- Metadata preservation (symlinks, ACLs, xattrs)
+- **Delta sync** — Only transfers changed bytes (rsync algorithm)
+- **Parallel transfers** — Configurable worker count (`-j`)
+- **Resume support** — Automatically resumes interrupted syncs
+- **Integrity verification** — Optional xxHash3 checksums (`--verify`)
+- **Bidirectional sync** — Two-way sync with conflict resolution
+- **Watch mode** — Continuous file monitoring
+- **SSH transport** — Binary protocol, faster than SFTP for bulk transfers
+- **S3 support** — AWS S3, Cloudflare R2, Backblaze B2 (experimental)
+- **Metadata preservation** — Symlinks, permissions, xattrs, ACLs
 
 ## Platform Support
 
-- ✅ **macOS**: Fully tested
-- ✅ **Linux**: Fully tested
-- ⚠️ **Windows**: Untested (should compile)
+| Platform | Status                    |
+| -------- | ------------------------- |
+| macOS    | Fully tested              |
+| Linux    | Fully tested              |
+| Windows  | Untested (should compile) |
 
 ## Contributing
 
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Interested in:
-
-- Windows testing
-- Performance profiling
-- Real-world feedback
-
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
