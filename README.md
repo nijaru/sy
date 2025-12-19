@@ -12,7 +12,7 @@
 **sy wins:**
 
 - Incremental/delta sync: **3x faster**
-- Large files: **8x faster** (COW reflinks on APFS/BTRFS)
+- Large files: **7x faster** (COW reflinks on APFS/BTRFS)
 - Bulk SSH transfers: **2-4x faster**
 
 **rsync wins:**

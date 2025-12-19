@@ -115,8 +115,6 @@ sy is intentionally NOT a drop-in rsync replacement. Key differences:
 | Resume       | Manual        | Automatic | Handles interruptions     |
 | `-b` flag    | Backup        | (removed) | Conflict avoidance        |
 
-For rsync-like speed without verification: `sy --mode fast`
-
 ## [0.0.65] - 2025-11-25
 
 ### Fixed
