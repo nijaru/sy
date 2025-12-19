@@ -39,8 +39,9 @@ Profiled xattr stripping on macOS:
 | Scenario                    | sy vs rsync        |
 | --------------------------- | ------------------ |
 | Local incremental/delta     | **sy 3x faster**   |
-| Local large files           | **sy 7x faster**   |
-| Local small files (initial) | **sy ~10% faster** |
+| Local large files           | **sy 44x faster**  |
+| Local small files (initial) | rsync 1.3x faster  |
+| Mixed workloads             | **sy 2.3x faster** |
 | Bulk SSH transfers          | **sy 2-4x faster** |
 | SSH incremental/delta       | rsync 1.3x faster  |
 

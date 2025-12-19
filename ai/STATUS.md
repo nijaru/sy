@@ -14,9 +14,10 @@
 
 | Scenario           | Initial     | Incremental | Delta       |
 | ------------------ | ----------- | ----------- | ----------- |
-| small_files (1000) | **sy ~par** | **sy 3x**   | **sy 3x**   |
-| large_file (100MB) | **sy 7x**   | **sy 1.5x** | **sy 1.1x** |
-| source_code (5000) | rsync 2.1x  | **sy 3.5x** | **sy 3.6x** |
+| small_files (1000) | rsync 1.3x  | **sy 2.9x** | **sy 3.1x** |
+| large_file (100MB) | **sy 44x**  | **sy 1.2x** | **sy 1.6x** |
+| mixed (505)        | **sy 2.3x** | **sy 2.5x** | **sy 2.4x** |
+| source_code (5000) | rsync 1.2x  | **sy 3.2x** | **sy 3.4x** |
 
 ### SSH (Mac → Fedora via Tailscale) - After pipelining (2025-12-18)
 
@@ -29,11 +30,11 @@
 
 ### Key Findings
 
-1. **Local incremental/delta**: sy wins massively (3-3.6x faster)
-2. **Local large files**: sy wins 7x on initial
-3. **SSH initial**: sy wins for bulk transfers (2-4x), except many small files
-4. **SSH incremental/delta**: Still ~1.3-1.4x slower (inherent protocol overhead)
-5. **Pipelining impact**: mixed/delta improved from 1.44x slower to ~par with rsync
+1. **Local incremental/delta**: sy wins massively (2.9-3.4x faster)
+2. **Local large files**: sy wins 44x on initial (COW/clonefile on APFS)
+3. **Local initial many files**: rsync wins 1.2-1.3x (parallelism overhead)
+4. **SSH initial**: sy wins for bulk transfers (2-4x), except many small files
+5. **SSH incremental/delta**: Still ~1.3-1.4x slower (inherent protocol overhead)
 
 ## Active Work
 
