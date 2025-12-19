@@ -21,6 +21,8 @@
 - Initial sync of many small files: ~1.3x faster
 - SSH incremental: ~1.3x faster
 
+> **Note:** After the first sync, sy is 3x faster on subsequent runs. The initial overhead pays off quickly.
+
 ## Why sy?
 
 - Optional integrity verification (`--verify` for xxHash3)
