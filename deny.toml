@@ -4,7 +4,8 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+# RUSTSEC-2025-0119: number_prefix unmaintained (transitive via indicatif)
+ignore = ["RUSTSEC-2025-0119"]
 
 [licenses]
 allow = [
