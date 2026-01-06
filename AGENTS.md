@@ -7,7 +7,7 @@ Fast, modern file synchronization tool written in Rust - a reimagining of rsync 
 **For AI agents:**
 
 1. Read `ai/STATUS.md` (current state)
-2. Check tasks: `bd ready` or `ai/TODO.md`
+2. Check tasks: `ai/TODO.md`
 3. Reference `ai/DESIGN.md` for architecture
 4. Reference `ai/DECISIONS.md` for rationale
 
@@ -56,7 +56,7 @@ sy/
 - `ai/design/` — Component specifications
 - `ai/tmp/` — Temporary artifacts (gitignored)
 
-**Task tracking**: Beads (`bd`) preferred, `ai/TODO.md` fallback
+**Task tracking**: `ai/TODO.md`
 
 ## Commands
 

@@ -14,7 +14,6 @@ exclude = [
     "scripts/",
     "man/",
     "templates/",
-    ".beads/",
     ".claude/",
     ".github/",
     "benches/",
