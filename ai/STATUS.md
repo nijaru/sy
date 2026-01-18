@@ -38,49 +38,24 @@
 
 ## Active Work
 
-**2026-01-18: Gemini handoff prepared for v0.2.1 bug fixes**
+**2026-01-18: v0.2.1 critical bug fixes completed**
 
-Handoff document: `ai/prompts/gemini-handoff.md`
+Critical bugs fixed:
+1. `content_equal()` now compares both size and mtime to prevent data loss.
+2. SSH `ConnectionPool` now recovers from poisoned locks instead of panicking.
+3. `SystemTime` unwrap panic in `resolver.rs` fixed by using `unwrap_or_default()`.
+4. Dead retry code removed from `retry.rs`.
 
-**Critical bugs to fix (v0.2.1)**:
-
-1. `content_equal()` compares size only → data loss risk (`bisync/classifier.rs:226`)
-2. Lock `expect()` panics → crash mid-sync (`transport/ssh.rs:172,225,240,248`)
-3. SystemTime unwrap panic (`bisync/resolver.rs:231`)
-4. Dead retry code (`retry.rs:107-121`)
-
-**Review completed** - see `ai/review/` for detailed findings.
-
-**PR #13 status**: AI-generated, quality unverified. Do not merge or cherry-pick. Use as reference only if needed.
-
-**Branches cleaned**: All old branches deleted, only `main` remains.
-
-**Previous work (2025-12-18)**:
-
-- Pipelined delta checksum requests (sy-09r)
-- Server-side parallelism: rayon parallel checksums, concurrent request handling, batched flushes
-
-**Investigation result**: Server-side optimizations didn't close SSH incremental gap. Bottleneck is network latency, not CPU.
-
-**SSH performance options** (v0.3.0):
-
-1. Daemon mode - eliminates 2.5s startup overhead
-2. Adaptive pipeline depth - adjust based on RTT
-3. Zero-copy with Arc<[u8]> - stop cloning file data
-4. Stream-level compression
-
-**Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
-
-**Community request**: [Issue #12](https://github.com/nijaru/sy/issues/12) - `--one-file-system`, SSH args, `--numeric-ids`
+**Next Focus**: v0.2.2 (Cloud Storage + Code Quality)
 
 ## Roadmap
 
-### v0.2.1 (Critical Bug Fixes)
+### v0.2.1 (Critical Bug Fixes) - COMPLETED 2026-01-18
 
-- [ ] Fix `content_equal()` data loss bug - compare mtime when sizes match
-- [ ] Fix lock `expect()` panics - recover from poisoned locks
-- [ ] Fix SystemTime unwrap panic in conflict resolution
-- [ ] Remove dead retry code (retry.rs:107-121)
+- [x] Fix `content_equal()` data loss bug - compare mtime when sizes match
+- [x] Fix lock `expect()` panics - recover from poisoned locks
+- [x] Fix SystemTime unwrap panic in conflict resolution
+- [x] Remove dead retry code (retry.rs:107-121)
 
 ### v0.2.2 (Cloud Storage + Code Quality)
 
