@@ -38,9 +38,11 @@
 
 ## Active Work
 
-**2026-01-18: v0.2.1 in progress**
+**2026-01-18: Streaming protocol rewrite planned**
 
-Bug fixes and cloud storage improvements. All uncommitted changes on `fix/v0.2.1-bugs` branch.
+Full protocol rewrite authorized. See `ai/design/streaming-protocol-v0.3.0.md`.
+
+v0.2.1 bug fixes are on `fix/v0.2.1-bugs` branch (uncommitted).
 
 ## Roadmap
 
@@ -65,19 +67,37 @@ Bug fixes and cloud storage improvements. All uncommitted changes on `fix/v0.2.1
 - [ ] Add GCS transport implementation (use `object_store` crate)
 - [ ] Fix sparse file lseek error handling
 
-### v0.3.0 (SSH Performance)
+### v0.3.0 (Streaming Protocol Rewrite) - See `ai/design/streaming-protocol-v0.3.0.md`
 
-- [ ] `Arc<[u8]>` zero-copy in server_mode.rs (-50% memory)
-- [ ] Deeper pipelining (8→64) (+20-30% throughput)
-- [ ] Adaptive pipeline depth based on RTT (+20-50% WAN)
-- [ ] Daemon mode - eliminates 2.5s startup overhead (3.5x repeated)
+Full protocol rewrite from request-response to rsync-style streaming.
+
+**Architecture:**
+
+- Three Tokio tasks: Generator → Sender → Receiver
+- Unidirectional flow, no ACKs in critical path
+- Incremental file list streaming (transfer while scanning)
+
+**Implementation Phases (4 weeks):**
+
+1. Protocol foundation (message types, channels)
+2. Generator (scanner integration)
+3. Sender (file reading, delta computation)
+4. Receiver (file writing)
+5. Integration (SSH transport)
+6. Delete + Resume
+7. Polish (compression, benchmarks)
+
+**Targets:**
+
+- SSH small_files: parity with rsync (from 1.6x slower)
+- Time to first byte: <0.5s (from 2.5s)
+- Memory (1M files): <500MB (from ~2GB)
 
 ### v0.4.0 (Code Quality)
 
 - [ ] SyncEngine builder pattern (35 params → builder)
 - [ ] Split sync_file_with_delta (475 lines → helpers)
-- [ ] Ring buffer for delta window (-30% CPU)
-- [ ] Pre-allocate protocol buffer (-20% allocations)
+- [ ] Incremental recursion (start transfer before scan)
 
 ### Backlog
 

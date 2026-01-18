@@ -208,10 +208,35 @@ impl TransportRouter {
                     "S3-to-SSH sync not yet supported",
                 )))
             }
+            #[cfg(feature = "s3")]
+            (SyncPath::Local { .. }, SyncPath::Gcs { .. })
+            | (SyncPath::Gcs { .. }, SyncPath::Local { .. }) => Err(crate::error::SyncError::Io(
+                std::io::Error::other("GCS sync not yet supported"),
+            )),
+            #[cfg(feature = "s3")]
+            (SyncPath::Gcs { .. }, SyncPath::Gcs { .. }) => Err(crate::error::SyncError::Io(
+                std::io::Error::other("GCS-to-GCS sync not yet supported"),
+            )),
+            #[cfg(feature = "s3")]
+            (SyncPath::S3 { .. }, SyncPath::Gcs { .. })
+            | (SyncPath::Gcs { .. }, SyncPath::S3 { .. }) => Err(crate::error::SyncError::Io(
+                std::io::Error::other("S3-to-GCS sync not yet supported"),
+            )),
+            #[cfg(feature = "s3")]
+            (SyncPath::Gcs { .. }, SyncPath::Remote { .. })
+            | (SyncPath::Remote { .. }, SyncPath::Gcs { .. }) => Err(crate::error::SyncError::Io(
+                std::io::Error::other("GCS-to-SSH sync not yet supported"),
+            )),
             #[cfg(not(feature = "s3"))]
             (SyncPath::S3 { .. }, _) | (_, SyncPath::S3 { .. }) => {
                 Err(crate::error::SyncError::Io(std::io::Error::other(
                     "S3 support not enabled. Reinstall with: cargo install sy --features s3",
+                )))
+            }
+            #[cfg(not(feature = "s3"))]
+            (SyncPath::Gcs { .. }, _) | (_, SyncPath::Gcs { .. }) => {
+                Err(crate::error::SyncError::Io(std::io::Error::other(
+                    "GCS support not enabled. Reinstall with: cargo install sy --features s3",
                 )))
             }
         }

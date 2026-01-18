@@ -841,13 +841,21 @@ impl SshTransport {
             let session_arc = self.connection_pool.get_session();
             let dest_clone = dest_buf.clone();
             tokio::task::spawn_blocking(move || {
-                let session = session_arc.lock().unwrap();
-                let sftp = session.sftp().unwrap();
-                let file = sftp.create(&dest_clone).unwrap();
+                let session = session_arc
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let sftp = session
+                    .sftp()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let file = sftp
+                    .create(&dest_clone)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 drop(file);
+                Ok::<(), std::io::Error>(())
             })
             .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(SyncError::Io)?;
         }
 
         let mut handles = Vec::new();
@@ -927,9 +935,16 @@ impl SshTransport {
             let session_arc = self.connection_pool.get_session();
             let dest_clone = dest_buf.clone();
             tokio::task::spawn_blocking(move || {
-                let session = session_arc.lock().unwrap();
-                let sftp = session.sftp().unwrap();
-                let mtime_secs = mtime.duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let session = session_arc
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let sftp = session
+                    .sftp()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let mtime_secs = mtime
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let _ = sftp.setstat(
                     &dest_clone,
                     ssh2::FileStat {
@@ -941,9 +956,11 @@ impl SshTransport {
                         mtime: Some(mtime_secs),
                     },
                 );
+                Ok::<(), std::io::Error>(())
             })
             .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(SyncError::Io)?;
         }
 
         Ok(TransferResult::new(file_size))

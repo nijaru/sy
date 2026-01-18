@@ -173,11 +173,11 @@ impl Transport for S3Transport {
             } else {
                 key
             };
-            let relative_path = PathBuf::from(relative_key);
+            let relative_path = Arc::new(PathBuf::from(relative_key));
 
             Ok(FileEntry {
-                path: Arc::new(PathBuf::from(key)),
-                relative_path: Arc::new(relative_path),
+                path: Arc::clone(&relative_path),
+                relative_path,
                 size,
                 modified,
                 is_dir,

@@ -1,42 +1,49 @@
 # Decisions
 
-## 2026-01-18: SSH Performance Gap Analysis
+## 2026-01-18: Full Streaming Protocol Rewrite
 
-**Context**: SSH incremental sync is ~1.3-1.4x slower than rsync despite server-side parallelism optimizations. Need to understand root cause and options.
+**Context**: SSH incremental sync is ~1.3-1.4x slower than rsync. Initial plan was incremental improvements, but analysis shows request-response model has inherent latency floor.
 
-**Analysis**: rsync's architecture is fundamentally different from sy's request-response model.
+**Analysis**: Even with depth-64 pipelining on 50ms RTT with 10,000 files:
 
-**rsync's design:**
+- sy: 156 round-trips = 7.8 seconds of pure waiting
+- rsync: ~1 round-trip = ~50ms
 
-- Three-process streaming pipeline (generator → sender → receiver)
-- Zero round-trips after initial connection
-- Incremental recursion (transfer starts before scan completes)
-- No packet framing (pure streaming)
+**Decision**: Full protocol rewrite to streaming model
 
-**sy's design:**
+**Architecture (Protocol v2):**
 
-- Request-response with pipeline depth of 8
-- Full scan before transfer
-- Per-message framing and acknowledgments
-- 2.5s startup overhead per SSH connection
+- Three Tokio tasks: Generator → Sender → Receiver
+- Unidirectional flow, no ACKs in critical path
+- Incremental file list streaming (transfer while scanning)
+- TCP handles backpressure
 
-**Decision**: Pursue incremental improvements without protocol rewrite
+**Key design choices:**
 
-**Recommended path:**
+- Tokio tasks over OS processes (lower overhead, easier error handling)
+- Stream FILE_ENTRY as scanned (no batching)
+- DELETE via hash set (O(n) memory, acceptable)
+- Checkpoint every 100 files for resume
 
-1. **Daemon mode** (from PR #13) - eliminates 2.5s startup, 3.5x faster for repeated syncs
-2. **Deeper pipelining** - increase from 8 to 64, measure impact
-3. **Adaptive pipeline** - adjust depth based on RTT measurement
-4. **Incremental recursion** - start transfer before scan completes (future)
+**Supersedes**: Earlier "incremental improvements" plan
 
-**Rejected alternative**: Full streaming model rewrite
+**Implementation**: 7 phases, ~4 weeks
 
-- Would require complete protocol redesign
-- Current protocol is well-documented and debuggable
-- rsync's protocol is "extremely difficult to document, debug or extend"
-- Incremental improvements can close most of the gap
+1. Protocol foundation
+2. Generator
+3. Sender
+4. Receiver
+5. Integration
+6. Delete + Resume
+7. Polish
 
-**References**: ai/research/rsync-ssh-performance.md, ai/DESIGN.md
+**Targets:**
+
+- SSH small_files: parity with rsync (from 1.6x slower)
+- Time to first byte: <0.5s (from 2.5s)
+- Memory (1M files): <500MB (from ~2GB)
+
+**References**: ai/design/streaming-protocol-v0.3.0.md
 
 ---
 
