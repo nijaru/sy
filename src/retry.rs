@@ -103,22 +103,6 @@ where
 
                 tokio::time::sleep(delay).await;
                 attempt += 1;
-
-                // Update attempts count for NetworkRetryable errors
-                if let SyncError::NetworkRetryable {
-                    message,
-                    max_attempts,
-                    ..
-                } = e
-                {
-                    // Create new error with updated attempt count
-                    let _updated = SyncError::NetworkRetryable {
-                        message,
-                        attempts: attempt,
-                        max_attempts,
-                    };
-                    // Note: The error will be recreated on next iteration
-                }
             }
             Err(e) => {
                 // Non-retryable error, fail immediately
