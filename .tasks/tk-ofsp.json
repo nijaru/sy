@@ -11,9 +11,14 @@
   "blocked_by": [],
   "estimate": null,
   "due_date": null,
-  "logs": [],
+  "logs": [
+    {
+      "ts": "2026-01-18T21:48:41.899Z",
+      "msg": "Phase 1 complete: protocol.rs, channel.rs, mod.rs with 18 tests"
+    }
+  ],
   "created_at": "2026-01-18T21:18:42.634Z",
-  "updated_at": "2026-01-18T21:18:42.634Z",
+  "updated_at": "2026-01-18T21:48:41.899Z",
   "completed_at": null,
   "external": {}
 }

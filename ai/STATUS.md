@@ -38,11 +38,20 @@
 
 ## Active Work
 
-**2026-01-18: Streaming protocol rewrite planned**
+**2026-01-18: Streaming Protocol v2 - Phase 1 Complete**
 
-Full protocol rewrite authorized. See `ai/design/streaming-protocol-v0.3.0.md`.
+Branch: `feature/streaming-protocol-v2`
 
-v0.2.1 bug fixes are on `fix/v0.2.1-bugs` branch (uncommitted).
+Phase 1 done:
+
+- `src/streaming/protocol.rs` - 16 message types, 1340 lines
+- `src/streaming/channel.rs` - FileJob, DestIndex, channel types
+- `src/streaming/mod.rs` - Public API
+- 18 new tests passing
+
+**Implementation plan:** `ai/design/streaming-implementation-plan.md` (detailed step-by-step for any AI agent)
+
+v0.2.1 bug fixes are on `fix/v0.2.1-bugs` branch.
 
 ## Roadmap
 
@@ -67,25 +76,22 @@ v0.2.1 bug fixes are on `fix/v0.2.1-bugs` branch (uncommitted).
 - [ ] Add GCS transport implementation (use `object_store` crate)
 - [ ] Fix sparse file lseek error handling
 
-### v0.3.0 (Streaming Protocol Rewrite) - See `ai/design/streaming-protocol-v0.3.0.md`
+### v0.3.0 (Streaming Protocol Rewrite) - IN PROGRESS
 
 Full protocol rewrite from request-response to rsync-style streaming.
 
-**Architecture:**
+**Design:** `ai/design/streaming-protocol-v0.3.0.md`
+**Implementation plan:** `ai/design/streaming-implementation-plan.md`
 
-- Three Tokio tasks: Generator → Sender → Receiver
-- Unidirectional flow, no ACKs in critical path
-- Incremental file list streaming (transfer while scanning)
+**Implementation Phases:**
 
-**Implementation Phases (4 weeks):**
-
-1. Protocol foundation (message types, channels)
-2. Generator (scanner integration)
-3. Sender (file reading, delta computation)
-4. Receiver (file writing)
-5. Integration (SSH transport)
-6. Delete + Resume
-7. Polish (compression, benchmarks)
+1. [x] Protocol foundation (message types, channels) - DONE
+2. [ ] Generator (scanner integration)
+3. [ ] Sender (file reading, delta computation)
+4. [ ] Receiver (file writing)
+5. [ ] Integration (pipeline orchestration)
+6. [ ] Server integration (sy --server v2)
+7. [ ] Client integration (SSH transport)
 
 **Targets:**
 
