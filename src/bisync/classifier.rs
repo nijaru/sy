@@ -449,9 +449,12 @@ mod tests {
 
     #[test]
     fn test_create_create_same_content() {
-        // Same size = treated as same content (conservative)
-        let source = vec![make_file_entry("file.txt", 100, 0)];
-        let dest = vec![make_file_entry("file.txt", 100, 0)];
+        // Same size and mtime = treated as same content
+        let source = vec![make_file_entry("file.txt", 100, 60)];
+        let mut dest_entry = make_file_entry("file.txt", 100, 60);
+        // Ensure exact same mtime
+        dest_entry.modified = source[0].modified;
+        let dest = vec![dest_entry];
         let prior = HashMap::new();
 
         let changes = classify_changes(&source, &dest, &prior).unwrap();
