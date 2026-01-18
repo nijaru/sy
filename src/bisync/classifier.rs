@@ -229,9 +229,13 @@ fn content_equal(source: &FileEntry, dest: &FileEntry) -> Result<bool> {
         return Ok(false);
     }
 
-    // For now, assume equal if sizes match
+    // Compare mtime as well
+    if source.modified != dest.modified {
+        return Ok(false);
+    }
+
     // In future: compare checksums if available
-    // This is conservative (may miss some conflicts) but safe
+    // For now, size + mtime is a strong heuristic for equality
 
     Ok(true)
 }
@@ -364,6 +368,29 @@ mod tests {
         let changes = classify_changes(&source, &dest, &prior).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type, ChangeType::ModifiedBoth);
+    }
+
+    #[test]
+    fn test_modified_both_same_size_different_mtime() {
+        let source = vec![make_file_entry("file.txt", 100, 0)]; // Modified, now T=0
+        let dest = vec![make_file_entry("file.txt", 100, 10)]; // Modified, now T=10
+        let mut prior = HashMap::new();
+        prior.insert(
+            PathBuf::from("file.txt"),
+            (
+                Some(make_sync_state("file.txt", 100, 60, Side::Source)),
+                Some(make_sync_state("file.txt", 100, 60, Side::Dest)),
+            ),
+        );
+
+        let changes = classify_changes(&source, &dest, &prior).unwrap();
+        // Should be a conflict because they have different mtimes, even if sizes are same
+        assert_eq!(changes.len(), 1, "Should detect a change");
+        assert_eq!(
+            changes[0].change_type,
+            ChangeType::ModifiedBoth,
+            "Should be a conflict"
+        );
     }
 
     #[test]
