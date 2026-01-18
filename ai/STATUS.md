@@ -38,17 +38,42 @@
 
 ## Active Work
 
-**Completed**:
+### 2026-01-18: Codebase Review + PR #13 Evaluation
 
-- Pipelined delta checksum requests (sy-09r)
-- Server-side parallelism (2025-12-18): rayon parallel checksums, concurrent request handling, batched flushes
+**Full review completed** - see branch `review/codebase-2026-01-18` for details.
 
-**Investigation result**: Server-side optimizations implemented but didn't close SSH incremental/delta gap. The ~1.3-1.4x slowdown is inherent to protocol/network latency, not server-side CPU processing. Benchmarks confirmed performance unchanged after server parallelism.
+**Critical bugs found:**
 
-**Remaining options**:
+1. `content_equal()` compares size only → data loss risk (`bisync/classifier.rs:226`)
+2. Lock `expect()` panics → crash mid-sync (`transport/ssh.rs:172,239,248`)
 
-1. Stream-level compression (may help with large deltas)
-2. Accept the gap - sy wins locally (3x) and on bulk SSH transfers (2-4x)
+**SSH performance analysis:**
+
+- rsync uses streaming architecture (generator → sender → receiver, no round-trips)
+- sy uses request-response with pipeline depth 8
+- Gap is architectural, not fixable with server-side optimizations
+
+**PR #13 evaluation:**
+| Feature | Decision | Rationale |
+|---------|----------|-----------|
+| GCS transport | Accept | Uses object_store like S3 |
+| S3 fixes | Accept | Real bugs (env vars, paths) |
+| Daemon mode | Accept | 3.5x faster repeated syncs |
+| Python bindings | Defer | Needs library extraction |
+
+**Recommended SSH improvements:**
+
+1. Daemon mode - eliminates 2.5s startup overhead
+2. Deeper pipelining (8→64)
+3. Adaptive pipeline based on RTT
+4. Incremental recursion (future)
+
+**Previous work (2025-12-18)**:
+
+- Pipelined delta checksum requests
+- Server-side parallelism (didn't close gap - bottleneck is latency)
+
+**Open question:** Architecture conclusion based on static analysis, not runtime profiling. Should profile actual SSH sync to verify bottleneck before major changes.
 
 **Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
 
@@ -56,25 +81,25 @@
 
 ## Roadmap
 
-### v0.2.0 (SSH Performance)
+### v0.2.1 (Critical Fixes)
 
-- [x] Pipeline delta checksum requests (P0) - done
-- [x] Parallelize delta computation in batches - done
-- [x] Server-side parallelism - done (didn't close gap, inherent latency)
-- [ ] Stream-level compression after HELLO (P1)
+- [ ] Fix `content_equal()` data loss bug
+- [ ] Fix lock `expect()` panics
+- [ ] Cherry-pick GCS transport from PR #13
+- [ ] Cherry-pick S3 fixes from PR #13
 
-### v0.3.0 (UX Polish)
+### v0.3.0 (SSH Performance)
 
-- [ ] Suppress stack traces on user errors
-- [ ] Fix quiet mode (suppress all logging)
-- [ ] Document resume-enabled default
+- [ ] Daemon mode (from PR #13) - 3.5x faster repeated syncs
+- [ ] Deeper pipelining (8→64)
+- [ ] Adaptive pipeline depth based on RTT
 
 ### Backlog
 
+- [ ] Incremental recursion (transfer before scan completes)
 - [ ] Issue #12 features (`--one-file-system`, SSH args)
-- [ ] russh migration (pure Rust SSH)
-- [ ] S3 bidirectional sync
-- [ ] Windows support
+- [ ] Python bindings (after library crate extraction)
+- [ ] Stream-level compression
 
 ## What Worked
 
