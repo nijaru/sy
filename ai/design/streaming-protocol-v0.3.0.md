@@ -50,6 +50,44 @@ Pull (remote -> local):
 
 ---
 
+## Initial Exchange (Before Streaming)
+
+For delta sync to work without round-trips during transfer, the sender needs destination file checksums upfront. This happens during the HELLO exchange:
+
+### Push Flow (local → remote)
+
+```
+CLIENT (local)                    SERVER (remote)
+     |                                 |
+     |-------- HELLO (push) --------->|
+     |                                 | [scan dest]
+     |<------- DEST_FILE_ENTRY -------|  (path, size, mtime, checksums)
+     |<------- DEST_FILE_ENTRY -------|
+     |<------- DEST_FILE_END ---------|
+     |                                 |
+     | [Generator has full dest state]|
+     | [Streaming phase begins]       |
+```
+
+### Pull Flow (remote → local)
+
+```
+CLIENT (local)                    SERVER (remote)
+     |                                 |
+     |-------- HELLO (pull) --------->|
+     | [scan local dest]              |
+     |------- DEST_FILE_ENTRY ------->|  (checksums for delta)
+     |------- DEST_FILE_END --------->|
+     |                                 | [Generator has dest state]
+     |                                 | [Streaming phase begins]
+```
+
+**Key point:** The initial exchange front-loads all destination metadata including block checksums for delta candidates. After this exchange completes, the streaming phase runs without any round-trips.
+
+**Memory:** O(dest_files) for checksums. For 1M files with 64KB blocks on 1GB average file = ~16 checksums/file = ~400MB. Acceptable.
+
+---
+
 ## Protocol v2 Messages
 
 Protocol version 2. Clean break from v1 - no backward compatibility.
@@ -68,22 +106,24 @@ All multi-byte integers are big-endian. Strings are length-prefixed (u16 len + U
 
 ### Message Types
 
-| Type | Name       | Direction     | Purpose                          |
-| ---- | ---------- | ------------- | -------------------------------- |
-| 0x01 | HELLO      | bidirectional | Version/capability negotiation   |
-| 0x02 | FILE_ENTRY | G->S          | Single file metadata (streaming) |
-| 0x03 | FILE_END   | G->S          | End of file list                 |
-| 0x04 | CHECKSUM   | G->S          | Block checksums for one file     |
-| 0x05 | DATA       | S->R          | File content (full or delta)     |
-| 0x06 | DATA_END   | S->R          | End of data for one file         |
-| 0x07 | DELETE     | G->R          | File to delete                   |
-| 0x08 | DELETE_END | G->R          | End of deletes                   |
-| 0x09 | MKDIR      | G->R          | Directory to create              |
-| 0x0A | SYMLINK    | G->R          | Symlink to create                |
-| 0x0B | PROGRESS   | R->client     | Stats update (async)             |
-| 0x0C | ERROR      | any           | Non-fatal error report           |
-| 0x0D | FATAL      | any           | Fatal error, abort sync          |
-| 0x10 | DONE       | R->client     | Sync complete                    |
+| Type | Name            | Direction     | Purpose                          |
+| ---- | --------------- | ------------- | -------------------------------- |
+| 0x01 | HELLO           | bidirectional | Version/capability negotiation   |
+| 0x02 | FILE_ENTRY      | G->S          | Source file metadata (streaming) |
+| 0x03 | FILE_END        | G->S          | End of source file list          |
+| 0x04 | DEST_FILE_ENTRY | R->G          | Dest file metadata + checksums   |
+| 0x05 | DEST_FILE_END   | R->G          | End of dest file list            |
+| 0x06 | DATA            | S->R          | File content (full or delta)     |
+| 0x07 | DATA_END        | S->R          | End of data for one file         |
+| 0x08 | DELETE          | G->R          | File to delete                   |
+| 0x09 | DELETE_END      | G->R          | End of deletes                   |
+| 0x0A | MKDIR           | G->R          | Directory to create              |
+| 0x0B | SYMLINK         | G->R          | Symlink to create                |
+| 0x0C | PROGRESS        | R->client     | Stats update (async)             |
+| 0x0D | ERROR           | any           | Non-fatal error report           |
+| 0x0E | FATAL           | any           | Fatal error, abort sync          |
+| 0x0F | XATTR           | S->R          | Extended attributes for file     |
+| 0x10 | DONE            | R->client     | Sync complete                    |
 
 ### Payload Formats
 
@@ -109,49 +149,74 @@ root_path: destination path (push) or source path (pull)
 #### FILE_ENTRY (0x02)
 
 ```
-+-------------+----------+-----------+---------+----------+
-| path: str   | size: u64| mtime: i64| mode: u32| flags: u8|
-+-------------+----------+-----------+---------+----------+
-| [symlink_target: str if FLAG_SYMLINK]                   |
-+---------------------------------------------------------+
++-------------+----------+-----------+---------+-----------+----------+
+| path: str   | size: u64| mtime: i64| mode: u32| inode: u64| flags: u8|
++-------------+----------+-----------+---------+-----------+----------+
+| [symlink_target: str if FLAG_SYMLINK]                               |
+| [link_target: str if FLAG_HARDLINK]                                 |
++---------------------------------------------------------------------+
 
 flags:
   bit 0: FLAG_DIR
   bit 1: FLAG_SYMLINK
-  bit 2: FLAG_NEED_CHECKSUM (dest has file, different size/mtime)
-  bit 3: FLAG_HARDLINK
-  bit 4: FLAG_HAS_XATTRS
-  bit 5: FLAG_SPARSE
+  bit 2: FLAG_HARDLINK
+  bit 3: FLAG_HAS_XATTRS
+  bit 4: FLAG_SPARSE
 ```
 
 Generator streams these continuously as scanning proceeds. No batching, no ACK.
 
+**Note:** Receiver caches FILE_ENTRY metadata until corresponding DATA_END, then applies mtime/mode.
+
 #### FILE_END (0x03)
 
 ```
-+---------------+--------------+
++----------------+----------------+
 | total_files: u64 | total_bytes: u64 |
-+---------------+--------------+
++----------------+----------------+
 ```
 
-Signals end of file list. Sender knows no more files coming.
+Signals end of source file list. Sender knows no more files coming.
 
-#### CHECKSUM (0x04)
+#### DEST_FILE_ENTRY (0x04)
+
+Sent by Receiver during initial exchange. Includes block checksums for delta computation.
 
 ```
-+------------+------------+--------------+-------------------+
-| path: str  | block_sz: u32 | count: u32 | checksums: [...]  |
-+------------+------------+--------------+-------------------+
++-------------+----------+-----------+---------+----------+
+| path: str   | size: u64| mtime: i64| mode: u32| flags: u8|
++-------------+----------+-----------+---------+----------+
+| [checksums if FLAG_HAS_CHECKSUMS]                       |
++---------------------------------------------------------+
 
-checksum entry (24 bytes each):
-+-------------+----------+----------+-----------+
-| offset: u64 | size: u32| weak: u32| strong: u64|
-+-------------+----------+----------+-----------+
+flags:
+  bit 0: FLAG_DIR
+  bit 1: FLAG_HAS_CHECKSUMS (file is delta candidate)
+
+checksums (if FLAG_HAS_CHECKSUMS):
++---------------+-------------+-------------------+
+| block_sz: u32 | count: u32  | entries: [...]    |
++---------------+-------------+-------------------+
+
+checksum entry (20 bytes each):
++-------------+----------+----------+-------------+
+| offset: u64 | weak: u32| strong: u64            |
++-------------+----------+----------+-------------+
 ```
 
-Generator sends these for files marked FLAG_NEED_CHECKSUM. Sender uses them to compute deltas.
+Server computes checksums for files that are delta candidates (exist on dest, size > DELTA_MIN_SIZE). Generator uses these to determine which files need delta vs full transfer.
 
-#### DATA (0x05)
+#### DEST_FILE_END (0x05)
+
+```
++----------------+----------------+
+| total_files: u64 | total_bytes: u64 |
++----------------+----------------+
+```
+
+Signals end of dest file list. Initial exchange complete, streaming phase begins.
+
+#### DATA (0x06)
 
 ```
 +------------+----------+----------+--------------+
@@ -173,7 +238,7 @@ delta_ops: [
 ]
 ```
 
-#### DATA_END (0x06)
+#### DATA_END (0x07)
 
 ```
 +------------+-----------+
@@ -185,9 +250,9 @@ status:
   1: ERROR (receiver should log)
 ```
 
-Sender sends this after all DATA chunks for a file. Informational - does not block anything.
+Sender sends this after all DATA chunks for a file. Receiver applies cached mtime/mode from FILE_ENTRY.
 
-#### DELETE (0x07)
+#### DELETE (0x08)
 
 ```
 +------------+----------+
@@ -197,7 +262,7 @@ Sender sends this after all DATA chunks for a file. Informational - does not blo
 
 Generator sends after FILE_END if --delete enabled. Lists files on dest not in source.
 
-#### DELETE_END (0x08)
+#### DELETE_END (0x09)
 
 ```
 +--------------+
@@ -207,7 +272,7 @@ Generator sends after FILE_END if --delete enabled. Lists files on dest not in s
 
 End of delete list.
 
-#### MKDIR (0x09)
+#### MKDIR (0x0A)
 
 ```
 +------------+---------+
@@ -217,7 +282,7 @@ End of delete list.
 
 Generator sends as directories are discovered. Receiver creates immediately.
 
-#### SYMLINK (0x0A)
+#### SYMLINK (0x0B)
 
 ```
 +------------+--------------+
@@ -225,17 +290,17 @@ Generator sends as directories are discovered. Receiver creates immediately.
 +------------+--------------+
 ```
 
-#### PROGRESS (0x0B)
+#### PROGRESS (0x0C)
 
 ```
-+-------------+--------------+---------------+--------------+
++-------------+--------------+------------------+------------------+
 | files: u64  | bytes: u64   | files_total: u64 | bytes_total: u64 |
-+-------------+--------------+---------------+--------------+
++-------------+--------------+------------------+------------------+
 ```
 
 Receiver sends periodically (every 100 files or 10MB). Does not block sender.
 
-#### ERROR (0x0C)
+#### ERROR (0x0D)
 
 ```
 +------------+----------+--------------+
@@ -253,7 +318,7 @@ codes:
 
 Non-fatal. Logged and sync continues.
 
-#### FATAL (0x0D)
+#### FATAL (0x0E)
 
 ```
 +----------+--------------+
@@ -262,6 +327,21 @@ Non-fatal. Logged and sync continues.
 ```
 
 Abort sync immediately. Used for protocol errors, connection issues.
+
+#### XATTR (0x0F)
+
+```
++------------+------------+---------------------------+
+| path: str  | count: u16 | entries: [(name, value)]  |
++------------+------------+---------------------------+
+
+entry:
++-------------+---------------+
+| name: str   | value: bytes  |
++-------------+---------------+
+```
+
+Sent after DATA_END for files with FLAG_HAS_XATTRS. Receiver applies xattrs.
 
 #### DONE (0x10)
 
@@ -279,48 +359,63 @@ Sync complete. Receiver sends when all DATA_END received and deletes processed.
 
 ### Push Flow (local -> remote)
 
+**Phase 1: Initial Exchange**
+
 ```
 LOCAL                          SSH                           REMOTE
 +-------------------+          |           +--------------------+
 |    Generator      |          |           |     Receiver       |
-|  (Tokio task #1)  |          |           |  (Tokio task #3)   |
 +--------+----------+          |           +---------+----------+
          |                     |                     |
-         | FILE_ENTRY -------->|                     |
-         | FILE_ENTRY -------->|----------FILE_ENTRY>|---> create dir
-         | MKDIR ------------->|----------MKDIR----->|---> write file
-         | FILE_ENTRY -------->|                     |
-         | CHECKSUM ---------->|                     |
-         | FILE_END ---------->|                     |
-         | DELETE ------------>|                     |
-         | DELETE_END -------->|                     |
+         |-------- HELLO ----->|-------- HELLO ----->|
+         |                     |                     | [scan dest]
+         |<-- DEST_FILE_ENTRY -|<-- DEST_FILE_ENTRY -| [with checksums]
+         |<-- DEST_FILE_ENTRY -|<-- DEST_FILE_ENTRY -|
+         |<--- DEST_FILE_END --|<--- DEST_FILE_END --|
+         |                     |                     |
+         | [has dest state]    |                     |
+```
+
+**Phase 2: Streaming Transfer**
+
+```
+LOCAL                          SSH                           REMOTE
++-------------------+          |           +--------------------+
+|    Generator      |          |           |     Receiver       |
++--------+----------+          |           +---------+----------+
+         |                     |                     |
+         |---- FILE_ENTRY ---->|---- FILE_ENTRY ---->|
+         |------ MKDIR ------->|------ MKDIR ------->|---> create dir
+         |---- FILE_ENTRY ---->|---- FILE_ENTRY ---->|
+         |---- FILE_END ------>|---- FILE_END ------>|
          |                     |                     |
 +--------+----------+          |                     |
 |     Sender        |          |                     |
-|  (Tokio task #2)  |          |                     |
 +--------+----------+          |                     |
          |                     |                     |
-         | DATA -------------->|----------DATA------>|---> write chunk
-         | DATA -------------->|----------DATA------>|---> apply delta
-         | DATA_END ---------->|----------DATA_END-->|---> set perms
-         | DATA -------------->|                     |
-         | DATA -------------->|                     |
-         | DATA_END ---------->|                     |
+         |------ DATA -------->|------ DATA -------->|---> write chunk
+         |------ DATA -------->|------ DATA -------->|---> apply delta
+         |---- DATA_END ------>|---- DATA_END ------>|---> set perms
+         |                     |                     |
          |                     |                     |<--- PROGRESS
          |                     |                     |<--- ERROR (async)
+         |                     |                     |
+         |---- DELETE -------->|---- DELETE -------->|---> remove file
+         |-- DELETE_END ------>|-- DELETE_END ------>|
          |                     |                     |<--- DONE
 ```
 
 ### Channel Design
 
 ```rust
-// Generator -> Sender
+// Generator -> Sender (internal, not on wire)
 struct FileJob {
     path: Arc<Path>,
     size: u64,
+    mtime: i64,
     mode: u32,
     need_delta: bool,
-    checksums: Option<Vec<BlockChecksum>>,  // If delta
+    checksums: Option<Vec<BlockChecksum>>,  // From DEST_FILE_ENTRY
 }
 
 // Fixed-size channels with backpressure
@@ -328,15 +423,17 @@ const GENERATOR_CHANNEL_SIZE: usize = 1024;  // File entries
 const SENDER_CHANNEL_SIZE: usize = 64;       // Large chunks
 ```
 
-Generator sends FileJob to Sender as files are discovered. Sender reads files and computes deltas. Receiver writes files directly from wire.
+Generator receives dest state during Initial Exchange, then scans source and sends FileJob to Sender. Sender reads local files, uses cached checksums to compute deltas, streams DATA to Receiver.
 
 ### Pull Flow (remote -> local)
 
-Identical structure, roles swapped:
+Roles swapped:
 
 - Generator runs on remote (scans source)
-- Sender runs on remote (reads files)
+- Sender runs on remote (reads source files)
 - Receiver runs on local (writes files)
+
+Initial Exchange: Local sends DEST_FILE_ENTRY with checksums to remote.
 
 ### Bidirectional Flow
 
@@ -384,26 +481,25 @@ Same mechanism - disk writes block receiver, TCP buffers fill, sender blocks.
 
 **Problem**: How to know what exists on dest but not source without complete scan?
 
-**Solution**: Incremental delete list.
+**Solution**: Use dest file list from Initial Exchange (see above).
 
-1. Generator scans source AND requests dest file list
-2. HELLO response includes streaming dest file list (if --delete)
-3. Generator maintains hash set of source paths
-4. After FILE_END, Generator emits DELETE for each dest path not in source set
+1. During Initial Exchange, Receiver streams DEST_FILE_ENTRY for all dest files
+2. Generator builds hash set of dest paths
+3. During source scan, Generator marks paths that exist in both
+4. After FILE_END, Generator emits DELETE for each dest path not in source
 
 ```
+[Initial Exchange - already completed]
+Generator has: HashSet<dest_paths>
+
+[Streaming Phase]
 Generator                    Receiver
     |                           |
-    | <--- dest FILE_ENTRY -----|  (during HELLO)
-    | <--- dest FILE_ENTRY -----|
-    | <--- dest FILE_END -------|
-    |                           |
-    | [scan source]             |
-    | FILE_ENTRY (src/a) ------>|
-    | FILE_ENTRY (src/b) ------>|
+    | FILE_ENTRY (src/a) ------>|  [remove "a" from dest_paths set]
+    | FILE_ENTRY (src/b) ------>|  [remove "b" from dest_paths set]
     | FILE_END ---------------->|
     |                           |
-    | [compute deletes]         |
+    | [remaining in dest_paths] |
     | DELETE (dest/c) --------->|  (c was on dest, not in source)
     | DELETE_END -------------->|
 ```
@@ -510,16 +606,11 @@ std::fs::set_permissions(&path, Permissions::from_mode(entry.mode))?;
 
 If HELLO flags include want_xattrs:
 
-1. FILE_ENTRY has FLAG_HAS_XATTRS
-2. After DATA_END, Sender sends XATTR message (new type 0x0E)
-3. Receiver applies xattrs
+1. FILE_ENTRY has FLAG_HAS_XATTRS set
+2. After DATA_END, Sender sends XATTR message (0x0F)
+3. Receiver applies xattrs after file is written
 
-```
-XATTR (0x0E):
-+------------+------------+-----------------------+
-| path: str  | count: u16 | entries: [(name,value)]|
-+------------+------------+-----------------------+
-```
+See XATTR message format in Protocol section above.
 
 ### Sparse Files
 
