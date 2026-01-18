@@ -23,6 +23,7 @@
 
 pub mod channel;
 pub mod generator;
+pub mod pipeline;
 pub mod protocol;
 pub mod receiver;
 pub mod sender;
@@ -34,6 +35,7 @@ pub use channel::{
 };
 
 pub use generator::{Generator, GeneratorConfig};
+pub use pipeline::StreamingSync;
 pub use receiver::{Receiver, ReceiverConfig};
 pub use sender::{Sender, SenderConfig};
 
