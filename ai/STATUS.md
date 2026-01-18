@@ -77,27 +77,38 @@ See `ai/review/` for detailed findings:
 
 ### v0.2.1 (Critical Bug Fixes)
 
-- [ ] Fix `content_equal()` data loss bug - compare checksums, not just size
+- [ ] Fix `content_equal()` data loss bug - compare mtime when sizes match
 - [ ] Fix lock `expect()` panics - recover from poisoned locks
+- [ ] Fix SystemTime unwrap panic in conflict resolution
+- [ ] Remove dead retry code (retry.rs:107-120)
 
-### v0.2.2 (Cloud Storage)
+### v0.2.2 (Cloud Storage + Code Quality)
 
-- [ ] Fix S3 env var loading and path handling bugs
+- [ ] Test and verify S3 transport functionality
 - [ ] Add GCS transport (use `object_store` crate, same pattern as S3)
+- [ ] Consolidate duplicated `format_bytes` (3 copies → 1)
+- [ ] Fix sparse file lseek error handling
 
 ### v0.3.0 (SSH Performance)
 
-- [ ] Daemon mode - persistent server, eliminates 2.5s startup overhead
-- [ ] Deeper pipelining (8→64)
-- [ ] Adaptive pipeline depth based on RTT
-- [ ] Stream-level compression after HELLO
+- [ ] `Arc<[u8]>` zero-copy in server_mode.rs (-50% memory)
+- [ ] Deeper pipelining (8→64) (+20-30% throughput)
+- [ ] Adaptive pipeline depth based on RTT (+20-50% WAN)
+- [ ] Daemon mode - eliminates 2.5s startup overhead (3.5x repeated)
+
+### v0.4.0 (Code Quality)
+
+- [ ] SyncEngine builder pattern (35 params → builder)
+- [ ] Split sync_file_with_delta (475 lines → helpers)
+- [ ] Ring buffer for delta window (-30% CPU)
+- [ ] Pre-allocate protocol buffer (-20% allocations)
 
 ### Backlog
 
 - [ ] Issue #12 features (`--one-file-system`, SSH args)
 - [ ] UX: Suppress stack traces on user errors
 - [ ] Incremental recursion (start transfer before scan)
-- [ ] russh migration (pure Rust SSH)
+- [ ] Stream-level compression after HELLO
 
 ## What Worked
 
