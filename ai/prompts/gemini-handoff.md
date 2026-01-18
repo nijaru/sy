@@ -30,7 +30,7 @@ Complete these in order. Each task has: location, problem, fix, verification.
 
 **Priority:** P1 - Critical
 **File:** `src/bisync/classifier.rs`
-**Lines:** 226-237
+**Lines:** 225-237
 
 **Problem:** Files with same size but different content are assumed equal. This causes data loss.
 
@@ -115,7 +115,7 @@ miss conflicts when both sides modify a file to the same byte count."
 
 ```bash
 cargo build
-cargo test transport::ssh
+cargo test ssh
 cargo clippy -- -D warnings
 ```
 
@@ -135,7 +135,7 @@ instead of panicking. Prevents crash if a thread panics while holding lock."
 
 **Priority:** P1 - Important
 **File:** `src/bisync/resolver.rs`
-**Lines:** 231-237
+**Lines:** 230-237
 
 **Problem:** `unwrap()` will panic if system clock is before Unix epoch.
 
