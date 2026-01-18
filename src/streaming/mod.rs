@@ -22,6 +22,7 @@
 //! See `ai/design/streaming-protocol-v0.3.0.md` for full specification.
 
 pub mod channel;
+pub mod generator;
 pub mod protocol;
 
 pub use channel::{
@@ -29,6 +30,8 @@ pub use channel::{
     GeneratorMessage, SyncDirection, SyncStats, DATA_CHUNK_SIZE, DELTA_MIN_SIZE,
     GENERATOR_CHANNEL_SIZE, SENDER_CHANNEL_SIZE,
 };
+
+pub use generator::{Generator, GeneratorConfig};
 
 pub use protocol::{
     BlockChecksum, Data, DataEnd, DataFlags, Delete, DeleteEnd, DestFileEnd, DestFileEntry,
