@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use bytes::{Buf, Bytes};
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Protocol Constants
@@ -144,6 +146,28 @@ impl Hello {
         let version = r.read_u16().await?;
         let flags = r.read_u32().await?;
         let capabilities = read_bytes(r).await?;
+        Ok(Hello {
+            version,
+            flags,
+            capabilities,
+        })
+    }
+
+    pub fn decode_payload(mut payload: Bytes) -> Result<Self> {
+        if payload.remaining() < 6 {
+            anyhow::bail!("Hello payload too short");
+        }
+        let version = payload.get_u16();
+        let flags = payload.get_u32();
+
+        let mut capabilities = Vec::new();
+        if payload.remaining() >= 4 {
+            let len = payload.get_u32() as usize;
+            if payload.remaining() >= len {
+                capabilities = payload.copy_to_bytes(len).to_vec();
+            }
+        }
+
         Ok(Hello {
             version,
             flags,

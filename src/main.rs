@@ -17,6 +17,7 @@ mod retry;
 mod server;
 mod sparse;
 mod ssh;
+mod streaming;
 mod sync;
 mod temp_file;
 mod transport;

@@ -18,6 +18,8 @@ use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::sync::scanner::{self, ScanOptions};
+use bytes::Bytes;
+use tokio::fs;
 
 /// Expand tilde (~) in paths to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -51,38 +53,58 @@ pub async fn run_server() -> Result<()> {
         std::fs::create_dir_all(&root_path)?;
     }
 
-    let mut stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let stdin = io::stdin();
+    let stdout = io::stdout();
 
-    let mut handler = ServerHandler::new(root_path);
+    let handler = ServerHandler::new(root_path);
 
     // Handshake
-    let _len = stdin.read_u32().await?;
-    let type_byte = stdin.read_u8().await?;
+    let mut stdin_pin = stdin;
+    let mut stdout_pin = stdout;
+
+    let len = stdin_pin.read_u32().await?;
+    let type_byte = stdin_pin.read_u8().await?;
 
     if type_byte != MessageType::Hello as u8 {
         let err = ErrorMessage {
             code: 1,
             message: format!("Expected HELLO (0x01), got 0x{:02X}", type_byte),
         };
-        err.write(&mut stdout).await?;
+        err.write(&mut stdout_pin).await?;
         return Ok(());
     }
 
-    let hello = Hello::read(&mut stdin).await?;
+    // Read payload to detect version
+    let mut payload = vec![0u8; len as usize];
+    stdin_pin.read_exact(&mut payload).await?;
+    let payload = Bytes::from(payload);
 
-    if hello.version != PROTOCOL_VERSION {
+    if payload.len() < 2 {
+        anyhow::bail!("HELLO payload too short");
+    }
+    let version = u16::from_be_bytes([payload[0], payload[1]]);
+
+    if version == 1 {
+        let hello = Hello::decode_payload(payload)?;
+        return run_server_v1(hello, stdin_pin, stdout_pin, handler).await;
+    } else if version >= 2 {
+        return run_server_v2(payload, stdin_pin, stdout_pin).await;
+    } else {
         let err = ErrorMessage {
             code: 1,
-            message: format!(
-                "Version mismatch: client {}, server {}",
-                hello.version, PROTOCOL_VERSION
-            ),
+            message: format!("Unsupported protocol version: {}", version),
         };
-        err.write(&mut stdout).await?;
-        return Ok(());
+        err.write(&mut stdout_pin).await?;
+        Ok(())
     }
+}
 
+pub async fn run_server_v1(
+    hello: Hello,
+    mut stdin: impl io::AsyncRead + Unpin,
+    mut stdout: impl io::AsyncWrite + Unpin,
+    mut handler: ServerHandler,
+) -> Result<()> {
     // Send HELLO response
     let resp = Hello {
         version: PROTOCOL_VERSION,
@@ -99,7 +121,7 @@ pub async fn run_server() -> Result<()> {
 
     // Shared state for concurrent CHECKSUM_REQ handling
     let mut file_list: Option<Arc<Vec<FileListEntry>>> = None;
-    let root_path = Arc::new(handler.root_path.clone());
+    let root_path_ref = Arc::new(handler.root_path.clone());
 
     // Channel for checksum results (spawned tasks send completed responses here)
     let (checksum_tx, mut checksum_rx) = mpsc::channel::<ChecksumResp>(32);
@@ -124,7 +146,7 @@ pub async fn run_server() -> Result<()> {
 
             // Read and handle incoming messages
             len_result = stdin.read_u32() => {
-                let _len = match len_result {
+                let len = match len_result {
                     Ok(len) => len,
                     Err(_) => break, // EOF or error, exit loop
                 };
@@ -153,83 +175,193 @@ pub async fn run_server() -> Result<()> {
                         handler.handle_symlink_batch(batch, &mut stdout).await?;
                     }
 
-                    Some(MessageType::FileData) => {
-                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
-                        let data = protocol::FileData::read(&mut stdin).await?;
-                        handler.handle_file_data(data, &mut stdout).await?;
-                    }
-
                     Some(MessageType::ChecksumReq) => {
                         let req = ChecksumReq::read(&mut stdin).await?;
 
-                        // Use concurrent handling if we have file list
-                        if let Some(ref fl) = file_list {
-                            let fl = Arc::clone(fl);
-                            let rp = Arc::clone(&root_path);
-                            let index = req.index;
-                            let block_size = req.block_size as usize;
-                            let tx = checksum_tx.clone();
+                        // Capture needed state for the task
+                        let tx = checksum_tx.clone();
+                        let root = root_path_ref.clone();
+                        let files = file_list.clone();
 
-                            // Spawn computation task - runs concurrently
-                            pending_checksum_count += 1;
+                        if let Some(entries) = files {
+                            // Spawn task for async checksum computation
                             tokio::spawn(async move {
-                                match compute_checksum_response(index, block_size, &fl, &rp).await {
-                                    Ok(resp) => {
-                                        let _ = tx.send(resp).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Checksum computation failed: {}", e);
-                                    }
+                                let resp = compute_checksum_response(req.index, req.block_size as usize, &entries, &root).await;
+                                match resp {
+                                    Ok(r) => { let _ = tx.send(r).await; }
+                                    Err(e) => { tracing::error!("Checksum error: {}", e); }
                                 }
                             });
-                        } else {
-                            // Fallback: sequential handling
-                            handler.handle_checksum_req(req, &mut stdout).await?;
+                            pending_checksum_count += 1;
                         }
                     }
 
                     Some(MessageType::DeltaData) => {
-                        // Wait for all pending checksums before handling delta
                         drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
                         let delta = DeltaData::read(&mut stdin).await?;
                         handler.handle_delta_data(delta, &mut stdout).await?;
                     }
 
-                    Some(MessageType::Error) => {
-                        let err = protocol::ErrorMessage::read(&mut stdin).await?;
-                        tracing::error!("Received error: {}", err.message);
-                        return Err(anyhow::anyhow!("Remote error: {}", err.message));
+                    Some(MessageType::FileData) => {
+                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+                        let data = FileData::read(&mut stdin).await?;
+                        handler.handle_file_data(data, &mut stdout).await?;
                     }
 
-                    Some(msg_type) => {
+                    Some(MessageType::FileDone) => {
                         drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
-                        tracing::warn!("Unhandled message type: {:?}", msg_type);
-                        let err = ErrorMessage {
-                            code: 1,
-                            message: format!("Unhandled message type: 0x{:02X}", type_byte),
-                        };
-                        err.write(&mut stdout).await?;
-                        stdout.flush().await?;
-                    }
-
-                    None => {
-                        drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
-                        tracing::error!("Unknown message type: 0x{:02X}", type_byte);
-                        let err = ErrorMessage {
-                            code: 1,
-                            message: format!("Unknown message type: 0x{:02X}", type_byte),
-                        };
-                        err.write(&mut stdout).await?;
-                        stdout.flush().await?;
                         break;
+                    }
+
+                    _ => {
+                        tracing::warn!("Unknown message type: 0x{:02X}", type_byte);
+                        // Skip unknown message payload
+                        let mut buf = vec![0u8; len as usize];
+                        stdin.read_exact(&mut buf).await?;
                     }
                 }
             }
         }
     }
 
-    // Drain any remaining pending checksums
-    drain_pending_checksums(&mut checksum_rx, &mut pending_checksum_count, &mut stdout).await?;
+    Ok(())
+}
+
+async fn run_server_v2(
+    payload: Bytes,
+    mut stdin: impl io::AsyncRead + Unpin,
+    mut stdout: impl io::AsyncWrite + Unpin,
+) -> Result<()> {
+    use crate::streaming::{
+        channel::file_job_channel, protocol as v2, Generator, GeneratorConfig, Receiver,
+        ReceiverConfig, Sender, SenderConfig,
+    };
+
+    let hello = v2::Hello::decode(payload)?;
+    let root_path = expand_tilde(Path::new(&hello.root_path));
+
+    // Ensure root exists
+    if !root_path.exists() {
+        fs::create_dir_all(&root_path).await?;
+    }
+
+    // Send HELLO response
+    let resp = v2::Hello::new(v2::HelloFlags::empty(), "");
+    v2::write_frame(&mut stdout, &resp.encode()).await?;
+    stdout.flush().await?;
+
+    if hello.flags.contains(v2::HelloFlags::PULL) {
+        // Client wants to pull - we are the source
+        // 1. Receive DEST_FILE_ENTRY messages from client (Initial Exchange)
+        let mut generator = Generator::new(GeneratorConfig {
+            root: root_path.clone(),
+            include_hidden: true,
+            follow_symlinks: false,
+            delete_enabled: hello.flags.contains(v2::HelloFlags::DELETE),
+        });
+
+        loop {
+            let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
+            match msg_type {
+                v2::MessageType::DestFileEntry => {
+                    let entry = v2::DestFileEntry::decode(payload)?;
+                    generator.add_dest_entry(entry);
+                }
+                v2::MessageType::DestFileEnd => {
+                    break;
+                }
+                _ => anyhow::bail!("Unexpected message during Initial Exchange: {:?}", msg_type),
+            }
+        }
+
+        // 2. Run Generator and Sender
+        let (tx, rx) = file_job_channel();
+        let gen_handle = tokio::spawn(async move { generator.run(tx).await });
+
+        let sender = Sender::new(SenderConfig {
+            root: root_path,
+            compress: hello.flags.contains(v2::HelloFlags::COMPRESSION),
+        });
+
+        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
+        let sender_handle = tokio::spawn(async move {
+            sender
+                .run(rx, |bytes| {
+                    if data_tx.blocking_send(bytes).is_err() {
+                        return Err(anyhow::anyhow!("Data channel closed"));
+                    }
+                    Ok(())
+                })
+                .await
+        });
+
+        while let Some(bytes) = data_rx.recv().await {
+            v2::write_frame(&mut stdout, &bytes).await?;
+        }
+        stdout.flush().await?;
+
+        let (total_files, total_bytes) = gen_handle.await??;
+        sender_handle.await??;
+
+        // Send DONE
+        let done = v2::Done {
+            files_ok: total_files,
+            files_err: 0,
+            bytes: total_bytes,
+            duration_ms: 0,
+        };
+        v2::write_frame(&mut stdout, &done.encode()).await?;
+        stdout.flush().await?;
+    } else {
+        // Client wants to push - we are the destination
+        let mut receiver = Receiver::new(ReceiverConfig {
+            root: root_path.clone(),
+            block_size: 4096,
+        });
+
+        // 1. Send Initial Exchange (our files metadata)
+        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
+        let receiver_root = root_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let receiver = Receiver::new(ReceiverConfig {
+                root: receiver_root,
+                block_size: 4096,
+            });
+            rt.block_on(receiver.scan_dest(|bytes| {
+                data_tx
+                    .blocking_send(bytes)
+                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
+            }))
+        })
+        .await??;
+
+        while let Some(bytes) = data_rx.recv().await {
+            v2::write_frame(&mut stdout, &bytes).await?;
+        }
+        stdout.flush().await?;
+
+        // 2. Receive streaming messages
+        loop {
+            let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
+
+            if msg_type == v2::MessageType::Done {
+                break;
+            }
+
+            receiver.handle_message(msg_type, payload).await?;
+        }
+
+        // 3. Send DONE
+        let done = v2::Done {
+            files_ok: receiver.stats().files_ok,
+            files_err: receiver.stats().files_err,
+            bytes: receiver.stats().bytes_transferred,
+            duration_ms: 0,
+        };
+        v2::write_frame(&mut stdout, &done.encode()).await?;
+        stdout.flush().await?;
+    }
 
     Ok(())
 }
