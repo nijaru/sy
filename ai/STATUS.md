@@ -38,15 +38,20 @@
 
 ## Active Work
 
-**2026-01-18: v0.2.1 critical bug fixes completed**
+**2026-01-18: v0.2.2 in progress**
 
-Critical bugs fixed:
-1. `content_equal()` now compares both size and mtime to prevent data loss.
-2. SSH `ConnectionPool` now recovers from poisoned locks instead of panicking.
-3. `SystemTime` unwrap panic in `resolver.rs` fixed by using `unwrap_or_default()`.
-4. Dead retry code removed from `retry.rs`.
+Gemini session started v0.2.2 work but left partial changes. Claude fixed:
 
-**Next Focus**: v0.2.2 (Cloud Storage + Code Quality)
+- Consolidated `format_bytes` to single copy in `resource.rs`
+- S3 transport: AWS env vars, http:// endpoints, path scanning bug
+- GCS: Added `gs://` URL parsing to `SyncPath` (transport not implemented)
+- Fixed incomplete router.rs (brace mismatch, missing match arms)
+
+Remaining v0.2.2 work:
+
+- Test and verify S3 transport functionality
+- Add GCS transport implementation (use `object_store` crate)
+- Fix sparse file lseek error handling
 
 ## Roadmap
 
@@ -57,11 +62,13 @@ Critical bugs fixed:
 - [x] Fix SystemTime unwrap panic in conflict resolution
 - [x] Remove dead retry code (retry.rs:107-121)
 
-### v0.2.2 (Cloud Storage + Code Quality)
+### v0.2.2 (Cloud Storage + Code Quality) - IN PROGRESS
 
+- [x] Consolidate duplicated `format_bytes` (3 copies → 1 in resource.rs)
+- [x] S3: AWS env vars, http:// endpoints, path scanning fix
+- [x] GCS: URL parsing (`gs://`) in SyncPath
 - [ ] Test and verify S3 transport functionality
-- [ ] Add GCS transport (use `object_store` crate, same pattern as S3)
-- [ ] Consolidate duplicated `format_bytes` (3 copies → 1)
+- [ ] Add GCS transport implementation
 - [ ] Fix sparse file lseek error handling
 
 ### v0.3.0 (SSH Performance)
