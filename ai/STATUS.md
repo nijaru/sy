@@ -38,42 +38,36 @@
 
 ## Active Work
 
-### 2026-01-18: Codebase Review + PR #13 Evaluation
+**2026-01-18: Full codebase review completed**
 
-**Full review completed** - see branch `review/codebase-2026-01-18` for details.
+See `ai/review/` for detailed findings:
 
-**Critical bugs found:**
+- `synthesis.md` - Combined recommendations
+- `codebase-review.md` - Bugs, security, tests
+- `performance-analysis.md` - Hot paths, memory, I/O
+- `architecture-analysis.md` - Transport layer, extensibility
+- `simplification-opportunities.md` - Duplication, complexity
+
+**Critical bugs found**:
 
 1. `content_equal()` compares size only → data loss risk (`bisync/classifier.rs:226`)
 2. Lock `expect()` panics → crash mid-sync (`transport/ssh.rs:172,239,248`)
 
-**SSH performance analysis:**
-
-- rsync uses streaming architecture (generator → sender → receiver, no round-trips)
-- sy uses request-response with pipeline depth 8
-- Gap is architectural, not fixable with server-side optimizations
-
-**PR #13 evaluation:**
-| Feature | Decision | Rationale |
-|---------|----------|-----------|
-| GCS transport | Accept | Uses object_store like S3 |
-| S3 fixes | Accept | Real bugs (env vars, paths) |
-| Daemon mode | Accept | 3.5x faster repeated syncs |
-| Python bindings | Defer | Needs library extraction |
-
-**Recommended SSH improvements:**
-
-1. Daemon mode - eliminates 2.5s startup overhead
-2. Deeper pipelining (8→64)
-3. Adaptive pipeline based on RTT
-4. Incremental recursion (future)
+**PR #13 status**: AI-generated, quality unverified. Do not merge or cherry-pick. Use as reference only if needed.
 
 **Previous work (2025-12-18)**:
 
-- Pipelined delta checksum requests
-- Server-side parallelism (didn't close gap - bottleneck is latency)
+- Pipelined delta checksum requests (sy-09r)
+- Server-side parallelism: rayon parallel checksums, concurrent request handling, batched flushes
 
-**Open question:** Architecture conclusion based on static analysis, not runtime profiling. Should profile actual SSH sync to verify bottleneck before major changes.
+**Investigation result**: Server-side optimizations didn't close SSH incremental gap. Bottleneck is network latency, not CPU.
+
+**SSH performance options** (v0.3.0):
+
+1. Daemon mode - eliminates 2.5s startup overhead
+2. Adaptive pipeline depth - adjust based on RTT
+3. Zero-copy with Arc<[u8]> - stop cloning file data
+4. Stream-level compression
 
 **Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
 
@@ -81,25 +75,29 @@
 
 ## Roadmap
 
-### v0.2.1 (Critical Fixes)
+### v0.2.1 (Critical Bug Fixes)
 
-- [ ] Fix `content_equal()` data loss bug
-- [ ] Fix lock `expect()` panics
-- [ ] Cherry-pick GCS transport from PR #13
-- [ ] Cherry-pick S3 fixes from PR #13
+- [ ] Fix `content_equal()` data loss bug - compare checksums, not just size
+- [ ] Fix lock `expect()` panics - recover from poisoned locks
+
+### v0.2.2 (Cloud Storage)
+
+- [ ] Fix S3 env var loading and path handling bugs
+- [ ] Add GCS transport (use `object_store` crate, same pattern as S3)
 
 ### v0.3.0 (SSH Performance)
 
-- [ ] Daemon mode (from PR #13) - 3.5x faster repeated syncs
+- [ ] Daemon mode - persistent server, eliminates 2.5s startup overhead
 - [ ] Deeper pipelining (8→64)
 - [ ] Adaptive pipeline depth based on RTT
+- [ ] Stream-level compression after HELLO
 
 ### Backlog
 
-- [ ] Incremental recursion (transfer before scan completes)
 - [ ] Issue #12 features (`--one-file-system`, SSH args)
-- [ ] Python bindings (after library crate extraction)
-- [ ] Stream-level compression
+- [ ] UX: Suppress stack traces on user errors
+- [ ] Incremental recursion (start transfer before scan)
+- [ ] russh migration (pure Rust SSH)
 
 ## What Worked
 

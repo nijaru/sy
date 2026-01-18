@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "cb9z",
+  "title": "Fix S3 env var loading and path handling",
+  "description": null,
+  "status": "open",
+  "priority": 2,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-18T18:41:35.954Z",
+  "updated_at": "2026-01-18T18:41:35.954Z",
+  "completed_at": null,
+  "external": {}
+}

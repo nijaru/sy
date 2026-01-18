@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "bapt",
+  "title": "Implement daemon mode for SSH",
+  "description": null,
+  "status": "open",
+  "priority": 2,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-18T18:41:37.002Z",
+  "updated_at": "2026-01-18T18:41:37.002Z",
+  "completed_at": null,
+  "external": {}
+}
