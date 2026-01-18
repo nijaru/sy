@@ -31,21 +31,28 @@ Complete these in order. Each task has: location, problem, fix, verification.
 
 **Problem:** Files with same size but different content are assumed equal. This causes data loss.
 
-**Current code:**
+**Current code (lines 225-237):**
 
 ```rust
+/// Check if two files have equal content
 fn content_equal(source: &FileEntry, dest: &FileEntry) -> Result<bool> {
+    // Fast path: size mismatch
     if source.size != dest.size {
         return Ok(false);
     }
+
     // For now, assume equal if sizes match
+    // In future: compare checksums if available
+    // This is conservative (may miss some conflicts) but safe
+
     Ok(true)
 }
 ```
 
-**Fix:** Compare mtime when sizes match:
+**Replace entire function with:**
 
 ```rust
+/// Check if two files have equal content
 fn content_equal(source: &FileEntry, dest: &FileEntry) -> Result<bool> {
     if source.size != dest.size {
         return Ok(false);
@@ -129,9 +136,10 @@ instead of panicking. Prevents crash if a thread panics while holding lock."
 
 **Problem:** `unwrap()` will panic if system clock is before Unix epoch.
 
-**Current code:**
+**Current code (lines 230-237):**
 
 ```rust
+/// Generate timestamp for conflict filename
 fn generate_conflict_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -141,9 +149,10 @@ fn generate_conflict_timestamp() -> String {
 }
 ```
 
-**Fix:**
+**Replace entire function with:**
 
 ```rust
+/// Generate timestamp for conflict filename
 fn generate_conflict_timestamp() -> String {
     use std::time::SystemTime;
     SystemTime::now()
@@ -177,30 +186,31 @@ system clock is incorrectly set before Unix epoch."
 
 **Priority:** P1 - Important
 **File:** `src/retry.rs`
-**Lines:** 108-121
+**Lines:** 107-121
 
 **Problem:** Creates an `_updated` error that is never used. The underscore prefix shows it's dead code.
 
-**Current code:**
+**Current code (lines 107-121):**
 
 ```rust
-if let SyncError::NetworkRetryable {
-    message,
-    max_attempts,
-    ..
-} = e
-{
-    // Create new error with updated attempt count
-    let _updated = SyncError::NetworkRetryable {
-        message,
-        attempts: attempt,
-        max_attempts,
-    };
-    // Note: The error will be recreated on next iteration
-}
+                // Update attempts count for NetworkRetryable errors
+                if let SyncError::NetworkRetryable {
+                    message,
+                    max_attempts,
+                    ..
+                } = e
+                {
+                    // Create new error with updated attempt count
+                    let _updated = SyncError::NetworkRetryable {
+                        message,
+                        attempts: attempt,
+                        max_attempts,
+                    };
+                    // Note: The error will be recreated on next iteration
+                }
 ```
 
-**Fix:** Delete lines 107-121 (the comment and entire if block). The variable is never used.
+**Fix:** Delete these 15 lines entirely (107-121). The `_updated` variable is created but never used.
 
 **Verification:**
 
@@ -250,6 +260,13 @@ git push origin main
 | 3    | resolver.rs   | SystemTime unwrap panic              |
 | 4    | retry.rs      | Dead code removal                    |
 
+## If Something Goes Wrong
+
+- **Build fails**: Check error message, ensure you replaced code exactly as shown
+- **Tests fail**: Read test output, the fix might need adjustment
+- **Clippy warns**: Address the warning before committing
+- **Unsure**: Stop and ask for help rather than guessing
+
 ## What NOT To Do
 
 - Do not touch PR #13 in any way
@@ -259,3 +276,4 @@ git push origin main
 - Do not modify CI/workflows
 - Do not add comments beyond what's necessary
 - Do not run `git push --force`
+- Do not continue if tests fail - fix the issue first
