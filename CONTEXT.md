@@ -4,56 +4,48 @@
 
 | Item         | Value                                                 |
 | ------------ | ----------------------------------------------------- |
-| Branch       | `fix/v0.2.1-bugs`                                     |
+| Branch       | `feature/streaming-protocol-v2`                       |
 | Last Release | v0.2.0 (2025-12-18)                                   |
 | Build        | Passing (`cargo check`, `cargo test`, `cargo clippy`) |
-| Commits      | 2 new (943537b, e4887f7)                              |
+| Commits      | 1 new (fe34175)                                       |
 
 ## What Was Done This Session
 
-1. **Code Review** - Found 1 ERROR (router.rs), 2 WARNs (ssh.rs)
-2. **Bug Fixes** - Fixed all review issues
-3. **Performance Analysis** - Identified request-response as fundamental bottleneck
-4. **Streaming Protocol Design** - Full rewrite planned + reviewed + fixed
+1. **Phase 1 Complete** - Protocol foundation implemented
+2. Created `src/streaming/` module with:
+   - `protocol.rs` - 16 message types for v2 streaming
+   - `channel.rs` - FileJob, DestIndex, channel types
+   - `mod.rs` - Public API exports
+3. Added bitflags dependency
+4. All 18 new tests pass, 511+ total tests pass
 
-## Key Decision
+## Key Files Created
 
-**Full protocol rewrite** from request-response to rsync-style streaming.
+| File                        | Purpose                                  |
+| --------------------------- | ---------------------------------------- |
+| `src/streaming/protocol.rs` | v2 message types (Hello, FileEntry, etc) |
+| `src/streaming/channel.rs`  | Pipeline channel types                   |
+| `src/streaming/mod.rs`      | Public API                               |
 
-Request-response has inherent latency floor. Even depth-64 pipelining on 50ms RTT with 10K files = 7.8s pure waiting. Streaming eliminates this.
+## Streaming Protocol v2 Progress
 
-## Streaming Protocol v2 (Ready for Implementation)
+**Phase 1: Protocol Foundation** - COMPLETE
 
-See `ai/design/streaming-protocol-v0.3.0.md` (800+ lines, fully specified).
+- [x] v2 message types with tests
+- [x] FileJob, channel types
+- [x] Version negotiation helpers
 
-**Two-Phase Design:**
+**Next: Phase 2: Generator**
 
-1. **Initial Exchange** - Receiver streams DEST_FILE_ENTRY with checksums
-2. **Streaming Transfer** - Pure unidirectional flow, no round-trips
-
-**Architecture:**
-
-- Three Tokio tasks: Generator → Sender → Receiver
-- Bounded channels for backpressure
-- TCP handles flow control
-
-**Key Messages:**
-
-- DEST_FILE_ENTRY (0x04) - Dest metadata + checksums for delta
-- FILE_ENTRY (0x02) - Source metadata (with inode for hard links)
-- DATA (0x06) - File content or delta ops
-- DELETE (0x08) - Files to remove
-
-**Targets:**
-
-- SSH small_files: parity with rsync (from 1.6x slower)
-- Time to first byte: <0.5s (from 2.5s)
-- Memory (1M files): <500MB (from ~2GB)
+- [ ] `streaming/generator.rs`: Scanner integration
+- [ ] Stream FILE_ENTRY as scanned (no batching)
+- [ ] MKDIR inline with discovery
+- [ ] Unit tests with mock channels
 
 ## Tasks
 
 ```
-tk-ofsp | p1 | Implement streaming protocol v2
+tk-ofsp | p1 | Implement streaming protocol v2 [Phase 1 complete]
 tk-dpw8 | p2 | Add GCS transport using object_store
 tk-cb9z | p2 | Test and verify S3 transport functionality
 tk-bapt | p3 | Implement daemon mode for SSH
@@ -69,6 +61,5 @@ tk-bapt | p3 | Implement daemon mode for SSH
 
 ## Next Steps
 
-1. `/compact` to clear context
-2. Create new branch for streaming implementation
-3. Start Phase 1: Protocol foundation (message types, channels)
+1. Continue with Phase 2: Generator implementation
+2. Or `/compact` to clear context if switching focus
