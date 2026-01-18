@@ -4,18 +4,21 @@ You are implementing critical bug fixes for sy, a Rust file sync tool.
 
 ## Critical Rules
 
-1. **DO NOT** touch, comment on, merge, or cherry-pick from PR #13
-2. **DO NOT** create new workflows or CI files
-3. **DO NOT** add new features - only fix the listed bugs
-4. **DO** commit after each fix with the exact format shown
-5. **DO** run verification after each fix before committing
+1. **DO NOT** push directly to main - use a feature branch and create a PR
+2. **DO NOT** touch, comment on, merge, or cherry-pick from PR #13
+3. **DO NOT** create new workflows or CI files
+4. **DO NOT** add new features - only fix the listed bugs
+5. **DO** commit after each fix with the exact format shown
+6. **DO** run verification after each fix before committing
 
 ## Setup
 
 ```bash
-git checkout main
-git pull origin main
+git fetch origin
+git checkout -b fix/v0.2.1-bugs origin/main
 ```
+
+**Important:** Work on a feature branch, NOT main.
 
 ## Tasks
 
@@ -245,11 +248,27 @@ cargo fmt --check
 
 All must pass with zero errors and zero warnings.
 
-## Push
+## Push and Create PR
 
 ```bash
-git push origin main
+git push -u origin fix/v0.2.1-bugs
+gh pr create --title "fix: Critical bug fixes for v0.2.1" --body "$(cat <<'EOF'
+## Summary
+- Fix content_equal() data loss bug - compare mtime when sizes match
+- Fix lock expect() panics in SSH transport - recover from poisoned locks
+- Fix SystemTime unwrap panic in resolver
+- Remove dead retry code
+
+## Test plan
+- [ ] `cargo build` passes
+- [ ] `cargo test` passes
+- [ ] `cargo clippy -- -D warnings` passes
+- [ ] `cargo fmt --check` passes
+EOF
+)"
 ```
+
+**Do NOT push directly to main.** Create a PR for review.
 
 ## Summary
 
@@ -269,6 +288,7 @@ git push origin main
 
 ## What NOT To Do
 
+- Do not push to main - use feature branch and create PR
 - Do not touch PR #13 in any way
 - Do not add new files unless required for the fix
 - Do not refactor surrounding code
