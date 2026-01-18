@@ -38,37 +38,31 @@
 
 ## Active Work
 
-**2026-01-18: v0.2.2 in progress**
+**2026-01-18: v0.2.1 in progress**
 
-Gemini session started v0.2.2 work but left partial changes. Claude fixed:
-
-- Consolidated `format_bytes` to single copy in `resource.rs`
-- S3 transport: AWS env vars, http:// endpoints, path scanning bug
-- GCS: Added `gs://` URL parsing to `SyncPath` (transport not implemented)
-- Fixed incomplete router.rs (brace mismatch, missing match arms)
-
-Remaining v0.2.2 work:
-
-- Test and verify S3 transport functionality
-- Add GCS transport implementation (use `object_store` crate)
-- Fix sparse file lseek error handling
+Bug fixes and cloud storage improvements. All uncommitted changes on `fix/v0.2.1-bugs` branch.
 
 ## Roadmap
 
-### v0.2.1 (Critical Bug Fixes) - COMPLETED 2026-01-18
+### v0.2.1 (Bug Fixes + Cloud Storage) - IN PROGRESS
+
+**Critical Bug Fixes (done):**
 
 - [x] Fix `content_equal()` data loss bug - compare mtime when sizes match
 - [x] Fix lock `expect()` panics - recover from poisoned locks
 - [x] Fix SystemTime unwrap panic in conflict resolution
 - [x] Remove dead retry code (retry.rs:107-121)
 
-### v0.2.2 (Cloud Storage + Code Quality) - IN PROGRESS
+**Code Quality (done):**
 
 - [x] Consolidate duplicated `format_bytes` (3 copies → 1 in resource.rs)
 - [x] S3: AWS env vars, http:// endpoints, path scanning fix
 - [x] GCS: URL parsing (`gs://`) in SyncPath
+
+**Remaining:**
+
 - [ ] Test and verify S3 transport functionality
-- [ ] Add GCS transport implementation
+- [ ] Add GCS transport implementation (use `object_store` crate)
 - [ ] Fix sparse file lseek error handling
 
 ### v0.3.0 (SSH Performance)
