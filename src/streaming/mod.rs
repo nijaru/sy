@@ -24,6 +24,7 @@
 pub mod channel;
 pub mod generator;
 pub mod protocol;
+pub mod sender;
 
 pub use channel::{
     DataChunk, DeltaInfo, DestFileState, DestIndex, FileJob, FileJobReceiver, FileJobSender,
@@ -32,6 +33,7 @@ pub use channel::{
 };
 
 pub use generator::{Generator, GeneratorConfig};
+pub use sender::{Sender, SenderConfig};
 
 pub use protocol::{
     BlockChecksum, Data, DataEnd, DataFlags, Delete, DeleteEnd, DestFileEnd, DestFileEntry,
