@@ -94,6 +94,7 @@ object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true 
 bytes = "1.10.1"
 crossbeam-channel = "0.5.15"
 memmap2 = "0.9.9"
+bitflags = "2.10.0"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
