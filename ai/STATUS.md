@@ -38,22 +38,22 @@
 
 ## Active Work
 
-**2026-01-18: Full codebase review completed**
+**2026-01-18: Gemini handoff prepared for v0.2.1 bug fixes**
 
-See `ai/review/` for detailed findings:
+Handoff document: `ai/prompts/gemini-handoff.md`
 
-- `synthesis.md` - Combined recommendations
-- `codebase-review.md` - Bugs, security, tests
-- `performance-analysis.md` - Hot paths, memory, I/O
-- `architecture-analysis.md` - Transport layer, extensibility
-- `simplification-opportunities.md` - Duplication, complexity
-
-**Critical bugs found**:
+**Critical bugs to fix (v0.2.1)**:
 
 1. `content_equal()` compares size only → data loss risk (`bisync/classifier.rs:226`)
-2. Lock `expect()` panics → crash mid-sync (`transport/ssh.rs:172,239,248`)
+2. Lock `expect()` panics → crash mid-sync (`transport/ssh.rs:172,225,240,248`)
+3. SystemTime unwrap panic (`bisync/resolver.rs:231`)
+4. Dead retry code (`retry.rs:107-121`)
+
+**Review completed** - see `ai/review/` for detailed findings.
 
 **PR #13 status**: AI-generated, quality unverified. Do not merge or cherry-pick. Use as reference only if needed.
+
+**Branches cleaned**: All old branches deleted, only `main` remains.
 
 **Previous work (2025-12-18)**:
 
@@ -80,7 +80,7 @@ See `ai/review/` for detailed findings:
 - [ ] Fix `content_equal()` data loss bug - compare mtime when sizes match
 - [ ] Fix lock `expect()` panics - recover from poisoned locks
 - [ ] Fix SystemTime unwrap panic in conflict resolution
-- [ ] Remove dead retry code (retry.rs:107-120)
+- [ ] Remove dead retry code (retry.rs:107-121)
 
 ### v0.2.2 (Cloud Storage + Code Quality)
 
