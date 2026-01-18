@@ -7,76 +7,48 @@
 | Branch       | `fix/v0.2.1-bugs`                                     |
 | Last Release | v0.2.0 (2025-12-18)                                   |
 | Build        | Passing (`cargo check`, `cargo test`, `cargo clippy`) |
-| Uncommitted  | 12 files (bug fixes + design docs)                    |
+| Commits      | 2 new (943537b, e4887f7)                              |
 
 ## What Was Done This Session
 
-1. **Code Review** - Found 1 ERROR (router.rs missing GCS match arms), 2 WARNs (ssh.rs unwrap)
-2. **Bug Fixes** - Fixed all issues from review
+1. **Code Review** - Found 1 ERROR (router.rs), 2 WARNs (ssh.rs)
+2. **Bug Fixes** - Fixed all review issues
 3. **Performance Analysis** - Identified request-response as fundamental bottleneck
-4. **Streaming Protocol Design** - Full rewrite planned (see ai/design/streaming-protocol-v0.3.0.md)
+4. **Streaming Protocol Design** - Full rewrite planned + reviewed + fixed
 
 ## Key Decision
 
-**Full protocol rewrite authorized** - from request-response to rsync-style streaming.
+**Full protocol rewrite** from request-response to rsync-style streaming.
 
-Current architecture has inherent latency floor that optimizations cannot eliminate.
-Even depth-64 pipelining on 50ms RTT with 10K files = 7.8 seconds of pure waiting.
+Request-response has inherent latency floor. Even depth-64 pipelining on 50ms RTT with 10K files = 7.8s pure waiting. Streaming eliminates this.
 
-## Uncommitted Changes
+## Streaming Protocol v2 (Ready for Implementation)
 
-```
-M CONTEXT.md
-M Cargo.lock
-M Cargo.toml           - gcp feature flag
-M ai/STATUS.md         - streaming protocol roadmap
-M ai/DECISIONS.md      - rewrite decision
-M src/error.rs         - format_bytes consolidation
-M src/main.rs          - format_bytes consolidation
-M src/path.rs          - GCS URL parsing + is_gcs()
-M src/perf.rs          - format_bytes consolidation
-M src/transport/local.rs
-M src/transport/router.rs - GCS match arms fixed
-M src/transport/s3.rs  - Arc reuse fix
-M src/transport/ssh.rs - unwrap → map_err
-A ai/design/streaming-protocol-v0.3.0.md
-A ai/design/performance-v0.3.0.md
-```
+See `ai/design/streaming-protocol-v0.3.0.md` (800+ lines, fully specified).
 
-## v0.3.0 Streaming Protocol (NEW)
+**Two-Phase Design:**
 
-Full rewrite from request-response to streaming. See `ai/design/streaming-protocol-v0.3.0.md`.
+1. **Initial Exchange** - Receiver streams DEST_FILE_ENTRY with checksums
+2. **Streaming Transfer** - Pure unidirectional flow, no round-trips
 
 **Architecture:**
 
 - Three Tokio tasks: Generator → Sender → Receiver
-- Unidirectional flow, no ACKs in critical path
-- Incremental file list streaming
+- Bounded channels for backpressure
+- TCP handles flow control
 
-**Phases (4 weeks):**
+**Key Messages:**
 
-1. Protocol foundation (message types)
-2. Generator (scanner integration)
-3. Sender (file reading, delta)
-4. Receiver (file writing)
-5. Integration (SSH)
-6. Delete + Resume
-7. Polish
+- DEST_FILE_ENTRY (0x04) - Dest metadata + checksums for delta
+- FILE_ENTRY (0x02) - Source metadata (with inode for hard links)
+- DATA (0x06) - File content or delta ops
+- DELETE (0x08) - Files to remove
 
 **Targets:**
 
-- SSH small_files: parity with rsync
+- SSH small_files: parity with rsync (from 1.6x slower)
 - Time to first byte: <0.5s (from 2.5s)
 - Memory (1M files): <500MB (from ~2GB)
-
-## Key Files
-
-| File                                     | Purpose                           |
-| ---------------------------------------- | --------------------------------- |
-| `ai/design/streaming-protocol-v0.3.0.md` | Full protocol design (726 lines)  |
-| `ai/STATUS.md`                           | Current state, roadmap            |
-| `ai/DECISIONS.md`                        | Rewrite decision rationale        |
-| `src/sync/server_mode.rs`                | Current protocol (to be replaced) |
 
 ## Tasks
 
@@ -87,8 +59,16 @@ tk-cb9z | p2 | Test and verify S3 transport functionality
 tk-bapt | p3 | Implement daemon mode for SSH
 ```
 
+## Key Files
+
+| File                                     | Purpose                          |
+| ---------------------------------------- | -------------------------------- |
+| `ai/design/streaming-protocol-v0.3.0.md` | Full protocol design (800 lines) |
+| `ai/STATUS.md`                           | Current state, roadmap           |
+| `ai/DECISIONS.md`                        | Rewrite decision rationale       |
+
 ## Next Steps
 
-1. Commit current changes (bug fixes + design)
-2. Create new branch for streaming protocol
-3. Start Phase 1: Protocol foundation
+1. `/compact` to clear context
+2. Create new branch for streaming implementation
+3. Start Phase 1: Protocol foundation (message types, channels)
