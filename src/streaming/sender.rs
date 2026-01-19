@@ -5,7 +5,7 @@
 
 use crate::delta::generator::{generate_delta_streaming, DeltaOp};
 use crate::streaming::channel::{
-    DeltaInfo, FileJob, FileJobReceiver, GeneratorMessage, DATA_CHUNK_SIZE,
+    DeltaInfo, FileJob, FileJobReceiver, GeneratorMessage, DATA_CHUNK_SIZE, DELTA_CHUNK_SIZE,
 };
 use crate::streaming::protocol::{
     Data, DataEnd, DataFlags, Delete, DeleteEnd, FileEnd, FileEntry, FileFlags, Mkdir, Symlink,
@@ -207,36 +207,61 @@ impl Sender {
         })
         .await??;
 
-        // Encode delta ops into DATA message
+        // Encode delta ops into DATA messages, chunking to avoid frame size limits
         let mut flags = DataFlags::DELTA;
         if self.config.compress {
             flags |= DataFlags::COMPRESSED;
         }
 
-        // Serialize delta ops manually according to protocol spec
+        // Serialize delta ops, chunking into multiple messages if needed
         let mut delta_bytes = Vec::new();
+        let mut chunk_offset = 0u64;
+
         for op in delta.ops {
-            match op {
+            // Serialize the op
+            let op_bytes = match &op {
                 DeltaOp::Copy { offset, size } => {
-                    delta_bytes.push(0x00);
-                    delta_bytes.extend_from_slice(&offset.to_be_bytes());
-                    delta_bytes.extend_from_slice(&(size as u32).to_be_bytes());
+                    let mut buf = Vec::with_capacity(13);
+                    buf.push(0x00);
+                    buf.extend_from_slice(&offset.to_be_bytes());
+                    buf.extend_from_slice(&(*size as u32).to_be_bytes());
+                    buf
                 }
                 DeltaOp::Data(data) => {
-                    delta_bytes.push(0x01);
-                    delta_bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                    delta_bytes.extend_from_slice(&data);
+                    let mut buf = Vec::with_capacity(5 + data.len());
+                    buf.push(0x01);
+                    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                    buf.extend_from_slice(data);
+                    buf
                 }
+            };
+
+            // Check if adding this op would exceed chunk size
+            if !delta_bytes.is_empty() && delta_bytes.len() + op_bytes.len() > DELTA_CHUNK_SIZE {
+                // Flush current chunk
+                let data = Data {
+                    path: path_str.to_string(),
+                    offset: chunk_offset,
+                    flags,
+                    data: Bytes::from(std::mem::take(&mut delta_bytes)),
+                };
+                on_data(data.encode())?;
+                chunk_offset += 1; // Increment to signal continuation
             }
+
+            delta_bytes.extend(op_bytes);
         }
 
-        let data = Data {
-            path: path_str.to_string(),
-            offset: 0,
-            flags,
-            data: Bytes::from(delta_bytes),
-        };
-        on_data(data.encode())?;
+        // Flush remaining ops
+        if !delta_bytes.is_empty() {
+            let data = Data {
+                path: path_str.to_string(),
+                offset: chunk_offset,
+                flags,
+                data: Bytes::from(delta_bytes),
+            };
+            on_data(data.encode())?;
+        }
 
         Ok(())
     }
