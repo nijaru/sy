@@ -4,28 +4,22 @@
 
 | Metric  | Value        | Updated    |
 | ------- | ------------ | ---------- |
-| Version | v0.2.0       | 2025-12-18 |
+| Version | v0.3.0       | 2026-01-19 |
 | Tests   | 620+ passing | 2026-01-19 |
 | Build   | PASSING      | 2026-01-19 |
 
 ## Active Work
 
-**2026-01-19: Performance Optimizations - Done**
+**2026-01-19: v0.3.0 Released**
 
-Branch: `feature/streaming-protocol-v2`
-
-**Completed:**
-
-- Streaming protocol v2 complete
+- Streaming protocol v2 merged to main
 - All security fixes, tests passing, benchmarks validated
 - Message batching for DEST_FILE_ENTRY (64KB batches)
-- Dir mtime cache analysis - deferred (fundamental design issues)
-
-**Ready for merge to main.**
+- GCS transport support
 
 ## Roadmap
 
-### v0.3.0 (Streaming Protocol) — READY FOR MERGE
+### v0.3.0 (Streaming Protocol) — RELEASED
 
 Cross-platform sync works. Benchmarks validated.
 

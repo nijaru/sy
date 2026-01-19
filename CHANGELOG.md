@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-01-19
+
+### Added
+
+- **GCS transport**: Google Cloud Storage support via object_store crate
+
 ### Performance
 
 - **Message batching**: DEST_FILE_ENTRY messages batched into 64KB chunks, reducing syscalls
