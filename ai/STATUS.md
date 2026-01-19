@@ -10,32 +10,34 @@
 
 ## Active Work
 
-**2026-01-19: Streaming Protocol Complete**
+**2026-01-19: Streaming Protocol - Security Fixes & Testing**
 
 Branch: `feature/streaming-protocol-v2`
 
-**v1 Protocol Removed** — Clean streaming-only codebase:
+**Completed Today:**
 
-- Deleted `server/handler.rs` (693 lines v1 handlers)
-- Deleted `server/protocol.rs` (993 lines v1 types)
-- Rewrote `server/mod.rs` (562→210 lines, streaming only)
-- Simplified `transport/server.rs` (634→87 lines, connection only)
-- Net removal: ~2600 lines of dead code
+- Fixed security issues (path traversal, frame size limits, symlink validation, delta bounds)
+- Fixed runtime panic (`blocking_send` in async context → unbounded channels)
+- Fixed pull mode directory creation
+- Cross-platform tests pass (macOS ↔ Fedora)
 
-**Completed:**
+**Next Steps:**
 
-- GCS transport (`object_store` based)
-- S3 transport verified
-- Streaming protocol phases 1-6
-- v1 code removal
+1. Run benchmarks (streaming vs rsync) - need data to validate design
+2. Verify features work: bidirectional sync, watch mode, resume
+3. Code cleanup: dead code, unused scripts/benchmarks
+4. Update README with accurate benchmark data
 
-**Ready for:** v0.3.0 release testing
+**Decisions Made:**
+
+- Use unbounded channels for async callbacks (bounded + blocking_send panics in tokio context)
+- Protocol is just "streaming" in code (no v2 suffix) - branch name is for dev tracking only
 
 ## Roadmap
 
-### v0.3.0 (Streaming Protocol) — READY FOR TESTING
+### v0.3.0 (Streaming Protocol) — TESTING IN PROGRESS
 
-All implementation complete. One clean protocol, no backwards compat.
+Cross-platform sync works. Need benchmark validation.
 
 **Targets:**
 
@@ -48,11 +50,11 @@ All implementation complete. One clean protocol, no backwards compat.
 | Priority | Task                                            |
 | -------- | ----------------------------------------------- |
 | P3       | Daemon mode (deferred - streaming reduces need) |
-| P4       | Python bindings                                 |
-| —        | SyncEngine builder pattern                      |
-| —        | Issue #12 features                              |
+| P4       | Python bindings (not implemented)               |
 
 ## Performance
+
+**NEEDS UPDATED BENCHMARKS** - values below are pre-streaming protocol:
 
 | Scenario           | sy vs rsync         |
 | ------------------ | ------------------- |
