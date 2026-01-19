@@ -11,7 +11,7 @@ use crate::streaming::protocol::{
 };
 use crate::temp_file::TempFileGuard;
 use anyhow::{Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
@@ -19,6 +19,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 /// Maximum size for delta copy operations (16MB)
 const MAX_DELTA_COPY_SIZE: usize = 16 * 1024 * 1024;
+
+/// Batch size for DEST_FILE_ENTRY messages (64KB)
+/// Reduces syscalls by batching multiple encoded frames into single writes
+const DEST_ENTRY_BATCH_SIZE: usize = 64 * 1024;
 
 /// Validate that a relative path is safe and doesn't escape the root.
 /// Returns the full path if valid.
@@ -140,6 +144,7 @@ impl Receiver {
     }
 
     /// Scan destination and yield DEST_FILE_ENTRY messages for Initial Exchange.
+    /// Messages are batched to reduce syscalls.
     pub async fn scan_dest<F>(&self, mut on_entry: F) -> Result<(u64, u64)>
     where
         F: FnMut(Bytes) -> Result<()>,
@@ -150,6 +155,9 @@ impl Receiver {
         let scanner = crate::sync::scanner::Scanner::new(&self.config.root);
         // Use blocking scan in spawn_blocking
         let entries = tokio::task::spawn_blocking(move || scanner.scan()).await??;
+
+        // Batch buffer for reducing syscalls
+        let mut batch = BytesMut::with_capacity(DEST_ENTRY_BATCH_SIZE);
 
         for entry in entries {
             let rel_path = entry.relative_path.as_ref();
@@ -192,13 +200,26 @@ impl Receiver {
                 block_size,
                 checksums,
             };
-            on_entry(dest_entry.encode())?;
+
+            // Add to batch
+            let encoded = dest_entry.encode();
+            batch.extend_from_slice(&encoded);
+
+            // Flush batch when threshold reached
+            if batch.len() >= DEST_ENTRY_BATCH_SIZE {
+                on_entry(batch.split().freeze())?;
+            }
 
             total_files += 1;
             total_bytes += entry.size;
         }
 
-        // Send DEST_FILE_END
+        // Flush remaining entries
+        if !batch.is_empty() {
+            on_entry(batch.freeze())?;
+        }
+
+        // Send DEST_FILE_END (not batched - signals end of entries)
         let end = DestFileEnd {
             total_files,
             total_bytes,

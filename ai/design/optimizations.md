@@ -64,54 +64,30 @@ where
 
 ## Optimization 2: Directory mtime Cache
 
-**Impact:** Variable (5-50ms) | **Effort:** Medium
+**Impact:** Variable (5-50ms) | **Effort:** Medium | **Status:** DEFERRED
 
 ### Problem
 
 Currently we stat every file during scan, even if the entire directory is unchanged.
 
-### Solution
+### Why Deferred
 
-Track directory mtimes. If dir mtime unchanged since last sync, skip scanning that subtree.
+After analysis, this optimization has fundamental issues:
 
-```rust
-// During Initial Exchange, server sends dir mtimes
-// Client compares with local dir mtimes
-// If match, skip children from scan
-```
+1. **Dir mtime only reflects entry changes** - modifying file content does NOT update parent dir mtime
+2. **Only detects adds/removes** - not content changes, which is the common case
+3. **Complexity vs benefit is poor** - requires persistent state tracking, race condition handling
+4. **Marginal benefit** - scanning 5000 files on SSD is ~100ms, optimization would save ~10-20ms at most
 
-### Complexity
+### What Would Be Needed
 
-1. Dir mtime semantics vary by filesystem:
-   - APFS/ext4: mtime updates when directory entries change
-   - Some FSes: mtime may not update on nested changes
+1. Persistent cache of last-sync dir mtimes
+2. Protocol extension to compare dir mtimes
+3. Careful handling of edge cases (file modified but dir mtime unchanged)
 
-2. Requires tracking state between syncs (either in protocol or local cache)
+### Recommendation
 
-3. Race condition: dir mtime could match but file changed right before sync
-
-### Implementation Approach
-
-Phase 1 (within protocol):
-
-- Include dir mtime in DEST_FILE_ENTRY with DIR flag
-- Generator checks if source dir mtime matches
-- If match AND no new/deleted files expected, skip individual file checks
-
-Phase 2 (persistent cache):
-
-- Store last-sync dir mtimes locally
-- Skip sending unchanged subtrees entirely
-
-### Files to Modify
-
-1. `src/streaming/protocol.rs` - Add dir mtime to DestFileEntry
-2. `src/streaming/generator.rs` - Check dir mtimes before scanning
-3. `src/sync/scanner.rs` - Add option to skip directories
-
-### Deferred
-
-This optimization is more complex than message batching. Consider after batching proves insufficient.
+Defer unless profiling shows scan overhead is the bottleneck. The message batching optimization addresses the main syscall overhead.
 
 ## Optimization 3: Daemon Mode
 
