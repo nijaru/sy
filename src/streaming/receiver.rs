@@ -130,6 +130,8 @@ struct PendingFile {
     entry: FileEntry,
     temp_path: PathBuf,
     file: Option<File>,
+    /// Cached original file handle for delta sync (avoids reopening per chunk)
+    original_file: Option<File>,
     bytes_written: u64,
     guard: Option<TempFileGuard>,
 }
@@ -314,6 +316,7 @@ impl Receiver {
                 entry,
                 temp_path,
                 file: Some(file),
+                original_file: None, // Lazily opened on first delta chunk
                 bytes_written: 0,
                 guard: Some(guard),
             },
@@ -323,6 +326,7 @@ impl Receiver {
     }
 
     async fn handle_data(&mut self, data: Data) -> Result<()> {
+        let root = self.config.root.clone();
         let pending = self
             .pending_files
             .get_mut(&data.path)
@@ -330,8 +334,20 @@ impl Receiver {
 
         if let Some(ref mut file) = pending.file {
             if data.flags.contains(DataFlags::DELTA) {
-                // Apply delta
-                Self::apply_delta_static(&self.config.root, file, &data.path, &data.data).await?;
+                // Lazily open original file on first delta chunk, reuse for subsequent chunks
+                if pending.original_file.is_none() {
+                    let original_path = validate_path(&root, &data.path)?;
+                    pending.original_file = Some(
+                        File::open(&original_path)
+                            .await
+                            .context("Failed to open original file for delta application")?,
+                    );
+                }
+
+                // Apply delta using cached original file
+                if let Some(ref mut original) = pending.original_file {
+                    Self::apply_delta_with_original(file, original, &data.data).await?;
+                }
             } else {
                 // Write raw data at offset
                 file.seek(SeekFrom::Start(data.offset)).await?;
@@ -451,18 +467,12 @@ impl Receiver {
         Ok(())
     }
 
-    async fn apply_delta_static(
-        root: &Path,
+    /// Apply delta operations using a pre-opened original file (avoids reopening per chunk)
+    async fn apply_delta_with_original(
         file: &mut File,
-        rel_path: &str,
+        original: &mut File,
         delta_data: &[u8],
     ) -> Result<()> {
-        // Validate path before opening
-        let original_path = validate_path(root, rel_path)?;
-        let mut original = File::open(&original_path)
-            .await
-            .context("Failed to open original file for delta application")?;
-
         // Get file size for bounds checking
         let file_size = original.metadata().await?.len();
 
