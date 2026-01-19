@@ -180,6 +180,11 @@ impl StreamingSync {
         }
         let _server_hello = Hello::decode(payload)?;
 
+        // Ensure local root exists
+        if !self.local_root.exists() {
+            tokio::fs::create_dir_all(&self.local_root).await?;
+        }
+
         // 3. Send DEST_FILE_ENTRY messages (Initial Exchange)
         // Use unbounded channel to avoid blocking_send (panics in tokio context)
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
