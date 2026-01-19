@@ -10,7 +10,7 @@
 
 ## Active Work
 
-**2026-01-19: v0.3.0 Ready for Release**
+**2026-01-19: v0.3.0 Released**
 
 - Streaming protocol v2 merged to main
 - Gemini review fixes: delta memory bounds, chunking
