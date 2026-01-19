@@ -10,7 +10,7 @@
 
 ## Active Work
 
-**2026-01-19: Performance Optimizations - Planned**
+**2026-01-19: Performance Optimizations - Done**
 
 Branch: `feature/streaming-protocol-v2`
 
@@ -18,11 +18,10 @@ Branch: `feature/streaming-protocol-v2`
 
 - Streaming protocol v2 complete
 - All security fixes, tests passing, benchmarks validated
-- Ready for merge to main
+- Message batching for DEST_FILE_ENTRY (64KB batches)
+- Dir mtime cache analysis - deferred (fundamental design issues)
 
-**Next: Quick Win Optimizations**
-
-See `ai/design/optimizations.md` for implementation details.
+**Ready for merge to main.**
 
 ## Roadmap
 
@@ -32,12 +31,11 @@ Cross-platform sync works. Benchmarks validated.
 
 ### Backlog
 
-| Priority | Task                                            | Notes                          |
-| -------- | ----------------------------------------------- | ------------------------------ |
-| P2       | Message batching                                | ~5ms, low effort               |
-| P2       | Dir mtime cache                                 | Variable impact, medium effort |
-| P3       | Daemon mode (deferred - streaming reduces need) | ~30ms, high effort             |
-| P4       | Python bindings (not implemented)               | maturin/pyo3                   |
+| Priority | Task                                            | Notes                            |
+| -------- | ----------------------------------------------- | -------------------------------- |
+| P3       | Daemon mode (deferred - streaming reduces need) | ~30ms, high effort               |
+| P3       | Dir mtime cache (deferred)                      | Fundamental issues - see design/ |
+| P4       | Python bindings (not implemented)               | maturin/pyo3                     |
 
 ## Performance
 
@@ -53,25 +51,25 @@ Cross-platform sync works. Benchmarks validated.
 | small_files | 1000  | 1.1x slower | 3.1x faster | 2.9x faster |
 | deep_dirs   | 100   | 1.1x faster | 1.7x faster | 1.6x faster |
 
-### SSH Sync
+### SSH Sync (with message batching)
 
 | Scenario    | Files | Initial     | Incremental | Delta       |
 | ----------- | ----- | ----------- | ----------- | ----------- |
-| source_code | 5000  | 2.0x faster | ~parity     | ~parity     |
-| large_file  | 1     | 1.1x faster | 1.6x slower | 1.7x slower |
-| mixed       | 505   | ~parity     | 1.5x slower | 1.4x slower |
-| small_files | 1000  | 1.5x slower | 1.3x slower | 1.3x slower |
-| deep_dirs   | 100   | 1.3x slower | 1.4x slower | 1.3x slower |
+| source_code | 5000  | 2.2x faster | ~parity     | ~parity     |
+| large_file  | 1     | 1.2x faster | 1.5x slower | 1.5x slower |
+| mixed       | 505   | ~parity     | 1.4x slower | 1.4x slower |
+| small_files | 1000  | 1.4x slower | 1.3x slower | 1.4x slower |
+| deep_dirs   | 100   | 1.4x slower | 1.3x slower | 1.3x slower |
 
-**Key insight:** sy excels with many small files (source_code scenario) due to pipelined transfers. rsync has edge on larger files and incremental SSH updates.
+**Key insight:** sy excels with many small files (source_code scenario) due to pipelined transfers + message batching. rsync has edge on incremental SSH updates.
 
-### Optimization Opportunities (Not Implemented)
+### Optimizations Applied
 
-| Optimization     | Impact       | Effort | Notes                             |
-| ---------------- | ------------ | ------ | --------------------------------- |
-| Daemon mode      | High (~30ms) | High   | Keep `sy --server` running        |
-| Message batching | Low (~5ms)   | Low    | Batch DEST_FILE_ENTRY messages    |
-| Dir mtime cache  | Medium       | Medium | Skip unchanged directory subtrees |
+| Optimization     | Status   | Notes                                  |
+| ---------------- | -------- | -------------------------------------- |
+| Message batching | Done     | 64KB batches for DEST_FILE_ENTRY       |
+| Dir mtime cache  | Deferred | Content changes don't update dir mtime |
+| Daemon mode      | Deferred | ~30ms gain, high effort                |
 
 The ~50ms gap vs rsync is fixed overhead (server spawn + protocol). Daemon mode would close most of this gap.
 
