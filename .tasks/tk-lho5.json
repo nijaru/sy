@@ -3,7 +3,7 @@
   "ref": "lho5",
   "title": "Code cleanup: remove dead code, consolidate scripts/benchmarks",
   "description": null,
-  "status": "open",
+  "status": "active",
   "priority": 2,
   "labels": [],
   "assignees": [],
@@ -13,7 +13,7 @@
   "due_date": null,
   "logs": [],
   "created_at": "2026-01-19T11:03:39.270Z",
-  "updated_at": "2026-01-19T11:03:39.270Z",
+  "updated_at": "2026-01-19T11:29:04.830Z",
   "completed_at": null,
   "external": {}
 }
