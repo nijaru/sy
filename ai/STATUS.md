@@ -67,6 +67,16 @@ Cross-platform sync works. Benchmarks validated.
 
 **Key insight:** sy excels with many small files (source_code scenario) due to pipelined transfers. rsync has edge on larger files and incremental SSH updates.
 
+### Optimization Opportunities (Not Implemented)
+
+| Optimization     | Impact       | Effort | Notes                             |
+| ---------------- | ------------ | ------ | --------------------------------- |
+| Daemon mode      | High (~30ms) | High   | Keep `sy --server` running        |
+| Message batching | Low (~5ms)   | Low    | Batch DEST_FILE_ENTRY messages    |
+| Dir mtime cache  | Medium       | Medium | Skip unchanged directory subtrees |
+
+The ~50ms gap vs rsync is fixed overhead (server spawn + protocol). Daemon mode would close most of this gap.
+
 ## Feature Flags
 
 | Flag  | Default  | Notes          |
