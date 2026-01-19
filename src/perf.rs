@@ -170,7 +170,7 @@ impl PerformanceMetrics {
 
     /// Format bytes as human-readable size
     fn format_size(bytes: u64) -> String {
-        crate::error::format_bytes(bytes)
+        crate::resource::format_bytes(bytes)
     }
 }
 

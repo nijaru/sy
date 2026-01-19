@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "3t42",
+  "title": "Fix SystemTime unwrap panic in resolver.rs",
+  "description": null,
+  "status": "done",
+  "priority": 1,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-18T19:01:52.598Z",
+  "updated_at": "2026-01-18T20:05:05.768Z",
+  "completed_at": "2026-01-18T20:05:05.768Z",
+  "external": {}
+}

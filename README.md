@@ -17,17 +17,17 @@ That's it. Use `sy --help` for options.
 
 **sy excels at:**
 
-- Repeated syncs (backups, deployments) — 3x faster after first run
+- Repeated local syncs — 2-3x faster after first run
 - Large files on APFS/BTRFS/XFS — 40x+ faster via COW reflinks
+- Many small files over SSH — 2x faster initial sync (5000+ files)
 - Mixed workloads — 2x faster
-- Bulk SSH transfers — 2-4x faster
 
 **rsync is better for:**
 
-- First-time sync of many small files — ~1.3x faster
+- First-time local sync of small files — ~1.1x faster
 - SSH incremental updates — ~1.3x faster
 
-**Bottom line:** If you sync the same paths repeatedly, sy saves time. If you're doing one-off copies of thousands of tiny files, rsync is faster.
+**Bottom line:** sy wins on local sync (especially repeated), COW filesystems, and large SSH transfers. rsync has slight edge on incremental SSH updates.
 
 ## Installation
 

@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "lho5",
+  "title": "Code cleanup: remove dead code, consolidate scripts/benchmarks",
+  "description": null,
+  "status": "done",
+  "priority": 2,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-19T11:03:39.270Z",
+  "updated_at": "2026-01-19T11:32:04.329Z",
+  "completed_at": "2026-01-19T11:32:04.329Z",
+  "external": {}
+}

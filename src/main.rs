@@ -17,6 +17,7 @@ mod retry;
 mod server;
 mod sparse;
 mod ssh;
+mod streaming;
 mod sync;
 mod temp_file;
 mod transport;
@@ -29,6 +30,7 @@ use config::Config;
 use filter::FilterEngine;
 use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
+use resource::format_bytes;
 use std::path::PathBuf;
 #[cfg(feature = "watch")]
 use sync::watch::WatchMode;
@@ -750,13 +752,13 @@ Or install from local source with: cargo install --path . --features acl"#
         if !cli.quiet && !cli.json {
             println!("Mode: Server protocol (push)\n");
         }
-        sync::server_mode::sync_server_mode(source.path(), destination).await?
+        sync::server_mode::sync_push(source.path(), destination, cli.delete, cli.compress).await?
     } else if source.is_remote() && destination.is_local() {
         // Use server mode for remote → local SSH (faster than SFTP)
         if !cli.quiet && !cli.json {
             println!("Mode: Server protocol (pull)\n");
         }
-        sync::server_mode::sync_pull_server_mode(source, destination.path()).await?
+        sync::server_mode::sync_pull(source, destination.path(), cli.delete, cli.compress).await?
     } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
@@ -975,22 +977,6 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     Ok(())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 fn format_duration(duration: std::time::Duration) -> String {

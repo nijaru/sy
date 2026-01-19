@@ -1,0 +1,24 @@
+{
+  "project": "tk",
+  "ref": "bapt",
+  "title": "Implement daemon mode for SSH",
+  "description": null,
+  "status": "open",
+  "priority": 3,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-01-19T09:10:28.870Z",
+      "msg": "Deferred until after v0.3.0 - streaming protocol reduces need. See ai/design/pr13-features.md"
+    }
+  ],
+  "created_at": "2026-01-18T18:41:37.002Z",
+  "updated_at": "2026-01-19T09:10:28.870Z",
+  "completed_at": null,
+  "external": {}
+}

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Message batching**: DEST_FILE_ENTRY messages batched into 64KB chunks, reducing syscalls
+- **SSH source_code scenario**: Initial sync improved from 2.0x to 2.2x faster vs rsync (5000 files)
+
+### Fixed
+
+- **Skip unchanged files**: Streaming protocol now correctly skips files with matching size+mtime
+- **Security hardening**: Path traversal validation, frame size limits, symlink target validation, delta bounds checking
+
+### Changed
+
+- **Streaming protocol v2**: Complete rewrite of SSH sync protocol
+  - Unidirectional streaming (no ACKs in critical path)
+  - Pipelined file transfers
+  - Delta sync with rolling checksums
+
 ## [0.2.0] - 2025-12-18
 
 ### Breaking Changes

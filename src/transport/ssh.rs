@@ -158,6 +158,28 @@ impl ConnectionPool {
         })
     }
 
+    /// Helper to get a read guard, recovering from poisoning if necessary
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<Mutex<Session>>>> {
+        match self.sessions.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("SSH connection pool lock poisoned during read, recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Helper to get a write guard, recovering from poisoning if necessary
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<Arc<Mutex<Session>>>> {
+        match self.sessions.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("SSH connection pool lock poisoned during write, recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Expand the pool to the target size (capped at max_size)
     ///
     /// Creates additional connections in parallel if needed.
@@ -166,11 +188,7 @@ impl ConnectionPool {
         use futures::future::join_all;
 
         let target = target_size.min(self.max_size);
-        let current_size = self
-            .sessions
-            .read()
-            .expect("SSH connection pool lock poisoned during read")
-            .len();
+        let current_size = self.read().len();
 
         if current_size >= target {
             return Ok(()); // Already have enough connections
@@ -219,10 +237,7 @@ impl ConnectionPool {
         }
 
         if !new_sessions.is_empty() {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("SSH connection pool lock poisoned during write");
+            let mut sessions = self.write();
             sessions.extend(new_sessions);
             tracing::info!(
                 "SSH connection pool expanded to {} connections",
@@ -234,19 +249,13 @@ impl ConnectionPool {
     }
 
     fn get_session(&self) -> Arc<Mutex<Session>> {
-        let sessions = self
-            .sessions
-            .read()
-            .expect("SSH connection pool lock poisoned");
+        let sessions = self.read();
         let index = self.next_index.fetch_add(1, Ordering::Relaxed) % sessions.len();
         Arc::clone(&sessions[index])
     }
 
     fn size(&self) -> usize {
-        self.sessions
-            .read()
-            .expect("SSH connection pool lock poisoned")
-            .len()
+        self.read().len()
     }
 }
 
@@ -832,13 +841,21 @@ impl SshTransport {
             let session_arc = self.connection_pool.get_session();
             let dest_clone = dest_buf.clone();
             tokio::task::spawn_blocking(move || {
-                let session = session_arc.lock().unwrap();
-                let sftp = session.sftp().unwrap();
-                let file = sftp.create(&dest_clone).unwrap();
+                let session = session_arc
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let sftp = session
+                    .sftp()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let file = sftp
+                    .create(&dest_clone)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 drop(file);
+                Ok::<(), std::io::Error>(())
             })
             .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(SyncError::Io)?;
         }
 
         let mut handles = Vec::new();
@@ -918,9 +935,16 @@ impl SshTransport {
             let session_arc = self.connection_pool.get_session();
             let dest_clone = dest_buf.clone();
             tokio::task::spawn_blocking(move || {
-                let session = session_arc.lock().unwrap();
-                let sftp = session.sftp().unwrap();
-                let mtime_secs = mtime.duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let session = session_arc
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let sftp = session
+                    .sftp()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let mtime_secs = mtime
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let _ = sftp.setstat(
                     &dest_clone,
                     ssh2::FileStat {
@@ -932,9 +956,11 @@ impl SshTransport {
                         mtime: Some(mtime_secs),
                     },
                 );
+                Ok::<(), std::io::Error>(())
             })
             .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(SyncError::Io)?;
         }
 
         Ok(TransferResult::new(file_size))

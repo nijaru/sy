@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "zovt",
+  "title": "Run benchmarks: streaming protocol vs rsync",
+  "description": null,
+  "status": "done",
+  "priority": 1,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-19T11:03:36.694Z",
+  "updated_at": "2026-01-19T11:27:24.010Z",
+  "completed_at": "2026-01-19T11:27:24.010Z",
+  "external": {}
+}

@@ -1,7 +1,8 @@
 use super::{TransferResult, Transport};
-use crate::error::{format_bytes, Result, SyncError};
+use crate::error::{Result, SyncError};
 use crate::fs_util::{has_hard_links, same_filesystem, supports_cow_reflinks};
 use crate::integrity::{ChecksumType, IntegrityVerifier};
+use crate::resource::format_bytes;
 use crate::sync::scanner::{FileEntry, ScanOptions, Scanner};
 use crate::temp_file::TempFileGuard;
 use async_trait::async_trait;

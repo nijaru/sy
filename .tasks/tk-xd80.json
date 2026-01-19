@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "xd80",
+  "title": "Implement message batching for DEST_FILE_ENTRY",
+  "description": null,
+  "status": "done",
+  "priority": 2,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-19T11:59:19.307Z",
+  "updated_at": "2026-01-19T14:52:12.117Z",
+  "completed_at": "2026-01-19T14:52:12.117Z",
+  "external": {}
+}

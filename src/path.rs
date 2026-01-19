@@ -20,6 +20,11 @@ pub enum SyncPath {
         endpoint: Option<String>,
         has_trailing_slash: bool,
     },
+    Gcs {
+        bucket: String,
+        key: String,
+        has_trailing_slash: bool,
+    },
 }
 
 impl SyncPath {
@@ -94,6 +99,36 @@ impl SyncPath {
             }
         }
 
+        // Check for GCS URL format
+        if let Some(remainder) = s.strip_prefix("gs://") {
+            // GCS usually doesn't use query params for region/endpoint in the same way,
+            // but we'll handle basic gs://bucket/key
+            let (path_part, _query_part) = if let Some(q_pos) = remainder.find('?') {
+                (&remainder[..q_pos], Some(&remainder[q_pos + 1..]))
+            } else {
+                (remainder, None)
+            };
+
+            // Split path into bucket and key
+            if let Some(slash_pos) = path_part.find('/') {
+                let bucket = path_part[..slash_pos].to_string();
+                let key = path_part[slash_pos + 1..].to_string();
+
+                return SyncPath::Gcs {
+                    bucket,
+                    key,
+                    has_trailing_slash,
+                };
+            } else {
+                // Just bucket, no key (treat as root)
+                return SyncPath::Gcs {
+                    bucket: path_part.to_string(),
+                    key: String::new(),
+                    has_trailing_slash,
+                };
+            }
+        }
+
         // Check for remote path format (contains : before any /)
         if let Some(colon_pos) = s.find(':') {
             // Check if this is a remote path (no / before the :)
@@ -147,6 +182,7 @@ impl SyncPath {
             SyncPath::Local { path, .. } => path,
             SyncPath::Remote { path, .. } => path,
             SyncPath::S3 { key, .. } => Path::new(key),
+            SyncPath::Gcs { key, .. } => Path::new(key),
         }
     }
 
@@ -164,6 +200,9 @@ impl SyncPath {
                 has_trailing_slash, ..
             } => *has_trailing_slash,
             SyncPath::S3 {
+                has_trailing_slash, ..
+            } => *has_trailing_slash,
+            SyncPath::Gcs {
                 has_trailing_slash, ..
             } => *has_trailing_slash,
         }
@@ -184,6 +223,12 @@ impl SyncPath {
     #[allow(dead_code)] // Public API for S3 path detection
     pub fn is_s3(&self) -> bool {
         matches!(self, SyncPath::S3 { .. })
+    }
+
+    /// Check if this is a GCS path
+    #[allow(dead_code)] // Public API for GCS path detection
+    pub fn is_gcs(&self) -> bool {
+        matches!(self, SyncPath::Gcs { .. })
     }
 }
 
@@ -219,6 +264,9 @@ impl std::fmt::Display for SyncPath {
                     write!(f, "?{}", query_params.join("&"))?;
                 }
                 Ok(())
+            }
+            SyncPath::Gcs { bucket, key, .. } => {
+                write!(f, "gs://{}/{}", bucket, key)
             }
         }
     }

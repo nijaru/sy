@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "o0n9",
+  "title": "Fix clippy errors and complete v1 removal from server/mod.rs",
+  "description": null,
+  "status": "done",
+  "priority": 1,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-18T22:54:20.320Z",
+  "updated_at": "2026-01-19T09:42:54.111Z",
+  "completed_at": "2026-01-19T09:42:54.111Z",
+  "external": {}
+}

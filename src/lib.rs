@@ -18,6 +18,7 @@ pub mod server;
 pub mod sparse;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+pub mod streaming;
 pub mod sync;
 pub mod temp_file;
 pub mod transport;

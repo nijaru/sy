@@ -27,6 +27,7 @@ exclude = [
 default = ["ssh"]
 acl = ["exacl"]
 s3 = ["object_store"]
+gcs = ["object_store"]
 ssh = ["dep:ssh2", "dep:whoami", "dep:regex"]
 watch = ["dep:notify"]
 
@@ -90,10 +91,11 @@ futures = "0.3.31"
 fjall = "2.11.2"
 
 # S3 / Cloud Storage (Phase 10) - Optional feature
-object_store = { version = "0.12.4", features = ["aws"], optional = true }
+object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }
 bytes = "1.10.1"
 crossbeam-channel = "0.5.15"
 memmap2 = "0.9.9"
+bitflags = "2.10.0"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]

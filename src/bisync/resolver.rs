@@ -232,7 +232,7 @@ fn generate_conflict_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or_default();
     format!("{}", now.as_secs())
 }
 

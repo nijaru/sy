@@ -1,0 +1,32 @@
+{
+  "project": "tk",
+  "ref": "ofsp",
+  "title": "Implement streaming protocol v2 (see ai/design/streaming-protocol-v0.3.0.md)",
+  "description": null,
+  "status": "done",
+  "priority": 1,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-01-18T21:48:41.899Z",
+      "msg": "Phase 1 complete: protocol.rs, channel.rs, mod.rs with 18 tests"
+    },
+    {
+      "ts": "2026-01-18T22:54:19.062Z",
+      "msg": "Phases 1-6 complete. Cleanup: removed v1 protocol code, one code path now. Remaining: fix clippy, update server/mod.rs"
+    },
+    {
+      "ts": "2026-01-19T09:03:12.732Z",
+      "msg": "Phases 1-6 complete. Documentation cleanup done. Code cleanup (v1 removal) is separate task tk-o0n9."
+    }
+  ],
+  "created_at": "2026-01-18T21:18:42.634Z",
+  "updated_at": "2026-01-19T09:42:54.134Z",
+  "completed_at": "2026-01-19T09:42:54.134Z",
+  "external": {}
+}

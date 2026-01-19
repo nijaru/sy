@@ -5,125 +5,80 @@
 | Metric  | Value        | Updated    |
 | ------- | ------------ | ---------- |
 | Version | v0.2.0       | 2025-12-18 |
-| Tests   | 620+ passing | 2025-11-27 |
-| Build   | 🟢 PASSING   | 2025-12-18 |
-
-## Performance Summary (2025-12-18)
-
-### Local (sy vs rsync)
-
-| Scenario           | Initial     | Incremental | Delta       |
-| ------------------ | ----------- | ----------- | ----------- |
-| small_files (1000) | rsync 1.3x  | **sy 2.9x** | **sy 3.1x** |
-| large_file (100MB) | **sy 44x**  | **sy 1.2x** | **sy 1.6x** |
-| mixed (505)        | **sy 2.3x** | **sy 2.5x** | **sy 2.4x** |
-| source_code (5000) | rsync 1.2x  | **sy 3.2x** | **sy 3.4x** |
-
-### SSH (Mac → Fedora via Tailscale) - After pipelining (2025-12-18)
-
-| Scenario           | Initial     | Incremental | Delta       |
-| ------------------ | ----------- | ----------- | ----------- |
-| small_files (1000) | rsync 1.6x  | rsync 1.4x  | rsync 1.4x  |
-| large_file (100MB) | **sy 4.1x** | rsync 1.3x  | rsync 1.4x  |
-| mixed (505)        | **sy 2.1x** | rsync 1.4x  | **sy ~par** |
-| source_code (5000) | rsync 1.3x  | rsync 1.4x  | rsync 1.4x  |
-
-### Key Findings
-
-1. **Local incremental/delta**: sy wins massively (2.9-3.4x faster)
-2. **Local large files**: sy wins 44x on initial (COW/clonefile on APFS)
-3. **Local initial many files**: rsync wins 1.2-1.3x (parallelism overhead)
-4. **SSH initial**: sy wins for bulk transfers (2-4x), except many small files
-5. **SSH incremental/delta**: Still ~1.3-1.4x slower (inherent protocol overhead)
+| Tests   | 620+ passing | 2026-01-19 |
+| Build   | PASSING      | 2026-01-19 |
 
 ## Active Work
 
-**Completed**:
+**2026-01-19: Performance Optimizations - Done**
 
-- Pipelined delta checksum requests (sy-09r)
-- Server-side parallelism (2025-12-18): rayon parallel checksums, concurrent request handling, batched flushes
+Branch: `feature/streaming-protocol-v2`
 
-**Investigation result**: Server-side optimizations implemented but didn't close SSH incremental/delta gap. The ~1.3-1.4x slowdown is inherent to protocol/network latency, not server-side CPU processing. Benchmarks confirmed performance unchanged after server parallelism.
+**Completed:**
 
-**Remaining options**:
+- Streaming protocol v2 complete
+- All security fixes, tests passing, benchmarks validated
+- Message batching for DEST_FILE_ENTRY (64KB batches)
+- Dir mtime cache analysis - deferred (fundamental design issues)
 
-1. Stream-level compression (may help with large deltas)
-2. Accept the gap - sy wins locally (3x) and on bulk SSH transfers (2-4x)
-
-**Benchmark tracking**: `scripts/benchmark.py` records to `benchmarks/history.jsonl`
-
-**Community request**: [Issue #12](https://github.com/nijaru/sy/issues/12) - `--one-file-system`, SSH args, `--numeric-ids`
+**Ready for merge to main.**
 
 ## Roadmap
 
-### v0.2.0 (SSH Performance)
+### v0.3.0 (Streaming Protocol) — READY FOR MERGE
 
-- [x] Pipeline delta checksum requests (P0) - done
-- [x] Parallelize delta computation in batches - done
-- [x] Server-side parallelism - done (didn't close gap, inherent latency)
-- [ ] Stream-level compression after HELLO (P1)
-
-### v0.3.0 (UX Polish)
-
-- [ ] Suppress stack traces on user errors
-- [ ] Fix quiet mode (suppress all logging)
-- [ ] Document resume-enabled default
+Cross-platform sync works. Benchmarks validated.
 
 ### Backlog
 
-- [ ] Issue #12 features (`--one-file-system`, SSH args)
-- [ ] russh migration (pure Rust SSH)
-- [ ] S3 bidirectional sync
-- [ ] Windows support
+| Priority | Task                                            | Notes                            |
+| -------- | ----------------------------------------------- | -------------------------------- |
+| P3       | Daemon mode (deferred - streaming reduces need) | ~30ms, high effort               |
+| P3       | Dir mtime cache (deferred)                      | Fundamental issues - see design/ |
+| P4       | Python bindings (not implemented)               | maturin/pyo3                     |
 
-## What Worked
+## Performance
 
-- Bidirectional server mode (74f7c35): Push + pull over SSH
-- Delta sync: 2-3x faster than rsync locally
-- Large file throughput: 7x faster than rsync locally
-- Protocol fix (66d05d5): Always send MKDIR_BATCH
-- Benchmark infrastructure: JSONL tracking, automated comparison
-- Delta pipelining: Batch CHECKSUM_REQ/RESP, parallel delta computation, batch DELTA_DATA/FILE_DONE
-- Server-side: Rayon parallel checksums, concurrent request handling with channels, batched flushes
-- Checkpoint default 10→100: Reduced resume state overhead for initial sync
-- Verification default flip: `--verify` now opt-in, sy matches rsync speed by default
+**Benchmarked 2026-01-19** (M3 Max → Fedora via Tailscale)
 
-## What Didn't Work
+### Local Sync
 
-- SSH incremental: 1.3-1.5x slower than rsync (protocol/network latency, not CPU)
-- Server-side parallelism: Implemented but didn't close gap - bottleneck is latency, not processing
-- UX: Stack traces shown on normal validation errors
+| Scenario    | Files | Initial     | Incremental | Delta       |
+| ----------- | ----- | ----------- | ----------- | ----------- |
+| source_code | 5000  | 1.3x faster | 3.5x faster | 3.6x faster |
+| large_file  | 1     | 42x faster  | 1.4x faster | 1.6x faster |
+| mixed       | 505   | 2.2x faster | 2.4x faster | 2.4x faster |
+| small_files | 1000  | 1.1x slower | 3.1x faster | 2.9x faster |
+| deep_dirs   | 100   | 1.1x faster | 1.7x faster | 1.6x faster |
 
-## Recent Releases
+### SSH Sync (with message batching)
 
-### v0.2.0 (2025-12-18)
+| Scenario    | Files | Initial     | Incremental | Delta       |
+| ----------- | ----- | ----------- | ----------- | ----------- |
+| source_code | 5000  | 2.2x faster | ~parity     | ~parity     |
+| large_file  | 1     | 1.2x faster | 1.5x slower | 1.5x slower |
+| mixed       | 505   | ~parity     | 1.4x slower | 1.4x slower |
+| small_files | 1000  | 1.4x slower | 1.3x slower | 1.4x slower |
+| deep_dirs   | 100   | 1.4x slower | 1.3x slower | 1.3x slower |
 
-- **Breaking:** `--verify` now opt-in (was default)
-- **Breaking:** Removed `--mode` flag (use `--verify` instead)
-- Performance: sy now ~10% faster than rsync on small files
-- Simplified verification to single `--verify` flag (xxHash3)
+**Key insight:** sy excels with many small files (source_code scenario) due to pipelined transfers + message batching. rsync has edge on incremental SSH updates.
 
-### v0.1.2 (2025-11-27)
+### Optimizations Applied
 
-- Bidirectional server mode (push + pull)
-- Delta sync 2x faster than rsync
-- Removed ~300 lines dead bulk_transfer code
+| Optimization     | Status   | Notes                                  |
+| ---------------- | -------- | -------------------------------------- |
+| Message batching | Done     | 64KB batches for DEST_FILE_ENTRY       |
+| Dir mtime cache  | Deferred | Content changes don't update dir mtime |
+| Daemon mode      | Deferred | ~30ms gain, high effort                |
 
-### v0.1.1 (2025-11-26)
-
-- Batch destination scanning (~1000x fewer SSH round-trips)
-- Planning phase: 90 min → 30 sec for 531K files
-
-### v0.1.0 (2025-11-25)
-
-- Breaking: rsync-compatible defaults
-- New flags: `--gitignore`, `--exclude-vcs`, `-u/--update`
+The ~50ms gap vs rsync is fixed overhead (server spawn + protocol). Daemon mode would close most of this gap.
 
 ## Feature Flags
 
-| Flag  | Default  | Notes             |
-| ----- | -------- | ----------------- |
-| SSH   | Enabled  | ssh2 (libssh2)    |
-| Watch | Disabled | File watching     |
-| ACL   | Disabled | Linux: libacl-dev |
-| S3    | Disabled | Experimental      |
+| Flag  | Default  | Notes          |
+| ----- | -------- | -------------- |
+| SSH   | Enabled  | ssh2 (libssh2) |
+| S3    | Disabled | object_store   |
+| GCS   | Disabled | object_store   |
+| ACL   | Disabled | libacl-dev     |
+| Watch | Disabled | notify         |
