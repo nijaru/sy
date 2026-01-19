@@ -213,9 +213,11 @@ impl Sender {
             flags |= DataFlags::COMPRESSED;
         }
 
-        // Serialize delta ops, chunking into multiple messages if needed
+        // Serialize delta ops, chunking into multiple messages if needed.
+        // Note: For delta operations, the receiver ignores the offset field (it processes
+        // ops sequentially), so we always use 0. The receiver appends all delta chunks
+        // to the output file in order.
         let mut delta_bytes = Vec::new();
-        let mut chunk_offset = 0u64;
 
         for op in delta.ops {
             // Serialize the op
@@ -241,12 +243,11 @@ impl Sender {
                 // Flush current chunk
                 let data = Data {
                     path: path_str.to_string(),
-                    offset: chunk_offset,
+                    offset: 0, // Unused for delta - receiver processes ops sequentially
                     flags,
                     data: Bytes::from(std::mem::take(&mut delta_bytes)),
                 };
                 on_data(data.encode())?;
-                chunk_offset += 1; // Increment to signal continuation
             }
 
             delta_bytes.extend(op_bytes);
@@ -256,7 +257,7 @@ impl Sender {
         if !delta_bytes.is_empty() {
             let data = Data {
                 path: path_str.to_string(),
-                offset: chunk_offset,
+                offset: 0, // Unused for delta
                 flags,
                 data: Bytes::from(delta_bytes),
             };
@@ -270,6 +271,7 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::protocol::BlockChecksum;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -321,5 +323,181 @@ mod tests {
 
         // Should have: FileEntry, Data, DataEnd, FileEnd
         assert!(messages.len() >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_sender_delta_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.txt");
+
+        // Create a file that will differ from the "destination"
+        let content = "new content that differs from original";
+        fs::write(&file_path, content).unwrap();
+
+        let config = SenderConfig {
+            root: tmp.path().to_path_buf(),
+            compress: false,
+        };
+
+        let (tx, rx) = crate::streaming::channel::file_job_channel();
+        let sender = Sender::new(config);
+
+        // Create fake destination checksums that won't match source
+        // This forces all source data to be sent as DeltaOp::Data
+        let delta_info = DeltaInfo {
+            block_size: 16,
+            file_size: 32,
+            checksums: vec![
+                BlockChecksum {
+                    offset: 0,
+                    weak: 0xDEADBEEF,
+                    strong: 0x0,
+                },
+                BlockChecksum {
+                    offset: 16,
+                    weak: 0xCAFEBABE,
+                    strong: 0x1,
+                },
+            ],
+        };
+
+        tx.send(GeneratorMessage::File(FileJob {
+            path: Arc::new(PathBuf::from("test.txt")),
+            size: content.len() as u64,
+            mtime: 0,
+            mode: 0o644,
+            inode: 0,
+            need_delta: true,
+            checksums: Some(delta_info),
+        }))
+        .await
+        .unwrap();
+
+        tx.send(GeneratorMessage::FileEnd {
+            total_files: 1,
+            total_bytes: content.len() as u64,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+
+        let mut messages = Vec::new();
+        sender
+            .run(rx, |bytes| {
+                messages.push(bytes);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Should have: FileEntry, Data (delta), DataEnd, FileEnd
+        assert!(messages.len() >= 4, "Expected at least 4 messages");
+
+        // Verify the Data message has DELTA flag set
+        // Message format: [length(4), type(1), path_len(2), path, offset(8), flags(1), data]
+        // The second message should be Data with DELTA flag
+        let data_msg = &messages[1];
+        assert_eq!(data_msg[4], 0x06, "Expected DATA message type");
+
+        // Parse the Data message to verify DELTA flag
+        // Skip: length(4) + type(1) + path_len(2) + path(8 bytes) + offset(8) = 23
+        let path_len = u16::from_be_bytes([data_msg[5], data_msg[6]]) as usize;
+        let flags_offset = 4 + 1 + 2 + path_len + 8; // len + type + path_len + path + offset
+        let flags = data_msg[flags_offset];
+        assert!(
+            flags & DataFlags::DELTA.bits() != 0,
+            "Expected DELTA flag to be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delta_always_uses_zero_offset() {
+        // Test that delta Data messages always use offset 0
+        // (receiver processes ops sequentially, offset is unused for delta)
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("large.txt");
+
+        // Create content that will be sent as delta literal data
+        let content = "a".repeat(100_000); // 100KB of 'a'
+        fs::write(&file_path, &content).unwrap();
+
+        let config = SenderConfig {
+            root: tmp.path().to_path_buf(),
+            compress: false,
+        };
+
+        let (tx, rx) = crate::streaming::channel::file_job_channel();
+        let sender = Sender::new(config);
+
+        // Fake checksums that won't match - forces literal data
+        let delta_info = DeltaInfo {
+            block_size: 1024,
+            file_size: 2048,
+            checksums: vec![
+                BlockChecksum {
+                    offset: 0,
+                    weak: 0x12345678,
+                    strong: 0x99,
+                },
+                BlockChecksum {
+                    offset: 1024,
+                    weak: 0x87654321,
+                    strong: 0x88,
+                },
+            ],
+        };
+
+        tx.send(GeneratorMessage::File(FileJob {
+            path: Arc::new(PathBuf::from("large.txt")),
+            size: content.len() as u64,
+            mtime: 0,
+            mode: 0o644,
+            inode: 0,
+            need_delta: true,
+            checksums: Some(delta_info),
+        }))
+        .await
+        .unwrap();
+
+        tx.send(GeneratorMessage::FileEnd {
+            total_files: 1,
+            total_bytes: content.len() as u64,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+
+        let mut messages = Vec::new();
+        sender
+            .run(rx, |bytes| {
+                messages.push(bytes);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Find all Data messages and verify they use offset 0
+        for msg in &messages {
+            if msg.len() > 4 && msg[4] == 0x06 {
+                // DATA message type
+                // Parse offset from message
+                // Format: length(4) + type(1) + path_len(2) + path + offset(8) + flags(1) + data_len(4) + data
+                let path_len = u16::from_be_bytes([msg[5], msg[6]]) as usize;
+                let offset_start = 4 + 1 + 2 + path_len; // length + type + path_len + path
+                let offset = u64::from_be_bytes([
+                    msg[offset_start],
+                    msg[offset_start + 1],
+                    msg[offset_start + 2],
+                    msg[offset_start + 3],
+                    msg[offset_start + 4],
+                    msg[offset_start + 5],
+                    msg[offset_start + 6],
+                    msg[offset_start + 7],
+                ]);
+                assert_eq!(offset, 0, "Delta Data message should always use offset 0");
+            }
+        }
     }
 }
