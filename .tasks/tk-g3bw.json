@@ -3,7 +3,7 @@
   "ref": "g3bw",
   "title": "Update README with accurate benchmark data",
   "description": null,
-  "status": "open",
+  "status": "active",
   "priority": 2,
   "labels": [],
   "assignees": [],
@@ -13,7 +13,7 @@
   "due_date": null,
   "logs": [],
   "created_at": "2026-01-19T11:03:40.294Z",
-  "updated_at": "2026-01-19T11:03:40.294Z",
+  "updated_at": "2026-01-19T11:32:04.349Z",
   "completed_at": null,
   "external": {}
 }
