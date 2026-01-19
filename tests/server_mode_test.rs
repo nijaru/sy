@@ -2,12 +2,11 @@
 mod tests {
     use std::fs;
     use sy::path::SyncPath;
-    use sy::sync::server_mode::{sync_pull_server_mode, sync_server_mode};
+    use sy::sync::server_mode::{sync_pull, sync_push};
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_server_mode_local_to_local() -> anyhow::Result<()> {
-        // Setup
+    async fn test_server_mode_push_local() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("src");
         let dest = temp.path().join("dest");
@@ -21,27 +20,14 @@ mod tests {
         fs::create_dir(source.join("subdir"))?;
         fs::write(source.join("subdir/file3.txt"), "Nested file")?;
 
-        // Run sync
-        let dest_sync_path = SyncPath::Local {
-            path: dest.clone(),
-            has_trailing_slash: false,
-        };
-
-        // Note: We need to ensure 'sy' binary is available for the server process
-        // This test assumes 'sy' is built and in target/debug or PATH.
-        // cargo test builds the binary but doesn't put it in PATH.
-        // We can use current_exe() to find the test binary, but we need the main 'sy' binary.
-        // Workaround: Point to the raw 'sy' binary path if possible, or skip if not found.
-        // For CI, we usually install it.
-        // Let's check if we can find it relative to CWD.
-
+        // Find sy binary
         let sy_bin = std::env::current_exe()?
             .parent()
             .unwrap()
             .parent()
-            .unwrap() // deps
+            .unwrap()
             .parent()
-            .unwrap() // debug
+            .unwrap()
             .join("sy");
 
         if !sy_bin.exists() {
@@ -49,12 +35,17 @@ mod tests {
             return Ok(());
         }
 
-        // Update PATH to include 'sy' dir
+        // Update PATH to include sy binary dir
         let path_env = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", sy_bin.parent().unwrap().display(), path_env);
         std::env::set_var("PATH", new_path);
 
-        sync_server_mode(&source, &dest_sync_path).await?;
+        let dest_sync_path = SyncPath::Local {
+            path: dest.clone(),
+            has_trailing_slash: false,
+        };
+
+        sync_push(&source, &dest_sync_path, false, false).await?;
 
         // Verify
         assert!(dest.join("file1.txt").exists());
@@ -66,8 +57,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_mode_pull_local_to_local() -> anyhow::Result<()> {
-        // Setup
+    async fn test_server_mode_pull_local() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("src");
         let dest = temp.path().join("dest");
@@ -86,9 +76,9 @@ mod tests {
             .parent()
             .unwrap()
             .parent()
-            .unwrap() // deps
+            .unwrap()
             .parent()
-            .unwrap() // debug
+            .unwrap()
             .join("sy");
 
         if !sy_bin.exists() {
@@ -96,18 +86,17 @@ mod tests {
             return Ok(());
         }
 
-        // Update PATH to include 'sy' dir
+        // Update PATH to include sy binary dir
         let path_env = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", sy_bin.parent().unwrap().display(), path_env);
         std::env::set_var("PATH", new_path);
 
-        // Run pull sync (source is "remote", dest is local)
         let source_sync_path = SyncPath::Local {
             path: source.clone(),
             has_trailing_slash: false,
         };
 
-        sync_pull_server_mode(&source_sync_path, &dest).await?;
+        sync_pull(&source_sync_path, &dest, false, false).await?;
 
         // Verify
         assert!(dest.join("file1.txt").exists());
