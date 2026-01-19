@@ -95,8 +95,8 @@ impl Generator {
                 continue;
             }
 
-            // Remove from dest_index (remaining entries are deletes)
-            self.dest_index.remove(&rel_path_str);
+            // Get destination state before removing from index
+            let dest_state = self.dest_index.remove(&rel_path_str);
 
             let mtime = entry
                 .modified
@@ -106,6 +106,16 @@ impl Generator {
 
             // TODO: Scanner should provide mode. For now use default.
             let mode = if entry.is_dir { 0o755 } else { 0o644 };
+
+            // Skip unchanged files (matching size and mtime)
+            if !entry.is_dir && !entry.is_symlink {
+                if let Some(ref dest) = dest_state {
+                    if dest.size == entry.size && dest.mtime == mtime {
+                        // File unchanged, skip it
+                        continue;
+                    }
+                }
+            }
 
             let msg = if entry.is_dir {
                 GeneratorMessage::Mkdir {
@@ -136,7 +146,8 @@ impl Generator {
                 };
 
                 // Determine if delta is needed
-                let (need_delta, checksums) = self.check_delta(&rel_path_str, entry.size);
+                let (need_delta, checksums) =
+                    self.check_delta_for_state(dest_state.as_ref(), entry.size);
 
                 total_files += 1;
                 total_bytes += entry.size;
@@ -188,13 +199,17 @@ impl Generator {
         Ok((total_files, total_bytes))
     }
 
-    fn check_delta(&self, path: &str, size: u64) -> (bool, Option<DeltaInfo>) {
+    fn check_delta_for_state(
+        &self,
+        dest_state: Option<&DestFileState>,
+        size: u64,
+    ) -> (bool, Option<DeltaInfo>) {
         if size < DELTA_MIN_SIZE {
             return (false, None);
         }
 
-        if let Some(dest_state) = self.dest_index.get(path) {
-            if let Some(ref delta_info) = dest_state.delta_info {
+        if let Some(state) = dest_state {
+            if let Some(ref delta_info) = state.delta_info {
                 return (true, Some(delta_info.clone()));
             }
         }
