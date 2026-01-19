@@ -10,23 +10,20 @@
 
 ## Active Work
 
-**2026-01-19: Streaming Protocol Complete**
+**2026-01-19: PR #13 Feature Review**
 
 Branch: `feature/streaming-protocol-v2`
 
-Implementation phases 1-6 complete:
+Streaming protocol phases 1-6 complete. Reviewed external PR #13 for useful features.
 
-- `src/streaming/` — Full module (protocol, channel, generator, sender, receiver, pipeline)
-- `src/server/mod.rs` — Server handler with v1/v2 dispatch
+**Created handoff doc:** `ai/design/pr13-features.md`
 
-**Documentation cleanup done:**
+- GCS transport (P1) — follow S3 pattern, ~100 LOC
+- S3 testing (P1) — verify with MinIO
+- Python bindings (P4) — after v0.3.0
+- Daemon mode (deferred) — streaming reduces need
 
-- Removed session handoff files (CONTEXT.md, handoff.md)
-- Removed gemini-specific prompts
-- Consolidated performance analysis
-- Updated DESIGN.md for streaming architecture
-
-**Next:** Code cleanup (remove v1 code paths, fix clippy) — separate task
+**Next:** Gemini to execute GCS + S3 tasks per handoff doc
 
 ## Roadmap
 

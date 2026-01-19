@@ -1,0 +1,19 @@
+{
+  "project": "tk",
+  "ref": "dyjb",
+  "title": "Python bindings (sypy crate with maturin/pyo3)",
+  "description": null,
+  "status": "open",
+  "priority": 4,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [],
+  "created_at": "2026-01-19T09:10:26.363Z",
+  "updated_at": "2026-01-19T09:10:26.363Z",
+  "completed_at": null,
+  "external": {}
+}
