@@ -18,6 +18,9 @@ pub const SENDER_CHANNEL_SIZE: usize = 64;
 /// Data chunk size for transfer
 pub const DATA_CHUNK_SIZE: usize = 256 * 1024; // 256KB
 
+/// Maximum delta chunk size (16MB - well under 64MB frame limit)
+pub const DELTA_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Minimum file size for delta sync
 pub const DELTA_MIN_SIZE: u64 = 64 * 1024; // 64KB
 

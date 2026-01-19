@@ -70,6 +70,7 @@ pub fn generate_delta_streaming(
     block_size: usize,
 ) -> io::Result<Delta> {
     const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
+    const MAX_LITERAL_SIZE: usize = 1024 * 1024; // Flush literals at 1MB to bound memory
 
     // Build hash map for O(1) lookup
     let mut checksum_map: HashMap<u32, Vec<&BlockChecksum>> = HashMap::new();
@@ -186,6 +187,11 @@ pub fn generate_delta_streaming(
         if !found_match && window_pos < window.len() {
             // No match - add byte to literal buffer
             literal_buffer.push(window[window_pos]);
+
+            // Periodic flush to bound memory usage for files with few matches
+            if literal_buffer.len() >= MAX_LITERAL_SIZE {
+                ops.push(DeltaOp::Data(std::mem::take(&mut literal_buffer)));
+            }
 
             // Update rolling hash for next position
             if window_pos + block_size < window.len() {
