@@ -345,9 +345,11 @@ impl Receiver {
                 }
 
                 // Apply delta using cached original file
-                if let Some(ref mut original) = pending.original_file {
-                    Self::apply_delta_with_original(file, original, &data.data).await?;
-                }
+                let original = pending
+                    .original_file
+                    .as_mut()
+                    .expect("original_file must be set before applying delta");
+                Self::apply_delta_with_original(file, original, &data.data).await?;
             } else {
                 // Write raw data at offset
                 file.seek(SeekFrom::Start(data.offset)).await?;

@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(data_msg[4], 0x06, "Expected DATA message type");
 
         // Parse the Data message to verify DELTA flag
-        // Skip: length(4) + type(1) + path_len(2) + path(8 "test.txt") + offset(8) = 23
+        // Skip: length(4) + type(1) + path_len(2) + path(8 bytes) + offset(8) = 23
         let path_len = u16::from_be_bytes([data_msg[5], data_msg[6]]) as usize;
         let flags_offset = 4 + 1 + 2 + path_len + 8; // len + type + path_len + path + offset
         let flags = data_msg[flags_offset];
@@ -412,13 +412,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delta_chunking_uses_zero_offset() {
+    async fn test_delta_always_uses_zero_offset() {
         // Test that delta Data messages always use offset 0
         // (receiver processes ops sequentially, offset is unused for delta)
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("large.txt");
 
-        // Create content that will generate multiple DeltaOp::Data operations
+        // Create content that will be sent as delta literal data
         let content = "a".repeat(100_000); // 100KB of 'a'
         fs::write(&file_path, &content).unwrap();
 
