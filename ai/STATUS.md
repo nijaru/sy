@@ -10,23 +10,19 @@
 
 ## Active Work
 
-**2026-01-19: Streaming Protocol - Complete**
+**2026-01-19: Performance Optimizations - Planned**
 
 Branch: `feature/streaming-protocol-v2`
 
 **Completed:**
 
-- Fixed security issues (path traversal, frame size limits, symlink validation, delta bounds)
-- Fixed runtime panic (`blocking_send` in async context → unbounded channels)
-- Fixed pull mode directory creation
-- Fixed skip-unchanged files (was re-transferring all files)
-- Cross-platform tests pass (macOS ↔ Fedora)
-- Benchmarks run with accurate data
-- Features verified: bidirectional sync, watch mode, resume
-- Code cleanup: removed 8 redundant scripts
-- README updated with accurate benchmark claims
+- Streaming protocol v2 complete
+- All security fixes, tests passing, benchmarks validated
+- Ready for merge to main
 
-**Ready for review/merge.**
+**Next: Quick Win Optimizations**
+
+See `ai/design/optimizations.md` for implementation details.
 
 ## Roadmap
 
@@ -36,10 +32,12 @@ Cross-platform sync works. Benchmarks validated.
 
 ### Backlog
 
-| Priority | Task                                            |
-| -------- | ----------------------------------------------- |
-| P3       | Daemon mode (deferred - streaming reduces need) |
-| P4       | Python bindings (not implemented)               |
+| Priority | Task                                            | Notes                          |
+| -------- | ----------------------------------------------- | ------------------------------ |
+| P2       | Message batching                                | ~5ms, low effort               |
+| P2       | Dir mtime cache                                 | Variable impact, medium effort |
+| P3       | Daemon mode (deferred - streaming reduces need) | ~30ms, high effort             |
+| P4       | Python bindings (not implemented)               | maturin/pyo3                   |
 
 ## Performance
 
