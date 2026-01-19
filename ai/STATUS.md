@@ -16,14 +16,17 @@ Branch: `feature/streaming-protocol-v2`
 
 Streaming protocol phases 1-6 complete. Reviewed external PR #13 for useful features.
 
-**Created handoff doc:** `ai/design/pr13-features.md`
+**Completed Task 1: GCS Transport**
+- Implemented `GcsTransport` using `object_store`
+- Added `gcs` feature flag
+- Updated `TransportRouter` for `gs://` URLs
 
-- GCS transport (P1) — follow S3 pattern, ~100 LOC
-- S3 testing (P1) — verify with MinIO
-- Python bindings (P4) — after v0.3.0
-- Daemon mode (deferred) — streaming reduces need
+**Completed Task 2: S3 Testing**
+- Verified `S3Transport` compilation and clippy
+- Verified S3 integration tests skip correctly without env vars
+- Actual MinIO testing skipped per user request
 
-**Next:** Gemini to execute GCS + S3 tasks per handoff doc
+**Next:** Python bindings (P4) after v0.3.0 stability.
 
 ## Roadmap
 
