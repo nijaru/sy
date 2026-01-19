@@ -5,34 +5,37 @@
 | Metric  | Value        | Updated    |
 | ------- | ------------ | ---------- |
 | Version | v0.2.0       | 2025-12-18 |
-| Tests   | 620+ passing | 2025-11-27 |
-| Build   | 🟢 PASSING   | 2026-01-18 |
+| Tests   | 620+ passing | 2026-01-19 |
+| Build   | 🟢 PASSING   | 2026-01-19 |
 
 ## Active Work
 
-**2026-01-19: PR #13 Feature Review**
+**2026-01-19: Streaming Protocol Complete**
 
 Branch: `feature/streaming-protocol-v2`
 
-Streaming protocol phases 1-6 complete. Reviewed external PR #13 for useful features.
+**v1 Protocol Removed** — Clean streaming-only codebase:
 
-**Completed Task 1: GCS Transport**
-- Implemented `GcsTransport` using `object_store`
-- Added `gcs` feature flag
-- Updated `TransportRouter` for `gs://` URLs
+- Deleted `server/handler.rs` (693 lines v1 handlers)
+- Deleted `server/protocol.rs` (993 lines v1 types)
+- Rewrote `server/mod.rs` (562→210 lines, streaming only)
+- Simplified `transport/server.rs` (634→87 lines, connection only)
+- Net removal: ~2600 lines of dead code
 
-**Completed Task 2: S3 Testing**
-- Verified `S3Transport` compilation and clippy
-- Verified S3 integration tests skip correctly without env vars
-- Actual MinIO testing skipped per user request
+**Completed:**
 
-**Next:** Python bindings (P4) after v0.3.0 stability.
+- GCS transport (`object_store` based)
+- S3 transport verified
+- Streaming protocol phases 1-6
+- v1 code removal
+
+**Ready for:** v0.3.0 release testing
 
 ## Roadmap
 
-### v0.3.0 (Streaming Protocol) — IN PROGRESS
+### v0.3.0 (Streaming Protocol) — READY FOR TESTING
 
-Phases 1-6 complete. Remaining: code cleanup.
+All implementation complete. One clean protocol, no backwards compat.
 
 **Targets:**
 
@@ -40,16 +43,14 @@ Phases 1-6 complete. Remaining: code cleanup.
 - Time to first byte: <0.5s
 - Memory (1M files): <500MB
 
-### v0.2.1 (Bug Fixes + Cloud Storage)
-
-**Done:** All critical bug fixes merged
-**Remaining:** S3/GCS testing
-
 ### Backlog
 
-- SyncEngine builder pattern
-- Issue #12 features
-- Incremental recursion
+| Priority | Task                                            |
+| -------- | ----------------------------------------------- |
+| P3       | Daemon mode (deferred - streaming reduces need) |
+| P4       | Python bindings                                 |
+| —        | SyncEngine builder pattern                      |
+| —        | Issue #12 features                              |
 
 ## Performance
 
@@ -61,9 +62,9 @@ Phases 1-6 complete. Remaining: code cleanup.
 
 ## Feature Flags
 
-| Flag  | Default  | Notes          |
-| ----- | -------- | -------------- |
-| SSH   | Enabled  | ssh2 (libssh2) |
-| Watch | Disabled | File watching  |
-| ACL   | Disabled | libacl-dev     |
-| S3    | Disabled | Experimental   |
+| Flag | Default  | Notes          |
+| ---- | -------- | -------------- |
+| SSH  | Enabled  | ssh2 (libssh2) |
+| S3   | Disabled | object_store   |
+| GCS  | Disabled | object_store   |
+| ACL  | Disabled | libacl-dev     |
