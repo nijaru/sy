@@ -1,3 +1,5 @@
+#[cfg(feature = "gcs")]
+use super::gcs::GcsTransport;
 #[cfg(feature = "s3")]
 use super::s3::S3Transport;
 #[cfg(feature = "ssh")]
@@ -21,6 +23,8 @@ pub enum TransportRouter {
     Dual(DualTransport),
     #[cfg(feature = "s3")]
     S3(S3Transport),
+    #[cfg(feature = "gcs")]
+    Gcs(GcsTransport),
 }
 
 impl TransportRouter {
@@ -208,21 +212,41 @@ impl TransportRouter {
                     "S3-to-SSH sync not yet supported",
                 )))
             }
-            #[cfg(feature = "s3")]
-            (SyncPath::Local { .. }, SyncPath::Gcs { .. })
-            | (SyncPath::Gcs { .. }, SyncPath::Local { .. }) => Err(crate::error::SyncError::Io(
-                std::io::Error::other("GCS sync not yet supported"),
-            )),
-            #[cfg(feature = "s3")]
-            (SyncPath::Gcs { .. }, SyncPath::Gcs { .. }) => Err(crate::error::SyncError::Io(
-                std::io::Error::other("GCS-to-GCS sync not yet supported"),
-            )),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "gcs")]
+            (SyncPath::Local { .. }, SyncPath::Gcs { bucket, key, .. }) => {
+                // Local → GCS: use GcsTransport for destination
+                let gcs_transport = GcsTransport::new(
+                    bucket.clone(),
+                    key.clone(),
+                    None, // Project ID not currently supported in CLI
+                )
+                .await?;
+                Ok(TransportRouter::Gcs(gcs_transport))
+            }
+            #[cfg(feature = "gcs")]
+            (SyncPath::Gcs { bucket, key, .. }, SyncPath::Local { .. }) => {
+                // GCS → Local: use GcsTransport for source
+                let gcs_transport = GcsTransport::new(
+                    bucket.clone(),
+                    key.clone(),
+                    None, // Project ID not currently supported in CLI
+                )
+                .await?;
+                Ok(TransportRouter::Gcs(gcs_transport))
+            }
+            #[cfg(feature = "gcs")]
+            (SyncPath::Gcs { .. }, SyncPath::Gcs { .. }) => {
+                // GCS → GCS: not yet supported
+                Err(crate::error::SyncError::Io(std::io::Error::other(
+                    "GCS-to-GCS sync not yet supported",
+                )))
+            }
+            #[cfg(all(feature = "s3", feature = "gcs"))]
             (SyncPath::S3 { .. }, SyncPath::Gcs { .. })
             | (SyncPath::Gcs { .. }, SyncPath::S3 { .. }) => Err(crate::error::SyncError::Io(
                 std::io::Error::other("S3-to-GCS sync not yet supported"),
             )),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "gcs")]
             (SyncPath::Gcs { .. }, SyncPath::Remote { .. })
             | (SyncPath::Remote { .. }, SyncPath::Gcs { .. }) => Err(crate::error::SyncError::Io(
                 std::io::Error::other("GCS-to-SSH sync not yet supported"),
@@ -233,10 +257,10 @@ impl TransportRouter {
                     "S3 support not enabled. Reinstall with: cargo install sy --features s3",
                 )))
             }
-            #[cfg(not(feature = "s3"))]
+            #[cfg(not(feature = "gcs"))]
             (SyncPath::Gcs { .. }, _) | (_, SyncPath::Gcs { .. }) => {
                 Err(crate::error::SyncError::Io(std::io::Error::other(
-                    "GCS support not enabled. Reinstall with: cargo install sy --features s3",
+                    "GCS support not enabled. Reinstall with: cargo install sy --features gcs",
                 )))
             }
         }
@@ -258,6 +282,11 @@ impl TransportRouter {
                 t.set_scan_options(options);
                 TransportRouter::S3(t)
             }
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(mut t) => {
+                t.set_scan_options(options);
+                TransportRouter::Gcs(t)
+            }
         }
     }
 }
@@ -270,6 +299,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.set_scan_options(options),
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_scan_options(options),
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.set_scan_options(options),
         }
     }
 
@@ -279,6 +310,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.prepare_for_transfer(file_count).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.prepare_for_transfer(file_count).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.prepare_for_transfer(file_count).await,
         }
     }
 
@@ -288,6 +321,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.scan(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.scan(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.scan(path).await,
         }
     }
 
@@ -300,6 +335,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.scan_streaming(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.scan_streaming(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.scan_streaming(path).await,
         }
     }
 
@@ -309,6 +346,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.exists(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.exists(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.exists(path).await,
         }
     }
 
@@ -318,6 +357,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.metadata(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.metadata(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.metadata(path).await,
         }
     }
 
@@ -327,6 +368,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.file_info(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.file_info(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.file_info(path).await,
         }
     }
 
@@ -336,6 +379,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.create_dir_all(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_dir_all(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.create_dir_all(path).await,
         }
     }
 
@@ -345,6 +390,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.create_dirs_batch(paths).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_dirs_batch(paths).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.create_dirs_batch(paths).await,
         }
     }
 
@@ -354,6 +401,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.copy_file(source, dest).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.copy_file(source, dest).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.copy_file(source, dest).await,
         }
     }
 
@@ -363,6 +412,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.sync_file_with_delta(source, dest).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.sync_file_with_delta(source, dest).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.sync_file_with_delta(source, dest).await,
         }
     }
 
@@ -372,6 +423,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.remove(path, is_dir).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.remove(path, is_dir).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.remove(path, is_dir).await,
         }
     }
 
@@ -381,6 +434,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.create_hardlink(source, dest).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_hardlink(source, dest).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.create_hardlink(source, dest).await,
         }
     }
 
@@ -390,6 +445,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.create_symlink(target, dest).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.create_symlink(target, dest).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.create_symlink(target, dest).await,
         }
     }
 
@@ -399,6 +456,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.read_file(path).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.read_file(path).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.read_file(path).await,
         }
     }
 
@@ -408,6 +467,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.check_disk_space(path, bytes_needed).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.check_disk_space(path, bytes_needed).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.check_disk_space(path, bytes_needed).await,
         }
     }
 
@@ -417,6 +478,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.set_xattrs(path, xattrs).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_xattrs(path, xattrs).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.set_xattrs(path, xattrs).await,
         }
     }
 
@@ -426,6 +489,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.set_acls(path, acls_text).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_acls(path, acls_text).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.set_acls(path, acls_text).await,
         }
     }
 
@@ -435,6 +500,8 @@ impl Transport for TransportRouter {
             TransportRouter::Dual(t) => t.set_bsd_flags(path, flags).await,
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => t.set_bsd_flags(path, flags).await,
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => t.set_bsd_flags(path, flags).await,
         }
     }
 
@@ -455,6 +522,11 @@ impl Transport for TransportRouter {
             }
             #[cfg(feature = "s3")]
             TransportRouter::S3(t) => {
+                t.bulk_copy_files(source_base, dest_base, relative_paths)
+                    .await
+            }
+            #[cfg(feature = "gcs")]
+            TransportRouter::Gcs(t) => {
                 t.bulk_copy_files(source_base, dest_base, relative_paths)
                     .await
             }

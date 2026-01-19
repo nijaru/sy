@@ -86,9 +86,9 @@ pub async fn run_server() -> Result<()> {
 
     if version == 1 {
         let hello = Hello::decode_payload(payload)?;
-        return run_server_v1(hello, stdin_pin, stdout_pin, handler).await;
+        run_server_v1(hello, stdin_pin, stdout_pin, handler).await
     } else if version >= 2 {
-        return run_server_v2(payload, stdin_pin, stdout_pin).await;
+        run_server_v2(payload, stdin_pin, stdout_pin).await
     } else {
         let err = ErrorMessage {
             code: 1,

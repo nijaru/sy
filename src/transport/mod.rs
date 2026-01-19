@@ -1,4 +1,6 @@
 pub mod dual;
+#[cfg(feature = "gcs")]
+pub mod gcs;
 pub mod local;
 pub mod router;
 #[cfg(feature = "s3")]

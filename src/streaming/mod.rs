@@ -21,6 +21,8 @@
 //!
 //! See `ai/design/streaming-protocol-v0.3.0.md` for full specification.
 
+#![allow(unused_imports, dead_code)]
+
 pub mod channel;
 pub mod generator;
 pub mod pipeline;

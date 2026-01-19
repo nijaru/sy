@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
-use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Protocol Constants

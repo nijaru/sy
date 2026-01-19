@@ -27,6 +27,7 @@ exclude = [
 default = ["ssh"]
 acl = ["exacl"]
 s3 = ["object_store"]
+gcs = ["object_store"]
 ssh = ["dep:ssh2", "dep:whoami", "dep:regex"]
 watch = ["dep:notify"]
 
