@@ -10,10 +10,12 @@
 
 ## Active Work
 
-**2026-01-19: v0.3.0 Released**
+**2026-01-19: v0.3.0 Ready for Release**
 
 - Streaming protocol v2 merged to main
-- All security fixes, tests passing, benchmarks validated
+- Gemini review fixes: delta memory bounds, chunking
+- Copilot review fixes: offset semantics, file handle caching
+- All 620+ tests passing, benchmarks validated
 - Message batching for DEST_FILE_ENTRY (64KB batches)
 - GCS transport support
 
