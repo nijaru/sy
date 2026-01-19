@@ -95,25 +95,18 @@ impl StreamingSync {
             compress: self.compress,
         });
 
-        // Use a channel to bridge sender to async writer
-        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
+        // Use unbounded channel to avoid blocking_send (panics in tokio context)
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
 
-        // Spawn sender in blocking context with fresh runtime
-        // (can't use Handle::current() - blocking_send panics within block_on)
-        let sender_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime for sender");
-            rt.block_on(async {
-                sender
-                    .run(rx, |bytes| {
-                        data_tx
-                            .blocking_send(bytes)
-                            .map_err(|_| anyhow::anyhow!("Data channel closed"))
-                    })
-                    .await
-            })
+        // Spawn sender - uses unbounded_send which never blocks
+        let sender_handle = tokio::spawn(async move {
+            sender
+                .run(rx, |bytes| {
+                    data_tx
+                        .send(bytes)
+                        .map_err(|_| anyhow::anyhow!("Data channel closed"))
+                })
+                .await
         });
 
         // Pipe data to writer concurrently with sender
@@ -188,26 +181,23 @@ impl StreamingSync {
         let _server_hello = Hello::decode(payload)?;
 
         // 3. Send DEST_FILE_ENTRY messages (Initial Exchange)
-        // Run scan and write concurrently to avoid deadlock on bounded channel
-        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
+        // Use unbounded channel to avoid blocking_send (panics in tokio context)
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
         let receiver_root = self.local_root.clone();
 
-        // Spawn scanner in blocking context with fresh runtime
-        // (can't use Handle::current() - blocking_send panics within block_on)
-        let scan_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime for scanner");
+        // Spawn scanner - uses unbounded_send which never blocks
+        let scan_handle = tokio::spawn(async move {
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
                 block_size: 4096,
             });
-            rt.block_on(receiver.scan_dest(|bytes| {
-                data_tx
-                    .blocking_send(bytes)
-                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
-            }))
+            receiver
+                .scan_dest(|bytes| {
+                    data_tx
+                        .send(bytes)
+                        .map_err(|_| anyhow::anyhow!("Data channel closed"))
+                })
+                .await
         });
 
         // Write data as it arrives (concurrent with scan)
