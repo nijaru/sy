@@ -465,9 +465,7 @@ pub struct Cli {
     #[arg(long, default_value = "1")]
     pub retry_delay: u64,
 
-    /// Run in server mode (internal use only)
-    /// This flag is used by the remote instance when spawned via SSH.
-    /// It speaks a custom binary protocol on stdin/stdout.
+    /// Internal: Run in server mode (used over SSH)
     #[arg(long, hide = true)]
     pub server: bool,
 

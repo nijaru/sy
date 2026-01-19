@@ -90,6 +90,56 @@ impl ServerSession {
         Ok(session)
     }
 
+    pub async fn connect_v2_ssh(config: &SshConfig, remote_path: &Path) -> Result<Self> {
+        let mut cmd = Command::new("ssh");
+
+        cmd.arg(&config.hostname);
+
+        if !config.user.is_empty() {
+            cmd.arg("-l").arg(&config.user);
+        }
+
+        if config.port != 22 {
+            cmd.arg("-p").arg(config.port.to_string());
+        }
+
+        for key in &config.identity_file {
+            cmd.arg("-i").arg(key);
+        }
+
+        // Remote command: sy --server <remote_path>
+
+        cmd.arg("sy");
+
+        cmd.arg("--server");
+
+        cmd.arg(remote_path);
+
+        cmd.stdin(Stdio::piped());
+
+        cmd.stdout(Stdio::piped());
+
+        cmd.stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn().context("Failed to spawn SSH process")?;
+
+        let stdin = child.stdin.take().context("Failed to open stdin")?;
+
+        let stdout = child.stdout.take().context("Failed to open stdout")?;
+
+        Ok(Self {
+            child,
+
+            stdin,
+
+            stdout,
+        })
+    }
+
+    pub fn split(self) -> (tokio::process::ChildStdin, tokio::process::ChildStdout) {
+        (self.stdin, self.stdout)
+    }
+
     async fn handshake(&mut self) -> Result<()> {
         let hello = Hello {
             version: PROTOCOL_VERSION,
