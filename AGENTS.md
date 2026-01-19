@@ -18,11 +18,11 @@ Fast, modern file synchronization tool written in Rust - a reimagining of rsync 
 | Attribute | Value                                |
 | --------- | ------------------------------------ |
 | Language  | Rust (edition 2021)                  |
-| Version   | v0.2.0 (2025-12-18)                  |
+| Version   | v0.3.0 (2026-01-19)                  |
 | Tests     | 620+ passing, 12 ignored (SSH agent) |
 | License   | MIT                                  |
 
-**Key Features**: Bidirectional server mode, delta sync, parallel transfers, SSH, sparse files, S3 (experimental)
+**Key Features**: Bidirectional server mode, delta sync, parallel transfers, SSH, sparse files, S3/GCS (experimental)
 
 ## Structure
 
@@ -143,4 +143,4 @@ See `ai/STATUS.md` for current state, `ai/DESIGN.md` for architecture.
 
 ---
 
-**Version**: v0.2.0 | **Updated**: 2025-12-18 | **Follows**: [agent-contexts](https://github.com/nijaru/agent-contexts)
+**Version**: v0.3.0 | **Updated**: 2026-01-19 | **Follows**: [agent-contexts](https://github.com/nijaru/agent-contexts)
