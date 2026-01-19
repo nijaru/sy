@@ -98,25 +98,19 @@ impl StreamingSync {
         // Use a channel to bridge sender to async writer
         let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
 
-        // Spawn sender in blocking context since Sender::run uses sync callback
+        // Spawn sender in blocking context with fresh runtime
+        // (can't use Handle::current() - blocking_send panics within block_on)
         let sender_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for sender");
             rt.block_on(async {
                 sender
                     .run(rx, |bytes| {
-                        // Use try_send to avoid blocking, fall back to blocking if needed
-                        match data_tx.try_send(bytes.clone()) {
-                            Ok(()) => Ok(()),
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Channel full - use blocking send (we're in spawn_blocking)
-                                data_tx
-                                    .blocking_send(bytes)
-                                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                Err(anyhow::anyhow!("Data channel closed"))
-                            }
-                        }
+                        data_tx
+                            .blocking_send(bytes)
+                            .map_err(|_| anyhow::anyhow!("Data channel closed"))
                     })
                     .await
             })
@@ -198,9 +192,13 @@ impl StreamingSync {
         let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
         let receiver_root = self.local_root.clone();
 
-        // Spawn scanner in background
+        // Spawn scanner in blocking context with fresh runtime
+        // (can't use Handle::current() - blocking_send panics within block_on)
         let scan_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for scanner");
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
                 block_size: 4096,

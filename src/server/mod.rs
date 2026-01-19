@@ -122,19 +122,19 @@ async fn run_server_pull(
 
     let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
 
-    // Spawn sender in blocking context since it uses sync callback
+    // Spawn sender in blocking context with fresh runtime
+    // (can't use Handle::current() - blocking_send panics within block_on)
     let sender_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime for sender");
         rt.block_on(async {
             sender
-                .run(rx, |bytes| match data_tx.try_send(bytes.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(mpsc::error::TrySendError::Full(_)) => data_tx
+                .run(rx, |bytes| {
+                    data_tx
                         .blocking_send(bytes)
-                        .map_err(|_| anyhow::anyhow!("Data channel closed")),
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        Err(anyhow::anyhow!("Data channel closed"))
-                    }
+                        .map_err(|_| anyhow::anyhow!("Data channel closed"))
                 })
                 .await
         })
@@ -179,9 +179,13 @@ async fn run_server_push(
     let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
     let receiver_root = root_path.clone();
 
-    // Spawn scanner in background
+    // Spawn scanner in blocking context with fresh runtime
+    // (can't use Handle::current() - blocking_send panics within block_on)
     let scan_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime for scanner");
         let receiver = Receiver::new(ReceiverConfig {
             root: receiver_root,
             block_size: 4096,
