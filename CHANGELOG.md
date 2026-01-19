@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Skip unchanged files**: Streaming protocol now correctly skips files with matching size+mtime
 - **Security hardening**: Path traversal validation, frame size limits, symlink target validation, delta bounds checking
+- **Delta memory bounds**: Periodic literal buffer flush (1MB) prevents OOM on large files with few matches
+- **Delta chunking**: Large delta operations split into 16MB chunks to avoid frame size violations
+- **Delta file handle caching**: Original file handle cached during delta sync (avoids reopening per chunk)
 
 ### Changed
 
