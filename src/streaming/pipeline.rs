@@ -95,21 +95,34 @@ impl StreamingSync {
             compress: self.compress,
         });
 
-        // Use a channel to bridge sync callback to async writer
+        // Use a channel to bridge sender to async writer
         let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
 
-        let sender_handle = tokio::spawn(async move {
-            sender
-                .run(rx, |bytes| {
-                    if data_tx.blocking_send(bytes).is_err() {
-                        return Err(anyhow::anyhow!("Data channel closed"));
-                    }
-                    Ok(())
-                })
-                .await
+        // Spawn sender in blocking context since Sender::run uses sync callback
+        let sender_handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                sender
+                    .run(rx, |bytes| {
+                        // Use try_send to avoid blocking, fall back to blocking if needed
+                        match data_tx.try_send(bytes.clone()) {
+                            Ok(()) => Ok(()),
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Channel full - use blocking send (we're in spawn_blocking)
+                                data_tx
+                                    .blocking_send(bytes)
+                                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                Err(anyhow::anyhow!("Data channel closed"))
+                            }
+                        }
+                    })
+                    .await
+            })
         });
 
-        // Pipe data to writer
+        // Pipe data to writer concurrently with sender
         while let Some(bytes) = data_rx.recv().await {
             writer.write_all(&bytes).await?;
         }
@@ -181,11 +194,12 @@ impl StreamingSync {
         let _server_hello = Hello::decode(payload)?;
 
         // 3. Send DEST_FILE_ENTRY messages (Initial Exchange)
-        // Use spawn_blocking for scan_dest as it calls Scanner::scan
+        // Run scan and write concurrently to avoid deadlock on bounded channel
         let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
         let receiver_root = self.local_root.clone();
 
-        tokio::task::spawn_blocking(move || {
+        // Spawn scanner in background
+        let scan_handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
@@ -196,13 +210,16 @@ impl StreamingSync {
                     .blocking_send(bytes)
                     .map_err(|_| anyhow::anyhow!("Data channel closed"))
             }))
-        })
-        .await??;
+        });
 
+        // Write data as it arrives (concurrent with scan)
         while let Some(bytes) = data_rx.recv().await {
             writer.write_all(&bytes).await?;
         }
         writer.flush().await?;
+
+        // Wait for scanner to complete
+        scan_handle.await??;
 
         // 4. Receive and process streaming messages
         let mut receiver = Receiver::new(ReceiverConfig {

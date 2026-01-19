@@ -47,6 +47,7 @@ impl Generator {
         let delta_info = if entry.flags.contains(DestFileFlags::HAS_CHECKSUMS) {
             Some(DeltaInfo {
                 block_size: entry.block_size,
+                file_size: entry.size,
                 checksums: entry.checksums,
             })
         } else {

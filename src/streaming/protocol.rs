@@ -296,30 +296,42 @@ impl FileEntry {
         let inode = payload.get_u64();
         let flags = FileFlags::from_bits_truncate(payload.get_u8());
 
-        let symlink_target = if flags.contains(FileFlags::SYMLINK) && payload.remaining() >= 2 {
-            let len = payload.get_u16() as usize;
-            if payload.remaining() >= len {
-                Some(
-                    String::from_utf8(payload.copy_to_bytes(len).to_vec())
-                        .context("Invalid UTF-8 in symlink target")?,
-                )
-            } else {
-                None
+        let symlink_target = if flags.contains(FileFlags::SYMLINK) {
+            if payload.remaining() < 2 {
+                anyhow::bail!("FileEntry symlink target length truncated");
             }
+            let len = payload.get_u16() as usize;
+            if payload.remaining() < len {
+                anyhow::bail!(
+                    "FileEntry symlink target truncated: expected {} bytes, got {}",
+                    len,
+                    payload.remaining()
+                );
+            }
+            Some(
+                String::from_utf8(payload.copy_to_bytes(len).to_vec())
+                    .context("Invalid UTF-8 in symlink target")?,
+            )
         } else {
             None
         };
 
-        let link_target = if flags.contains(FileFlags::HARDLINK) && payload.remaining() >= 2 {
-            let len = payload.get_u16() as usize;
-            if payload.remaining() >= len {
-                Some(
-                    String::from_utf8(payload.copy_to_bytes(len).to_vec())
-                        .context("Invalid UTF-8 in link target")?,
-                )
-            } else {
-                None
+        let link_target = if flags.contains(FileFlags::HARDLINK) {
+            if payload.remaining() < 2 {
+                anyhow::bail!("FileEntry hardlink target length truncated");
             }
+            let len = payload.get_u16() as usize;
+            if payload.remaining() < len {
+                anyhow::bail!(
+                    "FileEntry hardlink target truncated: expected {} bytes, got {}",
+                    len,
+                    payload.remaining()
+                );
+            }
+            Some(
+                String::from_utf8(payload.copy_to_bytes(len).to_vec())
+                    .context("Invalid UTF-8 in link target")?,
+            )
         } else {
             None
         };
@@ -442,25 +454,36 @@ impl DestFileEntry {
         let mode = payload.get_u32();
         let flags = DestFileFlags::from_bits_truncate(payload.get_u8());
 
-        let (block_size, checksums) =
-            if flags.contains(DestFileFlags::HAS_CHECKSUMS) && payload.remaining() >= 8 {
-                let bs = payload.get_u32();
-                let count = payload.get_u32() as usize;
-                let mut checksums = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if payload.remaining() < BlockChecksum::SIZE {
-                        break;
-                    }
-                    checksums.push(BlockChecksum {
-                        offset: payload.get_u64(),
-                        weak: payload.get_u32(),
-                        strong: payload.get_u64(),
-                    });
-                }
-                (bs, checksums)
-            } else {
-                (0, Vec::new())
-            };
+        let (block_size, checksums) = if flags.contains(DestFileFlags::HAS_CHECKSUMS) {
+            if payload.remaining() < 8 {
+                anyhow::bail!("DestFileEntry checksum header truncated");
+            }
+            let bs = payload.get_u32();
+            let count = payload.get_u32() as usize;
+
+            // Validate we have enough data for all checksums
+            let required = count * BlockChecksum::SIZE;
+            if payload.remaining() < required {
+                anyhow::bail!(
+                        "DestFileEntry checksums truncated: expected {} checksums ({} bytes), got {} bytes",
+                        count,
+                        required,
+                        payload.remaining()
+                    );
+            }
+
+            let mut checksums = Vec::with_capacity(count);
+            for _ in 0..count {
+                checksums.push(BlockChecksum {
+                    offset: payload.get_u64(),
+                    weak: payload.get_u32(),
+                    strong: payload.get_u64(),
+                });
+            }
+            (bs, checksums)
+        } else {
+            (0, Vec::new())
+        };
 
         Ok(Self {
             path,
@@ -952,19 +975,33 @@ impl Xattr {
         let count = payload.get_u16() as usize;
 
         let mut entries = Vec::with_capacity(count);
-        for _ in 0..count {
+        for i in 0..count {
             if payload.remaining() < 2 {
-                break;
+                anyhow::bail!(
+                    "Xattr entry {} name length truncated: expected 2 bytes, got {}",
+                    i,
+                    payload.remaining()
+                );
             }
             let name_len = payload.get_u16() as usize;
             if payload.remaining() < name_len + 4 {
-                break;
+                anyhow::bail!(
+                    "Xattr entry {} truncated: expected {} bytes for name + value length, got {}",
+                    i,
+                    name_len + 4,
+                    payload.remaining()
+                );
             }
             let name = String::from_utf8(payload.copy_to_bytes(name_len).to_vec())
                 .context("Invalid UTF-8 in Xattr name")?;
             let value_len = payload.get_u32() as usize;
             if payload.remaining() < value_len {
-                break;
+                anyhow::bail!(
+                    "Xattr entry {} value truncated: expected {} bytes, got {}",
+                    i,
+                    value_len,
+                    payload.remaining()
+                );
             }
             let value = payload.copy_to_bytes(value_len);
             entries.push(XattrEntry { name, value });
@@ -1015,15 +1052,27 @@ impl Done {
 // Frame reading/writing
 // =============================================================================
 
+/// Maximum frame size (64MB) - prevents OOM from malicious/corrupted frames
+pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
+
 /// Read a single frame from the stream.
 /// Returns (message_type, payload).
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(MessageType, Bytes)> {
     let len = r.read_u32().await.context("Failed to read frame length")?;
-    let msg_type = r.read_u8().await.context("Failed to read message type")?;
 
+    // Validate frame size before allocation
+    if len > MAX_FRAME_SIZE {
+        anyhow::bail!(
+            "Frame size {} exceeds maximum allowed size {}",
+            len,
+            MAX_FRAME_SIZE
+        );
+    }
+
+    let msg_type = r.read_u8().await.context("Failed to read message type")?;
     let msg_type = MessageType::from_u8(msg_type).context("Unknown message type")?;
 
-    let payload_len = len.saturating_sub(0) as usize;
+    let payload_len = len as usize;
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)
         .await

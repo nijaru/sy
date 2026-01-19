@@ -173,20 +173,27 @@ impl Sender {
     {
         // Convert protocol checksums to delta engine checksums
         let block_size = delta_info.block_size as usize;
+        let file_size = delta_info.file_size;
+        let num_checksums = delta_info.checksums.len();
+
         let dest_checksums: Vec<_> = delta_info
             .checksums
             .iter()
             .enumerate()
             .map(|(i, c)| {
+                // Calculate actual block size - last block may be smaller
+                let actual_size = if i == num_checksums - 1 {
+                    // Last block: calculate remaining bytes
+                    let remaining = file_size.saturating_sub(c.offset);
+                    remaining.min(block_size as u64) as usize
+                } else {
+                    block_size
+                };
+
                 crate::delta::BlockChecksum {
                     index: i as u64,
                     offset: c.offset,
-                    // We don't have the exact block size for each block from the protocol,
-                    // but we know it's block_size except for the last one.
-                    // Actually, the delta generator uses this size to know how much to copy.
-                    // For now, assume block_size.
-                    // TODO: Properly calculate size of last block if needed.
-                    size: block_size,
+                    size: actual_size,
                     weak: c.weak,
                     strong: c.strong,
                 }

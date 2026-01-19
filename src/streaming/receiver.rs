@@ -13,9 +13,99 @@ use crate::temp_file::TempFileGuard;
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+
+/// Maximum size for delta copy operations (16MB)
+const MAX_DELTA_COPY_SIZE: usize = 16 * 1024 * 1024;
+
+/// Validate that a relative path is safe and doesn't escape the root.
+/// Returns the full path if valid.
+fn validate_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    // Reject empty paths
+    if relative.is_empty() {
+        anyhow::bail!("Empty path not allowed");
+    }
+
+    // Reject absolute paths
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute() {
+        anyhow::bail!("Absolute paths not allowed: {}", relative);
+    }
+
+    // Check for path traversal attempts
+    for component in rel_path.components() {
+        match component {
+            Component::ParentDir => {
+                anyhow::bail!("Path traversal not allowed: {}", relative);
+            }
+            Component::Prefix(_) => {
+                anyhow::bail!("Windows prefix paths not allowed: {}", relative);
+            }
+            _ => {}
+        }
+    }
+
+    // Build full path and verify it's under root
+    let full = root.join(rel_path);
+
+    // Normalize and check (handles edge cases like "foo/../bar")
+    let normalized = normalize_path(&full);
+    let root_normalized = normalize_path(root);
+
+    if !normalized.starts_with(&root_normalized) {
+        anyhow::bail!("Path escapes root directory: {}", relative);
+    }
+
+    Ok(full)
+}
+
+/// Normalize a path without requiring it to exist (unlike canonicalize)
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            c => normalized.push(c),
+        }
+    }
+    normalized
+}
+
+/// Validate symlink target - must be relative and not escape root
+fn validate_symlink_target(root: &Path, link_path: &Path, target: &str) -> Result<()> {
+    let target_path = Path::new(target);
+
+    // Absolute symlink targets are not allowed
+    if target_path.is_absolute() {
+        anyhow::bail!(
+            "Absolute symlink targets not allowed: {} -> {}",
+            link_path.display(),
+            target
+        );
+    }
+
+    // Resolve the target relative to the symlink's parent
+    if let Some(link_parent) = link_path.parent() {
+        let resolved = link_parent.join(target_path);
+        let normalized = normalize_path(&resolved);
+        let root_normalized = normalize_path(root);
+
+        if !normalized.starts_with(&root_normalized) {
+            anyhow::bail!(
+                "Symlink target escapes root: {} -> {}",
+                link_path.display(),
+                target
+            );
+        }
+    }
+
+    Ok(())
+}
 
 /// Receiver configuration
 pub struct ReceiverConfig {
@@ -37,7 +127,7 @@ struct PendingFile {
     temp_path: PathBuf,
     file: Option<File>,
     bytes_written: u64,
-    _guard: TempFileGuard,
+    guard: Option<TempFileGuard>,
 }
 
 impl Receiver {
@@ -179,7 +269,7 @@ impl Receiver {
     }
 
     async fn handle_file_entry(&mut self, entry: FileEntry) -> Result<()> {
-        let full_path = self.config.root.join(&entry.path);
+        let full_path = validate_path(&self.config.root, &entry.path)?;
 
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
@@ -204,7 +294,7 @@ impl Receiver {
                 temp_path,
                 file: Some(file),
                 bytes_written: 0,
-                _guard: guard,
+                guard: Some(guard),
             },
         );
 
@@ -239,18 +329,30 @@ impl Receiver {
                 file.sync_all().await?;
             }
 
-            let full_path = self.config.root.join(&end.path);
+            // Path was already validated in handle_file_entry
+            let full_path = validate_path(&self.config.root, &end.path)?;
 
             if end.status == DataEnd::STATUS_OK {
                 // Move temp file to final destination
                 fs::rename(&pending.temp_path, &full_path).await?;
+
+                // Defuse guard after successful rename
+                if let Some(guard) = pending.guard.take() {
+                    guard.defuse();
+                }
 
                 // Set permissions
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let perms = std::fs::Permissions::from_mode(pending.entry.mode);
-                    let _ = fs::set_permissions(&full_path, perms).await;
+                    if let Err(e) = fs::set_permissions(&full_path, perms).await {
+                        tracing::warn!(
+                            "Failed to set permissions on {}: {}",
+                            full_path.display(),
+                            e
+                        );
+                    }
                 }
 
                 // Set mtime
@@ -271,14 +373,20 @@ impl Receiver {
     }
 
     async fn handle_mkdir(&mut self, mkdir: Mkdir) -> Result<()> {
-        let full_path = self.config.root.join(&mkdir.path);
+        let full_path = validate_path(&self.config.root, &mkdir.path)?;
         fs::create_dir_all(&full_path).await?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(mkdir.mode);
-            let _ = fs::set_permissions(&full_path, perms).await;
+            if let Err(e) = fs::set_permissions(&full_path, perms).await {
+                tracing::warn!(
+                    "Failed to set permissions on {}: {}",
+                    full_path.display(),
+                    e
+                );
+            }
         }
 
         self.stats.dirs_created += 1;
@@ -286,7 +394,10 @@ impl Receiver {
     }
 
     async fn handle_symlink(&mut self, symlink: Symlink) -> Result<()> {
-        let full_path = self.config.root.join(&symlink.path);
+        let full_path = validate_path(&self.config.root, &symlink.path)?;
+
+        // Validate symlink target
+        validate_symlink_target(&self.config.root, &full_path, &symlink.target)?;
 
         // Remove existing if any
         let _ = fs::remove_file(&full_path).await;
@@ -295,14 +406,19 @@ impl Receiver {
         tokio::fs::symlink(&symlink.target, &full_path).await?;
 
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&symlink.target, &full_path)?;
+        tokio::task::spawn_blocking({
+            let target = symlink.target.clone();
+            let path = full_path.clone();
+            move || std::os::windows::fs::symlink_file(&target, &path)
+        })
+        .await??;
 
         self.stats.symlinks_created += 1;
         Ok(())
     }
 
     async fn handle_delete(&mut self, delete: Delete) -> Result<()> {
-        let full_path = self.config.root.join(&delete.path);
+        let full_path = validate_path(&self.config.root, &delete.path)?;
 
         if delete.is_dir {
             let _ = fs::remove_dir_all(&full_path).await;
@@ -320,11 +436,17 @@ impl Receiver {
         rel_path: &str,
         delta_data: &[u8],
     ) -> Result<()> {
-        // The original file is at the final destination path
-        let original_path = root.join(rel_path);
+        // Validate path before opening
+        let original_path = validate_path(root, rel_path)?;
         let mut original = File::open(&original_path)
             .await
             .context("Failed to open original file for delta application")?;
+
+        // Get file size for bounds checking
+        let file_size = original.metadata().await?.len();
+
+        // Reusable buffer for copy operations
+        let mut copy_buf = Vec::new();
 
         let mut reader = delta_data;
 
@@ -332,21 +454,65 @@ impl Receiver {
             let op_type = reader.get_u8();
             match op_type {
                 0x00 => {
-                    // Copy
+                    // Copy from original file
+                    if reader.remaining() < 12 {
+                        anyhow::bail!("Delta copy op truncated");
+                    }
                     let offset = reader.get_u64();
                     let size = reader.get_u32() as usize;
 
-                    let mut buf = vec![0u8; size];
+                    // Bounds validation
+                    if size > MAX_DELTA_COPY_SIZE {
+                        anyhow::bail!(
+                            "Delta copy size {} exceeds max {}",
+                            size,
+                            MAX_DELTA_COPY_SIZE
+                        );
+                    }
+                    if offset > file_size {
+                        anyhow::bail!(
+                            "Delta copy offset {} exceeds file size {}",
+                            offset,
+                            file_size
+                        );
+                    }
+                    if offset.saturating_add(size as u64) > file_size {
+                        anyhow::bail!(
+                            "Delta copy range {}..{} exceeds file size {}",
+                            offset,
+                            offset + size as u64,
+                            file_size
+                        );
+                    }
+
+                    // Reuse buffer
+                    copy_buf.resize(size, 0);
                     original.seek(SeekFrom::Start(offset)).await?;
-                    original.read_exact(&mut buf).await?;
-                    file.write_all(&buf).await?;
+                    original.read_exact(&mut copy_buf).await?;
+                    file.write_all(&copy_buf).await?;
                 }
                 0x01 => {
-                    // Insert
+                    // Insert literal data
+                    if reader.remaining() < 4 {
+                        anyhow::bail!("Delta insert op truncated");
+                    }
                     let len = reader.get_u32() as usize;
-                    let mut buf = vec![0u8; len];
-                    reader.copy_to_slice(&mut buf);
-                    file.write_all(&buf).await?;
+
+                    if len > MAX_DELTA_COPY_SIZE {
+                        anyhow::bail!(
+                            "Delta insert size {} exceeds max {}",
+                            len,
+                            MAX_DELTA_COPY_SIZE
+                        );
+                    }
+                    if reader.remaining() < len {
+                        anyhow::bail!("Delta insert data truncated");
+                    }
+
+                    // Use copy_buf for insert data too
+                    copy_buf.resize(len, 0);
+                    reader.copy_to_slice(&mut copy_buf);
+                    file.write_all(&copy_buf).await?;
                 }
                 _ => anyhow::bail!("Unknown delta op type: {}", op_type),
             }

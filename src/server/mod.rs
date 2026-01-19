@@ -121,18 +121,26 @@ async fn run_server_pull(
     });
 
     let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
-    let sender_handle = tokio::spawn(async move {
-        sender
-            .run(rx, |bytes| {
-                if data_tx.blocking_send(bytes).is_err() {
-                    return Err(anyhow::anyhow!("Data channel closed"));
-                }
-                Ok(())
-            })
-            .await
+
+    // Spawn sender in blocking context since it uses sync callback
+    let sender_handle = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            sender
+                .run(rx, |bytes| match data_tx.try_send(bytes.clone()) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::error::TrySendError::Full(_)) => data_tx
+                        .blocking_send(bytes)
+                        .map_err(|_| anyhow::anyhow!("Data channel closed")),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Err(anyhow::anyhow!("Data channel closed"))
+                    }
+                })
+                .await
+        })
     });
 
-    // Stream data to client
+    // Stream data to client (concurrent with sender)
     while let Some(bytes) = data_rx.recv().await {
         v2::write_frame(&mut stdout, &bytes).await?;
     }
@@ -167,9 +175,12 @@ async fn run_server_push(
     });
 
     // 1. Send Initial Exchange (our files metadata)
+    // Run scan and write concurrently to avoid deadlock on bounded channel
     let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(100);
     let receiver_root = root_path.clone();
-    tokio::task::spawn_blocking(move || {
+
+    // Spawn scanner in background
+    let scan_handle = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         let receiver = Receiver::new(ReceiverConfig {
             root: receiver_root,
@@ -180,13 +191,16 @@ async fn run_server_push(
                 .blocking_send(bytes)
                 .map_err(|_| anyhow::anyhow!("Data channel closed"))
         }))
-    })
-    .await??;
+    });
 
+    // Write data as it arrives (concurrent with scan)
     while let Some(bytes) = data_rx.recv().await {
         v2::write_frame(&mut stdout, &bytes).await?;
     }
     stdout.flush().await?;
+
+    // Wait for scanner to complete
+    scan_handle.await??;
 
     // 2. Receive streaming messages
     loop {

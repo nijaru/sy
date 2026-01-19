@@ -58,6 +58,9 @@ pub struct DeltaInfo {
     /// Block size used for checksums
     pub block_size: u32,
 
+    /// Destination file size (needed to calculate last block size)
+    pub file_size: u64,
+
     /// Block checksums
     pub checksums: Vec<BlockChecksum>,
 }
