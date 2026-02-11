@@ -106,10 +106,15 @@ impl Sender {
         on_data(entry.encode())?;
 
         // Read and send data chunks
-        if job.need_delta && job.checksums.is_some() {
-            // Delta transfer
-            self.send_delta(&full_path, &path_str, job.checksums.unwrap(), on_data)
-                .await?;
+        if job.need_delta {
+            if let Some(checksums) = job.checksums {
+                // Delta transfer
+                self.send_delta(&full_path, &path_str, checksums, on_data)
+                    .await?;
+            } else {
+                // No destination checksums available, fall back to full transfer.
+                self.send_full(&full_path, &path_str, on_data).await?;
+            }
         } else {
             // Full transfer
             self.send_full(&full_path, &path_str, on_data).await?;
