@@ -10,6 +10,12 @@
 
 ## Active Work
 
+**2026-02-11: Dependency Security + PR Review**
+
+- Applied PR #21-equivalent dependency update: `bytes` `1.10.1` → `1.11.1` (overflow fix)
+- Validation complete: `cargo build`, `cargo test`, and `cargo clippy -- -D warnings` all pass
+- Extracted architecture-aligned ideas from PR #13 (no direct cherry-pick due scale/scope mismatch)
+
 **2026-01-19: v0.3.0 Released**
 
 - Streaming protocol v2 merged to main
