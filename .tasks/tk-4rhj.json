@@ -1,0 +1,28 @@
+{
+  "project": "tk",
+  "ref": "4rhj",
+  "title": "Review PR21 and apply bytes overflow fix",
+  "description": "Inspect PR #21 dependency bump for bytes integer overflow fix, update main dependencies safely, validate build/tests, and summarize PR #13 ideas compatible with current streaming architecture.",
+  "status": "active",
+  "priority": 2,
+  "labels": [],
+  "assignees": [],
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-02-11T01:11:02.281Z",
+      "msg": "Applied bytes 1.11.1 bump locally and validated with cargo build + cargo test (all passing, existing SSH integration tests remain ignored)."
+    },
+    {
+      "ts": "2026-02-11T01:13:19.400Z",
+      "msg": "PR #13 assessed at idea level: 1073 files / 22463 additions with broad scope (daemon, python bindings, CLI utilities, temp benchmark artifacts). Recommendation is selective adoption only (daemon architecture concept, progress callback model) and avoid cherry-picking code."
+    }
+  ],
+  "created_at": "2026-02-11T01:09:12.526Z",
+  "updated_at": "2026-02-11T01:13:19.400Z",
+  "completed_at": null,
+  "external": {}
+}
