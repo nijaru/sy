@@ -1,5 +1,0 @@
-# .mailmap - Hide bot/AI commits from GitHub contributor stats
-# Format: Preferred Name <preferred@email> Bot Name <bot@email>
-
-# Map Claude AI commits to the actual developer
-Nick Russo <nijaru7@gmail.com> Claude <noreply@anthropic.com>
