@@ -18,6 +18,7 @@ Thumbs.db
 /test-files/
 /benchmark-results/
 /tmp/
+/benchmarks/
 
 # Temporary session files
 ANALYSIS.md
