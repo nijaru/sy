@@ -4,6 +4,7 @@ mod cli;
 mod compress;
 mod config;
 mod delta;
+mod endpoint;
 mod error;
 mod filter;
 mod fs_util;
@@ -392,46 +393,60 @@ Or install from local source with: cargo install --path . --features acl"#
         );
     }
 
-    let engine = SyncEngine::new(
-        transport,
-        cli.dry_run,
-        cli.diff,
-        cli.delete,
-        cli.delete_threshold,
-        cli.trash,
-        cli.force_delete,
-        cli.quiet || cli.json, // JSON mode implies quiet
-        cli.parallel,
-        cli.max_errors,
-        cli.min_size,
-        cli.max_size,
+    let config = sync::SyncConfig {
+        dry_run: cli.dry_run,
+        diff_mode: cli.diff,
+        delete: if cli.delete {
+            sync::DeleteMode::Enabled {
+                threshold: cli.delete_threshold,
+                force: cli.force_delete,
+            }
+        } else {
+            sync::DeleteMode::Disabled
+        },
+        trash: cli.trash,
+        quiet: cli.quiet || cli.json,
+        max_concurrent: cli.parallel,
+        max_errors: cli.max_errors,
+        min_size: cli.min_size,
+        max_size: cli.max_size,
         filter_engine,
-        cli.bwlimit,
-        cli.resume(),
-        cli.checkpoint_files,
-        cli.checkpoint_bytes,
-        cli.json,
-        checksum_type,
-        verify_on_write,
-        symlink_mode,
-        cli.preserve_xattrs,
-        cli.preserve_hardlinks,
-        cli.preserve_acls,
-        cli.preserve_flags,
-        cli.per_file_progress,
-        cli.ignore_times,
-        cli.size_only,
-        cli.checksum,
-        cli.update,
-        cli.ignore_existing,
-        cli.use_cache,
-        cli.clear_cache,
-        cli.checksum_db,
-        cli.clear_checksum_db,
-        cli.prune_checksum_db,
-        destination.is_remote(),
-        cli.perf,
-    );
+        bwlimit: cli.bwlimit,
+        resume: sync::ResumeConfig {
+            enabled: cli.resume(),
+            checkpoint_files: cli.checkpoint_files,
+            checkpoint_bytes: cli.checkpoint_bytes,
+        },
+        json: cli.json,
+        verification: sync::VerificationConfig {
+            mode: checksum_type,
+            verify_on_write,
+            checksum_db: cli.checksum_db,
+            clear_checksum_db: cli.clear_checksum_db,
+            prune_checksum_db: cli.prune_checksum_db,
+        },
+        preserve: sync::PreserveConfig {
+            xattrs: cli.preserve_xattrs,
+            hardlinks: cli.preserve_hardlinks,
+            acls: cli.preserve_acls,
+            flags: cli.preserve_flags,
+            symlink_mode,
+        },
+        per_file_progress: cli.per_file_progress,
+        comparison: sync::ComparisonConfig {
+            ignore_times: cli.ignore_times,
+            size_only: cli.size_only,
+            checksum: cli.checksum,
+            update_only: cli.update,
+            ignore_existing: cli.ignore_existing,
+        },
+        use_cache: cli.use_cache,
+        clear_cache: cli.clear_cache,
+        dest_is_remote: destination.is_remote(),
+        perf: cli.perf,
+    };
+
+    let engine = SyncEngine::with_config(transport, config);
 
     // Execute pre-sync hook
     if let Some(ref executor) = hook_executor {

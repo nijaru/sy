@@ -128,6 +128,7 @@ impl<T: Transport + 'static> WatchMode<T> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::transport::local::LocalTransport;

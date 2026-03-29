@@ -4,6 +4,7 @@ pub mod cli;
 pub mod compress;
 pub mod config;
 pub mod delta;
+pub mod endpoint;
 pub mod error;
 pub mod filter;
 pub mod fs_util;

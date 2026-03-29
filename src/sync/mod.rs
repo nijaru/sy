@@ -1,4 +1,5 @@
 pub mod checksumdb;
+pub mod config;
 pub mod dircache;
 pub mod output;
 pub mod progress;
@@ -7,12 +8,15 @@ pub mod resume;
 pub mod scale;
 pub mod scanner;
 pub mod server_mode;
+pub mod stats;
 pub mod strategy;
 pub mod transfer;
 #[cfg(feature = "watch")]
 pub mod watch;
 
-use crate::cli::SymlinkMode;
+pub use config::{ComparisonConfig, DeleteMode, PreserveConfig, ResumeConfig, SyncConfig, VerificationConfig};
+pub use stats::{SyncError, SyncStats, VerificationResult};
+
 use crate::error::Result;
 use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
@@ -33,96 +37,16 @@ use std::time::{Duration, SystemTime};
 use strategy::{StrategyPlanner, SyncAction};
 use transfer::Transferrer;
 
-#[derive(Debug, Clone)]
-pub struct SyncError {
-    pub path: PathBuf,
-    pub error: String,
-    pub action: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SyncStats {
-    pub files_scanned: u64,
-    pub files_created: u64,
-    pub files_updated: u64,
-    pub files_skipped: usize,
-    pub files_deleted: usize,
-    pub bytes_transferred: u64,
-    pub files_delta_synced: usize,
-    pub delta_bytes_saved: u64,
-    pub files_compressed: usize,
-    pub compression_bytes_saved: u64,
-    pub files_verified: usize,
-    pub verification_failures: usize,
-    pub duration: Duration,
-    // Dry-run statistics
-    pub bytes_would_add: u64,
-    pub bytes_would_change: u64,
-    pub bytes_would_delete: u64,
-    // Server mode statistics (set by server_mode.rs, will be displayed in future)
-    #[allow(dead_code)]
-    pub dirs_created: u64,
-    #[allow(dead_code)]
-    pub symlinks_created: u64,
-    // Error tracking
-    pub errors: Vec<SyncError>,
-}
-
-#[derive(Debug)]
-pub struct VerificationResult {
-    pub files_matched: usize,
-    pub files_mismatched: Vec<PathBuf>,
-    pub files_only_in_source: Vec<PathBuf>,
-    pub files_only_in_dest: Vec<PathBuf>,
-    pub errors: Vec<SyncError>,
-    pub duration: Duration,
-}
-
 pub struct SyncEngine<T: Transport> {
     transport: Arc<T>,
-    dry_run: bool,
-    diff_mode: bool,
-    delete: bool,
-    delete_threshold: u8,
-    #[allow(dead_code)] // Planned feature: trash/recycle bin support
-    trash: bool,
-    force_delete: bool,
-    quiet: bool,
-    max_concurrent: usize,
-    max_errors: usize,
-    min_size: Option<u64>,
-    max_size: Option<u64>,
-    filter_engine: FilterEngine,
-    bwlimit: Option<u64>,
-    resume: bool,
-    checkpoint_files: usize,
-    checkpoint_bytes: u64,
-    json: bool,
-    verification_mode: ChecksumType,
-    verify_on_write: bool,
-    symlink_mode: SymlinkMode,
-    preserve_xattrs: bool,
-    preserve_hardlinks: bool,
-    preserve_acls: bool,
-    preserve_flags: bool,    // macOS only, no-op on other platforms
-    per_file_progress: bool, // Show progress bar for large files
-    ignore_times: bool,
-    size_only: bool,
-    checksum: bool,
-    update_only: bool,
-    ignore_existing: bool,
-    // Note: verify_only is handled at CLI level (main.rs) before sync runs
-    use_cache: bool,
-    clear_cache: bool,
-    checksum_db: bool,
-    clear_checksum_db: bool,
-    prune_checksum_db: bool,
-    dest_is_remote: bool,
+    config: SyncConfig,
     perf_monitor: Option<Arc<Mutex<PerformanceMonitor>>>,
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
     #[allow(clippy::too_many_arguments)]
+    #[deprecated(note = "Use SyncEngine::with_config instead")]
+    #[allow(dead_code)]
     pub fn new(
         transport: T,
         dry_run: bool,
@@ -142,13 +66,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
         checkpoint_files: usize,
         checkpoint_bytes: u64,
         json: bool,
-        verification_mode: ChecksumType,
+        verification_mode: crate::integrity::ChecksumType,
         verify_on_write: bool,
-        symlink_mode: SymlinkMode,
+        symlink_mode: crate::cli::SymlinkMode,
         preserve_xattrs: bool,
         preserve_hardlinks: bool,
         preserve_acls: bool,
-        preserve_flags: bool, // macOS only, no-op on other platforms
+        preserve_flags: bool,
         per_file_progress: bool,
         ignore_times: bool,
         size_only: bool,
@@ -163,20 +87,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
         dest_is_remote: bool,
         perf: bool,
     ) -> Self {
-        let perf_monitor = if perf {
-            Some(Arc::new(Mutex::new(PerformanceMonitor::new(bwlimit))))
-        } else {
-            None
-        };
-
-        Self {
-            transport: Arc::new(transport),
+        let config = SyncConfig {
             dry_run,
             diff_mode,
-            delete,
-            delete_threshold,
+            delete: if delete {
+                DeleteMode::Enabled {
+                    threshold: delete_threshold,
+                    force: force_delete,
+                }
+            } else {
+                DeleteMode::Disabled
+            },
             trash,
-            force_delete,
             quiet,
             max_concurrent,
             max_errors,
@@ -184,40 +106,63 @@ impl<T: Transport + 'static> SyncEngine<T> {
             max_size,
             filter_engine,
             bwlimit,
-            resume,
-            checkpoint_files,
-            checkpoint_bytes,
+            resume: ResumeConfig {
+                enabled: resume,
+                checkpoint_files,
+                checkpoint_bytes,
+            },
             json,
-            verification_mode,
-            verify_on_write,
-            symlink_mode,
-            preserve_xattrs,
-            preserve_hardlinks,
-            preserve_acls,
-            preserve_flags,
+            verification: VerificationConfig {
+                mode: verification_mode,
+                verify_on_write,
+                checksum_db,
+                clear_checksum_db,
+                prune_checksum_db,
+            },
+            preserve: PreserveConfig {
+                xattrs: preserve_xattrs,
+                hardlinks: preserve_hardlinks,
+                acls: preserve_acls,
+                flags: preserve_flags,
+                symlink_mode,
+            },
             per_file_progress,
-            ignore_times,
-            size_only,
-            checksum,
-            update_only,
-            ignore_existing,
+            comparison: ComparisonConfig {
+                ignore_times,
+                size_only,
+                checksum,
+                update_only,
+                ignore_existing,
+            },
             use_cache,
             clear_cache,
-            checksum_db,
-            clear_checksum_db,
-            prune_checksum_db,
             dest_is_remote,
+            perf,
+        };
+        Self::with_config(transport, config)
+    }
+
+    pub fn with_config(transport: T, config: SyncConfig) -> Self {
+        let perf_monitor = if config.perf {
+            Some(Arc::new(Mutex::new(PerformanceMonitor::new(config.bwlimit))))
+        } else {
+            None
+        };
+
+        Self {
+            transport: Arc::new(transport),
+            config,
             perf_monitor,
         }
     }
 
     fn should_filter_by_size(&self, file_size: u64) -> bool {
-        if let Some(min) = self.min_size {
+        if let Some(min) = self.config.min_size {
             if file_size < min {
                 return true;
             }
         }
-        if let Some(max) = self.max_size {
+        if let Some(max) = self.config.max_size {
             if file_size > max {
                 return true;
             }
@@ -226,7 +171,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
     }
 
     fn should_exclude(&self, relative_path: &Path, is_dir: bool) -> bool {
-        self.filter_engine.should_exclude(relative_path, is_dir)
+        self.config.filter_engine.should_exclude(relative_path, is_dir)
     }
 
     pub async fn sync(&self, source: &Path, destination: &Path) -> Result<SyncStats> {
@@ -248,7 +193,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Ensure destination directory exists before any operations
         // This is critical for remote syncs where the destination path may not exist yet
-        if !self.dry_run {
+        if !self.config.dry_run {
             tracing::debug!(
                 "Ensuring destination directory exists: {}",
                 destination.display()
@@ -257,7 +202,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Handle directory cache
-        if self.clear_cache && !self.dry_run {
+        if self.config.clear_cache && !self.config.dry_run {
             if let Err(e) = DirectoryCache::delete(destination) {
                 tracing::warn!("Failed to clear directory cache: {}", e);
             } else {
@@ -266,7 +211,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Load directory cache (if enabled)
-        let mut dir_cache = if self.use_cache {
+        let mut dir_cache = if self.config.use_cache {
             let cache = DirectoryCache::load(destination);
             tracing::debug!("Loaded directory cache with {} entries", cache.len());
             Some(cache)
@@ -275,14 +220,14 @@ impl<T: Transport + 'static> SyncEngine<T> {
         };
 
         // Handle checksum database
-        let checksum_db = if self.checksum && self.checksum_db {
+        let checksum_db = if self.config.comparison.checksum && self.config.verification.checksum_db {
             // Open checksum database
             match checksumdb::ChecksumDatabase::open(destination) {
                 Ok(db) => {
                     tracing::debug!("Opened checksum database");
 
                     // Clear if requested
-                    if self.clear_checksum_db && !self.dry_run {
+                    if self.config.verification.clear_checksum_db && !self.config.dry_run {
                         if let Err(e) = db.clear() {
                             tracing::warn!("Failed to clear checksum database: {}", e);
                         } else {
@@ -462,7 +407,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         tracing::debug!("Scan completed, about to check resources");
 
         // Check resources before starting sync
-        if !self.dry_run {
+        if !self.config.dry_run {
             // Calculate estimated bytes needed
             let bytes_needed: u64 = source_files
                 .iter()
@@ -476,20 +421,20 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 .await?;
 
             // Check FD limits
-            resource::check_fd_limits(self.max_concurrent)?;
+            resource::check_fd_limits(self.config.max_concurrent)?;
         }
 
         tracing::debug!("Resource checks completed, loading resume state");
 
         // Load or create resume state
         let current_flags = SyncFlags {
-            delete: self.delete,
+            delete: self.config.delete.is_enabled(),
             exclude: vec![], // Filter rules handled by FilterEngine
-            min_size: self.min_size,
-            max_size: self.max_size,
+            min_size: self.config.min_size,
+            max_size: self.config.max_size,
         };
 
-        let resume_state = if self.resume {
+        let resume_state = if self.config.resume.enabled {
             match ResumeState::load(destination)? {
                 Some(state) => {
                     if state.is_compatible_with(&current_flags) {
@@ -499,7 +444,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             completed,
                             total
                         );
-                        if !self.quiet {
+                        if !self.config.quiet {
                             println!(
                                 "📋 Resuming previous sync ({}/{} files completed)",
                                 completed, total
@@ -508,7 +453,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         Some(state)
                     } else {
                         tracing::warn!("Resume state incompatible (flags changed), starting fresh");
-                        if !self.quiet {
+                        if !self.config.quiet {
                             println!("⚠️  Resume state incompatible, starting fresh sync");
                         }
                         ResumeState::delete(destination)?;
@@ -549,11 +494,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Plan sync operations
         let planner = StrategyPlanner::with_comparison_flags(
-            self.ignore_times,
-            self.size_only,
-            self.checksum,
-            self.update_only,
-            self.ignore_existing,
+            self.config.comparison.ignore_times,
+            self.config.comparison.size_only,
+            self.config.comparison.checksum,
+            self.config.comparison.update_only,
+            self.config.comparison.ignore_existing,
         );
 
         tracing::debug!("Starting to plan {} tasks", source_files.len());
@@ -576,7 +521,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         tracing::debug!("Filtered to {} files to plan", total_to_plan);
 
         // Create planning progress bar (spinner for scanning destination)
-        let plan_pb = if self.quiet {
+        let plan_pb = if self.config.quiet {
             ProgressBar::hidden()
         } else {
             let pb = ProgressBar::new_spinner();
@@ -639,7 +584,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         plan_pb.finish_and_clear();
 
         // Plan deletions if requested
-        if self.delete {
+        if self.config.delete.is_enabled() {
             let deletions = planner.plan_deletions(&source_files, destination);
 
             // Apply deletion safety checks
@@ -650,32 +595,32 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     .unwrap_or(0);
 
                 // Check threshold: prevent mass deletion
-                if dest_file_count > 0 && !self.force_delete {
+                if dest_file_count > 0 && !self.config.delete.is_forced() {
                     let delete_percentage =
                         (deletions.len() as f64 / dest_file_count as f64) * 100.0;
 
-                    if delete_percentage > self.delete_threshold as f64 {
+                    if delete_percentage > self.config.delete.threshold() as f64 {
                         tracing::error!(
                             "Refusing to delete {:.1}% of destination files ({} files). Threshold: {}%. Use --force-delete to override.",
                             delete_percentage,
                             deletions.len(),
-                            self.delete_threshold
+                            self.config.delete.threshold()
                         );
 
-                        if !self.quiet {
+                        if !self.config.quiet {
                             eprintln!(
                                 "⚠️  ERROR: Would delete {:.1}% of files ({}/{}), exceeding threshold of {}%",
                                 delete_percentage,
                                 deletions.len(),
                                 dest_file_count,
-                                self.delete_threshold
+                                self.config.delete.threshold()
                             );
                             eprintln!("Use --force-delete to skip safety checks (dangerous!)");
                         }
 
                         return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
                             "Deletion threshold exceeded: {:.1}% > {}%",
-                            delete_percentage, self.delete_threshold
+                            delete_percentage, self.config.delete.threshold()
                         ))));
                     }
                 }
@@ -684,11 +629,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 // This prevents accidental destruction of large amounts of data
                 const CATASTROPHIC_THRESHOLD: usize = 10000;
                 if deletions.len() > CATASTROPHIC_THRESHOLD
-                    && !self.quiet
-                    && !self.json
-                    && !self.dry_run
+                    && !self.config.quiet
+                    && !self.config.json
+                    && !self.config.dry_run
                 {
-                    let warning_msg = if self.force_delete {
+                    let warning_msg = if self.config.delete.is_forced() {
                         format!(
                             "🚨 CRITICAL WARNING: About to delete {} files with --force-delete!\n\
                              This will PERMANENTLY DELETE a large amount of data.\n\
@@ -716,7 +661,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
 
-                    let confirmed = if self.force_delete {
+                    let confirmed = if self.config.delete.is_forced() {
                         // Require exact confirmation string for catastrophic deletions
                         input.trim() == format!("DELETE {}", deletions.len())
                     } else {
@@ -730,10 +675,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         )));
                     }
                 } else if deletions.len() > 1000
-                    && !self.force_delete
-                    && !self.quiet
-                    && !self.json
-                    && !self.dry_run
+                    && !self.config.delete.is_forced()
+                    && !self.config.quiet
+                    && !self.config.json
+                    && !self.config.dry_run
                 {
                     // Standard confirmation for large deletions (without --force-delete)
                     eprintln!(
@@ -770,7 +715,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Emit start event if JSON mode
-        if self.json {
+        if self.config.json {
             SyncEvent::Start {
                 source: source.to_path_buf(),
                 destination: destination.to_path_buf(),
@@ -781,8 +726,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Wrap resume state for thread-safe access
         let resume_state = Arc::new(Mutex::new(resume_state));
-        let _checkpoint_files = self.checkpoint_files;
-        let _checkpoint_bytes = self.checkpoint_bytes;
+        let _checkpoint_files = self.config.resume.checkpoint_files;
+        let _checkpoint_bytes = self.config.resume.checkpoint_bytes;
 
         // Execute sync operations in parallel
         // Thread-safe stats tracking
@@ -821,7 +766,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .sum();
 
         // Create progress bar (only if not quiet)
-        let pb = if self.quiet {
+        let pb = if self.config.quiet {
             ProgressBar::hidden()
         } else {
             let pb = ProgressBar::new(total_bytes);
@@ -839,6 +784,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Create rate limiter if bandwidth limit is set
         let rate_limiter = self
+            .config
             .bwlimit
             .map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
 
@@ -852,7 +798,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // OPTIMIZATION: Pre-create all directories in batch before file transfers
         // This avoids N round-trips for N files (each file was creating its parent dir)
-        if !self.dry_run {
+        if !self.config.dry_run {
             let unique_dirs: std::collections::HashSet<_> = tasks
                 .iter()
                 .filter(|t| matches!(t.action, SyncAction::Create | SyncAction::Update))
@@ -881,19 +827,19 @@ impl<T: Transport + 'static> SyncEngine<T> {
         // This allows processing results as they complete and enabling periodic checkpointing
         let transfer_futures = tasks.into_iter().map(|task| {
             let transport = Arc::clone(&self.transport);
-            let dry_run = self.dry_run;
-            let diff_mode = self.diff_mode;
-            let _json = self.json;
+            let dry_run = self.config.dry_run;
+            let diff_mode = self.config.diff_mode;
+            let _json = self.config.json;
             let pb = pb.clone();
             let rate_limiter = rate_limiter.clone();
-            let verification_mode = self.verification_mode;
-            let verify_on_write = self.verify_on_write;
-            let symlink_mode = self.symlink_mode;
-            let preserve_xattrs = self.preserve_xattrs;
-            let preserve_hardlinks = self.preserve_hardlinks;
-            let preserve_acls = self.preserve_acls;
-            let preserve_flags = self.preserve_flags;
-            let per_file_progress = self.per_file_progress && !self.quiet;
+            let verification_mode = self.config.verification.mode;
+            let verify_on_write = self.config.verification.verify_on_write;
+            let symlink_mode = self.config.preserve.symlink_mode;
+            let preserve_xattrs = self.config.preserve.xattrs;
+            let preserve_hardlinks = self.config.preserve.hardlinks;
+            let preserve_acls = self.config.preserve.acls;
+            let preserve_flags = self.config.preserve.flags;
+            let per_file_progress = self.config.per_file_progress && !self.config.quiet;
             let hardlink_map = Arc::clone(&hardlink_map);
             let _perf_monitor = self.perf_monitor.clone();
 
@@ -1131,7 +1077,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Process results as they stream in
         let mut stream =
-            futures::stream::iter(transfer_futures).buffer_unordered(self.max_concurrent);
+            futures::stream::iter(transfer_futures).buffer_unordered(self.config.max_concurrent);
 
         while let Some(result) = stream.next().await {
             match result {
@@ -1145,7 +1091,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             s.files_created += 1;
                             s.bytes_transferred += res.bytes_written;
 
-                            if self.dry_run {
+                            if self.config.dry_run {
                                 if let Some(src) = &task.source {
                                     if !src.is_dir {
                                         s.bytes_would_add += src.size;
@@ -1178,7 +1124,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             }
 
                             // Emit JSON
-                            if self.json {
+                            if self.config.json {
                                 SyncEvent::Create {
                                     path: task.dest_path.clone(),
                                     size: task.source.as_ref().map(|s| s.size).unwrap_or(0),
@@ -1191,7 +1137,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             s.files_updated += 1;
                             s.bytes_transferred += res.bytes_written;
 
-                            if self.dry_run {
+                            if self.config.dry_run {
                                 if let Some(src) = &task.source {
                                     if !src.is_dir {
                                         s.bytes_would_change += src.size;
@@ -1230,7 +1176,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                 }
                             }
 
-                            if self.json {
+                            if self.config.json {
                                 let delta_used = res
                                     .transfer_result
                                     .as_ref()
@@ -1247,7 +1193,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                         SyncAction::Skip => {
                             s.files_skipped += 1;
-                            if self.json {
+                            if self.config.json {
                                 SyncEvent::Skip {
                                     path: task.dest_path.clone(),
                                     reason: "up_to_date".to_string(),
@@ -1257,7 +1203,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                         SyncAction::Delete => {
                             s.files_deleted += 1;
-                            if self.dry_run && !task.dest_path.is_dir() {
+                            if self.config.dry_run && !task.dest_path.is_dir() {
                                 // Note: we don't have metadata here unless we checked it earlier
                                 // Simplified: we might miss bytes_would_delete accuracy in this refactor
                                 // unless we passed it in TaskResult, but Delete action doesn't return TaskResult with size
@@ -1267,7 +1213,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                 monitor.lock().unwrap().add_file_deleted();
                             }
 
-                            if self.json {
+                            if self.config.json {
                                 SyncEvent::Delete {
                                     path: task.dest_path.clone(),
                                 }
@@ -1280,8 +1226,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     if !res.verified {
                         s.verification_failures += 1;
                         tracing::warn!("Verification failed for {}", task.dest_path.display());
-                    } else if self.verification_mode != ChecksumType::None
-                        && !self.dry_run
+                    } else if self.config.verification.mode != ChecksumType::None
+                        && !self.config.dry_run
                         && matches!(task.action, SyncAction::Create | SyncAction::Update)
                         && task.source.as_ref().map(|s| !s.is_dir).unwrap_or(false)
                     {
@@ -1289,8 +1235,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     }
 
                     // Resume State Update & Periodic Checkpointing
-                    if self.resume
-                        && !self.dry_run
+                    if self.config.resume.enabled
+                        && !self.config.dry_run
                         && matches!(task.action, SyncAction::Create | SyncAction::Update)
                     {
                         if let Ok(mut state_guard) = resume_state.lock() {
@@ -1321,8 +1267,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                 bytes_since_checkpoint += res.bytes_written;
 
                                 // Check thresholds
-                                if files_since_checkpoint >= self.checkpoint_files
-                                    || bytes_since_checkpoint >= self.checkpoint_bytes
+                                if files_since_checkpoint >= self.config.resume.checkpoint_files
+                                    || bytes_since_checkpoint >= self.config.resume.checkpoint_bytes
                                 {
                                     tracing::debug!(
                                         "Checkpointing resume state ({} files, {} bytes)",
@@ -1331,7 +1277,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     );
                                     // Only save checkpoints if destination is local
                                     // (resume state files must be on local filesystem)
-                                    if !self.dest_is_remote {
+                                    if !self.config.dest_is_remote {
                                         if let Err(e) = state.save(destination) {
                                             tracing::warn!("Failed to save checkpoint: {}", e);
                                         }
@@ -1359,7 +1305,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     tracing::error!("Sync error for {}: {}", task.dest_path.display(), e);
 
                     // Check max errors
-                    if self.max_errors > 0 && s.errors.len() >= self.max_errors {
+                    if self.config.max_errors > 0 && s.errors.len() >= self.config.max_errors {
                         tracing::error!("Max errors exceeded. Aborting.");
                         pb.finish_with_message("Aborted due to errors");
                         return Err(crate::error::SyncError::Io(std::io::Error::other(
@@ -1384,7 +1330,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         if !final_stats.errors.is_empty() {
             tracing::warn!("Sync completed with {} errors", final_stats.errors.len());
 
-            if !self.quiet && !self.json {
+            if !self.config.quiet && !self.config.json {
                 use colored::Colorize;
                 eprintln!("\n{}", "⚠️  Errors occurred during sync:".red().bold());
                 eprintln!();
@@ -1424,7 +1370,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         );
 
         // Emit summary event if JSON mode
-        if self.json {
+        if self.config.json {
             SyncEvent::Summary {
                 files_created: final_stats.files_created as usize,
                 files_updated: final_stats.files_updated as usize,
@@ -1477,10 +1423,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Save directory cache if enabled
-        if self.use_cache && !self.dry_run {
+        if self.config.use_cache && !self.config.dry_run {
             if let Some(ref cache) = dir_cache {
                 // Only save cache if destination is local
-                if !self.dest_is_remote {
+                if !self.config.dest_is_remote {
                     if let Err(e) = cache.save(destination) {
                         tracing::warn!("Failed to save directory cache: {}", e);
                     } else {
@@ -1494,10 +1440,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Store checksums in database if enabled
         if let Some(ref db) = checksum_db {
-            if !self.dry_run {
+            if !self.config.dry_run {
                 let mut stored_count = 0;
                 let verifier = IntegrityVerifier::new(
-                    if self.checksum {
+                    if self.config.comparison.checksum {
                         ChecksumType::Fast
                     } else {
                         ChecksumType::None
@@ -1532,7 +1478,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
 
                 // Handle prune flag
-                if self.prune_checksum_db {
+                if self.config.verification.prune_checksum_db {
                     use std::collections::HashSet;
                     let existing_paths: HashSet<_> =
                         source_files.iter().map(|f| (*f.path).clone()).collect();
@@ -1579,7 +1525,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Ensure destination directory exists
-        if !self.dry_run {
+        if !self.config.dry_run {
             self.transport.create_dir_all(destination).await?;
         }
 
@@ -1593,7 +1539,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Create progress bar (indeterminate since we don't know total count)
-        let pb = if self.quiet {
+        let pb = if self.config.quiet {
             ProgressBar::hidden()
         } else {
             let pb = ProgressBar::new_spinner();
@@ -1631,11 +1577,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Strategy Planner
         let planner = Arc::new(StrategyPlanner::with_comparison_flags(
-            self.ignore_times,
-            self.size_only,
-            self.checksum,
-            self.update_only,
-            self.ignore_existing,
+            self.config.comparison.ignore_times,
+            self.config.comparison.size_only,
+            self.config.comparison.checksum,
+            self.config.comparison.update_only,
+            self.config.comparison.ignore_existing,
         ));
 
         // Create hardlink map for tracking inodes (shared across all parallel transfers)
@@ -1643,6 +1589,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Create rate limiter
         let rate_limiter = self
+            .config
             .bwlimit
             .map(|limit| Arc::new(Mutex::new(RateLimiter::new(limit))));
 
@@ -1650,8 +1597,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let bloom_filter = Arc::new(Mutex::new(FileSetBloom::new(1_000_000)));
 
         // Concurrency settings
-        let plan_concurrency = self.max_concurrent * 2;
-        let transfer_concurrency = self.max_concurrent;
+        let plan_concurrency = self.config.max_concurrent * 2;
+        let transfer_concurrency = self.config.max_concurrent;
 
         // STAGE 1: SOURCE STREAM (Scan -> Filter -> Plan -> Execute)
         let source_stream = self.transport.scan_streaming(source).await?;
@@ -1689,7 +1636,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let destination = destination.to_path_buf();
                 let stats = stats.clone();
                 let pb = pb.clone();
-                let _json = self.json;
+                let _json = self.config.json;
 
                 async move {
                     let file = match entry_result {
@@ -1720,18 +1667,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let transport = self.transport.clone();
                 let stats = stats.clone();
                 let pb = pb.clone();
-                let dry_run = self.dry_run;
-                let diff_mode = self.diff_mode;
-                let json = self.json;
+                let dry_run = self.config.dry_run;
+                let diff_mode = self.config.diff_mode;
+                let json = self.config.json;
                 // Clone other config fields...
-                let verification_mode = self.verification_mode;
-                let verify_on_write = self.verify_on_write;
-                let symlink_mode = self.symlink_mode;
-                let preserve_xattrs = self.preserve_xattrs;
-                let preserve_hardlinks = self.preserve_hardlinks;
-                let preserve_acls = self.preserve_acls;
-                let preserve_flags = self.preserve_flags;
-                let per_file_progress = self.per_file_progress && !self.quiet;
+                let verification_mode = self.config.verification.mode;
+                let verify_on_write = self.config.verification.verify_on_write;
+                let symlink_mode = self.config.preserve.symlink_mode;
+                let preserve_xattrs = self.config.preserve.xattrs;
+                let preserve_hardlinks = self.config.preserve.hardlinks;
+                let preserve_acls = self.config.preserve.acls;
+                let preserve_flags = self.config.preserve.flags;
+                let per_file_progress = self.config.per_file_progress && !self.config.quiet;
                 let hardlink_map = hardlink_map.clone();
                 let rate_limiter = rate_limiter.clone();
                 let perf_monitor = self.perf_monitor.clone();
@@ -1960,7 +1907,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             .await;
 
         // STAGE 2: DELETIONS
-        if self.delete {
+        if self.config.delete.is_enabled() {
             // Only run deletion scan if we had a successful source scan
             // Scan destination streaming
             // Note: We ignore errors during scan to attempt best-effort cleanup
@@ -1969,10 +1916,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let transport = self.transport.clone();
                 let stats = stats.clone();
                 let pb = pb.clone();
-                let dry_run = self.dry_run;
-                let json = self.json;
-                let _force_delete = self.force_delete;
-                let _delete_threshold = self.delete_threshold;
+                let dry_run = self.config.dry_run;
+                let json = self.config.json;
+                let _force_delete = self.config.delete.is_forced();
+                let _delete_threshold = self.config.delete.threshold();
 
                 // We need to count deletions to check threshold (which requires buffering or estimation)
                 // In streaming mode, strict threshold enforcement is hard before starting.
@@ -2047,7 +1994,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             }
                         }
                     })
-                    .buffer_unordered(self.max_concurrent)
+                    .buffer_unordered(self.config.max_concurrent)
                     .collect::<Vec<_>>()
                     .await;
             }
@@ -2106,10 +2053,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Create integrity verifier for checksum computation
-        let checksum_type = if self.checksum {
+        let checksum_type = if self.config.comparison.checksum {
             ChecksumType::Fast // Use xxHash3 for fast verification
         } else {
-            self.verification_mode // Use user-specified mode
+            self.config.verification.mode // Use user-specified mode
         };
         let verifier = IntegrityVerifier::new(checksum_type, false);
 
@@ -2147,7 +2094,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     Ok(true) => {
                         // Checksums match
                         files_matched += 1;
-                        if !self.quiet {
+                        if !self.config.quiet {
                             tracing::debug!("✓ {}", rel_path.display());
                         }
                     }
@@ -2270,17 +2217,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         // Per-file progress should respect quiet mode
-        let per_file_progress = self.per_file_progress && !self.quiet;
+        let per_file_progress = self.config.per_file_progress && !self.config.quiet;
 
         let transferrer = Transferrer::new(
             self.transport.as_ref(),
-            self.dry_run,
-            self.diff_mode,
-            self.symlink_mode,
-            self.preserve_xattrs,
-            self.preserve_hardlinks,
-            self.preserve_acls,
-            self.preserve_flags,
+            self.config.dry_run,
+            self.config.diff_mode,
+            self.config.preserve.symlink_mode,
+            self.config.preserve.xattrs,
+            self.config.preserve.hardlinks,
+            self.config.preserve.acls,
+            self.config.preserve.flags,
             per_file_progress,
             hardlink_map,
         );
@@ -2334,8 +2281,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             stats.files_created = 1;
 
             // Verify transfer if verification is enabled
-            if self.verification_mode != ChecksumType::None && !self.dry_run {
-                let verifier = IntegrityVerifier::new(self.verification_mode, self.verify_on_write);
+            if self.config.verification.mode != ChecksumType::None && !self.config.dry_run {
+                let verifier = IntegrityVerifier::new(self.config.verification.mode, self.config.verification.verify_on_write);
                 match verifier.verify_transfer(source, destination) {
                     Ok(verified) => {
                         if verified {
@@ -2412,8 +2359,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
             stats.files_updated = 1;
 
             // Verify transfer if verification is enabled
-            if self.verification_mode != ChecksumType::None && !self.dry_run {
-                let verifier = IntegrityVerifier::new(self.verification_mode, self.verify_on_write);
+            if self.config.verification.mode != ChecksumType::None && !self.config.dry_run {
+                let verifier = IntegrityVerifier::new(self.config.verification.mode, self.config.verification.verify_on_write);
                 match verifier.verify_transfer(source, destination) {
                     Ok(verified) => {
                         if verified {
@@ -2447,8 +2394,11 @@ impl<T: Transport + 'static> SyncEngine<T> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::cli::SymlinkMode;
+    use crate::integrity::ChecksumType;
     use crate::transport::local::LocalTransport;
     use std::fs;
     use tempfile::TempDir;
