@@ -448,19 +448,6 @@ Or install from local source with: cargo install --path . --features acl"#
         perf: cli.perf,
     };
 
-    // Create transport router for legacy features (single file, watch mode)
-    let transport = TransportRouter::new(
-        source,
-        destination,
-        checksum_type,
-        verify_on_write,
-        cli.parallel,
-        retry_config.clone(),
-    )
-    .await?
-    .with_scan_options(cli.scan_options());
-    let engine = SyncEngine::with_config(transport, config.clone());
-
     // Create SyncSession for strategy dispatch
     let source_endpoint = EndpointPair::from_sync_path(source);
     let dest_endpoint = EndpointPair::from_sync_path(destination);
@@ -589,6 +576,19 @@ Or install from local source with: cargo install --path . --features acl"#
             if !source.is_local() {
                 anyhow::bail!("Watch mode currently only supports local sources.");
             }
+
+            // Watch mode requires SyncEngine and transport
+            let transport = TransportRouter::new(
+                source,
+                destination,
+                checksum_type,
+                verify_on_write,
+                cli.parallel,
+                retry_config.clone(),
+            )
+            .await?
+            .with_scan_options(cli.scan_options());
+            let engine = SyncEngine::with_config(transport, config.clone());
 
             // Watch mode - continuous sync on file changes
             let watch_mode = WatchMode::new(
@@ -806,9 +806,7 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("Mode: Single file sync\n");
         }
         // For single files, trailing slash doesn't apply - use destination as-is
-        engine
-            .sync_single_file(source.path(), destination.path())
-            .await?
+        session.sync_single_file(source.path(), destination.path()).await?
     } else {
         // Use SyncSession for strategy dispatch
         let effective_dest = compute_destination_path(source, destination);

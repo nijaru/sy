@@ -528,6 +528,49 @@ impl SyncSession {
         Ok(stats)
     }
 
+    /// Sync a single file from source to destination.
+    pub async fn sync_single_file(&self, source: &Path, dest: &Path) -> Result<SyncStats> {
+        let start = std::time::Instant::now();
+        let mut stats = SyncStats::default();
+        stats.files_scanned = 1;
+
+        let (source_ep, dest_ep) = self.endpoints()?;
+
+        // Check if dest exists
+        let dest_exists = tokio::fs::metadata(dest).await.is_ok();
+
+        // Read source file
+        let source_path = crate::path::SyncPath::Local {
+            path: source.to_path_buf(),
+            has_trailing_slash: false,
+        };
+        let data = source_ep.read_file(&source_path.relative_path()).await?;
+        let meta = source_ep.metadata(&source_path.relative_path()).await?;
+
+        if !dest_exists {
+            // Create new file
+            let dest_path = crate::path::SyncPath::Local {
+                path: dest.to_path_buf(),
+                has_trailing_slash: false,
+            };
+            dest_ep.write_file(&dest_path.relative_path(), &data, &meta).await?;
+            stats.files_created = 1;
+            stats.bytes_transferred = data.len() as u64;
+        } else {
+            // Update existing file
+            let dest_path = crate::path::SyncPath::Local {
+                path: dest.to_path_buf(),
+                has_trailing_slash: false,
+            };
+            dest_ep.write_file(&dest_path.relative_path(), &data, &meta).await?;
+            stats.files_updated = 1;
+            stats.bytes_transferred = data.len() as u64;
+        }
+
+        stats.duration = start.elapsed();
+        Ok(stats)
+    }
+
     /// Local to SSH push sync.
     async fn streaming_push(&self) -> Result<SyncStats> {
         let (host, user, dest_root) = match &self.dest {
