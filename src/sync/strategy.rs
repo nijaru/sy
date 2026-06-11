@@ -101,7 +101,8 @@ impl StrategyPlanner {
         dest_map: &std::collections::HashMap<std::path::PathBuf, &FileEntry>,
         dest_root: &std::path::Path,
     ) -> Result<SyncTask> {
-        let dest_path = dest_root.join(&*source.relative_path);
+        // dest_path is relative — the endpoint's resolve() will join with root
+        let dest_path = (*source.relative_path).clone();
 
         if source.is_dir {
             // For directories, just check existence

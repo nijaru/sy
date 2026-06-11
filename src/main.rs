@@ -275,14 +275,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Process --exclude patterns
-    for pattern in &cli.exclude {
-        if let Err(e) = filter_engine.add_exclude(pattern) {
-            anyhow::bail!("Invalid exclude pattern '{}': {}", pattern, e);
-        }
-    }
-
-    // Load --include-from file
+    // Load --include-from file (before --exclude, rsync-compatible ordering)
     if let Some(ref include_from) = cli.include_from {
         // Read as include patterns (not rsync rules)
         use std::fs::File;
@@ -314,6 +307,13 @@ async fn main() -> Result<()> {
                     e
                 );
             }
+        }
+    }
+
+    // Process --exclude patterns (after --include-from, rsync-compatible ordering)
+    for pattern in &cli.exclude {
+        if let Err(e) = filter_engine.add_exclude(pattern) {
+            anyhow::bail!("Invalid exclude pattern '{}': {}", pattern, e);
         }
     }
 

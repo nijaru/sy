@@ -10,14 +10,32 @@ fn sy_bin() -> String {
     env!("CARGO_BIN_EXE_sy").to_string()
 }
 
-fn sy() -> Command {
-    Command::new(sy_bin())
+fn setup_test_dir() -> (TempDir, TempDir) {
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(source.path())
+        .output()
+        .unwrap();
+    (source, dest)
+}
+
+fn sync_args<'a>(source: &'a TempDir, dest: &'a TempDir, extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        format!("{}/", source.path().display()),
+        dest.path().to_str().unwrap().to_string(),
+        "--exclude-vcs".to_string(),
+    ];
+    for e in extra {
+        args.push(e.to_string());
+    }
+    args
 }
 
 #[test]
 fn test_archive_mode_preserves_permissions() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     let file = source.path().join("file.txt");
     fs::write(&file, "content").unwrap();
@@ -27,10 +45,8 @@ fn test_archive_mode_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let output = sy()
-            .arg("--archive")
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &["--archive"]))
             .output()
             .unwrap();
 
@@ -44,17 +60,15 @@ fn test_archive_mode_preserves_permissions() {
 
 #[test]
 fn test_symlink_preserve() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("target.txt"), "target").unwrap();
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("target.txt", source.path().join("link.txt")).unwrap();
 
-        let output = sy()
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &[]))
             .output()
             .unwrap();
 
@@ -69,17 +83,15 @@ fn test_symlink_preserve() {
 
 #[test]
 fn test_symlink_overwrite() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("old_target.txt", dest.path().join("link.txt")).unwrap();
         std::os::unix::fs::symlink("new_target.txt", source.path().join("link.txt")).unwrap();
 
-        let output = sy()
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &[]))
             .output()
             .unwrap();
 
@@ -94,8 +106,7 @@ fn test_symlink_overwrite() {
 
 #[test]
 fn test_symlink_over_regular_file() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(dest.path().join("file.txt"), "old").unwrap();
 
@@ -103,9 +114,8 @@ fn test_symlink_over_regular_file() {
     {
         std::os::unix::fs::symlink("target.txt", source.path().join("file.txt")).unwrap();
 
-        let output = sy()
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &["--ignore-times"]))
             .output()
             .unwrap();
 
@@ -119,8 +129,7 @@ fn test_symlink_over_regular_file() {
 
 #[test]
 fn test_multiple_symlinks_same_target() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("target.txt"), "target").unwrap();
 
@@ -129,9 +138,8 @@ fn test_multiple_symlinks_same_target() {
         std::os::unix::fs::symlink("target.txt", source.path().join("link1.txt")).unwrap();
         std::os::unix::fs::symlink("target.txt", source.path().join("link2.txt")).unwrap();
 
-        let output = sy()
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &[]))
             .output()
             .unwrap();
 
@@ -143,8 +151,7 @@ fn test_multiple_symlinks_same_target() {
 
 #[test]
 fn test_hardlink_preservation() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("original.txt"), "content").unwrap();
     #[cfg(unix)]
@@ -152,10 +159,8 @@ fn test_hardlink_preservation() {
         use std::os::unix::fs::MetadataExt;
         fs::hard_link(source.path().join("original.txt"), source.path().join("hardlink.txt")).unwrap();
 
-        let output = sy()
-            .arg("--hard-links")
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &["--preserve-hardlinks"]))
             .output()
             .unwrap();
 
@@ -175,8 +180,7 @@ fn test_hardlink_preservation() {
 
 #[test]
 fn test_hardlink_not_preserved_without_flag() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("original.txt"), "content").unwrap();
     #[cfg(unix)]
@@ -184,9 +188,8 @@ fn test_hardlink_not_preserved_without_flag() {
         use std::os::unix::fs::MetadataExt;
         fs::hard_link(source.path().join("original.txt"), source.path().join("hardlink.txt")).unwrap();
 
-        let output = sy()
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &[]))
             .output()
             .unwrap();
 
@@ -202,18 +205,15 @@ fn test_hardlink_not_preserved_without_flag() {
 
 #[test]
 fn test_xattr_preservation() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
     #[cfg(unix)]
     {
         if xattr::set(source.path().join("file.txt"), "user.test", b"value").is_ok() {
-            let output = sy()
-                .arg("--xattrs")
-                .arg(source.path())
-                .arg(dest.path())
+            let output = Command::new(sy_bin())
+                .args(sync_args(&source, &dest, &["--xattrs"]))
                 .output()
                 .unwrap();
 
@@ -226,17 +226,15 @@ fn test_xattr_preservation() {
 
 #[test]
 fn test_xattr_not_preserved_without_flag() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
     #[cfg(unix)]
     {
         if xattr::set(source.path().join("file.txt"), "user.test", b"value").is_ok() {
-            let output = sy()
-                .arg(source.path())
-                .arg(dest.path())
+            let output = Command::new(sy_bin())
+                .args(sync_args(&source, &dest, &[]))
                 .output()
                 .unwrap();
 
@@ -249,8 +247,7 @@ fn test_xattr_not_preserved_without_flag() {
 
 #[test]
 fn test_directory_permissions_preserved() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     let dir = source.path().join("subdir");
     fs::create_dir(&dir).unwrap();
@@ -260,10 +257,8 @@ fn test_directory_permissions_preserved() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let output = sy()
-            .arg("--archive")
-            .arg(source.path())
-            .arg(dest.path())
+        let output = Command::new(sy_bin())
+            .args(sync_args(&source, &dest, &["--archive"]))
             .output()
             .unwrap();
 

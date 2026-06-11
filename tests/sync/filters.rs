@@ -10,23 +10,38 @@ fn sy_bin() -> String {
     env!("CARGO_BIN_EXE_sy").to_string()
 }
 
-fn sy() -> Command {
-    Command::new(sy_bin())
+fn setup_test_dir() -> (TempDir, TempDir) {
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(source.path())
+        .output()
+        .unwrap();
+    (source, dest)
+}
+
+fn sync_args<'a>(source: &'a TempDir, dest: &'a TempDir, extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        format!("{}/", source.path().display()),
+        dest.path().to_str().unwrap().to_string(),
+        "--exclude-vcs".to_string(),
+    ];
+    for e in extra {
+        args.push(e.to_string());
+    }
+    args
 }
 
 #[test]
 fn test_exclude_flag_basic() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--exclude")
-        .arg("*.log")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--exclude", "*.log"]))
         .output()
         .unwrap();
 
@@ -37,20 +52,14 @@ fn test_exclude_flag_basic() {
 
 #[test]
 fn test_exclude_flag_multiple() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
     fs::write(source.path().join("file.log"), "log").unwrap();
     fs::write(source.path().join("file.tmp"), "tmp").unwrap();
 
-    let output = sy()
-        .arg("--exclude")
-        .arg("*.log")
-        .arg("--exclude")
-        .arg("*.tmp")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--exclude", "*.log", "--exclude", "*.tmp"]))
         .output()
         .unwrap();
 
@@ -62,18 +71,14 @@ fn test_exclude_flag_multiple() {
 
 #[test]
 fn test_exclude_directory() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::create_dir(source.path().join("node_modules")).unwrap();
     fs::write(source.path().join("node_modules/package"), "dep").unwrap();
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    let output = sy()
-        .arg("--exclude")
-        .arg("node_modules")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--exclude", "node_modules/"]))
         .output()
         .unwrap();
 
@@ -84,19 +89,13 @@ fn test_exclude_directory() {
 
 #[test]
 fn test_include_flag_basic() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("include.txt"), "include").unwrap();
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--include")
-        .arg("*.txt")
-        .arg("--exclude")
-        .arg("*")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--include", "*.txt", "--exclude", "*"]))
         .output()
         .unwrap();
 
@@ -107,19 +106,13 @@ fn test_include_flag_basic() {
 
 #[test]
 fn test_include_exclude_order_matters() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
     fs::write(source.path().join("file.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--include")
-        .arg("*.txt")
-        .arg("--exclude")
-        .arg("*")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--include", "*.txt", "--exclude", "*"]))
         .output()
         .unwrap();
 
@@ -130,19 +123,13 @@ fn test_include_exclude_order_matters() {
 
 #[test]
 fn test_filter_flag_include_syntax() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("include.txt"), "include").unwrap();
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--filter")
-        .arg("+ *.txt")
-        .arg("--filter")
-        .arg("- *")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--filter", "+ *.txt", "--filter", "- *"]))
         .output()
         .unwrap();
 
@@ -153,17 +140,13 @@ fn test_filter_flag_include_syntax() {
 
 #[test]
 fn test_filter_flag_exclude_syntax() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--filter")
-        .arg("- *.log")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--filter", "- *.log"]))
         .output()
         .unwrap();
 
@@ -174,8 +157,7 @@ fn test_filter_flag_exclude_syntax() {
 
 #[test]
 fn test_exclude_from_file() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
     let filter_file = TempDir::new().unwrap().into_path().join("exclude.txt");
 
     fs::write(&filter_file, "*.log\n*.tmp").unwrap();
@@ -183,11 +165,9 @@ fn test_exclude_from_file() {
     fs::write(source.path().join("file.log"), "log").unwrap();
     fs::write(source.path().join("file.tmp"), "tmp").unwrap();
 
-    let output = sy()
-        .arg("--exclude-from")
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--exclude-from"]))
         .arg(&filter_file)
-        .arg(source.path())
-        .arg(dest.path())
         .output()
         .unwrap();
 
@@ -199,21 +179,17 @@ fn test_exclude_from_file() {
 
 #[test]
 fn test_include_from_file() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
     let filter_file = TempDir::new().unwrap().into_path().join("include.txt");
 
     fs::write(&filter_file, "*.txt").unwrap();
     fs::write(source.path().join("include.txt"), "include").unwrap();
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--include-from")
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--include-from"]))
         .arg(&filter_file)
-        .arg("--exclude")
-        .arg("*")
-        .arg(source.path())
-        .arg(dest.path())
+        .args(["--exclude", "*"])
         .output()
         .unwrap();
 
@@ -224,18 +200,14 @@ fn test_include_from_file() {
 
 #[test]
 fn test_nested_directory_exclusion() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::create_dir_all(source.path().join("a/b/c")).unwrap();
     fs::write(source.path().join("a/b/c/file.txt"), "nested").unwrap();
     fs::write(source.path().join("a/b/c/exclude.log"), "log").unwrap();
 
-    let output = sy()
-        .arg("--exclude")
-        .arg("*.log")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--exclude", "*.log"]))
         .output()
         .unwrap();
 
@@ -246,17 +218,13 @@ fn test_nested_directory_exclusion() {
 
 #[test]
 fn test_min_size_filter() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("small.txt"), "hi").unwrap();
     fs::write(source.path().join("large.txt"), "hello world!").unwrap();
 
-    let output = sy()
-        .arg("--min-size")
-        .arg("10")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--min-size", "10"]))
         .output()
         .unwrap();
 
@@ -267,17 +235,13 @@ fn test_min_size_filter() {
 
 #[test]
 fn test_max_size_filter() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("small.txt"), "hi").unwrap();
     fs::write(source.path().join("large.txt"), "hello world!").unwrap();
 
-    let output = sy()
-        .arg("--max-size")
-        .arg("5")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--max-size", "5"]))
         .output()
         .unwrap();
 
@@ -288,20 +252,14 @@ fn test_max_size_filter() {
 
 #[test]
 fn test_min_max_size_filter_combined() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
 
     fs::write(source.path().join("tiny.txt"), "a").unwrap();
     fs::write(source.path().join("medium.txt"), "hello").unwrap();
     fs::write(source.path().join("large.txt"), "hello world!").unwrap();
 
-    let output = sy()
-        .arg("--min-size")
-        .arg("3")
-        .arg("--max-size")
-        .arg("10")
-        .arg(source.path())
-        .arg(dest.path())
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--min-size", "3", "--max-size", "10"]))
         .output()
         .unwrap();
 
@@ -313,8 +271,14 @@ fn test_min_max_size_filter_combined() {
 
 #[test]
 fn test_gitignore_basic() {
-    let source = TempDir::new().unwrap();
-    let dest = TempDir::new().unwrap();
+    let (source, dest) = setup_test_dir();
+
+    // Initialize git repo for gitignore to work
+    Command::new("git")
+        .args(["init"])
+        .current_dir(source.path())
+        .output()
+        .unwrap();
 
     fs::write(source.path().join(".gitignore"), "*.log\nbuild/").unwrap();
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
@@ -322,10 +286,13 @@ fn test_gitignore_basic() {
     fs::create_dir(source.path().join("build")).unwrap();
     fs::write(source.path().join("build/output"), "output").unwrap();
 
-    let output = sy()
-        .arg("--gitignore")
-        .arg(source.path())
-        .arg(dest.path())
+    // Use --gitignore to respect .gitignore rules
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--gitignore",
+        ])
         .output()
         .unwrap();
 
