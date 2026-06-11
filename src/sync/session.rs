@@ -534,7 +534,10 @@ impl SyncSession {
         let mut stats = SyncStats::default();
         stats.files_scanned = 1;
 
-        let (source_ep, dest_ep) = self.endpoints()?;
+        let source_ep = self.source.as_endpoint()
+            .ok_or_else(|| SyncError::Io(std::io::Error::other("Source must be local for single file sync")))?;
+        let dest_ep = self.dest.as_endpoint()
+            .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for single file sync")))?;
 
         // Check if dest exists
         let dest_exists = tokio::fs::metadata(dest).await.is_ok();
