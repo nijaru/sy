@@ -3,6 +3,7 @@
 //! Consolidates: comparison_modes_test.rs.
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -299,4 +300,299 @@ fn test_comparison_flags_mutually_exclusive() {
         .unwrap();
 
     assert!(!output.status.success());
+}
+
+#[test]
+fn test_update_copies_older_dest() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file in source with older time
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    // Create file in dest with newer time
+    fs::write(dest.path().join("file.txt"), "old content").unwrap();
+
+    // Run sync with --update (should copy older dest)
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--update",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+}
+
+#[test]
+fn test_rsync_r_flag_accepted() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // -r is rsync compatibility flag for recursive
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "-r",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("file.txt").exists());
+}
+
+#[test]
+fn test_rsync_avr_combination() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // -avr is common rsync flag组合 (archive, verbose, recursive)
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "-avr",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("file.txt").exists());
+}
+
+#[test]
+fn test_w_short_flag_recognized() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // -w is rsync flag for whole file (no delta)
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "-w",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("file.txt").exists());
+}
+
+#[test]
+fn test_z_short_flag_recognized() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // -z is rsync flag for compression
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "-z",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("file.txt").exists());
+}
+
+// Delta sync tests
+
+#[test]
+fn test_delta_sync_file_grows() {
+    let (source, dest) = setup_test_dir();
+
+    // Create initial file
+    fs::write(source.path().join("file.txt"), "initial content").unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Grow the file
+    fs::write(source.path().join("file.txt"), "initial content with more data").unwrap();
+
+    // Second sync should use delta
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "initial content with more data"
+    );
+}
+
+#[test]
+fn test_delta_sync_file_shrinks() {
+    let (source, dest) = setup_test_dir();
+
+    // Create initial file
+    fs::write(source.path().join("file.txt"), "initial content that is longer").unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Shrink the file
+    fs::write(source.path().join("file.txt"), "short").unwrap();
+
+    // Second sync should use delta
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "short"
+    );
+}
+
+#[test]
+fn test_delta_sync_correctness() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file with known content
+    let content = "Hello World\n".repeat(1000);
+    fs::write(source.path().join("file.txt"), &content).unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Modify middle of file
+    let mut modified = content.clone();
+    modified.insert_str(5000, "MODIFIED");
+    fs::write(source.path().join("file.txt"), &modified).unwrap();
+
+    // Second sync should produce identical content
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        modified
+    );
+}
+
+#[test]
+fn test_hard_links_preserved() {
+    let (source, dest) = setup_test_dir();
+
+    // Create hard linked files
+    fs::write(source.path().join("original.txt"), "content").unwrap();
+    fs::hard_link(
+        source.path().join("original.txt"),
+        source.path().join("link.txt"),
+    )
+    .unwrap();
+
+    // Sync with --hard-links
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--hard-links",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("original.txt").exists());
+    assert!(dest.path().join("link.txt").exists());
+
+    // Check that hard links are preserved
+    let orig_meta = fs::metadata(dest.path().join("original.txt")).unwrap();
+    let link_meta = fs::metadata(dest.path().join("link.txt")).unwrap();
+    assert_eq!(orig_meta.ino(), link_meta.ino());
+}
+
+#[test]
+fn test_sparse_file_delta_sync_preserves_sparseness() {
+    let (source, dest) = setup_test_dir();
+
+    // Create sparse file (large with mostly zeros)
+    let mut content = vec![0u8; 1024 * 1024]; // 1MB
+    content[0] = 1;
+    content[1024 * 512] = 1;
+    fs::write(source.path().join("sparse.bin"), &content).unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Modify sparse file
+    content[100] = 1;
+    fs::write(source.path().join("sparse.bin"), &content).unwrap();
+
+    // Second sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(dest.path().join("sparse.bin")).unwrap(),
+        content
+    );
 }
