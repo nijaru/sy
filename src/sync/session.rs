@@ -212,10 +212,73 @@ impl SyncSession {
         let dest_ep = self.dest.as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local endpoint")))?;
 
-        // Scan source
-        let source_entries = source_ep.scan(self.scan_options.clone()).await?;
+        // Load directory cache if enabled
+        let mut dir_cache = if self.config.use_cache {
+            let cache = crate::sync::dircache::DirectoryCache::load(dest_ep.root());
+            tracing::debug!("Loaded directory cache with {} entries", cache.len());
+            Some(cache)
+        } else {
+            None
+        };
+
+        // Check if we can use cached scan results
+        let can_use_cache = if let Some(ref cache) = dir_cache {
+            if let Ok(source_meta) = std::fs::metadata(source_ep.root()) {
+                if let Ok(source_mtime) = source_meta.modified() {
+                    let source_path = std::path::PathBuf::from(".");
+                    !cache.needs_rescan(&source_path, source_mtime)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Scan source (or use cache)
+        let source_entries = if can_use_cache {
+            if let Some(ref cache) = dir_cache {
+                if let Some(cached_files) = cache.get_cached_files(&std::path::PathBuf::from(".")) {
+                    tracing::info!("Using cached scan results ({} files)", cached_files.len());
+                    cached_files.iter().map(|cf| cf.to_file_entry(source_ep.root())).collect()
+                } else {
+                    source_ep.scan(self.scan_options.clone()).await?
+                }
+            } else {
+                source_ep.scan(self.scan_options.clone()).await?
+            }
+        } else {
+            source_ep.scan(self.scan_options.clone()).await?
+        };
         let source_count = source_entries.len();
         tracing::info!("Source scan: {} entries", source_count);
+
+        // Update cache with scanned files
+        if let Some(ref mut cache) = dir_cache {
+            use crate::sync::dircache::CachedFile;
+            use std::collections::HashMap;
+            
+            let mut files_by_dir: HashMap<std::path::PathBuf, Vec<CachedFile>> = HashMap::new();
+            
+            for entry in &source_entries {
+                if entry.is_dir {
+                    cache.update((*entry.relative_path).clone(), entry.modified);
+                }
+                let parent = (*entry.relative_path).parent()
+                    .unwrap_or(&std::path::PathBuf::from("."))
+                    .to_path_buf();
+                files_by_dir
+                    .entry(parent)
+                    .or_default()
+                    .push(CachedFile::from_file_entry(entry));
+            }
+            
+            for (dir, files) in files_by_dir {
+                cache.cache_files(dir, files);
+            }
+        }
 
         // Scan destination (for deletion support)
         let dest_entries = dest_ep.scan(self.scan_options.clone()).await?;
@@ -344,8 +407,16 @@ impl SyncSession {
                         #[cfg(unix)]
                         {
                             let target = std::fs::read_link(&source_path)?;
+                            // Remove existing file/symlink before creating
+                            if task.action == SyncAction::Update {
+                                dest_ep.remove(&task.dest_path, false).await?;
+                            }
                             dest_ep.create_symlink(&target, &task.dest_path).await?;
-                            stats.symlinks_created += 1;
+                            if task.action == SyncAction::Create {
+                                stats.symlinks_created += 1;
+                            } else {
+                                stats.files_updated += 1;
+                            }
                         }
                     } else {
                         // Check if this is a hard link that's already been copied
@@ -404,6 +475,14 @@ impl SyncSession {
         }
 
         stats.duration = start.elapsed();
+        
+        // Save directory cache if enabled
+        if let Some(ref cache) = dir_cache {
+            if let Err(e) = cache.save(dest_ep.root()) {
+                tracing::warn!("Failed to save directory cache: {}", e);
+            }
+        }
+        
         Ok(stats)
     }
 
