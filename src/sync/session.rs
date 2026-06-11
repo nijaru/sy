@@ -94,13 +94,25 @@ pub struct SyncSession {
     source: EndpointPair,
     dest: EndpointPair,
     config: SyncConfig,
+    scan_options: ScanOptions,
 }
 
 #[allow(dead_code)] // Wired in by main.rs rewrite (Phase 3 completion)
 impl SyncSession {
     /// Create a new sync session.
     pub fn new(source: EndpointPair, dest: EndpointPair, config: SyncConfig) -> Self {
-        Self { source, dest, config }
+        Self {
+            source,
+            dest,
+            config,
+            scan_options: ScanOptions::default(),
+        }
+    }
+
+    /// Create a new sync session with custom scan options.
+    pub fn with_scan_options(mut self, scan_options: ScanOptions) -> Self {
+        self.scan_options = scan_options;
+        self
     }
 
     /// Select the appropriate sync strategy based on endpoint types.
@@ -128,6 +140,69 @@ impl SyncSession {
         }
     }
 
+    /// Verify source and destination are in sync.
+    pub async fn verify(&self, source: &std::path::Path, dest: &std::path::Path) -> Result<crate::sync::VerificationResult> {
+        let source_ep = self.source.as_endpoint()
+            .ok_or_else(|| SyncError::Io(std::io::Error::other("Source must be local for verify")))?;
+        let dest_ep = self.dest.as_endpoint()
+            .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for verify")))?;
+
+        // Scan both sides
+        let source_entries = source_ep.scan(self.scan_options.clone()).await?;
+        let dest_entries = dest_ep.scan(self.scan_options.clone()).await?;
+
+        // Build lookup maps
+        let source_map: std::collections::HashMap<PathBuf, &FileEntry> = source_entries
+            .iter()
+            .map(|e| ((*e.relative_path).clone(), e))
+            .collect();
+        let dest_map: std::collections::HashMap<PathBuf, &FileEntry> = dest_entries
+            .iter()
+            .map(|e| ((*e.relative_path).clone(), e))
+            .collect();
+
+        let mut result = crate::sync::VerificationResult {
+            files_matched: 0,
+            files_mismatched: Vec::new(),
+            files_only_in_source: Vec::new(),
+            files_only_in_dest: Vec::new(),
+            errors: Vec::new(),
+            duration: std::time::Duration::ZERO,
+        };
+
+        let start = Instant::now();
+
+        // Check files in source
+        for (path, source_entry) in &source_map {
+            if let Some(dest_entry) = dest_map.get(path) {
+                // Both exist - compare
+                if source_entry.size == dest_entry.size {
+                    result.files_matched += 1;
+                } else {
+                    result.files_mismatched.push(source.join(path));
+                }
+            } else {
+                // Only in source
+                result.files_only_in_source.push(source.join(path));
+            }
+        }
+
+        // Check files only in dest
+        for (path, _) in &dest_map {
+            if !source_map.contains_key(path) {
+                result.files_only_in_dest.push(dest.join(path));
+            }
+        }
+
+        result.duration = start.elapsed();
+        Ok(result)
+    }
+
+    /// Get performance metrics (not yet implemented).
+    pub fn get_performance_metrics(&self) -> Option<&crate::perf::PerformanceMetrics> {
+        None // TODO: Add performance tracking to SyncSession
+    }
+
     /// Local to local sync: scan both sides, plan, execute.
     async fn direct_local(&self) -> Result<SyncStats> {
         let start = Instant::now();
@@ -138,12 +213,12 @@ impl SyncSession {
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local endpoint")))?;
 
         // Scan source
-        let source_entries = source_ep.scan(ScanOptions::default()).await?;
+        let source_entries = source_ep.scan(self.scan_options.clone()).await?;
         let source_count = source_entries.len();
         tracing::info!("Source scan: {} entries", source_count);
 
         // Scan destination (for deletion support)
-        let dest_entries = dest_ep.scan(ScanOptions::default()).await?;
+        let dest_entries = dest_ep.scan(self.scan_options.clone()).await?;
         tracing::info!("Dest scan: {} entries", dest_entries.len());
 
         // Build dest lookup for quick existence checks

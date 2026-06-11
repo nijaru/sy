@@ -73,9 +73,9 @@ impl Endpoint for LocalEndpoint {
         &self.root
     }
 
-    async fn scan(&self, _opts: ScanOptions) -> Result<Vec<FileEntry>> {
+    async fn scan(&self, opts: ScanOptions) -> Result<Vec<FileEntry>> {
         let path = self.root.clone();
-        let options = self.scan_options;
+        let options = opts;
         tokio::task::spawn_blocking(move || {
             let scanner = Scanner::new(&path).with_options(options);
             scanner.scan()
@@ -115,6 +115,12 @@ impl Endpoint for LocalEndpoint {
             &full_path,
             filetime::FileTime::from_system_time(meta.modified),
         )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(meta.mode);
+            tokio::fs::set_permissions(&full_path, perms).await?;
+        }
         Ok(())
     }
 

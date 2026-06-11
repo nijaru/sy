@@ -7,7 +7,7 @@
 ///
 /// Prerequisites:
 /// - fedora accessible via SSH
-/// - sy-remote installed on fedora
+/// - sy installed on fedora
 /// - Filesystem on fedora that supports sparse files (ext4, xfs, btrfs)
 ///
 use std::time::SystemTime;

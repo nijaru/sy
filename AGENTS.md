@@ -1,146 +1,79 @@
-# sy - Modern File Synchronization
+# sy — Fast File Sync
 
-Fast, modern file synchronization tool written in Rust - a reimagining of rsync with adaptive performance and verifiable integrity.
+`sy /source/ /dest` — rsync's mental model, Rust performance, sane defaults.
 
-## Quick Start
-
-**For AI agents:**
+## For AI Agents
 
 1. Read `ai/STATUS.md` (current state)
-2. Check tasks: `tk ls` (task tracker)
-3. Reference `ai/DESIGN.md` for architecture
+2. Read `ai/DESIGN.md` (what sy is, architecture)
+3. Check tasks: `tk ls`
 4. Reference `ai/DECISIONS.md` for rationale
 
-**Organization patterns**: [agent-contexts](https://github.com/nijaru/agent-contexts)
+## Project
 
-## Project Overview
+| Attribute | Value |
+|-----------|-------|
+| Language | Rust (edition 2021) |
+| Version | v0.3.0 |
+| Tests | 510 passing, 12 ignored (SSH agent) |
+| License | MIT |
+| Positioning | "fd for find" — spiritual successor, not wire-compatible |
 
-| Attribute | Value                                |
-| --------- | ------------------------------------ |
-| Language  | Rust (edition 2021)                  |
-| Version   | v0.3.0 (2026-01-19)                  |
-| Tests     | 620+ passing, 12 ignored (SSH agent) |
-| License   | MIT                                  |
-
-**Key Features**: Bidirectional server mode, delta sync, parallel transfers, SSH, sparse files, S3/GCS (experimental)
-
-## Structure
-
-```
-sy/
-├── AGENTS.md              # AI entry point
-├── CLAUDE.md → AGENTS.md  # Symlink
-├── ai/                    # AI working context
-│   ├── STATUS.md         # Current state (read FIRST)
-│   ├── DESIGN.md         # System architecture
-│   ├── DECISIONS.md      # Architectural decisions
-│   ├── research/         # External research
-│   ├── design/           # Component specs
-│   └── tmp/              # Temporary (gitignored)
-├── src/                   # Rust source
-├── tests/                 # Integration tests
-└── benches/               # Benchmarks
-```
-
-## AI Context Organization
-
-**Session files** (read every session, <500 lines each):
-
-- `ai/STATUS.md` — Current state, metrics, blockers
-- `ai/DESIGN.md` — System architecture, components
-- `ai/DECISIONS.md` — Architectural decisions
-
-**Reference files** (loaded on demand):
-
-- `ai/research/` — External research findings
-- `ai/design/` — Component specifications
-- `ai/tmp/` — Temporary artifacts (gitignored)
-
-**Task tracking**: `tk ls` (persisted in `.tasks/`)
-
-## Commands
+## Build & Verify
 
 ```bash
-# Build
-cargo build
-cargo build --release
-
-# Test
-cargo test
-cargo clippy -- -D warnings
-
-# Run
-cargo run -- /source /dest [OPTIONS]
-./target/release/sy /source /dest
-
-# Format
-cargo fmt
+cargo build                    # Build
+cargo test                     # Test (510 pass, 12 ignored SSH)
+cargo clippy -- -D warnings    # Lint (zero warnings)
+cargo fmt --check              # Format (no changes)
+cargo bench --no-run           # Verify benchmarks compile
 ```
 
-## Verification Steps
+## Architecture (v0.4 target)
 
-| Check  | Command                       | Requirement   |
-| ------ | ----------------------------- | ------------- |
-| Build  | `cargo build`                 | Zero errors   |
-| Tests  | `cargo test`                  | All pass      |
-| Lint   | `cargo clippy -- -D warnings` | Zero warnings |
-| Format | `cargo fmt --check`           | No changes    |
+```
+SyncSession
+  ├── source: EndpointPair (Local | SSH)
+  ├── dest: EndpointPair (Local | SSH | S3 | GCS)
+  └── config: SyncConfig
+        ↓
+    select_strategy()
+        ├── DirectLocal    (scan → plan → execute via Endpoint)
+        ├── StreamingPush  (SSH connect → sy --server → streaming protocol)
+        ├── StreamingPull  (reverse)
+        └── ObjectStore    (S3/GCS, future)
+```
+
+SSH bypasses the Endpoint trait — streaming protocol operates over stdin/stdout directly. Endpoint is for local/S3/GCS only.
 
 ## Code Standards
 
-| Aspect         | Standard                                                     |
-| -------------- | ------------------------------------------------------------ |
-| Commit format  | `type: description` (feat, fix, docs, refactor, test, chore) |
-| Comments       | WHY not WHAT                                                 |
-| Error handling | `anyhow` (CLI), `thiserror` (library)                        |
-| AI attribution | Remove "Generated with Claude"                               |
+| Aspect | Standard |
+|--------|---------|
+| Commit format | `type(scope): description` |
+| Comments | WHY not WHAT |
+| Error handling | `thiserror` (library), `anyhow` (binary) |
+| Parallelism | All cores by default, `-j 1` to escape |
+| State | Stateless core, filesystem is truth |
 
-## Codebase Quirks
+## Quirks
 
-| Area         | Knowledge                    | Why                                                       |
-| ------------ | ---------------------------- | --------------------------------------------------------- |
-| Hashing      | xxHash3 ≠ rolling hash       | Cannot replace Adler-32 in delta sync. Different purposes |
-| Networking   | QUIC slower on fast networks | 45% regression >600 Mbps. Use TCP+BBR                     |
-| Compression  | Overhead on >4Gbps           | CPU bottleneck. Never compress local sync                 |
-| Filesystems  | COW + hard links conflict    | Hard links MUST use in-place strategy (nlink > 1)         |
-| Sparse files | FS-dependent SEEK_HOLE       | Not all FSes support. Graceful fallback                   |
-| SSH          | Server mode tilde expansion  | `sy --server` receives literal `~`. Must expand manually  |
-| SSH          | russh migration blocked      | SSH agent requires ~300 LOC custom protocol               |
-| S3           | 5MB multipart minimum        | Small files use simple put                                |
+| Area | Knowledge |
+|------|-----------|
+| Hashing | xxHash3 ≠ rolling hash (Adler-32). Different purposes |
+| Compression | Overhead on >4Gbps. Never compress local sync |
+| Filesystems | COW + hard links conflict. Hard links force in-place (nlink > 1) |
+| SSH | `sy --server` receives literal `~`. Must expand manually |
+| S3 | 5MB multipart minimum. Small files use simple put |
 
-## Performance
+## What We Skip
 
-| Scenario     | Result                             |
-| ------------ | ---------------------------------- |
-| Local→Local  | 2-11x faster than rsync            |
-| Delta sync   | 2x faster than rsync               |
-| COW strategy | 5-9x faster on APFS/BTRFS/XFS      |
-| Server mode  | Bidirectional, pipelined transfers |
-
-## Dependencies
-
-| Crate               | Purpose                  |
-| ------------------- | ------------------------ |
-| tokio               | Async runtime            |
-| clap                | CLI parsing              |
-| ssh2                | SSH/SFTP (C bindings)    |
-| xxhash-rust, blake3 | Hashing                  |
-| zstd, lz4-flex      | Compression              |
-| fjall               | LSM-tree database        |
-| object_store        | Cloud storage (optional) |
-
-## Claude Code
-
-| Feature  | Details                       |
-| -------- | ----------------------------- |
-| Commands | `.claude/commands/release.md` |
-| MCP      | None                          |
-| Hooks    | None                          |
+io_uring (security, complexity), CDC (backup dedup, not sync), persistent state (test before adding), QUIC (45% regression on fast networks), wire-compatible rsync (too much burden).
 
 ## Current Focus
 
-See `ai/STATUS.md` for current state, `ai/DESIGN.md` for architecture.
+v0.4 rewrite: SyncSession replaces SyncEngine god object. See `ai/STATUS.md`.
 
 ---
 
-**Version**: v0.3.0 | **Updated**: 2026-01-19 | **Follows**: [agent-contexts](https://github.com/nijaru/agent-contexts)
+**Updated**: 2026-06-11

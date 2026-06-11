@@ -32,10 +32,16 @@ cargo build --all-features         # All features
 
 # Run locally
 cargo run -- /source /dest --dry-run
+```
 
-# Format and lint
-cargo fmt
-cargo clippy
+## Verification
+
+Run all checks before opening a PR:
+
+```bash
+cargo fmt --check                  # Format
+cargo clippy -- -D warnings        # Lint (zero warnings)
+cargo test                         # Tests (all pass)
 ```
 
 ## Testing
@@ -43,6 +49,9 @@ cargo clippy
 ```bash
 # Run all tests
 cargo test
+
+# Run specific test
+cargo test test_basic_sync
 
 # Run benchmarks
 cargo bench
@@ -52,7 +61,7 @@ cargo bench
 
 1. Fork and create a feature branch
 2. Write tests for new functionality
-3. Run `cargo test && cargo clippy && cargo fmt`
+3. Run `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
 4. Open PR with clear description
 5. Wait for CI to pass
 
@@ -62,6 +71,7 @@ cargo bench
 - No clippy warnings
 - Add tests for new features
 - Update README if adding user-facing features
+- Commit format: `type: description` (feat, fix, docs, refactor, test, chore)
 
 ## Questions?
 

@@ -336,7 +336,7 @@ fn test_file_permissions_preserved() {
         assert!(dest_file.exists());
 
         let dest_perms = fs::metadata(&dest_file).unwrap().permissions();
-        // Note: Permissions may not be exactly preserved in Phase 1
+        // Note: Permissions may not be exactly preserved
         // This is a future enhancement, but let's document current behavior
         assert!(dest_perms.mode() > 0);
     }

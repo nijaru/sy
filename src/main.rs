@@ -36,6 +36,7 @@ use std::path::PathBuf;
 #[cfg(feature = "watch")]
 use sync::watch::WatchMode;
 use sync::SyncEngine;
+use sync::session::{SyncSession, EndpointPair};
 use tracing_subscriber::{fmt, EnvFilter};
 use transport::router::TransportRouter;
 
@@ -249,7 +250,7 @@ async fn main() -> Result<()> {
         checksum_type,
         verify_on_write,
         cli.parallel, // SSH connection pool size = number of workers
-        retry_config,
+        retry_config.clone(),
     )
     .await?
     .with_scan_options(cli.scan_options());
@@ -446,7 +447,24 @@ Or install from local source with: cargo install --path . --features acl"#
         perf: cli.perf,
     };
 
-    let engine = SyncEngine::with_config(transport, config);
+    // Create transport router for legacy features (single file, watch mode)
+    let transport = TransportRouter::new(
+        source,
+        destination,
+        checksum_type,
+        verify_on_write,
+        cli.parallel,
+        retry_config.clone(),
+    )
+    .await?
+    .with_scan_options(cli.scan_options());
+    let engine = SyncEngine::with_config(transport, config.clone());
+
+    // Create SyncSession for strategy dispatch
+    let source_endpoint = EndpointPair::from_sync_path(source);
+    let dest_endpoint = EndpointPair::from_sync_path(destination);
+    let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
+        .with_scan_options(cli.scan_options());
 
     // Execute pre-sync hook
     if let Some(ref executor) = hook_executor {
@@ -476,7 +494,7 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("Verifying {} ↔ {}\n", source, destination);
         }
 
-        let result = engine.verify(source.path(), destination.path()).await?;
+        let result = session.verify(source.path(), destination.path()).await?;
 
         // Determine exit code
         let exit_code = if !result.errors.is_empty() {
@@ -763,17 +781,25 @@ Or install from local source with: cargo install --path . --features acl"#
                 .collect(),
         }
     } else if source.is_local() && destination.is_remote() {
-        // Use server mode for local → remote SSH (faster than SFTP)
+        // Use SyncSession for local → remote SSH push
         if !cli.quiet && !cli.json {
-            println!("Mode: Server protocol (push)\n");
+            println!("Mode: Streaming push\n");
         }
-        sync::server_mode::sync_push(source.path(), destination, cli.delete, cli.compress).await?
+        let source_endpoint = EndpointPair::from_sync_path(source);
+        let dest_endpoint = EndpointPair::from_sync_path(destination);
+        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
+            .with_scan_options(cli.scan_options());
+        session.sync().await?
     } else if source.is_remote() && destination.is_local() {
-        // Use server mode for remote → local SSH (faster than SFTP)
+        // Use SyncSession for remote → local SSH pull
         if !cli.quiet && !cli.json {
-            println!("Mode: Server protocol (pull)\n");
+            println!("Mode: Streaming pull\n");
         }
-        sync::server_mode::sync_pull(source, destination.path(), cli.delete, cli.compress).await?
+        let source_endpoint = EndpointPair::from_sync_path(source);
+        let dest_endpoint = EndpointPair::from_sync_path(destination);
+        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
+            .with_scan_options(cli.scan_options());
+        session.sync().await?
     } else if cli.is_single_file() {
         if !cli.quiet && !cli.json {
             println!("Mode: Single file sync\n");
@@ -783,19 +809,26 @@ Or install from local source with: cargo install --path . --features acl"#
             .sync_single_file(source.path(), destination.path())
             .await?
     } else {
-        // Compute effective destination path based on trailing slash semantics
+        // Use SyncSession for strategy dispatch
         let effective_dest = compute_destination_path(source, destination);
+        
+        // Update session with effective destination
+        let dest_endpoint = EndpointPair::from_sync_path(&crate::path::SyncPath::Local {
+            path: effective_dest.clone(),
+            has_trailing_slash: false,
+        });
+        let session = SyncSession::new(
+            EndpointPair::from_sync_path(source),
+            dest_endpoint,
+            config.clone(),
+        )
+        .with_scan_options(cli.scan_options());
 
-        if cli.stream {
-            if !cli.quiet && !cli.json {
-                println!("Mode: Streaming sync (experimental)\n");
-            }
-            engine
-                .sync_streaming(source.path(), &effective_dest)
-                .await?
-        } else {
-            engine.sync(source.path(), &effective_dest).await?
+        if !cli.quiet && !cli.json {
+            println!("Mode: {:?}\n", session.select_strategy());
         }
+
+        session.sync().await?
     };
 
     // Execute post-sync hook
@@ -985,7 +1018,7 @@ Or install from local source with: cargo install --path . --features acl"#
 
         // Print performance summary if --perf is enabled
         if cli.perf {
-            if let Some(metrics) = engine.get_performance_metrics() {
+            if let Some(metrics) = session.get_performance_metrics() {
                 metrics.print_summary();
             }
         }

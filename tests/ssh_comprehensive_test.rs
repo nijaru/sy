@@ -1,15 +1,13 @@
 /// Comprehensive SSH transport tests (requires fedora)
 ///
-/// These tests verify ALL SSH transport operations, error scenarios, edge cases,
-/// and large-scale operations to ensure production-ready SSH functionality.
-///
-/// **CRITICAL**: Run ALL these tests before considering v0.0.52 production-ready!
+/// These tests verify SSH transport operations, error scenarios, edge cases,
+/// and large-scale operations.
 ///
 /// Run with: cargo test --test ssh_comprehensive_test -- --ignored
 ///
 /// Prerequisites:
 /// - fedora accessible via SSH (tailscale: nick@fedora)
-/// - sy-remote installed on fedora: `cargo install --path . --bin sy-remote`
+/// - sy installed on fedora
 /// - SSH keys configured for passwordless login
 /// - ~5GB free space on fedora:/tmp/
 ///

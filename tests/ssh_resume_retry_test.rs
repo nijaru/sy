@@ -1,6 +1,6 @@
 /// SSH retry comprehensive tests (requires fedora)
 ///
-/// Tests automatic retry with exponential backoff added in v0.0.50.
+/// Tests automatic retry with exponential backoff .
 /// Resume state management is tested internally via unit tests.
 ///
 /// **CRITICAL**: Retry prevents data loss on network failures!
@@ -9,7 +9,7 @@
 ///
 /// Prerequisites:
 /// - fedora accessible via SSH
-/// - sy-remote installed on fedora
+/// - sy installed on fedora
 ///
 use std::sync::Arc;
 use std::time::Duration;

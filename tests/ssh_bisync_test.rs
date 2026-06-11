@@ -10,7 +10,7 @@
 ///
 /// Prerequisites:
 /// - fedora accessible via SSH
-/// - sy-remote installed on fedora
+/// - sy installed on fedora
 /// - SSH keys configured
 /// - Clean ~/.cache/sy/bisync/ directory
 ///

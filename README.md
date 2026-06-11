@@ -1,6 +1,6 @@
 # sy
 
-> Modern file synchronization tool - rsync, reimagined
+> Fast, modern file sync — rsync's mental model, Rust performance, sane defaults.
 
 [![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -11,23 +11,24 @@
 sy /source /destination
 ```
 
-That's it. Use `sy --help` for options.
+Same trailing-slash semantics as rsync: `/source` copies the directory, `/source/` copies contents only.
 
-## When to Use sy
+## What sy Does Well
 
-**sy excels at:**
+| Scenario | sy vs rsync | Why |
+|----------|-------------|-----|
+| Local sync (repeated) | 2-3x faster | Delta sync + parallel workers |
+| Large files on COW FS | 40x+ faster | Reflink copies on APFS/BTRFS/XFS |
+| Many files over SSH | 2x faster | Streaming protocol, 1 round-trip |
+| Mixed local workloads | 2x faster | Parallel scan, hash, transfer |
 
-- Repeated local syncs — 2-3x faster after first run
-- Large files on APFS/BTRFS/XFS — 40x+ faster via COW reflinks
-- Many small files over SSH — 2x faster initial sync (5000+ files)
-- Mixed workloads — 2x faster
+## Where rsync Is Still Fine
 
-**rsync is better for:**
+- First-time local sync of small files (~1.1x faster)
+- Incremental SSH updates (~1.3x faster — closing this gap is the v0.4 focus)
+- rsync's massive flag set and ecosystem integrations
 
-- First-time local sync of small files — ~1.1x faster
-- SSH incremental updates — ~1.3x faster
-
-**Bottom line:** sy wins on local sync (especially repeated), COW filesystems, and large SSH transfers. rsync has slight edge on incremental SSH updates.
+sy doesn't try to be wire-compatible with rsync. It's a modern tool that covers the same mental model for the common case.
 
 ## Installation
 
@@ -58,7 +59,7 @@ cargo install --path .
 
 **For SSH sync:** Install sy on both local and remote machines.
 
-## Examples
+## Usage
 
 ```bash
 # Basic
@@ -84,27 +85,26 @@ sy ~/dev /backup --watch                 # Continuous sync
 sy ~/src ~/dest -j 1                     # Sequential (many tiny files)
 ```
 
-> **Trailing slash:** sy follows rsync semantics — `/source` copies the directory, `/source/` copies contents only.
-
 ## Features
 
 - **Delta sync** — Only transfers changed bytes (rsync algorithm)
 - **Parallel transfers** — Configurable worker count (`-j`)
+- **Streaming SSH** — Binary protocol, 1 round-trip delta, zstd compression
+- **COW-aware** — Reflink copies on APFS/BTRFS/XFS (40x+ faster for large files)
 - **Resume support** — Automatically resumes interrupted syncs
 - **Integrity verification** — Optional xxHash3 checksums (`--verify`)
 - **Bidirectional sync** — Two-way sync with conflict resolution
 - **Watch mode** — Continuous file monitoring
-- **SSH transport** — Binary protocol, faster than SFTP for bulk transfers
 - **S3 support** — AWS S3, Cloudflare R2, Backblaze B2 (experimental)
 - **Metadata preservation** — Symlinks, permissions, xattrs, ACLs
 
 ## Platform Support
 
-| Platform | Status                    |
-| -------- | ------------------------- |
-| macOS    | Fully tested              |
-| Linux    | Fully tested              |
-| Windows  | Untested (should compile) |
+| Platform | Status |
+|----------|--------|
+| macOS | Fully tested |
+| Linux | Fully tested |
+| Windows | Untested (should compile) |
 
 ## Contributing
 
