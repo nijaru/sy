@@ -432,6 +432,7 @@ Or install from local source with: cargo install --path . --features acl"#
             acls: cli.preserve_acls,
             flags: cli.preserve_flags,
             symlink_mode,
+            permissions: cli.should_preserve_permissions(),
         },
         per_file_progress: cli.per_file_progress,
         comparison: sync::ComparisonConfig {

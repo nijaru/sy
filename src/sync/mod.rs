@@ -127,6 +127,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 acls: preserve_acls,
                 flags: preserve_flags,
                 symlink_mode,
+                permissions: false,
             },
             per_file_progress,
             comparison: ComparisonConfig {

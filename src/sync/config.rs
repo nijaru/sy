@@ -114,6 +114,7 @@ pub struct PreserveConfig {
     pub acls: bool,
     pub flags: bool,
     pub symlink_mode: SymlinkMode,
+    pub permissions: bool,
 }
 
 impl Default for PreserveConfig {
@@ -124,6 +125,7 @@ impl Default for PreserveConfig {
             acls: false,
             flags: false,
             symlink_mode: SymlinkMode::Preserve,
+            permissions: false,
         }
     }
 }

@@ -99,7 +99,7 @@ impl StrategyPlanner {
         &self,
         source: &FileEntry,
         dest_map: &std::collections::HashMap<std::path::PathBuf, &FileEntry>,
-        dest_root: &std::path::Path,
+        _dest_root: &std::path::Path,
     ) -> Result<SyncTask> {
         // dest_path is relative — the endpoint's resolve() will join with root
         let dest_path = (*source.relative_path).clone();

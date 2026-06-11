@@ -148,8 +148,8 @@ impl SyncSession {
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for verify")))?;
 
         // Scan both sides
-        let source_entries = source_ep.scan(self.scan_options.clone()).await?;
-        let dest_entries = dest_ep.scan(self.scan_options.clone()).await?;
+        let source_entries = source_ep.scan(self.scan_options).await?;
+        let dest_entries = dest_ep.scan(self.scan_options).await?;
 
         // Build lookup maps
         let source_map: std::collections::HashMap<PathBuf, &FileEntry> = source_entries
@@ -188,7 +188,7 @@ impl SyncSession {
         }
 
         // Check files only in dest
-        for (path, _) in &dest_map {
+        for path in dest_map.keys() {
             if !source_map.contains_key(path) {
                 result.files_only_in_dest.push(dest.join(path));
             }
@@ -244,13 +244,13 @@ impl SyncSession {
                     tracing::info!("Using cached scan results ({} files)", cached_files.len());
                     cached_files.iter().map(|cf| cf.to_file_entry(source_ep.root())).collect()
                 } else {
-                    source_ep.scan(self.scan_options.clone()).await?
+                    source_ep.scan(self.scan_options).await?
                 }
             } else {
-                source_ep.scan(self.scan_options.clone()).await?
+                source_ep.scan(self.scan_options).await?
             }
         } else {
-            source_ep.scan(self.scan_options.clone()).await?
+            source_ep.scan(self.scan_options).await?
         };
         let source_count = source_entries.len();
         tracing::info!("Source scan: {} entries", source_count);
@@ -281,7 +281,7 @@ impl SyncSession {
         }
 
         // Scan destination (for deletion support)
-        let dest_entries = dest_ep.scan(self.scan_options.clone()).await?;
+        let dest_entries = dest_ep.scan(self.scan_options).await?;
         tracing::info!("Dest scan: {} entries", dest_entries.len());
 
         // Build dest lookup for quick existence checks
@@ -401,6 +401,22 @@ impl SyncSession {
 
                     if source_entry.is_dir {
                         dest_ep.create_dir_all(&task.dest_path).await?;
+                        
+                        // Preserve directory permissions if enabled
+                        #[cfg(unix)]
+                        if self.config.preserve.permissions {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(meta) = std::fs::metadata(&source_path) {
+                                let mode = meta.permissions().mode();
+                                let abs_dest = if task.dest_path.is_absolute() {
+                                    task.dest_path.clone()
+                                } else {
+                                    dest_ep.root().join(&*task.dest_path)
+                                };
+                                let _ = std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode));
+                            }
+                        }
+                        
                         stats.dirs_created += 1;
                     } else if source_entry.is_symlink {
                         // Read symlink target
@@ -464,6 +480,26 @@ impl SyncSession {
                             let meta = source_ep.metadata(&source_entry.relative_path).await?;
                             dest_ep.write_file(&task.dest_path, &data, &meta).await?;
                             stats.bytes_transferred += data.len() as u64;
+                        }
+
+                        // Copy xattrs if enabled
+                        if self.config.preserve.xattrs {
+                            #[cfg(unix)]
+                            {
+                                let abs_source = if source_path.is_absolute() {
+                                    source_path.clone()
+                                } else {
+                                    source_ep.root().join(&source_path)
+                                };
+                                if let Ok(xattrs) = xattr::list(&abs_source) {
+                                    for attr in xattrs {
+                                        if let Ok(Some(val)) = xattr::get(&abs_source, &attr) {
+                                            let abs_dest = dest_ep.root().join(&*task.dest_path);
+                                            let _ = xattr::set(&abs_dest, &attr, &val);
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         if task.action == SyncAction::Create {
