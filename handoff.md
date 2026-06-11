@@ -2,35 +2,23 @@
 
 ## What Happened This Session
 
-Implemented Phases 3, 4, and 5a of the v0.4 architecture rewrite.
+### Phase 5b: Wire SyncSession into main.rs ✅
+- Replaced `server_mode::sync_push/pull` with SyncSession
+- Added `verify()` method to SyncSession
+- Added `get_performance_metrics()` stub
+- Fixed `LocalEndpoint::scan()` to use passed ScanOptions
+- Added `with_scan_options()` builder to SyncSession
 
-### Phase 3: SyncSession ✅
-- Created `src/sync/session.rs` (~350 lines)
-- `EndpointPair` enum (Local/SSH), `SyncStrategy` enum
-- `SyncSession::sync()` dispatches to `direct_local()`, `streaming_push()`, `streaming_pull()`
-- `EndpointPair::from_sync_path()` for CLI integration
-- `StrategyPlanner::plan_from_scan()` for in-memory scan results
-- 8 new tests (strategy selection, local sync, dry-run, delete)
+### Phase 5c: Hard link preservation ✅
+- Track inodes in `HashMap<u64, PathBuf>` during `direct_local()`
+- For files with `nlink > 1`, create hard link to first copy
+- Handle Update action by removing existing file before hard link
+- 2 hard link tests now passing
 
-### Phase 4: TaskExecutor ✅
-- Created `src/sync/executor.rs` (~450 lines)
-- `TaskExecutor` with `execute_task()`, `execute_batch()`, `verify_transfer()`
-- Parallel execution via `buffer_unordered(max_concurrent)`
-- 15 new tests (create, update, delete, batch, verify, dry-run)
-
-### Phase 5a: Test Restructuring ✅
-- Created `tests/sync/` directory structure
-- `tests/sync/basic.rs` — 11 tests, all passing
-- `tests/sync/filters.rs` — written, needs pattern fixes
-- `tests/sync/metadata.rs` — written, needs pattern fixes
-- `tests/sync/comparison.rs` — written, needs pattern fixes
-- `tests/sync/edge_cases.rs` — written, needs pattern fixes
-- Added `[[test]]` entries to Cargo.toml
-
-### Supporting Changes
-- `LocalEndpoint::remove()` fixed for files vs directories
-- `ChecksumType` gets `Default` derive (returns `Fast`)
-- `VerificationConfig` gets `Default` derive
+### Supporting Fixes
+- `LocalEndpoint::write_file()` preserves unix permissions
+- `--exclude-vcs` flag now works with SyncSession
+- Better error messages in delta_sync_test.rs
 
 ## Current State
 
@@ -38,33 +26,34 @@ Implemented Phases 3, 4, and 5a of the v0.4 architecture rewrite.
 |--------|-------|
 | Build | PASSING |
 | Clippy | CLEAN |
-| Tests | 533 passing, 12 ignored |
-| Phase | 5a done, 5b next |
+| Tests | 533 passing, 4 failing, 12 ignored |
+| Commits | 3 new commits on `refactor` |
 
 ## What's NOT Done
 
-1. **main.rs rewrite** — still uses SyncEngine + TransportRouter (~500 line change)
-2. **transport/ deletion** — blocked on main.rs rewrite
-3. **Test file porting** — 4 files need pattern fixes
-4. **Test-dependent cleanup** — 3 files import `sy::transport::*`
+1. **`--use-cache`** — 4 directory cache tests failing
+2. **Single file sync** — still uses SyncEngine
+3. **Watch mode** — still uses SyncEngine
+4. **transport/ deletion** — blocked on above
+5. **Test file porting** — 4 files need pattern fixes
 
 ## Next Steps
 
-**Option A: Wire SyncSession into main.rs** (recommended)
-1. Replace `TransportRouter::new()` with `EndpointPair::from_sync_path()`
-2. Replace `SyncEngine::with_config()` with `SyncSession::new()`
-3. Replace `engine.sync()` with `session.sync()`
-4. Keep `engine.verify()` path for now (or add to SyncSession)
-5. ~500 lines, most is argument passing
+**Option A: Fix `--use-cache`** (closes 4 test failures)
+- Add directory cache support to SyncSession
+- ~100 lines, straightforward
 
-**Option B: Finish test porting first**
-1. Fix pattern in filters.rs, metadata.rs, comparison.rs, edge_cases.rs
-2. Need: `setup_test_dir()`, `--exclude-vcs`, trailing slash on source
-3. Run full suite to verify
+**Option B: Migrate single file sync** (closes SyncEngine dependency)
+- Add `sync_single_file()` to SyncSession
+- ~50 lines
 
-**Option C: Both in parallel**
-- Test porting doesn't depend on main.rs rewrite
-- Can do both concurrently
+**Option C: Delete transport/** (big cleanup)
+- Removes ~8,000 lines of dead code
+- Blocked on single file + watch mode migration
+
+**Option D: Test file porting** (quality improvement)
+- Fix pattern in filters.rs, metadata.rs, comparison.rs, edge_cases.rs
+- Needs: setup_test_dir + --exclude-vcs + trailing slash + .args() format
 
 ## Key Patterns for Tests
 
@@ -92,15 +81,10 @@ Command::new(sy_bin())
 
 | File | Change |
 |------|--------|
-| `src/sync/session.rs` | NEW — SyncSession |
-| `src/sync/executor.rs` | NEW — TaskExecutor |
-| `src/sync/mod.rs` | Added session, executor modules |
-| `src/sync/strategy.rs` | Added plan_from_scan() |
-| `src/sync/config.rs` | Added Default derives |
-| `src/integrity/mod.rs` | Added Default for ChecksumType |
-| `src/endpoint/local.rs` | Fixed remove() |
-| `Cargo.toml` | Added [[test]] entries |
-| `tests/sync/*.rs` | NEW — consolidated test structure |
+| `src/main.rs` | Wired SyncSession for main sync paths |
+| `src/sync/session.rs` | Added verify(), hard links, get_performance_metrics(), with_scan_options() |
+| `src/endpoint/local.rs` | Fixed scan(), added permission preservation |
+| `tests/delta_sync_test.rs` | Better error messages |
 | `ai/STATUS.md` | Updated |
 | `ai/DECISIONS.md` | Added session log |
 
