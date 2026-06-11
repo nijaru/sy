@@ -544,8 +544,9 @@ impl SyncSession {
             path: source.to_path_buf(),
             has_trailing_slash: false,
         };
-        let data = source_ep.read_file(&source_path.relative_path()).await?;
-        let meta = source_ep.metadata(&source_path.relative_path()).await?;
+        let rel_source = source_path.path().strip_prefix(source_ep.root()).unwrap_or(source_path.path());
+        let data = source_ep.read_file(rel_source).await?;
+        let meta = source_ep.metadata(rel_source).await?;
 
         if !dest_exists {
             // Create new file
@@ -553,7 +554,8 @@ impl SyncSession {
                 path: dest.to_path_buf(),
                 has_trailing_slash: false,
             };
-            dest_ep.write_file(&dest_path.relative_path(), &data, &meta).await?;
+            let rel_dest = dest_path.path().strip_prefix(dest_ep.root()).unwrap_or(dest_path.path());
+            dest_ep.write_file(rel_dest, &data, &meta).await?;
             stats.files_created = 1;
             stats.bytes_transferred = data.len() as u64;
         } else {
@@ -562,7 +564,8 @@ impl SyncSession {
                 path: dest.to_path_buf(),
                 has_trailing_slash: false,
             };
-            dest_ep.write_file(&dest_path.relative_path(), &data, &meta).await?;
+            let rel_dest = dest_path.path().strip_prefix(dest_ep.root()).unwrap_or(dest_path.path());
+            dest_ep.write_file(rel_dest, &data, &meta).await?;
             stats.files_updated = 1;
             stats.bytes_transferred = data.len() as u64;
         }
