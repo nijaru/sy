@@ -406,7 +406,13 @@ impl SyncSession {
                         // Read symlink target
                         #[cfg(unix)]
                         {
-                            let target = std::fs::read_link(&source_path)?;
+                            // Resolve absolute path for read_link
+                            let abs_source = if source_path.is_absolute() {
+                                source_path.clone()
+                            } else {
+                                source_ep.root().join(&source_path)
+                            };
+                            let target = std::fs::read_link(&abs_source)?;
                             // Remove existing file/symlink before creating
                             if task.action == SyncAction::Update {
                                 dest_ep.remove(&task.dest_path, false).await?;

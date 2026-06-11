@@ -126,7 +126,7 @@ impl Endpoint for LocalEndpoint {
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
         let full_path = self.resolve(path);
-        let meta = tokio::fs::metadata(&full_path).await?;
+        let meta = tokio::fs::symlink_metadata(&full_path).await?;
         if meta.is_dir() {
             if recursive {
                 tokio::fs::remove_dir_all(&full_path).await?;

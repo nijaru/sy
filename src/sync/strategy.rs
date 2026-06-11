@@ -146,6 +146,9 @@ impl StrategyPlanner {
                     source.size != dest_entry.size
                 } else if self.ignore_times {
                     true // Always update when ignore_times is set
+                } else if source.is_symlink || dest_entry.is_symlink {
+                    // For symlinks, compare targets (size/mtime are unreliable)
+                    source.symlink_target != dest_entry.symlink_target
                 } else {
                     // Compare size and mtime (with tolerance)
                     source.size != dest_entry.size

@@ -213,7 +213,7 @@ fn test_xattr_preservation() {
     {
         if xattr::set(source.path().join("file.txt"), "user.test", b"value").is_ok() {
             let output = Command::new(sy_bin())
-                .args(sync_args(&source, &dest, &["--xattrs"]))
+                .args(sync_args(&source, &dest, &["--preserve-xattrs"]))
                 .output()
                 .unwrap();
 
