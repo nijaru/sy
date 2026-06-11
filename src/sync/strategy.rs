@@ -90,6 +90,90 @@ impl StrategyPlanner {
         }
     }
 
+    /// Plan sync action from scan results (for local-to-local sync via SyncSession).
+    ///
+    /// This is a simplified version that works with in-memory scan results
+    /// instead of requiring async Transport calls.
+    #[allow(dead_code)] // Wired in by SyncSession (Phase 3)
+    pub fn plan_from_scan(
+        &self,
+        source: &FileEntry,
+        dest_map: &std::collections::HashMap<std::path::PathBuf, &FileEntry>,
+        dest_root: &std::path::Path,
+    ) -> Result<SyncTask> {
+        let dest_path = dest_root.join(&*source.relative_path);
+
+        if source.is_dir {
+            // For directories, just check existence
+            let exists = dest_map.contains_key(&*source.relative_path);
+            let action = if exists { SyncAction::Skip } else { SyncAction::Create };
+            return Ok(SyncTask {
+                source: Some(Arc::new(source.clone())),
+                dest_path,
+                action,
+                source_checksum: None,
+                dest_checksum: None,
+            });
+        }
+
+        match dest_map.get(&*source.relative_path) {
+            Some(dest_entry) => {
+                // --ignore-existing
+                if self.ignore_existing {
+                    return Ok(SyncTask {
+                        source: Some(Arc::new(source.clone())),
+                        dest_path,
+                        action: SyncAction::Skip,
+                        source_checksum: None,
+                        dest_checksum: None,
+                    });
+                }
+
+                // --update: dest newer
+                if self.update_only && dest_entry.modified > source.modified {
+                    return Ok(SyncTask {
+                        source: Some(Arc::new(source.clone())),
+                        dest_path,
+                        action: SyncAction::Skip,
+                        source_checksum: None,
+                        dest_checksum: None,
+                    });
+                }
+
+                // Check if file needs update
+                let needs_update = if self.size_only {
+                    source.size != dest_entry.size
+                } else if self.ignore_times {
+                    true // Always update when ignore_times is set
+                } else {
+                    // Compare size and mtime (with tolerance)
+                    source.size != dest_entry.size
+                        || !self.mtime_matches(&source.modified, &dest_entry.modified)
+                };
+
+                let action = if needs_update { SyncAction::Update } else { SyncAction::Skip };
+
+                Ok(SyncTask {
+                    source: Some(Arc::new(source.clone())),
+                    dest_path,
+                    action,
+                    source_checksum: None,
+                    dest_checksum: None,
+                })
+            }
+            None => {
+                // File doesn't exist in dest
+                Ok(SyncTask {
+                    source: Some(Arc::new(source.clone())),
+                    dest_path,
+                    action: SyncAction::Create,
+                    source_checksum: None,
+                    dest_checksum: None,
+                })
+            }
+        }
+    }
+
     /// Determine sync action for a source file (async version using transport)
     pub async fn plan_file_async<T: Transport>(
         &self,

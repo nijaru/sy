@@ -3,7 +3,7 @@ name = "sy"
 version = "0.3.0"
 edition = "2021"
 authors = ["Nick Russo <nijaru7@gmail.com>"]
-description = "Modern rsync alternative - Fast, parallel file synchronization"
+description = "Fast, modern file sync — rsync's mental model, Rust performance, sane defaults"
 repository = "https://github.com/nijaru/sy"
 license = "MIT"
 keywords = ["rsync", "sync", "file-transfer", "backup", "cli"]
@@ -77,20 +77,20 @@ lz4_flex = "0.11"  # 23 GB/s, faster but lower ratio
 rayon = "1.10"
 num_cpus = "1.16"  # CPU count detection for parallel scanning
 
-# Scale (Phase 11)
+# Scale
 fastbloom = "0.7"  # Bloom filters for efficient deletion checks
 
-# SSH (Phase 2) - Optional feature
+# SSH - Optional feature
 ssh2 = { version = "0.9", optional = true }
 whoami = { version = "1", optional = true }
 dirs = "5"
 regex = { version = "1", optional = true }
 futures = "0.3.31"
 
-# Database (Phase 5b)
+# Database
 fjall = "2.11.2"
 
-# S3 / Cloud Storage (Phase 10) - Optional feature
+# S3 / Cloud Storage - Optional feature
 object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
@@ -150,3 +150,23 @@ path = "src/bin/sy-bench-gen.rs"
 [[bin]]
 name = "sy-scan"
 path = "src/bin/sy-scan.rs"
+
+[[test]]
+name = "sync_basic"
+path = "tests/sync/basic.rs"
+
+[[test]]
+name = "sync_filters"
+path = "tests/sync/filters.rs"
+
+[[test]]
+name = "sync_metadata"
+path = "tests/sync/metadata.rs"
+
+[[test]]
+name = "sync_comparison"
+path = "tests/sync/comparison.rs"
+
+[[test]]
+name = "sync_edge_cases"
+path = "tests/sync/edge_cases.rs"

@@ -8,13 +8,14 @@ pub use self::blake3::Blake3Hasher;
 pub use self::xxhash3::XxHash3Hasher;
 
 /// Type of checksum to compute
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChecksumType {
     /// No checksum verification (trust TCP)
     None,
 
     /// Fast non-cryptographic checksum (xxHash3)
     /// Good for detecting corruption but not malicious tampering
+    #[default]
     Fast,
 
     /// Cryptographic checksum (BLAKE3)

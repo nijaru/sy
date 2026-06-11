@@ -1,6 +1,7 @@
 pub mod checksumdb;
 pub mod config;
 pub mod dircache;
+pub mod executor;
 pub mod output;
 pub mod progress;
 pub mod ratelimit;
@@ -8,6 +9,7 @@ pub mod resume;
 pub mod scale;
 pub mod scanner;
 pub mod server_mode;
+pub mod session;
 pub mod stats;
 pub mod strategy;
 pub mod transfer;

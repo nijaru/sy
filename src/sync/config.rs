@@ -98,7 +98,7 @@ pub struct ComparisonConfig {
     pub ignore_existing: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VerificationConfig {
     pub mode: ChecksumType,
     pub verify_on_write: bool,

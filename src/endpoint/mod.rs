@@ -6,6 +6,9 @@ pub mod s3;
 #[cfg(feature = "gcs")]
 pub mod gcs;
 
+// Dead-code suppressed until Phase 3 (SyncSession) wires these in.
+// Remove this allow once Endpoint types are referenced by SyncSession.
+
 use crate::error::Result;
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
@@ -13,6 +16,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 pub enum EndpointType {
     Local,
     Ssh,
@@ -21,6 +25,7 @@ pub enum EndpointType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 pub struct Capabilities {
     pub delta_sync: bool,
     pub streaming_read: bool,
@@ -60,6 +65,7 @@ impl Capabilities {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 pub struct FileMetadata {
     pub size: u64,
     pub modified: SystemTime,
@@ -76,6 +82,7 @@ pub struct FileMetadata {
 }
 
 #[async_trait]
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 pub trait Endpoint: Send + Sync {
     fn endpoint_type(&self) -> EndpointType;
     fn capabilities(&self) -> &Capabilities;

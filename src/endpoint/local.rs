@@ -9,12 +9,15 @@ use std::time::SystemTime;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+// Dead-code suppressed until Phase 3 (SyncSession) wires these in.
+#[allow(dead_code)]
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
     scan_options: ScanOptions,
 }
 
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 impl LocalEndpoint {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -38,6 +41,7 @@ impl LocalEndpoint {
     }
 }
 
+#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
     FileMetadata {
         size: meta.len(),
@@ -116,15 +120,15 @@ impl Endpoint for LocalEndpoint {
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
         let full_path = self.resolve(path);
-        if recursive {
-            tokio::fs::remove_dir_all(&full_path).await?;
-        } else {
-            let meta = tokio::fs::metadata(&full_path).await?;
-            if meta.is_dir() {
-                tokio::fs::remove_dir(&full_path).await?;
+        let meta = tokio::fs::metadata(&full_path).await?;
+        if meta.is_dir() {
+            if recursive {
+                tokio::fs::remove_dir_all(&full_path).await?;
             } else {
-                tokio::fs::remove_file(&full_path).await?;
+                tokio::fs::remove_dir(&full_path).await?;
             }
+        } else {
+            tokio::fs::remove_file(&full_path).await?;
         }
         Ok(())
     }
