@@ -302,3 +302,161 @@ fn test_gitignore_basic() {
     assert!(!dest.path().join("exclude.log").exists());
     assert!(!dest.path().join("build").exists());
 }
+
+#[test]
+fn test_basename_vs_path_matching() {
+    let (source, dest) = setup_test_dir();
+
+    // Create files with similar names in different directories
+    fs::create_dir_all(source.path().join("dir1")).unwrap();
+    fs::create_dir_all(source.path().join("dir2")).unwrap();
+    fs::write(source.path().join("dir1/test.txt"), "content1").unwrap();
+    fs::write(source.path().join("dir2/test.txt"), "content2").unwrap();
+    fs::write(source.path().join("dir1/other.txt"), "other").unwrap();
+
+    // Exclude by basename (should match in any directory)
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--exclude",
+            "test.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join("dir1/test.txt").exists());
+    assert!(!dest.path().join("dir2/test.txt").exists());
+    assert!(dest.path().join("dir1/other.txt").exists());
+}
+
+#[test]
+fn test_min_size_filters_small_files() {
+    let (source, dest) = setup_test_dir();
+
+    // Create files of different sizes
+    fs::write(source.path().join("small.txt"), "tiny").unwrap();
+    fs::write(source.path().join("medium.txt"), "a".repeat(1000)).unwrap();
+    fs::write(source.path().join("large.txt"), "a".repeat(10000)).unwrap();
+
+    // Filter with --min-size 100
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--min-size",
+            "100",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join("small.txt").exists());
+    assert!(dest.path().join("medium.txt").exists());
+    assert!(dest.path().join("large.txt").exists());
+}
+
+#[test]
+fn test_max_size_filters_large_files() {
+    let (source, dest) = setup_test_dir();
+
+    // Create files of different sizes
+    fs::write(source.path().join("small.txt"), "tiny").unwrap();
+    fs::write(source.path().join("medium.txt"), "a".repeat(1000)).unwrap();
+    fs::write(source.path().join("large.txt"), "a".repeat(10000)).unwrap();
+
+    // Filter with --max-size 1000
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--max-size",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("small.txt").exists());
+    assert!(dest.path().join("medium.txt").exists());
+    assert!(!dest.path().join("large.txt").exists());
+}
+
+#[test]
+fn test_min_size_exact_boundary() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file exactly at boundary
+    fs::write(source.path().join("exact.txt"), "a".repeat(100)).unwrap();
+    fs::write(source.path().join("below.txt"), "a".repeat(99)).unwrap();
+
+    // Filter with --min-size 100
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--min-size",
+            "100",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("exact.txt").exists());
+    assert!(!dest.path().join("below.txt").exists());
+}
+
+#[test]
+fn test_max_size_exact_boundary() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file exactly at boundary
+    fs::write(source.path().join("exact.txt"), "a".repeat(100)).unwrap();
+    fs::write(source.path().join("above.txt"), "a".repeat(101)).unwrap();
+
+    // Filter with --max-size 100
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--max-size",
+            "100",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("exact.txt").exists());
+    assert!(!dest.path().join("above.txt").exists());
+}
+
+#[test]
+fn test_size_human_readable_formats() {
+    let (source, dest) = setup_test_dir();
+
+    // Create files of different sizes
+    fs::write(source.path().join("1k.txt"), "a".repeat(1024)).unwrap();
+    fs::write(source.path().join("1m.txt"), "a".repeat(1024 * 1024)).unwrap();
+
+    // Filter with --min-size 1K
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--min-size",
+            "1K",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("1k.txt").exists());
+    assert!(dest.path().join("1m.txt").exists());
+}
