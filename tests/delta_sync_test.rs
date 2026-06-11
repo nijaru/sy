@@ -216,7 +216,7 @@ fn test_hard_link_update_both_files_same_content() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Sync should succeed");
+    assert!(output.status.success(), "Sync should succeed: {}", String::from_utf8_lossy(&output.stderr));
 
     // Verify both dest files have new content
     let dest_file1 = dest.path().join("file1.txt");

@@ -226,6 +226,17 @@ impl SyncSession {
             .iter()
             .map(|e| ((*e.relative_path).clone(), e))
             .collect();
+        
+        tracing::debug!("Source root: {:?}", source_ep.root());
+        tracing::debug!("Dest root: {:?}", dest_ep.root());
+        tracing::debug!("Source entries:");
+        for entry in &source_entries {
+            tracing::debug!("  {:?}", entry.relative_path);
+        }
+        tracing::debug!("Dest entries:");
+        for entry in &dest_entries {
+            tracing::debug!("  {:?}", entry.relative_path);
+        }
 
         // Plan tasks using StrategyPlanner
         let planner = StrategyPlanner::with_comparison_flags(
@@ -312,6 +323,9 @@ impl SyncSession {
             ..Default::default()
         };
 
+        // Track inodes for hard link preservation
+        let mut hardlink_map: std::collections::HashMap<u64, PathBuf> = std::collections::HashMap::new();
+
         for task in &tasks {
             match task.action {
                 SyncAction::Skip => {
@@ -334,11 +348,46 @@ impl SyncSession {
                             stats.symlinks_created += 1;
                         }
                     } else {
-                        // Copy file
-                        let data = source_ep.read_file(&source_entry.relative_path).await?;
-                        let meta = source_ep.metadata(&source_entry.relative_path).await?;
-                        dest_ep.write_file(&task.dest_path, &data, &meta).await?;
-                        stats.bytes_transferred += data.len() as u64;
+                        // Check if this is a hard link that's already been copied
+                        let is_hardlink = self.config.preserve.hardlinks
+                            && source_entry.nlink > 1;
+                        
+                        if is_hardlink {
+                            if let Some(inode) = source_entry.inode {
+                                if let Some(first_path) = hardlink_map.get(&inode) {
+                                    // Remove existing file before creating hard link
+                                    if task.action == SyncAction::Update {
+                                        dest_ep.remove(&task.dest_path, false).await?;
+                                    }
+                                    // Create hard link to first copy
+                                    dest_ep.create_hardlink(first_path, &task.dest_path).await?;
+                                    if task.action == SyncAction::Create {
+                                        stats.files_created += 1;
+                                    } else {
+                                        stats.files_updated += 1;
+                                    }
+                                    continue;
+                                }
+                                // First copy of this inode - copy normally and record
+                                let data = source_ep.read_file(&source_entry.relative_path).await?;
+                                let meta = source_ep.metadata(&source_entry.relative_path).await?;
+                                dest_ep.write_file(&task.dest_path, &data, &meta).await?;
+                                stats.bytes_transferred += data.len() as u64;
+                                hardlink_map.insert(inode, task.dest_path.clone());
+                            } else {
+                                // No inode info - copy normally
+                                let data = source_ep.read_file(&source_entry.relative_path).await?;
+                                let meta = source_ep.metadata(&source_entry.relative_path).await?;
+                                dest_ep.write_file(&task.dest_path, &data, &meta).await?;
+                                stats.bytes_transferred += data.len() as u64;
+                            }
+                        } else {
+                            // Regular file copy
+                            let data = source_ep.read_file(&source_entry.relative_path).await?;
+                            let meta = source_ep.metadata(&source_entry.relative_path).await?;
+                            dest_ep.write_file(&task.dest_path, &data, &meta).await?;
+                            stats.bytes_transferred += data.len() as u64;
+                        }
 
                         if task.action == SyncAction::Create {
                             stats.files_created += 1;
