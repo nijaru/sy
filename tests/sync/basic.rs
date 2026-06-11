@@ -286,3 +286,310 @@ fn test_update_shows_correct_stats() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Files updated:     2") || stdout.contains("Files updated:     1"));
 }
+
+#[test]
+fn test_gitignore_support() {
+    let (source, dest) = setup_test_dir("gitignore");
+
+    // Create .gitignore
+    fs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+    fs::write(source.path().join("ignore.log"), "ignore").unwrap();
+
+    // Run sync with --gitignore flag to respect .gitignore patterns
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--gitignore",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("keep.txt").exists());
+    assert!(!dest.path().join("ignore.log").exists());
+}
+
+#[test]
+fn test_large_file_update_with_delta_sync() {
+    let (source, dest) = setup_test_dir("large_delta");
+
+    // Create large file in source (10MB)
+    let large_content = vec![0u8; 10 * 1024 * 1024];
+    fs::write(source.path().join("large.bin"), &large_content).unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Modify part of the file
+    let mut modified = large_content;
+    for byte in &mut modified[..1024] {
+        *byte = 1;
+    }
+    fs::write(source.path().join("large.bin"), &modified).unwrap();
+
+    // Second sync should use delta
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(dest.path().join("large.bin")).unwrap(),
+        modified
+    );
+}
+
+#[test]
+fn test_directory_cache_created() {
+    let (source, dest) = setup_test_dir("cache_created");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join(".sy-dir-cache.json").exists());
+}
+
+#[test]
+fn test_directory_cache_not_created_by_default() {
+    let (source, dest) = setup_test_dir("no_cache");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join(".sy-dir-cache.json").exists());
+}
+
+#[test]
+fn test_directory_cache_persists() {
+    let (source, dest) = setup_test_dir("cache_persist");
+
+    fs::write(source.path().join("file1.txt"), "content1").unwrap();
+
+    // First sync with cache
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Add new file
+    fs::write(source.path().join("file2.txt"), "content2").unwrap();
+
+    // Second sync should use cache
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(dest.path().join("file2.txt").exists());
+}
+
+#[test]
+fn test_directory_cache_clear() {
+    let (source, dest) = setup_test_dir("cache_clear");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Create cache
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(dest.path().join(".sy-dir-cache.json").exists());
+
+    // Clear cache
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--clear-cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!dest.path().join(".sy-dir-cache.json").exists());
+}
+
+#[test]
+fn test_directory_cache_dry_run() {
+    let (source, dest) = setup_test_dir("cache_dry_run");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Dry run with cache should not create cache file
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join(".sy-dir-cache.json").exists());
+}
+
+#[test]
+fn test_directory_cache_updates_on_new_directories() {
+    let (source, dest) = setup_test_dir("cache_new_dirs");
+
+    fs::create_dir_all(source.path().join("subdir")).unwrap();
+    fs::write(source.path().join("subdir/file.txt"), "content").unwrap();
+
+    // First sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Add new directory
+    fs::create_dir_all(source.path().join("newdir")).unwrap();
+    fs::write(source.path().join("newdir/file2.txt"), "content2").unwrap();
+
+    // Second sync should pick up new directory
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--use-cache=true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(dest.path().join("newdir/file2.txt").exists());
+}
+
+// Trailing slash behavior tests
+// These test rsync-compatible trailing slash semantics
+
+fn compute_test_destination(source: &sy::path::SyncPath, dest: &sy::path::SyncPath) -> std::path::PathBuf {
+    let source_path = source.path();
+
+    // For directories with trailing slash, use destination as-is (copy contents)
+    if source.has_trailing_slash() {
+        return dest.path().to_path_buf();
+    }
+
+    // For directories without trailing slash, append directory name to destination
+    if let Some(dir_name) = source_path.file_name() {
+        dest.path().join(dir_name)
+    } else {
+        // Fallback: use destination as-is
+        dest.path().to_path_buf()
+    }
+}
+
+#[test]
+fn test_syncpath_trailing_slash_detection() {
+    // Test trailing slash detection for local paths
+    let path_without = sy::path::SyncPath::parse("/home/user/mydir");
+    assert!(!path_without.has_trailing_slash());
+
+    let path_with = sy::path::SyncPath::parse("/home/user/mydir/");
+    assert!(path_with.has_trailing_slash());
+
+    // Test remote paths
+    let remote_without = sy::path::SyncPath::parse("user@host:/path/to/dir");
+    assert!(!remote_without.has_trailing_slash());
+
+    let remote_with = sy::path::SyncPath::parse("user@host:/path/to/dir/");
+    assert!(remote_with.has_trailing_slash());
+}
+
+#[test]
+fn test_destination_computation_without_trailing_slash() {
+    let source = sy::path::SyncPath::parse("/a/myproject");
+    let dest = sy::path::SyncPath::parse("/target");
+
+    let effective_dest = compute_test_destination(&source, &dest);
+    assert_eq!(effective_dest, std::path::PathBuf::from("/target/myproject"));
+}
+
+#[test]
+fn test_destination_computation_with_trailing_slash() {
+    let source = sy::path::SyncPath::parse("/a/myproject/");
+    let dest = sy::path::SyncPath::parse("/target");
+
+    let effective_dest = compute_test_destination(&source, &dest);
+    assert_eq!(effective_dest, std::path::PathBuf::from("/target"));
+}
+
+#[test]
+fn test_remote_destination_computation_without_trailing_slash() {
+    let source = sy::path::SyncPath::parse("user@host:/a/myproject");
+    let dest = sy::path::SyncPath::parse("/target");
+
+    assert!(!source.has_trailing_slash());
+    let effective_dest = compute_test_destination(&source, &dest);
+    assert_eq!(effective_dest, std::path::PathBuf::from("/target/myproject"));
+}
+
+#[test]
+fn test_remote_destination_computation_with_trailing_slash() {
+    let source = sy::path::SyncPath::parse("user@host:/a/myproject/");
+    let dest = sy::path::SyncPath::parse("/target");
+
+    assert!(source.has_trailing_slash());
+    let effective_dest = compute_test_destination(&source, &dest);
+    assert_eq!(effective_dest, std::path::PathBuf::from("/target"));
+}

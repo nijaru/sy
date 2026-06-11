@@ -534,41 +534,30 @@ impl SyncSession {
         let mut stats = SyncStats::default();
         stats.files_scanned = 1;
 
-        let source_ep = self.source.as_endpoint()
-            .ok_or_else(|| SyncError::Io(std::io::Error::other("Source must be local for single file sync")))?;
-        let dest_ep = self.dest.as_endpoint()
-            .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for single file sync")))?;
+        // For single file sync, use the parent directory as the endpoint root
+        let source_parent = source.parent().unwrap_or(Path::new("."));
+        let dest_parent = dest.parent().unwrap_or(Path::new("."));
+        let source_filename = source.file_name().unwrap();
+        let dest_filename = dest.file_name().unwrap();
+
+        let source_ep = LocalEndpoint::new(source_parent.to_path_buf());
+        let dest_ep = LocalEndpoint::new(dest_parent.to_path_buf());
 
         // Check if dest exists
         let dest_exists = tokio::fs::metadata(dest).await.is_ok();
 
         // Read source file
-        let source_path = crate::path::SyncPath::Local {
-            path: source.to_path_buf(),
-            has_trailing_slash: false,
-        };
-        let rel_source = source_path.path().strip_prefix(source_ep.root()).unwrap_or(source_path.path());
-        let data = source_ep.read_file(rel_source).await?;
-        let meta = source_ep.metadata(rel_source).await?;
+        let data = source_ep.read_file(Path::new(source_filename)).await?;
+        let meta = source_ep.metadata(Path::new(source_filename)).await?;
 
         if !dest_exists {
             // Create new file
-            let dest_path = crate::path::SyncPath::Local {
-                path: dest.to_path_buf(),
-                has_trailing_slash: false,
-            };
-            let rel_dest = dest_path.path().strip_prefix(dest_ep.root()).unwrap_or(dest_path.path());
-            dest_ep.write_file(rel_dest, &data, &meta).await?;
+            dest_ep.write_file(Path::new(dest_filename), &data, &meta).await?;
             stats.files_created = 1;
             stats.bytes_transferred = data.len() as u64;
         } else {
             // Update existing file
-            let dest_path = crate::path::SyncPath::Local {
-                path: dest.to_path_buf(),
-                has_trailing_slash: false,
-            };
-            let rel_dest = dest_path.path().strip_prefix(dest_ep.root()).unwrap_or(dest_path.path());
-            dest_ep.write_file(rel_dest, &data, &meta).await?;
+            dest_ep.write_file(Path::new(dest_filename), &data, &meta).await?;
             stats.files_updated = 1;
             stats.bytes_transferred = data.len() as u64;
         }
