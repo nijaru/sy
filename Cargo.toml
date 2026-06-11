@@ -170,3 +170,19 @@ path = "tests/sync/comparison.rs"
 [[test]]
 name = "sync_edge_cases"
 path = "tests/sync/edge_cases.rs"
+
+[[test]]
+name = "sync_performance"
+path = "tests/sync/performance.rs"
+
+[[test]]
+name = "sync_progress"
+path = "tests/sync/progress.rs"
+
+[[test]]
+name = "sync_advanced"
+path = "tests/sync/advanced.rs"
+
+[[test]]
+name = "sync_ssh"
+path = "tests/sync/ssh.rs"
