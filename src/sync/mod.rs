@@ -79,7 +79,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         preserve_hardlinks: bool,
         preserve_acls: bool,
         preserve_flags: bool,
-        per_file_progress: bool,
+        progress: bool,
         ignore_times: bool,
         size_only: bool,
         checksum: bool,
@@ -134,7 +134,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 symlink_mode,
                 permissions: false,
             },
-            per_file_progress,
+            progress,
             comparison: ComparisonConfig {
                 ignore_times,
                 size_only,
@@ -847,7 +847,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_hardlinks = self.config.preserve.hardlinks;
             let preserve_acls = self.config.preserve.acls;
             let preserve_flags = self.config.preserve.flags;
-            let per_file_progress = self.config.per_file_progress && !self.config.quiet;
+            let progress = self.config.progress && !self.config.quiet;
             let hardlink_map = Arc::clone(&hardlink_map);
             let _perf_monitor = self.perf_monitor.clone();
 
@@ -864,7 +864,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     preserve_hardlinks,
                     preserve_acls,
                     preserve_flags,
-                    per_file_progress,
+                    progress,
                     hardlink_map,
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -1686,7 +1686,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let preserve_hardlinks = self.config.preserve.hardlinks;
                 let preserve_acls = self.config.preserve.acls;
                 let preserve_flags = self.config.preserve.flags;
-                let per_file_progress = self.config.per_file_progress && !self.config.quiet;
+                let progress = self.config.progress && !self.config.quiet;
                 let hardlink_map = hardlink_map.clone();
                 let rate_limiter = rate_limiter.clone();
                 let perf_monitor = self.perf_monitor.clone();
@@ -1722,7 +1722,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         preserve_hardlinks,
                         preserve_acls,
                         preserve_flags,
-                        per_file_progress,
+                        progress,
                         hardlink_map,
                     );
                     let _verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -2225,7 +2225,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         // Per-file progress should respect quiet mode
-        let per_file_progress = self.config.per_file_progress && !self.config.quiet;
+        let progress = self.config.progress && !self.config.quiet;
 
         let transferrer = Transferrer::new(
             self.transport.as_ref(),
@@ -2236,7 +2236,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.config.preserve.hardlinks,
             self.config.preserve.acls,
             self.config.preserve.flags,
-            per_file_progress,
+            progress,
             hardlink_map,
         );
 
@@ -2440,7 +2440,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2552,7 +2552,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2904,7 +2904,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -2985,7 +2985,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -3068,7 +3068,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
@@ -3148,7 +3148,7 @@ mod tests {
             false, // preserve_hardlinks
             false, // preserve_acls
             false, // preserve_flags
-            false, // per_file_progress
+            false, // progress
             false, // ignore_times
             false, // size_only
             false, // checksum
