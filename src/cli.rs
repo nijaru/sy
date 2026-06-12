@@ -9,6 +9,18 @@ use crate::compress::CompressionDetection;
 
 use crate::sync::scanner::ScanOptions;
 
+/// Verify mode for file integrity
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Disable verification (default)
+    #[default]
+    No,
+    /// Verify each file after writing
+    After,
+    /// Audit file integrity without modifying anything
+    Only,
+}
+
 /// Resume mode for interrupted transfers
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 pub enum ResumeMode {
@@ -299,10 +311,12 @@ pub struct Cli {
 
     /// Verify file integrity after write using xxHash3 checksums
     ///
-    /// By default, sy trusts the OS like rsync does. Enable this flag
-    /// to read back and verify each file after writing.
-    #[arg(long)]
-    pub verify: bool,
+    /// Modes:
+    /// - after: Verify each file after writing (default)
+    /// - only: Audit file integrity without modifying anything
+    /// - no: Disable verification (default)
+    #[arg(long, value_enum, default_value = "no")]
+    pub verify: VerifyMode,
 
     /// Enable compression for network transfers (auto-detects based on file type)
     #[arg(short = 'z', long)]
@@ -403,11 +417,7 @@ pub struct Cli {
     #[arg(long)]
     pub ignore_existing: bool,
 
-    /// Verify-only mode: audit file integrity without modifying anything
-    /// Compares source and destination checksums and reports mismatches
-    /// Returns exit code 0 if all match, 1 if mismatches found, 2 on error
-    #[arg(long)]
-    pub verify_only: bool,
+
 
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
@@ -510,16 +520,16 @@ impl Cli {
             );
         }
 
-        // --verify-only conflicts with modification flags
-        if self.verify_only {
+        // --verify=only conflicts with modification flags
+        if self.verify == VerifyMode::Only {
             if self.delete {
-                anyhow::bail!("--verify-only cannot be used with --delete (read-only mode)");
+                anyhow::bail!("--verify=only cannot be used with --delete (read-only mode)");
             }
             if self.watch {
-                anyhow::bail!("--verify-only cannot be used with --watch (read-only mode)");
+                anyhow::bail!("--verify=only cannot be used with --watch (read-only mode)");
             }
             if self.dry_run {
-                anyhow::bail!("--verify-only is already read-only, --dry-run is redundant");
+                anyhow::bail!("--verify=only is already read-only, --dry-run is redundant");
             }
         }
 
@@ -544,9 +554,9 @@ impl Cli {
             }
 
             // Bidirectional conflicts with certain flags
-            if self.verify_only {
+            if self.verify == VerifyMode::Only {
                 anyhow::bail!(
-                    "--bidirectional cannot be used with --verify-only (conflicts with sync logic)"
+                    "--bidirectional cannot be used with --verify=only (conflicts with sync logic)"
                 );
             }
             if self.watch {
@@ -589,10 +599,9 @@ impl Cli {
 
     /// Get the verification mode based on --verify flag
     pub fn verification_mode(&self) -> VerificationMode {
-        if self.verify {
-            VerificationMode::Verify
-        } else {
-            VerificationMode::None
+        match self.verify {
+            VerifyMode::No => VerificationMode::None,
+            VerifyMode::After | VerifyMode::Only => VerificationMode::Verify,
         }
     }
 
@@ -742,7 +751,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -766,7 +775,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -828,7 +836,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -852,7 +860,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -918,7 +925,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -942,7 +949,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1009,7 +1015,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1033,7 +1039,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1095,7 +1100,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1119,7 +1124,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1181,7 +1185,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1205,7 +1209,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1267,7 +1270,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1291,7 +1294,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1353,7 +1355,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1377,7 +1379,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1458,7 +1459,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1482,7 +1483,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1547,7 +1547,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1571,7 +1571,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1633,7 +1632,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: true, // But --verify flag should override
+            verify: VerifyMode::After, // But --verify flag should override
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1657,7 +1656,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1732,7 +1730,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1756,7 +1754,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1818,7 +1815,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1842,7 +1839,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1904,7 +1900,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -1928,7 +1924,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -1990,7 +1985,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2014,7 +2009,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2083,7 +2077,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2107,7 +2101,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2175,7 +2168,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2199,7 +2192,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2268,7 +2260,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2292,7 +2284,6 @@ mod tests {
             ignore_times: true, // Both enabled - should fail
             size_only: true,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2361,7 +2352,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2385,7 +2376,6 @@ mod tests {
             ignore_times: true, // Only this flag enabled
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2451,7 +2441,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2475,7 +2465,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: true, // Only this flag enabled
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,
@@ -2584,7 +2573,7 @@ mod tests {
             bwlimit: None,
             compress: false,
             compression_detection: CompressionDetection::Auto,
-            verify: false,
+            verify: VerifyMode::No,
             resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
@@ -2608,7 +2597,6 @@ mod tests {
             ignore_times: false,
             size_only: false,
             checksum: false,
-            verify_only: false,
             json: false,
             stream: false,
             watch: false,

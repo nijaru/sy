@@ -25,7 +25,7 @@ mod transport;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use cli::{Cli, ResumeMode};
+use cli::{Cli, ResumeMode, VerifyMode};
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
@@ -469,7 +469,7 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Verify-only mode
-    if cli.verify_only {
+    if cli.verify == VerifyMode::Only {
         if !cli.quiet && !cli.json {
             println!("sy v{}", env!("CARGO_PKG_VERSION"));
             println!("Verifying {} ↔ {}\n", source, destination);
