@@ -9,6 +9,18 @@ use crate::compress::CompressionDetection;
 
 use crate::sync::scanner::ScanOptions;
 
+/// Resume mode for interrupted transfers
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// Resume interrupted transfers if state found (default)
+    #[default]
+    Auto,
+    /// Only resume interrupted transfers, don't start new ones
+    Only,
+    /// Disable resume support
+    No,
+}
+
 fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
@@ -129,7 +141,7 @@ pub enum SymlinkMode {
 
     # Resume interrupted transfers
     sy /source user@host:/dest --resume         # Auto-resume interrupted large files
-    sy /source user@host:/dest --resume-only    # Only resume, don't start new transfers
+    sy /source user@host:/dest --resume=only    # Only resume, don't start new transfers
     sy /source user@host:/dest --clear-resume-state  # Clear all resume state
 
 For more information: https://github.com/nijaru/sy")]
@@ -236,17 +248,12 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
-    /// Enable resume support (auto-resume if state file found, default: true)
-    #[arg(long, overrides_with = "no_resume")]
-    resume: bool,
-
-    /// Disable resume support
-    #[arg(long, overrides_with = "resume")]
-    pub no_resume: bool,
-
-    /// Only resume interrupted transfers, don't start new ones
-    #[arg(long)]
-    pub resume_only: bool,
+    /// Resume mode (auto|only|no)
+    /// - auto: Resume interrupted transfers if state found (default)
+    /// - only: Only resume interrupted transfers, don't start new ones
+    /// - no: Disable resume support
+    #[arg(long, value_enum, default_value = "auto")]
+    pub resume: ResumeMode,
 
     /// Clear all resume state before starting
     #[arg(long)]
@@ -620,15 +627,14 @@ impl Cli {
     /// Get effective resume setting (default: true)
     ///
     /// Priority:
-    /// 1. --no-resume: disables resume (returns false)
-    /// 2. --resume: enables resume (returns true)
-    /// 3. Default: enabled (returns true)
+    /// 1. --resume=no: disables resume (returns false)
+    /// 2. --resume or --resume=auto: enables resume (returns true)
+    /// 3. --resume=only: only resume, don't start new (returns true)
+    /// 4. Default: enabled (returns true)
     pub fn resume(&self) -> bool {
-        if self.no_resume {
-            false
-        } else {
-            // Default is true, --resume flag also sets to true
-            true
+        match self.resume {
+            ResumeMode::No => false,
+            ResumeMode::Auto | ResumeMode::Only => true,
         }
     }
 
@@ -737,8 +743,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -782,7 +787,6 @@ mod tests {
             prune_checksum_db: false,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -825,8 +829,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -870,7 +873,6 @@ mod tests {
             prune_checksum_db: false,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -917,8 +919,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -964,7 +965,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1010,8 +1010,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1057,7 +1056,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1098,8 +1096,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1145,7 +1142,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1186,8 +1182,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1233,7 +1228,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1274,8 +1268,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1321,7 +1314,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1362,8 +1354,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1409,7 +1400,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1469,8 +1459,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1516,7 +1505,6 @@ mod tests {
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1560,8 +1548,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1607,7 +1594,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1648,8 +1634,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: true, // But --verify flag should override
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1695,7 +1680,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1749,8 +1733,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1796,7 +1779,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1837,8 +1819,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1884,7 +1865,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -1925,8 +1905,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -1972,7 +1951,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2013,8 +1991,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2060,7 +2037,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2108,8 +2084,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2155,7 +2130,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2202,8 +2176,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2249,7 +2222,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2297,8 +2269,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2344,7 +2315,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2392,8 +2362,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2439,7 +2408,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2484,8 +2452,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2531,7 +2498,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,
@@ -2619,8 +2585,7 @@ mod tests {
             compress: false,
             compression_detection: CompressionDetection::Auto,
             verify: false,
-            resume: false,
-            no_resume: false,
+            resume: ResumeMode::Auto,
             checkpoint_files: 100,
             checkpoint_bytes: 104857600,
             clean_state: false,
@@ -2666,7 +2631,6 @@ mod tests {
             max_size: None,
             retry: 3,
             retry_delay: 1,
-            resume_only: false,
             clear_resume_state: false,
             recursive: false,
             server: false,

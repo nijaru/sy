@@ -134,6 +134,7 @@ impl Default for PreserveConfig {
 #[derive(Debug, Clone)]
 pub struct ResumeConfig {
     pub enabled: bool,
+    pub only: bool,
     pub checkpoint_files: usize,
     pub checkpoint_bytes: u64,
 }
@@ -143,6 +144,7 @@ impl ResumeConfig {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            only: false,
             checkpoint_files: 0,
             checkpoint_bytes: 0,
         }

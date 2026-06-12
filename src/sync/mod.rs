@@ -114,6 +114,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             bwlimit,
             resume: ResumeConfig {
                 enabled: resume,
+                only: false, // TODO: integrate resume_only parameter
                 checkpoint_files,
                 checkpoint_bytes,
             },

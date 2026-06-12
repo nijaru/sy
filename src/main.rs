@@ -25,7 +25,7 @@ mod transport;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, ResumeMode};
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
@@ -172,7 +172,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
         if let Some(resume) = profile.resume {
             // Profile sets resume=false means --no-resume
             if !resume {
-                cli.no_resume = true;
+                cli.resume = ResumeMode::No;
             }
         }
     }
@@ -407,6 +407,7 @@ Or install from local source with: cargo install --path . --features acl"#
         bwlimit: cli.bwlimit,
         resume: sync::ResumeConfig {
             enabled: cli.resume(),
+            only: cli.resume == ResumeMode::Only,
             checkpoint_files: cli.checkpoint_files,
             checkpoint_bytes: cli.checkpoint_bytes,
         },
