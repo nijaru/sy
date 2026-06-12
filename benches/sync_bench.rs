@@ -34,7 +34,7 @@ fn bench_sync_small_files(c: &mut Criterion) {
 
                     let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                         .args([
-                            source.path().to_str().unwrap(),
+                            &format!("{}/", source.path().display()), "--exclude-vcs",
                             dest.path().to_str().unwrap(),
                         ])
                         .output()
@@ -73,7 +73,7 @@ fn bench_sync_nested_dirs(c: &mut Criterion) {
 
                 let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
-                        source.path().to_str().unwrap(),
+                        &format!("{}/", source.path().display()), "--exclude-vcs",
                         dest.path().to_str().unwrap(),
                     ])
                     .output()
@@ -111,7 +111,7 @@ fn bench_sync_large_files(c: &mut Criterion) {
 
                     let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                         .args([
-                            source.path().to_str().unwrap(),
+                            &format!("{}/", source.path().display()), "--exclude-vcs",
                             dest.path().to_str().unwrap(),
                         ])
                         .output()
@@ -135,7 +135,7 @@ fn bench_sync_idempotent(c: &mut Criterion) {
         // First sync
         Command::new(env!("CARGO_BIN_EXE_sy"))
             .args([
-                source.path().to_str().unwrap(),
+                &format!("{}/", source.path().display()), "--exclude-vcs",
                 dest.path().to_str().unwrap(),
             ])
             .output()
@@ -145,7 +145,7 @@ fn bench_sync_idempotent(c: &mut Criterion) {
             // Subsequent syncs (should be fast - all skipped)
             let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                 .args([
-                    source.path().to_str().unwrap(),
+                    &format!("{}/", source.path().display()), "--exclude-vcs",
                     dest.path().to_str().unwrap(),
                 ])
                 .output()
@@ -173,7 +173,7 @@ fn bench_cache_full_vs_incremental(c: &mut Criterion) {
                 // First sync to set up dest
                 Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
-                        source.path().to_str().unwrap(),
+                        &format!("{}/", source.path().display()), "--exclude-vcs",
                         dest.path().to_str().unwrap(),
                     ])
                     .output()
@@ -182,7 +182,7 @@ fn bench_cache_full_vs_incremental(c: &mut Criterion) {
                 b.iter(|| {
                     let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                         .args([
-                            source.path().to_str().unwrap(),
+                            &format!("{}/", source.path().display()), "--exclude-vcs",
                             dest.path().to_str().unwrap(),
                             "--use-cache=false",
                         ])
@@ -207,7 +207,7 @@ fn bench_cache_full_vs_incremental(c: &mut Criterion) {
                 // First sync with cache enabled
                 Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
-                        source.path().to_str().unwrap(),
+                        &format!("{}/", source.path().display()), "--exclude-vcs",
                         dest.path().to_str().unwrap(),
                         "--use-cache=true",
                     ])
@@ -217,7 +217,7 @@ fn bench_cache_full_vs_incremental(c: &mut Criterion) {
                 b.iter(|| {
                     let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                         .args([
-                            source.path().to_str().unwrap(),
+                            &format!("{}/", source.path().display()), "--exclude-vcs",
                             dest.path().to_str().unwrap(),
                             "--use-cache=true",
                         ])
@@ -258,7 +258,7 @@ fn bench_cache_nested_directories(c: &mut Criterion) {
             // First sync
             Command::new(env!("CARGO_BIN_EXE_sy"))
                 .args([
-                    source.path().to_str().unwrap(),
+                    &format!("{}/", source.path().display()), "--exclude-vcs",
                     dest.path().to_str().unwrap(),
                 ])
                 .output()
@@ -267,7 +267,7 @@ fn bench_cache_nested_directories(c: &mut Criterion) {
             b.iter(|| {
                 let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
-                        source.path().to_str().unwrap(),
+                        &format!("{}/", source.path().display()), "--exclude-vcs",
                         dest.path().to_str().unwrap(),
                         "--use-cache=false",
                     ])
@@ -303,7 +303,7 @@ fn bench_cache_nested_directories(c: &mut Criterion) {
                 // First sync with cache
                 Command::new(env!("CARGO_BIN_EXE_sy"))
                     .args([
-                        source.path().to_str().unwrap(),
+                        &format!("{}/", source.path().display()), "--exclude-vcs",
                         dest.path().to_str().unwrap(),
                         "--use-cache=true",
                     ])
@@ -313,7 +313,7 @@ fn bench_cache_nested_directories(c: &mut Criterion) {
                 b.iter(|| {
                     let output = Command::new(env!("CARGO_BIN_EXE_sy"))
                         .args([
-                            source.path().to_str().unwrap(),
+                            &format!("{}/", source.path().display()), "--exclude-vcs",
                             dest.path().to_str().unwrap(),
                             "--use-cache=true",
                         ])
