@@ -242,19 +242,6 @@ async fn main() -> Result<()> {
     let retry_config =
         retry::RetryConfig::new(cli.retry, std::time::Duration::from_secs(cli.retry_delay));
 
-    // Create transport router based on source and destination
-    // Use worker count for SSH connection pool size to enable true parallel transfers
-    let transport = TransportRouter::new(
-        source,
-        destination,
-        checksum_type,
-        verify_on_write,
-        cli.parallel, // SSH connection pool size = number of workers
-        retry_config.clone(),
-    )
-    .await?
-    .with_scan_options(cli.scan_options());
-
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();
 
