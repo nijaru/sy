@@ -151,7 +151,6 @@ mod tests {
             false,                              // delete
             50, // max_delete
             false,                              // trash
-            false,                              // force_delete
             true,                               // quiet
             10,                                 // parallel
             100,                                // max_errors
@@ -215,7 +214,6 @@ mod tests {
             false, // delete
             50, // max_delete
             false, // trash
-            false, // force_delete
             true,
             10,
             100, // max_errors

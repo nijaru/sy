@@ -60,7 +60,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         delete: bool,
         max_delete: u8,
         trash: bool,
-        force_delete: bool,
         quiet: bool,
         max_concurrent: usize,
         max_errors: usize,
@@ -99,7 +98,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             delete: if delete {
                 DeleteMode::Enabled {
                     threshold: max_delete,
-                    force: force_delete,
+                    force: false,
                 }
             } else {
                 DeleteMode::Disabled
@@ -2421,7 +2420,6 @@ mod tests {
             false,               // delete
             50, // max_delete
             false,               // trash
-            false,               // force_delete
             true,                // quiet
             4,                   // max_concurrent
             100,                 // max_errors
@@ -2533,7 +2531,6 @@ mod tests {
             false,               // delete
             50, // max_delete
             false,               // trash
-            false,               // force_delete
             true,                // quiet
             4,                   // max_concurrent
             100,                 // max_errors
@@ -2885,7 +2882,6 @@ mod tests {
             false,               // delete
             50, // max_delete
             false,               // trash
-            false,               // force_delete
             true,                // quiet
             1,                   // max_concurrent (serial to make errors predictable)
             0,                   // max_errors = 0 (unlimited)
@@ -2966,7 +2962,6 @@ mod tests {
             false,               // delete
             50, // max_delete
             false,               // trash
-            false,               // force_delete
             true,                // quiet
             1,                   // max_concurrent (serial)
             3,                   // max_errors = 3
@@ -3049,7 +3044,6 @@ mod tests {
             false,               // delete
             50, // max_delete
             false,               // trash
-            false,               // force_delete
             true,                // quiet
             1,                   // max_concurrent
             5,                   // max_errors = 5 (above expected errors)
@@ -3129,7 +3123,6 @@ mod tests {
             false, // delete
             50, // max_delete
             false, // trash
-            false, // force_delete
             true,  // quiet
             1,     // max_concurrent
             2,     // max_errors = 2 (will be exceeded)
