@@ -330,6 +330,9 @@ fn test_large_file_update_with_delta_sync() {
         .unwrap();
     assert!(output.status.success());
 
+    // Sleep to ensure mtime differs (need >2s because mtime tolerance is 1s and as_secs() truncates)
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
     // Modify part of the file
     let mut modified = large_content;
     for byte in &mut modified[..1024] {

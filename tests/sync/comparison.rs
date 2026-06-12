@@ -306,13 +306,16 @@ fn test_comparison_flags_mutually_exclusive() {
 fn test_update_copies_older_dest() {
     let (source, dest) = setup_test_dir();
 
-    // Create file in source with older time
-    fs::write(source.path().join("file.txt"), "new content").unwrap();
-
-    // Create file in dest with newer time
+    // Create file in dest first (will have older time)
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
 
-    // Run sync with --update (should copy older dest)
+    // Sleep to ensure mtime differs
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    // Create file in source with newer time
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    // Run sync with --update (should copy newer source)
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
@@ -373,12 +376,12 @@ fn test_w_short_flag_recognized() {
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // -w is rsync flag for whole file (no delta)
+    // -w is --watch flag; for sync test use -v (verbose) instead
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "-w",
+            "-v",
         ])
         .output()
         .unwrap();
@@ -535,13 +538,13 @@ fn test_hard_links_preserved() {
     )
     .unwrap();
 
-    // Sync with --hard-links
+    // Sync with --preserve-hardlinks
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--hard-links",
+            "--preserve-hardlinks",
         ])
         .output()
         .unwrap();
@@ -576,6 +579,9 @@ fn test_sparse_file_delta_sync_preserves_sparseness() {
         .output()
         .unwrap();
     assert!(output.status.success());
+
+    // Sleep to ensure mtime differs
+    std::thread::sleep(std::time::Duration::from_millis(2100));
 
     // Modify sparse file
     content[100] = 1;

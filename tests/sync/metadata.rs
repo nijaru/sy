@@ -530,7 +530,8 @@ fn test_sync_symlink_to_empty_dest() {
         .unwrap();
 
     assert!(output.status.success());
-    assert!(dest.path().join("link.txt").exists());
+    // Use symlink_metadata since Path::exists() follows symlinks (returns false for dangling symlinks)
+    assert!(fs::symlink_metadata(dest.path().join("link.txt")).is_ok());
     let link_target = fs::read_link(dest.path().join("link.txt")).unwrap();
     assert_eq!(link_target, std::path::PathBuf::from("target.txt"));
 }
