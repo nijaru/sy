@@ -212,7 +212,7 @@ pub struct Cli {
     pub stats: bool,
 
     /// Show file sizes in human-readable format (e.g., 1K, 234M, 2G)
-    #[arg(long, short = 'h')]
+    #[arg(long)]
     pub human_readable: bool,
 
     /// Make backups of existing destination files
@@ -264,6 +264,10 @@ pub struct Cli {
     /// Compression level (1-9, 0 disables compression)
     #[arg(long)]
     pub compress_level: Option<u8>,
+
+    /// Show what changed for each file (like rsync -i)
+    #[arg(long, short = 'i')]
+    pub itemize_changes: bool,
 
     /// Number of parallel file transfers (default: 10)
     #[arg(short = 'j', long, default_value = "10")]
@@ -793,6 +797,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             min_size: None,
@@ -888,6 +893,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             min_size: None,
@@ -989,6 +995,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1089,6 +1096,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1184,6 +1192,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1279,6 +1288,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1374,6 +1384,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1469,6 +1480,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1583,6 +1595,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1681,6 +1694,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1776,6 +1790,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1884,6 +1899,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -1979,6 +1995,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2074,6 +2091,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2169,6 +2187,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2271,6 +2290,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2372,6 +2392,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2474,6 +2495,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2576,6 +2598,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2675,6 +2698,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
@@ -2817,6 +2841,7 @@ mod tests {
             contimeout: None,
             rsh: None,
             compress_level: None,
+            itemize_changes: false,
             parallel: 10,
             max_errors: 100,
             exclude: vec![],
