@@ -345,7 +345,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
     }
 
     // Load ignore templates
-    for template_name in &cli.ignore_template {
+    for template_name in &cli.exclude_template {
         if let Err(e) = filter_engine.add_template(template_name) {
             tracing::warn!("Failed to load template '{}': {}", template_name, e);
         } else if !cli.quiet && !cli.json {
