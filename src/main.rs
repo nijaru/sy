@@ -33,12 +33,8 @@ use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
 use resource::format_bytes;
 use std::path::PathBuf;
-#[cfg(feature = "watch")]
-use sync::watch::WatchMode;
-use sync::SyncEngine;
 use sync::session::{SyncSession, EndpointPair};
 use tracing_subscriber::{fmt, EnvFilter};
-use transport::router::TransportRouter;
 
 /// Compute effective destination path based on rsync trailing slash semantics
 ///
@@ -237,10 +233,6 @@ async fn main() -> Result<()> {
     let verification_mode = cli.verification_mode();
     let checksum_type = verification_mode.checksum_type();
     let verify_on_write = verification_mode.verify_blocks();
-
-    // Create retry config from CLI args for network interruption recovery
-    let retry_config =
-        retry::RetryConfig::new(cli.retry, std::time::Duration::from_secs(cli.retry_delay));
 
     // Get symlink mode
     let symlink_mode = cli.symlink_mode();
@@ -564,28 +556,15 @@ Or install from local source with: cargo install --path . --features acl"#
                 anyhow::bail!("Watch mode currently only supports local sources.");
             }
 
-            // Watch mode requires SyncEngine and transport
-            let transport = TransportRouter::new(
+            // Watch mode using SyncSession (v0.4)
+            let watch_session = sync::watch_session::WatchSession::from_paths(
                 source,
                 destination,
-                checksum_type,
-                verify_on_write,
-                cli.parallel,
-                retry_config.clone(),
-            )
-            .await?
-            .with_scan_options(cli.scan_options());
-            let engine = SyncEngine::with_config(transport, config.clone());
-
-            // Watch mode - continuous sync on file changes
-            let watch_mode = WatchMode::new(
-                engine,
-                source.path().to_path_buf(),
-                destination.path().to_path_buf(),
+                config.clone(),
                 std::time::Duration::from_millis(500), // 500ms debounce
-            );
+            )?;
 
-            watch_mode.watch().await?;
+            watch_session.watch().await?;
             return Ok(()); // Watch mode handles its own output
         }
         #[cfg(not(feature = "watch"))]

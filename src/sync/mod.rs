@@ -14,7 +14,10 @@ pub mod stats;
 pub mod strategy;
 pub mod transfer;
 #[cfg(feature = "watch")]
+#[cfg(feature = "watch")]
 pub mod watch;
+#[cfg(feature = "watch")]
+pub mod watch_session;
 
 pub use config::{ComparisonConfig, DeleteMode, PreserveConfig, ResumeConfig, SyncConfig, VerificationConfig};
 pub use stats::{SyncError, SyncStats, VerificationResult};
