@@ -434,7 +434,7 @@ Or install from local source with: cargo install --path . --features acl"#
             update_only: cli.update,
             ignore_existing: cli.ignore_existing,
         },
-        use_cache: cli.use_cache,
+        cache: cli.cache,
         clear_cache: cli.clear_cache,
         dest_is_remote: destination.is_remote(),
         perf: cli.perf,

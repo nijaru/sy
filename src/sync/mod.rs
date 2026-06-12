@@ -85,7 +85,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         checksum: bool,
         update_only: bool,
         ignore_existing: bool,
-        use_cache: bool,
+        cache: bool,
         clear_cache: bool,
         checksum_db: bool,
         clear_checksum_db: bool,
@@ -141,7 +141,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 update_only,
                 ignore_existing,
             },
-            use_cache,
+            cache,
             clear_cache,
             dest_is_remote,
             perf,
@@ -218,7 +218,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Load directory cache (if enabled)
-        let mut dir_cache = if self.config.use_cache {
+        let mut dir_cache = if self.config.cache {
             let cache = DirectoryCache::load(destination);
             tracing::debug!("Loaded directory cache with {} entries", cache.len());
             Some(cache)
@@ -254,7 +254,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         };
 
         // Check if we can use cached scan results (incremental scanning)
-        let can_use_cache = if let Some(ref cache) = dir_cache {
+        let can_cache = if let Some(ref cache) = dir_cache {
             // Check source directory mtime
             if let Ok(source_meta) = std::fs::metadata(source) {
                 if let Ok(source_mtime) = source_meta.modified() {
@@ -276,7 +276,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Scan source directory (or use cache)
-        let all_files = if can_use_cache {
+        let all_files = if can_cache {
             // Use cached files for incremental scan
             if let Some(ref cache) = dir_cache {
                 if let Some(cached_files) = cache.get_cached_files(&PathBuf::from(".")) {
@@ -306,7 +306,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         };
 
         let total_scanned = all_files.len();
-        if can_use_cache {
+        if can_cache {
             tracing::info!("Retrieved {} items from cache", total_scanned);
         } else {
             tracing::info!("Found {} items in source", total_scanned);
@@ -1430,7 +1430,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         }
 
         // Save directory cache if enabled
-        if self.config.use_cache && !self.config.dry_run {
+        if self.config.cache && !self.config.dry_run {
             if let Some(ref cache) = dir_cache {
                 // Only save cache if destination is local
                 if !self.config.dest_is_remote {
@@ -2445,7 +2445,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache (disabled in tests to avoid side effects)
+            false, // cache (disabled in tests to avoid side effects)
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db
@@ -2557,7 +2557,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache
+            false, // cache
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db
@@ -2909,7 +2909,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache
+            false, // cache
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db
@@ -2990,7 +2990,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache
+            false, // cache
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db
@@ -3073,7 +3073,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache
+            false, // cache
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db
@@ -3153,7 +3153,7 @@ mod tests {
             false, // checksum
             false, // update_only
             false, // ignore_existing
-            false, // use_cache
+            false, // cache
             false, // clear_cache
             false, // checksum_db
             false, // clear_checksum_db

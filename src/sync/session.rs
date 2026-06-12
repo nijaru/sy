@@ -222,7 +222,7 @@ impl SyncSession {
         }
 
         // Load directory cache if enabled
-        let mut dir_cache = if self.config.use_cache {
+        let mut dir_cache = if self.config.cache {
             let cache = crate::sync::dircache::DirectoryCache::load(dest_ep.root());
             tracing::debug!("Loaded directory cache with {} entries", cache.len());
             Some(cache)
@@ -231,7 +231,7 @@ impl SyncSession {
         };
 
         // Check if we can use cached scan results
-        let can_use_cache = if let Some(ref cache) = dir_cache {
+        let can_cache = if let Some(ref cache) = dir_cache {
             if let Ok(source_meta) = std::fs::metadata(source_ep.root()) {
                 if let Ok(source_mtime) = source_meta.modified() {
                     let source_path = std::path::PathBuf::from(".");
@@ -247,7 +247,7 @@ impl SyncSession {
         };
 
         // Scan source (or use cache)
-        let source_entries = if can_use_cache {
+        let source_entries = if can_cache {
             if let Some(ref cache) = dir_cache {
                 if let Some(cached_files) = cache.get_cached_files(&std::path::PathBuf::from(".")) {
                     tracing::info!("Using cached scan results ({} files)", cached_files.len());
