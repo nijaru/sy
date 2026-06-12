@@ -181,10 +181,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub delete: bool,
 
-    /// Maximum percentage of files that can be deleted (0-100, default: 50)
-    /// Prevents accidental mass deletion
-    #[arg(long, default_value = "50")]
-    pub delete_threshold: u8,
+
 
     /// Move deleted files to trash instead of permanent deletion
     #[arg(long)]
@@ -509,12 +506,7 @@ impl Cli {
         }
 
         // Validate deletion threshold (0-100)
-        if self.delete_threshold > 100 {
-            anyhow::bail!(
-                "--delete-threshold must be between 0 and 100 (got: {})",
-                self.delete_threshold
-            );
-        }
+
 
         // --verify=only conflicts with modification flags
         if self.verify == VerifyMode::Only {
@@ -727,7 +719,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -811,7 +802,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -901,7 +891,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -990,7 +979,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1074,7 +1062,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1158,7 +1145,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1242,7 +1228,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 1,
@@ -1326,7 +1311,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 2,
@@ -1429,7 +1413,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1516,7 +1499,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1600,7 +1582,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1697,7 +1678,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1781,7 +1761,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1865,7 +1844,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -1949,7 +1927,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2040,7 +2017,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2130,7 +2106,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2221,7 +2196,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2312,7 +2286,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2400,7 +2373,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,
@@ -2531,7 +2503,6 @@ mod tests {
             dry_run: false,
             diff: false,
             delete: false,
-            delete_threshold: 50,
             trash: false,
             force_delete: false,
             verbose: 0,

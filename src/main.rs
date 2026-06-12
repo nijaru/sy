@@ -391,7 +391,7 @@ Or install from local source with: cargo install --path . --features acl"#
         diff_mode: cli.diff,
         delete: if cli.delete {
             sync::DeleteMode::Enabled {
-                threshold: cli.delete_threshold,
+                threshold: cli.max_delete,
                 force: cli.force_delete,
             }
         } else {

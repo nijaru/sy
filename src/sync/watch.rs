@@ -149,7 +149,7 @@ mod tests {
             false,                              // dry_run
             false,                              // diff_mode
             false,                              // delete
-            50,                                 // delete_threshold
+            50, // max_delete
             false,                              // trash
             false,                              // force_delete
             true,                               // quiet
@@ -213,7 +213,7 @@ mod tests {
             false, // dry_run
             false, // diff_mode
             false, // delete
-            50,    // delete_threshold
+            50, // max_delete
             false, // trash
             false, // force_delete
             true,

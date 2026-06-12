@@ -58,7 +58,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
         dry_run: bool,
         diff_mode: bool,
         delete: bool,
-        delete_threshold: u8,
+        max_delete: u8,
         trash: bool,
         force_delete: bool,
         quiet: bool,
@@ -98,7 +98,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             diff_mode,
             delete: if delete {
                 DeleteMode::Enabled {
-                    threshold: delete_threshold,
+                    threshold: max_delete,
                     force: force_delete,
                 }
             } else {
@@ -2419,7 +2419,7 @@ mod tests {
             false,               // dry_run
             false,               // diff_mode
             false,               // delete
-            50,                  // delete_threshold
+            50, // max_delete
             false,               // trash
             false,               // force_delete
             true,                // quiet
@@ -2531,7 +2531,7 @@ mod tests {
             true,                // dry_run = true
             false,               // diff_mode
             false,               // delete
-            50,                  // delete_threshold
+            50, // max_delete
             false,               // trash
             false,               // force_delete
             true,                // quiet
@@ -2883,7 +2883,7 @@ mod tests {
             false,               // dry_run
             false,               // diff_mode
             false,               // delete
-            50,                  // delete_threshold
+            50, // max_delete
             false,               // trash
             false,               // force_delete
             true,                // quiet
@@ -2964,7 +2964,7 @@ mod tests {
             false,               // dry_run
             false,               // diff_mode
             false,               // delete
-            50,                  // delete_threshold
+            50, // max_delete
             false,               // trash
             false,               // force_delete
             true,                // quiet
@@ -3047,7 +3047,7 @@ mod tests {
             false,               // dry_run
             false,               // diff_mode
             false,               // delete
-            50,                  // delete_threshold
+            50, // max_delete
             false,               // trash
             false,               // force_delete
             true,                // quiet
@@ -3127,7 +3127,7 @@ mod tests {
             false, // dry_run
             false, // diff_mode
             false, // delete
-            50,    // delete_threshold
+            50, // max_delete
             false, // trash
             false, // force_delete
             true,  // quiet
