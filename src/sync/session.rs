@@ -11,6 +11,7 @@
 
 use crate::endpoint::Endpoint;
 use crate::endpoint::local::LocalEndpoint;
+use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
 use crate::ssh::config::SshConfig;
 use crate::sync::config::SyncConfig;
@@ -606,7 +607,7 @@ impl SyncSession {
             source_root,
             dest_root.clone(),
             self.config.delete.is_enabled(),
-            true, // compress for SSH
+            CompressionDetection::Auto, // compress for SSH
         );
 
         let streaming_stats = streaming.push(&mut stdout, &mut stdin)
@@ -657,7 +658,7 @@ impl SyncSession {
             dest_root,
             source_root.clone(),
             self.config.delete.is_enabled(),
-            true, // compress for SSH
+            CompressionDetection::Auto, // compress for SSH
         );
 
         let streaming_stats = streaming.pull(&mut stdout, &mut stdin)

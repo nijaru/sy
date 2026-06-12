@@ -4,6 +4,7 @@
 //! computes deltas when possible, and sends Data chunks.
 
 use crate::delta::generator::{generate_delta_streaming, DeltaOp};
+use crate::compress::CompressionDetection;
 use crate::streaming::channel::{
     DeltaInfo, FileJob, FileJobReceiver, GeneratorMessage, DATA_CHUNK_SIZE, DELTA_CHUNK_SIZE,
 };
@@ -20,8 +21,8 @@ use tokio::io::{AsyncReadExt, BufReader};
 pub struct SenderConfig {
     /// Root path for reading files
     pub root: PathBuf,
-    /// Whether to compress data
-    pub compress: bool,
+    /// Compression mode
+    pub compress: CompressionDetection,
 }
 
 /// Sender state
@@ -148,7 +149,7 @@ impl Sender {
             }
 
             let mut flags = DataFlags::empty();
-            if self.config.compress {
+            if self.config.compress != CompressionDetection::Never {
                 flags |= DataFlags::COMPRESSED;
             }
 
@@ -214,7 +215,7 @@ impl Sender {
 
         // Encode delta ops into DATA messages, chunking to avoid frame size limits
         let mut flags = DataFlags::DELTA;
-        if self.config.compress {
+        if self.config.compress != CompressionDetection::Never {
             flags |= DataFlags::COMPRESSED;
         }
 
@@ -289,7 +290,7 @@ mod tests {
 
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
-            compress: false,
+            compress: CompressionDetection::Never,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();
@@ -341,7 +342,7 @@ mod tests {
 
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
-            compress: false,
+            compress: CompressionDetection::Never,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();
@@ -429,7 +430,7 @@ mod tests {
 
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
-            compress: false,
+            compress: CompressionDetection::Never,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();

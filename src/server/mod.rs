@@ -12,6 +12,7 @@ use tokio::fs;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::compress::CompressionDetection;
 use crate::streaming::{
     channel::file_job_channel,
     protocol::{self as v2, HelloFlags, MessageType},
@@ -117,7 +118,11 @@ async fn run_server_pull(
 
     let sender = Sender::new(SenderConfig {
         root: root_path,
-        compress: hello.flags.contains(HelloFlags::COMPRESSION),
+        compress: if hello.flags.contains(HelloFlags::COMPRESSION) {
+            CompressionDetection::Auto
+        } else {
+            CompressionDetection::Never
+        },
     });
 
     // Use unbounded channel to avoid blocking_send (panics in tokio context)

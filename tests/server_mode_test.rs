@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use sy::compress::CompressionDetection;
     use sy::path::SyncPath;
     use sy::sync::server_mode::{sync_pull, sync_push};
     use tempfile::TempDir;
@@ -45,7 +46,7 @@ mod tests {
             has_trailing_slash: false,
         };
 
-        sync_push(&source, &dest_sync_path, false, false).await?;
+        sync_push(&source, &dest_sync_path, false, CompressionDetection::Never).await?;
 
         // Verify
         assert!(dest.join("file1.txt").exists());
@@ -96,7 +97,7 @@ mod tests {
             has_trailing_slash: false,
         };
 
-        sync_pull(&source_sync_path, &dest, false, false).await?;
+        sync_pull(&source_sync_path, &dest, false, CompressionDetection::Never).await?;
 
         // Verify
         assert!(dest.join("file1.txt").exists());

@@ -2,6 +2,7 @@
 //!
 //! Orchestrates Generator, Sender, and Receiver tasks.
 
+use crate::compress::CompressionDetection;
 use crate::streaming::{
     channel::{file_job_channel, SyncStats},
     protocol::{read_frame, write_frame, Done, Hello, HelloFlags, MessageType},
@@ -18,7 +19,7 @@ pub struct StreamingSync {
     pub local_root: PathBuf,
     pub remote_root: PathBuf,
     pub delete_enabled: bool,
-    pub compress: bool,
+    pub compress: CompressionDetection,
 }
 
 impl StreamingSync {
@@ -26,7 +27,7 @@ impl StreamingSync {
         local_root: PathBuf,
         remote_root: PathBuf,
         delete_enabled: bool,
-        compress: bool,
+        compress: CompressionDetection,
     ) -> Self {
         Self {
             local_root,
@@ -165,7 +166,7 @@ impl StreamingSync {
         if self.delete_enabled {
             flags |= HelloFlags::DELETE;
         }
-        if self.compress {
+        if self.compress != CompressionDetection::Never {
             flags |= HelloFlags::COMPRESSION;
         }
 

@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::compress::CompressionDetection;
 use crate::path::SyncPath;
 use crate::ssh::config::SshConfig;
 use crate::streaming::StreamingSync;
@@ -18,7 +19,7 @@ pub async fn sync_push(
     source: &Path,
     dest: &SyncPath,
     delete: bool,
-    compress: bool,
+    compress: CompressionDetection,
 ) -> Result<SyncStats> {
     let session = match dest {
         SyncPath::Remote { host, user, .. } => {
@@ -58,7 +59,7 @@ pub async fn sync_pull(
     source: &SyncPath,
     dest: &Path,
     delete: bool,
-    compress: bool,
+    compress: CompressionDetection,
 ) -> Result<SyncStats> {
     let session = match source {
         SyncPath::Remote { host, user, .. } => {
