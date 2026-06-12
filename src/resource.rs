@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::error::{Result, SyncError};
 use std::path::Path;
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::error::{Result, SyncError};
 use crossbeam_channel::{bounded, Receiver};
 use ignore::{WalkBuilder, WalkState};

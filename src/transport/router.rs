@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[cfg(feature = "gcs")]
 use super::gcs::GcsTransport;
 #[cfg(feature = "s3")]

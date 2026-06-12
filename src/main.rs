@@ -66,9 +66,22 @@ fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBu
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Parse CLI arguments
     let mut cli = Cli::parse();
+    
+    // Set RUST_BACKTRACE=0 unless user explicitly set it
+    if std::env::var("RUST_BACKTRACE").is_err() {
+        std::env::set_var("RUST_BACKTRACE", "0");
+    }
+
+    if let Err(e) = run(&mut cli).await {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: &mut Cli) -> Result<()> {
 
     // Load config file
     let config = Config::load()?;

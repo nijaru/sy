@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod dual;
 #[cfg(feature = "gcs")]
 pub mod gcs;

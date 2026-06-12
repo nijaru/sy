@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Server mode sync - uses subprocess protocol for remote operations.
 //!
 //! Supports both SSH (remote) and local subprocess for testing.

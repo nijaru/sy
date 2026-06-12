@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::cli::SymlinkMode;
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;

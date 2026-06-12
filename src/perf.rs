@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Performance monitoring and metrics collection
 //!
 //! Tracks sync performance metrics including:

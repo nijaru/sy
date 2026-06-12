@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Per-file progress display for large file transfers
 //
 // Shows real-time progress bars for files >= 1MB to provide better UX

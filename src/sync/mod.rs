@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod checksumdb;
 pub mod config;
 pub mod dircache;

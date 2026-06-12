@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::error::SyncError;
 use std::future::Future;
 use std::time::Duration;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::time::{Duration, Instant};
 
 /// Simple token bucket rate limiter

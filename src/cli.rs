@@ -645,8 +645,8 @@ impl Cli {
         }
 
         match self.verbose {
-            0 => tracing::Level::INFO,
-            1 => tracing::Level::DEBUG,
+            0 => tracing::Level::WARN,
+            1 => tracing::Level::INFO,
             _ => tracing::Level::TRACE,
         }
     }
@@ -1238,7 +1238,7 @@ mod tests {
             recursive: false,
             server: false,
         };
-        assert_eq!(cli.log_level(), tracing::Level::INFO);
+        assert_eq!(cli.log_level(), tracing::Level::WARN);
     }
 
     #[test]
@@ -1326,7 +1326,7 @@ mod tests {
             recursive: false,
             server: false,
         };
-        assert_eq!(cli.log_level(), tracing::Level::DEBUG);
+        assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
 
     #[test]

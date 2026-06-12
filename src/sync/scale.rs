@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Scale-related utilities for handling millions of files efficiently
 ///
 /// This module provides optimizations for large-scale syncs:

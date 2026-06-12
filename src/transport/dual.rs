@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::{TransferResult, Transport};
 use crate::error::Result;
 use crate::sync::scanner::FileEntry;

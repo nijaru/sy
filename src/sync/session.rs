@@ -212,6 +212,15 @@ impl SyncSession {
         let dest_ep = self.dest.as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local endpoint")))?;
 
+        // Auto-create destination if it doesn't exist
+        if !dest_ep.root().exists() {
+            std::fs::create_dir_all(dest_ep.root())
+                .map_err(|e| SyncError::Io(std::io::Error::other(
+                    format!("Failed to create destination {:?}: {}", dest_ep.root(), e)
+                )))?;
+            tracing::info!("Created destination directory: {:?}", dest_ep.root());
+        }
+
         // Load directory cache if enabled
         let mut dir_cache = if self.config.use_cache {
             let cache = crate::sync::dircache::DirectoryCache::load(dest_ep.root());

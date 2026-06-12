@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::checksumdb::ChecksumDatabase;
 use super::scanner::FileEntry;
 use crate::error::{Result, SyncError};
