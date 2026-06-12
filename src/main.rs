@@ -822,7 +822,7 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Print summary (skip if JSON mode - already emitted JSON summary)
-    if !cli.quiet && !cli.json {
+    if (!cli.quiet && !cli.json) || cli.stats {
         if cli.dry_run {
             println!(
                 "\n{}\n",
