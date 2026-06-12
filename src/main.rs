@@ -212,16 +212,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
             .map(|e| e.with_abort_on_failure(cli.abort_on_hook_failure))
     };
 
-    // Clean state files if requested
-    if cli.clean_state {
-        use sync::resume::ResumeState;
-        if let Err(e) = ResumeState::delete(destination.path()) {
-            tracing::warn!("Failed to clean state file: {}", e);
-        } else if !cli.quiet && !cli.json {
-            tracing::info!("Cleaned existing state files");
-        }
-    }
-
     // Clear cache if requested (before creating engine)
     if cli.clear_cache {
         use sync::dircache::DirectoryCache;
