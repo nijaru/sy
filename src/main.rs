@@ -643,7 +643,7 @@ Or install from local source with: cargo install --path . --features acl"#
                                 &config,
                                 cli.parallel,
                                 Default::default(),
-                                std::time::Duration::from_secs(cli.timeout.unwrap_or(30)),
+                                std::time::Duration::from_secs(cli.contimeout.or(cli.timeout).unwrap_or(30)),
                             ).await?,
                 );
                 (local, remote)
@@ -668,7 +668,7 @@ Or install from local source with: cargo install --path . --features acl"#
                                 &config,
                                 cli.parallel,
                                 Default::default(),
-                                std::time::Duration::from_secs(cli.timeout.unwrap_or(30)),
+                                std::time::Duration::from_secs(cli.contimeout.or(cli.timeout).unwrap_or(30)),
                             ).await?,
                 );
                 let local =
