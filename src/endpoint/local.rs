@@ -248,4 +248,97 @@ mod tests {
         assert!(ep.capabilities().cow_writes);
         assert!(ep.capabilities().delta_sync);
     }
+
+    #[tokio::test]
+    async fn test_remove_file() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        fs::write(dir.path().join("file.txt"), "data").unwrap();
+        assert!(ep.exists(Path::new("file.txt")).await.unwrap());
+
+        ep.remove(Path::new("file.txt"), false).await.unwrap();
+        assert!(!ep.exists(Path::new("file.txt")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_recursive() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        fs::write(dir.path().join("subdir/file.txt"), "data").unwrap();
+
+        ep.remove(Path::new("subdir"), true).await.unwrap();
+        assert!(!ep.exists(Path::new("subdir")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_all() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        ep.create_dir_all(Path::new("a/b/c")).await.unwrap();
+        assert!(dir.path().join("a/b/c").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_create_symlink() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        fs::write(dir.path().join("target.txt"), "data").unwrap();
+        ep.create_symlink(Path::new("target.txt"), Path::new("link.txt"))
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("link.txt").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(dir.path().join("link.txt")).unwrap(), Path::new("target.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_create_hardlink() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        fs::write(dir.path().join("original.txt"), "data").unwrap();
+        ep.create_hardlink(Path::new("original.txt"), Path::new("hardlink.txt"))
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("hardlink.txt").exists());
+        assert_eq!(fs::read(dir.path().join("hardlink.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn test_copy_file() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        ep.write_file(Path::new("source.txt"), b"content", &make_meta())
+            .await
+            .unwrap();
+
+        let bytes = ep.copy_file(Path::new("source.txt"), Path::new("dest.txt"))
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, 7);
+        assert_eq!(ep.read_file(Path::new("dest.txt")).await.unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn test_metadata() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+
+        ep.write_file(Path::new("file.txt"), b"content", &make_meta())
+            .await
+            .unwrap();
+
+        let meta = ep.metadata(Path::new("file.txt")).await.unwrap();
+        assert_eq!(meta.size, 7);
+        assert!(!meta.is_dir);
+        assert!(!meta.is_symlink);
+    }
 }

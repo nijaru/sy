@@ -378,6 +378,11 @@ impl SyncSession {
             creates, updates, delete_count, skips
         );
 
+        // Filter out Create tasks if --existing is set (only update existing files)
+        if self.config.existing {
+            tasks.retain(|t| t.action != SyncAction::Create);
+        }
+
         // Execute tasks (inline for Phase 3, TaskExecutor extracts in Phase 4)
         if self.config.dry_run {
             return Ok(SyncStats {
@@ -842,5 +847,57 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert!(!dst_dir.path().join("delete.txt").exists());
         assert!(dst_dir.path().join("keep.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_direct_local_with_subdirectories() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
+        std::fs::write(src_dir.path().join("subdir/file.txt"), "content").unwrap();
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, test_config());
+
+        let stats = session.sync().await.unwrap();
+        assert!(stats.files_created >= 1);
+        assert!(dst_dir.path().join("subdir/file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_direct_local_existing_only() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create files in source
+        std::fs::write(src_dir.path().join("new.txt"), "new").unwrap();
+        std::fs::write(src_dir.path().join("update.txt"), "updated").unwrap();
+
+        // Create only update.txt in dest (so it gets updated, but new.txt is skipped)
+        std::fs::write(dst_dir.path().join("update.txt"), "old").unwrap();
+
+        let config = SyncConfig {
+            existing: true,
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config);
+
+        let stats = session.sync().await.unwrap();
+        // update.txt should be updated, new.txt should NOT be created
+        assert_eq!(stats.files_updated, 1);
+        assert!(!dst_dir.path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_strategy_select() {
+        let local = EndpointPair::Local(Box::new(LocalEndpoint::new(PathBuf::from("/tmp/src"))));
+        let local2 = EndpointPair::Local(Box::new(LocalEndpoint::new(PathBuf::from("/tmp/dst"))));
+        let session = SyncSession::new(local, local2, test_config());
+        assert_eq!(session.select_strategy(), SyncStrategy::DirectLocal);
     }
 }
