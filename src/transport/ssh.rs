@@ -8,6 +8,7 @@ use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
 use crate::sync::scanner::{FileEntry, ScanOptions};
+use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
@@ -15,7 +16,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 
 // Temporary inlined sparse detection (module resolution issue workaround)
 #[cfg(unix)]
@@ -122,6 +123,7 @@ struct ConnectionPool {
     next_index: AtomicUsize,
     config: SshConfig,
     max_size: usize,
+    timeout: Duration,
 }
 
 impl ConnectionPool {
@@ -129,7 +131,7 @@ impl ConnectionPool {
     ///
     /// The pool starts small and can be expanded via `expand_to()` after
     /// scanning determines how many connections are actually needed.
-    async fn new(config: &SshConfig, max_size: usize) -> Result<Self> {
+    async fn new(config: &SshConfig, max_size: usize, timeout: Duration) -> Result<Self> {
         if max_size == 0 {
             return Err(SyncError::Io(std::io::Error::other(
                 "Connection pool max size must be at least 1",
@@ -141,7 +143,7 @@ impl ConnectionPool {
             "Creating initial SSH connection (max pool size: {})",
             max_size
         );
-        let session = connect::connect(config).await?;
+        let session = connect::connect_with_timeout(config, timeout).await?;
 
         let sessions = vec![Arc::new(Mutex::new(session))];
 
@@ -155,6 +157,7 @@ impl ConnectionPool {
             next_index: AtomicUsize::new(0),
             config: config.clone(),
             max_size,
+            timeout,
         })
     }
 
@@ -211,7 +214,7 @@ impl ConnectionPool {
                         current_size + i + 1,
                         target
                     );
-                    connect::connect(&config).await
+                    connect::connect_with_timeout(&config, self.timeout).await
                 }
             })
             .collect();
@@ -309,6 +312,7 @@ pub struct SshTransport {
     retry_config: RetryConfig,
     speedometer: Arc<Speedometer>,
     scan_options: ScanOptions,
+    timeout: Duration,
 }
 
 impl SshTransport {
@@ -334,13 +338,24 @@ impl SshTransport {
         pool_size: usize,
         retry_config: RetryConfig,
     ) -> Result<Self> {
-        let connection_pool = ConnectionPool::new(config, pool_size).await?;
+        Self::with_timeout(config, pool_size, retry_config, Duration::from_secs(30)).await
+    }
+
+    /// Create SSH transport with custom timeout
+    pub async fn with_timeout(
+        config: &SshConfig,
+        pool_size: usize,
+        retry_config: RetryConfig,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let connection_pool = ConnectionPool::new(config, pool_size, timeout).await?;
         Ok(Self {
             connection_pool: Arc::new(connection_pool),
             remote_binary_path: "sy-remote".to_string(),
             retry_config,
             speedometer: Arc::new(Speedometer::new()),
             scan_options: ScanOptions::default(),
+            timeout,
         })
     }
 
@@ -2888,6 +2903,7 @@ mod tests {
             next_index: AtomicUsize::new(0),
             config: SshConfig::default(),
             max_size,
+            timeout: Duration::from_secs(30),
         }
     }
 

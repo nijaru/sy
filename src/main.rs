@@ -639,7 +639,12 @@ Or install from local source with: cargo install --path . --features acl"#
                 let local =
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 let remote = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?,
+                    transport::ssh::SshTransport::with_timeout(
+                                &config,
+                                cli.parallel,
+                                Default::default(),
+                                std::time::Duration::from_secs(cli.timeout.unwrap_or(30)),
+                            ).await?,
                 );
                 (local, remote)
             }
@@ -659,7 +664,12 @@ Or install from local source with: cargo install --path . --features acl"#
                 };
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
                 let remote = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_pool_size(&config, cli.parallel).await?,
+                    transport::ssh::SshTransport::with_timeout(
+                                &config,
+                                cli.parallel,
+                                Default::default(),
+                                std::time::Duration::from_secs(cli.timeout.unwrap_or(30)),
+                            ).await?,
                 );
                 let local =
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));

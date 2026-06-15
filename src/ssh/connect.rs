@@ -16,8 +16,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 3. Performs SSH handshake
 /// 4. Authenticates using available methods (keys, agent, password)
 pub async fn connect(config: &SshConfig) -> Result<Session> {
+    connect_with_timeout(config, DEFAULT_TIMEOUT).await
+}
+
+/// Connect to SSH with custom timeout
+pub async fn connect_with_timeout(config: &SshConfig, timeout: Duration) -> Result<Session> {
     // Establish TCP connection
-    let tcp = connect_tcp(&config.hostname, config.port).await?;
+    let tcp = connect_tcp(&config.hostname, config.port, timeout).await?;
 
     // Clone config data needed for authentication
     let username = config.user.clone();
@@ -35,7 +40,7 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
 
         // Keep session blocking for handshake and authentication
         // (we're already in spawn_blocking context)
-        session.set_timeout(DEFAULT_TIMEOUT.as_millis() as u32);
+        session.set_timeout(timeout.as_millis() as u32);
 
         // Set TCP stream
         session.set_tcp_stream(tcp);
@@ -116,10 +121,10 @@ pub async fn connect(config: &SshConfig) -> Result<Session> {
 }
 
 /// Establish TCP connection to SSH server
-async fn connect_tcp(hostname: &str, port: u16) -> Result<TcpStream> {
+async fn connect_tcp(hostname: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
     let addr = format!("{}:{}", hostname, port);
 
-    tokio::time::timeout(DEFAULT_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         TcpStream::connect(&addr).map_err(|e| {
             SyncError::Io(std::io::Error::new(
                 ErrorKind::ConnectionRefused,
