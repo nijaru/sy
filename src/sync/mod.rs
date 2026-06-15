@@ -91,6 +91,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
         prune_checksum_db: bool,
         dest_is_remote: bool,
         perf: bool,
+        // rsync-compat flags
+        remove_source_files: bool,
+        existing: bool,
+        dirs: bool,
+        backup: Option<String>,
+        backup_dir: Option<PathBuf>,
+        suffix: String,
+        partial: Option<String>,
+        partial_dir: Option<PathBuf>,
+        timeout: Option<u64>,
+        contimeout: Option<u64>,
+        rsh: Option<String>,
+        compress_level: Option<u8>,
+        itemize_changes: bool,
+        human_readable: bool,
+        stats: bool,
     ) -> Self {
         let config = SyncConfig {
             dry_run,
@@ -145,6 +161,22 @@ impl<T: Transport + 'static> SyncEngine<T> {
             clear_cache,
             dest_is_remote,
             perf,
+            // rsync-compat flags
+            remove_source_files,
+            existing,
+            dirs,
+            backup,
+            backup_dir,
+            suffix,
+            partial,
+            partial_dir,
+            timeout,
+            contimeout,
+            rsh,
+            compress_level,
+            itemize_changes,
+            human_readable,
+            stats,
         };
         Self::with_config(transport, config)
     }
@@ -802,6 +834,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
         if let Some(ref monitor) = self.perf_monitor {
             monitor.lock().unwrap().start_transfer();
         }
+
+        // Filter out Create tasks if --existing is set (only update existing files)
+        let tasks = if self.config.existing {
+            tasks.into_iter().filter(|t| !matches!(t.action, SyncAction::Create)).collect()
+        } else {
+            tasks
+        };
 
         // OPTIMIZATION: Pre-create all directories in batch before file transfers
         // This avoids N round-trips for N files (each file was creating its parent dir)
@@ -1503,6 +1542,31 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             tracing::warn!("Failed to prune checksum database: {}", e);
                         }
                     }
+                }
+            }
+        }
+
+        // Remove source files after successful transfer (--remove-source-files)
+        if self.config.remove_source_files && !self.config.dry_run && final_stats.errors.is_empty() {
+            let mut removed_count = 0;
+            for file in &source_files {
+                if file.is_dir {
+                    continue; // Skip directories
+                }
+                // Only remove files that were successfully transferred
+                if file.path.exists() {
+                    if let Err(e) = std::fs::remove_file(&*file.path) {
+                        tracing::warn!("Failed to remove source file {}: {}", file.path.display(), e);
+                    } else {
+                        removed_count += 1;
+                        tracing::debug!("Removed source file: {}", file.path.display());
+                    }
+                }
+            }
+            if removed_count > 0 {
+                tracing::info!("Removed {} source files after successful transfer", removed_count);
+                if !self.config.quiet && !self.config.json {
+                    println!("  Removed source files: {}", removed_count);
                 }
             }
         }
@@ -2451,6 +2515,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         )
     }
 
@@ -2562,6 +2642,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let stats = engine
@@ -2913,6 +3009,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -2993,6 +3105,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -3075,6 +3203,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -3154,6 +3298,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;

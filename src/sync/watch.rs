@@ -245,6 +245,22 @@ mod tests {
             false, // prune_checksum_db
             false, // dest_is_remote
             false, // perf
+            // rsync-compat flags
+            false, // remove_source_files
+            false, // existing
+            false, // dirs
+            None,  // backup
+            None,  // backup_dir
+            "~".to_string(), // suffix
+            None,  // partial
+            None,  // partial_dir
+            None,  // timeout
+            None,  // contimeout
+            None,  // rsh
+            None,  // compress_level
+            false, // itemize_changes
+            false, // human_readable
+            false, // stats
         );
 
         let watch_mode = WatchMode::new(engine, source, destination, Duration::from_millis(500));

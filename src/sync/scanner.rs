@@ -164,6 +164,7 @@ fn read_bsd_flags(_metadata: &std::fs::Metadata) -> Option<u32> {
 pub struct ScanOptions {
     pub respect_gitignore: bool,
     pub include_git_dir: bool,
+    pub dirs_only: bool, // --dirs: don't recurse into directories
 }
 
 impl Default for ScanOptions {
@@ -171,6 +172,7 @@ impl Default for ScanOptions {
         Self {
             respect_gitignore: false,
             include_git_dir: true,
+            dirs_only: false,
         }
     }
 }
@@ -399,6 +401,11 @@ impl Scanner {
             }
         }
 
+        // Set max_depth for --dirs mode (don't recurse into directories)
+        if self.options.dirs_only {
+            walker.max_depth(Some(1));
+        }
+
         // Determine whether to use parallel scanning
         // - If auto_select: check directory size (parallel has overhead for small dirs)
         // - If explicit threads: respect user's choice
@@ -566,6 +573,7 @@ mod tests {
         let scanner = Scanner::new(root).with_options(ScanOptions {
             respect_gitignore: true,
             include_git_dir: false,
+            dirs_only: false,
         });
         let entries = scanner.scan().unwrap();
 
@@ -611,6 +619,7 @@ mod tests {
         let scanner = Scanner::new(root).with_options(ScanOptions {
             respect_gitignore: true,
             include_git_dir: true,
+            dirs_only: false,
         });
         let entries = scanner.scan().unwrap();
 

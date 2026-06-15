@@ -677,6 +677,7 @@ impl Cli {
         ScanOptions {
             respect_gitignore,
             include_git_dir,
+            dirs_only: self.dirs,
         }
     }
 

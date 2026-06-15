@@ -2,6 +2,7 @@
 use crate::cli::SymlinkMode;
 use crate::filter::FilterEngine;
 use crate::integrity::ChecksumType;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -27,6 +28,22 @@ pub struct SyncConfig {
     pub clear_cache: bool,
     pub dest_is_remote: bool,
     pub perf: bool,
+    // rsync-compat flags
+    pub remove_source_files: bool,
+    pub existing: bool,
+    pub dirs: bool,
+    pub backup: Option<String>,
+    pub backup_dir: Option<PathBuf>,
+    pub suffix: String,
+    pub partial: Option<String>,
+    pub partial_dir: Option<PathBuf>,
+    pub timeout: Option<u64>,
+    pub contimeout: Option<u64>,
+    pub rsh: Option<String>,
+    pub compress_level: Option<u8>,
+    pub itemize_changes: bool,
+    pub human_readable: bool,
+    pub stats: bool,
 }
 
 impl SyncConfig {
@@ -60,6 +77,22 @@ impl SyncConfig {
             clear_cache: false,
             dest_is_remote: false,
             perf: false,
+            // rsync-compat flags
+            remove_source_files: false,
+            existing: false,
+            dirs: false,
+            backup: None,
+            backup_dir: None,
+            suffix: "~".to_string(),
+            partial: None,
+            partial_dir: None,
+            timeout: None,
+            contimeout: None,
+            rsh: None,
+            compress_level: None,
+            itemize_changes: false,
+            human_readable: false,
+            stats: false,
         }
     }
 }

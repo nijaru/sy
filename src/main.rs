@@ -429,6 +429,22 @@ Or install from local source with: cargo install --path . --features acl"#
         clear_cache: cli.clear_cache,
         dest_is_remote: destination.is_remote(),
         perf: cli.perf,
+        // rsync-compat flags
+        remove_source_files: cli.remove_source_files,
+        existing: cli.existing,
+        dirs: cli.dirs,
+        backup: cli.backup.clone(),
+        backup_dir: cli.backup_dir.clone(),
+        suffix: cli.suffix.clone(),
+        partial: cli.partial.clone(),
+        partial_dir: cli.partial_dir.clone(),
+        timeout: cli.timeout,
+        contimeout: cli.contimeout,
+        rsh: cli.rsh.clone(),
+        compress_level: cli.compress_level,
+        itemize_changes: cli.itemize_changes,
+        human_readable: cli.human_readable,
+        stats: cli.stats,
     };
 
     // Create SyncSession for strategy dispatch
