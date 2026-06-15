@@ -39,10 +39,15 @@ impl Compression {
 
 /// Compress data
 pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
+    compress_with_level(data, compression, None)
+}
+
+/// Compress data with optional level override
+pub fn compress_with_level(data: &[u8], compression: Compression, level: Option<u8>) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
         Compression::Lz4 => compress_lz4(data),
-        Compression::Zstd => compress_zstd(data),
+        Compression::Zstd => compress_zstd_with_level(data, level.unwrap_or(3) as i32),
     }
 }
 
@@ -100,9 +105,14 @@ fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+#[allow(dead_code)]
 fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
     // Level 3: 8.7 GB/s throughput (benchmarked), optimal balance
-    let mut encoder = zstd::Encoder::new(Vec::new(), 3)?;
+    compress_zstd_with_level(data, 3)
+}
+
+fn compress_zstd_with_level(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
+    let mut encoder = zstd::Encoder::new(Vec::new(), level)?;
     encoder.write_all(data)?;
     encoder.finish()
 }
