@@ -49,6 +49,26 @@ pub struct SyncEngine<T: Transport> {
     perf_monitor: Option<Arc<Mutex<PerformanceMonitor>>>,
 }
 
+/// Generate rsync-style itemization string for --itemize-changes
+/// Format: YXcstpoguax
+/// Y = file type, X = update type
+fn itemize_string(action: &crate::sync::strategy::SyncAction, is_dir: bool, is_symlink: bool) -> String {
+    let file_type = if is_dir {
+        'd'
+    } else if is_symlink {
+        'L'
+    } else {
+        'f'
+    };
+    let update_type = match action {
+        crate::sync::strategy::SyncAction::Create => '<',
+        crate::sync::strategy::SyncAction::Update => '>',
+        crate::sync::strategy::SyncAction::Delete => '*',
+        crate::sync::strategy::SyncAction::Skip => '.',
+    };
+    format!("{}{}..........", file_type, update_type)
+}
+
 impl<T: Transport + 'static> SyncEngine<T> {
     #[allow(clippy::too_many_arguments)]
     #[deprecated(note = "Use SyncEngine::with_config instead")]
@@ -1249,6 +1269,13 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         }
                         SyncAction::Delete => {
                             s.files_deleted += 1;
+
+                            // Itemize changes if --itemize-changes is set
+                            if self.config.itemize_changes {
+                                let item = itemize_string(&SyncAction::Delete, task.dest_path.is_dir(), false);
+                                println!("{} {}", item, task.dest_path.display());
+                            }
+
                             if self.config.dry_run && !task.dest_path.is_dir() {
                                 // Note: we don't have metadata here unless we checked it earlier
                                 // Simplified: we might miss bytes_would_delete accuracy in this refactor
@@ -1827,6 +1854,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             stats.bytes_transferred += bytes_written;
                                             stats.files_created += 1;
 
+                                            // Itemize changes if --itemize-changes is set
+                                            if self.config.itemize_changes {
+                                                let item = itemize_string(&SyncAction::Create, source.is_dir, source.is_symlink);
+                                                println!("{} {}", item, task.dest_path.display());
+                                            }
+
                                             if let Some(monitor) = &perf_monitor {
                                                 monitor.lock().unwrap().add_file_created();
                                                 monitor
@@ -1905,6 +1938,12 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                                 }
                                             }
                                             stats.files_updated += 1;
+
+                                            // Itemize changes if --itemize-changes is set
+                                            if self.config.itemize_changes {
+                                                let item = itemize_string(&SyncAction::Update, source.is_dir, source.is_symlink);
+                                                println!("{} {}", item, task.dest_path.display());
+                                            }
 
                                             if let Some(monitor) = &perf_monitor {
                                                 monitor.lock().unwrap().add_file_updated();
