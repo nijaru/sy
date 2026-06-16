@@ -761,4 +761,74 @@ mod tests {
         assert!(matches!(result, TaskResult::Created { bytes: 0 }));
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("empty.txt")).unwrap(), "");
     }
+
+    #[tokio::test]
+    async fn test_missing_source_for_create() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = test_executor(&source, &dest);
+
+        let task = SyncTask {
+            source: None, // Missing source
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing source"));
+    }
+
+    #[tokio::test]
+    async fn test_backup_config() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create source and dest files
+        std::fs::write(src_dir.path().join("test.txt"), "updated").unwrap();
+        std::fs::write(dst_dir.path().join("test.txt"), "old").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig {
+                mode: ChecksumType::Fast,
+                verify_on_write: false,
+                checksum_db: false,
+                clear_checksum_db: false,
+                prune_checksum_db: false,
+            },
+            4,
+        ).with_backup(BackupConfig {
+            enabled: true,
+            suffix: "~".to_string(),
+            dir: None,
+        });
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Update,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
+        
+        // Check backup was created
+        assert!(dst_dir.path().join("test.txt~").exists());
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt~")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
+    }
 }
