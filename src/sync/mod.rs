@@ -52,7 +52,7 @@ pub struct SyncEngine<T: Transport> {
 /// Generate rsync-style itemization string for --itemize-changes
 /// Format: YXcstpoguax
 /// Y = file type, X = update type
-fn itemize_string(action: &crate::sync::strategy::SyncAction, is_dir: bool, is_symlink: bool) -> String {
+pub(crate) fn itemize_string(action: &crate::sync::strategy::SyncAction, is_dir: bool, is_symlink: bool) -> String {
     let file_type = if is_dir {
         'd'
     } else if is_symlink {

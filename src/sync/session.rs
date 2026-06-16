@@ -14,24 +14,7 @@ use crate::endpoint::local::LocalEndpoint;
 use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
 use crate::sync::strategy::SyncAction;
-
-/// Generate rsync-style itemize string for a file change.
-fn itemize_string(action: &SyncAction, is_dir: bool, is_symlink: bool) -> String {
-    let file_type = if is_dir {
-        'd'
-    } else if is_symlink {
-        'L'
-    } else {
-        'f'
-    };
-    let update_type = match action {
-        SyncAction::Create => '<',
-        SyncAction::Update => '>',
-        SyncAction::Delete => '*',
-        SyncAction::Skip => '.',
-    };
-    format!("{}{}..........", file_type, update_type)
-}
+use crate::sync::itemize_string;
 use crate::ssh::config::SshConfig;
 use crate::sync::config::SyncConfig;
 use crate::sync::scanner::FileEntry;
