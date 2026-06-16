@@ -513,8 +513,18 @@ impl SyncSession {
 
                             let data = source_ep.read_file(&source_entry.relative_path).await?;
                             let meta = source_ep.metadata(&source_entry.relative_path).await?;
-                            dest_ep.write_file(&task.dest_path, &data, &meta).await?;
-                            stats.bytes_transferred += data.len() as u64;
+                            match dest_ep.write_file(&task.dest_path, &data, &meta).await {
+                                Ok(()) => {
+                                    stats.bytes_transferred += data.len() as u64;
+                                }
+                                Err(e) => {
+                                    // Clean up partial file on failure unless --partial
+                                    if self.config.partial.is_none() {
+                                        let _ = dest_ep.remove(&task.dest_path, false).await;
+                                    }
+                                    return Err(e);
+                                }
+                            }
                         }
 
                         // Copy xattrs if enabled
