@@ -491,6 +491,26 @@ impl SyncSession {
                             }
                         } else {
                             // Regular file copy
+                            // Backup existing file if configured
+                            if self.config.backup.is_some() && task.action == SyncAction::Update {
+                                let abs_dest = dest_ep.root().join(&*task.dest_path);
+                                if abs_dest.exists() {
+                                    let backup_path = abs_dest.with_extension(
+                                        format!("{}{}",
+                                            abs_dest.extension().unwrap_or_default().to_string_lossy(),
+                                            self.config.suffix
+                                        )
+                                    );
+                                    if let Some(ref dir) = self.config.backup_dir {
+                                        let file_name = abs_dest.file_name().unwrap();
+                                        let backup_path = dir.join(file_name);
+                                        let _ = std::fs::copy(&abs_dest, &backup_path);
+                                    } else {
+                                        let _ = std::fs::copy(&abs_dest, &backup_path);
+                                    }
+                                }
+                            }
+
                             let data = source_ep.read_file(&source_entry.relative_path).await?;
                             let meta = source_ep.metadata(&source_entry.relative_path).await?;
                             dest_ep.write_file(&task.dest_path, &data, &meta).await?;

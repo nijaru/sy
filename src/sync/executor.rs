@@ -41,6 +41,15 @@ pub struct TaskExecutor<'a> {
     preserve: PreserveConfig,
     verification: VerificationConfig,
     max_concurrent: usize,
+    backup: BackupConfig,
+}
+
+/// Configuration for backup behavior
+#[derive(Debug, Clone)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub suffix: String,
+    pub dir: Option<PathBuf>,
 }
 
 #[allow(dead_code)] // Wired in by main.rs rewrite (Phase 4 completion)
@@ -61,7 +70,18 @@ impl<'a> TaskExecutor<'a> {
             preserve,
             verification,
             max_concurrent,
+            backup: BackupConfig {
+                enabled: false,
+                suffix: "~".to_string(),
+                dir: None,
+            },
         }
+    }
+
+    /// Set backup configuration
+    pub fn with_backup(mut self, config: BackupConfig) -> Self {
+        self.backup = config;
+        self
     }
 
     /// Execute a single sync task.
@@ -124,6 +144,11 @@ impl<'a> TaskExecutor<'a> {
 
     /// Execute file copy with optional verification.
     async fn execute_file_copy(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+        // Backup existing file if configured
+        if self.backup.enabled && task.action == SyncAction::Update {
+            self.create_backup(&task.dest_path).await?;
+        }
+
         // Read source file
         let data = self.source.read_file(&source_entry.relative_path).await?;
         let meta = self.source.metadata(&source_entry.relative_path).await?;
@@ -148,6 +173,41 @@ impl<'a> TaskExecutor<'a> {
         } else {
             Ok(TaskResult::Updated { bytes })
         }
+    }
+
+    /// Create a backup of an existing file before overwriting.
+    async fn create_backup(&self, path: &Path) -> Result<()> {
+        if !self.dest.exists(path).await? {
+            return Ok(());
+        }
+
+        let backup_path = if let Some(ref dir) = self.backup.dir {
+            // Store backup in specified directory
+            let file_name = path.file_name()
+                .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
+            dir.join(format!("{}{}",
+                file_name.to_string_lossy(),
+                self.backup.suffix
+            ))
+        } else {
+            // Store backup next to original
+            let file_name = path.file_name()
+                .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
+            path.parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("{}{}",
+                    file_name.to_string_lossy(),
+                    self.backup.suffix
+                ))
+        };
+
+        // Copy the file (we can't rename cross-filesystem reliably)
+        let data = self.dest.read_file(path).await?;
+        let meta = self.dest.metadata(path).await?;
+        self.dest.write_file(&backup_path, &data, &meta).await?;
+
+        tracing::debug!("Backup created: {:?} -> {:?}", path, backup_path);
+        Ok(())
     }
 
     /// Execute a batch of tasks in parallel.
