@@ -122,7 +122,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         partial_dir: Option<PathBuf>,
         timeout: Option<u64>,
         contimeout: Option<u64>,
-        rsh: Option<String>,
         compress_level: Option<u8>,
         itemize_changes: bool,
         human_readable: bool,
@@ -192,7 +191,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             partial_dir,
             timeout,
             contimeout,
-            rsh,
             compress_level,
             itemize_changes,
             human_readable,
@@ -2565,7 +2563,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
@@ -2692,7 +2689,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
@@ -3059,7 +3055,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
@@ -3155,7 +3150,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
@@ -3253,7 +3247,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
@@ -3348,7 +3341,6 @@ mod tests {
             None,  // partial_dir
             None,  // timeout
             None,  // contimeout
-            None,  // rsh
             None,  // compress_level
             false, // itemize_changes
             false, // human_readable
