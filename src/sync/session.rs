@@ -13,11 +13,30 @@ use crate::endpoint::Endpoint;
 use crate::endpoint::local::LocalEndpoint;
 use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
+use crate::sync::strategy::SyncAction;
+
+/// Generate rsync-style itemize string for a file change.
+fn itemize_string(action: &SyncAction, is_dir: bool, is_symlink: bool) -> String {
+    let file_type = if is_dir {
+        'd'
+    } else if is_symlink {
+        'L'
+    } else {
+        'f'
+    };
+    let update_type = match action {
+        SyncAction::Create => '<',
+        SyncAction::Update => '>',
+        SyncAction::Delete => '*',
+        SyncAction::Skip => '.',
+    };
+    format!("{}{}..........", file_type, update_type)
+}
 use crate::ssh::config::SshConfig;
 use crate::sync::config::SyncConfig;
 use crate::sync::scanner::FileEntry;
 use crate::sync::stats::SyncStats;
-use crate::sync::strategy::{StrategyPlanner, SyncAction, SyncTask};
+use crate::sync::strategy::{StrategyPlanner, SyncTask};
 use crate::sync::scanner::ScanOptions;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -547,10 +566,28 @@ impl SyncSession {
                             }
                         }
 
+                        // Itemize changes if --itemize-changes is set
+                        if self.config.itemize_changes {
+                            let item = itemize_string(&task.action, source_entry.is_dir, source_entry.is_symlink);
+                            eprintln!("{} {}", item, task.dest_path.display());
+                        }
+
                         if task.action == SyncAction::Create {
                             stats.files_created += 1;
                         } else {
                             stats.files_updated += 1;
+                        }
+
+                        // Remove source file after successful transfer if --remove-source-files
+                        if self.config.remove_source_files {
+                            let abs_source = if source_path.is_absolute() {
+                                source_path.clone()
+                            } else {
+                                source_ep.root().join(&source_path)
+                            };
+                            if let Err(e) = std::fs::remove_file(&abs_source) {
+                                tracing::warn!("Failed to remove source {}: {}", abs_source.display(), e);
+                            }
                         }
                     }
                 }
@@ -568,6 +605,17 @@ impl SyncSession {
             if let Err(e) = cache.save(dest_ep.root()) {
                 tracing::warn!("Failed to save directory cache: {}", e);
             }
+        }
+        
+        // Print stats if --stats is set
+        if self.config.stats {
+            eprintln!("Transfer complete: {} created, {} updated, {} skipped, {} deleted, {:.2}s",
+                stats.files_created,
+                stats.files_updated,
+                stats.files_skipped,
+                stats.files_deleted,
+                stats.duration.as_secs_f64()
+            );
         }
         
         Ok(stats)
