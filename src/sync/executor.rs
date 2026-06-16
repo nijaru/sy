@@ -831,4 +831,76 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt~")).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_permission_denied_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create source file
+        std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
+
+        // Create read-only destination directory
+        let readonly_dir = dst_dir.path().join("readonly");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = test_executor(&source, &dest);
+
+        let entry = make_file_entry("readonly/test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: readonly_dir.join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await;
+        assert!(result.is_err(), "Should fail when destination is read-only");
+
+        // Restore permissions for cleanup
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_symlink_preserve() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create source file and symlink
+        std::fs::write(src_dir.path().join("target.txt"), "content").unwrap();
+        std::os::unix::fs::symlink("target.txt", src_dir.path().join("link.txt")).unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = test_executor(&source, &dest);
+
+        let entry = make_file_entry("link.txt", 0, false, true);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("link.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::SymlinkCreated));
+
+        // Verify symlink was created
+        let link_path = dst_dir.path().join("link.txt");
+        assert!(link_path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link_path).unwrap().to_str().unwrap(), "target.txt");
+    }
 }
