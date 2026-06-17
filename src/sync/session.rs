@@ -898,4 +898,169 @@ mod tests {
         let session = SyncSession::new(local, local2, test_config());
         assert_eq!(session.select_strategy(), SyncStrategy::DirectLocal);
     }
+
+    #[tokio::test]
+    async fn test_delete_threshold_enforcement() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create 10 source files
+        for i in 0..10 {
+            std::fs::write(src_dir.path().join(format!("file{}.txt", i)), "content").unwrap();
+        }
+
+        // Create 100 dest files (90 would be deleted)
+        for i in 0..100 {
+            std::fs::write(dst_dir.path().join(format!("old{}.txt", i)), "old").unwrap();
+        }
+
+        let config = SyncConfig {
+            delete: DeleteMode::Enabled { threshold: 50, force: false },
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config);
+
+        let result = session.sync().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("threshold") || err.contains("too many"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_threshold_force_override() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create 10 source files
+        for i in 0..10 {
+            std::fs::write(src_dir.path().join(format!("file{}.txt", i)), "content").unwrap();
+        }
+
+        // Create 100 dest files
+        for i in 0..100 {
+            std::fs::write(dst_dir.path().join(format!("old{}.txt", i)), "old").unwrap();
+        }
+
+        let config = SyncConfig {
+            delete: DeleteMode::Enabled { threshold: 50, force: true },
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config);
+
+        // Should succeed with force=true
+        let stats = session.sync().await.unwrap();
+        assert_eq!(stats.files_created, 10);
+        assert_eq!(stats.files_deleted, 100);
+    }
+
+    #[tokio::test]
+    async fn test_ignore_existing_filter() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create files in source
+        std::fs::write(src_dir.path().join("new.txt"), "new").unwrap();
+        std::fs::write(src_dir.path().join("existing.txt"), "updated").unwrap();
+
+        // Create existing.txt in dest
+        std::fs::write(dst_dir.path().join("existing.txt"), "old").unwrap();
+
+        let config = SyncConfig {
+            comparison: ComparisonConfig {
+                ignore_existing: true,
+                ..Default::default()
+            },
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config);
+
+        let stats = session.sync().await.unwrap();
+        // new.txt should be created, existing.txt should be skipped
+        assert_eq!(stats.files_created, 1);
+        assert!(dst_dir.path().join("new.txt").exists());
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("existing.txt")).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn test_dirs_only_filter() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create files and directories
+        std::fs::write(src_dir.path().join("file.txt"), "content").unwrap();
+        std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
+        std::fs::write(src_dir.path().join("subdir/nested.txt"), "nested").unwrap();
+
+        let config = SyncConfig {
+            dirs: true,
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config)
+            .with_scan_options(ScanOptions {
+                dirs_only: true,
+                ..Default::default()
+            });
+
+        let stats = session.sync().await.unwrap();
+        // Files in root should be synced, but nested files should not
+        assert!(dst_dir.path().join("file.txt").exists());
+        assert!(dst_dir.path().join("subdir").exists());
+        // Nested file should NOT be synced because dirs_only limits recursion
+        assert!(!dst_dir.path().join("subdir/nested.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_filter_engine_integration() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create files
+        std::fs::write(src_dir.path().join("include.txt"), "include").unwrap();
+        std::fs::write(src_dir.path().join("exclude.txt"), "exclude").unwrap();
+        std::fs::write(src_dir.path().join("exclude.log"), "log").unwrap();
+
+        let mut filter = crate::filter::FilterEngine::new();
+        filter.add_exclude("*.log").unwrap();
+
+        let config = SyncConfig {
+            filter_engine: filter,
+            ..test_config()
+        };
+
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, config);
+
+        let stats = session.sync().await.unwrap();
+        assert!(dst_dir.path().join("include.txt").exists());
+        assert!(dst_dir.path().join("exclude.txt").exists());
+        assert!(!dst_dir.path().join("exclude.log").exists());
+    }
+
+    #[tokio::test]
+    async fn test_error_handling_source_not_found() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Don't create any source files
+        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
+        let session = SyncSession::new(source, dest, test_config());
+
+        // Should succeed with 0 files
+        let stats = session.sync().await.unwrap();
+        assert_eq!(stats.files_scanned, 0);
+    }
 }
