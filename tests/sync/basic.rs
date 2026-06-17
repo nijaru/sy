@@ -927,3 +927,78 @@ fn test_bwlimit_flag() {
     // Check file is synced
     assert!(dest.path().join("large.txt").exists(), "File should be synced");
 }
+
+#[test]
+fn test_special_characters_in_filenames() {
+    let (source, dest) = setup_test_dir("special_chars");
+
+    // Create files with special characters
+    fs::write(source.path().join("file with spaces.txt"), "content").unwrap();
+    fs::write(source.path().join("file\twith\ttabs.txt"), "content").unwrap();
+    fs::write(source.path().join("file'with'quotes.txt"), "content").unwrap();
+    fs::write(source.path().join("file\"with\"doublequotes.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check all files are synced
+    assert!(dest.path().join("file with spaces.txt").exists(), "File with spaces should exist");
+    assert!(dest.path().join("file\twith\ttabs.txt").exists(), "File with tabs should exist");
+    assert!(dest.path().join("file'with'quotes.txt").exists(), "File with quotes should exist");
+    assert!(dest.path().join("file\"with\"doublequotes.txt").exists(), "File with double quotes should exist");
+}
+
+#[test]
+fn test_empty_files() {
+    let (source, dest) = setup_test_dir("empty_files");
+
+    // Create empty files
+    fs::write(source.path().join("empty.txt"), "").unwrap();
+    fs::create_dir(source.path().join("empty_dir")).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check empty files and dirs are synced
+    assert!(dest.path().join("empty.txt").exists(), "Empty file should exist");
+    assert!(dest.path().join("empty_dir").exists(), "Empty directory should exist");
+}
+
+#[test]
+fn test_long_filenames() {
+    let (source, dest) = setup_test_dir("long_filenames");
+
+    // Create file with long name
+    let long_name = "a".repeat(255);
+    fs::write(source.path().join(&long_name), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check file is synced
+    assert!(dest.path().join(&long_name).exists(), "Long filename file should exist");
+}
