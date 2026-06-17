@@ -382,7 +382,7 @@ Or install from local source with: cargo install --path . --features acl"#
         delete: if cli.delete {
             sync::DeleteMode::Enabled {
                 threshold: cli.max_delete,
-                force: false,
+                force: cli.force_delete,
             }
         } else {
             sync::DeleteMode::Disabled

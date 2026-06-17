@@ -347,28 +347,48 @@ impl SyncSession {
 
         // Add delete tasks if enabled
         let mut delete_count = 0usize;
-        if let crate::sync::config::DeleteMode::Enabled { .. } = self.config.delete {
+        if let crate::sync::config::DeleteMode::Enabled { threshold, force } = self.config.delete {
             let source_set: std::collections::HashSet<PathBuf> = source_entries
                 .iter()
                 .map(|e| (*e.relative_path).clone())
                 .collect();
 
+            // Collect deletions first for threshold check
+            let mut deletions = Vec::new();
             for dest_entry in &dest_entries {
                 if !source_set.contains(&*dest_entry.relative_path) {
                     // Apply filter engine to deletions too
                     if self.config.filter_engine.should_exclude(&dest_entry.relative_path, dest_entry.is_dir) {
                         continue;
                     }
-
-                    tasks.push(SyncTask {
-                        source: None,
-                        dest_path: self.dest.root().join(&*dest_entry.relative_path),
-                        action: SyncAction::Delete,
-                        source_checksum: None,
-                        dest_checksum: None,
-                    });
-                    delete_count += 1;
+                    deletions.push(dest_entry);
                 }
+            }
+
+            // Check deletion threshold
+            let dest_file_count = dest_entries.len();
+            if dest_file_count > 0 && !force {
+                let delete_percentage = (deletions.len() as f64 / dest_file_count as f64) * 100.0;
+                if delete_percentage > threshold as f64 {
+                    return Err(crate::error::SyncError::Io(std::io::Error::other(
+                        format!(
+                            "Deletion threshold exceeded: {:.1}% > {}% (use --force-delete to override)",
+                            delete_percentage, threshold
+                        )
+                    )));
+                }
+            }
+
+            // Create delete tasks
+            for dest_entry in deletions {
+                tasks.push(SyncTask {
+                    source: None,
+                    dest_path: self.dest.root().join(&*dest_entry.relative_path),
+                    action: SyncAction::Delete,
+                    source_checksum: None,
+                    dest_checksum: None,
+                });
+                delete_count += 1;
             }
         }
 
@@ -477,6 +497,32 @@ impl SyncSession {
         if dest_exists {
             let source_meta = tokio::fs::metadata(source).await?;
             if source_meta.len() > DELTA_THRESHOLD {
+                // Determine delta sync strategy
+                let supports_cow = crate::fs_util::supports_cow_reflinks(dest);
+                let same_fs = crate::fs_util::same_filesystem(source, dest);
+                let has_hardlinks = crate::fs_util::has_hard_links(dest);
+
+                let use_cow_strategy = supports_cow && same_fs && !has_hardlinks;
+
+                if use_cow_strategy {
+                    tracing::info!(
+                        "Delta sync strategy: COW (clone + selective writes) - filesystem supports COW reflinks"
+                    );
+                } else {
+                    let reason = if !supports_cow {
+                        "filesystem does not support COW reflinks"
+                    } else if !same_fs {
+                        "source and dest on different filesystems"
+                    } else {
+                        "destination has hard links (preserving link integrity)"
+                    };
+
+                    tracing::info!(
+                        "Delta sync strategy: in-place (full file rebuild) - {}",
+                        reason
+                    );
+                }
+
                 match crate::delta::estimate_change_ratio(
                     source,
                     dest,

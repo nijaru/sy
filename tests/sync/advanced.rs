@@ -37,7 +37,7 @@ fn test_compression_end_to_end() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--compress",
+            "--compress=auto",
         ])
         .output()
         .unwrap();
@@ -61,7 +61,7 @@ fn test_compression_skip_small_files() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--compress",
+            "--compress=auto",
         ])
         .output()
         .unwrap();
@@ -86,7 +86,7 @@ fn test_compression_skip_local() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--compress",
+            "--compress=auto",
         ])
         .output()
         .unwrap();

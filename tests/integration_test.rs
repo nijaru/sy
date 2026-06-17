@@ -451,7 +451,7 @@ fn test_directory_cache_created() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -516,7 +516,7 @@ fn test_directory_cache_persists() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -544,7 +544,7 @@ fn test_directory_cache_persists() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -572,7 +572,7 @@ fn test_directory_cache_clear() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -610,7 +610,7 @@ fn test_directory_cache_dry_run() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
             "--dry-run",
         ])
         .output()
@@ -637,7 +637,7 @@ fn test_directory_cache_updates_on_new_directories() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -661,7 +661,7 @@ fn test_directory_cache_updates_on_new_directories() {
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
