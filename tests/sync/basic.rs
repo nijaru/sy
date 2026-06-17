@@ -904,3 +904,26 @@ fn test_max_size_flag() {
     assert!(dest.path().join("small.txt").exists(), "Small file should be synced");
     assert!(!dest.path().join("large.txt").exists(), "Large file should not be synced");
 }
+
+#[test]
+fn test_bwlimit_flag() {
+    let (source, dest) = setup_test_dir("bwlimit");
+
+    // Create a large file
+    fs::write(source.path().join("large.txt"), "a".repeat(10000)).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--bwlimit=1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check file is synced
+    assert!(dest.path().join("large.txt").exists(), "File should be synced");
+}
