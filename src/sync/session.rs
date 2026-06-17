@@ -472,6 +472,47 @@ impl SyncSession {
         // Check if dest exists
         let dest_exists = tokio::fs::metadata(dest).await.is_ok();
 
+        // Check change ratio for large files (above 10MB delta threshold)
+        const DELTA_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+        if dest_exists {
+            let source_meta = tokio::fs::metadata(source).await?;
+            if source_meta.len() > DELTA_THRESHOLD {
+                match crate::delta::estimate_change_ratio(
+                    source,
+                    dest,
+                    64 * 1024, // 64KB blocks
+                    Some(20),  // Sample 20 blocks
+                    Some(0.75), // 75% threshold
+                ) {
+                    Ok(ratio) => {
+                        tracing::info!(
+                            "Change ratio: {}/{} blocks changed ({:.1}%)",
+                            ratio.blocks_changed,
+                            ratio.blocks_sampled,
+                            ratio.change_ratio * 100.0
+                        );
+
+                        if ratio.use_delta {
+                            tracing::info!(
+                                "Change ratio {:.1}% below threshold {:.1}%, using delta sync",
+                                ratio.change_ratio * 100.0,
+                                ratio.threshold * 100.0
+                            );
+                        } else {
+                            tracing::info!(
+                                "Change ratio {:.1}% exceeds threshold {:.1}%, using full copy",
+                                ratio.change_ratio * 100.0,
+                                ratio.threshold * 100.0
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Change ratio detection failed: {}", e);
+                    }
+                }
+            }
+        }
+
         // Read source file
         let data = source_ep.read_file(Path::new(source_filename)).await?;
         let meta = source_ep.metadata(Path::new(source_filename)).await?;

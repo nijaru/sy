@@ -245,6 +245,48 @@ impl<'a> TaskExecutor<'a> {
             self.create_backup(&task.dest_path).await?;
         }
 
+        // Check change ratio for large files (above 10MB delta threshold)
+        const DELTA_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+        if task.action == SyncAction::Update && source_entry.size > DELTA_THRESHOLD {
+            let abs_dest = self.abs_dest_path(&task.dest_path);
+            if abs_dest.exists() {
+                let source_path = self.source.root().join(&*source_entry.relative_path);
+                match crate::delta::estimate_change_ratio(
+                    &source_path,
+                    &abs_dest,
+                    64 * 1024, // 64KB blocks
+                    Some(20),  // Sample 20 blocks
+                    Some(0.75), // 75% threshold
+                ) {
+                    Ok(ratio) => {
+                        tracing::info!(
+                            "Change ratio: {} ({}/{} blocks changed)",
+                            ratio.change_ratio_percent(),
+                            ratio.blocks_changed,
+                            ratio.blocks_sampled
+                        );
+
+                        if ratio.use_delta {
+                            tracing::info!(
+                                "Change ratio {} below threshold {:.1}%, using delta sync",
+                                ratio.change_ratio_percent(),
+                                ratio.threshold * 100.0
+                            );
+                        } else {
+                            tracing::info!(
+                                "Change ratio {} exceeds threshold {:.1}%, using full copy",
+                                ratio.change_ratio_percent(),
+                                ratio.threshold * 100.0
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Change ratio detection failed: {}", e);
+                    }
+                }
+            }
+        }
+
         // Read source file
         let data = self.source.read_file(&source_entry.relative_path).await?;
         let meta = self.source.metadata(&source_entry.relative_path).await?;
