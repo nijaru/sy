@@ -195,7 +195,12 @@ impl<'a> TaskExecutor<'a> {
                 eprintln!("{} {}", item, task.dest_path.display());
             }
 
-            Ok(TaskResult::SymlinkCreated)
+            // Return appropriate result based on action
+            if task.action == SyncAction::Create {
+                Ok(TaskResult::SymlinkCreated)
+            } else {
+                Ok(TaskResult::Updated { bytes: 0 })
+            }
         }
         #[cfg(not(unix))]
         {
@@ -386,17 +391,6 @@ impl<'a> TaskExecutor<'a> {
         }
 
         stats.duration = start.elapsed();
-
-        // Print stats if configured
-        if self.config.print_stats {
-            eprintln!("Transfer complete: {} created, {} updated, {} skipped, {} deleted, {:.2}s",
-                stats.files_created,
-                stats.files_updated,
-                stats.files_skipped,
-                stats.files_deleted,
-                stats.duration.as_secs_f64()
-            );
-        }
 
         Ok(stats)
     }

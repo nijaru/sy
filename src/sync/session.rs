@@ -429,6 +429,7 @@ impl SyncSession {
         // Execute tasks using TaskExecutor
         let mut stats = executor.execute_batch(tasks).await?;
         stats.files_scanned = source_count as u64;
+        stats.duration = start.elapsed(); // Include scan/plan time
         
         // Save directory cache if enabled
         if let Some(ref cache) = dir_cache {
