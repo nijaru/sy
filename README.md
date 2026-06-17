@@ -1,115 +1,190 @@
 # sy
 
-> Fast, modern file sync — rsync's mental model, Rust performance, sane defaults.
+[![CI](https://github.com/nijaru/sy/actions/workflows/ci.yml/badge.svg)](https://github.com/nijaru/sy/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[![CI](https://github.com/nijaru/sy/workflows/CI/badge.svg)](https://github.com/nijaru/sy/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Fast file synchronization. Same mental model as rsync, built in Rust.
+
+## Install
+
+```bash
+cargo install sy
+```
 
 ## Quick Start
 
 ```bash
+# Basic sync
 sy /source /destination
-```
 
-Same trailing-slash semantics as rsync: `/source` copies the directory, `/source/` copies contents only.
+# Preview changes
+sy /source /destination --dry-run
 
-## What sy Does Well
+# Mirror (delete extra files)
+sy /source /destination --delete
 
-| Scenario | sy vs rsync | Why |
-|----------|-------------|-----|
-| Local sync (repeated) | 2-3x faster | Delta sync + parallel workers |
-| Large files on COW FS | 40x+ faster | Reflink copies on APFS/BTRFS/XFS |
-| Many files over SSH | 2x faster | Streaming protocol, 1 round-trip |
-| Mixed local workloads | 2x faster | Parallel scan, hash, transfer |
-
-## Where rsync Is Still Fine
-
-- First-time local sync of small files (~1.1x faster)
-- Incremental SSH updates (~1.3x faster — closing this gap is the v0.4 focus)
-- rsync's massive flag set and ecosystem integrations
-
-sy doesn't try to be wire-compatible with rsync. It's a modern tool that covers the same mental model for the common case.
-
-## Installation
-
-### Homebrew (macOS)
-
-```bash
-brew tap nijaru/tap
-brew install sy
-```
-
-### From crates.io
-
-```bash
-cargo install sy
-
-# Optional features
-cargo install sy --features acl    # ACL preservation (Linux: requires libacl)
-cargo install sy --features s3     # S3 support (experimental)
-```
-
-### From Source
-
-```bash
-git clone https://github.com/nijaru/sy.git
-cd sy
-cargo install --path .
-```
-
-**For SSH sync:** Install sy on both local and remote machines.
-
-## Usage
-
-```bash
-# Basic
-sy ~/project ~/backup                    # Local backup
-sy ~/src ~/dest --delete                 # Mirror (remove extra files)
-sy /source /dest --dry-run               # Preview changes
-
-# Remote
-sy /local user@host:/remote              # SSH sync
-sy /local user@host:/backup --bwlimit 1MB
-
-# Verification
-sy ~/src ~/dest --verify                 # Verify writes (xxHash3)
-sy ~/backup ~/original --verify-only     # Audit existing files
-
-# Filters
-sy ~/src ~/dest --exclude "*.log"
-sy ~/src ~/dest --gitignore --exclude-vcs
-
-# Advanced
-sy --bidirectional /laptop /backup       # Two-way sync
-sy ~/dev /backup --watch                 # Continuous sync
-sy ~/src ~/dest -j 1                     # Sequential (many tiny files)
+# Remote sync via SSH
+sy /local user@host:/remote
+sy user@host:/remote /local
 ```
 
 ## Features
 
-- **Delta sync** — Only transfers changed bytes (rsync algorithm)
-- **Parallel transfers** — Configurable worker count (`-j`)
-- **Streaming SSH** — Binary protocol, 1 round-trip delta, zstd compression
-- **COW-aware** — Reflink copies on APFS/BTRFS/XFS (40x+ faster for large files)
-- **Resume support** — Automatically resumes interrupted syncs
-- **Integrity verification** — Optional xxHash3 checksums (`--verify`)
-- **Bidirectional sync** — Two-way sync with conflict resolution
-- **Watch mode** — Continuous file monitoring
-- **S3 support** — AWS S3, Cloudflare R2, Backblaze B2 (experimental)
-- **Metadata preservation** — Symlinks, permissions, xattrs, ACLs
+- **Fast** — 8-11x faster than rsync on local sync (see [benchmarks](#benchmarks))
+- **Parallel** — uses all cores by default, `-j 1` to limit
+- **Delta sync** — only transfers changed blocks for large files
+- **COW support** — reflink copies on APFS/Btrfs/XFS
+- **rsync-compatible flags** — `--delete`, `--exclude`, `--compress`, `--progress`, etc.
+- **SSH sync** — streaming protocol over SSH stdin/stdout
+- **Integrity** — BLAKE3 checksums, xxHash3 verification
 
-## Platform Support
+## Usage
 
-| Platform | Status |
-|----------|--------|
-| macOS | Fully tested |
-| Linux | Fully tested |
-| Windows | Untested (should compile) |
+```
+sy [OPTIONS] <SOURCE> <DESTINATION>
+```
+
+### Common Flags
+
+| Flag | Description |
+|------|-------------|
+| `-n, --dry-run` | Preview changes without applying |
+| `-d, --delete` | Delete files not in source |
+| `-v, --verbose` | Increase verbosity (repeatable) |
+| `-q, --quiet` | Suppress output |
+| `--progress` | Show progress for large files |
+| `--stats` | Show transfer statistics |
+| `--exclude <PATTERN>` | Exclude files matching pattern |
+| `--compress <MODE>` | Compression: auto, always, never |
+| `-j, --max-concurrent <N>` | Parallel transfers (default: all cores) |
+| `--bwlimit <RATE>` | Bandwidth limit (e.g., 1MB, 500KB) |
+
+### Sync Modes
+
+```bash
+# Mirror mode
+sy /source /dest --delete
+
+# Update only (skip newer dest files)
+sy /source /dest --update
+
+# Existing only (don't create new files)
+sy /source /dest --existing
+
+# Directories only (no recursion)
+sy /source /dest --dirs
+```
+
+### Remote Sync
+
+```bash
+# Push to remote
+sy /local user@host:/remote
+
+# Pull from remote
+sy user@host:/remote /local
+
+# With SSH options
+sy /local user@host:/remote --timeout 30
+```
+
+### Filters
+
+```bash
+# Exclude patterns
+sy /source /dest --exclude "*.log" --exclude ".git"
+
+# Exclude from file
+sy /source /dest --exclude-from .syignore
+
+# Include specific patterns
+sy /source /dest --exclude "*" --include "*.rs"
+```
+
+### Backup & Safety
+
+```bash
+# Backup before overwrite
+sy /source /dest --backup
+
+# Custom backup directory
+sy /source /dest --backup --backup-dir /backups
+
+# Custom suffix
+sy /source /dest --backup --suffix .bak
+
+# Force delete when threshold exceeded
+sy /source /dest --delete --force-delete
+```
+
+### Verification
+
+```bash
+# Verify after write
+sy /source /dest --verify
+
+# Show itemized changes
+sy /source /dest --itemize-changes
+```
+
+## Benchmarks
+
+Tested on macOS M3 Max with NVMe storage:
+
+| Scenario | sy | rsync | Speedup |
+|----------|-----|-------|---------|
+| 1000 × 1KB files | 189ms | 237ms | 1.25× |
+| 10 × 10MB files | 29ms | 330ms | 11.5× |
+| 1 × 100MB file | 38ms | 324ms | 8.6× |
+| Incremental (no changes) | 33ms | 63ms | 1.9× |
+
+Run benchmarks yourself:
+
+```bash
+cargo bench
+```
+
+## Configuration
+
+sy reads `~/.config/sy/config.toml` for defaults:
+
+```toml
+# Example config
+max_concurrent = 8
+compress = "auto"
+exclude = [".git", "node_modules", "*.pyc"]
+```
+
+## Comparison to rsync
+
+| Feature | sy | rsync |
+|---------|-----|-------|
+| Local sync speed | Fast (parallel) | Sequential |
+| Delta sync | Yes (xxHash3) | Yes (MD4) |
+| COW reflinks | Yes | No |
+| SSH sync | Yes | Yes |
+| Wire protocol | Custom | rsync protocol |
+| Incremental | Yes | Yes |
+| Compression | zstd | zlib |
+
+**sy is not a drop-in rsync replacement.** It uses the same mental model but a different protocol. For rsync-to-rsync compatibility, use rsync.
 
 ## Contributing
 
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+# Build
+cargo build
+
+# Test
+cargo test
+
+# Lint
+cargo clippy -- -D warnings
+
+# Format
+cargo fmt --check
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
