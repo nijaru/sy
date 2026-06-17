@@ -596,3 +596,103 @@ fn test_remote_destination_computation_with_trailing_slash() {
     let effective_dest = compute_test_destination(&source, &dest);
     assert_eq!(effective_dest, std::path::PathBuf::from("/target"));
 }
+
+#[test]
+fn test_itemize_changes() {
+    let (source, dest) = setup_test_dir("itemize");
+
+    // Create a file
+    fs::write(source.path().join("new.txt"), "content").unwrap();
+
+    // Sync with --itemize-changes
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--itemize-changes",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check itemize output in stdout
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("f"), "Expected itemize output in stdout: {}", stdout);
+}
+
+#[test]
+fn test_stats_flag() {
+    let (source, dest) = setup_test_dir("stats");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--stats",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check stats output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Files scanned:"), "Expected stats in stdout: {}", stdout);
+    assert!(stdout.contains("Files created:"), "Expected stats in stdout: {}", stdout);
+}
+
+#[test]
+fn test_backup_flag() {
+    let (source, dest) = setup_test_dir("backup");
+
+    // Create initial file in dest
+    fs::write(dest.path().join("file.txt"), "old content").unwrap();
+    
+    // Wait to ensure source is newer
+    thread::sleep(Duration::from_secs(2));
+    
+    // Create updated file in source
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check backup file exists
+    assert!(dest.path().join("file.txt~").exists(), "Backup file should exist");
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+}
+
+#[test]
+fn test_partial_flag() {
+    let (source, dest) = setup_test_dir("partial");
+
+    // Create a file in source
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Sync without --partial (default behavior)
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(dest.path().join("file.txt").exists());
+}
