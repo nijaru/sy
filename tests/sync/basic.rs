@@ -696,3 +696,86 @@ fn test_partial_flag() {
     assert!(output.status.success());
     assert!(dest.path().join("file.txt").exists());
 }
+
+#[test]
+fn test_remove_source_files() {
+    let (source, dest) = setup_test_dir("remove_source");
+
+    // Create a file in source
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--remove-source-files",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check source file is removed
+    assert!(!source.path().join("file.txt").exists(), "Source file should be removed");
+    
+    // Check dest file exists
+    assert!(dest.path().join("file.txt").exists(), "Dest file should exist");
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "content");
+}
+
+#[test]
+fn test_existing_flag() {
+    let (source, dest) = setup_test_dir("existing");
+
+    // Create files in source
+    fs::write(source.path().join("existing.txt"), "content").unwrap();
+    fs::write(source.path().join("new.txt"), "content").unwrap();
+
+    // Create one file in dest
+    fs::write(dest.path().join("existing.txt"), "old content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--existing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check only existing file was updated
+    assert!(dest.path().join("existing.txt").exists(), "Existing file should be updated");
+    assert!(!dest.path().join("new.txt").exists(), "New file should not be created");
+}
+
+#[test]
+fn test_ignore_existing_flag() {
+    let (source, dest) = setup_test_dir("ignore_existing");
+
+    // Create files in source
+    fs::write(source.path().join("existing.txt"), "new content").unwrap();
+    fs::write(source.path().join("new.txt"), "content").unwrap();
+
+    // Create one file in dest
+    fs::write(dest.path().join("existing.txt"), "old content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--ignore-existing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check only new file was created
+    assert_eq!(fs::read_to_string(dest.path().join("existing.txt")).unwrap(), "old content");
+    assert!(dest.path().join("new.txt").exists(), "New file should be created");
+}
