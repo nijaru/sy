@@ -3,6 +3,7 @@
 //! Covers: basic sync, dry run, delete mode, nested dirs, quiet mode, error handling.
 
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1046,4 +1047,95 @@ fn test_concurrent_sync_safety() {
     // Check files exist
     assert!(dest.path().join("file1.txt").exists(), "File1 should exist");
     assert!(dest.path().join("file2.txt").exists(), "File2 should exist");
+}
+
+#[test]
+fn test_backup_dir_flag() {
+    let (source, dest) = setup_test_dir("backup_dir");
+
+    // Create initial file in dest
+    fs::write(dest.path().join("file.txt"), "old content").unwrap();
+    
+    // Wait to ensure source is newer
+    thread::sleep(Duration::from_secs(2));
+    
+    // Create updated file in source
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    let backup_dir = dest.path().join("backups");
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            &format!("--backup-dir={}", backup_dir.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check backup file exists in backup dir
+    assert!(backup_dir.join("file.txt~").exists(), "Backup file should exist in backup dir");
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+}
+
+#[test]
+fn test_times_flag() {
+    let (source, dest) = setup_test_dir("times");
+
+    // Create a file
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--preserve-times",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check file exists
+    assert!(dest.path().join("file.txt").exists(), "File should exist");
+    
+    // Check mtime is preserved (within tolerance)
+    let src_meta = fs::metadata(source.path().join("file.txt")).unwrap();
+    let dst_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
+    let src_mtime = src_meta.modified().unwrap();
+    let dst_mtime = dst_meta.modified().unwrap();
+    let diff = src_mtime.duration_since(dst_mtime).unwrap_or_else(|_| dst_mtime.duration_since(src_mtime).unwrap());
+    assert!(diff.as_secs() <= 1, "Mtime should be preserved (diff: {}s)", diff.as_secs());
+}
+
+#[test]
+fn test_perms_flag() {
+    let (source, dest) = setup_test_dir("perms");
+
+    // Create a file
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--preserve-permissions",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check file exists
+    assert!(dest.path().join("file.txt").exists(), "File should exist");
+    
+    // Check permissions are preserved
+    let src_meta = fs::metadata(source.path().join("file.txt")).unwrap();
+    let dst_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
+    assert_eq!(src_meta.permissions().mode(), dst_meta.permissions().mode(), "Permissions should be preserved");
 }
