@@ -510,10 +510,12 @@ pub struct Cli {
     #[arg(long, default_value = "newer")]
     pub conflict_resolve: String,
 
-    /// Maximum percentage of files that can be deleted in bidirectional sync (0-100)
-    /// Set to 0 for unlimited deletions (default: 50)
-    #[arg(long, default_value = "50")]
-    pub max_delete: u8,
+    /// Maximum deletions allowed
+    /// - Absolute count: --max-delete=1000
+    /// - Percentage: --max-delete=50%
+    /// - 0 = unlimited (default: 50%)
+    #[arg(long, default_value = "50%")]
+    pub max_delete: String,
 
     /// Clear bidirectional sync state before syncing
     /// Forces full comparison instead of using cached state
@@ -583,12 +585,15 @@ impl Cli {
 
         // Bidirectional sync validation
         if self.bidirectional {
-            // Validate max_delete percentage
-            if self.max_delete > 100 {
-                anyhow::bail!(
-                    "--max-delete must be between 0 and 100 (got: {})",
-                    self.max_delete
-                );
+            // Validate max_delete format
+            if !self.max_delete.ends_with('%') {
+                // Absolute count - must be a number
+                if self.max_delete.parse::<u64>().is_err() {
+                    anyhow::bail!(
+                        "--max-delete must be a number or percentage (got: '{}'). Use '50%' for percentage or '1000' for absolute count.",
+                        self.max_delete
+                    );
+                }
             }
 
             // Validate conflict resolution strategy

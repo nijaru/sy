@@ -380,8 +380,14 @@ Or install from local source with: cargo install --path . --features acl"#
         dry_run: cli.dry_run,
         diff_mode: cli.diff,
         delete: if cli.delete {
+            let threshold = if cli.max_delete.ends_with('%') {
+                cli.max_delete.trim_end_matches('%').parse::<u8>().unwrap_or(50)
+            } else {
+                // For absolute counts, we'll use 100% (no threshold) since the limit is handled elsewhere
+                100
+            };
             sync::DeleteMode::Enabled {
-                threshold: cli.max_delete,
+                threshold,
                 force: cli.force_delete,
             }
         } else {
@@ -719,10 +725,16 @@ Or install from local source with: cargo install --path . --features acl"#
         };
 
         let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
+        let max_delete_percent = if cli.max_delete.ends_with('%') {
+            cli.max_delete.trim_end_matches('%').parse::<u8>().unwrap_or(50)
+        } else {
+            // For absolute counts, convert to percentage (assuming 100% means no limit)
+            100
+        };
         let bisync_opts = bisync::BisyncOptions {
             conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
                 .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,
-            max_delete_percent: cli.max_delete,
+            max_delete_percent,
             dry_run: cli.dry_run,
             clear_state: cli.clear_bisync_state,
             force_resync: cli.force_resync,
