@@ -14,7 +14,7 @@ use crate::endpoint::local::LocalEndpoint;
 use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
 use crate::sync::strategy::SyncAction;
-use crate::sync::itemize_string;
+use crate::sync::executor::TaskExecutor;
 use crate::ssh::config::SshConfig;
 use crate::sync::config::SyncConfig;
 use crate::sync::scanner::FileEntry;
@@ -398,190 +398,37 @@ impl SyncSession {
             });
         }
 
-        let mut stats = SyncStats {
-            files_scanned: source_count as u64,
-            ..Default::default()
-        };
+        // Create TaskExecutor with config from SyncConfig
+        let executor = TaskExecutor::new(
+            source_ep,
+            dest_ep,
+            false, // dry_run handled above
+            self.config.preserve.clone(),
+            crate::sync::config::VerificationConfig {
+                mode: self.config.verification.mode.clone(),
+                verify_on_write: self.config.verification.verify_on_write,
+                checksum_db: self.config.verification.checksum_db,
+                clear_checksum_db: self.config.verification.clear_checksum_db,
+                prune_checksum_db: self.config.verification.prune_checksum_db,
+            },
+            self.config.max_concurrent,
+        ).with_backup(crate::sync::executor::BackupConfig {
+            enabled: self.config.backup.is_some(),
+            suffix: self.config.suffix.clone(),
+            dir: self.config.backup_dir.clone(),
+        }).with_config(crate::sync::executor::ExecuteConfig {
+            preserve_hardlinks: self.config.preserve.hardlinks,
+            preserve_xattrs: self.config.preserve.xattrs,
+            preserve_dir_permissions: self.config.preserve.permissions,
+            keep_partial: self.config.partial.is_some(),
+            itemize_changes: self.config.itemize_changes,
+            remove_source_files: self.config.remove_source_files,
+            print_stats: self.config.stats,
+        });
 
-        // Track inodes for hard link preservation
-        let mut hardlink_map: std::collections::HashMap<u64, PathBuf> = std::collections::HashMap::new();
-
-        for task in &tasks {
-            match task.action {
-                SyncAction::Skip => {
-                    stats.files_skipped += 1;
-                }
-                SyncAction::Create | SyncAction::Update => {
-                    let source_entry = task.source.as_ref()
-                        .ok_or_else(|| SyncError::Io(std::io::Error::other("Missing source for create/update")))?;
-                    let source_path = source_ep.root().join(&*source_entry.relative_path);
-
-                    if source_entry.is_dir {
-                        dest_ep.create_dir_all(&task.dest_path).await?;
-                        
-                        // Preserve directory permissions if enabled
-                        #[cfg(unix)]
-                        if self.config.preserve.permissions {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(meta) = std::fs::metadata(&source_path) {
-                                let mode = meta.permissions().mode();
-                                let abs_dest = if task.dest_path.is_absolute() {
-                                    task.dest_path.clone()
-                                } else {
-                                    dest_ep.root().join(&*task.dest_path)
-                                };
-                                let _ = std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode));
-                            }
-                        }
-                        
-                        stats.dirs_created += 1;
-                    } else if source_entry.is_symlink {
-                        // Read symlink target
-                        #[cfg(unix)]
-                        {
-                            // Resolve absolute path for read_link
-                            let abs_source = if source_path.is_absolute() {
-                                source_path.clone()
-                            } else {
-                                source_ep.root().join(&source_path)
-                            };
-                            let target = std::fs::read_link(&abs_source)?;
-                            // Remove existing file/symlink before creating
-                            if task.action == SyncAction::Update {
-                                dest_ep.remove(&task.dest_path, false).await?;
-                            }
-                            dest_ep.create_symlink(&target, &task.dest_path).await?;
-                            if task.action == SyncAction::Create {
-                                stats.symlinks_created += 1;
-                            } else {
-                                stats.files_updated += 1;
-                            }
-                        }
-                    } else {
-                        // Check if this is a hard link that's already been copied
-                        let is_hardlink = self.config.preserve.hardlinks
-                            && source_entry.nlink > 1;
-                        
-                        if is_hardlink {
-                            if let Some(inode) = source_entry.inode {
-                                if let Some(first_path) = hardlink_map.get(&inode) {
-                                    // Remove existing file before creating hard link
-                                    if task.action == SyncAction::Update {
-                                        dest_ep.remove(&task.dest_path, false).await?;
-                                    }
-                                    // Create hard link to first copy
-                                    dest_ep.create_hardlink(first_path, &task.dest_path).await?;
-                                    if task.action == SyncAction::Create {
-                                        stats.files_created += 1;
-                                    } else {
-                                        stats.files_updated += 1;
-                                    }
-                                    continue;
-                                }
-                                // First copy of this inode - copy normally and record
-                                let data = source_ep.read_file(&source_entry.relative_path).await?;
-                                let meta = source_ep.metadata(&source_entry.relative_path).await?;
-                                dest_ep.write_file(&task.dest_path, &data, &meta).await?;
-                                stats.bytes_transferred += data.len() as u64;
-                                hardlink_map.insert(inode, task.dest_path.clone());
-                            } else {
-                                // No inode info - copy normally
-                                let data = source_ep.read_file(&source_entry.relative_path).await?;
-                                let meta = source_ep.metadata(&source_entry.relative_path).await?;
-                                dest_ep.write_file(&task.dest_path, &data, &meta).await?;
-                                stats.bytes_transferred += data.len() as u64;
-                            }
-                        } else {
-                            // Regular file copy
-                            // Backup existing file if configured
-                            if self.config.backup.is_some() && task.action == SyncAction::Update {
-                                let abs_dest = dest_ep.root().join(&*task.dest_path);
-                                if abs_dest.exists() {
-                                    let backup_path = abs_dest.with_extension(
-                                        format!("{}{}",
-                                            abs_dest.extension().unwrap_or_default().to_string_lossy(),
-                                            self.config.suffix
-                                        )
-                                    );
-                                    if let Some(ref dir) = self.config.backup_dir {
-                                        let file_name = abs_dest.file_name().unwrap();
-                                        let backup_path = dir.join(file_name);
-                                        let _ = std::fs::copy(&abs_dest, &backup_path);
-                                    } else {
-                                        let _ = std::fs::copy(&abs_dest, &backup_path);
-                                    }
-                                }
-                            }
-
-                            let data = source_ep.read_file(&source_entry.relative_path).await?;
-                            let meta = source_ep.metadata(&source_entry.relative_path).await?;
-                            match dest_ep.write_file(&task.dest_path, &data, &meta).await {
-                                Ok(()) => {
-                                    stats.bytes_transferred += data.len() as u64;
-                                }
-                                Err(e) => {
-                                    // Clean up partial file on failure unless --partial
-                                    if self.config.partial.is_none() {
-                                        let _ = dest_ep.remove(&task.dest_path, false).await;
-                                    }
-                                    return Err(e);
-                                }
-                            }
-                        }
-
-                        // Copy xattrs if enabled
-                        if self.config.preserve.xattrs {
-                            #[cfg(unix)]
-                            {
-                                let abs_source = if source_path.is_absolute() {
-                                    source_path.clone()
-                                } else {
-                                    source_ep.root().join(&source_path)
-                                };
-                                if let Ok(xattrs) = xattr::list(&abs_source) {
-                                    for attr in xattrs {
-                                        if let Ok(Some(val)) = xattr::get(&abs_source, &attr) {
-                                            let abs_dest = dest_ep.root().join(&*task.dest_path);
-                                            let _ = xattr::set(&abs_dest, &attr, &val);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Itemize changes if --itemize-changes is set
-                        if self.config.itemize_changes {
-                            let item = itemize_string(&task.action, source_entry.is_dir, source_entry.is_symlink);
-                            eprintln!("{} {}", item, task.dest_path.display());
-                        }
-
-                        if task.action == SyncAction::Create {
-                            stats.files_created += 1;
-                        } else {
-                            stats.files_updated += 1;
-                        }
-
-                        // Remove source file after successful transfer if --remove-source-files
-                        if self.config.remove_source_files {
-                            let abs_source = if source_path.is_absolute() {
-                                source_path.clone()
-                            } else {
-                                source_ep.root().join(&source_path)
-                            };
-                            if let Err(e) = std::fs::remove_file(&abs_source) {
-                                tracing::warn!("Failed to remove source {}: {}", abs_source.display(), e);
-                            }
-                        }
-                    }
-                }
-                SyncAction::Delete => {
-                    dest_ep.remove(&task.dest_path, true).await?;
-                    stats.files_deleted += 1;
-                }
-            }
-        }
-
-        stats.duration = start.elapsed();
+        // Execute tasks using TaskExecutor
+        let mut stats = executor.execute_batch(tasks).await?;
+        stats.files_scanned = source_count as u64;
         
         // Save directory cache if enabled
         if let Some(ref cache) = dir_cache {

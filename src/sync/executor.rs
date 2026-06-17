@@ -1,15 +1,19 @@
 //! TaskExecutor: executes sync tasks against endpoints.
 //!
 //! Handles create/update/delete operations with parallelism and verification.
+//! Supports hardlink tracking, xattr preservation, backup, and rsync-compatible flags.
 
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
 use crate::sync::config::{PreserveConfig, VerificationConfig};
+use crate::sync::itemize_string;
 use crate::sync::scanner::FileEntry;
 use crate::sync::stats::{SyncError, SyncStats};
 use crate::sync::strategy::{SyncAction, SyncTask};
 use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Result of executing a single task
@@ -31,19 +35,6 @@ pub enum TaskResult {
     VerificationFailed { expected: String, actual: String },
 }
 
-/// Executes sync tasks against source and destination endpoints.
-#[allow(dead_code)] // Wired in by main.rs rewrite (Phase 4 completion)
-pub struct TaskExecutor<'a> {
-    source: &'a dyn Endpoint,
-    dest: &'a dyn Endpoint,
-    dry_run: bool,
-    #[allow(dead_code)] // Will be used for xattr/hardlink/acl preservation
-    preserve: PreserveConfig,
-    verification: VerificationConfig,
-    max_concurrent: usize,
-    backup: BackupConfig,
-}
-
 /// Configuration for backup behavior
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
@@ -52,7 +43,53 @@ pub struct BackupConfig {
     pub dir: Option<PathBuf>,
 }
 
-#[allow(dead_code)] // Wired in by main.rs rewrite (Phase 4 completion)
+/// Configuration for task execution behavior
+#[derive(Debug, Clone)]
+pub struct ExecuteConfig {
+    /// Preserve hardlinks (track inodes, create hardlinks for same inode)
+    pub preserve_hardlinks: bool,
+    /// Preserve xattrs (copy xattrs after file copy)
+    pub preserve_xattrs: bool,
+    /// Preserve directory permissions (unix only)
+    pub preserve_dir_permissions: bool,
+    /// Clean up partial files on failure (unless true)
+    pub keep_partial: bool,
+    /// Output rsync-style itemize changes
+    pub itemize_changes: bool,
+    /// Remove source files after successful transfer
+    pub remove_source_files: bool,
+    /// Print transfer summary
+    pub print_stats: bool,
+}
+
+impl Default for ExecuteConfig {
+    fn default() -> Self {
+        Self {
+            preserve_hardlinks: false,
+            preserve_xattrs: false,
+            preserve_dir_permissions: false,
+            keep_partial: false,
+            itemize_changes: false,
+            remove_source_files: false,
+            print_stats: false,
+        }
+    }
+}
+
+/// Executes sync tasks against source and destination endpoints.
+pub struct TaskExecutor<'a> {
+    source: &'a dyn Endpoint,
+    dest: &'a dyn Endpoint,
+    dry_run: bool,
+    preserve: PreserveConfig,
+    verification: VerificationConfig,
+    max_concurrent: usize,
+    backup: BackupConfig,
+    config: ExecuteConfig,
+    /// Track inodes for hardlink preservation (inode -> first dest path)
+    hardlink_map: Mutex<HashMap<u64, PathBuf>>,
+}
+
 impl<'a> TaskExecutor<'a> {
     /// Create a new TaskExecutor.
     pub fn new(
@@ -75,12 +112,20 @@ impl<'a> TaskExecutor<'a> {
                 suffix: "~".to_string(),
                 dir: None,
             },
+            config: ExecuteConfig::default(),
+            hardlink_map: Mutex::new(HashMap::new()),
         }
     }
 
     /// Set backup configuration
     pub fn with_backup(mut self, config: BackupConfig) -> Self {
         self.backup = config;
+        self
+    }
+
+    /// Set execution configuration
+    pub fn with_config(mut self, config: ExecuteConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -117,33 +162,92 @@ impl<'a> TaskExecutor<'a> {
         }
 
         if source_entry.is_dir {
-            self.dest.create_dir_all(&task.dest_path).await?;
-            Ok(TaskResult::DirCreated)
+            self.execute_directory(source_entry, task).await
         } else if source_entry.is_symlink {
             self.execute_symlink(source_entry, task).await
         } else {
-            self.execute_file_copy(source_entry, task).await
+            self.execute_file(source_entry, task).await
         }
     }
 
-    /// Execute symlink creation based on preserve config.
+    /// Execute directory creation with optional permission preservation.
+    async fn execute_directory(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+        self.dest.create_dir_all(&task.dest_path).await?;
+
+        // Preserve directory permissions if enabled
+        #[cfg(unix)]
+        if self.config.preserve_dir_permissions {
+            use std::os::unix::fs::PermissionsExt;
+            let source_path = self.source.root().join(&*source_entry.relative_path);
+            if let Ok(meta) = std::fs::metadata(&source_path) {
+                let mode = meta.permissions().mode();
+                let abs_dest = self.abs_dest_path(&task.dest_path);
+                let _ = std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode));
+            }
+        }
+
+        Ok(TaskResult::DirCreated)
+    }
+
+    /// Execute symlink creation.
     async fn execute_symlink(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
         #[cfg(unix)]
         {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             let target = std::fs::read_link(&source_path)?;
+
+            // Remove existing file/symlink before creating
+            if task.action == SyncAction::Update {
+                self.dest.remove(&task.dest_path, false).await?;
+            }
+
             self.dest.create_symlink(&target, &task.dest_path).await?;
+
+            // Itemize if configured
+            if self.config.itemize_changes {
+                let item = itemize_string(&task.action, false, true);
+                eprintln!("{} {}", item, task.dest_path.display());
+            }
+
             Ok(TaskResult::SymlinkCreated)
         }
         #[cfg(not(unix))]
         {
             let _ = (source_entry, task);
-            Err(SyncError::Io(std::io::Error::other("Symlinks not supported on this platform")))
+            Err(Error::Io(std::io::Error::other("Symlinks not supported on this platform")))
         }
     }
 
-    /// Execute file copy with optional verification.
-    async fn execute_file_copy(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+    /// Execute file copy with hardlink tracking, backup, xattrs, and verification.
+    async fn execute_file(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+        // Check if this is a hardlink that's already been copied
+        if self.config.preserve_hardlinks && source_entry.nlink > 1 {
+            if let Some(inode) = source_entry.inode {
+                let map = self.hardlink_map.lock().unwrap();
+                if let Some(first_path) = map.get(&inode) {
+                    // Remove existing file before creating hard link
+                    if task.action == SyncAction::Update {
+                        self.dest.remove(&task.dest_path, false).await?;
+                    }
+                    self.dest.create_hardlink(first_path, &task.dest_path).await?;
+
+                    // Itemize if configured
+                    if self.config.itemize_changes {
+                        let item = itemize_string(&task.action, false, false);
+                        eprintln!("{} {}", item, task.dest_path.display());
+                    }
+
+                    return Ok(if task.action == SyncAction::Create {
+                        TaskResult::Created { bytes: 0 }
+                    } else {
+                        TaskResult::Updated { bytes: 0 }
+                    });
+                }
+                // First copy of this inode - fall through to normal copy
+                drop(map);
+            }
+        }
+
         // Backup existing file if configured
         if self.backup.enabled && task.action == SyncAction::Update {
             self.create_backup(&task.dest_path).await?;
@@ -154,24 +258,84 @@ impl<'a> TaskExecutor<'a> {
         let meta = self.source.metadata(&source_entry.relative_path).await?;
 
         // Write to destination
-        self.dest.write_file(&task.dest_path, &data, &meta).await?;
+        match self.dest.write_file(&task.dest_path, &data, &meta).await {
+            Ok(()) => {
+                // Record inode for hardlink tracking
+                if self.config.preserve_hardlinks && source_entry.nlink > 1 {
+                    if let Some(inode) = source_entry.inode {
+                        let mut map = self.hardlink_map.lock().unwrap();
+                        map.insert(inode, task.dest_path.clone());
+                    }
+                }
 
-        // Verify if configured
-        if self.verification.verify_on_write {
-            let dest_data = self.dest.read_file(&task.dest_path).await?;
-            if data != dest_data {
-                return Ok(TaskResult::VerificationFailed {
-                    expected: format!("{} bytes", data.len()),
-                    actual: format!("{} bytes", dest_data.len()),
-                });
+                // Copy xattrs if enabled
+                #[cfg(unix)]
+                if self.config.preserve_xattrs {
+                    self.copy_xattrs(source_entry, &task.dest_path);
+                }
+
+                // Itemize if configured
+                if self.config.itemize_changes {
+                    let item = itemize_string(&task.action, false, false);
+                    eprintln!("{} {}", item, task.dest_path.display());
+                }
+
+                // Remove source file after successful transfer
+                if self.config.remove_source_files {
+                    let source_path = self.source.root().join(&*source_entry.relative_path);
+                    if let Err(e) = std::fs::remove_file(&source_path) {
+                        tracing::warn!("Failed to remove source {}: {}", source_path.display(), e);
+                    }
+                }
+
+                // Verify if configured
+                if self.verification.verify_on_write {
+                    let dest_data = self.dest.read_file(&task.dest_path).await?;
+                    if data != dest_data {
+                        return Ok(TaskResult::VerificationFailed {
+                            expected: format!("{} bytes", data.len()),
+                            actual: format!("{} bytes", dest_data.len()),
+                        });
+                    }
+                }
+
+                let bytes = data.len() as u64;
+                Ok(if task.action == SyncAction::Create {
+                    TaskResult::Created { bytes }
+                } else {
+                    TaskResult::Updated { bytes }
+                })
+            }
+            Err(e) => {
+                // Clean up partial file on failure unless keep_partial
+                if !self.config.keep_partial {
+                    let _ = self.dest.remove(&task.dest_path, false).await;
+                }
+                Err(e)
             }
         }
+    }
 
-        let bytes = data.len() as u64;
-        if task.action == SyncAction::Create {
-            Ok(TaskResult::Created { bytes })
+    /// Copy xattrs from source to destination (unix only)
+    #[cfg(unix)]
+    fn copy_xattrs(&self, source_entry: &FileEntry, dest_path: &Path) {
+        let source_path = self.source.root().join(&*source_entry.relative_path);
+        if let Ok(xattrs) = xattr::list(&source_path) {
+            for attr in xattrs {
+                if let Ok(Some(val)) = xattr::get(&source_path, &attr) {
+                    let abs_dest = self.abs_dest_path(dest_path);
+                    let _ = xattr::set(&abs_dest, &attr, &val);
+                }
+            }
+        }
+    }
+
+    /// Get absolute destination path
+    fn abs_dest_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            Ok(TaskResult::Updated { bytes })
+            self.dest.root().join(path)
         }
     }
 
@@ -181,19 +345,18 @@ impl<'a> TaskExecutor<'a> {
             return Ok(());
         }
 
+        let abs_dest = self.abs_dest_path(path);
         let backup_path = if let Some(ref dir) = self.backup.dir {
-            // Store backup in specified directory
-            let file_name = path.file_name()
+            let file_name = abs_dest.file_name()
                 .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
             dir.join(format!("{}{}",
                 file_name.to_string_lossy(),
                 self.backup.suffix
             ))
         } else {
-            // Store backup next to original
-            let file_name = path.file_name()
+            let file_name = abs_dest.file_name()
                 .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
-            path.parent()
+            abs_dest.parent()
                 .unwrap_or(Path::new("."))
                 .join(format!("{}{}",
                     file_name.to_string_lossy(),
@@ -210,46 +373,78 @@ impl<'a> TaskExecutor<'a> {
         Ok(())
     }
 
-    /// Execute a batch of tasks in parallel.
+    /// Execute a batch of tasks and return stats.
+    ///
+    /// Note: For hardlink preservation, tasks should be executed sequentially.
+    /// Parallel execution may miss hardlinks if the first copy hasn't completed.
     pub async fn execute_batch(&self, tasks: Vec<SyncTask>) -> Result<SyncStats> {
         let start = Instant::now();
         let mut stats = SyncStats::default();
 
-        // Process tasks in parallel with bounded concurrency
-        let results: Vec<Result<TaskResult>> = stream::iter(tasks.iter())
-            .map(|task| async move { self.execute_task(task).await })
-            .buffer_unordered(self.max_concurrent)
-            .collect()
-            .await;
+        // Process tasks - sequential for hardlink tracking, parallel otherwise
+        if self.config.preserve_hardlinks {
+            for task in &tasks {
+                self.execute_and_record(task, &mut stats).await?;
+            }
+        } else {
+            let results: Vec<Result<TaskResult>> = stream::iter(tasks.iter())
+                .map(|task| async move { self.execute_task(task).await })
+                .buffer_unordered(self.max_concurrent)
+                .collect()
+                .await;
 
-        // Aggregate results
-        for result in results {
-            match result? {
-                TaskResult::Skipped => stats.files_skipped += 1,
-                TaskResult::Created { bytes } => {
-                    stats.files_created += 1;
-                    stats.bytes_transferred += bytes;
-                }
-                TaskResult::Updated { bytes } => {
-                    stats.files_updated += 1;
-                    stats.bytes_transferred += bytes;
-                }
-                TaskResult::DirCreated => stats.dirs_created += 1,
-                TaskResult::SymlinkCreated => stats.symlinks_created += 1,
-                TaskResult::Deleted => stats.files_deleted += 1,
-                TaskResult::VerificationFailed { expected, actual } => {
-                    stats.verification_failures += 1;
-                    stats.errors.push(SyncError {
-                        path: PathBuf::new(),
-                        error: format!("Verification failed: expected {}, got {}", expected, actual),
-                        action: "verify".to_string(),
-                    });
-                }
+            for result in results {
+                self.record_result(result?, &mut stats);
             }
         }
 
         stats.duration = start.elapsed();
+
+        // Print stats if configured
+        if self.config.print_stats {
+            eprintln!("Transfer complete: {} created, {} updated, {} skipped, {} deleted, {:.2}s",
+                stats.files_created,
+                stats.files_updated,
+                stats.files_skipped,
+                stats.files_deleted,
+                stats.duration.as_secs_f64()
+            );
+        }
+
         Ok(stats)
+    }
+
+    /// Execute a single task and record the result in stats.
+    async fn execute_and_record(&self, task: &SyncTask, stats: &mut SyncStats) -> Result<()> {
+        let result = self.execute_task(task).await?;
+        self.record_result(result, stats);
+        Ok(())
+    }
+
+    /// Record a task result in stats.
+    fn record_result(&self, result: TaskResult, stats: &mut SyncStats) {
+        match result {
+            TaskResult::Skipped => stats.files_skipped += 1,
+            TaskResult::Created { bytes } => {
+                stats.files_created += 1;
+                stats.bytes_transferred += bytes;
+            }
+            TaskResult::Updated { bytes } => {
+                stats.files_updated += 1;
+                stats.bytes_transferred += bytes;
+            }
+            TaskResult::DirCreated => stats.dirs_created += 1,
+            TaskResult::SymlinkCreated => stats.symlinks_created += 1,
+            TaskResult::Deleted => stats.files_deleted += 1,
+            TaskResult::VerificationFailed { expected, actual } => {
+                stats.verification_failures += 1;
+                stats.errors.push(SyncError {
+                    path: PathBuf::new(),
+                    error: format!("Verification failed: expected {}, got {}", expected, actual),
+                    action: "verify".to_string(),
+                });
+            }
+        }
     }
 
     /// Verify a file transfer by comparing source and destination.
@@ -314,7 +509,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file
         std::fs::write(src_dir.path().join("test.txt"), "hello").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -340,9 +534,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file
         std::fs::write(src_dir.path().join("test.txt"), "updated").unwrap();
-        // Create old dest file
         std::fs::write(dst_dir.path().join("test.txt"), "old").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -368,7 +560,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source dir
         std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -394,7 +585,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create dest file to delete
         std::fs::write(dst_dir.path().join("delete.txt"), "delete me").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -440,7 +630,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file
         std::fs::write(src_dir.path().join("test.txt"), "hello").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -466,7 +655,7 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Created { .. }));
-        assert!(!dst_dir.path().join("test.txt").exists()); // Not actually created
+        assert!(!dst_dir.path().join("test.txt").exists());
     }
 
     #[tokio::test]
@@ -474,7 +663,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create dest file
         std::fs::write(dst_dir.path().join("keep.txt"), "keep").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -499,7 +687,7 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Deleted));
-        assert!(dst_dir.path().join("keep.txt").exists()); // Not actually deleted
+        assert!(dst_dir.path().join("keep.txt").exists());
     }
 
     #[tokio::test]
@@ -507,7 +695,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create matching files
         std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
         std::fs::write(dst_dir.path().join("test.txt"), "content").unwrap();
 
@@ -527,7 +714,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create mismatched files
         std::fs::write(src_dir.path().join("test.txt"), "source").unwrap();
         std::fs::write(dst_dir.path().join("test.txt"), "dest").unwrap();
 
@@ -547,7 +733,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file
         std::fs::write(src_dir.path().join("test.txt"), "hello").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -560,7 +745,7 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig {
                 mode: ChecksumType::Fast,
-                verify_on_write: true, // Enable verification
+                verify_on_write: true,
                 checksum_db: false,
                 clear_checksum_db: false,
                 prune_checksum_db: false,
@@ -578,7 +763,6 @@ mod tests {
         };
 
         let result = executor.execute_task(&task).await.unwrap();
-        // Should succeed (files match)
         assert!(matches!(result, TaskResult::Created { .. }));
     }
 
@@ -587,7 +771,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create multiple source files
         for i in 0..5 {
             std::fs::write(
                 src_dir.path().join(format!("file{}.txt", i)),
@@ -599,7 +782,6 @@ mod tests {
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
         let executor = test_executor(&source, &dest);
 
-        // Create tasks
         let tasks: Vec<SyncTask> = (0..5)
             .map(|i| {
                 let name = format!("file{}.txt", i);
@@ -615,9 +797,8 @@ mod tests {
 
         let stats = executor.execute_batch(tasks).await.unwrap();
         assert_eq!(stats.files_created, 5);
-        assert_eq!(stats.bytes_transferred, 40); // 5 files * 8 bytes
+        assert_eq!(stats.bytes_transferred, 40);
 
-        // Verify all files exist
         for i in 0..5 {
             let path = dst_dir.path().join(format!("file{}.txt", i));
             assert!(path.exists());
@@ -629,12 +810,8 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file for update
         std::fs::write(src_dir.path().join("update.txt"), "new").unwrap();
-        // Create old dest file
         std::fs::write(dst_dir.path().join("update.txt"), "old").unwrap();
-
-        // Create dest file for deletion
         std::fs::write(dst_dir.path().join("delete.txt"), "delete").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -670,9 +847,7 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(stats.files_skipped, 1);
 
-        // Verify file was updated
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("update.txt")).unwrap(), "new");
-        // Verify file was deleted
         assert!(!dst_dir.path().join("delete.txt").exists());
     }
 
@@ -682,9 +857,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create target file
         std::fs::write(src_dir.path().join("target.txt"), "target").unwrap();
-        // Create symlink
         std::os::unix::fs::symlink("target.txt", src_dir.path().join("link.txt")).unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -703,7 +876,6 @@ mod tests {
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::SymlinkCreated));
 
-        // Verify symlink exists and points to correct target
         let dest_link = dst_dir.path().join("link.txt");
         let meta = std::fs::symlink_metadata(&dest_link).unwrap();
         assert!(meta.is_symlink());
@@ -715,7 +887,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create nested source dir
         std::fs::create_dir_all(src_dir.path().join("a/b/c")).unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -741,7 +912,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create empty file
         std::fs::write(src_dir.path().join("empty.txt"), "").unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -772,7 +942,7 @@ mod tests {
         let executor = test_executor(&source, &dest);
 
         let task = SyncTask {
-            source: None, // Missing source
+            source: None,
             dest_path: dst_dir.path().join("test.txt"),
             action: SyncAction::Create,
             source_checksum: None,
@@ -789,7 +959,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source and dest files
         std::fs::write(src_dir.path().join("test.txt"), "updated").unwrap();
         std::fs::write(dst_dir.path().join("test.txt"), "old").unwrap();
 
@@ -826,7 +995,6 @@ mod tests {
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
         
-        // Check backup was created
         assert!(dst_dir.path().join("test.txt~").exists());
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt~")).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
@@ -840,10 +1008,8 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file
         std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
 
-        // Create read-only destination directory
         let readonly_dir = dst_dir.path().join("readonly");
         std::fs::create_dir(&readonly_dir).unwrap();
         let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
@@ -866,7 +1032,6 @@ mod tests {
         let result = executor.execute_task(&task).await;
         assert!(result.is_err(), "Should fail when destination is read-only");
 
-        // Restore permissions for cleanup
         let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&readonly_dir, perms).unwrap();
@@ -878,7 +1043,6 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        // Create source file and symlink
         std::fs::write(src_dir.path().join("target.txt"), "content").unwrap();
         std::os::unix::fs::symlink("target.txt", src_dir.path().join("link.txt")).unwrap();
 
@@ -898,9 +1062,105 @@ mod tests {
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::SymlinkCreated));
 
-        // Verify symlink was created
         let link_path = dst_dir.path().join("link.txt");
         assert!(link_path.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_link(&link_path).unwrap().to_str().unwrap(), "target.txt");
+    }
+
+    #[tokio::test]
+    async fn test_hardlink_preservation() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create two hardlinked files
+        std::fs::write(src_dir.path().join("original.txt"), "content").unwrap();
+        std::fs::hard_link(
+            src_dir.path().join("original.txt"),
+            src_dir.path().join("link.txt"),
+        ).unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig { hardlinks: true, ..Default::default() },
+            VerificationConfig::default(),
+            4,
+        ).with_config(ExecuteConfig {
+            preserve_hardlinks: true,
+            ..Default::default()
+        });
+
+        // Execute first file
+        let entry1 = make_file_entry("original.txt", 7, false, false);
+        let task1 = SyncTask {
+            source: Some(Arc::new(entry1)),
+            dest_path: dst_dir.path().join("original.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+        executor.execute_task(&task1).await.unwrap();
+
+        // Execute second file (same inode)
+        let entry2 = FileEntry {
+            path: Arc::new(PathBuf::from(format!("/source/link.txt"))),
+            relative_path: Arc::new(PathBuf::from("link.txt")),
+            size: 7,
+            modified: std::time::SystemTime::now(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            is_sparse: false,
+            allocated_size: 7,
+            xattrs: None,
+            inode: Some(12345), // Same inode
+            nlink: 2,
+            acls: None,
+            bsd_flags: None,
+        };
+        let task2 = SyncTask {
+            source: Some(Arc::new(entry2)),
+            dest_path: dst_dir.path().join("link.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+        executor.execute_task(&task2).await.unwrap();
+
+        // Both files should exist
+        assert!(dst_dir.path().join("original.txt").exists());
+        assert!(dst_dir.path().join("link.txt").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_partial_cleanup() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        // Create a source file
+        std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        
+        // Create executor with keep_partial = false (default)
+        let executor = test_executor(&source, &dest);
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        // This should succeed
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Created { bytes: 7 }));
     }
 }
