@@ -854,3 +854,53 @@ fn test_copy_links_flag() {
     assert!(dest.path().join("link.txt").exists(), "Link file should exist");
     assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "content");
 }
+
+#[test]
+fn test_min_size_flag() {
+    let (source, dest) = setup_test_dir("min_size");
+
+    // Create files of different sizes
+    fs::write(source.path().join("small.txt"), "small").unwrap();
+    fs::write(source.path().join("large.txt"), "a".repeat(1000)).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--min-size=100",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check only large file is synced
+    assert!(!dest.path().join("small.txt").exists(), "Small file should not be synced");
+    assert!(dest.path().join("large.txt").exists(), "Large file should be synced");
+}
+
+#[test]
+fn test_max_size_flag() {
+    let (source, dest) = setup_test_dir("max_size");
+
+    // Create files of different sizes
+    fs::write(source.path().join("small.txt"), "small").unwrap();
+    fs::write(source.path().join("large.txt"), "a".repeat(1000)).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--max-size=100",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check only small file is synced
+    assert!(dest.path().join("small.txt").exists(), "Small file should be synced");
+    assert!(!dest.path().join("large.txt").exists(), "Large file should not be synced");
+}
