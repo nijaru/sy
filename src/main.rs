@@ -818,7 +818,7 @@ Or install from local source with: cargo install --path . --features acl"#
         )
         .with_scan_options(cli.scan_options());
 
-        if !cli.quiet && !cli.json {
+        if !cli.quiet && !cli.json && !cli.dry_run {
             println!("Mode: {:?}\n", session.select_strategy());
         }
 

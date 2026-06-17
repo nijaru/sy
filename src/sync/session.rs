@@ -370,12 +370,10 @@ impl SyncSession {
             if dest_file_count > 0 && !force {
                 let delete_percentage = (deletions.len() as f64 / dest_file_count as f64) * 100.0;
                 if delete_percentage > threshold as f64 {
-                    return Err(crate::error::SyncError::Io(std::io::Error::other(
-                        format!(
-                            "Deletion threshold exceeded: {:.1}% > {}% (use --force-delete to override)",
-                            delete_percentage, threshold
-                        )
-                    )));
+                    return Err(crate::error::SyncError::DeletionThresholdExceeded {
+                        percentage: delete_percentage,
+                        threshold,
+                    });
                 }
             }
 
@@ -456,17 +454,6 @@ impl SyncSession {
             if let Err(e) = cache.save(dest_ep.root()) {
                 tracing::warn!("Failed to save directory cache: {}", e);
             }
-        }
-        
-        // Print stats if --stats is set
-        if self.config.stats {
-            eprintln!("Transfer complete: {} created, {} updated, {} skipped, {} deleted, {:.2}s",
-                stats.files_created,
-                stats.files_updated,
-                stats.files_skipped,
-                stats.files_deleted,
-                stats.duration.as_secs_f64()
-            );
         }
         
         Ok(stats)

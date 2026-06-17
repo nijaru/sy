@@ -377,7 +377,10 @@ pub struct Cli {
     /// - extension: Extension-only detection (legacy)
     /// - always: Always compress (override detection)
     /// - never: Never compress (override detection)
-    #[arg(short = 'z', long, value_enum, default_value = "never")]
+    ///
+    /// -z (no value) enables auto compression
+    /// --compress=MODE for explicit control
+    #[arg(short = 'z', long, value_enum, default_value = "never", default_missing_value = "auto", num_args = 0..=1)]
     pub compress: CompressionDetection,
 
     /// Symlink handling mode (preserve, follow, skip)

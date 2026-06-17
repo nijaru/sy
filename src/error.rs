@@ -21,6 +21,12 @@ pub enum SyncError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Deletion threshold exceeded: {percentage:.1}% > {threshold}% (use --force-delete to override)")]
+    DeletionThresholdExceeded {
+        percentage: f64,
+        threshold: u8,
+    },
+
     #[error("Failed to read directory: {path}\nCause: {source}\nCheck that the directory exists and you have read permissions.")]
     ReadDirError {
         path: PathBuf,
