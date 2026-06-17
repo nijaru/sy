@@ -28,3 +28,10 @@ SESSION_SUMMARY.md
 PERFORMANCE_ANALYSIS.md
 man/
 __pycache__
+
+# AI agent context
+ai/
+.pi/
+.tasks/
+.mailmap
+handoff.md
