@@ -405,7 +405,7 @@ impl SyncSession {
             false, // dry_run handled above
             self.config.preserve.clone(),
             crate::sync::config::VerificationConfig {
-                mode: self.config.verification.mode.clone(),
+                mode: self.config.verification.mode,
                 verify_on_write: self.config.verification.verify_on_write,
                 checksum_db: self.config.verification.checksum_db,
                 clear_checksum_db: self.config.verification.clear_checksum_db,
@@ -454,8 +454,10 @@ impl SyncSession {
     /// Sync a single file from source to destination.
     pub async fn sync_single_file(&self, source: &Path, dest: &Path) -> Result<SyncStats> {
         let start = std::time::Instant::now();
-        let mut stats = SyncStats::default();
-        stats.files_scanned = 1;
+        let mut stats = SyncStats {
+            files_scanned: 1,
+            ..Default::default()
+        };
 
         // For single file sync, use the parent directory as the endpoint root
         let source_parent = source.parent().unwrap_or(Path::new("."));

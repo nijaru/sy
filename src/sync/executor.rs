@@ -44,7 +44,7 @@ pub struct BackupConfig {
 }
 
 /// Configuration for task execution behavior
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecuteConfig {
     /// Preserve hardlinks (track inodes, create hardlinks for same inode)
     pub preserve_hardlinks: bool,
@@ -60,20 +60,6 @@ pub struct ExecuteConfig {
     pub remove_source_files: bool,
     /// Print transfer summary
     pub print_stats: bool,
-}
-
-impl Default for ExecuteConfig {
-    fn default() -> Self {
-        Self {
-            preserve_hardlinks: false,
-            preserve_xattrs: false,
-            preserve_dir_permissions: false,
-            keep_partial: false,
-            itemize_changes: false,
-            remove_source_files: false,
-            print_stats: false,
-        }
-    }
 }
 
 /// Executes sync tasks against source and destination endpoints.
@@ -223,13 +209,16 @@ impl<'a> TaskExecutor<'a> {
         // Check if this is a hardlink that's already been copied
         if self.config.preserve_hardlinks && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
-                let map = self.hardlink_map.lock().unwrap();
-                if let Some(first_path) = map.get(&inode) {
+                let first_path = {
+                    let map = self.hardlink_map.lock().unwrap();
+                    map.get(&inode).cloned()
+                };
+                if let Some(first_path) = first_path {
                     // Remove existing file before creating hard link
                     if task.action == SyncAction::Update {
                         self.dest.remove(&task.dest_path, false).await?;
                     }
-                    self.dest.create_hardlink(first_path, &task.dest_path).await?;
+                    self.dest.create_hardlink(&first_path, &task.dest_path).await?;
 
                     // Itemize if configured
                     if self.config.itemize_changes {
@@ -243,8 +232,6 @@ impl<'a> TaskExecutor<'a> {
                         TaskResult::Updated { bytes: 0 }
                     });
                 }
-                // First copy of this inode - fall through to normal copy
-                drop(map);
             }
         }
 
