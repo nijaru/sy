@@ -779,3 +779,78 @@ fn test_ignore_existing_flag() {
     assert_eq!(fs::read_to_string(dest.path().join("existing.txt")).unwrap(), "old content");
     assert!(dest.path().join("new.txt").exists(), "New file should be created");
 }
+
+#[test]
+fn test_dirs_flag() {
+    let (source, dest) = setup_test_dir("dirs");
+
+    // Create files and directories in source
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+    fs::create_dir(source.path().join("subdir")).unwrap();
+    fs::write(source.path().join("subdir/nested.txt"), "nested content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--dirs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check that directory structure is preserved
+    assert!(dest.path().join("subdir").exists(), "Subdir should exist");
+}
+
+#[test]
+fn test_links_flag() {
+    let (source, dest) = setup_test_dir("links");
+
+    // Create a file and a symlink
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+    std::os::unix::fs::symlink("file.txt", source.path().join("link.txt")).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--links=preserve",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check symlink is preserved
+    assert!(dest.path().join("link.txt").exists(), "Symlink should exist");
+    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "content");
+}
+
+#[test]
+fn test_copy_links_flag() {
+    let (source, dest) = setup_test_dir("copy_links");
+
+    // Create a file and a symlink
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+    std::os::unix::fs::symlink("file.txt", source.path().join("link.txt")).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--copy-links",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check symlink target is copied, not the symlink
+    assert!(dest.path().join("link.txt").exists(), "Link file should exist");
+    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "content");
+}
