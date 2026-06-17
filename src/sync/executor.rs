@@ -356,10 +356,8 @@ impl<'a> TaskExecutor<'a> {
                 ))
         };
 
-        // Copy the file (we can't rename cross-filesystem reliably)
-        let data = self.dest.read_file(path).await?;
-        let meta = self.dest.metadata(path).await?;
-        self.dest.write_file(&backup_path, &data, &meta).await?;
+        // Copy the file using the endpoint's copy_file method
+        self.dest.copy_file(path, &backup_path).await?;
 
         tracing::debug!("Backup created: {:?} -> {:?}", path, backup_path);
         Ok(())
