@@ -1002,3 +1002,48 @@ fn test_long_filenames() {
     // Check file is synced
     assert!(dest.path().join(&long_name).exists(), "Long filename file should exist");
 }
+
+#[test]
+fn test_concurrent_sync_safety() {
+    let (source, dest) = setup_test_dir("concurrent");
+
+    // Create files
+    fs::write(source.path().join("file1.txt"), "content1").unwrap();
+    fs::write(source.path().join("file2.txt"), "content2").unwrap();
+
+    // Start two syncs concurrently
+    let dest_path = dest.path().to_path_buf();
+    let source_path = format!("{}/", source.path().display());
+    
+    let handle1 = std::thread::spawn({
+        let dest_path = dest_path.clone();
+        let source_path = source_path.clone();
+        move || {
+            Command::new(sy_bin())
+                .args([&source_path, dest_path.to_str().unwrap(), "--exclude-vcs"])
+                .output()
+                .unwrap()
+        }
+    });
+    
+    let handle2 = std::thread::spawn({
+        let dest_path = dest_path.clone();
+        let source_path = source_path.clone();
+        move || {
+            Command::new(sy_bin())
+                .args([&source_path, dest_path.to_str().unwrap(), "--exclude-vcs"])
+                .output()
+                .unwrap()
+        }
+    });
+
+    let output1 = handle1.join().unwrap();
+    let output2 = handle2.join().unwrap();
+
+    // At least one should succeed
+    assert!(output1.status.success() || output2.status.success(), "At least one sync should succeed");
+    
+    // Check files exist
+    assert!(dest.path().join("file1.txt").exists(), "File1 should exist");
+    assert!(dest.path().join("file2.txt").exists(), "File2 should exist");
+}
