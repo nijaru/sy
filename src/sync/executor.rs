@@ -1184,4 +1184,303 @@ mod tests {
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Created { bytes: 7 }));
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_xattr_preservation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
+
+        // Set xattr on source (skip if not supported)
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::macos::fs::MetadataExt;
+            let _ = xattr::set(src_dir.path().join("test.txt"), "com.test.attr", b"value");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = xattr::set(src_dir.path().join("test.txt"), "user.test.attr", b"value");
+        }
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig { xattrs: true, ..Default::default() },
+            VerificationConfig::default(),
+            4,
+        ).with_config(ExecuteConfig {
+            preserve_xattrs: true,
+            ..Default::default()
+        });
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Created { bytes: 7 }));
+
+        // Verify xattr was copied (if supported)
+        #[cfg(target_os = "macos")]
+        {
+            let val = xattr::get(dst_dir.path().join("test.txt"), "com.test.attr").unwrap();
+            assert_eq!(val, Some(b"value".to_vec()));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let val = xattr::get(dst_dir.path().join("test.txt"), "user.test.attr").unwrap();
+            assert_eq!(val, Some(b"value".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_itemize_changes() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "hello").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig::default(),
+            4,
+        ).with_config(ExecuteConfig {
+            itemize_changes: true,
+            ..Default::default()
+        });
+
+        let entry = make_file_entry("test.txt", 5, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        // Capture stderr
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Created { bytes: 5 }));
+    }
+
+    #[tokio::test]
+    async fn test_remove_source_files() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "content").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig::default(),
+            4,
+        ).with_config(ExecuteConfig {
+            remove_source_files: true,
+            ..Default::default()
+        });
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Created { bytes: 7 }));
+
+        // Source should be removed
+        assert!(!src_dir.path().join("test.txt").exists());
+        // Dest should have the content
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "content");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_directory_permission_preservation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
+        let mut perms = std::fs::metadata(src_dir.path().join("subdir")).unwrap().permissions();
+        perms.set_mode(0o750);
+        std::fs::set_permissions(src_dir.path().join("subdir"), perms).unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig { permissions: true, ..Default::default() },
+            VerificationConfig::default(),
+            4,
+        ).with_config(ExecuteConfig {
+            preserve_dir_permissions: true,
+            ..Default::default()
+        });
+
+        let entry = make_file_entry("subdir", 0, true, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("subdir"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::DirCreated));
+
+        // Verify permissions
+        let dest_perms = std::fs::metadata(dst_dir.path().join("subdir")).unwrap().permissions();
+        assert_eq!(dest_perms.mode() & 0o777, 0o750);
+    }
+
+    #[tokio::test]
+    async fn test_backup_with_custom_dir() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "updated").unwrap();
+        std::fs::write(dst_dir.path().join("test.txt"), "old").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig::default(),
+            4,
+        ).with_backup(BackupConfig {
+            enabled: true,
+            suffix: "~".to_string(),
+            dir: Some(backup_dir.path().to_path_buf()),
+        });
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Update,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
+
+        // Backup should be in custom directory
+        assert!(backup_dir.path().join("test.txt~").exists());
+        assert_eq!(std::fs::read_to_string(backup_dir.path().join("test.txt~")).unwrap(), "old");
+        // Dest should have new content
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
+    }
+
+    #[tokio::test]
+    async fn test_backup_with_custom_suffix() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "updated").unwrap();
+        std::fs::write(dst_dir.path().join("test.txt"), "old").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig::default(),
+            4,
+        ).with_backup(BackupConfig {
+            enabled: true,
+            suffix: ".bak".to_string(),
+            dir: None,
+        });
+
+        let entry = make_file_entry("test.txt", 7, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Update,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
+
+        // Backup should have custom suffix
+        assert!(dst_dir.path().join("test.txt.bak").exists());
+        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt.bak")).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn test_backup_not_created_for_create() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+
+        std::fs::write(src_dir.path().join("test.txt"), "new").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig::default(),
+            4,
+        ).with_backup(BackupConfig {
+            enabled: true,
+            suffix: "~".to_string(),
+            dir: None,
+        });
+
+        let entry = make_file_entry("test.txt", 3, false, false);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: dst_dir.path().join("test.txt"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let result = executor.execute_task(&task).await.unwrap();
+        assert!(matches!(result, TaskResult::Created { bytes: 3 }));
+
+        // No backup should be created for Create action
+        assert!(!dst_dir.path().join("test.txt~").exists());
+    }
 }

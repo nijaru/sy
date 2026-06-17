@@ -37,7 +37,7 @@ fn test_progress_shown_for_large_files() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--per-file-progress",
+            "--progress",
         ])
         .output()
         .unwrap();
@@ -58,7 +58,7 @@ fn test_progress_not_shown_for_small_files() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--per-file-progress",
+            "--progress",
         ])
         .output()
         .unwrap();
@@ -82,7 +82,7 @@ fn test_progress_with_multiple_large_files() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--per-file-progress",
+            "--progress",
         ])
         .output()
         .unwrap();
@@ -109,7 +109,7 @@ fn test_progress_with_mixed_file_sizes() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--per-file-progress",
+            "--progress",
         ])
         .output()
         .unwrap();

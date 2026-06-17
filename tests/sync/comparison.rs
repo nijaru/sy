@@ -396,12 +396,13 @@ fn test_z_short_flag_recognized() {
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // -z is rsync flag for compression
+    // -z is rsync flag for compression, now requires a value
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "-z",
+            "auto",
         ])
         .output()
         .unwrap();

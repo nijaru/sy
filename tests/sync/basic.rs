@@ -367,7 +367,7 @@ fn test_directory_cache_created() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -407,7 +407,7 @@ fn test_directory_cache_persists() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -422,7 +422,7 @@ fn test_directory_cache_persists() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -442,7 +442,7 @@ fn test_directory_cache_clear() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -475,7 +475,7 @@ fn test_directory_cache_dry_run() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
             "--dry-run",
         ])
         .output()
@@ -498,7 +498,7 @@ fn test_directory_cache_updates_on_new_directories() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
@@ -514,7 +514,7 @@ fn test_directory_cache_updates_on_new_directories() {
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--use-cache=true",
+            "--cache=true",
         ])
         .output()
         .unwrap();
