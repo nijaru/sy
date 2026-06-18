@@ -1384,4 +1384,156 @@ mod tests {
         assert!(!is_legacy_protocol(2));
         assert!(!is_legacy_protocol(0));
     }
+
+    #[test]
+    fn test_hello_flags_combinations() {
+        // Test all flag combinations
+        let flags = HelloFlags::PULL | HelloFlags::DELETE | HelloFlags::CHECKSUM | HelloFlags::COMPRESSION | HelloFlags::XATTRS | HelloFlags::ACLS | HelloFlags::DRY_RUN;
+        assert!(flags.contains(HelloFlags::PULL));
+        assert!(flags.contains(HelloFlags::DELETE));
+        assert!(flags.contains(HelloFlags::CHECKSUM));
+        assert!(flags.contains(HelloFlags::COMPRESSION));
+        assert!(flags.contains(HelloFlags::XATTRS));
+        assert!(flags.contains(HelloFlags::ACLS));
+        assert!(flags.contains(HelloFlags::DRY_RUN));
+    }
+
+    #[test]
+    fn test_hello_empty_path() {
+        let hello = Hello::new(HelloFlags::empty(), "");
+        let encoded = hello.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Hello::decode(payload).unwrap();
+        assert_eq!(decoded.root_path, "");
+    }
+
+    #[test]
+    fn test_hello_long_path() {
+        let long_path = "a".repeat(10000);
+        let hello = Hello::new(HelloFlags::empty(), &long_path);
+        let encoded = hello.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Hello::decode(payload).unwrap();
+        assert_eq!(decoded.root_path, long_path);
+    }
+
+    #[test]
+    fn test_file_entry_special_characters() {
+        let entry = FileEntry {
+            path: "file with spaces and \"quotes\" and 'single'".to_string(),
+            size: 1024,
+            mtime: 1234567890,
+            mode: 0o644,
+            inode: 0,
+            flags: FileFlags::empty(),
+            symlink_target: None,
+            link_target: None,
+        };
+        let encoded = entry.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = FileEntry::decode(payload).unwrap();
+        assert_eq!(decoded.path, entry.path);
+    }
+
+    #[test]
+    fn test_dest_file_entry_empty_checksums() {
+        let entry = DestFileEntry {
+            path: "small.txt".to_string(),
+            size: 100,
+            mtime: 1234567890,
+            mode: 0o644,
+            flags: DestFileFlags::empty(),
+            block_size: 0,
+            checksums: Vec::new(),
+        };
+        let encoded = entry.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = DestFileEntry::decode(payload).unwrap();
+        assert_eq!(decoded.path, entry.path);
+        assert!(decoded.checksums.is_empty());
+    }
+
+    #[test]
+    fn test_dest_file_entry_many_checksums() {
+        // Simulate a large file with many blocks
+        let mut checksums = Vec::new();
+        for i in 0..10000 {
+            checksums.push(BlockChecksum {
+                offset: i * 4096,
+                weak: i as u32,
+                strong: i as u64,
+            });
+        }
+        let entry = DestFileEntry {
+            path: "large.bin".to_string(),
+            size: 10000 * 4096,
+            mtime: 1234567890,
+            mode: 0o644,
+            flags: DestFileFlags::HAS_CHECKSUMS,
+            block_size: 4096,
+            checksums,
+        };
+        let encoded = entry.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = DestFileEntry::decode(payload).unwrap();
+        assert_eq!(decoded.checksums.len(), 10000);
+        assert_eq!(decoded.checksums[0].offset, 0);
+        assert_eq!(decoded.checksums[9999].offset, 9999 * 4096);
+    }
+
+    #[test]
+    fn test_data_empty_payload() {
+        let data = Data {
+            path: "file.txt".to_string(),
+            offset: 0,
+            flags: DataFlags::empty(),
+            data: Bytes::new(),
+        };
+        let encoded = data.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Data::decode(payload).unwrap();
+        assert!(decoded.data.is_empty());
+    }
+
+    #[test]
+    fn test_data_compressed_flag() {
+        let data = Data {
+            path: "file.txt".to_string(),
+            offset: 1024,
+            flags: DataFlags::COMPRESSED,
+            data: Bytes::from(vec![0u8; 100]),
+        };
+        let encoded = data.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Data::decode(payload).unwrap();
+        assert!(decoded.flags.contains(DataFlags::COMPRESSED));
+    }
+
+    #[test]
+    fn test_progress_zero_values() {
+        let progress = Progress {
+            files: 0,
+            bytes: 0,
+            files_total: 0,
+            bytes_total: 0,
+        };
+        let encoded = progress.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Progress::decode(payload).unwrap();
+        assert_eq!(decoded.files, 0);
+        assert_eq!(decoded.bytes, 0);
+    }
+
+    #[test]
+    fn test_fatal_long_message() {
+        let long_msg = "error ".repeat(1000);
+        let fatal = Fatal {
+            code: 1,
+            message: long_msg.clone(),
+        };
+        let encoded = fatal.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Fatal::decode(payload).unwrap();
+        assert_eq!(decoded.message, long_msg);
+    }
 }
