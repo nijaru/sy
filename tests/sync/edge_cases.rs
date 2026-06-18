@@ -445,3 +445,38 @@ fn test_zero_byte_files() {
         0
     );
 }
+
+#[test]
+fn test_deeply_nested_paths() {
+    let (source, dest) = setup_test_dir();
+
+    // Create deeply nested structure (20 levels)
+    let mut path = source.path().to_path_buf();
+    for i in 0..20 {
+        path = path.join(format!("level_{}", i));
+    }
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("deep.txt"), "deep content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Verify deep file exists
+    let mut dest_path = dest.path().to_path_buf();
+    for i in 0..20 {
+        dest_path = dest_path.join(format!("level_{}", i));
+    }
+    assert!(dest_path.join("deep.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dest_path.join("deep.txt")).unwrap(),
+        "deep content"
+    );
+}

@@ -1139,3 +1139,30 @@ fn test_perms_flag() {
     let dst_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
     assert_eq!(src_meta.permissions().mode(), dst_meta.permissions().mode(), "Permissions should be preserved");
 }
+
+#[test]
+fn test_default_includes_git() {
+    // By default, .git directories are included (rsync-compatible)
+    let (source, dest) = setup_test_dir("default_git");
+
+    // setup_test_dir already does git init, so .git exists
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Run without --exclude-vcs
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // .git SHOULD be included by default (rsync-compatible)
+    assert!(
+        dest.path().join(".git").exists(),
+        ".git should be included by default"
+    );
+    assert!(dest.path().join("file.txt").exists());
+}

@@ -603,3 +603,35 @@ fn test_sparse_file_delta_sync_preserves_sparseness() {
         content
     );
 }
+
+#[test]
+fn test_ignore_existing_skips_existing_files() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("existing.txt"), "source version").unwrap();
+    fs::write(source.path().join("new.txt"), "new file").unwrap();
+    fs::write(dest.path().join("existing.txt"), "dest version").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--ignore-existing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // Existing file should NOT have changed
+    let existing_content = fs::read_to_string(dest.path().join("existing.txt")).unwrap();
+    assert_eq!(
+        existing_content, "dest version",
+        "--ignore-existing should not overwrite existing files"
+    );
+
+    // New file should have been created
+    let new_content = fs::read_to_string(dest.path().join("new.txt")).unwrap();
+    assert_eq!(new_content, "new file", "New file should be created");
+}

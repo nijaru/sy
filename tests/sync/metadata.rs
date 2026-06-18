@@ -556,3 +556,36 @@ fn test_sync_skips_identical_symlink() {
 
     assert!(output.status.success());
 }
+
+#[test]
+fn test_archive_preserves_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (source, dest) = setup_test_dir();
+
+    // Create file with specific permissions
+    let file_path = source.path().join("script.sh");
+    fs::write(&file_path, "#!/bin/bash\necho hello").unwrap();
+
+    // Set executable permission (755)
+    let mut perms = fs::metadata(&file_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&file_path, perms).unwrap();
+
+    // Run with -a
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "-a",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "sy -a failed");
+
+    // Verify permissions preserved
+    let dest_perms = fs::metadata(dest.path().join("script.sh")).unwrap().permissions();
+    assert_eq!(dest_perms.mode() & 0o777, 0o755, "Permissions should be preserved");
+}
