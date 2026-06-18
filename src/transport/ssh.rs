@@ -101,6 +101,7 @@ struct FileEntryJson {
     path: String,
     size: u64,
     mtime: i64,
+    mode: u32,
     is_dir: bool,
     // Extended metadata for full preservation
     is_symlink: bool,
@@ -1203,6 +1204,7 @@ impl Transport for SshTransport {
                     ),
                     size: e.size,
                     modified,
+                    mode: e.mode,
                     is_dir: e.is_dir,
                     is_symlink: e.is_symlink,
                     symlink_target: e.symlink_target.map(|t| Arc::new(PathBuf::from(t))),

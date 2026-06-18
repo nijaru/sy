@@ -85,6 +85,7 @@ struct FileEntryJson {
     path: String,
     size: u64,
     mtime: i64,
+    mode: u32,
     is_dir: bool,
     // Extended metadata for full preservation
     is_symlink: bool,
@@ -119,8 +120,8 @@ fn main() -> anyhow::Result<()> {
                     let mtime = e
                         .modified
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
+                        .unwrap_or_default();
+                    let mtime_nanos = mtime.as_nanos() as i64;
 
                     // Encode xattrs to base64 for transport
                     let xattrs = e.xattrs.map(|xattrs_map| {
@@ -142,7 +143,8 @@ fn main() -> anyhow::Result<()> {
                     FileEntryJson {
                         path: e.path.to_string_lossy().to_string(),
                         size: e.size,
-                        mtime,
+                        mtime: mtime_nanos,
+                        mode: e.mode,
                         is_dir: e.is_dir,
                         is_symlink: e.is_symlink,
                         symlink_target: e.symlink_target.map(|p| p.to_string_lossy().to_string()),

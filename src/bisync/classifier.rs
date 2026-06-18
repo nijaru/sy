@@ -252,6 +252,7 @@ mod tests {
             relative_path: Arc::new(PathBuf::from(path)),
             size,
             modified: SystemTime::now() - Duration::from_secs(mtime_secs_ago),
+            mode: 0o644,
             is_dir: false,
             is_symlink: false,
             symlink_target: None,

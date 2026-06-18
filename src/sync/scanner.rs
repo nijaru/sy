@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
@@ -19,6 +19,7 @@ pub struct FileEntry {
     pub relative_path: Arc<PathBuf>,
     pub size: u64,
     pub modified: SystemTime,
+    pub mode: u32,         // Unix permission bits (e.g., 0o755)
     pub is_dir: bool,
     pub is_symlink: bool,
     pub symlink_target: Option<Arc<PathBuf>>,
@@ -259,11 +260,17 @@ fn process_dir_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> 
         source: e,
     })?;
 
+    #[cfg(unix)]
+    let mode = metadata.permissions().mode();
+    #[cfg(not(unix))]
+    let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+
     Ok(FileEntry {
         path: Arc::new(path),
         relative_path: Arc::new(relative_path),
         size: metadata.len(),
         modified,
+        mode,
         is_dir: metadata.is_dir(),
         is_symlink,
         symlink_target: symlink_target.map(Arc::new),

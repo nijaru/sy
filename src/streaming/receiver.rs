@@ -17,6 +17,9 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 /// Maximum size for delta copy operations (16MB)
 const MAX_DELTA_COPY_SIZE: usize = 16 * 1024 * 1024;
 
@@ -187,16 +190,18 @@ impl Receiver {
             let mtime = entry
                 .modified
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+                .unwrap_or_default();
+            let mtime_nanos = mtime.as_nanos() as i64;
 
-            // TODO: Scanner should provide mode. For now use 0.
+            #[cfg(unix)]
+            let mode = entry.mode;
+            #[cfg(not(unix))]
             let mode = if entry.is_dir { 0o755 } else { 0o644 };
 
             let dest_entry = DestFileEntry {
                 path: path_str,
                 size: entry.size,
-                mtime,
+                mtime: mtime_nanos,
                 mode,
                 flags,
                 block_size,

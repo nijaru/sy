@@ -111,16 +111,15 @@ impl Generator {
             let mtime = entry
                 .modified
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+                .unwrap_or_default();
+            let mtime_nanos = mtime.as_nanos() as i64;
 
-            // TODO: Scanner should provide mode. For now use default.
-            let mode = if entry.is_dir { 0o755 } else { 0o644 };
+            let mode = entry.mode;
 
             // Skip unchanged files (matching size and mtime)
             if !entry.is_dir && !entry.is_symlink {
                 if let Some(ref dest) = dest_state {
-                    if dest.size == entry.size && dest.mtime == mtime {
+                    if dest.size == entry.size && dest.mtime == mtime_nanos {
                         // File unchanged, skip it
                         continue;
                     }
@@ -165,7 +164,7 @@ impl Generator {
                 GeneratorMessage::File(FileJob {
                     path: Arc::new(rel_path),
                     size: entry.size,
-                    mtime,
+                    mtime: mtime_nanos,
                     mode,
                     inode,
                     need_delta,

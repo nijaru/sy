@@ -15,8 +15,15 @@ pub struct CachedFile {
     pub size: u64,
     /// Last modification time
     pub modified: SystemTime,
+    /// Unix permission mode
+    #[serde(default = "default_mode")]
+    pub mode: u32,
     /// Whether this is a directory
     pub is_dir: bool,
+}
+
+fn default_mode() -> u32 {
+    0o644
 }
 
 impl CachedFile {
@@ -26,6 +33,7 @@ impl CachedFile {
             path: (*file.relative_path).clone(),
             size: file.size,
             modified: file.modified,
+            mode: file.mode,
             is_dir: file.is_dir,
         }
     }
@@ -38,6 +46,7 @@ impl CachedFile {
             relative_path: Arc::new(self.path.clone()),
             size: self.size,
             modified: self.modified,
+            mode: self.mode,
             is_dir: self.is_dir,
             is_symlink: false, // Not cached
             symlink_target: None,
