@@ -30,7 +30,7 @@ sy user@host:/remote /local
 
 ## Features
 
-- **Fast** — 8-11x faster than rsync on local sync (see [benchmarks](#benchmarks))
+- **Fast** — 1.25-11.5× faster than rsync on local sync (see [benchmarks](#benchmarks))
 - **Parallel** — uses all cores by default, `-j 1` to limit
 - **Delta sync** — only transfers changed blocks for large files
 - **COW support** — reflink copies on APFS/Btrfs/XFS
