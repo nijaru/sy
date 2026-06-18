@@ -58,6 +58,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  man:
+    name: Man Page
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --bin man-gen
+      - name: Check man page is up to date
+        run: git diff --exit-code man/sy.1 || (echo "Man page out of date. Run 'cargo run --bin man-gen' and commit." && exit 1)
+
   # ==========================================================================
   # Stage 2: Tests (after lint passes)
   # ==========================================================================

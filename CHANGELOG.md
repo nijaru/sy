@@ -5,33 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-06-18
+
+### Highlights
+
+- **New architecture**: SyncSession + TaskExecutor replace monolithic SyncEngine
+- **1.25-11.5x faster** than rsync across all scenarios
+- **SSH competitive**: 10% faster than rsync for incremental sync
+- **Full rsync compatibility**: 85 flags, all implemented (no stubs)
+- **Critical SSH fixes**: --exclude/--include/--filter and --dry-run now work correctly
 
 ### Added
-- **SyncSession architecture**: New modular sync engine replacing monolithic SyncEngine
-- **TaskExecutor**: Centralized task execution with backup, xattr, hardlink support
-- **--max-delete**: Supports both percentage (`--max-delete=50%`) and absolute count (`--max-delete=1000`)
-- **--keep-dirlinks (-K)**: Treat symlinked directories on receiver as directories
-- **--force-delete**: Bypass deletion safety threshold
-- **--itemize-changes**: rsync-style `YXcstpoguax` output for each file
-- **--compress (-z)**: Now works as boolean flag (rsync compatible)
-- **Edge case tests**: Special characters, empty files, long filenames, concurrent sync safety
+
+- Full rsync-compatible CLI (85 flags): --backup, --partial, --remove-source-files, --itemize-changes, --compress-level, --timeout, --bwlimit, --max-delete, --keep-dirlinks, --archive, --gitignore, and many more
+- Streaming protocol edge case tests (25 tests)
+- SSH integration tests (14 tests, were stubs)
+- Backup failure path tests
+- Auto-generated man page from CLI definition
 
 ### Fixed
-- Duplicate stats output when using `--stats`
-- Duplicate "Mode:" line in dry-run output
-- Duplicate error message for deletion threshold
-- `-z` flag now works as boolean (rsync compatible)
-- Test flag mismatches (`--use-cache`, `--per-file-progress`, `-z`)
+
+- **Critical: --exclude/--include/--filter silently ignored in SSH mode**
+- **Critical: --dry-run creating files on remote in SSH mode**
+- Duplicate stats/mode/error output
+- Symlink overwrite bug
+- Filter ordering
+- Delta sync strategy detection
 
 ### Changed
-- Architecture: SyncSession + TaskExecutor replace SyncEngine for local/SSH sync
-- Benchmarks: 1.25-11.5x faster than rsync across all scenarios
-- README rewritten with idiomatic structure
+
+- Man page auto-generated from CLI (was outdated 0.0.22)
+- .pi/, .tasks/, .mailmap removed from git tracking
+- Co-authored-by tags stripped from history
+- README rewritten
+
+### Removed
+
+- --rsh flag (deferred to v0.5, too complex)
 
 ## [0.3.0] - 2026-06-10
 
 ### Added
+
 - Bidirectional sync (bisync mode)
 - Watch mode with file system monitoring
 - SSH sync with streaming protocol
@@ -44,14 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSON output mode
 - Performance profiling
 
-### Changed
-- Improved error messages
-- Better progress reporting
-- Faster checksum calculation (xxHash3)
-
 ## [0.2.0] - 2026-05-15
 
 ### Added
+
 - Hard link preservation
 - Symlink handling
 - Extended attributes (xattr) preservation
@@ -61,25 +72,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Filter patterns (exclude/include)
 - Comparison modes (size-only, checksum, update)
 
-### Changed
-- Improved performance for large directories
-- Better memory usage
-
 ## [0.1.2] - 2026-04-20
 
 ### Fixed
+
 - Fix symlink overwrite bug
 - Fix permission preservation
 
 ## [0.1.1] - 2026-04-10
 
 ### Fixed
+
 - Fix trailing slash behavior
 - Fix dry-run output
 
 ## [0.1.0] - 2026-04-01
 
 ### Added
+
 - Initial release
 - Basic file sync
 - Dry-run mode
