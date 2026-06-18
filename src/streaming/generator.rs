@@ -381,6 +381,95 @@ mod tests {
 
         assert!(got_delete, "Should have received delete for delete_me.txt");
     }
+
+    #[tokio::test]
+    async fn test_generator_delete_threshold_exceeded() {
+        let tmp = TempDir::new().unwrap();
+        // No source files — all dest entries will be candidates for deletion
+
+        let config = GeneratorConfig {
+            root: tmp.path().to_path_buf(),
+            include_hidden: false,
+            follow_symlinks: false,
+            delete_enabled: true,
+            max_delete: Some("50%".to_string()),
+            force_delete: false,
+            filter: None,
+        };
+
+        let (tx, _rx) = crate::streaming::channel::file_job_channel();
+        let mut gen = Generator::new(config);
+
+        // Add 10 dest entries — deleting all 10 exceeds 50% threshold
+        for i in 0..10 {
+            gen.add_dest_entry(DestFileEntry {
+                path: format!("file_{}.txt", i),
+                size: 100,
+                mtime: 0,
+                mode: 0o644,
+                flags: DestFileFlags::empty(),
+                block_size: 0,
+                checksums: vec![],
+            });
+        }
+
+        // Generator should fail with threshold exceeded
+        let result = gen.run(tx).await;
+        assert!(result.is_err(), "Should have failed with threshold exceeded");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("threshold"),
+            "Error should mention threshold, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generator_delete_force_bypasses_threshold() {
+        let tmp = TempDir::new().unwrap();
+        // No source files — all dest entries will be candidates for deletion
+
+        let config = GeneratorConfig {
+            root: tmp.path().to_path_buf(),
+            include_hidden: false,
+            follow_symlinks: false,
+            delete_enabled: true,
+            max_delete: Some("50%".to_string()),
+            force_delete: true, // bypass threshold
+            filter: None,
+        };
+
+        let (tx, mut rx) = crate::streaming::channel::file_job_channel();
+        let mut gen = Generator::new(config);
+
+        // Add 10 dest entries
+        for i in 0..10 {
+            gen.add_dest_entry(DestFileEntry {
+                path: format!("file_{}.txt", i),
+                size: 100,
+                mtime: 0,
+                mode: 0o644,
+                flags: DestFileFlags::empty(),
+                block_size: 0,
+                checksums: vec![],
+            });
+        }
+
+        tokio::spawn(async move {
+            gen.run(tx).await.unwrap();
+        });
+
+        // Should receive 10 deletes (threshold bypassed)
+        let mut delete_count = 0;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                GeneratorMessage::Delete { .. } => delete_count += 1,
+                GeneratorMessage::DeleteEnd { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(delete_count, 10, "force_delete should bypass threshold");
+    }
 }
 
 /// Parse max-delete value (absolute count or percentage)
@@ -394,5 +483,38 @@ fn parse_max_delete(max_delete: &str, dest_count: u64) -> u64 {
         (dest_count as f64 * percent / 100.0) as u64
     } else {
         max_delete.parse::<u64>().unwrap_or(dest_count)
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_max_delete;
+
+    #[test]
+    fn test_percentage() {
+        assert_eq!(parse_max_delete("50%", 100), 50);
+        assert_eq!(parse_max_delete("10%", 200), 20);
+        assert_eq!(parse_max_delete("100%", 100), 100);
+        assert_eq!(parse_max_delete("0%", 100), 0);
+    }
+
+    #[test]
+    fn test_absolute() {
+        assert_eq!(parse_max_delete("1000", 100), 1000);
+        assert_eq!(parse_max_delete("0", 100), 0);
+        assert_eq!(parse_max_delete("1", 100), 1);
+    }
+
+    #[test]
+    fn test_invalid_fallback() {
+        assert_eq!(parse_max_delete("abc%", 100), 50);
+        assert_eq!(parse_max_delete("abc", 100), 100);
+    }
+
+    #[test]
+    fn test_integer_truncation() {
+        assert_eq!(parse_max_delete("50%", 10), 5);
+        assert_eq!(parse_max_delete("50%", 1), 0);
+        assert_eq!(parse_max_delete("50%", 3), 1);
     }
 }
