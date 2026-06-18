@@ -635,3 +635,67 @@ fn test_ignore_existing_skips_existing_files() {
     let new_content = fs::read_to_string(dest.path().join("new.txt")).unwrap();
     assert_eq!(new_content, "new file", "New file should be created");
 }
+
+#[test]
+fn test_nanosecond_mtime_preserved() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file
+    let file = source.path().join("file.txt");
+    fs::write(&file, "content").unwrap();
+
+    // Set a specific mtime with nanosecond precision
+    // Use a time that has non-zero nanoseconds
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // 1234567890 seconds + 123456789 nanoseconds
+        let mtime = UNIX_EPOCH + Duration::new(1234567890, 123456789);
+        let atime = filetime::FileTime::from_system_time(UNIX_EPOCH);
+        let mtime_ft = filetime::FileTime::from_system_time(mtime);
+        filetime::set_file_times(&file, atime, mtime_ft).unwrap();
+
+        // Verify source mtime has nanosecond precision
+        let src_meta = fs::metadata(&file).unwrap();
+        let src_mtime = src_meta.modified().unwrap();
+        let src_nanos = src_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        // Filesystem may truncate — just verify it's non-zero and close
+        assert!(src_nanos > 0, "Source mtime nanos should be non-zero, got {}", src_nanos);
+
+        // Sync
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                "--exclude-vcs",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        // Verify dest mtime matches source mtime (within filesystem precision)
+        let dest_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
+        let dest_mtime = dest_meta.modified().unwrap();
+        let dest_nanos = dest_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+
+        // Both should have non-zero nanoseconds (not truncated to seconds)
+        assert!(
+            dest_nanos > 0,
+            "Dest mtime nanos should be non-zero (not truncated to seconds), got {}",
+            dest_nanos
+        );
+
+        // Mtime difference should be < 1 second (ideally 0)
+        let diff = if dest_mtime > src_mtime {
+            dest_mtime.duration_since(src_mtime).unwrap()
+        } else {
+            src_mtime.duration_since(dest_mtime).unwrap()
+        };
+        assert!(
+            diff < Duration::from_secs(1),
+            "Mtime difference should be < 1s, got {:?} (src_nanos={}, dest_nanos={})",
+            diff, src_nanos, dest_nanos
+        );
+    }
+}

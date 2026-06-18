@@ -709,6 +709,70 @@ fn test_ssh_preserve_permissions() {
 
 #[test]
 #[ignore]
+fn test_ssh_nanosecond_mtime() {
+    let (source, _dest) = setup_test_dir("ssh_mtime");
+    let remote = fedora_path("mtime");
+    cleanup_fedora(&remote);
+
+    // Create file with specific mtime including nanoseconds
+    std::fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Set mtime with nanosecond precision: 1234567890.123456789
+        let mtime = UNIX_EPOCH + Duration::new(1234567890, 123456789);
+        let atime = filetime::FileTime::from_system_time(UNIX_EPOCH);
+        let mtime_ft = filetime::FileTime::from_system_time(mtime);
+        filetime::set_file_times(source.path().join("file.txt"), atime, mtime_ft).unwrap();
+
+        // Verify source mtime has nanosecond precision
+        let src_meta = std::fs::metadata(source.path().join("file.txt")).unwrap();
+        let src_mtime = src_meta.modified().unwrap();
+        let src_nanos = src_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        assert!(src_nanos > 0, "Source mtime nanos should be non-zero, got {}", src_nanos);
+
+        // Sync to remote
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                &format!("fedora:{}/", remote),
+                "--exclude-vcs",
+                "--force-delete",
+            ])
+            .output()
+            .expect("Failed to run sy");
+        assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+
+        // Verify remote mtime preserves nanosecond precision
+        // Use stat with nanoseconds: %y gives mtime with nanos
+        let check = Command::new("ssh")
+            .args(["fedora", &format!("stat -c %y {}/file.txt", remote)])
+            .output()
+            .unwrap();
+        let remote_mtime = String::from_utf8_lossy(&check.stdout).trim().to_string();
+
+        // stat -c %y format: "2009-02-13 23:31:30.123456789 +0000"
+        // The nanoseconds should NOT be .000000000 (truncated to seconds)
+        assert!(
+            !remote_mtime.ends_with(".000000000"),
+            "Remote mtime should have nanosecond precision, got: {}",
+            remote_mtime
+        );
+        // Should contain our specific nanoseconds
+        assert!(
+            remote_mtime.contains(".123456789"),
+            "Remote mtime should preserve .123456789 nanoseconds, got: {}",
+            remote_mtime
+        );
+    }
+
+    cleanup_fedora(&remote);
+}
+
+#[test]
+#[ignore]
 fn test_ssh_large_file() {
     let (source, _dest) = setup_test_dir("ssh_large");
     let remote = fedora_path("large");

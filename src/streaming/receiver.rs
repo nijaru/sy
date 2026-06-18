@@ -399,8 +399,10 @@ impl Receiver {
                     }
                 }
 
-                // Set mtime
-                let mtime = filetime::FileTime::from_unix_time(pending.entry.mtime, 0);
+                // Set mtime (mtime field stores total nanoseconds since epoch)
+                let mtime_secs = pending.entry.mtime / 1_000_000_000;
+                let mtime_nanos = (pending.entry.mtime % 1_000_000_000) as u32;
+                let mtime = filetime::FileTime::from_unix_time(mtime_secs, mtime_nanos);
                 let _ = tokio::task::spawn_blocking(move || {
                     filetime::set_file_mtime(&full_path, mtime)
                 })
