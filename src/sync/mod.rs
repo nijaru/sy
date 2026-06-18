@@ -138,6 +138,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             } else {
                 DeleteMode::Disabled
             },
+            max_delete: if delete { Some(format!("{}%", max_delete)) } else { None },
             trash,
             quiet,
             max_concurrent,

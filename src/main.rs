@@ -299,6 +299,19 @@ async fn run(cli: &mut Cli) -> Result<()> {
         }
     }
 
+    // --exclude-vcs: add .git (and .svn, .hg) to exclude list
+    // This ensures the filter engine excludes VCS dirs in both local and streaming modes
+    if cli.exclude_vcs {
+        let _ = filter_engine.add_exclude(".git");
+        let _ = filter_engine.add_exclude(".git/**");
+        let _ = filter_engine.add_exclude(".svn");
+        let _ = filter_engine.add_exclude(".svn/**");
+        let _ = filter_engine.add_exclude(".hg");
+        let _ = filter_engine.add_exclude(".hg/**");
+        let _ = filter_engine.add_exclude(".bzr");
+        let _ = filter_engine.add_exclude(".bzr/**");
+    }
+
     // Load --exclude-from file
     if let Some(ref exclude_from) = cli.exclude_from {
         // Read as exclude patterns (not rsync rules)
@@ -393,6 +406,7 @@ Or install from local source with: cargo install --path . --features acl"#
         } else {
             sync::DeleteMode::Disabled
         },
+        max_delete: if cli.delete { Some(cli.max_delete.clone()) } else { None },
         trash: cli.trash,
         quiet: cli.quiet || cli.json,
         max_concurrent: cli.parallel,

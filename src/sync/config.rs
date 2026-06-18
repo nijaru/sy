@@ -9,6 +9,8 @@ pub struct SyncConfig {
     pub dry_run: bool,
     pub diff_mode: bool,
     pub delete: DeleteMode,
+    /// Maximum deletions (absolute count or percentage string like "50%")
+    pub max_delete: Option<String>,
     #[allow(dead_code)]
     pub trash: bool,
     pub quiet: bool,
@@ -52,6 +54,7 @@ impl SyncConfig {
             dry_run: false,
             diff_mode: false,
             delete: DeleteMode::Disabled,
+            max_delete: None,
             trash: false,
             quiet: true,
             max_concurrent: 4,

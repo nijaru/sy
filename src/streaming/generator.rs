@@ -24,6 +24,10 @@ pub struct GeneratorConfig {
     pub follow_symlinks: bool,
     /// Whether --delete is enabled
     pub delete_enabled: bool,
+    /// Whether --force-delete bypasses threshold
+    pub force_delete: bool,
+    /// Maximum deletions (absolute count or percentage string like "50%")
+    pub max_delete: Option<String>,
     /// Filter engine for --exclude/--include/--filter
     pub filter: Option<FilterEngine>,
 }
@@ -47,6 +51,15 @@ impl Generator {
     /// Process a DEST_FILE_ENTRY received during Initial Exchange.
     /// Call this for each entry before starting the scan.
     pub fn add_dest_entry(&mut self, entry: DestFileEntry) {
+        // Apply filter to dest entries too (e.g., --exclude-vcs)
+        if let Some(ref filter) = self.config.filter {
+            let path = std::path::Path::new(&entry.path);
+            let is_dir = entry.flags.contains(DestFileFlags::DIR);
+            if filter.should_exclude(path, is_dir) {
+                return;
+            }
+        }
+
         let delta_info = if entry.flags.contains(DestFileFlags::HAS_CHECKSUMS) {
             Some(DeltaInfo {
                 block_size: entry.block_size,
@@ -85,6 +98,9 @@ impl Generator {
 
         let mut total_files = 0u64;
         let mut total_bytes = 0u64;
+
+        // Snapshot total dest count before scan (for deletion threshold)
+        let original_dest_count = self.dest_index.len() as u64;
 
         // Scanner::scan() is blocking, so we run it in spawn_blocking
         let entries = tokio::task::spawn_blocking(move || scanner.scan()).await??;
@@ -184,12 +200,25 @@ impl Generator {
 
         // Send deletes if enabled
         if self.config.delete_enabled {
-            let mut delete_count = 0u64;
             let remaining: Vec<_> = self
                 .dest_index
                 .remaining_paths()
                 .map(|(path, state)| (path.clone(), state.is_dir))
                 .collect();
+
+            // Check deletion threshold (skip if force_delete)
+            let delete_count = remaining.len() as u64;
+            if !self.config.force_delete {
+                if let Some(ref max_delete) = self.config.max_delete {
+                    let threshold = parse_max_delete(max_delete, original_dest_count);
+                    if delete_count > threshold {
+                        anyhow::bail!(
+                            "Deletion safety threshold exceeded: {} files to delete exceeds max-delete '{}' (threshold: {} of {} dest files)",
+                            delete_count, max_delete, threshold, original_dest_count
+                        );
+                    }
+                }
+            }
 
             for (path, is_dir) in remaining {
                 tx.send(GeneratorMessage::Delete {
@@ -197,7 +226,6 @@ impl Generator {
                     is_dir,
                 })
                 .await?;
-                delete_count += 1;
             }
             tx.send(GeneratorMessage::DeleteEnd {
                 count: delete_count,
@@ -241,6 +269,8 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: false,
+            max_delete: None,
+            force_delete: false,
             filter: None,
         };
 
@@ -272,6 +302,8 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: false,
+            max_delete: None,
+            force_delete: false,
             filter: None,
         };
 
@@ -311,6 +343,8 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: true,
+            max_delete: None,
+            force_delete: false,
             filter: None,
         };
 
@@ -346,5 +380,19 @@ mod tests {
         }
 
         assert!(got_delete, "Should have received delete for delete_me.txt");
+    }
+}
+
+/// Parse max-delete value (absolute count or percentage)
+/// Returns the maximum number of files that can be deleted
+fn parse_max_delete(max_delete: &str, dest_count: u64) -> u64 {
+    if max_delete.ends_with('%') {
+        let percent: f64 = max_delete
+            .trim_end_matches('%')
+            .parse()
+            .unwrap_or(50.0);
+        (dest_count as f64 * percent / 100.0) as u64
+    } else {
+        max_delete.parse::<u64>().unwrap_or(dest_count)
     }
 }

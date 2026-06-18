@@ -20,6 +20,8 @@ pub struct StreamingSync {
     pub local_root: PathBuf,
     pub remote_root: PathBuf,
     pub delete_enabled: bool,
+    pub force_delete: bool,
+    pub max_delete: Option<String>,
     pub compress: CompressionDetection,
     pub filter: Option<FilterEngine>,
     pub dry_run: bool,
@@ -36,10 +38,24 @@ impl StreamingSync {
             local_root,
             remote_root,
             delete_enabled,
+            force_delete: false,
+            max_delete: None,
             compress,
             filter: None,
             dry_run: false,
         }
+    }
+
+    /// Set max-delete threshold
+    pub fn with_max_delete(mut self, max_delete: String) -> Self {
+        self.max_delete = Some(max_delete);
+        self
+    }
+
+    /// Set force-delete to bypass threshold
+    pub fn with_force_delete(mut self, force: bool) -> Self {
+        self.force_delete = force;
+        self
     }
 
     /// Set filter engine for --exclude/--include/--filter
@@ -85,6 +101,8 @@ impl StreamingSync {
             include_hidden: true,
             follow_symlinks: false,
             delete_enabled: self.delete_enabled,
+            force_delete: self.force_delete,
+            max_delete: self.max_delete.clone(),
             filter: self.filter.clone(),
         });
 
@@ -153,6 +171,11 @@ impl StreamingSync {
         // Actually, the protocol says DONE is from R->client.
         // Maybe we need a message from client to server to say "I'm finished sending".
         // Let's use Done message but client side.
+        // Wait for generator to complete first (may fail on deletion threshold)
+        let gen_result = gen_handle.await?;
+        sender_handle.await??;
+
+        // Send DONE only after generator completes
         let client_done = Done {
             files_ok: 0,
             files_err: 0,
@@ -162,8 +185,8 @@ impl StreamingSync {
         write_frame(writer, &client_done.encode()).await?;
         writer.flush().await?;
 
-        let (total_files, total_bytes) = gen_handle.await??;
-        sender_handle.await??;
+        // Propagate generator error (e.g., deletion threshold exceeded)
+        let (total_files, total_bytes) = gen_result?;
 
         // Finally receive DONE from server
         let (msg_type, payload) = read_frame(reader).await?;

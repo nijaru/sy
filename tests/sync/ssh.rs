@@ -453,6 +453,7 @@ fn test_ssh_max_delete() {
         std::fs::write(source.path().join(format!("file{}.txt", i)), format!("content{}", i)).unwrap();
     }
 
+    // Initial sync
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
@@ -470,9 +471,24 @@ fn test_ssh_max_delete() {
         std::fs::remove_file(source.path().join(format!("file{}.txt", i))).unwrap();
     }
 
-    // With max-delete=50%, local sync would fail.
-    // SSH streaming mode does not yet enforce deletion threshold.
-    // This is a known limitation — test verifies sync completes.
+    // With max-delete=50%, should fail because 90% deletion exceeds threshold
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            &format!("fedora:{}/", remote),
+            "--exclude-vcs",
+            "--delete",
+            "--max-delete=50%",
+        ])
+        .output()
+        .expect("Failed to run sy");
+
+    // Should fail — threshold exceeded
+    assert!(!output.status.success(), "SSH sync should fail when max-delete threshold exceeded, got success. stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("threshold") || stderr.contains("max-delete"), "Error should mention threshold");
+
+    // With --force-delete, should succeed despite threshold
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
@@ -484,18 +500,7 @@ fn test_ssh_max_delete() {
         ])
         .output()
         .expect("Failed to run sy");
-
-    // TODO: When deletion threshold is enforced in SSH mode, change to:
-    // assert!(!output.status.success());
-    // For now, verify the sync completes (even though it deletes too many files)
-    assert!(output.status.success(), "SSH sync should complete even with max-delete");
-
-    // Verify file was deleted from remote
-    let check = Command::new("ssh")
-        .args(["fedora", &format!("test -f {}/file1.txt && echo exists || echo gone", remote)])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "gone");
+    assert!(output.status.success(), "SSH sync should succeed with --force-delete");
 
     cleanup_fedora(&remote);
 }
@@ -668,9 +673,6 @@ fn test_ssh_idempotent() {
 #[test]
 #[ignore]
 fn test_ssh_preserve_permissions() {
-    // NOTE: Known limitation — streaming protocol hardcodes 0o644.
-    // Source permissions are not propagated over SSH.
-    // This test documents the expected behavior once fixed.
     let (source, _dest) = setup_test_dir("ssh_perms");
     let remote = fedora_path("perms");
     cleanup_fedora(&remote);
@@ -695,13 +697,12 @@ fn test_ssh_preserve_permissions() {
 
     assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    // Currently fails: streaming protocol hardcodes 0o644
-    // When the protocol is fixed to propagate permissions, uncomment:
-    // let check = Command::new("ssh")
-    //     .args(["fedora", &format!("stat -c %a {}/script.sh", remote)])
-    //     .output()
-    //     .unwrap();
-    // assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "755");
+    // Verify permissions were propagated
+    let check = Command::new("ssh")
+        .args(["fedora", &format!("stat -c %a {}/script.sh", remote)])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "755");
 
     cleanup_fedora(&remote);
 }

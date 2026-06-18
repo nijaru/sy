@@ -98,6 +98,8 @@ async fn run_server_pull(
         include_hidden: true,
         follow_symlinks: false,
         delete_enabled: hello.flags.contains(HelloFlags::DELETE),
+        force_delete: false, // TODO: wire from Hello flags
+        max_delete: None, // TODO: wire from Hello flags
         filter: None,
     });
 

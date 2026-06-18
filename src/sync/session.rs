@@ -593,13 +593,20 @@ impl SyncSession {
         let (mut stdin, mut stdout) = server_session.split();
 
         // Use streaming protocol
-        let streaming = crate::streaming::StreamingSync::new(
+        let mut streaming = crate::streaming::StreamingSync::new(
             source_root,
             dest_root.clone(),
             self.config.delete.is_enabled(),
             CompressionDetection::Auto, // compress for SSH
         ).with_filter(self.config.filter_engine.clone())
          .with_dry_run(self.config.dry_run);
+
+        if let Some(ref max_delete) = self.config.max_delete {
+            streaming = streaming.with_max_delete(max_delete.clone());
+        }
+        if self.config.delete.is_forced() {
+            streaming = streaming.with_force_delete(true);
+        }
 
         let streaming_stats = streaming.push(&mut stdout, &mut stdin)
             .await
@@ -645,12 +652,19 @@ impl SyncSession {
         let (mut stdin, mut stdout) = server_session.split();
 
         // Use streaming protocol (pull)
-        let streaming = crate::streaming::StreamingSync::new(
+        let mut streaming = crate::streaming::StreamingSync::new(
             dest_root,
             source_root.clone(),
             self.config.delete.is_enabled(),
             CompressionDetection::Auto, // compress for SSH
         ).with_filter(self.config.filter_engine.clone());
+
+        if let Some(ref max_delete) = self.config.max_delete {
+            streaming = streaming.with_max_delete(max_delete.clone());
+        }
+        if self.config.delete.is_forced() {
+            streaming = streaming.with_force_delete(true);
+        }
 
         let streaming_stats = streaming.pull(&mut stdout, &mut stdin)
             .await
