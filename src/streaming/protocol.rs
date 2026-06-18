@@ -85,6 +85,7 @@ bitflags::bitflags! {
         const COMPRESSION = 1 << 3;
         const XATTRS = 1 << 4;
         const ACLS = 1 << 5;
+        const DRY_RUN = 1 << 6;
     }
 }
 

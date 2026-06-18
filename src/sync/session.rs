@@ -598,7 +598,8 @@ impl SyncSession {
             dest_root.clone(),
             self.config.delete.is_enabled(),
             CompressionDetection::Auto, // compress for SSH
-        );
+        ).with_filter(self.config.filter_engine.clone())
+         .with_dry_run(self.config.dry_run);
 
         let streaming_stats = streaming.push(&mut stdout, &mut stdin)
             .await
@@ -649,7 +650,7 @@ impl SyncSession {
             source_root.clone(),
             self.config.delete.is_enabled(),
             CompressionDetection::Auto, // compress for SSH
-        );
+        ).with_filter(self.config.filter_engine.clone());
 
         let streaming_stats = streaming.pull(&mut stdout, &mut stdin)
             .await

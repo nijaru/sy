@@ -98,6 +98,7 @@ async fn run_server_pull(
         include_hidden: true,
         follow_symlinks: false,
         delete_enabled: hello.flags.contains(HelloFlags::DELETE),
+        filter: None,
     });
 
     loop {

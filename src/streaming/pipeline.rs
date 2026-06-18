@@ -3,6 +3,7 @@
 //! Orchestrates Generator, Sender, and Receiver tasks.
 
 use crate::compress::CompressionDetection;
+use crate::filter::FilterEngine;
 use crate::streaming::{
     channel::{file_job_channel, SyncStats},
     protocol::{read_frame, write_frame, Done, Hello, HelloFlags, MessageType},
@@ -20,6 +21,8 @@ pub struct StreamingSync {
     pub remote_root: PathBuf,
     pub delete_enabled: bool,
     pub compress: CompressionDetection,
+    pub filter: Option<FilterEngine>,
+    pub dry_run: bool,
 }
 
 impl StreamingSync {
@@ -34,7 +37,21 @@ impl StreamingSync {
             remote_root,
             delete_enabled,
             compress,
+            filter: None,
+            dry_run: false,
         }
+    }
+
+    /// Set filter engine for --exclude/--include/--filter
+    pub fn with_filter(mut self, filter: FilterEngine) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Set dry-run mode
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
     }
 
     /// Run a push sync (local -> remote).
@@ -44,8 +61,12 @@ impl StreamingSync {
         W: AsyncWrite + Unpin,
     {
         // 1. Send HELLO
+        let mut hello_flags = HelloFlags::empty();
+        if self.dry_run {
+            hello_flags |= HelloFlags::DRY_RUN;
+        }
         let hello = Hello::new(
-            HelloFlags::empty(),
+            hello_flags,
             self.remote_root.to_string_lossy().into_owned(),
         );
         write_frame(writer, &hello.encode()).await?;
@@ -64,6 +85,7 @@ impl StreamingSync {
             include_hidden: true,
             follow_symlinks: false,
             delete_enabled: self.delete_enabled,
+            filter: self.filter.clone(),
         });
 
         loop {
@@ -111,8 +133,15 @@ impl StreamingSync {
         });
 
         // Pipe data to writer concurrently with sender
-        while let Some(bytes) = data_rx.recv().await {
-            writer.write_all(&bytes).await?;
+        // In dry-run mode, we still run the pipeline to compute stats,
+        // but we don't send any data to the server.
+        if !self.dry_run {
+            while let Some(bytes) = data_rx.recv().await {
+                writer.write_all(&bytes).await?;
+            }
+        } else {
+            // Drain the channel without sending
+            while data_rx.recv().await.is_some() {}
         }
 
         // Send DONE (Wait, DONE is sent by Receiver)

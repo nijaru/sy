@@ -8,6 +8,7 @@ use crate::streaming::channel::{
 };
 use crate::streaming::protocol::{DestFileEntry, DestFileFlags};
 use crate::sync::scanner::Scanner;
+use crate::filter::FilterEngine;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ pub struct GeneratorConfig {
     pub follow_symlinks: bool,
     /// Whether --delete is enabled
     pub delete_enabled: bool,
+    /// Filter engine for --exclude/--include/--filter
+    pub filter: Option<FilterEngine>,
 }
 
 /// Generator state
@@ -93,6 +96,13 @@ impl Generator {
             // Skip root directory (empty relative path)
             if rel_path_str.is_empty() {
                 continue;
+            }
+
+            // Apply filter engine (--exclude/--include/--filter)
+            if let Some(ref filter) = self.config.filter {
+                if filter.should_exclude(&entry.relative_path, entry.is_dir) {
+                    continue;
+                }
             }
 
             // Get destination state before removing from index
@@ -232,6 +242,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: false,
+            filter: None,
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -262,6 +273,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: false,
+            filter: None,
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -300,6 +312,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             delete_enabled: true,
+            filter: None,
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
