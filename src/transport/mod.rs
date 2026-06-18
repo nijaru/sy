@@ -257,14 +257,21 @@ pub trait Transport: Send + Sync {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Write file
-        let mut file = tokio::fs::File::create(path).await?;
+        // Atomic write: temp file + rename (same directory = same filesystem)
+        let temp_path = path.with_extension(".sy.tmp");
+        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
+
+        let mut file = tokio::fs::File::create(&temp_path).await?;
         file.write_all(data).await?;
         file.flush().await?;
         drop(file);
 
-        // Set mtime
-        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(mtime))?;
+        // Set mtime on temp file
+        filetime::set_file_mtime(&temp_path, filetime::FileTime::from_system_time(mtime))?;
+
+        // Atomic rename to final path
+        tokio::fs::rename(&temp_path, path).await?;
+        guard.defuse();
 
         Ok(())
     }

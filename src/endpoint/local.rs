@@ -110,17 +110,27 @@ impl Endpoint for LocalEndpoint {
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&full_path, data).await?;
+
+        // Atomic write: temp file + rename (same directory = same filesystem)
+        let temp_path = full_path.with_extension(".sy.tmp");
+        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
+
+        tokio::fs::write(&temp_path, data).await?;
         filetime::set_file_mtime(
-            &full_path,
+            &temp_path,
             filetime::FileTime::from_system_time(meta.modified),
         )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(meta.mode);
-            tokio::fs::set_permissions(&full_path, perms).await?;
+            tokio::fs::set_permissions(&temp_path, perms).await?;
         }
+
+        // Atomic rename to final path
+        tokio::fs::rename(&temp_path, &full_path).await?;
+        guard.defuse();
+
         Ok(())
     }
 
