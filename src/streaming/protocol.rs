@@ -1536,4 +1536,71 @@ mod tests {
         let decoded = Fatal::decode(payload).unwrap();
         assert_eq!(decoded.message, long_msg);
     }
+
+    // --- Error path tests: truncated/malformed messages ---
+
+    #[test]
+    fn test_hello_payload_too_short() {
+        let payload = Bytes::from(vec![0u8; 7]); // Needs 8
+        let result = Hello::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_file_entry_payload_too_short() {
+        let payload = Bytes::from(vec![0u8; 1]); // Needs 2 for path_len
+        let result = FileEntry::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_file_entry_path_truncated() {
+        // path_len says 100 but only 2 bytes follow
+        let mut data = vec![0u8; 3];
+        data[0] = 0; data[1] = 100; // path_len = 100
+        let payload = Bytes::from(data);
+        let result = FileEntry::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn test_data_payload_too_short() {
+        // Data needs at least: 2 (path_len) + path + 8 (offset) + 1 (flags) + data
+        // With 1 byte, path_len read fails
+        let payload = Bytes::from(vec![0u8; 1]);
+        let result = Data::decode(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dest_file_entry_payload_too_short() {
+        let payload = Bytes::from(vec![0u8; 1]); // Needs 2 for path_len
+        let result = DestFileEntry::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_error_payload_too_short() {
+        let payload = Bytes::from(vec![0u8; 1]); // Too short for Error
+        let result = Error::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_file_entry_symlink_target_truncated() {
+        // Create a FileEntry with symlink flag but truncated target length
+        let mut data = vec![0u8; 30];
+        data[24] = 0x01; // set symlink flag
+        // symlink_target_length at offset 25-26, set to 100 but don't provide data
+        data[25] = 100;
+        let payload = Bytes::from(data);
+        let result = FileEntry::decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
 }

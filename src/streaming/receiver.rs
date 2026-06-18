@@ -623,4 +623,68 @@ mod tests {
         let content = fs::read_to_string(tmp.path().join("test.txt")).unwrap();
         assert_eq!(content, "hello world");
     }
+
+    #[test]
+    fn test_validate_path_normal() {
+        let root = Path::new("/tmp/sync_root");
+        assert!(validate_path(root, "file.txt").is_ok());
+        assert!(validate_path(root, "dir/file.txt").is_ok());
+        assert!(validate_path(root, "a/b/c/file.txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_empty() {
+        let root = Path::new("/tmp/sync_root");
+        let err = validate_path(root, "").unwrap_err();
+        assert!(err.to_string().contains("Empty path"));
+    }
+
+    #[test]
+    fn test_validate_path_absolute() {
+        let root = Path::new("/tmp/sync_root");
+        let err = validate_path(root, "/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("Absolute paths"));
+    }
+
+    #[test]
+    fn test_validate_path_traversal() {
+        let root = Path::new("/tmp/sync_root");
+        let err = validate_path(root, "../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("traversal"));
+        let err = validate_path(root, "dir/../../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_path_dot_dot_in_middle() {
+        let root = Path::new("/tmp/sync_root");
+        // "foo/../bar" contains ParentDir — rejected before normalization
+        // This is the correct security behavior: reject ANY .. component
+        let err = validate_path(root, "foo/../bar").unwrap_err();
+        assert!(err.to_string().contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_symlink_target_normal() {
+        let root = Path::new("/tmp/sync_root");
+        let link_path = Path::new("/tmp/sync_root/link");
+        assert!(validate_symlink_target(root, link_path, "target.txt").is_ok());
+        assert!(validate_symlink_target(root, link_path, "dir/target.txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_symlink_target_absolute() {
+        let root = Path::new("/tmp/sync_root");
+        let link_path = Path::new("/tmp/sync_root/link");
+        let err = validate_symlink_target(root, link_path, "/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("Absolute"));
+    }
+
+    #[test]
+    fn test_validate_symlink_target_traversal() {
+        let root = Path::new("/tmp/sync_root");
+        let link_path = Path::new("/tmp/sync_root/link");
+        let err = validate_symlink_target(root, link_path, "../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("escapes"));
+    }
 }
