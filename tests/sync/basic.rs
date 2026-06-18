@@ -1166,3 +1166,106 @@ fn test_default_includes_git() {
     );
     assert!(dest.path().join("file.txt").exists());
 }
+
+#[test]
+fn test_backup_readonly_dir() {
+    let (source, dest) = setup_test_dir("backup_readonly");
+
+    // Create initial file in dest
+    fs::write(dest.path().join("file.txt"), "old content").unwrap();
+    
+    // Make dest read-only
+    let mut perms = fs::metadata(dest.path()).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(dest.path(), perms).unwrap();
+    
+    // Create updated file in source
+    thread::sleep(Duration::from_secs(2));
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+        ])
+        .output()
+        .unwrap();
+
+    // Should fail because dest is read-only
+    assert!(!output.status.success(), "Should fail when dest is read-only");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Permission denied") || stderr.contains("permission") || stderr.contains("denied"),
+        "Error should mention permission: {}", stderr);
+
+    // Restore permissions for cleanup
+    let mut perms = fs::metadata(dest.path()).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(dest.path(), perms).unwrap();
+}
+
+#[test]
+fn test_backup_dir_nonexistent() {
+    let (source, dest) = setup_test_dir("backup_dir_nonexistent");
+
+    // Create initial file in dest
+    fs::write(dest.path().join("file.txt"), "old content").unwrap();
+    
+    // Wait to ensure source is newer
+    thread::sleep(Duration::from_secs(2));
+    
+    // Create updated file in source
+    fs::write(source.path().join("file.txt"), "new content").unwrap();
+
+    // Use a non-existent backup dir (should be created automatically)
+    let backup_dir = dest.path().join("nonexistent").join("backups");
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            &format!("--backup-dir={}", backup_dir.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check backup file exists in backup dir
+    assert!(backup_dir.join("file.txt~").exists(), "Backup file should exist in backup dir");
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+}
+
+#[test]
+fn test_backup_preserves_original() {
+    let (source, dest) = setup_test_dir("backup_preserves");
+
+    // Create initial file in dest with specific content
+    fs::write(dest.path().join("file.txt"), "original content").unwrap();
+    
+    // Wait to ensure source is newer
+    thread::sleep(Duration::from_secs(2));
+    
+    // Create updated file in source
+    fs::write(source.path().join("file.txt"), "updated content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    
+    // Check backup file contains original content
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt~")).unwrap(), "original content");
+    // Check main file contains updated content
+    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "updated content");
+}

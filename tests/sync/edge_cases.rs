@@ -5,6 +5,8 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn sy_bin() -> String {
@@ -479,4 +481,92 @@ fn test_deeply_nested_paths() {
         fs::read_to_string(dest_path.join("deep.txt")).unwrap(),
         "deep content"
     );
+}
+
+#[test]
+fn test_hardlink_delta_sync() {
+    let (source, dest) = setup_test_dir();
+
+    // Create a file and a hard link to it
+    let content = "original content for hardlink test";
+    fs::write(source.path().join("original.txt"), content).unwrap();
+    fs::hard_link(source.path().join("original.txt"), source.path().join("link.txt")).unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--preserve-hardlinks",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify both files exist and are hard linked
+    assert!(dest.path().join("original.txt").exists());
+    assert!(dest.path().join("link.txt").exists());
+
+    // Update the original file
+    thread::sleep(Duration::from_secs(2));
+    fs::write(source.path().join("original.txt"), "updated content").unwrap();
+
+    // Sync again
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--preserve-hardlinks",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify both files have updated content
+    assert_eq!(fs::read_to_string(dest.path().join("original.txt")).unwrap(), "updated content");
+    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "updated content");
+}
+
+#[test]
+fn test_symlink_to_file_delta() {
+    let (source, dest) = setup_test_dir();
+
+    // Create a file and a symlink to it
+    fs::write(source.path().join("target.txt"), "target content").unwrap();
+    std::os::unix::fs::symlink("target.txt", source.path().join("link.txt")).unwrap();
+
+    // Initial sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify symlink exists
+    assert!(dest.path().join("link.txt").exists());
+    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "target content");
+
+    // Update the target file
+    thread::sleep(Duration::from_secs(2));
+    fs::write(source.path().join("target.txt"), "updated target").unwrap();
+
+    // Sync again
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify symlink still works and has updated content
+    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "updated target");
 }
