@@ -30,7 +30,6 @@ sy user@host:/remote /local
 
 ## Features
 
-- **Fast** — 1.25-11.5× faster than rsync on local sync (see [benchmarks](#benchmarks))
 - **Parallel** — uses all cores by default, `-j 1` to limit
 - **Delta sync** — only transfers changed blocks for large files
 - **COW support** — reflink copies on APFS/Btrfs/XFS
@@ -129,7 +128,7 @@ sy /source /dest --itemize-changes
 
 ## Benchmarks
 
-Tested on macOS M3 Max with NVMe storage:
+Preliminary benchmarks on macOS M3 Max with NVMe storage. Results vary significantly by hardware, file sizes, and workload.
 
 | Scenario | sy | rsync | Speedup |
 |----------|-----|-------|---------|
@@ -137,6 +136,8 @@ Tested on macOS M3 Max with NVMe storage:
 | 10 × 10MB files | 29ms | 330ms | 11.5× |
 | 1 × 100MB file | 38ms | 324ms | 8.6× |
 | Incremental (no changes) | 33ms | 63ms | 1.9× |
+
+**Note:** These are limited benchmarks on a single machine. We recommend running your own benchmarks for your specific use case.
 
 Run benchmarks yourself:
 
