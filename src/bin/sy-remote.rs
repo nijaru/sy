@@ -6,6 +6,7 @@ use sy::compress::{decompress, Compression};
 use sy::delta::{apply_delta, compute_checksums, Delta};
 use sy::sparse::DataRegion;
 use sy::sync::scanner::Scanner;
+use sy::temp_file::TempFileGuard;
 
 #[derive(Parser)]
 #[command(name = "sy-remote")]
@@ -245,20 +246,25 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            // Write file
-            let mut output_file = std::fs::File::create(&output_path)?;
-            output_file.write_all(&file_data)?;
-            output_file.flush()?;
+            // Write file atomically: temp + rename
+            let temp_path = TempFileGuard::temp_path_for(&output_path);
+            {
+                let mut temp_file = std::fs::File::create(&temp_path)?;
+                temp_file.write_all(&file_data)?;
+                temp_file.flush()?;
 
-            // Set mtime if provided
-            if let Some(mtime_secs) = mtime {
-                use std::time::{Duration, UNIX_EPOCH};
-                let mtime = UNIX_EPOCH + Duration::from_secs(mtime_secs);
-                let _ = filetime::set_file_mtime(
-                    &output_path,
-                    filetime::FileTime::from_system_time(mtime),
-                );
+                // Set mtime on temp file before rename
+                if let Some(mtime_secs) = mtime {
+                    use std::time::{Duration, UNIX_EPOCH};
+                    let mtime = UNIX_EPOCH + Duration::from_secs(mtime_secs);
+                    let _ = filetime::set_file_mtime(
+                        &temp_path,
+                        filetime::FileTime::from_system_time(mtime),
+                    );
+                }
             }
+            // Atomic rename to final path
+            std::fs::rename(&temp_path, &output_path)?;
 
             // Report success with bytes written
             println!("{{\"bytes_written\": {}}}", file_data.len());
