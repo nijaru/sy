@@ -605,11 +605,17 @@ impl StrategyPlanner {
         false
     }
 
-    /// Check if mtimes match within tolerance
+    /// Check if mtimes match within tolerance (subsecond precision)
     fn mtime_matches(&self, source_mtime: &SystemTime, dest_mtime: &SystemTime) -> bool {
         match source_mtime.duration_since(*dest_mtime) {
-            Ok(duration) => duration.as_secs() <= self.mtime_tolerance,
-            Err(e) => e.duration().as_secs() <= self.mtime_tolerance,
+            Ok(duration) => {
+                let tolerance = std::time::Duration::from_secs(self.mtime_tolerance);
+                duration <= tolerance
+            }
+            Err(e) => {
+                let tolerance = std::time::Duration::from_secs(self.mtime_tolerance);
+                e.duration() <= tolerance
+            }
         }
     }
 
@@ -617,7 +623,10 @@ impl StrategyPlanner {
     fn dest_is_newer(&self, source: &FileEntry, dest_info: &FileInfo) -> bool {
         // dest is newer if dest_mtime > source_mtime (outside tolerance)
         match dest_info.modified.duration_since(source.modified) {
-            Ok(duration) => duration.as_secs() > self.mtime_tolerance,
+            Ok(duration) => {
+                let tolerance = std::time::Duration::from_secs(self.mtime_tolerance);
+                duration > tolerance
+            }
             Err(_) => false, // source is newer or same
         }
     }
@@ -1109,5 +1118,30 @@ mod tests {
 
         // No deletions needed
         assert_eq!(deletions.len(), 0);
+    }
+
+    #[test]
+    fn test_mtime_matches_subsecond() {
+        let planner = StrategyPlanner::default();
+        
+        let base = std::time::SystemTime::now();
+        let same_time = base;
+        assert!(planner.mtime_matches(&base, &same_time));
+        
+        // 0.5 seconds difference — within 1s tolerance
+        let half_sec_later = base + std::time::Duration::from_millis(500);
+        assert!(planner.mtime_matches(&base, &half_sec_later));
+        
+        // 1.5 seconds difference — exceeds 1s tolerance
+        let one_half_sec = base + std::time::Duration::from_millis(1500);
+        assert!(!planner.mtime_matches(&base, &one_half_sec));
+        
+        // 1.0 second difference — within tolerance
+        let one_sec = base + std::time::Duration::from_secs(1);
+        assert!(planner.mtime_matches(&base, &one_sec));
+        
+        // 2.0 seconds difference — exceeds tolerance
+        let two_sec = base + std::time::Duration::from_secs(2);
+        assert!(!planner.mtime_matches(&base, &two_sec));
     }
 }
