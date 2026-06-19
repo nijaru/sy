@@ -149,15 +149,23 @@ impl Sender {
             }
 
             let mut flags = DataFlags::empty();
-            if self.config.compress != CompressionDetection::Never {
+            // Compress if enabled and file type benefits from compression
+            let should_compress = self.config.compress != CompressionDetection::Never
+                && !crate::compress::is_compressed_extension(path_str);
+            let payload = if should_compress {
                 flags |= DataFlags::COMPRESSED;
-            }
+                let raw = &buf[..n];
+                Bytes::from(crate::compress::compress(raw, crate::compress::Compression::Lz4)
+                    .unwrap_or_else(|_| raw.to_vec()))  // Fallback to uncompressed on error
+            } else {
+                Bytes::copy_from_slice(&buf[..n])
+            };
 
             let data = Data {
                 path: path_str.to_string(),
                 offset,
                 flags,
-                data: Bytes::copy_from_slice(&buf[..n]),
+                data: payload,
             };
             on_data(data.encode())?;
 
@@ -215,7 +223,9 @@ impl Sender {
 
         // Encode delta ops into DATA messages, chunking to avoid frame size limits
         let mut flags = DataFlags::DELTA;
-        if self.config.compress != CompressionDetection::Never {
+        let should_compress = self.config.compress != CompressionDetection::Never
+            && !crate::compress::is_compressed_extension(path_str);
+        if should_compress {
             flags |= DataFlags::COMPRESSED;
         }
 
@@ -247,11 +257,18 @@ impl Sender {
             // Check if adding this op would exceed chunk size
             if !delta_bytes.is_empty() && delta_bytes.len() + op_bytes.len() > DELTA_CHUNK_SIZE {
                 // Flush current chunk
+                let raw = std::mem::take(&mut delta_bytes);
+                let payload = if should_compress {
+                    Bytes::from(crate::compress::compress(&raw, crate::compress::Compression::Lz4)
+                        .unwrap_or(raw))
+                } else {
+                    Bytes::from(raw)
+                };
                 let data = Data {
                     path: path_str.to_string(),
                     offset: 0, // Unused for delta - receiver processes ops sequentially
                     flags,
-                    data: Bytes::from(std::mem::take(&mut delta_bytes)),
+                    data: payload,
                 };
                 on_data(data.encode())?;
             }
@@ -261,11 +278,17 @@ impl Sender {
 
         // Flush remaining ops
         if !delta_bytes.is_empty() {
+            let payload = if should_compress {
+                Bytes::from(crate::compress::compress(&delta_bytes, crate::compress::Compression::Lz4)
+                    .unwrap_or(delta_bytes))
+            } else {
+                Bytes::from(delta_bytes)
+            };
             let data = Data {
                 path: path_str.to_string(),
                 offset: 0, // Unused for delta
                 flags,
-                data: Bytes::from(delta_bytes),
+                data: payload,
             };
             on_data(data.encode())?;
         }

@@ -338,6 +338,14 @@ impl Receiver {
             .ok_or_else(|| anyhow::anyhow!("No pending file for {}", data.path))?;
 
         if let Some(ref mut file) = pending.file {
+            // Decompress if compressed
+            let raw_data = if data.flags.contains(DataFlags::COMPRESSED) {
+                Bytes::from(crate::compress::decompress(&data.data, crate::compress::Compression::Lz4)
+                    .context("Failed to decompress data")?)
+            } else {
+                data.data
+            };
+
             if data.flags.contains(DataFlags::DELTA) {
                 // Lazily open original file on first delta chunk, reuse for subsequent chunks
                 if pending.original_file.is_none() {
@@ -354,13 +362,13 @@ impl Receiver {
                     .original_file
                     .as_mut()
                     .expect("original_file must be set before applying delta");
-                Self::apply_delta_with_original(file, original, &data.data).await?;
+                Self::apply_delta_with_original(file, original, &raw_data).await?;
             } else {
                 // Write raw data at offset
                 file.seek(SeekFrom::Start(data.offset)).await?;
-                file.write_all(&data.data).await?;
+                file.write_all(&raw_data).await?;
             }
-            pending.bytes_written += data.data.len() as u64;
+            pending.bytes_written += raw_data.len() as u64;
         }
 
         Ok(())
