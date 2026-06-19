@@ -1011,9 +1011,13 @@ impl SshTransport {
         let source_buf = source.to_path_buf();
         let dest_buf = dest.to_path_buf();
 
-        // Create local file with fixed size
+        // Atomic write: temp file + rename (same directory = same filesystem)
+        let temp_buf = dest_buf.with_extension(".sy.tmp");
+        let guard = crate::temp_file::TempFileGuard::new(&temp_buf);
+
+        // Create temp file with fixed size
         {
-            let file = std::fs::File::create(&dest_buf).map_err(SyncError::Io)?;
+            let file = std::fs::File::create(&temp_buf).map_err(SyncError::Io)?;
             file.set_len(file_size).map_err(SyncError::Io)?;
         }
 
@@ -1025,7 +1029,7 @@ impl SshTransport {
             let length = std::cmp::min(chunk_size, file_size - offset);
 
             let source_path = source_buf.clone();
-            let dest_path = dest_buf.clone();
+            let temp_path = temp_buf.clone();
             let session_arc = self.connection_pool.get_session();
             let progress = Arc::clone(&progress);
             let cb = progress_callback.clone();
@@ -1049,7 +1053,7 @@ impl SshTransport {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
-                    let file = std::fs::OpenOptions::new().write(true).open(&dest_path)?;
+                    let file = std::fs::OpenOptions::new().write(true).open(&temp_path)?;
 
                     // Optimize buffer size to 1MB to reduce syscalls
                     let mut buffer = vec![0u8; 1024 * 1024];
@@ -1116,10 +1120,14 @@ impl SshTransport {
             }
         }
 
-        // Get mtime from source and set on dest
+        // Get mtime from source and set on temp file, then rename
         let mtime = self.get_mtime(source).await?;
-        filetime::set_file_mtime(&dest_buf, filetime::FileTime::from_system_time(mtime))
+        filetime::set_file_mtime(&temp_buf, filetime::FileTime::from_system_time(mtime))
             .map_err(SyncError::Io)?;
+
+        // Atomic rename to final path
+        std::fs::rename(&temp_buf, &dest_buf).map_err(SyncError::Io)?;
+        guard.defuse();
 
         Ok(TransferResult::new(file_size))
     }
@@ -2586,6 +2594,13 @@ impl Transport for SshTransport {
                     }
 
                     // Open local destination file (append if resuming, create if new)
+                    // For new transfers: atomic write via temp file + rename
+                    let use_temp = !is_resuming;
+                    let actual_dest = if use_temp {
+                        dest_buf.with_extension(".sy.tmp")
+                    } else {
+                        dest_buf.clone()
+                    };
                     let mut dest_file = if is_resuming {
                         std::fs::OpenOptions::new()
                             .append(true)
@@ -2601,10 +2616,10 @@ impl Transport for SshTransport {
                                 ))
                             })?
                     } else {
-                        std::fs::File::create(&dest_buf).map_err(|e| {
+                        std::fs::File::create(&actual_dest).map_err(|e| {
                             SyncError::Io(std::io::Error::new(
                                 e.kind(),
-                                format!("Failed to create file {}: {}", dest_buf.display(), e),
+                                format!("Failed to create file {}: {}", actual_dest.display(), e),
                             ))
                         })?
                     };
@@ -2671,15 +2686,30 @@ impl Transport for SshTransport {
 
                     // Set mtime on local file
                     filetime::set_file_mtime(
-                        &dest_buf,
+                        &actual_dest,
                         filetime::FileTime::from_system_time(mtime_systime),
                     )
                     .map_err(|e| {
                         SyncError::Io(std::io::Error::new(
                             e.kind(),
-                            format!("Failed to set mtime on {}: {}", dest_buf.display(), e),
+                            format!("Failed to set mtime on {}: {}", actual_dest.display(), e),
                         ))
                     })?;
+
+                    // Atomic rename for new transfers
+                    if use_temp {
+                        std::fs::rename(&actual_dest, &dest_buf).map_err(|e| {
+                            SyncError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "Failed to rename {} to {}: {}",
+                                    actual_dest.display(),
+                                    dest_buf.display(),
+                                    e
+                                ),
+                            ))
+                        })?;
+                    }
 
                     Ok(TransferResult::new(bytes_transferred))
                 })
