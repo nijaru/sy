@@ -304,6 +304,23 @@ impl Receiver {
             fs::create_dir_all(parent).await?;
         }
 
+        // Handle hardlinks: create link to target instead of temp file
+        if entry.is_hardlink() {
+            if let Some(ref target) = entry.link_target {
+                let target_path = validate_path(&self.config.root, target)?;
+                if target_path.exists() {
+                    fs::hard_link(&target_path, &full_path).await
+                        .context("Failed to create hardlink")?;
+                } else {
+                    tracing::warn!(
+                        "Hardlink target {} does not exist, skipping hardlink for {}",
+                        target, entry.path
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         // Create temp file
         let temp_path = full_path.with_extension("sy.tmp");
         let guard = TempFileGuard::new(&temp_path);
