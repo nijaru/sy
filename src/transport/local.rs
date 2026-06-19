@@ -841,6 +841,14 @@ impl Transport for LocalTransport {
                 0.0
             };
 
+            // Set metadata on temp file before rename
+            if let Ok(source_meta) = fs::metadata(&source) {
+                if let Ok(mtime) = source_meta.modified() {
+                    let _ = filetime::set_file_mtime(&temp_dest, filetime::FileTime::from_system_time(mtime));
+                }
+                let _ = fs::set_permissions(&temp_dest, source_meta.permissions());
+            }
+
             // Atomic rename
             fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
                 path: dest.clone(),
