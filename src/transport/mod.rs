@@ -258,7 +258,7 @@ pub trait Transport: Send + Sync {
         }
 
         // Atomic write: temp file + rename (same directory = same filesystem)
-        let temp_path = path.with_extension(".sy.tmp");
+        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(path);
         let guard = crate::temp_file::TempFileGuard::new(&temp_path);
 
         let mut file = tokio::fs::File::create(&temp_path).await?;

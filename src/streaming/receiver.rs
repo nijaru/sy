@@ -322,7 +322,7 @@ impl Receiver {
         }
 
         // Create temp file
-        let temp_path = full_path.with_extension("sy.tmp");
+        let temp_path = TempFileGuard::temp_path_for(&full_path);
         let guard = TempFileGuard::new(&temp_path);
 
         let file = OpenOptions::new()

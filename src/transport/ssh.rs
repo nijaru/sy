@@ -1012,7 +1012,7 @@ impl SshTransport {
         let dest_buf = dest.to_path_buf();
 
         // Atomic write: temp file + rename (same directory = same filesystem)
-        let temp_buf = dest_buf.with_extension(".sy.tmp");
+        let temp_buf = crate::temp_file::TempFileGuard::temp_path_for(&dest_buf);
         let guard = crate::temp_file::TempFileGuard::new(&temp_buf);
 
         // Create temp file with fixed size
@@ -2597,7 +2597,7 @@ impl Transport for SshTransport {
                     // For new transfers: atomic write via temp file + rename
                     let use_temp = !is_resuming;
                     let actual_dest = if use_temp {
-                        dest_buf.with_extension(".sy.tmp")
+                        crate::temp_file::TempFileGuard::temp_path_for(&dest_buf)
                     } else {
                         dest_buf.clone()
                     };

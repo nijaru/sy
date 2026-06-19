@@ -39,6 +39,23 @@ impl TempFileGuard {
         }
     }
 
+    /// Generate a temp file path in the same directory as `target` that won't exceed
+    /// the 255-byte filename limit. Uses process ID + timestamp to avoid concurrent conflicts.
+    ///
+    /// Pattern: `.sy-<8-char-random>.tmp` — always 17 chars, fits in any filesystem.
+    pub fn temp_path_for(target: &Path) -> PathBuf {
+        let parent = target.parent().unwrap_or(Path::new("."));
+        // Use PID + nanoseconds to avoid conflicts between concurrent syncs
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let hash = pid.wrapping_mul(31).wrapping_add(nanos);
+        let name = format!(".sy-{:08x}.tmp", hash);
+        parent.join(name)
+    }
+
     /// Defuse the guard, preventing automatic cleanup.
     ///
     /// Call this after successfully completing an operation to prevent

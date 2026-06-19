@@ -546,7 +546,7 @@ impl Transport for LocalTransport {
 
             // Strategy 1: COW clone + selective writes (fast on APFS/BTRFS/XFS)
             // Strategy 2: In-place delta (for ext4, hard links, cross-filesystem)
-            let temp_dest = dest.with_extension("sy.tmp");
+            let temp_dest = TempFileGuard::temp_path_for(&dest);
             let temp_guard = TempFileGuard::new(&temp_dest);
 
             let (bytes_written, literal_bytes, changed_blocks) = if use_cow_strategy {

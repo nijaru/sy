@@ -112,7 +112,7 @@ impl Endpoint for LocalEndpoint {
         }
 
         // Atomic write: temp file + rename (same directory = same filesystem)
-        let temp_path = full_path.with_extension(".sy.tmp");
+        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&full_path);
         let guard = crate::temp_file::TempFileGuard::new(&temp_path);
 
         tokio::fs::write(&temp_path, data).await?;
