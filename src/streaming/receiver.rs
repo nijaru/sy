@@ -402,36 +402,38 @@ impl Receiver {
             let full_path = validate_path(&self.config.root, &end.path)?;
 
             if end.status == DataEnd::STATUS_OK {
-                // Move temp file to final destination
+                // Set permissions and mtime on temp file BEFORE rename
+                // so the final path always has correct metadata
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(pending.entry.mode);
+                    if let Err(e) = fs::set_permissions(&pending.temp_path, perms).await {
+                        tracing::warn!(
+                            "Failed to set permissions on {}: {}",
+                            pending.temp_path.display(),
+                            e
+                        );
+                    }
+                }
+
+                // Set mtime on temp file (mtime field stores total nanoseconds since epoch)
+                let mtime_secs = pending.entry.mtime / 1_000_000_000;
+                let mtime_nanos = (pending.entry.mtime % 1_000_000_000) as u32;
+                let mtime = filetime::FileTime::from_unix_time(mtime_secs, mtime_nanos);
+                let temp_for_mtime = pending.temp_path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    filetime::set_file_mtime(&temp_for_mtime, mtime)
+                })
+                .await?;
+
+                // Atomic rename to final destination
                 fs::rename(&pending.temp_path, &full_path).await?;
 
                 // Defuse guard after successful rename
                 if let Some(guard) = pending.guard.take() {
                     guard.defuse();
                 }
-
-                // Set permissions
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(pending.entry.mode);
-                    if let Err(e) = fs::set_permissions(&full_path, perms).await {
-                        tracing::warn!(
-                            "Failed to set permissions on {}: {}",
-                            full_path.display(),
-                            e
-                        );
-                    }
-                }
-
-                // Set mtime (mtime field stores total nanoseconds since epoch)
-                let mtime_secs = pending.entry.mtime / 1_000_000_000;
-                let mtime_nanos = (pending.entry.mtime % 1_000_000_000) as u32;
-                let mtime = filetime::FileTime::from_unix_time(mtime_secs, mtime_nanos);
-                let _ = tokio::task::spawn_blocking(move || {
-                    filetime::set_file_mtime(&full_path, mtime)
-                })
-                .await?;
 
                 self.stats.files_ok += 1;
                 self.stats.bytes_transferred += pending.bytes_written;
