@@ -72,7 +72,7 @@ base64 = "0.22"
 
 # Compression
 zstd = "0.13"  # Level 3: 8.7 GB/s, best ratio
-lz4_flex = "0.11"  # 23 GB/s, faster but lower ratio
+lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
 
 # Parallel processing
 rayon = "1.10"
