@@ -69,7 +69,6 @@ pub fn generate_delta_streaming(
     dest_checksums: &[BlockChecksum],
     block_size: usize,
 ) -> io::Result<Delta> {
-    
     const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
     const MAX_LITERAL_SIZE: usize = 1024 * 1024; // Flush literals at 1MB to bound memory
 

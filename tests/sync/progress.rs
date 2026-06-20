@@ -166,5 +166,4 @@ fn test_progress_json_mode() {
 
     // JSON mode should output valid JSON
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
 }

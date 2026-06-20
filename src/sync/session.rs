@@ -9,18 +9,17 @@
 // Dead-code suppressed until main.rs is rewritten to use SyncSession (Phase 3 completion).
 // Remove this allow once SyncSession is wired into main.rs.
 
-use crate::endpoint::Endpoint;
 use crate::endpoint::local::LocalEndpoint;
-use crate::compress::CompressionDetection;
+use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
-use crate::sync::strategy::SyncAction;
-use crate::sync::executor::TaskExecutor;
 use crate::ssh::config::SshConfig;
 use crate::sync::config::SyncConfig;
+use crate::sync::executor::TaskExecutor;
 use crate::sync::scanner::FileEntry;
-use crate::sync::stats::SyncStats;
-use crate::sync::strategy::{StrategyPlanner, SyncTask};
 use crate::sync::scanner::ScanOptions;
+use crate::sync::stats::SyncStats;
+use crate::sync::strategy::SyncAction;
+use crate::sync::strategy::{StrategyPlanner, SyncTask};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,7 +29,11 @@ pub enum EndpointPair {
     /// Local filesystem endpoint
     Local(Box<dyn Endpoint>),
     /// SSH remote endpoint (connection established during sync)
-    Ssh { host: String, user: Option<String>, root: PathBuf },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        root: PathBuf,
+    },
 }
 
 impl EndpointPair {
@@ -41,13 +44,13 @@ impl EndpointPair {
             crate::path::SyncPath::Local { path, .. } => {
                 EndpointPair::Local(Box::new(LocalEndpoint::new(path.clone())))
             }
-            crate::path::SyncPath::Remote { host, user, path, .. } => {
-                EndpointPair::Ssh {
-                    host: host.clone(),
-                    user: user.clone(),
-                    root: path.clone(),
-                }
-            }
+            crate::path::SyncPath::Remote {
+                host, user, path, ..
+            } => EndpointPair::Ssh {
+                host: host.clone(),
+                user: user.clone(),
+                root: path.clone(),
+            },
             _ => panic!("S3/GCS endpoints not yet supported"),
         }
     }
@@ -137,17 +140,24 @@ impl SyncSession {
             SyncStrategy::DirectLocal => self.direct_local().await,
             SyncStrategy::StreamingPush => self.streaming_push().await,
             SyncStrategy::StreamingPull => self.streaming_pull().await,
-            SyncStrategy::ObjectStore => {
-                Err(SyncError::Io(std::io::Error::other("Object store sync not yet implemented")))
-            }
+            SyncStrategy::ObjectStore => Err(SyncError::Io(std::io::Error::other(
+                "Object store sync not yet implemented",
+            ))),
         }
     }
 
     /// Verify source and destination are in sync.
-    pub async fn verify(&self, source: &std::path::Path, dest: &std::path::Path) -> Result<crate::sync::VerificationResult> {
-        let source_ep = self.source.as_endpoint()
-            .ok_or_else(|| SyncError::Io(std::io::Error::other("Source must be local for verify")))?;
-        let dest_ep = self.dest.as_endpoint()
+    pub async fn verify(
+        &self,
+        source: &std::path::Path,
+        dest: &std::path::Path,
+    ) -> Result<crate::sync::VerificationResult> {
+        let source_ep = self.source.as_endpoint().ok_or_else(|| {
+            SyncError::Io(std::io::Error::other("Source must be local for verify"))
+        })?;
+        let dest_ep = self
+            .dest
+            .as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for verify")))?;
 
         // Scan both sides
@@ -201,26 +211,36 @@ impl SyncSession {
         Ok(result)
     }
 
-    /// Get performance metrics (not yet implemented).
+    /// Get performance metrics.
+    ///
+    /// SyncSession reports per-run data through SyncStats. The legacy SyncEngine owns
+    /// PerformanceMonitor state; SyncSession does not retain per-run metrics after sync.
     pub fn get_performance_metrics(&self) -> Option<&crate::perf::PerformanceMetrics> {
-        None // TODO: Add performance tracking to SyncSession
+        None
     }
 
     /// Local to local sync: scan both sides, plan, execute.
     async fn direct_local(&self) -> Result<SyncStats> {
         let start = Instant::now();
 
-        let source_ep = self.source.as_endpoint()
+        let source_ep = self
+            .source
+            .as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Source must be local endpoint")))?;
-        let dest_ep = self.dest.as_endpoint()
+        let dest_ep = self
+            .dest
+            .as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local endpoint")))?;
 
         // Auto-create destination if it doesn't exist
         if !dest_ep.root().exists() {
-            std::fs::create_dir_all(dest_ep.root())
-                .map_err(|e| SyncError::Io(std::io::Error::other(
-                    format!("Failed to create destination {:?}: {}", dest_ep.root(), e)
-                )))?;
+            std::fs::create_dir_all(dest_ep.root()).map_err(|e| {
+                SyncError::Io(std::io::Error::other(format!(
+                    "Failed to create destination {:?}: {}",
+                    dest_ep.root(),
+                    e
+                )))
+            })?;
             tracing::info!("Created destination directory: {:?}", dest_ep.root());
         }
 
@@ -254,7 +274,10 @@ impl SyncSession {
             if let Some(ref cache) = dir_cache {
                 if let Some(cached_files) = cache.get_cached_files(&std::path::PathBuf::from(".")) {
                     tracing::info!("Using cached scan results ({} files)", cached_files.len());
-                    cached_files.iter().map(|cf| cf.to_file_entry(source_ep.root())).collect()
+                    cached_files
+                        .iter()
+                        .map(|cf| cf.to_file_entry(source_ep.root()))
+                        .collect()
                 } else {
                     source_ep.scan(self.scan_options).await?
                 }
@@ -271,14 +294,15 @@ impl SyncSession {
         if let Some(ref mut cache) = dir_cache {
             use crate::sync::dircache::CachedFile;
             use std::collections::HashMap;
-            
+
             let mut files_by_dir: HashMap<std::path::PathBuf, Vec<CachedFile>> = HashMap::new();
-            
+
             for entry in &source_entries {
                 if entry.is_dir {
                     cache.update((*entry.relative_path).clone(), entry.modified);
                 }
-                let parent = (*entry.relative_path).parent()
+                let parent = (*entry.relative_path)
+                    .parent()
                     .unwrap_or(&std::path::PathBuf::from("."))
                     .to_path_buf();
                 files_by_dir
@@ -286,7 +310,7 @@ impl SyncSession {
                     .or_default()
                     .push(CachedFile::from_file_entry(entry));
             }
-            
+
             for (dir, files) in files_by_dir {
                 cache.cache_files(dir, files);
             }
@@ -301,7 +325,7 @@ impl SyncSession {
             .iter()
             .map(|e| ((*e.relative_path).clone(), e))
             .collect();
-        
+
         tracing::debug!("Source root: {:?}", source_ep.root());
         tracing::debug!("Dest root: {:?}", dest_ep.root());
         tracing::debug!("Source entries:");
@@ -337,7 +361,11 @@ impl SyncSession {
             }
 
             // Apply filter engine
-            if self.config.filter_engine.should_exclude(&entry.relative_path, entry.is_dir) {
+            if self
+                .config
+                .filter_engine
+                .should_exclude(&entry.relative_path, entry.is_dir)
+            {
                 continue;
             }
 
@@ -358,7 +386,11 @@ impl SyncSession {
             for dest_entry in &dest_entries {
                 if !source_set.contains(&*dest_entry.relative_path) {
                     // Apply filter engine to deletions too
-                    if self.config.filter_engine.should_exclude(&dest_entry.relative_path, dest_entry.is_dir) {
+                    if self
+                        .config
+                        .filter_engine
+                        .should_exclude(&dest_entry.relative_path, dest_entry.is_dir)
+                    {
                         continue;
                     }
                     deletions.push(dest_entry);
@@ -390,12 +422,24 @@ impl SyncSession {
             }
         }
 
-        let creates = tasks.iter().filter(|t| t.action == SyncAction::Create).count();
-        let updates = tasks.iter().filter(|t| t.action == SyncAction::Update).count();
-        let skips = tasks.iter().filter(|t| t.action == SyncAction::Skip).count();
+        let creates = tasks
+            .iter()
+            .filter(|t| t.action == SyncAction::Create)
+            .count();
+        let updates = tasks
+            .iter()
+            .filter(|t| t.action == SyncAction::Update)
+            .count();
+        let skips = tasks
+            .iter()
+            .filter(|t| t.action == SyncAction::Skip)
+            .count();
         tracing::info!(
             "Plan: {} creates, {} updates, {} deletes, {} skips",
-            creates, updates, delete_count, skips
+            creates,
+            updates,
+            delete_count,
+            skips
         );
 
         // Filter out Create tasks if --existing is set (only update existing files)
@@ -430,11 +474,13 @@ impl SyncSession {
                 prune_checksum_db: self.config.verification.prune_checksum_db,
             },
             self.config.max_concurrent,
-        ).with_backup(crate::sync::executor::BackupConfig {
+        )
+        .with_backup(crate::sync::executor::BackupConfig {
             enabled: self.config.backup.is_some(),
             suffix: self.config.suffix.clone(),
             dir: self.config.backup_dir.clone(),
-        }).with_config(crate::sync::executor::ExecuteConfig {
+        })
+        .with_config(crate::sync::executor::ExecuteConfig {
             preserve_hardlinks: self.config.preserve.hardlinks,
             preserve_xattrs: self.config.preserve.xattrs,
             preserve_dir_permissions: self.config.preserve.permissions,
@@ -448,14 +494,14 @@ impl SyncSession {
         let mut stats = executor.execute_batch(tasks).await?;
         stats.files_scanned = source_count as u64;
         stats.duration = start.elapsed(); // Include scan/plan time
-        
+
         // Save directory cache if enabled
         if let Some(ref cache) = dir_cache {
             if let Err(e) = cache.save(dest_ep.root()) {
                 tracing::warn!("Failed to save directory cache: {}", e);
             }
         }
-        
+
         Ok(stats)
     }
 
@@ -513,8 +559,8 @@ impl SyncSession {
                 match crate::delta::estimate_change_ratio(
                     source,
                     dest,
-                    64 * 1024, // 64KB blocks
-                    Some(20),  // Sample 20 blocks
+                    64 * 1024,  // 64KB blocks
+                    Some(20),   // Sample 20 blocks
                     Some(0.75), // 75% threshold
                 ) {
                     Ok(ratio) => {
@@ -552,12 +598,16 @@ impl SyncSession {
 
         if !dest_exists {
             // Create new file
-            dest_ep.write_file(Path::new(dest_filename), &data, &meta).await?;
+            dest_ep
+                .write_file(Path::new(dest_filename), &data, &meta)
+                .await?;
             stats.files_created = 1;
             stats.bytes_transferred = data.len() as u64;
         } else {
             // Update existing file
-            dest_ep.write_file(Path::new(dest_filename), &data, &meta).await?;
+            dest_ep
+                .write_file(Path::new(dest_filename), &data, &meta)
+                .await?;
             stats.files_updated = 1;
             stats.bytes_transferred = data.len() as u64;
         }
@@ -570,7 +620,11 @@ impl SyncSession {
     async fn streaming_push(&self) -> Result<SyncStats> {
         let (host, user, dest_root) = match &self.dest {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
-            _ => return Err(SyncError::Io(std::io::Error::other("Dest must be SSH for push"))),
+            _ => {
+                return Err(SyncError::Io(std::io::Error::other(
+                    "Dest must be SSH for push",
+                )))
+            }
         };
 
         let source_root = self.source.root().to_path_buf();
@@ -587,9 +641,10 @@ impl SyncSession {
         };
 
         // Use ServerSession which handles SSH subprocess properly
-        let server_session = crate::transport::server::ServerSession::connect_ssh(&ssh_config, dest_root)
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+        let server_session =
+            crate::transport::server::ServerSession::connect_ssh(&ssh_config, dest_root)
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
         let (mut stdin, mut stdout) = server_session.split();
 
         // Use streaming protocol
@@ -597,9 +652,11 @@ impl SyncSession {
             source_root,
             dest_root.clone(),
             self.config.delete.is_enabled(),
-            CompressionDetection::Auto, // compress for SSH
-        ).with_filter(self.config.filter_engine.clone())
-         .with_dry_run(self.config.dry_run);
+            self.config.compression_detection,
+        )
+        .with_filter(self.config.filter_engine.clone())
+        .with_dry_run(self.config.dry_run)
+        .with_scan_options(self.scan_options);
 
         if let Some(ref max_delete) = self.config.max_delete {
             streaming = streaming.with_max_delete(max_delete.clone());
@@ -608,7 +665,8 @@ impl SyncSession {
             streaming = streaming.with_force_delete(true);
         }
 
-        let streaming_stats = streaming.push(&mut stdout, &mut stdin)
+        let streaming_stats = streaming
+            .push(&mut stdout, &mut stdin)
             .await
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -629,7 +687,11 @@ impl SyncSession {
     async fn streaming_pull(&self) -> Result<SyncStats> {
         let (host, user, source_root) = match &self.source {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
-            _ => return Err(SyncError::Io(std::io::Error::other("Source must be SSH for pull"))),
+            _ => {
+                return Err(SyncError::Io(std::io::Error::other(
+                    "Source must be SSH for pull",
+                )))
+            }
         };
 
         let dest_root = self.dest.root().to_path_buf();
@@ -646,9 +708,10 @@ impl SyncSession {
         };
 
         // Use ServerSession which handles SSH subprocess properly
-        let server_session = crate::transport::server::ServerSession::connect_ssh(&ssh_config, source_root)
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
+        let server_session =
+            crate::transport::server::ServerSession::connect_ssh(&ssh_config, source_root)
+                .await
+                .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
         let (mut stdin, mut stdout) = server_session.split();
 
         // Use streaming protocol (pull)
@@ -656,8 +719,10 @@ impl SyncSession {
             dest_root,
             source_root.clone(),
             self.config.delete.is_enabled(),
-            CompressionDetection::Auto, // compress for SSH
-        ).with_filter(self.config.filter_engine.clone());
+            self.config.compression_detection,
+        )
+        .with_filter(self.config.filter_engine.clone())
+        .with_scan_options(self.scan_options);
 
         if let Some(ref max_delete) = self.config.max_delete {
             streaming = streaming.with_max_delete(max_delete.clone());
@@ -666,7 +731,8 @@ impl SyncSession {
             streaming = streaming.with_force_delete(true);
         }
 
-        let streaming_stats = streaming.pull(&mut stdout, &mut stdin)
+        let streaming_stats = streaming
+            .pull(&mut stdout, &mut stdin)
             .await
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -741,7 +807,8 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 
@@ -759,7 +826,8 @@ mod tests {
         std::fs::write(src_dir.path().join("file1.txt"), "hello").unwrap();
         std::fs::write(src_dir.path().join("file2.txt"), "world").unwrap();
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 
@@ -770,8 +838,14 @@ mod tests {
         assert_eq!(stats.bytes_transferred, 10); // 5 + 5
 
         // Verify files were copied
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("file1.txt")).unwrap(), "hello");
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("file2.txt")).unwrap(), "world");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("file1.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("file2.txt")).unwrap(),
+            "world"
+        );
     }
 
     #[tokio::test]
@@ -782,7 +856,8 @@ mod tests {
         // Create source file
         std::fs::write(src_dir.path().join("file.txt"), "hello").unwrap();
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 
@@ -791,7 +866,8 @@ mod tests {
         assert_eq!(stats.files_created, 1);
 
         // Second sync should skip
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 
@@ -812,7 +888,8 @@ mod tests {
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -834,11 +911,15 @@ mod tests {
         std::fs::write(dst_dir.path().join("delete.txt"), "delete").unwrap();
 
         let config = SyncConfig {
-            delete: DeleteMode::Enabled { threshold: 100, force: false },
+            delete: DeleteMode::Enabled {
+                threshold: 100,
+                force: false,
+            },
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -857,7 +938,8 @@ mod tests {
         std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
         std::fs::write(src_dir.path().join("subdir/file.txt"), "content").unwrap();
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 
@@ -883,7 +965,8 @@ mod tests {
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -917,11 +1000,15 @@ mod tests {
         }
 
         let config = SyncConfig {
-            delete: DeleteMode::Enabled { threshold: 50, force: false },
+            delete: DeleteMode::Enabled {
+                threshold: 50,
+                force: false,
+            },
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -947,11 +1034,15 @@ mod tests {
         }
 
         let config = SyncConfig {
-            delete: DeleteMode::Enabled { threshold: 50, force: true },
+            delete: DeleteMode::Enabled {
+                threshold: 50,
+                force: true,
+            },
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -981,7 +1072,8 @@ mod tests {
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -989,7 +1081,10 @@ mod tests {
         // new.txt should be created, existing.txt should be skipped
         assert_eq!(stats.files_created, 1);
         assert!(dst_dir.path().join("new.txt").exists());
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("existing.txt")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("existing.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[tokio::test]
@@ -1007,13 +1102,13 @@ mod tests {
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
-        let session = SyncSession::new(source, dest, config)
-            .with_scan_options(ScanOptions {
-                dirs_only: true,
-                ..Default::default()
-            });
+        let session = SyncSession::new(source, dest, config).with_scan_options(ScanOptions {
+            dirs_only: true,
+            ..Default::default()
+        });
 
         let stats = session.sync().await.unwrap();
         // Files in root should be synced, but nested files should not
@@ -1041,7 +1136,8 @@ mod tests {
             ..test_config()
         };
 
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
@@ -1057,7 +1153,8 @@ mod tests {
         let dst_dir = TempDir::new().unwrap();
 
         // Don't create any source files
-        let source = EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
+        let source =
+            EndpointPair::Local(Box::new(LocalEndpoint::new(src_dir.path().to_path_buf())));
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, test_config());
 

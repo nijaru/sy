@@ -54,7 +54,7 @@ pub struct StrategyPlanner {
 impl StrategyPlanner {
     pub fn new() -> Self {
         Self {
-            mtime_tolerance: 1, // 1 second tolerance for mtime comparison
+            mtime_tolerance: 0, // exact mtime comparison; scanners preserve nanoseconds
             ignore_times: false,
             size_only: false,
             checksum: false,
@@ -81,7 +81,7 @@ impl StrategyPlanner {
         };
 
         Self {
-            mtime_tolerance: 1,
+            mtime_tolerance: 0,
             ignore_times,
             size_only,
             checksum,
@@ -108,7 +108,11 @@ impl StrategyPlanner {
         if source.is_dir {
             // For directories, just check existence
             let exists = dest_map.contains_key(&*source.relative_path);
-            let action = if exists { SyncAction::Skip } else { SyncAction::Create };
+            let action = if exists {
+                SyncAction::Skip
+            } else {
+                SyncAction::Create
+            };
             return Ok(SyncTask {
                 source: Some(Arc::new(source.clone())),
                 dest_path,
@@ -156,7 +160,11 @@ impl StrategyPlanner {
                         || !self.mtime_matches(&source.modified, &dest_entry.modified)
                 };
 
-                let action = if needs_update { SyncAction::Update } else { SyncAction::Skip };
+                let action = if needs_update {
+                    SyncAction::Update
+                } else {
+                    SyncAction::Skip
+                };
 
                 Ok(SyncTask {
                     source: Some(Arc::new(source.clone())),
@@ -769,13 +777,15 @@ mod tests {
         let dest_root = temp.path();
 
         // Create destination file
-        fs::write(dest_root.join("file.txt"), "content").unwrap();
+        let dest_path = dest_root.join("file.txt");
+        fs::write(&dest_path, "content").unwrap();
+        let dest_mtime = fs::metadata(&dest_path).unwrap().modified().unwrap();
 
         let source_file = FileEntry {
             path: Arc::new(PathBuf::from("/source/file.txt")),
             relative_path: Arc::new(PathBuf::from("file.txt")),
             size: 7, // "content".len()
-            modified: SystemTime::now(),
+            modified: dest_mtime,
             mode: 0o644,
             is_dir: false,
             is_symlink: false,
@@ -894,7 +904,7 @@ mod tests {
                 relative_path: Arc::new(PathBuf::from(format!("file{}.txt", i))),
                 size: 7,
                 modified: SystemTime::now(),
-            mode: 0o644,
+                mode: 0o644,
                 is_dir: false,
                 is_symlink: false,
                 symlink_target: None,
@@ -1082,7 +1092,7 @@ mod tests {
                 relative_path: Arc::new(PathBuf::from("file1.txt")),
                 size: 7,
                 modified: SystemTime::now(),
-            mode: 0o644,
+                mode: 0o644,
                 is_dir: false,
                 is_symlink: false,
                 symlink_target: None,
@@ -1099,7 +1109,7 @@ mod tests {
                 relative_path: Arc::new(PathBuf::from("file2.txt")),
                 size: 7,
                 modified: SystemTime::now(),
-            mode: 0o644,
+                mode: 0o644,
                 is_dir: false,
                 is_symlink: false,
                 symlink_target: None,
@@ -1123,25 +1133,19 @@ mod tests {
     #[test]
     fn test_mtime_matches_subsecond() {
         let planner = StrategyPlanner::default();
-        
+
         let base = std::time::SystemTime::now();
         let same_time = base;
         assert!(planner.mtime_matches(&base, &same_time));
-        
-        // 0.5 seconds difference — within 1s tolerance
+
+        // Any subsecond difference matters on filesystems with nanosecond mtimes.
         let half_sec_later = base + std::time::Duration::from_millis(500);
-        assert!(planner.mtime_matches(&base, &half_sec_later));
-        
-        // 1.5 seconds difference — exceeds 1s tolerance
-        let one_half_sec = base + std::time::Duration::from_millis(1500);
-        assert!(!planner.mtime_matches(&base, &one_half_sec));
-        
-        // 1.0 second difference — within tolerance
+        assert!(!planner.mtime_matches(&base, &half_sec_later));
+
+        let one_nano_later = base + std::time::Duration::from_nanos(1);
+        assert!(!planner.mtime_matches(&base, &one_nano_later));
+
         let one_sec = base + std::time::Duration::from_secs(1);
-        assert!(planner.mtime_matches(&base, &one_sec));
-        
-        // 2.0 seconds difference — exceeds tolerance
-        let two_sec = base + std::time::Duration::from_secs(2);
-        assert!(!planner.mtime_matches(&base, &two_sec));
+        assert!(!planner.mtime_matches(&base, &one_sec));
     }
 }

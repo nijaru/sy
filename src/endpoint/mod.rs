@@ -1,10 +1,10 @@
-pub mod local;
-#[cfg(feature = "ssh")]
-pub mod ssh;
-#[cfg(feature = "s3")]
-pub mod s3;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+pub mod local;
+#[cfg(feature = "s3")]
+pub mod s3;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 
 // Dead-code suppressed until Phase 3 (SyncSession) wires these in.
 // Remove this allow once Endpoint types are referenced by SyncSession.

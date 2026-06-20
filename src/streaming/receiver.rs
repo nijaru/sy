@@ -27,12 +27,29 @@ const MAX_DELTA_COPY_SIZE: usize = 16 * 1024 * 1024;
 /// Reduces syscalls by batching multiple encoded frames into single writes
 const DEST_ENTRY_BATCH_SIZE: usize = 64 * 1024;
 
+#[cfg(unix)]
+fn safe_received_mode(mode: u32) -> u32 {
+    // Remote peers are untrusted. Preserve normal permission bits and sticky
+    // directories, but strip file-type bits plus setuid/setgid privilege bits.
+    mode & 0o1777
+}
+
 /// Validate that a relative path is safe and doesn't escape the root.
 /// Returns the full path if valid.
 fn validate_path(root: &Path, relative: &str) -> Result<PathBuf> {
     // Reject empty paths
     if relative.is_empty() {
         anyhow::bail!("Empty path not allowed");
+    }
+
+    // Reject excessively long paths (filesystem limit is typically 4096)
+    const MAX_PATH_LEN: usize = 4096;
+    if relative.len() > MAX_PATH_LEN {
+        anyhow::bail!(
+            "Path too long: {} bytes (max {})",
+            relative.len(),
+            MAX_PATH_LEN
+        );
     }
 
     // Reject absolute paths
@@ -309,12 +326,14 @@ impl Receiver {
             if let Some(ref target) = entry.link_target {
                 let target_path = validate_path(&self.config.root, target)?;
                 if target_path.exists() {
-                    fs::hard_link(&target_path, &full_path).await
+                    fs::hard_link(&target_path, &full_path)
+                        .await
                         .context("Failed to create hardlink")?;
                 } else {
                     tracing::warn!(
                         "Hardlink target {} does not exist, skipping hardlink for {}",
-                        target, entry.path
+                        target,
+                        entry.path
                     );
                 }
             }
@@ -357,8 +376,10 @@ impl Receiver {
         if let Some(ref mut file) = pending.file {
             // Decompress if compressed
             let raw_data = if data.flags.contains(DataFlags::COMPRESSED) {
-                Bytes::from(crate::compress::decompress(&data.data, crate::compress::Compression::Lz4)
-                    .context("Failed to decompress data")?)
+                Bytes::from(
+                    crate::compress::decompress(&data.data, crate::compress::Compression::Lz4)
+                        .context("Failed to decompress data")?,
+                )
             } else {
                 data.data
             };
@@ -407,7 +428,8 @@ impl Receiver {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(pending.entry.mode);
+                    let perms =
+                        std::fs::Permissions::from_mode(safe_received_mode(pending.entry.mode));
                     if let Err(e) = fs::set_permissions(&pending.temp_path, perms).await {
                         tracing::warn!(
                             "Failed to set permissions on {}: {}",
@@ -452,7 +474,7 @@ impl Receiver {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(mkdir.mode);
+            let perms = std::fs::Permissions::from_mode(safe_received_mode(mkdir.mode));
             if let Err(e) = fs::set_permissions(&full_path, perms).await {
                 tracing::warn!(
                     "Failed to set permissions on {}: {}",

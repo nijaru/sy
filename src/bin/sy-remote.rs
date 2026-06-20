@@ -99,6 +99,8 @@ struct FileEntryJson {
     nlink: u64,
     #[serde(default)]
     acls: Option<String>, // ACL text format (one per line)
+    #[serde(default)]
+    bsd_flags: Option<u32>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -155,6 +157,7 @@ fn main() -> anyhow::Result<()> {
                         inode: e.inode,
                         nlink: e.nlink,
                         acls,
+                        bsd_flags: e.bsd_flags,
                     }
                 })
                 .collect();
@@ -283,8 +286,12 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
+            // Atomic write: build the sparse file in a temp path, then rename.
+            let temp_path = TempFileGuard::temp_path_for(&output_path);
+            let temp_guard = TempFileGuard::new(&temp_path);
+
             // Create file and set its size (creates sparse file with holes)
-            let mut output_file = std::fs::File::create(&output_path)?;
+            let mut output_file = std::fs::File::create(&temp_path)?;
             output_file.set_len(total_size)?;
 
             // Read and write each data region from stdin
@@ -306,16 +313,21 @@ fn main() -> anyhow::Result<()> {
 
             output_file.flush()?;
             output_file.sync_all()?;
+            drop(output_file);
 
-            // Set mtime if provided
+            // Set mtime on temp BEFORE rename
             if let Some(mtime_secs) = mtime {
                 use std::time::{Duration, UNIX_EPOCH};
                 let mtime = UNIX_EPOCH + Duration::from_secs(mtime_secs);
                 let _ = filetime::set_file_mtime(
-                    &output_path,
+                    &temp_path,
                     filetime::FileTime::from_system_time(mtime),
                 );
             }
+
+            // Atomic rename to final path
+            std::fs::rename(&temp_path, &output_path)?;
+            temp_guard.defuse();
 
             // Report success with total data bytes written (not file size)
             println!(

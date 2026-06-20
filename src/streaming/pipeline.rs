@@ -9,6 +9,7 @@ use crate::streaming::{
     protocol::{read_frame, write_frame, Done, Hello, HelloFlags, MessageType},
     Generator, GeneratorConfig, Receiver, ReceiverConfig, Sender, SenderConfig,
 };
+use crate::sync::scanner::ScanOptions;
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ pub struct StreamingSync {
     pub compress: CompressionDetection,
     pub filter: Option<FilterEngine>,
     pub dry_run: bool,
+    pub scan_options: ScanOptions,
 }
 
 impl StreamingSync {
@@ -43,6 +45,7 @@ impl StreamingSync {
             compress,
             filter: None,
             dry_run: false,
+            scan_options: ScanOptions::default(),
         }
     }
 
@@ -70,6 +73,12 @@ impl StreamingSync {
         self
     }
 
+    /// Set scanner options for .gitignore and VCS directory handling.
+    pub fn with_scan_options(mut self, scan_options: ScanOptions) -> Self {
+        self.scan_options = scan_options;
+        self
+    }
+
     /// Run a push sync (local -> remote).
     pub async fn push<R, W>(&self, reader: &mut R, writer: &mut W) -> Result<SyncStats>
     where
@@ -81,10 +90,7 @@ impl StreamingSync {
         if self.dry_run {
             hello_flags |= HelloFlags::DRY_RUN;
         }
-        let hello = Hello::new(
-            hello_flags,
-            self.remote_root.to_string_lossy().into_owned(),
-        );
+        let hello = Hello::new(hello_flags, self.remote_root.to_string_lossy().into_owned());
         write_frame(writer, &hello.encode()).await?;
         writer.flush().await?;
 
@@ -104,6 +110,7 @@ impl StreamingSync {
             force_delete: self.force_delete,
             max_delete: self.max_delete.clone(),
             filter: self.filter.clone(),
+            scan_options: self.scan_options,
         });
 
         loop {
@@ -221,8 +228,18 @@ impl StreamingSync {
         if self.compress != CompressionDetection::Never {
             flags |= HelloFlags::COMPRESSION;
         }
+        if self.force_delete {
+            flags |= HelloFlags::FORCE_DELETE;
+        }
+        if self.scan_options.respect_gitignore {
+            flags |= HelloFlags::RESPECT_GITIGNORE;
+        }
+        if !self.scan_options.include_git_dir {
+            flags |= HelloFlags::EXCLUDE_GIT_DIR;
+        }
 
-        let hello = Hello::new(flags, self.remote_root.to_string_lossy().into_owned());
+        let hello = Hello::new(flags, self.remote_root.to_string_lossy().into_owned())
+            .with_max_delete(self.max_delete.clone());
         write_frame(writer, &hello.encode()).await?;
         writer.flush().await?;
 

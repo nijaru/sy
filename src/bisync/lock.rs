@@ -23,11 +23,12 @@ impl SyncLock {
     pub fn acquire(source: &Path, dest: &Path) -> Result<Self> {
         let lock_path = Self::get_lock_path(source, dest)?;
 
-        // Create lock file
+        // Create lock file without truncating before lock acquisition. Truncating
+        // here would erase the current holder's PID even when try_lock_exclusive fails.
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .open(&lock_path)?;
 
         // Try to acquire exclusive lock (non-blocking)

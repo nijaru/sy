@@ -190,8 +190,6 @@ pub struct Cli {
     #[arg(long)]
     pub trash: bool,
 
-
-
     /// Verbosity level (can be repeated: -v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -339,8 +337,6 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size, default_value = "104857600")]
     pub checkpoint_bytes: u64,
 
-
-
     /// Use directory cache for faster re-syncs (default: false)
     /// The cache stores directory mtimes to skip unchanged directories
     #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
@@ -475,8 +471,6 @@ pub struct Cli {
     #[arg(long)]
     pub ignore_existing: bool,
 
-
-
     /// Output JSON (newline-delimited JSON for scripting)
     #[arg(long)]
     pub json: bool,
@@ -573,7 +567,6 @@ impl Cli {
         }
 
         // Validate deletion threshold (0-100)
-
 
         // --verify=only conflicts with modification flags
         if self.verify == VerifyMode::Only {
@@ -808,7 +801,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -905,7 +898,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1008,7 +1001,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1110,7 +1103,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1207,7 +1200,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1304,7 +1297,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1401,7 +1394,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1498,7 +1491,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1614,7 +1607,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1714,7 +1707,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1811,7 +1804,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -1921,7 +1914,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2018,7 +2011,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2115,7 +2108,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2212,7 +2205,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2316,7 +2309,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2419,7 +2412,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2523,7 +2516,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2627,7 +2620,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2728,7 +2721,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,
@@ -2872,7 +2865,7 @@ mod tests {
             dirs: false,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
             itemize_changes: false,
             parallel: 10,
             max_errors: 100,

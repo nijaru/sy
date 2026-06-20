@@ -57,7 +57,11 @@ fn test_ssh_push_single_file() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify file exists on remote
     let check = Command::new("ssh")
@@ -91,7 +95,11 @@ fn test_ssh_push_directory() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify files exist on remote
     let check = Command::new("ssh")
@@ -122,7 +130,10 @@ fn test_ssh_pull() {
         .args(["fedora", &format!("mkdir -p {}", remote)])
         .output();
     let _ = Command::new("ssh")
-        .args(["fedora", &format!("echo 'remote file' > {}/file.txt", remote)])
+        .args([
+            "fedora",
+            &format!("echo 'remote file' > {}/file.txt", remote),
+        ])
         .output();
 
     let output = Command::new(sy_bin())
@@ -134,7 +145,11 @@ fn test_ssh_pull() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify file exists locally
     let content = std::fs::read_to_string(dest.path().join("file.txt")).unwrap();
@@ -248,7 +263,11 @@ fn test_ssh_delta_sync() {
         .args(["fedora", &format!("md5sum {}/large.bin", remote)])
         .output()
         .unwrap();
-    let remote_md5 = String::from_utf8_lossy(&check.stdout).split_whitespace().next().unwrap().to_string();
+    let remote_md5 = String::from_utf8_lossy(&check.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
 
     let local_md5 = {
         let output = Command::new("md5")
@@ -259,7 +278,10 @@ fn test_ssh_delta_sync() {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
 
-    assert_eq!(local_md5, remote_md5, "File content mismatch after delta sync");
+    assert_eq!(
+        local_md5, remote_md5,
+        "File content mismatch after delta sync"
+    );
 
     cleanup_fedora(&remote);
 }
@@ -305,7 +327,10 @@ fn test_ssh_delete() {
 
     // Verify file was deleted from remote
     let check = Command::new("ssh")
-        .args(["fedora", &format!("test -f {}/remove.txt && echo exists || echo gone", remote)])
+        .args([
+            "fedora",
+            &format!("test -f {}/remove.txt && echo exists || echo gone", remote),
+        ])
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "gone");
@@ -344,11 +369,17 @@ fn test_ssh_dry_run() {
 
     // Verify no files were created on remote
     let check = Command::new("ssh")
-        .args(["fedora", &format!("test -d {} && echo DIR_EXISTS || echo DIR_NOT_FOUND", remote)])
+        .args([
+            "fedora",
+            &format!(
+                "test -d {} && echo DIR_EXISTS || echo DIR_NOT_FOUND",
+                remote
+            ),
+        ])
         .output()
         .unwrap();
     let dir_status = String::from_utf8_lossy(&check.stdout).trim().to_string();
-    
+
     if dir_status == "DIR_EXISTS" {
         // Directory exists, check if it's empty
         let check = Command::new("ssh")
@@ -356,7 +387,11 @@ fn test_ssh_dry_run() {
             .output()
             .unwrap();
         let contents = String::from_utf8_lossy(&check.stdout).trim().to_string();
-        assert!(contents.is_empty(), "Dry run should not create files, found: '{}'", contents);
+        assert!(
+            contents.is_empty(),
+            "Dry run should not create files, found: '{}'",
+            contents
+        );
     }
     // If directory doesn't exist, that's fine too
 
@@ -384,7 +419,11 @@ fn test_ssh_symlink() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify symlink exists and points to correct target
     let check = Command::new("ssh")
@@ -398,7 +437,10 @@ fn test_ssh_symlink() {
         .args(["fedora", &format!("cat {}/link.txt", remote)])
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "target content");
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout).trim(),
+        "target content"
+    );
 
     cleanup_fedora(&remote);
 }
@@ -426,7 +468,11 @@ fn test_ssh_compress() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify content matches
     let check = Command::new("ssh")
@@ -450,7 +496,11 @@ fn test_ssh_max_delete() {
 
     // Create 10 files
     for i in 0..10 {
-        std::fs::write(source.path().join(format!("file{}.txt", i)), format!("content{}", i)).unwrap();
+        std::fs::write(
+            source.path().join(format!("file{}.txt", i)),
+            format!("content{}", i),
+        )
+        .unwrap();
     }
 
     // Initial sync
@@ -484,9 +534,16 @@ fn test_ssh_max_delete() {
         .expect("Failed to run sy");
 
     // Should fail — threshold exceeded
-    assert!(!output.status.success(), "SSH sync should fail when max-delete threshold exceeded, got success. stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !output.status.success(),
+        "SSH sync should fail when max-delete threshold exceeded, got success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("threshold") || stderr.contains("max-delete"), "Error should mention threshold");
+    assert!(
+        stderr.contains("threshold") || stderr.contains("max-delete"),
+        "Error should mention threshold"
+    );
 
     // With --force-delete, should succeed despite threshold
     let output = Command::new(sy_bin())
@@ -500,7 +557,10 @@ fn test_ssh_max_delete() {
         ])
         .output()
         .expect("Failed to run sy");
-    assert!(output.status.success(), "SSH sync should succeed with --force-delete");
+    assert!(
+        output.status.success(),
+        "SSH sync should succeed with --force-delete"
+    );
 
     cleanup_fedora(&remote);
 }
@@ -527,7 +587,11 @@ fn test_ssh_exclude() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify keep.txt exists
     let check = Command::new("ssh")
@@ -538,7 +602,10 @@ fn test_ssh_exclude() {
 
     // Verify skip.log does NOT exist
     let check = Command::new("ssh")
-        .args(["fedora", &format!("test -f {}/skip.log && echo exists || echo gone", remote)])
+        .args([
+            "fedora",
+            &format!("test -f {}/skip.log && echo exists || echo gone", remote),
+        ])
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "gone");
@@ -568,7 +635,11 @@ fn test_ssh_special_chars() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify all files exist
     let check = Command::new("ssh")
@@ -606,11 +677,18 @@ fn test_ssh_empty_file() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify empty file exists on remote
     let check = Command::new("ssh")
-        .args(["fedora", &format!("test -f {}/empty.txt && echo exists || echo gone", remote)])
+        .args([
+            "fedora",
+            &format!("test -f {}/empty.txt && echo exists || echo gone", remote),
+        ])
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&check.stdout).trim(), "exists");
@@ -669,7 +747,6 @@ fn test_ssh_idempotent() {
     cleanup_fedora(&remote);
 }
 
-
 #[test]
 #[ignore]
 fn test_ssh_preserve_permissions() {
@@ -682,7 +759,8 @@ fn test_ssh_preserve_permissions() {
     std::fs::set_permissions(
         source.path().join("script.sh"),
         std::fs::Permissions::from_mode(0o755),
-    ).unwrap();
+    )
+    .unwrap();
 
     let output = Command::new(sy_bin())
         .args([
@@ -695,7 +773,11 @@ fn test_ssh_preserve_permissions() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify permissions were propagated
     let check = Command::new("ssh")
@@ -731,7 +813,11 @@ fn test_ssh_nanosecond_mtime() {
         let src_meta = std::fs::metadata(source.path().join("file.txt")).unwrap();
         let src_mtime = src_meta.modified().unwrap();
         let src_nanos = src_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
-        assert!(src_nanos > 0, "Source mtime nanos should be non-zero, got {}", src_nanos);
+        assert!(
+            src_nanos > 0,
+            "Source mtime nanos should be non-zero, got {}",
+            src_nanos
+        );
 
         // Sync to remote
         let output = Command::new(sy_bin())
@@ -743,7 +829,11 @@ fn test_ssh_nanosecond_mtime() {
             ])
             .output()
             .expect("Failed to run sy");
-        assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "sy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         // Verify remote mtime preserves nanosecond precision
         // Use stat with nanoseconds: %y gives mtime with nanos
@@ -792,7 +882,11 @@ fn test_ssh_large_file() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Check size on remote
     let check = Command::new("ssh")
@@ -819,7 +913,8 @@ fn test_ssh_many_files() {
         std::fs::write(
             source.path().join(format!("file_{:04}.txt", i)),
             format!("content_{}", i),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let output = Command::new(sy_bin())
@@ -832,7 +927,11 @@ fn test_ssh_many_files() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Verify count on remote
     let check = Command::new("ssh")
@@ -873,9 +972,12 @@ fn test_ssh_include_filter() {
     // Sync with include filter (only .rs and .txt files)
     let output = Command::new(sy_bin())
         .args([
-            "--include", "*.rs",
-            "--include", "*.txt",
-            "--exclude", "*",
+            "--include",
+            "*.rs",
+            "--include",
+            "*.txt",
+            "--exclude",
+            "*",
             &format!("{}/", source.path().display()),
             &format!("fedora:{}/", remote),
             "--exclude-vcs",
@@ -884,7 +986,11 @@ fn test_ssh_include_filter() {
         .output()
         .expect("Failed to run sy");
 
-    assert!(output.status.success(), "sy failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Should have .rs and .txt
     let check = Command::new("ssh")

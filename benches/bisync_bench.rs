@@ -14,6 +14,7 @@ fn make_file_entry(path: &str, size: u64, mtime_secs_ago: u64) -> FileEntry {
         relative_path: Arc::new(PathBuf::from(path)),
         size,
         modified: mtime,
+        mode: 0o644,
         is_dir: false,
         is_symlink: false,
         symlink_target: None,

@@ -3,12 +3,12 @@
 //! Scans source directory and streams file metadata to Sender.
 //! Receives destination state during Initial Exchange.
 
+use crate::filter::FilterEngine;
 use crate::streaming::channel::{
     DeltaInfo, DestFileState, DestIndex, FileJob, FileJobSender, GeneratorMessage, DELTA_MIN_SIZE,
 };
 use crate::streaming::protocol::{DestFileEntry, DestFileFlags};
-use crate::sync::scanner::Scanner;
-use crate::filter::FilterEngine;
+use crate::sync::scanner::{ScanOptions, Scanner};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +30,8 @@ pub struct GeneratorConfig {
     pub max_delete: Option<String>,
     /// Filter engine for --exclude/--include/--filter
     pub filter: Option<FilterEngine>,
+    /// Scanner options for gitignore, VCS directory, and dirs-only behavior
+    pub scan_options: ScanOptions,
 }
 
 /// Generator state
@@ -37,6 +39,7 @@ pub struct Generator {
     config: GeneratorConfig,
     dest_index: DestIndex,
     seen_inodes: HashMap<u64, Arc<PathBuf>>, // For hard link detection
+    excluded_dest_dirs: Vec<PathBuf>,
 }
 
 impl Generator {
@@ -45,17 +48,29 @@ impl Generator {
             config,
             dest_index: DestIndex::new(),
             seen_inodes: HashMap::new(),
+            excluded_dest_dirs: Vec::new(),
         }
     }
 
     /// Process a DEST_FILE_ENTRY received during Initial Exchange.
     /// Call this for each entry before starting the scan.
     pub fn add_dest_entry(&mut self, entry: DestFileEntry) {
-        // Apply filter to dest entries too (e.g., --exclude-vcs)
+        // Apply filter to dest entries too (e.g., --exclude-vcs). If a directory
+        // is excluded, exclude all children as rsync users expect (`--exclude .git`).
+        let path = PathBuf::from(&entry.path);
+        if self
+            .excluded_dest_dirs
+            .iter()
+            .any(|dir| path.starts_with(dir))
+        {
+            return;
+        }
         if let Some(ref filter) = self.config.filter {
-            let path = std::path::Path::new(&entry.path);
             let is_dir = entry.flags.contains(DestFileFlags::DIR);
-            if filter.should_exclude(path, is_dir) {
+            if filter.should_exclude(&path, is_dir) {
+                if is_dir {
+                    self.excluded_dest_dirs.push(path);
+                }
                 return;
             }
         }
@@ -90,11 +105,9 @@ impl Generator {
     /// Run the generator, scanning source and sending to channel.
     /// Returns (total_files, total_bytes).
     pub async fn run(mut self, tx: FileJobSender) -> Result<(u64, u64)> {
-        let mut scanner = Scanner::new(&self.config.root);
-        scanner = scanner.follow_links(self.config.follow_symlinks);
-
-        // ScanOptions in this codebase only has respect_gitignore and include_git_dir
-        // We'll use defaults for now.
+        let scanner = Scanner::new(&self.config.root)
+            .follow_links(self.config.follow_symlinks)
+            .with_options(self.config.scan_options);
 
         let mut total_files = 0u64;
         let mut total_bytes = 0u64;
@@ -105,6 +118,8 @@ impl Generator {
         // Scanner::scan() is blocking, so we run it in spawn_blocking
         let entries = tokio::task::spawn_blocking(move || scanner.scan()).await??;
 
+        let mut excluded_source_dirs: Vec<PathBuf> = Vec::new();
+
         for entry in entries {
             let rel_path = entry.relative_path.as_ref().to_path_buf();
             let rel_path_str = rel_path.to_string_lossy().to_string();
@@ -114,9 +129,19 @@ impl Generator {
                 continue;
             }
 
-            // Apply filter engine (--exclude/--include/--filter)
+            // Apply filter engine (--exclude/--include/--filter). If a directory
+            // is excluded, exclude all children as rsync users expect (`--exclude .git`).
+            if excluded_source_dirs
+                .iter()
+                .any(|dir| rel_path.starts_with(dir))
+            {
+                continue;
+            }
             if let Some(ref filter) = self.config.filter {
                 if filter.should_exclude(&entry.relative_path, entry.is_dir) {
+                    if entry.is_dir {
+                        excluded_source_dirs.push(rel_path.clone());
+                    }
                     continue;
                 }
             }
@@ -272,6 +297,7 @@ mod tests {
             max_delete: None,
             force_delete: false,
             filter: None,
+            scan_options: ScanOptions::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -305,6 +331,7 @@ mod tests {
             max_delete: None,
             force_delete: false,
             filter: None,
+            scan_options: ScanOptions::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -346,6 +373,7 @@ mod tests {
             max_delete: None,
             force_delete: false,
             filter: None,
+            scan_options: ScanOptions::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -395,6 +423,7 @@ mod tests {
             max_delete: Some("50%".to_string()),
             force_delete: false,
             filter: None,
+            scan_options: ScanOptions::default(),
         };
 
         let (tx, _rx) = crate::streaming::channel::file_job_channel();
@@ -415,7 +444,10 @@ mod tests {
 
         // Generator should fail with threshold exceeded
         let result = gen.run(tx).await;
-        assert!(result.is_err(), "Should have failed with threshold exceeded");
+        assert!(
+            result.is_err(),
+            "Should have failed with threshold exceeded"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("threshold"),
@@ -437,6 +469,7 @@ mod tests {
             max_delete: Some("50%".to_string()),
             force_delete: true, // bypass threshold
             filter: None,
+            scan_options: ScanOptions::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -476,10 +509,7 @@ mod tests {
 /// Returns the maximum number of files that can be deleted
 fn parse_max_delete(max_delete: &str, dest_count: u64) -> u64 {
     if max_delete.ends_with('%') {
-        let percent: f64 = max_delete
-            .trim_end_matches('%')
-            .parse()
-            .unwrap_or(50.0);
+        let percent: f64 = max_delete.trim_end_matches('%').parse().unwrap_or(50.0);
         (dest_count as f64 * percent / 100.0) as u64
     } else {
         max_delete.parse::<u64>().unwrap_or(dest_count)

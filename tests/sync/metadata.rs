@@ -78,7 +78,10 @@ fn test_symlink_preserve() {
         let dest_link = dest.path().join("link.txt");
         let meta = fs::symlink_metadata(&dest_link).unwrap();
         assert!(meta.is_symlink());
-        assert_eq!(fs::read_link(&dest_link).unwrap().to_str().unwrap(), "target.txt");
+        assert_eq!(
+            fs::read_link(&dest_link).unwrap().to_str().unwrap(),
+            "target.txt"
+        );
     }
 }
 
@@ -101,7 +104,10 @@ fn test_symlink_overwrite() {
         let dest_link = dest.path().join("link.txt");
         let meta = fs::symlink_metadata(&dest_link).unwrap();
         assert!(meta.is_symlink());
-        assert_eq!(fs::read_link(&dest_link).unwrap().to_str().unwrap(), "new_target.txt");
+        assert_eq!(
+            fs::read_link(&dest_link).unwrap().to_str().unwrap(),
+            "new_target.txt"
+        );
     }
 }
 
@@ -145,8 +151,20 @@ fn test_multiple_symlinks_same_target() {
             .unwrap();
 
         assert!(output.status.success());
-        assert_eq!(fs::read_link(dest.path().join("link1.txt")).unwrap().to_str().unwrap(), "target.txt");
-        assert_eq!(fs::read_link(dest.path().join("link2.txt")).unwrap().to_str().unwrap(), "target.txt");
+        assert_eq!(
+            fs::read_link(dest.path().join("link1.txt"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "target.txt"
+        );
+        assert_eq!(
+            fs::read_link(dest.path().join("link2.txt"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "target.txt"
+        );
     }
 }
 
@@ -158,7 +176,11 @@ fn test_hardlink_preservation() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::hard_link(source.path().join("original.txt"), source.path().join("hardlink.txt")).unwrap();
+        fs::hard_link(
+            source.path().join("original.txt"),
+            source.path().join("hardlink.txt"),
+        )
+        .unwrap();
 
         let output = Command::new(sy_bin())
             .args(sync_args(&source, &dest, &["--preserve-hardlinks"]))
@@ -187,7 +209,11 @@ fn test_hardlink_not_preserved_without_flag() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::hard_link(source.path().join("original.txt"), source.path().join("hardlink.txt")).unwrap();
+        fs::hard_link(
+            source.path().join("original.txt"),
+            source.path().join("hardlink.txt"),
+        )
+        .unwrap();
 
         let output = Command::new(sy_bin())
             .args(sync_args(&source, &dest, &[]))
@@ -586,6 +612,12 @@ fn test_archive_preserves_permissions() {
     assert!(output.status.success(), "sy -a failed");
 
     // Verify permissions preserved
-    let dest_perms = fs::metadata(dest.path().join("script.sh")).unwrap().permissions();
-    assert_eq!(dest_perms.mode() & 0o777, 0o755, "Permissions should be preserved");
+    let dest_perms = fs::metadata(dest.path().join("script.sh"))
+        .unwrap()
+        .permissions();
+    assert_eq!(
+        dest_perms.mode() & 0o777,
+        0o755,
+        "Permissions should be preserved"
+    );
 }

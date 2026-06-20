@@ -29,6 +29,7 @@ fn bench_deletion_planning(c: &mut Criterion) {
                         relative_path: Arc::new(PathBuf::from(format!("file{}.txt", i))),
                         size: 100,
                         modified: SystemTime::now(),
+                        mode: 0o644,
                         is_dir: false,
                         is_symlink: false,
                         symlink_target: None,

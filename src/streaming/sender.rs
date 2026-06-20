@@ -3,8 +3,8 @@
 //! Receives FileJobs from Generator, reads file content,
 //! computes deltas when possible, and sends Data chunks.
 
-use crate::delta::generator::{generate_delta_streaming, DeltaOp};
 use crate::compress::CompressionDetection;
+use crate::delta::generator::{generate_delta_streaming, DeltaOp};
 use crate::streaming::channel::{
     DeltaInfo, FileJob, FileJobReceiver, GeneratorMessage, DATA_CHUNK_SIZE, DELTA_CHUNK_SIZE,
 };
@@ -155,8 +155,10 @@ impl Sender {
             let payload = if should_compress {
                 flags |= DataFlags::COMPRESSED;
                 let raw = &buf[..n];
-                Bytes::from(crate::compress::compress(raw, crate::compress::Compression::Lz4)
-                    .unwrap_or_else(|_| raw.to_vec()))  // Fallback to uncompressed on error
+                Bytes::from(
+                    crate::compress::compress(raw, crate::compress::Compression::Lz4)
+                        .unwrap_or_else(|_| raw.to_vec()),
+                ) // Fallback to uncompressed on error
             } else {
                 Bytes::copy_from_slice(&buf[..n])
             };
@@ -259,8 +261,10 @@ impl Sender {
                 // Flush current chunk
                 let raw = std::mem::take(&mut delta_bytes);
                 let payload = if should_compress {
-                    Bytes::from(crate::compress::compress(&raw, crate::compress::Compression::Lz4)
-                        .unwrap_or(raw))
+                    Bytes::from(
+                        crate::compress::compress(&raw, crate::compress::Compression::Lz4)
+                            .unwrap_or(raw),
+                    )
                 } else {
                     Bytes::from(raw)
                 };
@@ -279,8 +283,10 @@ impl Sender {
         // Flush remaining ops
         if !delta_bytes.is_empty() {
             let payload = if should_compress {
-                Bytes::from(crate::compress::compress(&delta_bytes, crate::compress::Compression::Lz4)
-                    .unwrap_or(delta_bytes))
+                Bytes::from(
+                    crate::compress::compress(&delta_bytes, crate::compress::Compression::Lz4)
+                        .unwrap_or(delta_bytes),
+                )
             } else {
                 Bytes::from(delta_bytes)
             };

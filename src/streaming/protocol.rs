@@ -72,6 +72,14 @@ impl MessageType {
     }
 }
 
+fn u16_len(label: &str, len: usize) -> u16 {
+    u16::try_from(len).unwrap_or_else(|_| panic!("{label} too long for protocol u16 length: {len}"))
+}
+
+fn u32_len(label: &str, len: usize) -> u32 {
+    u32::try_from(len).unwrap_or_else(|_| panic!("{label} too long for protocol u32 length: {len}"))
+}
+
 // =============================================================================
 // Hello Flags
 // =============================================================================
@@ -86,6 +94,9 @@ bitflags::bitflags! {
         const XATTRS = 1 << 4;
         const ACLS = 1 << 5;
         const DRY_RUN = 1 << 6;
+        const FORCE_DELETE = 1 << 7;
+        const RESPECT_GITIGNORE = 1 << 8;
+        const EXCLUDE_GIT_DIR = 1 << 9;
     }
 }
 
@@ -165,6 +176,9 @@ pub struct Hello {
     pub version: u16,
     pub flags: HelloFlags,
     pub root_path: String,
+    /// Optional max-delete threshold propagated to the remote generator in PULL
+    /// mode so the server enforces the client's `--max-delete`.
+    pub max_delete: Option<String>,
 }
 
 impl Hello {
@@ -173,7 +187,14 @@ impl Hello {
             version: PROTOCOL_VERSION,
             flags,
             root_path: root_path.into(),
+            max_delete: None,
         }
+    }
+
+    /// Attach the client's max-delete threshold to propagate to the server.
+    pub fn with_max_delete(mut self, max_delete: Option<String>) -> Self {
+        self.max_delete = max_delete;
+        self
     }
 
     pub fn is_pull(&self) -> bool {
@@ -182,15 +203,32 @@ impl Hello {
 
     pub fn encode(&self) -> Bytes {
         let path_bytes = self.root_path.as_bytes();
-        let payload_len = 2 + 4 + 2 + path_bytes.len();
+        // Optional trailing field: u8 present + (u16 len + bytes) when present.
+        let max_len = self.max_delete.as_ref().map(|m| m.len()).unwrap_or(0);
+        let max_field_len = 1 + if self.max_delete.is_some() {
+            2 + max_len
+        } else {
+            0
+        };
+        let payload_len = 2 + 4 + 2 + path_bytes.len() + max_field_len;
         let mut buf = BytesMut::with_capacity(5 + payload_len);
 
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Hello as u8);
         buf.put_u16(self.version);
         buf.put_u32(self.flags.bits());
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
+
+        // Trailing max_delete: present flag + optional length-prefixed string.
+        // Old peers ignore trailing bytes, so this is backwards compatible.
+        if let Some(max_delete) = &self.max_delete {
+            buf.put_u8(1);
+            buf.put_u16(u16_len("max_delete", max_delete.len()));
+            buf.put_slice(max_delete.as_bytes());
+        } else {
+            buf.put_u8(0);
+        }
 
         buf.freeze()
     }
@@ -208,10 +246,31 @@ impl Hello {
         let root_path = String::from_utf8(payload.copy_to_bytes(path_len).to_vec())
             .context("Invalid UTF-8 in Hello path")?;
 
+        // Optional trailing max_delete (absent on old peers → None).
+        let max_delete = if payload.remaining() >= 1 {
+            let present = payload.get_u8();
+            if present == 1 && payload.remaining() >= 2 {
+                let max_len = payload.get_u16() as usize;
+                if payload.remaining() >= max_len {
+                    Some(
+                        String::from_utf8(payload.copy_to_bytes(max_len).to_vec())
+                            .context("Invalid UTF-8 in Hello max_delete")?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             version,
             flags,
             root_path,
+            max_delete,
         })
     }
 }
@@ -259,9 +318,9 @@ impl FileEntry {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::FileEntry as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u64(self.size);
         buf.put_i64(self.mtime);
@@ -270,11 +329,11 @@ impl FileEntry {
         buf.put_u8(self.flags.bits());
 
         if let Some(b) = symlink_bytes {
-            buf.put_u16(b.len() as u16);
+            buf.put_u16(u16_len("optional path", b.len()));
             buf.put_slice(b);
         }
         if let Some(b) = link_bytes {
-            buf.put_u16(b.len() as u16);
+            buf.put_u16(u16_len("optional path", b.len()));
             buf.put_slice(b);
         }
 
@@ -418,9 +477,9 @@ impl DestFileEntry {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::DestFileEntry as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u64(self.size);
         buf.put_i64(self.mtime);
@@ -429,7 +488,7 @@ impl DestFileEntry {
 
         if has_checksums {
             buf.put_u32(self.block_size);
-            buf.put_u32(self.checksums.len() as u32);
+            buf.put_u32(u32_len("checksums", self.checksums.len()));
             for cs in &self.checksums {
                 buf.put_u64(cs.offset);
                 buf.put_u32(cs.weak);
@@ -462,8 +521,12 @@ impl DestFileEntry {
             let bs = payload.get_u32();
             let count = payload.get_u32() as usize;
 
-            // Validate we have enough data for all checksums
-            let required = count * BlockChecksum::SIZE;
+            // Validate we have enough data for all checksums BEFORE allocating
+            // (prevents OOM from a malicious count value in a small frame)
+            let required = match count.checked_mul(BlockChecksum::SIZE) {
+                Some(r) => r,
+                None => anyhow::bail!("DestFileEntry checksum count overflow"),
+            };
             if payload.remaining() < required {
                 anyhow::bail!(
                         "DestFileEntry checksums truncated: expected {} checksums ({} bytes), got {} bytes",
@@ -547,13 +610,13 @@ impl Data {
         let payload_len = 2 + path_bytes.len() + 8 + 1 + 4 + self.data.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Data as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u64(self.offset);
         buf.put_u8(self.flags.bits());
-        buf.put_u32(self.data.len() as u32);
+        buf.put_u32(u32_len("data", self.data.len()));
         buf.put_slice(&self.data);
 
         buf.freeze()
@@ -605,9 +668,9 @@ impl DataEnd {
         let payload_len = 2 + path_bytes.len() + 1;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::DataEnd as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u8(self.status);
 
@@ -646,9 +709,9 @@ impl Delete {
         let payload_len = 2 + path_bytes.len() + 1;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Delete as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u8(self.is_dir as u8);
 
@@ -715,9 +778,9 @@ impl Mkdir {
         let payload_len = 2 + path_bytes.len() + 4;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Mkdir as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u32(self.mode);
 
@@ -757,11 +820,11 @@ impl Symlink {
         let payload_len = 2 + path_bytes.len() + 2 + target_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Symlink as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
-        buf.put_u16(target_bytes.len() as u16);
+        buf.put_u16(u16_len("symlink target", target_bytes.len()));
         buf.put_slice(target_bytes);
 
         buf.freeze()
@@ -843,12 +906,12 @@ impl Error {
         let payload_len = 2 + path_bytes.len() + 2 + 2 + msg_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Error as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
         buf.put_u16(self.code);
-        buf.put_u16(msg_bytes.len() as u16);
+        buf.put_u16(u16_len("message", msg_bytes.len()));
         buf.put_slice(msg_bytes);
 
         buf.freeze()
@@ -896,10 +959,10 @@ impl Fatal {
         let payload_len = 2 + 2 + msg_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Fatal as u8);
         buf.put_u16(self.code);
-        buf.put_u16(msg_bytes.len() as u16);
+        buf.put_u16(u16_len("message", msg_bytes.len()));
         buf.put_slice(msg_bytes);
 
         buf.freeze()
@@ -946,17 +1009,17 @@ impl Xattr {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(payload_len as u32);
+        buf.put_u32(u32_len("payload", payload_len));
         buf.put_u8(MessageType::Xattr as u8);
-        buf.put_u16(path_bytes.len() as u16);
+        buf.put_u16(u16_len("path", path_bytes.len()));
         buf.put_slice(path_bytes);
-        buf.put_u16(self.entries.len() as u16);
+        buf.put_u16(u16_len("xattr entries", self.entries.len()));
 
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
-            buf.put_u16(name_bytes.len() as u16);
+            buf.put_u16(u16_len("xattr name", name_bytes.len()));
             buf.put_slice(name_bytes);
-            buf.put_u32(entry.value.len() as u32);
+            buf.put_u32(u32_len("xattr value", entry.value.len()));
             buf.put_slice(&entry.value);
         }
 
@@ -974,6 +1037,18 @@ impl Xattr {
         let path = String::from_utf8(payload.copy_to_bytes(path_len).to_vec())
             .context("Invalid UTF-8 in Xattr path")?;
         let count = payload.get_u16() as usize;
+
+        // Validate minimum entry size before allocating
+        // (prevents unnecessary allocation from a malicious count value)
+        const MIN_XATTR_ENTRY_SIZE: usize = 2 + 4; // u16 name_len + u32 value_len
+        if payload.remaining() < count * MIN_XATTR_ENTRY_SIZE {
+            anyhow::bail!(
+                "Xattr entries truncated: expected at least {} bytes for {} entries, got {}",
+                count * MIN_XATTR_ENTRY_SIZE,
+                count,
+                payload.remaining()
+            );
+        }
 
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
@@ -1388,7 +1463,13 @@ mod tests {
     #[test]
     fn test_hello_flags_combinations() {
         // Test all flag combinations
-        let flags = HelloFlags::PULL | HelloFlags::DELETE | HelloFlags::CHECKSUM | HelloFlags::COMPRESSION | HelloFlags::XATTRS | HelloFlags::ACLS | HelloFlags::DRY_RUN;
+        let flags = HelloFlags::PULL
+            | HelloFlags::DELETE
+            | HelloFlags::CHECKSUM
+            | HelloFlags::COMPRESSION
+            | HelloFlags::XATTRS
+            | HelloFlags::ACLS
+            | HelloFlags::DRY_RUN;
         assert!(flags.contains(HelloFlags::PULL));
         assert!(flags.contains(HelloFlags::DELETE));
         assert!(flags.contains(HelloFlags::CHECKSUM));
@@ -1559,7 +1640,8 @@ mod tests {
     fn test_file_entry_path_truncated() {
         // path_len says 100 but only 2 bytes follow
         let mut data = vec![0u8; 3];
-        data[0] = 0; data[1] = 100; // path_len = 100
+        data[0] = 0;
+        data[1] = 100; // path_len = 100
         let payload = Bytes::from(data);
         let result = FileEntry::decode(payload);
         assert!(result.is_err());
@@ -1596,7 +1678,7 @@ mod tests {
         // Create a FileEntry with symlink flag but truncated target length
         let mut data = vec![0u8; 30];
         data[24] = 0x01; // set symlink flag
-        // symlink_target_length at offset 25-26, set to 100 but don't provide data
+                         // symlink_target_length at offset 25-26, set to 100 but don't provide data
         data[25] = 100;
         let payload = Bytes::from(data);
         let result = FileEntry::decode(payload);

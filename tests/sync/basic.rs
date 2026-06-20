@@ -44,8 +44,14 @@ fn test_basic_sync() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file1.txt")).unwrap(), "content1");
-    assert_eq!(fs::read_to_string(dest.path().join("file2.txt")).unwrap(), "content2");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file1.txt")).unwrap(),
+        "content1"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file2.txt")).unwrap(),
+        "content2"
+    );
 }
 
 #[test]
@@ -106,7 +112,10 @@ fn test_nested_directories() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("a/b/c/file.txt")).unwrap(), "nested");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("a/b/c/file.txt")).unwrap(),
+        "nested"
+    );
 }
 
 #[test]
@@ -124,7 +133,10 @@ fn test_update_existing_files() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "original");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "original"
+    );
 
     // Wait to ensure mtime changes
     thread::sleep(Duration::from_secs(2));
@@ -140,7 +152,10 @@ fn test_update_existing_files() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "updated");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "updated"
+    );
 }
 
 #[test]
@@ -196,10 +211,7 @@ fn test_error_source_not_exists() {
     let dest = TempDir::new().unwrap();
 
     let output = Command::new(sy_bin())
-        .args([
-            "/nonexistent/path",
-            dest.path().to_str().unwrap(),
-        ])
+        .args(["/nonexistent/path", dest.path().to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -226,7 +238,10 @@ fn test_single_file_sync() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(dest_file.exists());
-    assert_eq!(fs::read_to_string(&dest_file).unwrap(), "test content for single file");
+    assert_eq!(
+        fs::read_to_string(&dest_file).unwrap(),
+        "test content for single file"
+    );
 }
 
 #[test]
@@ -351,10 +366,7 @@ fn test_large_file_update_with_delta_sync() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(
-        fs::read(dest.path().join("large.bin")).unwrap(),
-        modified
-    );
+    assert_eq!(fs::read(dest.path().join("large.bin")).unwrap(), modified);
 }
 
 #[test]
@@ -526,7 +538,10 @@ fn test_directory_cache_updates_on_new_directories() {
 // Trailing slash behavior tests
 // These test rsync-compatible trailing slash semantics
 
-fn compute_test_destination(source: &sy::path::SyncPath, dest: &sy::path::SyncPath) -> std::path::PathBuf {
+fn compute_test_destination(
+    source: &sy::path::SyncPath,
+    dest: &sy::path::SyncPath,
+) -> std::path::PathBuf {
     let source_path = source.path();
 
     // For directories with trailing slash, use destination as-is (copy contents)
@@ -566,7 +581,10 @@ fn test_destination_computation_without_trailing_slash() {
     let dest = sy::path::SyncPath::parse("/target");
 
     let effective_dest = compute_test_destination(&source, &dest);
-    assert_eq!(effective_dest, std::path::PathBuf::from("/target/myproject"));
+    assert_eq!(
+        effective_dest,
+        std::path::PathBuf::from("/target/myproject")
+    );
 }
 
 #[test]
@@ -585,7 +603,10 @@ fn test_remote_destination_computation_without_trailing_slash() {
 
     assert!(!source.has_trailing_slash());
     let effective_dest = compute_test_destination(&source, &dest);
-    assert_eq!(effective_dest, std::path::PathBuf::from("/target/myproject"));
+    assert_eq!(
+        effective_dest,
+        std::path::PathBuf::from("/target/myproject")
+    );
 }
 
 #[test]
@@ -617,10 +638,14 @@ fn test_itemize_changes() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check itemize output in stdout
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("f"), "Expected itemize output in stdout: {}", stdout);
+    assert!(
+        stdout.contains("f"),
+        "Expected itemize output in stdout: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -640,11 +665,19 @@ fn test_stats_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check stats output
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files scanned:"), "Expected stats in stdout: {}", stdout);
-    assert!(stdout.contains("Files created:"), "Expected stats in stdout: {}", stdout);
+    assert!(
+        stdout.contains("Files scanned:"),
+        "Expected stats in stdout: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Files created:"),
+        "Expected stats in stdout: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -653,10 +686,10 @@ fn test_backup_flag() {
 
     // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-    
+
     // Wait to ensure source is newer
     thread::sleep(Duration::from_secs(2));
-    
+
     // Create updated file in source
     fs::write(source.path().join("file.txt"), "new content").unwrap();
 
@@ -671,10 +704,16 @@ fn test_backup_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check backup file exists
-    assert!(dest.path().join("file.txt~").exists(), "Backup file should exist");
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+    assert!(
+        dest.path().join("file.txt~").exists(),
+        "Backup file should exist"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "new content"
+    );
 }
 
 #[test]
@@ -716,13 +755,22 @@ fn test_remove_source_files() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check source file is removed
-    assert!(!source.path().join("file.txt").exists(), "Source file should be removed");
-    
+    assert!(
+        !source.path().join("file.txt").exists(),
+        "Source file should be removed"
+    );
+
     // Check dest file exists
-    assert!(dest.path().join("file.txt").exists(), "Dest file should exist");
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "content");
+    assert!(
+        dest.path().join("file.txt").exists(),
+        "Dest file should exist"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -747,10 +795,16 @@ fn test_existing_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check only existing file was updated
-    assert!(dest.path().join("existing.txt").exists(), "Existing file should be updated");
-    assert!(!dest.path().join("new.txt").exists(), "New file should not be created");
+    assert!(
+        dest.path().join("existing.txt").exists(),
+        "Existing file should be updated"
+    );
+    assert!(
+        !dest.path().join("new.txt").exists(),
+        "New file should not be created"
+    );
 }
 
 #[test]
@@ -775,10 +829,16 @@ fn test_ignore_existing_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check only new file was created
-    assert_eq!(fs::read_to_string(dest.path().join("existing.txt")).unwrap(), "old content");
-    assert!(dest.path().join("new.txt").exists(), "New file should be created");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("existing.txt")).unwrap(),
+        "old content"
+    );
+    assert!(
+        dest.path().join("new.txt").exists(),
+        "New file should be created"
+    );
 }
 
 #[test]
@@ -801,7 +861,7 @@ fn test_dirs_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check that directory structure is preserved
     assert!(dest.path().join("subdir").exists(), "Subdir should exist");
 }
@@ -825,10 +885,16 @@ fn test_links_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check symlink is preserved
-    assert!(dest.path().join("link.txt").exists(), "Symlink should exist");
-    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "content");
+    assert!(
+        dest.path().join("link.txt").exists(),
+        "Symlink should exist"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("link.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -850,10 +916,16 @@ fn test_copy_links_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check symlink target is copied, not the symlink
-    assert!(dest.path().join("link.txt").exists(), "Link file should exist");
-    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "content");
+    assert!(
+        dest.path().join("link.txt").exists(),
+        "Link file should exist"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("link.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -875,10 +947,16 @@ fn test_min_size_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check only large file is synced
-    assert!(!dest.path().join("small.txt").exists(), "Small file should not be synced");
-    assert!(dest.path().join("large.txt").exists(), "Large file should be synced");
+    assert!(
+        !dest.path().join("small.txt").exists(),
+        "Small file should not be synced"
+    );
+    assert!(
+        dest.path().join("large.txt").exists(),
+        "Large file should be synced"
+    );
 }
 
 #[test]
@@ -900,10 +978,16 @@ fn test_max_size_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check only small file is synced
-    assert!(dest.path().join("small.txt").exists(), "Small file should be synced");
-    assert!(!dest.path().join("large.txt").exists(), "Large file should not be synced");
+    assert!(
+        dest.path().join("small.txt").exists(),
+        "Small file should be synced"
+    );
+    assert!(
+        !dest.path().join("large.txt").exists(),
+        "Large file should not be synced"
+    );
 }
 
 #[test]
@@ -924,9 +1008,12 @@ fn test_bwlimit_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check file is synced
-    assert!(dest.path().join("large.txt").exists(), "File should be synced");
+    assert!(
+        dest.path().join("large.txt").exists(),
+        "File should be synced"
+    );
 }
 
 #[test]
@@ -937,7 +1024,11 @@ fn test_special_characters_in_filenames() {
     fs::write(source.path().join("file with spaces.txt"), "content").unwrap();
     fs::write(source.path().join("file\twith\ttabs.txt"), "content").unwrap();
     fs::write(source.path().join("file'with'quotes.txt"), "content").unwrap();
-    fs::write(source.path().join("file\"with\"doublequotes.txt"), "content").unwrap();
+    fs::write(
+        source.path().join("file\"with\"doublequotes.txt"),
+        "content",
+    )
+    .unwrap();
 
     let output = Command::new(sy_bin())
         .args([
@@ -949,12 +1040,24 @@ fn test_special_characters_in_filenames() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check all files are synced
-    assert!(dest.path().join("file with spaces.txt").exists(), "File with spaces should exist");
-    assert!(dest.path().join("file\twith\ttabs.txt").exists(), "File with tabs should exist");
-    assert!(dest.path().join("file'with'quotes.txt").exists(), "File with quotes should exist");
-    assert!(dest.path().join("file\"with\"doublequotes.txt").exists(), "File with double quotes should exist");
+    assert!(
+        dest.path().join("file with spaces.txt").exists(),
+        "File with spaces should exist"
+    );
+    assert!(
+        dest.path().join("file\twith\ttabs.txt").exists(),
+        "File with tabs should exist"
+    );
+    assert!(
+        dest.path().join("file'with'quotes.txt").exists(),
+        "File with quotes should exist"
+    );
+    assert!(
+        dest.path().join("file\"with\"doublequotes.txt").exists(),
+        "File with double quotes should exist"
+    );
 }
 
 #[test]
@@ -975,10 +1078,16 @@ fn test_empty_files() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check empty files and dirs are synced
-    assert!(dest.path().join("empty.txt").exists(), "Empty file should exist");
-    assert!(dest.path().join("empty_dir").exists(), "Empty directory should exist");
+    assert!(
+        dest.path().join("empty.txt").exists(),
+        "Empty file should exist"
+    );
+    assert!(
+        dest.path().join("empty_dir").exists(),
+        "Empty directory should exist"
+    );
 }
 
 #[test]
@@ -999,9 +1108,12 @@ fn test_long_filenames() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check file is synced
-    assert!(dest.path().join(&long_name).exists(), "Long filename file should exist");
+    assert!(
+        dest.path().join(&long_name).exists(),
+        "Long filename file should exist"
+    );
 }
 
 #[test]
@@ -1015,7 +1127,7 @@ fn test_concurrent_sync_safety() {
     // Start two syncs concurrently
     let dest_path = dest.path().to_path_buf();
     let source_path = format!("{}/", source.path().display());
-    
+
     let handle1 = std::thread::spawn({
         let dest_path = dest_path.clone();
         let source_path = source_path.clone();
@@ -1026,7 +1138,7 @@ fn test_concurrent_sync_safety() {
                 .unwrap()
         }
     });
-    
+
     let handle2 = std::thread::spawn({
         let dest_path = dest_path.clone();
         let source_path = source_path.clone();
@@ -1042,8 +1154,11 @@ fn test_concurrent_sync_safety() {
     let output2 = handle2.join().unwrap();
 
     // At least one should succeed
-    assert!(output1.status.success() || output2.status.success(), "At least one sync should succeed");
-    
+    assert!(
+        output1.status.success() || output2.status.success(),
+        "At least one sync should succeed"
+    );
+
     // Check files exist
     assert!(dest.path().join("file1.txt").exists(), "File1 should exist");
     assert!(dest.path().join("file2.txt").exists(), "File2 should exist");
@@ -1055,10 +1170,10 @@ fn test_backup_dir_flag() {
 
     // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-    
+
     // Wait to ensure source is newer
     thread::sleep(Duration::from_secs(2));
-    
+
     // Create updated file in source
     fs::write(source.path().join("file.txt"), "new content").unwrap();
 
@@ -1075,10 +1190,16 @@ fn test_backup_dir_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check backup file exists in backup dir
-    assert!(backup_dir.join("file.txt~").exists(), "Backup file should exist in backup dir");
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+    assert!(
+        backup_dir.join("file.txt~").exists(),
+        "Backup file should exist in backup dir"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "new content"
+    );
 }
 
 #[test]
@@ -1099,17 +1220,23 @@ fn test_times_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check file exists
     assert!(dest.path().join("file.txt").exists(), "File should exist");
-    
+
     // Check mtime is preserved (within tolerance)
     let src_meta = fs::metadata(source.path().join("file.txt")).unwrap();
     let dst_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
     let src_mtime = src_meta.modified().unwrap();
     let dst_mtime = dst_meta.modified().unwrap();
-    let diff = src_mtime.duration_since(dst_mtime).unwrap_or_else(|_| dst_mtime.duration_since(src_mtime).unwrap());
-    assert!(diff.as_secs() <= 1, "Mtime should be preserved (diff: {}s)", diff.as_secs());
+    let diff = src_mtime
+        .duration_since(dst_mtime)
+        .unwrap_or_else(|_| dst_mtime.duration_since(src_mtime).unwrap());
+    assert!(
+        diff.as_secs() <= 1,
+        "Mtime should be preserved (diff: {}s)",
+        diff.as_secs()
+    );
 }
 
 #[test]
@@ -1130,14 +1257,18 @@ fn test_perms_flag() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check file exists
     assert!(dest.path().join("file.txt").exists(), "File should exist");
-    
+
     // Check permissions are preserved
     let src_meta = fs::metadata(source.path().join("file.txt")).unwrap();
     let dst_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
-    assert_eq!(src_meta.permissions().mode(), dst_meta.permissions().mode(), "Permissions should be preserved");
+    assert_eq!(
+        src_meta.permissions().mode(),
+        dst_meta.permissions().mode(),
+        "Permissions should be preserved"
+    );
 }
 
 #[test]
@@ -1173,12 +1304,12 @@ fn test_backup_readonly_dir() {
 
     // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-    
+
     // Make dest read-only
     let mut perms = fs::metadata(dest.path()).unwrap().permissions();
     perms.set_readonly(true);
     fs::set_permissions(dest.path(), perms).unwrap();
-    
+
     // Create updated file in source
     thread::sleep(Duration::from_secs(2));
     fs::write(source.path().join("file.txt"), "new content").unwrap();
@@ -1194,10 +1325,18 @@ fn test_backup_readonly_dir() {
         .unwrap();
 
     // Should fail because dest is read-only
-    assert!(!output.status.success(), "Should fail when dest is read-only");
+    assert!(
+        !output.status.success(),
+        "Should fail when dest is read-only"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Permission denied") || stderr.contains("permission") || stderr.contains("denied"),
-        "Error should mention permission: {}", stderr);
+    assert!(
+        stderr.contains("Permission denied")
+            || stderr.contains("permission")
+            || stderr.contains("denied"),
+        "Error should mention permission: {}",
+        stderr
+    );
 
     // Restore permissions for cleanup
     let mut perms = fs::metadata(dest.path()).unwrap().permissions();
@@ -1211,10 +1350,10 @@ fn test_backup_dir_nonexistent() {
 
     // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-    
+
     // Wait to ensure source is newer
     thread::sleep(Duration::from_secs(2));
-    
+
     // Create updated file in source
     fs::write(source.path().join("file.txt"), "new content").unwrap();
 
@@ -1233,10 +1372,16 @@ fn test_backup_dir_nonexistent() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check backup file exists in backup dir
-    assert!(backup_dir.join("file.txt~").exists(), "Backup file should exist in backup dir");
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+    assert!(
+        backup_dir.join("file.txt~").exists(),
+        "Backup file should exist in backup dir"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "new content"
+    );
 }
 
 #[test]
@@ -1245,10 +1390,10 @@ fn test_backup_preserves_original() {
 
     // Create initial file in dest with specific content
     fs::write(dest.path().join("file.txt"), "original content").unwrap();
-    
+
     // Wait to ensure source is newer
     thread::sleep(Duration::from_secs(2));
-    
+
     // Create updated file in source
     fs::write(source.path().join("file.txt"), "updated content").unwrap();
 
@@ -1263,9 +1408,15 @@ fn test_backup_preserves_original() {
         .unwrap();
 
     assert!(output.status.success());
-    
+
     // Check backup file contains original content
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt~")).unwrap(), "original content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt~")).unwrap(),
+        "original content"
+    );
     // Check main file contains updated content
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "updated content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "updated content"
+    );
 }

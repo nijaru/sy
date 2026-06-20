@@ -97,12 +97,12 @@ impl Endpoint for LocalEndpoint {
 
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
         let full_path = self.resolve(path);
-        tokio::fs::read(&full_path)
-            .await
-            .map_err(|e| crate::error::SyncError::Io(std::io::Error::new(
+        tokio::fs::read(&full_path).await.map_err(|e| {
+            crate::error::SyncError::Io(std::io::Error::new(
                 e.kind(),
                 format!("Failed to read file {}: {}", full_path.display(), e),
-            )))
+            ))
+        })
     }
 
     async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()> {
@@ -302,8 +302,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(dir.path().join("link.txt").symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(fs::read_link(dir.path().join("link.txt")).unwrap(), Path::new("target.txt"));
+        assert!(dir
+            .path()
+            .join("link.txt")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(dir.path().join("link.txt")).unwrap(),
+            Path::new("target.txt")
+        );
     }
 
     #[tokio::test]
@@ -329,12 +338,16 @@ mod tests {
             .await
             .unwrap();
 
-        let bytes = ep.copy_file(Path::new("source.txt"), Path::new("dest.txt"))
+        let bytes = ep
+            .copy_file(Path::new("source.txt"), Path::new("dest.txt"))
             .await
             .unwrap();
 
         assert_eq!(bytes, 7);
-        assert_eq!(ep.read_file(Path::new("dest.txt")).await.unwrap(), b"content");
+        assert_eq!(
+            ep.read_file(Path::new("dest.txt")).await.unwrap(),
+            b"content"
+        );
     }
 
     #[tokio::test]

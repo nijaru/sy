@@ -172,7 +172,10 @@ fn test_ignore_existing() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Files skipped:     1"));
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "old");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "old"
+    );
 }
 
 #[test]
@@ -201,7 +204,10 @@ fn test_update_skips_newer_dest() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Files skipped:     1"));
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "dest content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "dest content"
+    );
 }
 
 #[test]
@@ -327,7 +333,10 @@ fn test_update_copies_older_dest() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "new content"
+    );
 }
 
 #[test]
@@ -432,7 +441,11 @@ fn test_delta_sync_file_grows() {
     assert!(output.status.success());
 
     // Grow the file
-    fs::write(source.path().join("file.txt"), "initial content with more data").unwrap();
+    fs::write(
+        source.path().join("file.txt"),
+        "initial content with more data",
+    )
+    .unwrap();
 
     // Second sync should use delta
     let output = Command::new(sy_bin())
@@ -455,7 +468,11 @@ fn test_delta_sync_file_shrinks() {
     let (source, dest) = setup_test_dir();
 
     // Create initial file
-    fs::write(source.path().join("file.txt"), "initial content that is longer").unwrap();
+    fs::write(
+        source.path().join("file.txt"),
+        "initial content that is longer",
+    )
+    .unwrap();
 
     // Initial sync
     let output = Command::new(sy_bin())
@@ -598,10 +615,7 @@ fn test_sparse_file_delta_sync_preserves_sparseness() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(
-        fs::read(dest.path().join("sparse.bin")).unwrap(),
-        content
-    );
+    assert_eq!(fs::read(dest.path().join("sparse.bin")).unwrap(), content);
 }
 
 #[test]
@@ -661,7 +675,11 @@ fn test_nanosecond_mtime_preserved() {
         let src_mtime = src_meta.modified().unwrap();
         let src_nanos = src_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
         // Filesystem may truncate — just verify it's non-zero and close
-        assert!(src_nanos > 0, "Source mtime nanos should be non-zero, got {}", src_nanos);
+        assert!(
+            src_nanos > 0,
+            "Source mtime nanos should be non-zero, got {}",
+            src_nanos
+        );
 
         // Sync
         let output = Command::new(sy_bin())
@@ -677,7 +695,10 @@ fn test_nanosecond_mtime_preserved() {
         // Verify dest mtime matches source mtime (within filesystem precision)
         let dest_meta = fs::metadata(dest.path().join("file.txt")).unwrap();
         let dest_mtime = dest_meta.modified().unwrap();
-        let dest_nanos = dest_mtime.duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let dest_nanos = dest_mtime
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
 
         // Both should have non-zero nanoseconds (not truncated to seconds)
         assert!(
@@ -695,7 +716,9 @@ fn test_nanosecond_mtime_preserved() {
         assert!(
             diff < Duration::from_secs(1),
             "Mtime difference should be < 1s, got {:?} (src_nanos={}, dest_nanos={})",
-            diff, src_nanos, dest_nanos
+            diff,
+            src_nanos,
+            dest_nanos
         );
     }
 }

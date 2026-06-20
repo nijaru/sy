@@ -43,7 +43,11 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 }
 
 /// Compress data with optional level override
-pub fn compress_with_level(data: &[u8], compression: Compression, level: Option<u8>) -> io::Result<Vec<u8>> {
+pub fn compress_with_level(
+    data: &[u8],
+    compression: Compression,
+    level: Option<u8>,
+) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
         Compression::Lz4 => compress_lz4(data),

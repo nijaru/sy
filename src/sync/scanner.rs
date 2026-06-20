@@ -19,7 +19,7 @@ pub struct FileEntry {
     pub relative_path: Arc<PathBuf>,
     pub size: u64,
     pub modified: SystemTime,
-    pub mode: u32,         // Unix permission bits (e.g., 0o755)
+    pub mode: u32, // Unix permission bits (e.g., 0o755)
     pub is_dir: bool,
     pub is_symlink: bool,
     pub symlink_target: Option<Arc<PathBuf>>,
@@ -469,9 +469,6 @@ impl Iterator for StreamingScanner {
         }
     }
 }
-
-// StreamingScanner is Send because it only contains Send types
-unsafe impl Send for StreamingScanner {}
 
 /// Parallel streaming iterator over FileEntry items
 ///

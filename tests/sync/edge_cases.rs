@@ -50,9 +50,18 @@ fn test_unicode_filenames() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("日本語.txt")).unwrap(), "japanese");
-    assert_eq!(fs::read_to_string(dest.path().join("émoji🎉.txt")).unwrap(), "emoji");
-    assert_eq!(fs::read_to_string(dest.path().join("über.txt")).unwrap(), "german");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("日本語.txt")).unwrap(),
+        "japanese"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("émoji🎉.txt")).unwrap(),
+        "emoji"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("über.txt")).unwrap(),
+        "german"
+    );
 }
 
 #[test]
@@ -77,7 +86,10 @@ fn test_deep_directory_structure() {
     for i in 0..10 {
         dest_path = dest_path.join(format!("level{}", i));
     }
-    assert_eq!(fs::read_to_string(dest_path.join("deep.txt")).unwrap(), "deep content");
+    assert_eq!(
+        fs::read_to_string(dest_path.join("deep.txt")).unwrap(),
+        "deep content"
+    );
 }
 
 #[test]
@@ -94,9 +106,18 @@ fn test_special_characters_in_filenames() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file with spaces.txt")).unwrap(), "spaces");
-    assert_eq!(fs::read_to_string(dest.path().join("file-with-dashes.txt")).unwrap(), "dashes");
-    assert_eq!(fs::read_to_string(dest.path().join("file.with.dots.txt")).unwrap(), "dots");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file with spaces.txt")).unwrap(),
+        "spaces"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file-with-dashes.txt")).unwrap(),
+        "dashes"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.with.dots.txt")).unwrap(),
+        "dots"
+    );
 }
 
 #[test]
@@ -129,7 +150,10 @@ fn test_trailing_slash_source() {
 
     assert!(output.status.success());
     assert!(dest.path().join("file.txt").exists());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -145,7 +169,10 @@ fn test_trailing_slash_dest() {
 
     assert!(output.status.success());
     assert!(dest.path().join("file.txt").exists());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -161,7 +188,10 @@ fn test_trailing_slash_both() {
 
     assert!(output.status.success());
     assert!(dest.path().join("file.txt").exists());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "content"
+    );
 }
 
 // TODO: No-trailing-slash case needs adjusted dest path passed to SyncSession
@@ -187,7 +217,10 @@ fn test_no_trailing_slash_copies_directory() {
 
     assert!(output.status.success());
     assert!(dest.path().join("mydir/file.txt").exists());
-    assert_eq!(fs::read_to_string(dest.path().join("mydir/file.txt")).unwrap(), "content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("mydir/file.txt")).unwrap(),
+        "content"
+    );
 }
 
 #[test]
@@ -210,7 +243,11 @@ fn test_large_number_of_files() {
     let (source, dest) = setup_test_dir();
 
     for i in 0..100 {
-        fs::write(source.path().join(format!("file{:03}.txt", i)), format!("content{}", i)).unwrap();
+        fs::write(
+            source.path().join(format!("file{:03}.txt", i)),
+            format!("content{}", i),
+        )
+        .unwrap();
     }
 
     let output = Command::new(sy_bin())
@@ -270,7 +307,10 @@ fn test_overwrite_existing_files() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_to_string(dest.path().join("file.txt")).unwrap(), "new content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "new content"
+    );
 }
 
 #[test]
@@ -366,10 +406,7 @@ fn test_binary_files() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(
-        fs::read(dest.path().join("binary.bin")).unwrap(),
-        content
-    );
+    assert_eq!(fs::read(dest.path().join("binary.bin")).unwrap(), content);
 }
 
 #[test]
@@ -490,7 +527,11 @@ fn test_hardlink_delta_sync() {
     // Create a file and a hard link to it
     let content = "original content for hardlink test";
     fs::write(source.path().join("original.txt"), content).unwrap();
-    fs::hard_link(source.path().join("original.txt"), source.path().join("link.txt")).unwrap();
+    fs::hard_link(
+        source.path().join("original.txt"),
+        source.path().join("link.txt"),
+    )
+    .unwrap();
 
     // Initial sync
     let output = Command::new(sy_bin())
@@ -525,8 +566,14 @@ fn test_hardlink_delta_sync() {
     assert!(output.status.success());
 
     // Verify both files have updated content
-    assert_eq!(fs::read_to_string(dest.path().join("original.txt")).unwrap(), "updated content");
-    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "updated content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("original.txt")).unwrap(),
+        "updated content"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("link.txt")).unwrap(),
+        "updated content"
+    );
 }
 
 #[test]
@@ -550,7 +597,10 @@ fn test_symlink_to_file_delta() {
 
     // Verify symlink exists
     assert!(dest.path().join("link.txt").exists());
-    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "target content");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("link.txt")).unwrap(),
+        "target content"
+    );
 
     // Update the target file
     thread::sleep(Duration::from_secs(2));
@@ -568,5 +618,8 @@ fn test_symlink_to_file_delta() {
     assert!(output.status.success());
 
     // Verify symlink still works and has updated content
-    assert_eq!(fs::read_to_string(dest.path().join("link.txt")).unwrap(), "updated target");
+    assert_eq!(
+        fs::read_to_string(dest.path().join("link.txt")).unwrap(),
+        "updated target"
+    );
 }

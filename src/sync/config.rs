@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::cli::SymlinkMode;
+use crate::compress::CompressionDetection;
 use crate::filter::FilterEngine;
 use crate::integrity::ChecksumType;
 use std::path::PathBuf;
@@ -42,6 +43,7 @@ pub struct SyncConfig {
     pub timeout: Option<u64>,
     pub contimeout: Option<u64>,
     pub compress_level: Option<u8>,
+    pub compression_detection: CompressionDetection,
     pub itemize_changes: bool,
     pub human_readable: bool,
     pub stats: bool,
@@ -90,7 +92,8 @@ impl SyncConfig {
             partial_dir: None,
             timeout: None,
             contimeout: None,
-                        compress_level: None,
+            compress_level: None,
+            compression_detection: CompressionDetection::Never,
             itemize_changes: false,
             human_readable: false,
             stats: false,

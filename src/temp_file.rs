@@ -1,4 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-process counter guaranteeing distinct temp names even when
+/// two calls land in the same nanosecond (parallel writes to the same dir).
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard for temporary files that automatically cleans up on drop.
 ///
@@ -40,18 +45,26 @@ impl TempFileGuard {
     }
 
     /// Generate a temp file path in the same directory as `target` that won't exceed
-    /// the 255-byte filename limit. Uses process ID + timestamp to avoid concurrent conflicts.
+    /// the 255-byte filename limit. Uses process ID + nanoseconds + a monotonic
+    /// counter to avoid conflicts between concurrent syncs.
     ///
-    /// Pattern: `.sy-<8-char-random>.tmp` — always 17 chars, fits in any filesystem.
+    /// Pattern: `.sy-<8-char-hex>.tmp` — always 17 chars, fits in any filesystem.
     pub fn temp_path_for(target: &Path) -> PathBuf {
         let parent = target.parent().unwrap_or(Path::new("."));
-        // Use PID + nanoseconds to avoid conflicts between concurrent syncs
+        // PID + nanoseconds + a monotonic counter. The counter guarantees
+        // uniqueness across concurrent calls in the same process even when
+        // two calls share the same nanosecond.
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
-        let hash = pid.wrapping_mul(31).wrapping_add(nanos);
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
+        let hash = pid
+            .wrapping_mul(31)
+            .wrapping_add(nanos)
+            .wrapping_mul(31)
+            .wrapping_add(counter);
         let name = format!(".sy-{:08x}.tmp", hash);
         parent.join(name)
     }

@@ -207,26 +207,16 @@ mod tests {
         let config = SyncConfig::default();
 
         let session = SyncSession::new(source_endpoint, dest_endpoint, config);
-        let watch_session = WatchSession::new(
-            session,
-            source,
-            destination,
-            Duration::from_millis(500),
-        );
+        let watch_session =
+            WatchSession::new(session, source, destination, Duration::from_millis(500));
 
         // Create events
-        let create_event = Event::new(notify::EventKind::Create(
-            notify::event::CreateKind::File,
-        ));
-        let modify_event = Event::new(notify::EventKind::Modify(
-            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
-        ));
-        let remove_event = Event::new(notify::EventKind::Remove(
-            notify::event::RemoveKind::File,
-        ));
-        let access_event = Event::new(notify::EventKind::Access(
-            notify::event::AccessKind::Read,
-        ));
+        let create_event = Event::new(notify::EventKind::Create(notify::event::CreateKind::File));
+        let modify_event = Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
+        let remove_event = Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File));
+        let access_event = Event::new(notify::EventKind::Access(notify::event::AccessKind::Read));
 
         assert!(watch_session.should_sync_event(&create_event));
         assert!(watch_session.should_sync_event(&modify_event));

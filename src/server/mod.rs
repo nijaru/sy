@@ -18,6 +18,7 @@ use crate::streaming::{
     protocol::{self as v2, HelloFlags, MessageType},
     Generator, GeneratorConfig, Receiver, ReceiverConfig, Sender, SenderConfig,
 };
+use crate::sync::scanner::ScanOptions;
 
 /// Expand tilde (~) in paths to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -93,14 +94,21 @@ async fn run_server_pull(
     mut stdout: impl io::AsyncWrite + Unpin,
 ) -> Result<()> {
     // 1. Receive DEST_FILE_ENTRY messages from client (Initial Exchange)
+    let scan_options = ScanOptions {
+        respect_gitignore: hello.flags.contains(HelloFlags::RESPECT_GITIGNORE),
+        include_git_dir: !hello.flags.contains(HelloFlags::EXCLUDE_GIT_DIR),
+        dirs_only: false,
+    };
+
     let mut generator = Generator::new(GeneratorConfig {
         root: root_path.clone(),
         include_hidden: true,
         follow_symlinks: false,
         delete_enabled: hello.flags.contains(HelloFlags::DELETE),
-        force_delete: false, // TODO: wire from Hello flags
-        max_delete: None, // TODO: wire from Hello flags
+        force_delete: hello.flags.contains(HelloFlags::FORCE_DELETE),
+        max_delete: hello.max_delete.clone(),
         filter: None,
+        scan_options,
     });
 
     loop {

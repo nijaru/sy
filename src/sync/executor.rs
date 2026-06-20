@@ -119,9 +119,7 @@ impl<'a> TaskExecutor<'a> {
     pub async fn execute_task(&self, task: &SyncTask) -> Result<TaskResult> {
         match task.action {
             SyncAction::Skip => Ok(TaskResult::Skipped),
-            SyncAction::Create | SyncAction::Update => {
-                self.execute_create_or_update(task).await
-            }
+            SyncAction::Create | SyncAction::Update => self.execute_create_or_update(task).await,
             SyncAction::Delete => {
                 if self.dry_run {
                     return Ok(TaskResult::Deleted);
@@ -134,7 +132,9 @@ impl<'a> TaskExecutor<'a> {
 
     /// Execute a create or update task.
     async fn execute_create_or_update(&self, task: &SyncTask) -> Result<TaskResult> {
-        let source_entry = task.source.as_ref()
+        let source_entry = task
+            .source
+            .as_ref()
             .ok_or_else(|| Error::Io(std::io::Error::other("Missing source for create/update")))?;
 
         if self.dry_run {
@@ -143,7 +143,9 @@ impl<'a> TaskExecutor<'a> {
             } else if source_entry.is_symlink {
                 Ok(TaskResult::SymlinkCreated)
             } else {
-                Ok(TaskResult::Created { bytes: source_entry.size })
+                Ok(TaskResult::Created {
+                    bytes: source_entry.size,
+                })
             };
         }
 
@@ -157,7 +159,11 @@ impl<'a> TaskExecutor<'a> {
     }
 
     /// Execute directory creation with optional permission preservation.
-    async fn execute_directory(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+    async fn execute_directory(
+        &self,
+        source_entry: &FileEntry,
+        task: &SyncTask,
+    ) -> Result<TaskResult> {
         self.dest.create_dir_all(&task.dest_path).await?;
 
         // Preserve directory permissions if enabled
@@ -176,7 +182,11 @@ impl<'a> TaskExecutor<'a> {
     }
 
     /// Execute symlink creation.
-    async fn execute_symlink(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
+    async fn execute_symlink(
+        &self,
+        source_entry: &FileEntry,
+        task: &SyncTask,
+    ) -> Result<TaskResult> {
         #[cfg(unix)]
         {
             let source_path = self.source.root().join(&*source_entry.relative_path);
@@ -205,7 +215,9 @@ impl<'a> TaskExecutor<'a> {
         #[cfg(not(unix))]
         {
             let _ = (source_entry, task);
-            Err(Error::Io(std::io::Error::other("Symlinks not supported on this platform")))
+            Err(Error::Io(std::io::Error::other(
+                "Symlinks not supported on this platform",
+            )))
         }
     }
 
@@ -223,7 +235,9 @@ impl<'a> TaskExecutor<'a> {
                     if task.action == SyncAction::Update {
                         self.dest.remove(&task.dest_path, false).await?;
                     }
-                    self.dest.create_hardlink(&first_path, &task.dest_path).await?;
+                    self.dest
+                        .create_hardlink(&first_path, &task.dest_path)
+                        .await?;
 
                     // Itemize if configured
                     if self.config.itemize_changes {
@@ -254,8 +268,8 @@ impl<'a> TaskExecutor<'a> {
                 match crate::delta::estimate_change_ratio(
                     &source_path,
                     &abs_dest,
-                    64 * 1024, // 64KB blocks
-                    Some(20),  // Sample 20 blocks
+                    64 * 1024,  // 64KB blocks
+                    Some(20),   // Sample 20 blocks
                     Some(0.75), // 75% threshold
                 ) {
                     Ok(ratio) => {
@@ -314,15 +328,8 @@ impl<'a> TaskExecutor<'a> {
                     eprintln!("{} {}", item, task.dest_path.display());
                 }
 
-                // Remove source file after successful transfer
-                if self.config.remove_source_files {
-                    let source_path = self.source.root().join(&*source_entry.relative_path);
-                    if let Err(e) = std::fs::remove_file(&source_path) {
-                        tracing::warn!("Failed to remove source {}: {}", source_path.display(), e);
-                    }
-                }
-
-                // Verify if configured
+                // Verify if configured (BEFORE removing source — a failed write
+                // must not leave the user without the original file).
                 if self.verification.verify_on_write {
                     let dest_data = self.dest.read_file(&task.dest_path).await?;
                     if data != dest_data {
@@ -330,6 +337,14 @@ impl<'a> TaskExecutor<'a> {
                             expected: format!("{} bytes", data.len()),
                             actual: format!("{} bytes", dest_data.len()),
                         });
+                    }
+                }
+
+                // Remove source file only after confirmed successful transfer + verification.
+                if self.config.remove_source_files {
+                    let source_path = self.source.root().join(&*source_entry.relative_path);
+                    if let Err(e) = std::fs::remove_file(&source_path) {
+                        tracing::warn!("Failed to remove source {}: {}", source_path.display(), e);
                     }
                 }
 
@@ -381,21 +396,23 @@ impl<'a> TaskExecutor<'a> {
 
         let abs_dest = self.abs_dest_path(path);
         let backup_path = if let Some(ref dir) = self.backup.dir {
-            let file_name = abs_dest.file_name()
+            let file_name = abs_dest
+                .file_name()
                 .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
-            dir.join(format!("{}{}",
+            dir.join(format!(
+                "{}{}",
                 file_name.to_string_lossy(),
                 self.backup.suffix
             ))
         } else {
-            let file_name = abs_dest.file_name()
+            let file_name = abs_dest
+                .file_name()
                 .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
-            abs_dest.parent()
-                .unwrap_or(Path::new("."))
-                .join(format!("{}{}",
-                    file_name.to_string_lossy(),
-                    self.backup.suffix
-                ))
+            abs_dest.parent().unwrap_or(Path::new(".")).join(format!(
+                "{}{}",
+                file_name.to_string_lossy(),
+                self.backup.suffix
+            ))
         };
 
         // Copy the file using the endpoint's copy_file method
@@ -480,16 +497,13 @@ impl<'a> TaskExecutor<'a> {
 mod tests {
     use super::*;
     use crate::endpoint::local::LocalEndpoint;
-    use crate::sync::config::VerificationConfig;
     use crate::integrity::ChecksumType;
+    use crate::sync::config::VerificationConfig;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn test_executor<'a>(
-        source: &'a dyn Endpoint,
-        dest: &'a dyn Endpoint,
-    ) -> TaskExecutor<'a> {
+    fn test_executor<'a>(source: &'a dyn Endpoint, dest: &'a dyn Endpoint) -> TaskExecutor<'a> {
         TaskExecutor::new(
             source,
             dest,
@@ -548,7 +562,10 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Created { bytes: 5 }));
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[tokio::test]
@@ -574,7 +591,10 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(),
+            "updated"
+        );
     }
 
     #[tokio::test]
@@ -724,10 +744,10 @@ mod tests {
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
         let executor = test_executor(&source, &dest);
 
-        let result = executor.verify_transfer(
-            Path::new("test.txt"),
-            Path::new("test.txt"),
-        ).await.unwrap();
+        let result = executor
+            .verify_transfer(Path::new("test.txt"), Path::new("test.txt"))
+            .await
+            .unwrap();
         assert!(result);
     }
 
@@ -743,10 +763,10 @@ mod tests {
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
         let executor = test_executor(&source, &dest);
 
-        let result = executor.verify_transfer(
-            Path::new("test.txt"),
-            Path::new("test.txt"),
-        ).await.unwrap();
+        let result = executor
+            .verify_transfer(Path::new("test.txt"), Path::new("test.txt"))
+            .await
+            .unwrap();
         assert!(!result);
     }
 
@@ -797,7 +817,8 @@ mod tests {
             std::fs::write(
                 src_dir.path().join(format!("file{}.txt", i)),
                 format!("content{}", i),
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
@@ -869,7 +890,10 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(stats.files_skipped, 1);
 
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("update.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("update.txt")).unwrap(),
+            "new"
+        );
         assert!(!dst_dir.path().join("delete.txt").exists());
     }
 
@@ -901,7 +925,10 @@ mod tests {
         let dest_link = dst_dir.path().join("link.txt");
         let meta = std::fs::symlink_metadata(&dest_link).unwrap();
         assert!(meta.is_symlink());
-        assert_eq!(std::fs::read_link(&dest_link).unwrap().to_str().unwrap(), "target.txt");
+        assert_eq!(
+            std::fs::read_link(&dest_link).unwrap().to_str().unwrap(),
+            "target.txt"
+        );
     }
 
     #[tokio::test]
@@ -951,7 +978,10 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Created { bytes: 0 }));
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("empty.txt")).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("empty.txt")).unwrap(),
+            ""
+        );
     }
 
     #[tokio::test]
@@ -999,7 +1029,8 @@ mod tests {
                 prune_checksum_db: false,
             },
             4,
-        ).with_backup(BackupConfig {
+        )
+        .with_backup(BackupConfig {
             enabled: true,
             suffix: "~".to_string(),
             dir: None,
@@ -1016,10 +1047,16 @@ mod tests {
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Updated { bytes: 7 }));
-        
+
         assert!(dst_dir.path().join("test.txt~").exists());
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt~")).unwrap(), "old");
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt~")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(),
+            "updated"
+        );
     }
 
     #[tokio::test]
@@ -1085,8 +1122,15 @@ mod tests {
         assert!(matches!(result, TaskResult::SymlinkCreated));
 
         let link_path = dst_dir.path().join("link.txt");
-        assert!(link_path.symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_link(&link_path).unwrap().to_str().unwrap(), "target.txt");
+        assert!(link_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link_path).unwrap().to_str().unwrap(),
+            "target.txt"
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1143,8 @@ mod tests {
         std::fs::hard_link(
             src_dir.path().join("original.txt"),
             src_dir.path().join("link.txt"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
@@ -1107,10 +1152,14 @@ mod tests {
             &source,
             &dest,
             false,
-            PreserveConfig { hardlinks: true, ..Default::default() },
+            PreserveConfig {
+                hardlinks: true,
+                ..Default::default()
+            },
             VerificationConfig::default(),
             4,
-        ).with_config(ExecuteConfig {
+        )
+        .with_config(ExecuteConfig {
             preserve_hardlinks: true,
             ..Default::default()
         });
@@ -1169,7 +1218,7 @@ mod tests {
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
-        
+
         // Create executor with keep_partial = false (default)
         let executor = test_executor(&source, &dest);
 
@@ -1214,10 +1263,14 @@ mod tests {
             &source,
             &dest,
             false,
-            PreserveConfig { xattrs: true, ..Default::default() },
+            PreserveConfig {
+                xattrs: true,
+                ..Default::default()
+            },
             VerificationConfig::default(),
             4,
-        ).with_config(ExecuteConfig {
+        )
+        .with_config(ExecuteConfig {
             preserve_xattrs: true,
             ..Default::default()
         });
@@ -1263,7 +1316,8 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig::default(),
             4,
-        ).with_config(ExecuteConfig {
+        )
+        .with_config(ExecuteConfig {
             itemize_changes: true,
             ..Default::default()
         });
@@ -1298,7 +1352,8 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig::default(),
             4,
-        ).with_config(ExecuteConfig {
+        )
+        .with_config(ExecuteConfig {
             remove_source_files: true,
             ..Default::default()
         });
@@ -1318,7 +1373,10 @@ mod tests {
         // Source should be removed
         assert!(!src_dir.path().join("test.txt").exists());
         // Dest should have the content
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "content");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(),
+            "content"
+        );
     }
 
     #[tokio::test]
@@ -1330,7 +1388,9 @@ mod tests {
         let dst_dir = TempDir::new().unwrap();
 
         std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
-        let mut perms = std::fs::metadata(src_dir.path().join("subdir")).unwrap().permissions();
+        let mut perms = std::fs::metadata(src_dir.path().join("subdir"))
+            .unwrap()
+            .permissions();
         perms.set_mode(0o750);
         std::fs::set_permissions(src_dir.path().join("subdir"), perms).unwrap();
 
@@ -1340,10 +1400,14 @@ mod tests {
             &source,
             &dest,
             false,
-            PreserveConfig { permissions: true, ..Default::default() },
+            PreserveConfig {
+                permissions: true,
+                ..Default::default()
+            },
             VerificationConfig::default(),
             4,
-        ).with_config(ExecuteConfig {
+        )
+        .with_config(ExecuteConfig {
             preserve_dir_permissions: true,
             ..Default::default()
         });
@@ -1361,7 +1425,9 @@ mod tests {
         assert!(matches!(result, TaskResult::DirCreated));
 
         // Verify permissions
-        let dest_perms = std::fs::metadata(dst_dir.path().join("subdir")).unwrap().permissions();
+        let dest_perms = std::fs::metadata(dst_dir.path().join("subdir"))
+            .unwrap()
+            .permissions();
         assert_eq!(dest_perms.mode() & 0o777, 0o750);
     }
 
@@ -1383,7 +1449,8 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig::default(),
             4,
-        ).with_backup(BackupConfig {
+        )
+        .with_backup(BackupConfig {
             enabled: true,
             suffix: "~".to_string(),
             dir: Some(backup_dir.path().to_path_buf()),
@@ -1403,9 +1470,15 @@ mod tests {
 
         // Backup should be in custom directory
         assert!(backup_dir.path().join("test.txt~").exists());
-        assert_eq!(std::fs::read_to_string(backup_dir.path().join("test.txt~")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(backup_dir.path().join("test.txt~")).unwrap(),
+            "old"
+        );
         // Dest should have new content
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(), "updated");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap(),
+            "updated"
+        );
     }
 
     #[tokio::test]
@@ -1425,7 +1498,8 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig::default(),
             4,
-        ).with_backup(BackupConfig {
+        )
+        .with_backup(BackupConfig {
             enabled: true,
             suffix: ".bak".to_string(),
             dir: None,
@@ -1445,7 +1519,10 @@ mod tests {
 
         // Backup should have custom suffix
         assert!(dst_dir.path().join("test.txt.bak").exists());
-        assert_eq!(std::fs::read_to_string(dst_dir.path().join("test.txt.bak")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.path().join("test.txt.bak")).unwrap(),
+            "old"
+        );
     }
 
     #[tokio::test]
@@ -1464,7 +1541,8 @@ mod tests {
             PreserveConfig::default(),
             VerificationConfig::default(),
             4,
-        ).with_backup(BackupConfig {
+        )
+        .with_backup(BackupConfig {
             enabled: true,
             suffix: "~".to_string(),
             dir: None,

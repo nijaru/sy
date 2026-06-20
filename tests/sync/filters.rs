@@ -59,7 +59,11 @@ fn test_exclude_flag_multiple() {
     fs::write(source.path().join("file.tmp"), "tmp").unwrap();
 
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--exclude", "*.log", "--exclude", "*.tmp"]))
+        .args(sync_args(
+            &source,
+            &dest,
+            &["--exclude", "*.log", "--exclude", "*.tmp"],
+        ))
         .output()
         .unwrap();
 
@@ -95,7 +99,11 @@ fn test_include_flag_basic() {
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--include", "*.txt", "--exclude", "*"]))
+        .args(sync_args(
+            &source,
+            &dest,
+            &["--include", "*.txt", "--exclude", "*"],
+        ))
         .output()
         .unwrap();
 
@@ -112,7 +120,11 @@ fn test_include_exclude_order_matters() {
     fs::write(source.path().join("file.log"), "log").unwrap();
 
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--include", "*.txt", "--exclude", "*"]))
+        .args(sync_args(
+            &source,
+            &dest,
+            &["--include", "*.txt", "--exclude", "*"],
+        ))
         .output()
         .unwrap();
 
@@ -129,7 +141,11 @@ fn test_filter_flag_include_syntax() {
     fs::write(source.path().join("exclude.log"), "log").unwrap();
 
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--filter", "+ *.txt", "--filter", "- *"]))
+        .args(sync_args(
+            &source,
+            &dest,
+            &["--filter", "+ *.txt", "--filter", "- *"],
+        ))
         .output()
         .unwrap();
 
@@ -259,7 +275,11 @@ fn test_min_max_size_filter_combined() {
     fs::write(source.path().join("large.txt"), "hello world!").unwrap();
 
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--min-size", "3", "--max-size", "10"]))
+        .args(sync_args(
+            &source,
+            &dest,
+            &["--min-size", "3", "--max-size", "10"],
+        ))
         .output()
         .unwrap();
 

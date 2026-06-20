@@ -302,85 +302,60 @@ impl Transport for LocalTransport {
         let dest = dest.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            // Check if source is sparse
+            // Atomic copy: write to a temp file, set metadata on it, then rename.
+            // A crash leaves the destination unchanged (old file intact) or complete.
             let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
                 path: source.clone(),
                 source: e,
             })?;
 
-            let is_sparse = is_file_sparse(&source_meta);
+            let temp_path = TempFileGuard::temp_path_for(&dest);
+            let temp_guard = TempFileGuard::new(&temp_path);
 
-            if is_sparse {
-                // For sparse files, use std::fs::copy() which preserves sparseness on Unix
-                tracing::debug!(
-                    "Sparse file detected ({}), using sparse-aware copy",
-                    source.display()
-                );
-                let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
+            // fs::copy() is optimized per-platform (clonefile on macOS, copy_file_range
+            // on Linux) and preserves sparseness on Unix. We copy into the temp path.
+            let bytes_written =
+                fs::copy(&source, &temp_path).map_err(|e| SyncError::CopyError {
                     path: source.clone(),
                     source: e,
                 })?;
-
-                // Strip xattrs (fs::copy may preserve them on some platforms)
-                #[cfg(unix)]
-                {
-                    if let Ok(xattr_list) = xattr::list(&dest) {
-                        for attr_name in xattr_list {
-                            let _ = xattr::remove(&dest, &attr_name);
-                        }
-                    }
-                }
-
-                // Preserve modification time
-                if let Ok(mtime) = source_meta.modified() {
-                    let _ = filetime::set_file_mtime(
-                        &dest,
-                        filetime::FileTime::from_system_time(mtime),
-                    );
-                }
-
-                tracing::debug!(
-                    "Sparse copy complete: {} ({} bytes logical size)",
-                    source.display(),
-                    bytes_written
-                );
-
-                return Ok(bytes_written);
-            }
-
-            // Use fs::copy() which is optimized per-platform:
-            // - macOS: clonefile() for COW reflinks on APFS (100x+ faster)
-            // - Linux: copy_file_range() for zero-copy (kernel-side)
-            // - Fallback: sendfile() or read/write
-            // This is MUCH faster than manual read/write loop
-            let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
-                path: source.clone(),
-                source: e,
-            })?;
 
             // fs::copy() may preserve xattrs on some platforms (e.g., macOS).
             // Strip all xattrs so that Transferrer can selectively re-add them
             // based on preserve_xattrs setting.
             #[cfg(unix)]
             {
-                if let Ok(xattr_list) = xattr::list(&dest) {
+                if let Ok(xattr_list) = xattr::list(&temp_path) {
                     for attr_name in xattr_list {
-                        let _ = xattr::remove(&dest, &attr_name);
+                        let _ = xattr::remove(&temp_path, &attr_name);
                     }
                 }
             }
 
+            // Set metadata on temp BEFORE rename so a crash never leaves a file
+            // with wrong permissions or mtime at the final path.
+            if let Ok(mtime) = source_meta.modified() {
+                let _ = filetime::set_file_mtime(
+                    &temp_path,
+                    filetime::FileTime::from_system_time(mtime),
+                );
+            }
+            let _ = fs::set_permissions(&temp_path, source_meta.permissions());
+
+            // Atomic rename to final destination. On failure, temp_guard drops and
+            // cleans up the temp file; the original destination is untouched.
+            fs::rename(&temp_path, &dest).map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+            temp_guard.defuse();
+
             tracing::debug!(
-                "Copied {} ({} bytes, fast copy)",
+                "Copied {} -> {} ({} bytes, atomic)",
                 source.display(),
+                dest.display(),
                 bytes_written
             );
-
-            // Preserve modification time
-            if let Ok(mtime) = source_meta.modified() {
-                let _ =
-                    filetime::set_file_mtime(&dest, filetime::FileTime::from_system_time(mtime));
-            }
 
             Ok(bytes_written)
         })
@@ -455,11 +430,28 @@ impl Transport for LocalTransport {
                     "Source file is sparse (allocated size < logical size), using sparse-aware copy"
                 );
 
-                // Use SEEK_HOLE/SEEK_DATA to preserve sparseness
-                let bytes_written = copy_sparse_file(&source, &dest).map_err(|e| SyncError::CopyError {
-                    path: source.clone(),
+                // Atomic: copy to temp, set metadata on temp, then rename.
+                let temp_dest = TempFileGuard::temp_path_for(&dest);
+                let temp_guard = TempFileGuard::new(&temp_dest);
+                let bytes_written =
+                    copy_sparse_file(&source, &temp_dest).map_err(|e| SyncError::CopyError {
+                        path: source.clone(),
+                        source: e,
+                    })?;
+
+                if let Ok(mtime) = source_meta.modified() {
+                    let _ = filetime::set_file_mtime(
+                        &temp_dest,
+                        filetime::FileTime::from_system_time(mtime),
+                    );
+                }
+                let _ = fs::set_permissions(&temp_dest, source_meta.permissions());
+
+                fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
+                    path: dest.clone(),
                     source: e,
                 })?;
+                temp_guard.defuse();
 
                 tracing::debug!(
                     "Sparse file copy complete: {} bytes logical size",
@@ -495,11 +487,30 @@ impl Transport for LocalTransport {
                             ratio.threshold * 100.0
                         );
 
-                        // Fallback to full copy (not sparse, so fs::copy is fine)
-                        let bytes_written = fs::copy(&source, &dest).map_err(|e| SyncError::CopyError {
-                            path: source.clone(),
+                        // Fallback to full copy. Keep it atomic: copy to temp, set
+                        // metadata on temp, then rename over the final destination.
+                        let temp_dest = TempFileGuard::temp_path_for(&dest);
+                        let temp_guard = TempFileGuard::new(&temp_dest);
+                        let bytes_written = fs::copy(&source, &temp_dest).map_err(|e| {
+                            SyncError::CopyError {
+                                path: source.clone(),
+                                source: e,
+                            }
+                        })?;
+
+                        if let Ok(mtime) = source_meta.modified() {
+                            let _ = filetime::set_file_mtime(
+                                &temp_dest,
+                                filetime::FileTime::from_system_time(mtime),
+                            );
+                        }
+                        let _ = fs::set_permissions(&temp_dest, source_meta.permissions());
+
+                        fs::rename(&temp_dest, &dest).map_err(|e| SyncError::CopyError {
+                            path: dest.clone(),
                             source: e,
                         })?;
+                        temp_guard.defuse();
 
                         return Ok(TransferResult::new(bytes_written));
                     }
@@ -974,7 +985,7 @@ impl Transport for LocalTransport {
         tokio::task::spawn_blocking(move || {
             use std::io::{Read, Write};
 
-            // Get source metadata
+            // Atomic streaming copy: write to temp, set metadata on temp, then rename.
             let source_meta = fs::metadata(&source).map_err(|e| SyncError::CopyError {
                 path: source.clone(),
                 source: e,
@@ -988,9 +999,11 @@ impl Transport for LocalTransport {
                 source: e,
             })?;
 
-            // Create destination for writing
-            let mut dst_file = File::create(&dest).map_err(|e| SyncError::CopyError {
-                path: dest.clone(),
+            // Write to a temp file, never directly to the final path.
+            let temp_path = TempFileGuard::temp_path_for(&dest);
+            let temp_guard = TempFileGuard::new(&temp_path);
+            let mut dst_file = File::create(&temp_path).map_err(|e| SyncError::CopyError {
+                path: temp_path.clone(),
                 source: e,
             })?;
 
@@ -1019,7 +1032,7 @@ impl Transport for LocalTransport {
                 dst_file
                     .write_all(&buffer[..bytes_read])
                     .map_err(|e| SyncError::CopyError {
-                        path: dest.clone(),
+                        path: temp_path.clone(),
                         source: e,
                     })?;
 
@@ -1033,11 +1046,11 @@ impl Transport for LocalTransport {
 
             // Flush and sync
             dst_file.flush().map_err(|e| SyncError::CopyError {
-                path: dest.clone(),
+                path: temp_path.clone(),
                 source: e,
             })?;
             dst_file.sync_all().map_err(|e| SyncError::CopyError {
-                path: dest.clone(),
+                path: temp_path.clone(),
                 source: e,
             })?;
             drop(dst_file);
@@ -1045,22 +1058,34 @@ impl Transport for LocalTransport {
             // Strip xattrs (to match copy_file behavior)
             #[cfg(unix)]
             {
-                if let Ok(xattr_list) = xattr::list(&dest) {
+                if let Ok(xattr_list) = xattr::list(&temp_path) {
                     for attr_name in xattr_list {
-                        let _ = xattr::remove(&dest, &attr_name);
+                        let _ = xattr::remove(&temp_path, &attr_name);
                     }
                 }
             }
 
-            // Preserve modification time
+            // Set metadata on temp BEFORE rename. Permissions were previously
+            // never propagated here (exec bits lost); mtime was set on the live path.
             if let Ok(mtime) = source_meta.modified() {
-                let _ =
-                    filetime::set_file_mtime(&dest, filetime::FileTime::from_system_time(mtime));
+                let _ = filetime::set_file_mtime(
+                    &temp_path,
+                    filetime::FileTime::from_system_time(mtime),
+                );
             }
+            let _ = fs::set_permissions(&temp_path, source_meta.permissions());
+
+            // Atomic rename to final destination
+            fs::rename(&temp_path, &dest).map_err(|e| SyncError::CopyError {
+                path: dest.clone(),
+                source: e,
+            })?;
+            temp_guard.defuse();
 
             tracing::debug!(
-                "Streaming copy complete: {} ({} bytes)",
+                "Streaming copy complete: {} -> {} ({} bytes, atomic)",
                 source.display(),
+                dest.display(),
                 bytes_transferred
             );
 

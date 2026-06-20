@@ -33,7 +33,7 @@ use hooks::{HookContext, HookExecutor, HookType};
 use path::SyncPath;
 use resource::format_bytes;
 use std::path::PathBuf;
-use sync::session::{SyncSession, EndpointPair};
+use sync::session::{EndpointPair, SyncSession};
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Compute effective destination path based on rsync trailing slash semantics
@@ -69,7 +69,7 @@ fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBu
 async fn main() {
     // Parse CLI arguments
     let mut cli = Cli::parse();
-    
+
     // Set RUST_BACKTRACE=0 unless user explicitly set it
     if std::env::var("RUST_BACKTRACE").is_err() {
         std::env::set_var("RUST_BACKTRACE", "0");
@@ -82,7 +82,6 @@ async fn main() {
 }
 
 async fn run(cli: &mut Cli) -> Result<()> {
-
     // Load config file
     let config = Config::load()?;
 
@@ -394,7 +393,10 @@ Or install from local source with: cargo install --path . --features acl"#
         diff_mode: cli.diff,
         delete: if cli.delete {
             let threshold = if cli.max_delete.ends_with('%') {
-                cli.max_delete.trim_end_matches('%').parse::<u8>().unwrap_or(50)
+                cli.max_delete
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .unwrap_or(50)
             } else {
                 // For absolute counts, we'll use 100% (no threshold) since the limit is handled elsewhere
                 100
@@ -406,7 +408,11 @@ Or install from local source with: cargo install --path . --features acl"#
         } else {
             sync::DeleteMode::Disabled
         },
-        max_delete: if cli.delete { Some(cli.max_delete.clone()) } else { None },
+        max_delete: if cli.delete {
+            Some(cli.max_delete.clone())
+        } else {
+            None
+        },
         trash: cli.trash,
         quiet: cli.quiet || cli.json,
         max_concurrent: cli.parallel,
@@ -460,7 +466,8 @@ Or install from local source with: cargo install --path . --features acl"#
         partial_dir: cli.partial_dir.clone(),
         timeout: cli.timeout,
         contimeout: cli.contimeout,
-                compress_level: cli.compress_level,
+        compress_level: cli.compress_level,
+        compression_detection: cli.compress,
         itemize_changes: cli.itemize_changes,
         human_readable: cli.human_readable,
         stats: cli.stats,
@@ -659,11 +666,14 @@ Or install from local source with: cargo install --path . --features acl"#
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
                 let remote = std::sync::Arc::new(
                     transport::ssh::SshTransport::with_timeout(
-                                &config,
-                                cli.parallel,
-                                Default::default(),
-                                std::time::Duration::from_secs(cli.contimeout.or(cli.timeout).unwrap_or(30)),
-                            ).await?,
+                        &config,
+                        cli.parallel,
+                        Default::default(),
+                        std::time::Duration::from_secs(
+                            cli.contimeout.or(cli.timeout).unwrap_or(30),
+                        ),
+                    )
+                    .await?,
                 );
                 (local, remote)
             }
@@ -684,11 +694,14 @@ Or install from local source with: cargo install --path . --features acl"#
                 let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
                 let remote = std::sync::Arc::new(
                     transport::ssh::SshTransport::with_timeout(
-                                &config,
-                                cli.parallel,
-                                Default::default(),
-                                std::time::Duration::from_secs(cli.contimeout.or(cli.timeout).unwrap_or(30)),
-                            ).await?,
+                        &config,
+                        cli.parallel,
+                        Default::default(),
+                        std::time::Duration::from_secs(
+                            cli.contimeout.or(cli.timeout).unwrap_or(30),
+                        ),
+                    )
+                    .await?,
                 );
                 let local =
                     std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
@@ -740,7 +753,10 @@ Or install from local source with: cargo install --path . --features acl"#
 
         let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
         let max_delete_percent = if cli.max_delete.ends_with('%') {
-            cli.max_delete.trim_end_matches('%').parse::<u8>().unwrap_or(50)
+            cli.max_delete
+                .trim_end_matches('%')
+                .parse::<u8>()
+                .unwrap_or(50)
         } else {
             // For absolute counts, convert to percentage (assuming 100% means no limit)
             100
@@ -827,11 +843,13 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("Mode: Single file sync\n");
         }
         // For single files, trailing slash doesn't apply - use destination as-is
-        session.sync_single_file(source.path(), destination.path()).await?
+        session
+            .sync_single_file(source.path(), destination.path())
+            .await?
     } else {
         // Use SyncSession for strategy dispatch
         let effective_dest = compute_destination_path(source, destination);
-        
+
         // Update session with effective destination
         let dest_endpoint = EndpointPair::from_sync_path(&crate::path::SyncPath::Local {
             path: effective_dest.clone(),

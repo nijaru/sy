@@ -8,7 +8,6 @@ use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
 use crate::sync::scanner::{FileEntry, ScanOptions};
-use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
@@ -16,6 +15,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::{Instant, UNIX_EPOCH};
 
 // Temporary inlined sparse detection (module resolution issue workaround)
@@ -114,6 +114,8 @@ struct FileEntryJson {
     nlink: u64,
     #[serde(default)]
     acls: Option<String>, // ACL text format (one per line)
+    #[serde(default)]
+    bsd_flags: Option<u32>,
 }
 
 /// Connection pool for parallel SSH operations
@@ -313,6 +315,7 @@ pub struct SshTransport {
     retry_config: RetryConfig,
     speedometer: Arc<Speedometer>,
     scan_options: ScanOptions,
+    compression_detection: CompressionDetection,
     timeout: Duration,
 }
 
@@ -356,6 +359,7 @@ impl SshTransport {
             retry_config,
             speedometer: Arc::new(Speedometer::new()),
             scan_options: ScanOptions::default(),
+            compression_detection: CompressionDetection::Auto,
             timeout,
         })
     }
@@ -363,6 +367,12 @@ impl SshTransport {
     #[allow(dead_code)] // Public API
     pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
         self.scan_options = options;
+        self
+    }
+
+    #[allow(dead_code)] // Public API
+    pub fn with_compression_detection(mut self, mode: CompressionDetection) -> Self {
+        self.compression_detection = mode;
         self
     }
 
@@ -1222,7 +1232,7 @@ impl Transport for SshTransport {
                     inode: e.inode,
                     nlink: e.nlink,
                     acls,
-                    bsd_flags: None, // TODO: Serialize BSD flags in SSH protocol
+                    bsd_flags: e.bsd_flags,
                 })
             })
             .collect();
@@ -1452,15 +1462,13 @@ impl Transport for SshTransport {
                     // Get current network speed for adaptive compression
                     let network_speed = Some(transport.speedometer.get_speed_mbps());
 
-                    // Determine if compression would be beneficial using smart detection
-                    // Use content-based detection with Auto mode (default)
-                    // TODO: Thread compression_detection mode from CLI through transport
+                    // Determine if compression would be beneficial using configured detection.
                     let compression_mode = should_compress_smart(
                         Some(&source_path),
                         filename,
                         file_size,
                         false, // SSH transfers are always remote (not local)
-                        CompressionDetection::Auto,
+                        transport.compression_detection,
                     );
                     // Refine decision with adaptive compression logic which checks speed
                     let compression_mode = if matches!(compression_mode, Compression::Lz4 | Compression::Zstd) {
