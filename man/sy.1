@@ -58,7 +58,7 @@ Directory to store partial files (alias for \-\-partial=DIR)
 Remove source files after successful transfer (like mv)
 .TP
 \fB\-\-existing\fR
-Don\*(Aqt create new files on destination, only update existing Works for local sync; not yet wired in streaming (SSH) mode
+Don\*(Aqt create new files on destination, only update existing
 .TP
 \fB\-\-dirs\fR
 Transfer directories without recursing (like rsync \-d)
@@ -106,7 +106,7 @@ Read include patterns from file (one pattern per line)
 Apply exclude template from ~/.config/sy/templates/ (can be repeated) Examples: "rust", "node", "python"
 .TP
 \fB\-\-bwlimit\fR \fI<BWLIMIT>\fR
-Bandwidth limit in bytes per second (e.g., "1MB", "500KB") Works for local sync; not yet wired in streaming (SSH) mode
+Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
 .TP
 \fB\-\-resume\fR \fI<RESUME>\fR [default: auto]
 Resume mode (auto|only|no) \- auto: Resume interrupted transfers if state found (default) \- only: Only resume interrupted transfers, don\*(Aqt start new ones \- no: Disable resume support
@@ -269,19 +269,19 @@ Exclude .git directories from the sync (opt\-in)
 By default, sy copies .git directories like rsync/cp. Use this flag to skip version control directories for faster syncs.
 .TP
 \fB\-\-ignore\-times\fR
-Ignore modification times, always compare checksums (rsync \-\-ignore\-times) Works for local sync; not yet wired in streaming (SSH) mode
+Ignore modification times, always compare checksums (rsync \-\-ignore\-times)
 .TP
 \fB\-\-size\-only\fR
 Only compare file size, skip mtime checks (rsync \-\-size\-only)
 .TP
 \fB\-c\fR, \fB\-\-checksum\fR
-Always compare checksums instead of size+mtime (slow but thorough, rsync \-\-checksum) Works for local sync; not yet wired in streaming (SSH) mode
+Always compare checksums instead of size+mtime (slow but thorough, rsync \-\-checksum)
 .TP
 \fB\-u\fR, \fB\-\-update\fR
-Skip files where destination is newer than source (rsync \-\-update) Works for local sync; not yet wired in streaming (SSH) mode
+Skip files where destination is newer than source (rsync \-\-update)
 .TP
 \fB\-\-ignore\-existing\fR
-Skip files that already exist in destination (rsync \-\-ignore\-existing) Works for local sync; not yet wired in streaming (SSH) mode
+Skip files that already exist in destination (rsync \-\-ignore\-existing)
 .TP
 \fB\-\-json\fR
 Output JSON (newline\-delimited JSON for scripting)
@@ -356,10 +356,6 @@ EXAMPLES:
 
     # Verify file integrity after write
     sy /source /destination \-\-verify            # xxHash3 verification
-
-    # Network retry options
-    sy /source user@host:/dest \-\-retry 5        # Retry up to 5 times on network errors
-    sy /source user@host:/dest \-\-retry\-delay 2  # Start with 2s delay (2s, 4s, 8s, ...)
 
     # Resume interrupted transfers
     sy /source user@host:/dest \-\-resume         # Auto\-resume interrupted large files

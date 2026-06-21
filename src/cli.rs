@@ -140,10 +140,6 @@ pub enum SymlinkMode {
     # Verify file integrity after write
     sy /source /destination --verify            # xxHash3 verification
 
-    # Network retry options
-    sy /source user@host:/dest --retry 5        # Retry up to 5 times on network errors
-    sy /source user@host:/dest --retry-delay 2  # Start with 2s delay (2s, 4s, 8s, ...)
-
     # Resume interrupted transfers
     sy /source user@host:/dest --resume         # Auto-resume interrupted large files
     sy /source user@host:/dest --resume=only    # Only resume, don't start new transfers
