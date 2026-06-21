@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Critical: --exclude/--include/--filter silently ignored in SSH pull mode**
 - **Critical: --dry-run creating files on remote in SSH mode**
 - **Critical: pull-mode scan options (respect_gitignore, exclude_vcs, dirs_only) not propagated**
+- **Critical: Hello protocol frame length missing comparison_flags field** (caused "Unexpected message during Initial Exchange: Done" in SSH tests)
 - **ReceiveFile temp file leak on early error** (TempFileGuard)
 - **SSH streaming files_scanned reported as 0** (Done message now carries scan count)
 - Duplicate stats/mode/error output
