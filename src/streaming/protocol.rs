@@ -253,7 +253,14 @@ impl Hello {
         } else {
             0
         };
-        let payload_len = 2 + 4 + 2 + path_bytes.len() + max_field_len + filter_field_len;
+        // comparison_flags: 1 byte present flag + 1 byte value when present.
+        let comp_field_len = if self.comparison_flags.is_some() {
+            2
+        } else {
+            1
+        };
+        let payload_len =
+            2 + 4 + 2 + path_bytes.len() + max_field_len + filter_field_len + comp_field_len;
         let mut buf = BytesMut::with_capacity(5 + payload_len);
 
         buf.put_u32(u32_len("payload", payload_len));
@@ -1869,6 +1876,35 @@ mod tests {
         assert!(existing);
         assert!(ignore_times);
         assert!(size_only);
+    }
+
+    /// Frame length header must match actual payload size — otherwise the
+    /// receiver reads the wrong number of bytes and the stream corrupts.
+    #[test]
+    fn test_hello_frame_length_matches_payload() {
+        let cases = [
+            Hello::new(HelloFlags::empty(), "/tmp"),
+            Hello::new(HelloFlags::PULL, "/src").with_comparison_flags(0x01),
+            Hello::new(HelloFlags::DELETE, "/a").with_max_delete(Some("50%".into())),
+            Hello::new(HelloFlags::PULL, "/b")
+                .with_filter_patterns(Some("- build".into()))
+                .with_comparison_flags(0x1F),
+            Hello::new(HelloFlags::PULL | HelloFlags::DELETE, "/c")
+                .with_max_delete(Some("100".into()))
+                .with_filter_patterns(Some("+ *.rs\n- target".into()))
+                .with_comparison_flags(0x08),
+        ];
+        for hello in &cases {
+            let encoded = hello.encode();
+            let frame_len =
+                u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+            let actual_payload = encoded.len() - 5; // 4 len + 1 type
+            assert_eq!(
+                frame_len, actual_payload,
+                "frame length mismatch for Hello({:?})",
+                hello.flags
+            );
+        }
     }
 
     #[test]
