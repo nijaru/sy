@@ -237,9 +237,15 @@ impl StreamingSync {
         if !self.scan_options.include_git_dir {
             flags |= HelloFlags::EXCLUDE_GIT_DIR;
         }
+        if self.scan_options.dirs_only {
+            flags |= HelloFlags::DIRS_ONLY;
+        }
+
+        let filter_patterns = self.filter.as_ref().map(|f| f.to_rule_strings().join("\n"));
 
         let hello = Hello::new(flags, self.remote_root.to_string_lossy().into_owned())
-            .with_max_delete(self.max_delete.clone());
+            .with_max_delete(self.max_delete.clone())
+            .with_filter_patterns(filter_patterns);
         write_frame(writer, &hello.encode()).await?;
         writer.flush().await?;
 

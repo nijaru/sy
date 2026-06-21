@@ -97,6 +97,7 @@ bitflags::bitflags! {
         const FORCE_DELETE = 1 << 7;
         const RESPECT_GITIGNORE = 1 << 8;
         const EXCLUDE_GIT_DIR = 1 << 9;
+        const DIRS_ONLY = 1 << 10;
     }
 }
 
@@ -179,6 +180,9 @@ pub struct Hello {
     /// Optional max-delete threshold propagated to the remote generator in PULL
     /// mode so the server enforces the client's `--max-delete`.
     pub max_delete: Option<String>,
+    /// Optional filter patterns (rsync-style "- pattern" / "+ pattern" lines,
+    /// newline-separated) propagated to the server in PULL mode.
+    pub filter_patterns: Option<String>,
 }
 
 impl Hello {
@@ -188,6 +192,7 @@ impl Hello {
             flags,
             root_path: root_path.into(),
             max_delete: None,
+            filter_patterns: None,
         }
     }
 
@@ -197,20 +202,32 @@ impl Hello {
         self
     }
 
+    /// Attach the client's filter patterns to propagate to the server.
+    pub fn with_filter_patterns(mut self, patterns: Option<String>) -> Self {
+        self.filter_patterns = patterns;
+        self
+    }
+
     pub fn is_pull(&self) -> bool {
         self.flags.contains(HelloFlags::PULL)
     }
 
     pub fn encode(&self) -> Bytes {
         let path_bytes = self.root_path.as_bytes();
-        // Optional trailing field: u8 present + (u16 len + bytes) when present.
+        // Trailing optional fields: each is u8 present + (u16 len + bytes) when present.
         let max_len = self.max_delete.as_ref().map(|m| m.len()).unwrap_or(0);
         let max_field_len = 1 + if self.max_delete.is_some() {
             2 + max_len
         } else {
             0
         };
-        let payload_len = 2 + 4 + 2 + path_bytes.len() + max_field_len;
+        let filter_len = self.filter_patterns.as_ref().map(|f| f.len()).unwrap_or(0);
+        let filter_field_len = 1 + if self.filter_patterns.is_some() {
+            2 + filter_len
+        } else {
+            0
+        };
+        let payload_len = 2 + 4 + 2 + path_bytes.len() + max_field_len + filter_field_len;
         let mut buf = BytesMut::with_capacity(5 + payload_len);
 
         buf.put_u32(u32_len("payload", payload_len));
@@ -226,6 +243,15 @@ impl Hello {
             buf.put_u8(1);
             buf.put_u16(u16_len("max_delete", max_delete.len()));
             buf.put_slice(max_delete.as_bytes());
+        } else {
+            buf.put_u8(0);
+        }
+
+        // Trailing filter_patterns: newline-separated rsync-style rules.
+        if let Some(filter_patterns) = &self.filter_patterns {
+            buf.put_u8(1);
+            buf.put_u16(u16_len("filter_patterns", filter_patterns.len()));
+            buf.put_slice(filter_patterns.as_bytes());
         } else {
             buf.put_u8(0);
         }
@@ -266,11 +292,32 @@ impl Hello {
             None
         };
 
+        // Optional trailing filter_patterns (absent on old peers → None).
+        let filter_patterns = if payload.remaining() >= 1 {
+            let present = payload.get_u8();
+            if present == 1 && payload.remaining() >= 2 {
+                let filter_len = payload.get_u16() as usize;
+                if payload.remaining() >= filter_len {
+                    Some(
+                        String::from_utf8(payload.copy_to_bytes(filter_len).to_vec())
+                            .context("Invalid UTF-8 in Hello filter_patterns")?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             version,
             flags,
             root_path,
             max_delete,
+            filter_patterns,
         })
     }
 }
@@ -1684,5 +1731,75 @@ mod tests {
         let result = FileEntry::decode(payload);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn test_hello_filter_patterns_roundtrip() {
+        let patterns = "- .git\n- .git/**\n+ *.rs\n- *.py".to_string();
+        let hello =
+            Hello::new(HelloFlags::PULL, "/src").with_filter_patterns(Some(patterns.clone()));
+        let encoded = hello.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Hello::decode(payload).unwrap();
+
+        assert_eq!(decoded.filter_patterns, Some(patterns));
+        assert!(decoded.max_delete.is_none());
+    }
+
+    #[test]
+    fn test_hello_dirs_only_flag() {
+        let hello = Hello::new(HelloFlags::PULL | HelloFlags::DIRS_ONLY, "/src");
+        let encoded = hello.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Hello::decode(payload).unwrap();
+
+        assert!(decoded.flags.contains(HelloFlags::DIRS_ONLY));
+    }
+
+    #[test]
+    fn test_hello_all_trailing_fields() {
+        let patterns = "- build".to_string();
+        let max_delete = "50%".to_string();
+        let hello = Hello::new(HelloFlags::PULL | HelloFlags::DELETE, "/src")
+            .with_max_delete(Some(max_delete.clone()))
+            .with_filter_patterns(Some(patterns.clone()));
+        let encoded = hello.encode();
+        let payload = Bytes::copy_from_slice(&encoded[5..]);
+        let decoded = Hello::decode(payload).unwrap();
+
+        assert_eq!(decoded.max_delete, Some(max_delete));
+        assert_eq!(decoded.filter_patterns, Some(patterns));
+    }
+
+    #[test]
+    fn test_hello_backward_compat_no_trailing_fields() {
+        // Simulate old peer: only version+flags+path
+        let mut buf = BytesMut::new();
+        buf.put_u16(PROTOCOL_VERSION);
+        buf.put_u32(HelloFlags::PULL.bits());
+        buf.put_u16(5);
+        buf.put_slice(b"/dest");
+        let decoded = Hello::decode(buf.freeze()).unwrap();
+
+        assert!(decoded.max_delete.is_none());
+        assert!(decoded.filter_patterns.is_none());
+    }
+
+    #[test]
+    fn test_hello_backward_compat_max_delete_no_filter() {
+        // Simulate peer with max_delete but no filter_patterns (previous version)
+        let mut buf = BytesMut::new();
+        buf.put_u16(PROTOCOL_VERSION);
+        buf.put_u32(HelloFlags::PULL.bits());
+        buf.put_u16(5);
+        buf.put_slice(b"/dest");
+        buf.put_u8(1);
+        let md = b"30%";
+        buf.put_u16(md.len() as u16);
+        buf.put_slice(md);
+        let decoded = Hello::decode(buf.freeze()).unwrap();
+
+        assert_eq!(decoded.max_delete, Some("30%".to_string()));
+        assert!(decoded.filter_patterns.is_none());
     }
 }

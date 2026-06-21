@@ -200,6 +200,30 @@ impl FilterEngine {
         Ok(())
     }
 
+    /// Serialize rules to rsync-style strings for protocol transmission.
+    /// Returns `Vec` of `"+ pattern"` or `"- pattern"` strings.
+    pub fn to_rule_strings(&self) -> Vec<String> {
+        self.rules
+            .iter()
+            .map(|r| {
+                let prefix = match r.action {
+                    FilterAction::Include => "+ ",
+                    FilterAction::Exclude => "- ",
+                };
+                format!("{}{}", prefix, r.pattern_str)
+            })
+            .collect()
+    }
+
+    /// Reconstruct a `FilterEngine` from rsync-style rule strings.
+    pub fn from_rule_strings(rules: &[String]) -> Result<Self> {
+        let mut engine = Self::new();
+        for rule in rules {
+            engine.add_rule(rule)?;
+        }
+        Ok(engine)
+    }
+
     /// Load filter rules from a file
     pub fn add_rules_from_file(&mut self, file_path: &Path) -> Result<()> {
         let file = File::open(file_path)
@@ -538,5 +562,36 @@ mod tests {
         assert!(!filter2.should_include(Path::new("other/build"), false)); // basename is "build"
         assert!(filter2.should_include(Path::new("build/output.txt"), false)); // basename is "output.txt", not "build"
         assert!(filter2.should_include(Path::new("building"), false)); // basename is "building", not "build"
+    }
+
+    #[test]
+    fn test_filter_engine_serialization_roundtrip() {
+        let mut filter = FilterEngine::new();
+        filter.add_exclude(".git").unwrap();
+        filter.add_exclude(".git/**").unwrap();
+        filter.add_include("*.rs").unwrap();
+        filter.add_exclude("target/**").unwrap();
+
+        let rules = filter.to_rule_strings();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0], "- .git");
+        assert_eq!(rules[1], "- .git/**");
+        assert_eq!(rules[2], "+ *.rs");
+        assert_eq!(rules[3], "- target/**");
+
+        let restored = FilterEngine::from_rule_strings(&rules).unwrap();
+        assert!(!restored.should_include(Path::new(".git/config"), true));
+        assert!(restored.should_include(Path::new("src/main.rs"), false));
+        assert!(!restored.should_include(Path::new("target/debug/sy"), false));
+    }
+
+    #[test]
+    fn test_filter_engine_empty_serialization() {
+        let filter = FilterEngine::new();
+        let rules = filter.to_rule_strings();
+        assert!(rules.is_empty());
+
+        let restored = FilterEngine::from_rule_strings(&rules).unwrap();
+        assert!(restored.should_include(Path::new("anything.txt"), false));
     }
 }

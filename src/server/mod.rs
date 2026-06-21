@@ -97,7 +97,15 @@ async fn run_server_pull(
     let scan_options = ScanOptions {
         respect_gitignore: hello.flags.contains(HelloFlags::RESPECT_GITIGNORE),
         include_git_dir: !hello.flags.contains(HelloFlags::EXCLUDE_GIT_DIR),
-        dirs_only: false,
+        dirs_only: hello.flags.contains(HelloFlags::DIRS_ONLY),
+    };
+
+    let filter = match &hello.filter_patterns {
+        Some(patterns) => {
+            let rules: Vec<String> = patterns.lines().map(String::from).collect();
+            Some(crate::filter::FilterEngine::from_rule_strings(&rules)?)
+        }
+        None => None,
     };
 
     let mut generator = Generator::new(GeneratorConfig {
@@ -107,7 +115,7 @@ async fn run_server_pull(
         delete_enabled: hello.flags.contains(HelloFlags::DELETE),
         force_delete: hello.flags.contains(HelloFlags::FORCE_DELETE),
         max_delete: hello.max_delete.clone(),
-        filter: None,
+        filter,
         scan_options,
     });
 
