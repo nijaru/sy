@@ -1239,8 +1239,6 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_xattr_preservation() {
-        use std::os::unix::fs::MetadataExt;
-
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
@@ -1249,7 +1247,6 @@ mod tests {
         // Set xattr on source (skip if not supported)
         #[cfg(target_os = "macos")]
         {
-            use std::os::macos::fs::MetadataExt;
             let _ = xattr::set(src_dir.path().join("test.txt"), "com.test.attr", b"value");
         }
         #[cfg(target_os = "linux")]

@@ -1166,7 +1166,7 @@ mod tests {
             ..Default::default()
         });
 
-        let stats = session.sync().await.unwrap();
+        let _stats = session.sync().await.unwrap();
         // Files in root should be synced, but nested files should not
         assert!(dst_dir.path().join("file.txt").exists());
         assert!(dst_dir.path().join("subdir").exists());
@@ -1197,7 +1197,7 @@ mod tests {
         let dest = EndpointPair::Local(Box::new(LocalEndpoint::new(dst_dir.path().to_path_buf())));
         let session = SyncSession::new(source, dest, config);
 
-        let stats = session.sync().await.unwrap();
+        let _stats = session.sync().await.unwrap();
         assert!(dst_dir.path().join("include.txt").exists());
         assert!(dst_dir.path().join("exclude.txt").exists());
         assert!(!dst_dir.path().join("exclude.log").exists());
