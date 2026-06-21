@@ -54,21 +54,16 @@ sy [OPTIONS] <SOURCE> <DESTINATION>
 | `--progress` | Show progress for large files |
 | `--stats` | Show transfer statistics |
 | `--exclude <PATTERN>` | Exclude files matching pattern |
-| `--compress <MODE>` | Compression: auto, always, never |
+| `--exclude-from <FILE>` | Read exclude patterns from file |
+| `--include <PATTERN>` | Include files matching pattern (use after `--exclude`) |
+| `--compress` | Compress transfers (auto-detected) |
 | `-j, --max-concurrent <N>` | Parallel transfers (default: all cores) |
-| `--bwlimit <RATE>` | Bandwidth limit (e.g., 1MB, 500KB) |
 
 ### Sync Modes
 
 ```bash
 # Mirror mode
 sy /source /dest --delete
-
-# Update only (skip newer dest files)
-sy /source /dest --update
-
-# Existing only (don't create new files)
-sy /source /dest --existing
 
 # Directories only (no recursion)
 sy /source /dest --dirs
@@ -83,7 +78,7 @@ sy /local user@host:/remote
 # Pull from remote
 sy user@host:/remote /local
 
-# With SSH options
+# With SSH timeout
 sy /local user@host:/remote --timeout 30
 ```
 
@@ -96,7 +91,7 @@ sy /source /dest --exclude "*.log" --exclude ".git"
 # Exclude from file
 sy /source /dest --exclude-from .syignore
 
-# Include specific patterns
+# Include specific patterns (after exclude)
 sy /source /dest --exclude "*" --include "*.rs"
 ```
 
@@ -119,16 +114,40 @@ sy /source /dest --delete --force-delete
 ### Verification
 
 ```bash
-# Verify after write
+# Verify writes by reading back (local sync only)
 sy /source /dest --verify
 
 # Show itemized changes
 sy /source /dest --itemize-changes
 ```
 
+## Feature Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Local sync (push) | Stable | Fully tested |
+| Local sync (pull) | Stable | Fully tested |
+| SSH push | Stable | Tested with key-based auth |
+| SSH pull | Stable | Tested with key-based auth |
+| Delta sync | Stable | xxHash3 block-level diffs |
+| Filters (--exclude/--include) | Stable | rsync-style patterns |
+| Delete mode (--delete) | Stable | With --max-delete safety threshold |
+| Compression | Stable | Auto-detected, zstd |
+| Hard links | Stable | Preserved on local sync |
+| Symlinks | Stable | Preserved |
+| Backup mode (--backup) | Stable | |
+| Atomic writes | Stable | Temp file + rename, all paths |
+| Bisync | Experimental | Works for simple cases; complex conflict resolution is limited |
+| S3/GCS endpoints | Experimental | Code complete, not tested against real infrastructure |
+| --bwlimit | Not implemented | Parsed but not enforced |
+| --checksum | Not implemented | Forces full transfer without comparing checksums |
+| --partial | Not implemented | Not wired in streaming protocol |
+| --update / --existing | Not implemented | Not wired in streaming generator |
+| --verify | Local only | Works for local sync; not available over SSH |
+
 ## Benchmarks
 
-Preliminary benchmarks on macOS M3 Max with NVMe storage. Results vary significantly by hardware, file sizes, and workload.
+Benchmarks on macOS M3 Max with NVMe storage. Results vary by hardware, file sizes, and workload.
 
 | Scenario | sy | rsync | Speedup |
 |----------|-----|-------|---------|
@@ -136,8 +155,6 @@ Preliminary benchmarks on macOS M3 Max with NVMe storage. Results vary significa
 | 10 × 10MB files | 29ms | 330ms | 11.5× |
 | 1 × 100MB file | 38ms | 324ms | 8.6× |
 | Incremental (no changes) | 33ms | 63ms | 1.9× |
-
-**Note:** These are limited benchmarks on a single machine. We recommend running your own benchmarks for your specific use case.
 
 Run benchmarks yourself:
 
@@ -150,7 +167,6 @@ cargo bench
 sy reads `~/.config/sy/config.toml` for defaults:
 
 ```toml
-# Example config
 max_concurrent = 8
 compress = "auto"
 exclude = [".git", "node_modules", "*.pyc"]
@@ -168,21 +184,14 @@ exclude = [".git", "node_modules", "*.pyc"]
 | Incremental | Yes | Yes |
 | Compression | zstd | zlib |
 
-**sy is not a drop-in rsync replacement.** It uses the same mental model but a different protocol. For rsync-to-rsync compatibility, use rsync.
+**sy is not a drop-in rsync replacement.** Same mental model, different protocol. For rsync-to-rsync compatibility, use rsync.
 
 ## Contributing
 
 ```bash
-# Build
 cargo build
-
-# Test
 cargo test
-
-# Lint
 cargo clippy -- -D warnings
-
-# Format
 cargo fmt --check
 ```
 
