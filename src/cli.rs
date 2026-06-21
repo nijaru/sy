@@ -234,7 +234,6 @@ pub struct Cli {
     pub remove_source_files: bool,
 
     /// Don't create new files on destination, only update existing
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub existing: bool,
 
@@ -304,7 +303,6 @@ pub struct Cli {
     pub exclude_template: Vec<String>,
 
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
@@ -446,7 +444,6 @@ pub struct Cli {
     pub exclude_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub ignore_times: bool,
 
@@ -455,17 +452,14 @@ pub struct Cli {
     pub size_only: bool,
 
     /// Always compare checksums instead of size+mtime (slow but thorough, rsync --checksum)
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(short = 'c', long)]
     pub checksum: bool,
 
     /// Skip files where destination is newer than source (rsync --update)
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(short = 'u', long)]
     pub update: bool,
 
     /// Skip files that already exist in destination (rsync --ignore-existing)
-    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub ignore_existing: bool,
 

@@ -108,6 +108,9 @@ async fn run_server_pull(
         None => None,
     };
 
+    let (checksum, update_only, ignore_existing, ignore_times, size_only) =
+        hello.comparison_flags_tuple();
+
     let mut generator = Generator::new(GeneratorConfig {
         root: root_path.clone(),
         include_hidden: true,
@@ -117,6 +120,13 @@ async fn run_server_pull(
         max_delete: hello.max_delete.clone(),
         filter,
         scan_options,
+        comparison: crate::streaming::generator::ComparisonFlags {
+            checksum,
+            update_only,
+            ignore_existing,
+            ignore_times,
+            size_only,
+        },
     });
 
     loop {
@@ -142,6 +152,7 @@ async fn run_server_pull(
         } else {
             CompressionDetection::Never
         },
+        bwlimit: None,
     });
 
     // Use unbounded channel to avoid blocking_send (panics in tokio context)
@@ -183,14 +194,16 @@ async fn run_server_pull(
 
 /// Handle PUSH mode: client pushes files to server (we are destination)
 async fn run_server_push(
-    _hello: v2::Hello,
+    hello: v2::Hello,
     root_path: PathBuf,
     mut stdin: impl io::AsyncRead + Unpin,
     mut stdout: impl io::AsyncWrite + Unpin,
 ) -> Result<()> {
+    let verify = hello.flags.contains(HelloFlags::VERIFY);
     let mut receiver = Receiver::new(ReceiverConfig {
         root: root_path.clone(),
         block_size: 4096,
+        verify,
     });
 
     // 1. Send Initial Exchange (our files metadata)
@@ -203,6 +216,7 @@ async fn run_server_push(
         let receiver = Receiver::new(ReceiverConfig {
             root: receiver_root,
             block_size: 4096,
+            verify,
         });
         receiver
             .scan_dest(|bytes| {

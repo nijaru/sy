@@ -658,6 +658,34 @@ impl SyncSession {
         .with_dry_run(self.config.dry_run)
         .with_scan_options(self.scan_options);
 
+        // Wire comparison flags to streaming
+        let comp = &self.config.comparison;
+        let mut comp_flags: u8 = 0;
+        if comp.checksum {
+            comp_flags |= 0x01;
+        }
+        if comp.update_only {
+            comp_flags |= 0x02;
+        }
+        if comp.ignore_existing {
+            comp_flags |= 0x04;
+        }
+        if comp.ignore_times {
+            comp_flags |= 0x08;
+        }
+        if comp.size_only {
+            comp_flags |= 0x10;
+        }
+        if comp_flags != 0 {
+            streaming = streaming.with_comparison_flags(comp_flags);
+        }
+        if self.config.verification.verify_on_write {
+            streaming = streaming.with_verify(true);
+        }
+        if let Some(bwlimit) = self.config.bwlimit {
+            streaming = streaming.with_bwlimit(bwlimit);
+        }
+
         if let Some(ref max_delete) = self.config.max_delete {
             streaming = streaming.with_max_delete(max_delete.clone());
         }
@@ -723,6 +751,34 @@ impl SyncSession {
         )
         .with_filter(self.config.filter_engine.clone())
         .with_scan_options(self.scan_options);
+
+        // Wire comparison flags to streaming
+        let comp = &self.config.comparison;
+        let mut comp_flags: u8 = 0;
+        if comp.checksum {
+            comp_flags |= 0x01;
+        }
+        if comp.update_only {
+            comp_flags |= 0x02;
+        }
+        if comp.ignore_existing {
+            comp_flags |= 0x04;
+        }
+        if comp.ignore_times {
+            comp_flags |= 0x08;
+        }
+        if comp.size_only {
+            comp_flags |= 0x10;
+        }
+        if comp_flags != 0 {
+            streaming = streaming.with_comparison_flags(comp_flags);
+        }
+        if self.config.verification.verify_on_write {
+            streaming = streaming.with_verify(true);
+        }
+        if let Some(bwlimit) = self.config.bwlimit {
+            streaming = streaming.with_bwlimit(bwlimit);
+        }
 
         if let Some(ref max_delete) = self.config.max_delete {
             streaming = streaming.with_max_delete(max_delete.clone());

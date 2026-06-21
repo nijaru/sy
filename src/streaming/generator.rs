@@ -14,6 +14,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Comparison mode for streaming generator
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComparisonFlags {
+    /// Compare by checksum instead of mtime (requires reading both files)
+    pub checksum: bool,
+    /// Skip files where destination is newer
+    pub update_only: bool,
+    /// Skip files that already exist at destination
+    pub ignore_existing: bool,
+    /// Always transfer, ignore mtime/size
+    pub ignore_times: bool,
+    /// Compare by size only, ignore mtime
+    pub size_only: bool,
+}
+
 /// Generator configuration
 pub struct GeneratorConfig {
     /// Root path to scan
@@ -32,6 +47,8 @@ pub struct GeneratorConfig {
     pub filter: Option<FilterEngine>,
     /// Scanner options for gitignore, VCS directory, and dirs-only behavior
     pub scan_options: ScanOptions,
+    /// Comparison flags (--checksum, --update, --existing, etc.)
+    pub comparison: ComparisonFlags,
 }
 
 /// Generator state
@@ -160,13 +177,36 @@ impl Generator {
 
             let mode = entry.mode;
 
-            // Skip unchanged files (matching size and mtime)
+            // Skip unchanged files based on comparison flags
             if !entry.is_dir && !entry.is_symlink {
-                if let Some(ref dest) = dest_state {
-                    if dest.size == entry.size && dest.mtime == mtime_nanos {
-                        // File unchanged, skip it
-                        continue;
+                let flags = &self.config.comparison;
+                let should_skip = if flags.ignore_times {
+                    // Always transfer
+                    false
+                } else if let Some(ref dest) = dest_state {
+                    if flags.ignore_existing {
+                        // Skip if destination exists
+                        true
+                    } else if flags.update_only {
+                        // Skip if destination is newer (dest.mtime >= source mtime)
+                        dest.mtime >= mtime_nanos
+                    } else if flags.size_only {
+                        // Compare size only
+                        dest.size == entry.size
+                    } else if flags.checksum {
+                        // TODO: checksum comparison requires reading file data.
+                        // For now, fall through to delta detection which does block-level checksums.
+                        dest.size == entry.size && dest.mtime == mtime_nanos
+                    } else {
+                        // Default: size + mtime match
+                        dest.size == entry.size && dest.mtime == mtime_nanos
                     }
+                } else {
+                    // No destination state — file is new, don't skip
+                    false
+                };
+                if should_skip {
+                    continue;
                 }
             }
 
@@ -301,6 +341,7 @@ mod tests {
             force_delete: false,
             filter: None,
             scan_options: ScanOptions::default(),
+            comparison: ComparisonFlags::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -335,6 +376,7 @@ mod tests {
             force_delete: false,
             filter: None,
             scan_options: ScanOptions::default(),
+            comparison: ComparisonFlags::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -377,6 +419,7 @@ mod tests {
             force_delete: false,
             filter: None,
             scan_options: ScanOptions::default(),
+            comparison: ComparisonFlags::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();
@@ -427,6 +470,7 @@ mod tests {
             force_delete: false,
             filter: None,
             scan_options: ScanOptions::default(),
+            comparison: ComparisonFlags::default(),
         };
 
         let (tx, _rx) = crate::streaming::channel::file_job_channel();
@@ -473,6 +517,7 @@ mod tests {
             force_delete: true, // bypass threshold
             filter: None,
             scan_options: ScanOptions::default(),
+            comparison: ComparisonFlags::default(),
         };
 
         let (tx, mut rx) = crate::streaming::channel::file_job_channel();

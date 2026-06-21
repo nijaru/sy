@@ -27,6 +27,12 @@ pub struct StreamingSync {
     pub filter: Option<FilterEngine>,
     pub dry_run: bool,
     pub scan_options: ScanOptions,
+    /// Comparison flags bitfield (checksum, update_only, ignore_existing, ignore_times, size_only)
+    pub comparison_flags: Option<u8>,
+    /// Optional bandwidth limit in bytes per second
+    pub bwlimit: Option<u64>,
+    /// Whether to verify written files by reading them back
+    pub verify: bool,
 }
 
 impl StreamingSync {
@@ -46,6 +52,9 @@ impl StreamingSync {
             filter: None,
             dry_run: false,
             scan_options: ScanOptions::default(),
+            comparison_flags: None,
+            bwlimit: None,
+            verify: false,
         }
     }
 
@@ -79,6 +88,38 @@ impl StreamingSync {
         self
     }
 
+    /// Set comparison flags (--checksum, --update, --existing, etc.)
+    pub fn with_comparison_flags(mut self, flags: u8) -> Self {
+        self.comparison_flags = Some(flags);
+        self
+    }
+
+    /// Decode comparison_flags bitfield into (checksum, update_only, ignore_existing, ignore_times, size_only).
+    fn comparison_flags_tuple(&self) -> (bool, bool, bool, bool, bool) {
+        match self.comparison_flags {
+            Some(f) => (
+                f & 0x01 != 0,
+                f & 0x02 != 0,
+                f & 0x04 != 0,
+                f & 0x08 != 0,
+                f & 0x10 != 0,
+            ),
+            None => (false, false, false, false, false),
+        }
+    }
+
+    /// Set bandwidth limit in bytes per second.
+    pub fn with_bwlimit(mut self, bytes_per_second: u64) -> Self {
+        self.bwlimit = Some(bytes_per_second);
+        self
+    }
+
+    /// Enable verify-after-write for received files.
+    pub fn with_verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
+        self
+    }
+
     /// Run a push sync (local -> remote).
     pub async fn push<R, W>(&self, reader: &mut R, writer: &mut W) -> Result<SyncStats>
     where
@@ -90,7 +131,13 @@ impl StreamingSync {
         if self.dry_run {
             hello_flags |= HelloFlags::DRY_RUN;
         }
-        let hello = Hello::new(hello_flags, self.remote_root.to_string_lossy().into_owned());
+        if self.verify {
+            hello_flags |= HelloFlags::VERIFY;
+        }
+        let hello = Hello::new(hello_flags, self.remote_root.to_string_lossy().into_owned())
+            .with_max_delete(self.max_delete.clone())
+            .with_filter_patterns(self.filter.as_ref().map(|f| f.to_rule_strings().join("\n")))
+            .with_comparison_flags(self.comparison_flags.unwrap_or(0));
         write_frame(writer, &hello.encode()).await?;
         writer.flush().await?;
 
@@ -102,6 +149,8 @@ impl StreamingSync {
         let _server_hello = Hello::decode(payload)?;
 
         // 3. Receive DEST_FILE_ENTRY messages (Initial Exchange)
+        let (checksum, update_only, ignore_existing, ignore_times, size_only) =
+            self.comparison_flags_tuple();
         let mut generator = Generator::new(GeneratorConfig {
             root: self.local_root.clone(),
             include_hidden: true,
@@ -111,6 +160,13 @@ impl StreamingSync {
             max_delete: self.max_delete.clone(),
             filter: self.filter.clone(),
             scan_options: self.scan_options,
+            comparison: crate::streaming::generator::ComparisonFlags {
+                checksum,
+                update_only,
+                ignore_existing,
+                ignore_times,
+                size_only,
+            },
         });
 
         loop {
@@ -141,6 +197,7 @@ impl StreamingSync {
         let sender = Sender::new(SenderConfig {
             root: self.local_root.clone(),
             compress: self.compress,
+            bwlimit: self.bwlimit,
         });
 
         // Use unbounded channel to avoid blocking_send (panics in tokio context)
@@ -274,12 +331,14 @@ impl StreamingSync {
         // Use unbounded channel to avoid blocking_send (panics in tokio context)
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
         let receiver_root = self.local_root.clone();
+        let verify = self.verify;
 
         // Spawn scanner - uses unbounded_send which never blocks
         let scan_handle = tokio::spawn(async move {
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
                 block_size: 4096,
+                verify,
             });
             receiver
                 .scan_dest(|bytes| {
@@ -303,6 +362,7 @@ impl StreamingSync {
         let mut receiver = Receiver::new(ReceiverConfig {
             root: self.local_root.clone(),
             block_size: 4096,
+            verify: self.verify,
         });
 
         loop {

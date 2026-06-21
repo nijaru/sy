@@ -98,6 +98,7 @@ bitflags::bitflags! {
         const RESPECT_GITIGNORE = 1 << 8;
         const EXCLUDE_GIT_DIR = 1 << 9;
         const DIRS_ONLY = 1 << 10;
+        const VERIFY = 1 << 11;
     }
 }
 
@@ -183,6 +184,10 @@ pub struct Hello {
     /// Optional filter patterns (rsync-style "- pattern" / "+ pattern" lines,
     /// newline-separated) propagated to the server in PULL mode.
     pub filter_patterns: Option<String>,
+    /// Optional comparison flags (bitfield) propagated to the server.
+    /// Bit 0: checksum, Bit 1: update_only, Bit 2: ignore_existing,
+    /// Bit 3: ignore_times, Bit 4: size_only
+    pub comparison_flags: Option<u8>,
 }
 
 impl Hello {
@@ -193,6 +198,7 @@ impl Hello {
             root_path: root_path.into(),
             max_delete: None,
             filter_patterns: None,
+            comparison_flags: None,
         }
     }
 
@@ -206,6 +212,26 @@ impl Hello {
     pub fn with_filter_patterns(mut self, patterns: Option<String>) -> Self {
         self.filter_patterns = patterns;
         self
+    }
+
+    /// Attach comparison flags to propagate to the server.
+    pub fn with_comparison_flags(mut self, flags: u8) -> Self {
+        self.comparison_flags = Some(flags);
+        self
+    }
+
+    /// Decode comparison_flags bitfield into (checksum, update_only, ignore_existing, ignore_times, size_only).
+    pub fn comparison_flags_tuple(&self) -> (bool, bool, bool, bool, bool) {
+        match self.comparison_flags {
+            Some(f) => (
+                f & 0x01 != 0,
+                f & 0x02 != 0,
+                f & 0x04 != 0,
+                f & 0x08 != 0,
+                f & 0x10 != 0,
+            ),
+            None => (false, false, false, false, false),
+        }
     }
 
     pub fn is_pull(&self) -> bool {
@@ -252,6 +278,14 @@ impl Hello {
             buf.put_u8(1);
             buf.put_u16(u16_len("filter_patterns", filter_patterns.len()));
             buf.put_slice(filter_patterns.as_bytes());
+        } else {
+            buf.put_u8(0);
+        }
+
+        // Trailing comparison_flags: single u8 bitfield.
+        if let Some(flags) = self.comparison_flags {
+            buf.put_u8(1);
+            buf.put_u8(flags);
         } else {
             buf.put_u8(0);
         }
@@ -312,12 +346,25 @@ impl Hello {
             None
         };
 
+        // Optional trailing comparison_flags (absent on old peers → None).
+        let comparison_flags = if payload.remaining() >= 1 {
+            let present = payload.get_u8();
+            if present == 1 && payload.remaining() >= 1 {
+                Some(payload.get_u8())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             version,
             flags,
             root_path,
             max_delete,
             filter_patterns,
+            comparison_flags,
         })
     }
 }
@@ -1806,13 +1853,22 @@ mod tests {
         let max_delete = "50%".to_string();
         let hello = Hello::new(HelloFlags::PULL | HelloFlags::DELETE, "/src")
             .with_max_delete(Some(max_delete.clone()))
-            .with_filter_patterns(Some(patterns.clone()));
+            .with_filter_patterns(Some(patterns.clone()))
+            .with_comparison_flags(0x1F); // all flags set
         let encoded = hello.encode();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
 
         assert_eq!(decoded.max_delete, Some(max_delete));
         assert_eq!(decoded.filter_patterns, Some(patterns));
+        assert_eq!(decoded.comparison_flags, Some(0x1F));
+        let (checksum, update, existing, ignore_times, size_only) =
+            decoded.comparison_flags_tuple();
+        assert!(checksum);
+        assert!(update);
+        assert!(existing);
+        assert!(ignore_times);
+        assert!(size_only);
     }
 
     #[test]
@@ -1827,6 +1883,7 @@ mod tests {
 
         assert!(decoded.max_delete.is_none());
         assert!(decoded.filter_patterns.is_none());
+        assert!(decoded.comparison_flags.is_none());
     }
 
     #[test]

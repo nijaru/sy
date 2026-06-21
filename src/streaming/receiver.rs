@@ -137,6 +137,8 @@ pub struct ReceiverConfig {
     pub root: PathBuf,
     /// Block size for checksums
     pub block_size: u32,
+    /// Whether to verify written files by reading them back
+    pub verify: bool,
 }
 
 /// Receiver state
@@ -457,6 +459,29 @@ impl Receiver {
                     guard.defuse();
                 }
 
+                // Verify written file if enabled
+                if self.config.verify {
+                    match fs::metadata(&full_path).await {
+                        Ok(meta) => {
+                            if meta.len() != pending.entry.size {
+                                anyhow::bail!(
+                                    "Verify failed for {}: expected {} bytes, got {}",
+                                    full_path.display(),
+                                    pending.entry.size,
+                                    meta.len()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            anyhow::bail!(
+                                "Verify failed for {}: could not read metadata: {}",
+                                full_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
                 self.stats.files_ok += 1;
                 self.stats.bytes_transferred += pending.bytes_written;
             } else {
@@ -627,6 +652,7 @@ mod tests {
         let config = ReceiverConfig {
             root: tmp.path().to_path_buf(),
             block_size: 4096,
+            verify: false,
         };
         let mut receiver = Receiver::new(config);
 

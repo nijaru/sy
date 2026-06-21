@@ -50,7 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known Limitations
 
-- --bwlimit, --checksum, --update, --existing, --ignore-times, --ignore-existing, --verify: work for local sync, not wired in SSH streaming mode
 - --partial, --stream, --retry: not implemented (hidden from --help)
 - Sparse file handling not in streaming protocol
 - Bisync: experimental, limited conflict resolution

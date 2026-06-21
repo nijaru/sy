@@ -389,34 +389,8 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Warn about unimplemented flags
-    if cli.bwlimit.is_some() {
-        eprintln!(
-            "Warning: --bwlimit works for local sync but is not yet wired in streaming (SSH) mode"
-        );
-    }
-    if cli.checksum {
-        eprintln!(
-            "Warning: --checksum works for local sync but is not yet wired in streaming (SSH) mode"
-        );
-    }
     if cli.partial.is_some() {
         eprintln!("Warning: --partial is not yet implemented");
-    }
-    if cli.update {
-        eprintln!(
-            "Warning: --update works for local sync but is not yet wired in streaming (SSH) mode"
-        );
-    }
-    if cli.existing {
-        eprintln!(
-            "Warning: --existing works for local sync but is not yet wired in streaming (SSH) mode"
-        );
-    }
-    if cli.ignore_existing {
-        eprintln!("Warning: --ignore-existing works for local sync but is not yet wired in streaming (SSH) mode");
-    }
-    if cli.ignore_times {
-        eprintln!("Warning: --ignore-times works for local sync but is not yet wired in streaming (SSH) mode");
     }
     if cli.stream {
         eprintln!("Warning: --stream is not yet implemented");

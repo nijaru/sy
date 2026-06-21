@@ -23,6 +23,8 @@ pub struct SenderConfig {
     pub root: PathBuf,
     /// Compression mode
     pub compress: CompressionDetection,
+    /// Optional bandwidth limit in bytes per second
+    pub bwlimit: Option<u64>,
 }
 
 /// Sender state
@@ -141,11 +143,23 @@ impl Sender {
         let mut reader = BufReader::new(file);
         let mut offset = 0u64;
         let mut buf = vec![0u8; DATA_CHUNK_SIZE];
+        let mut limiter = self
+            .config
+            .bwlimit
+            .map(crate::sync::ratelimit::RateLimiter::new);
 
         loop {
             let n = reader.read(&mut buf).await?;
             if n == 0 {
                 break;
+            }
+
+            // Rate limit before sending
+            if let Some(ref mut limiter) = limiter {
+                let sleep_dur = limiter.consume(n as u64);
+                if !sleep_dur.is_zero() {
+                    tokio::time::sleep(sleep_dur).await;
+                }
             }
 
             let mut flags = DataFlags::empty();
@@ -320,6 +334,7 @@ mod tests {
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
             compress: CompressionDetection::Never,
+            bwlimit: None,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();
@@ -372,6 +387,7 @@ mod tests {
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
             compress: CompressionDetection::Never,
+            bwlimit: None,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();
@@ -460,6 +476,7 @@ mod tests {
         let config = SenderConfig {
             root: tmp.path().to_path_buf(),
             compress: CompressionDetection::Never,
+            bwlimit: None,
         };
 
         let (tx, rx) = crate::streaming::channel::file_job_channel();

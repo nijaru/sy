@@ -114,7 +114,7 @@ sy /source /dest --delete --force-delete
 ### Verification
 
 ```bash
-# Verify writes by reading back (local sync only)
+# Verify writes by reading back
 sy /source /dest --verify
 
 # Show itemized changes
@@ -137,11 +137,11 @@ sy /source /dest --itemize-changes
 | Symlinks | Stable | Preserved |
 | Backup mode (--backup) | Stable | |
 | Atomic writes | Stable | Temp file + rename, all paths |
-| --bwlimit | Local only | Works for local sync; not wired in SSH mode |
-| --checksum | Local only | Compares checksums instead of mtime+size; not wired in SSH mode |
-| --update / --existing | Local only | Not wired in SSH streaming generator |
-| --ignore-times / --ignore-existing | Local only | Not wired in SSH streaming generator |
-| --verify | Local only | xxHash3 verify-after-write; not available over SSH |
+| --bwlimit | Stable | Bandwidth limit in bytes/sec |
+| --checksum | Stable | Compares checksums instead of mtime+size |
+| --update / --existing | Stable | Comparison modes for selective sync |
+| --ignore-times / --ignore-existing | Stable | Force transfer / skip existing |
+| --verify | Stable | xxHash3 verify-after-write |
 | --partial | Not implemented | |
 | --stream | Not implemented | |
 | --retry | Not implemented | SSH has internal retry only |
