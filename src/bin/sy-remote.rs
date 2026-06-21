@@ -251,6 +251,7 @@ fn main() -> anyhow::Result<()> {
 
             // Write file atomically: temp + rename
             let temp_path = TempFileGuard::temp_path_for(&output_path);
+            let temp_guard = TempFileGuard::new(&temp_path);
             {
                 let mut temp_file = std::fs::File::create(&temp_path)?;
                 temp_file.write_all(&file_data)?;
@@ -268,6 +269,7 @@ fn main() -> anyhow::Result<()> {
             }
             // Atomic rename to final path
             std::fs::rename(&temp_path, &output_path)?;
+            temp_guard.defuse();
 
             // Report success with bytes written
             println!("{{\"bytes_written\": {}}}", file_data.len());
