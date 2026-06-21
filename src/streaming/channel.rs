@@ -242,6 +242,9 @@ pub struct SyncStats {
 
     /// Hard links created
     pub hardlinks_created: u64,
+
+    /// Total source entries scanned (including skipped/filtered)
+    pub files_scanned: u64,
 }
 
 impl SyncStats {

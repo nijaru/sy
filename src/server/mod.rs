@@ -164,7 +164,7 @@ async fn run_server_pull(
     }
     stdout.flush().await?;
 
-    let (total_files, total_bytes) = gen_handle.await??;
+    let (total_files, total_bytes, files_scanned) = gen_handle.await??;
     sender_handle.await??;
 
     // Send DONE
@@ -173,6 +173,7 @@ async fn run_server_pull(
         files_err: 0,
         bytes: total_bytes,
         duration_ms: 0,
+        files_scanned,
     };
     v2::write_frame(&mut stdout, &done.encode()).await?;
     stdout.flush().await?;
@@ -238,6 +239,7 @@ async fn run_server_push(
         files_err: receiver.stats().files_err,
         bytes: receiver.stats().bytes_transferred,
         duration_ms: 0,
+        files_scanned: 0, // Client knows its own source count in push mode
     };
     v2::write_frame(&mut stdout, &done.encode()).await?;
     stdout.flush().await?;

@@ -1144,17 +1144,29 @@ pub struct Done {
     pub files_err: u64,
     pub bytes: u64,
     pub duration_ms: u64,
+    /// Total source entries scanned (including skipped/filtered). Optional trailing
+    /// field for backwards compat — old peers return 0.
+    pub files_scanned: u64,
 }
 
 impl Done {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(5 + 32);
-        buf.put_u32(32);
+        // Fixed: 4×u64 = 32 bytes. Optional trailing: 1 + 8 = 9 bytes when present.
+        let trailing_len = if self.files_scanned > 0 { 9 } else { 1 };
+        let mut buf = BytesMut::with_capacity(5 + 32 + trailing_len);
+        buf.put_u32(32 + trailing_len as u32);
         buf.put_u8(MessageType::Done as u8);
         buf.put_u64(self.files_ok);
         buf.put_u64(self.files_err);
         buf.put_u64(self.bytes);
         buf.put_u64(self.duration_ms);
+        // Trailing files_scanned: present flag + optional u64.
+        if self.files_scanned > 0 {
+            buf.put_u8(1);
+            buf.put_u64(self.files_scanned);
+        } else {
+            buf.put_u8(0);
+        }
         buf.freeze()
     }
 
@@ -1162,11 +1174,27 @@ impl Done {
         if payload.remaining() < 32 {
             anyhow::bail!("Done payload too short");
         }
+        let files_ok = payload.get_u64();
+        let files_err = payload.get_u64();
+        let bytes = payload.get_u64();
+        let duration_ms = payload.get_u64();
+        // Optional trailing files_scanned.
+        let files_scanned = if payload.remaining() >= 1 {
+            let present = payload.get_u8();
+            if present == 1 && payload.remaining() >= 8 {
+                payload.get_u64()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         Ok(Self {
-            files_ok: payload.get_u64(),
-            files_err: payload.get_u64(),
-            bytes: payload.get_u64(),
-            duration_ms: payload.get_u64(),
+            files_ok,
+            files_err,
+            bytes,
+            duration_ms,
+            files_scanned,
         })
     }
 }
@@ -1438,6 +1466,7 @@ mod tests {
             files_err: 2,
             bytes: 1024 * 1024 * 50,
             duration_ms: 5000,
+            files_scanned: 200,
         };
         let encoded = done.encode();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
@@ -1447,6 +1476,21 @@ mod tests {
         assert_eq!(decoded.files_err, 2);
         assert_eq!(decoded.bytes, 1024 * 1024 * 50);
         assert_eq!(decoded.duration_ms, 5000);
+        assert_eq!(decoded.files_scanned, 200);
+    }
+
+    #[test]
+    fn test_done_backward_compat_no_scanned() {
+        // Old peer sends Done without trailing files_scanned
+        let mut buf = BytesMut::new();
+        buf.put_u64(10);
+        buf.put_u64(0);
+        buf.put_u64(1024);
+        buf.put_u64(100);
+        let decoded = Done::decode(buf.freeze()).unwrap();
+
+        assert_eq!(decoded.files_ok, 10);
+        assert_eq!(decoded.files_scanned, 0);
     }
 
     #[test]

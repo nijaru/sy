@@ -103,14 +103,15 @@ impl Generator {
     }
 
     /// Run the generator, scanning source and sending to channel.
-    /// Returns (total_files, total_bytes).
-    pub async fn run(mut self, tx: FileJobSender) -> Result<(u64, u64)> {
+    /// Returns (total_files, total_bytes, files_scanned).
+    pub async fn run(mut self, tx: FileJobSender) -> Result<(u64, u64, u64)> {
         let scanner = Scanner::new(&self.config.root)
             .follow_links(self.config.follow_symlinks)
             .with_options(self.config.scan_options);
 
         let mut total_files = 0u64;
         let mut total_bytes = 0u64;
+        let mut files_scanned = 0u64;
 
         // Snapshot total dest count before scan (for deletion threshold)
         let original_dest_count = self.dest_index.len() as u64;
@@ -128,6 +129,8 @@ impl Generator {
             if rel_path_str.is_empty() {
                 continue;
             }
+
+            files_scanned += 1;
 
             // Apply filter engine (--exclude/--include/--filter). If a directory
             // is excluded, exclude all children as rsync users expect (`--exclude .git`).
@@ -258,7 +261,7 @@ impl Generator {
             .await?;
         }
 
-        Ok((total_files, total_bytes))
+        Ok((total_files, total_bytes, files_scanned))
     }
 
     fn check_delta_for_state(

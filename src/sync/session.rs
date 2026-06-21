@@ -671,7 +671,7 @@ impl SyncSession {
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(SyncStats {
-            files_scanned: streaming_stats.files_ok as u64,
+            files_scanned: streaming_stats.files_scanned as u64,
             files_created: streaming_stats.files_ok as u64,
             bytes_transferred: streaming_stats.bytes_transferred,
             files_delta_synced: streaming_stats.delta_files as usize,
@@ -737,7 +737,7 @@ impl SyncSession {
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(SyncStats {
-            files_scanned: streaming_stats.files_ok as u64,
+            files_scanned: streaming_stats.files_scanned as u64,
             files_created: streaming_stats.files_ok as u64,
             bytes_transferred: streaming_stats.bytes_transferred,
             files_delta_synced: streaming_stats.delta_files as usize,

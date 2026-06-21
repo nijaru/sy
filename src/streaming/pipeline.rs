@@ -188,27 +188,36 @@ impl StreamingSync {
             files_err: 0,
             bytes: 0,
             duration_ms: 0,
+            files_scanned: 0,
         };
         write_frame(writer, &client_done.encode()).await?;
         writer.flush().await?;
 
         // Propagate generator error (e.g., deletion threshold exceeded)
-        let (total_files, total_bytes) = gen_result?;
+        let (total_files, total_bytes, source_scanned) = gen_result?;
 
         // Finally receive DONE from server
         let (msg_type, payload) = read_frame(reader).await?;
         if msg_type == MessageType::Done {
             let done = Done::decode(payload)?;
+            // In push mode, server doesn't know source scan count — use local generator's.
+            let scanned = if done.files_scanned > 0 {
+                done.files_scanned
+            } else {
+                source_scanned
+            };
             Ok(SyncStats {
                 files_ok: done.files_ok,
                 files_err: done.files_err,
                 bytes_transferred: done.bytes,
+                files_scanned: scanned,
                 ..Default::default()
             })
         } else {
             Ok(SyncStats {
                 files_ok: total_files,
                 bytes_transferred: total_bytes,
+                files_scanned: source_scanned,
                 ..Default::default()
             })
         }
@@ -305,6 +314,7 @@ impl StreamingSync {
                 stats.files_ok = done.files_ok;
                 stats.files_err = done.files_err;
                 stats.bytes_transferred = done.bytes;
+                stats.files_scanned = done.files_scanned;
                 return Ok(stats);
             }
 

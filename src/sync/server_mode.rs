@@ -96,7 +96,11 @@ pub async fn sync_pull(
 
 fn make_sync_stats(stats: crate::streaming::channel::SyncStats) -> SyncStats {
     SyncStats {
-        files_scanned: stats.files_ok,
+        files_scanned: if stats.files_scanned > 0 {
+            stats.files_scanned
+        } else {
+            stats.files_ok
+        },
         files_created: stats.files_ok,
         files_updated: 0,
         files_deleted: stats.deleted as usize,
