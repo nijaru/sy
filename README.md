@@ -191,12 +191,18 @@ exclude = [".git", "node_modules", "*.pyc"]
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and workflow.
+
 ```bash
 cargo build
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

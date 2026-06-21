@@ -5,39 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-06-18
+## [0.4.0] - 2026-06-21
 
 ### Highlights
 
 - **New architecture**: SyncSession + TaskExecutor replace monolithic SyncEngine
 - **1.25-11.5x faster** than rsync across all scenarios
 - **SSH competitive**: 10% faster than rsync for incremental sync
-- **Full rsync compatibility**: 85 flags, all implemented (no stubs)
 - **Critical SSH fixes**: --exclude/--include/--filter and --dry-run now work correctly
+- **Data safety audit**: all destination writes use atomic temp+rename
 
 ### Added
 
-- Full rsync-compatible CLI (85 flags): --backup, --partial, --remove-source-files, --itemize-changes, --compress-level, --timeout, --bwlimit, --max-delete, --keep-dirlinks, --archive, --gitignore, and many more
+- Full rsync-compatible CLI: --backup, --remove-source-files, --itemize-changes, --compress-level, --timeout, --bwlimit, --max-delete, --keep-dirlinks, --archive, --gitignore, --exclude-from, --include-from, and more
 - Streaming protocol edge case tests (25 tests)
-- SSH integration tests (14 tests, were stubs)
+- SSH integration tests (19 tests)
 - Backup failure path tests
 - Auto-generated man page from CLI definition
+- Feature status table in README (stable/local-only/experimental/not-implemented)
+- Runtime warnings for flags not wired in SSH mode
+- Protocol backward compatibility for new trailing fields (filter_patterns, files_scanned, max_delete)
 
 ### Fixed
 
-- **Critical: --exclude/--include/--filter silently ignored in SSH mode**
+- **Critical: --exclude/--include/--filter silently ignored in SSH pull mode**
 - **Critical: --dry-run creating files on remote in SSH mode**
+- **Critical: pull-mode scan options (respect_gitignore, exclude_vcs, dirs_only) not propagated**
+- **ReceiveFile temp file leak on early error** (TempFileGuard)
+- **SSH streaming files_scanned reported as 0** (Done message now carries scan count)
 - Duplicate stats/mode/error output
 - Symlink overwrite bug
 - Filter ordering
 - Delta sync strategy detection
+- Lock file truncate(false) to preserve holder PID
+- BSD flags JSON propagation
+- setuid/setgid stripping in safe_received_mode()
 
 ### Changed
 
 - Man page auto-generated from CLI (was outdated 0.0.22)
 - .pi/, .tasks/, .mailmap removed from git tracking
 - Co-authored-by tags stripped from history
-- README rewritten
+- README rewritten with feature status table
+
+### Known Limitations
+
+- --bwlimit, --checksum, --update, --existing, --ignore-times, --ignore-existing, --verify: work for local sync, not wired in SSH streaming mode
+- --partial, --stream, --retry: not implemented (hidden from --help)
+- Sparse file handling not in streaming protocol
+- Bisync: experimental, limited conflict resolution
+- S3/GCS: code complete, not tested against real infrastructure
 
 ### Removed
 

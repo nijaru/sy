@@ -71,7 +71,7 @@ cargo bench
 - No clippy warnings
 - Add tests for new features
 - Update README if adding user-facing features
-- Commit format: `type: description` (feat, fix, docs, refactor, test, chore)
+- Commit format: `type(scope): description` (feat, fix, docs, refactor, test, chore)
 
 ## Questions?
 

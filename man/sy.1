@@ -4,7 +4,7 @@
 .SH NAME
 sy \- Modern file synchronization tool
 .SH SYNOPSIS
-\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-\-trash\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-progress\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-partial\fR] [\fB\-\-partial\-dir\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-\-compress\-level\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-max\-errors\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-resume\fR] [\fB\-\-clear\-resume\-state\fR] [\fB\-\-stream\fR] [\fB\-\-checkpoint\-files\fR] [\fB\-\-checkpoint\-bytes\fR] [\fB\-\-cache\fR] [\fB\-\-clear\-cache\fR] [\fB\-\-checksum\-db\fR] [\fB\-\-clear\-checksum\-db\fR] [\fB\-\-prune\-checksum\-db\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-K\fR|\fB\-\-keep\-dirlinks\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-g\fR|\fB\-\-preserve\-group\fR] [\fB\-o\fR|\fB\-\-preserve\-owner\fR] [\fB\-D\fR|\fB\-\-preserve\-devices\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-\-retry\fR] [\fB\-\-retry\-delay\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
+\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-\-trash\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-progress\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-partial\-dir\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-\-compress\-level\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-max\-errors\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-resume\fR] [\fB\-\-clear\-resume\-state\fR] [\fB\-\-checkpoint\-files\fR] [\fB\-\-checkpoint\-bytes\fR] [\fB\-\-cache\fR] [\fB\-\-clear\-cache\fR] [\fB\-\-checksum\-db\fR] [\fB\-\-clear\-checksum\-db\fR] [\fB\-\-prune\-checksum\-db\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-K\fR|\fB\-\-keep\-dirlinks\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-g\fR|\fB\-\-preserve\-group\fR] [\fB\-o\fR|\fB\-\-preserve\-owner\fR] [\fB\-D\fR|\fB\-\-preserve\-devices\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
 .SH DESCRIPTION
 Modern file synchronization tool
 .SH OPTIONS
@@ -51,9 +51,6 @@ Directory to store backup files (default: same as destination)
 \fB\-\-suffix\fR \fI<SUFFIX>\fR [default: ~]
 Backup file suffix (default: ~)
 .TP
-\fB\-\-partial\fR [\fI<PARTIAL>\fR]
-Keep partially transferred files Optional DIR to store partial files in a separate directory
-.TP
 \fB\-\-partial\-dir\fR \fI<PARTIAL_DIR>\fR
 Directory to store partial files (alias for \-\-partial=DIR)
 .TP
@@ -61,7 +58,7 @@ Directory to store partial files (alias for \-\-partial=DIR)
 Remove source files after successful transfer (like mv)
 .TP
 \fB\-\-existing\fR
-Don\*(Aqt create new files on destination, only update existing
+Don\*(Aqt create new files on destination, only update existing Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-\-dirs\fR
 Transfer directories without recursing (like rsync \-d)
@@ -109,7 +106,7 @@ Read include patterns from file (one pattern per line)
 Apply exclude template from ~/.config/sy/templates/ (can be repeated) Examples: "rust", "node", "python"
 .TP
 \fB\-\-bwlimit\fR \fI<BWLIMIT>\fR
-Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
+Bandwidth limit in bytes per second (e.g., "1MB", "500KB") Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-\-resume\fR \fI<RESUME>\fR [default: auto]
 Resume mode (auto|only|no) \- auto: Resume interrupted transfers if state found (default) \- only: Only resume interrupted transfers, don\*(Aqt start new ones \- no: Disable resume support
@@ -128,9 +125,6 @@ no: Disable resume support
 .TP
 \fB\-\-clear\-resume\-state\fR
 Clear all resume state before starting
-.TP
-\fB\-\-stream\fR
-Use streaming mode for massive directories (experimental)
 .TP
 \fB\-\-checkpoint\-files\fR \fI<CHECKPOINT_FILES>\fR [default: 100]
 Checkpoint every N files (default: 100)
@@ -275,19 +269,19 @@ Exclude .git directories from the sync (opt\-in)
 By default, sy copies .git directories like rsync/cp. Use this flag to skip version control directories for faster syncs.
 .TP
 \fB\-\-ignore\-times\fR
-Ignore modification times, always compare checksums (rsync \-\-ignore\-times)
+Ignore modification times, always compare checksums (rsync \-\-ignore\-times) Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-\-size\-only\fR
 Only compare file size, skip mtime checks (rsync \-\-size\-only)
 .TP
 \fB\-c\fR, \fB\-\-checksum\fR
-Always compare checksums instead of size+mtime (slow but thorough, rsync \-\-checksum)
+Always compare checksums instead of size+mtime (slow but thorough, rsync \-\-checksum) Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-u\fR, \fB\-\-update\fR
-Skip files where destination is newer than source (rsync \-\-update)
+Skip files where destination is newer than source (rsync \-\-update) Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-\-ignore\-existing\fR
-Skip files that already exist in destination (rsync \-\-ignore\-existing)
+Skip files that already exist in destination (rsync \-\-ignore\-existing) Works for local sync; not yet wired in streaming (SSH) mode
 .TP
 \fB\-\-json\fR
 Output JSON (newline\-delimited JSON for scripting)
@@ -325,12 +319,6 @@ Clear bidirectional sync state before syncing Forces full comparison instead of 
 \fB\-\-force\-resync\fR
 Force resync by ignoring corrupt state (recovery mode) Use this when bisync state file is corrupted All differences will be treated as new changes on first sync
 .TP
-\fB\-\-retry\fR \fI<RETRY>\fR [default: 3]
-Maximum retry attempts for network operations (default: 3, 0 = no retries)
-.TP
-\fB\-\-retry\-delay\fR \fI<RETRY_DELAY>\fR [default: 1]
-Initial delay between retries in seconds (default: 1) Delay increases exponentially with each retry (1s, 2s, 4s, ...)
-.TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
@@ -363,16 +351,8 @@ EXAMPLES:
     sy /local user@host:/remote
     sy user@host:/remote /local
 
-    # S3 sync
-    sy /local s3://bucket/path
-    sy s3://bucket/path /local
-
     # Quiet mode (only errors)
     sy /source /destination \-\-quiet
-
-    # Bandwidth limiting
-    sy /source /destination \-\-bwlimit 1MB     # Limit to 1 MB/s
-    sy /source user@host:/dest \-\-bwlimit 500KB  # Limit to 500 KB/s
 
     # Verify file integrity after write
     sy /source /destination \-\-verify            # xxHash3 verification
