@@ -520,7 +520,7 @@ pub struct Cli {
     pub force_resync: bool,
 
     /// Maximum retry attempts for network operations (default: 3, 0 = no retries)
-    #[arg(long, default_value = "3", hide = true)]
+    #[arg(long, default_value = "0", hide = true)]
     pub retry: u32,
 
     /// Initial delay between retries in seconds (default: 1)
