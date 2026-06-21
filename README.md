@@ -137,13 +137,16 @@ sy /source /dest --itemize-changes
 | Symlinks | Stable | Preserved |
 | Backup mode (--backup) | Stable | |
 | Atomic writes | Stable | Temp file + rename, all paths |
+| --bwlimit | Local only | Works for local sync; not wired in SSH mode |
+| --checksum | Local only | Compares checksums instead of mtime+size; not wired in SSH mode |
+| --update / --existing | Local only | Not wired in SSH streaming generator |
+| --ignore-times / --ignore-existing | Local only | Not wired in SSH streaming generator |
+| --verify | Local only | xxHash3 verify-after-write; not available over SSH |
+| --partial | Not implemented | |
+| --stream | Not implemented | |
+| --retry | Not implemented | SSH has internal retry only |
 | Bisync | Experimental | Works for simple cases; complex conflict resolution is limited |
 | S3/GCS endpoints | Experimental | Code complete, not tested against real infrastructure |
-| --bwlimit | Not implemented | Parsed but not enforced |
-| --checksum | Not implemented | Forces full transfer without comparing checksums |
-| --partial | Not implemented | Not wired in streaming protocol |
-| --update / --existing | Not implemented | Not wired in streaming generator |
-| --verify | Local only | Works for local sync; not available over SSH |
 
 ## Benchmarks
 

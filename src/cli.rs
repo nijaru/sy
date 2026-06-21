@@ -134,16 +134,8 @@ pub enum SymlinkMode {
     sy /local user@host:/remote
     sy user@host:/remote /local
 
-    # S3 sync
-    sy /local s3://bucket/path
-    sy s3://bucket/path /local
-
     # Quiet mode (only errors)
     sy /source /destination --quiet
-
-    # Bandwidth limiting
-    sy /source /destination --bwlimit 1MB     # Limit to 1 MB/s
-    sy /source user@host:/dest --bwlimit 500KB  # Limit to 500 KB/s
 
     # Verify file integrity after write
     sy /source /destination --verify            # xxHash3 verification
@@ -230,7 +222,7 @@ pub struct Cli {
 
     /// Keep partially transferred files
     /// Optional DIR to store partial files in a separate directory
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    #[arg(long, num_args = 0..=1, default_missing_value = "", hide = true)]
     pub partial: Option<String>,
 
     /// Directory to store partial files (alias for --partial=DIR)
@@ -242,6 +234,7 @@ pub struct Cli {
     pub remove_source_files: bool,
 
     /// Don't create new files on destination, only update existing
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub existing: bool,
 
@@ -311,6 +304,7 @@ pub struct Cli {
     pub exclude_template: Vec<String>,
 
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
@@ -326,7 +320,7 @@ pub struct Cli {
     pub clear_resume_state: bool,
 
     /// Use streaming mode for massive directories (experimental)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub stream: bool,
 
     /// Checkpoint every N files (default: 100)
@@ -452,6 +446,7 @@ pub struct Cli {
     pub exclude_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub ignore_times: bool,
 
@@ -460,14 +455,17 @@ pub struct Cli {
     pub size_only: bool,
 
     /// Always compare checksums instead of size+mtime (slow but thorough, rsync --checksum)
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(short = 'c', long)]
     pub checksum: bool,
 
     /// Skip files where destination is newer than source (rsync --update)
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(short = 'u', long)]
     pub update: bool,
 
     /// Skip files that already exist in destination (rsync --ignore-existing)
+    /// Works for local sync; not yet wired in streaming (SSH) mode
     #[arg(long)]
     pub ignore_existing: bool,
 
@@ -528,12 +526,12 @@ pub struct Cli {
     pub force_resync: bool,
 
     /// Maximum retry attempts for network operations (default: 3, 0 = no retries)
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "3", hide = true)]
     pub retry: u32,
 
     /// Initial delay between retries in seconds (default: 1)
     /// Delay increases exponentially with each retry (1s, 2s, 4s, ...)
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "1", hide = true)]
     pub retry_delay: u64,
 
     /// Internal: Run in server mode (used over SSH)

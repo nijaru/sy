@@ -390,25 +390,39 @@ Or install from local source with: cargo install --path . --features acl"#
 
     // Warn about unimplemented flags
     if cli.bwlimit.is_some() {
-        eprintln!("Warning: --bwlimit is not yet enforced (parsed but ignored)");
+        eprintln!(
+            "Warning: --bwlimit works for local sync but is not yet wired in streaming (SSH) mode"
+        );
     }
     if cli.checksum {
-        eprintln!("Warning: --checksum forces full transfer but does not compare checksums yet");
+        eprintln!(
+            "Warning: --checksum works for local sync but is not yet wired in streaming (SSH) mode"
+        );
     }
     if cli.partial.is_some() {
         eprintln!("Warning: --partial is not yet implemented");
     }
     if cli.update {
-        eprintln!("Warning: --update is not yet wired in streaming (SSH) mode");
+        eprintln!(
+            "Warning: --update works for local sync but is not yet wired in streaming (SSH) mode"
+        );
     }
     if cli.existing {
-        eprintln!("Warning: --existing is not yet wired in streaming (SSH) mode");
+        eprintln!(
+            "Warning: --existing works for local sync but is not yet wired in streaming (SSH) mode"
+        );
     }
     if cli.ignore_existing {
-        eprintln!("Warning: --ignore-existing is not yet wired in streaming (SSH) mode");
+        eprintln!("Warning: --ignore-existing works for local sync but is not yet wired in streaming (SSH) mode");
     }
     if cli.ignore_times {
-        eprintln!("Warning: --ignore-times is not yet implemented");
+        eprintln!("Warning: --ignore-times works for local sync but is not yet wired in streaming (SSH) mode");
+    }
+    if cli.stream {
+        eprintln!("Warning: --stream is not yet implemented");
+    }
+    if cli.retry > 0 {
+        eprintln!("Warning: --retry is not yet wired (SSH has internal retry only)");
     }
 
     let config = sync::SyncConfig {
