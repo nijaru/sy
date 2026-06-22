@@ -37,12 +37,10 @@ fn safe_received_mode(mode: u32) -> u32 {
 /// Validate that a relative path is safe and doesn't escape the root.
 /// Returns the full path if valid.
 fn validate_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    // Reject empty paths
     if relative.is_empty() {
         anyhow::bail!("Empty path not allowed");
     }
 
-    // Reject excessively long paths (filesystem limit is typically 4096)
     const MAX_PATH_LEN: usize = 4096;
     if relative.len() > MAX_PATH_LEN {
         anyhow::bail!(
@@ -52,13 +50,11 @@ fn validate_path(root: &Path, relative: &str) -> Result<PathBuf> {
         );
     }
 
-    // Reject absolute paths
     let rel_path = Path::new(relative);
     if rel_path.is_absolute() {
         anyhow::bail!("Absolute paths not allowed: {}", relative);
     }
 
-    // Check for path traversal attempts
     for component in rel_path.components() {
         match component {
             Component::ParentDir => {
@@ -71,10 +67,7 @@ fn validate_path(root: &Path, relative: &str) -> Result<PathBuf> {
         }
     }
 
-    // Build full path and verify it's under root
     let full = root.join(rel_path);
-
-    // Normalize and check (handles edge cases like "foo/../bar")
     let normalized = normalize_path(&full);
     let root_normalized = normalize_path(root);
 
@@ -104,7 +97,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 fn validate_symlink_target(root: &Path, link_path: &Path, target: &str) -> Result<()> {
     let target_path = Path::new(target);
 
-    // Absolute symlink targets are not allowed
     if target_path.is_absolute() {
         anyhow::bail!(
             "Absolute symlink targets not allowed: {} -> {}",
@@ -113,7 +105,6 @@ fn validate_symlink_target(root: &Path, link_path: &Path, target: &str) -> Resul
         );
     }
 
-    // Resolve the target relative to the symlink's parent
     if let Some(link_parent) = link_path.parent() {
         let resolved = link_parent.join(target_path);
         let normalized = normalize_path(&resolved);
@@ -177,7 +168,6 @@ impl Receiver {
         let mut total_bytes = 0u64;
 
         let scanner = crate::sync::scanner::Scanner::new(&self.config.root);
-        // Use blocking scan in spawn_blocking
         let entries = tokio::task::spawn_blocking(move || scanner.scan()).await??;
 
         // Batch buffer for reducing syscalls
@@ -187,7 +177,6 @@ impl Receiver {
             let rel_path = entry.relative_path.as_ref();
             let path_str = rel_path.to_string_lossy().to_string();
 
-            // Skip root
             if path_str.is_empty() {
                 continue;
             }
@@ -227,11 +216,9 @@ impl Receiver {
                 checksums,
             };
 
-            // Add to batch
             let encoded = dest_entry.encode();
             batch.extend_from_slice(&encoded);
 
-            // Flush batch when threshold reached
             if batch.len() >= DEST_ENTRY_BATCH_SIZE {
                 on_entry(batch.split().freeze())?;
             }
@@ -240,7 +227,6 @@ impl Receiver {
             total_bytes += entry.size;
         }
 
-        // Flush remaining entries
         if !batch.is_empty() {
             on_entry(batch.freeze())?;
         }
@@ -308,22 +294,19 @@ impl Receiver {
             MessageType::DeleteEnd => {
                 let _end = DeleteEnd::decode(payload)?;
             }
-            _ => {
-                // Ignore unknown messages
-            }
+            _ => {}
         }
         Ok(())
     }
 
+    /// Handle a FileEntry message — create temp file for incoming data.
     async fn handle_file_entry(&mut self, entry: FileEntry) -> Result<()> {
         let full_path = validate_path(&self.config.root, &entry.path)?;
 
-        // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        // Handle hardlinks: create link to target instead of temp file
         if entry.is_hardlink() {
             if let Some(ref target) = entry.link_target {
                 let target_path = validate_path(&self.config.root, target)?;
@@ -342,7 +325,6 @@ impl Receiver {
             return Ok(());
         }
 
-        // Create temp file
         let temp_path = TempFileGuard::temp_path_for(&full_path);
         let guard = TempFileGuard::new(&temp_path);
 
@@ -376,7 +358,6 @@ impl Receiver {
             .ok_or_else(|| anyhow::anyhow!("No pending file for {}", data.path))?;
 
         if let Some(ref mut file) = pending.file {
-            // Decompress if compressed
             let raw_data = if data.flags.contains(DataFlags::COMPRESSED) {
                 Bytes::from(
                     crate::compress::decompress(&data.data, crate::compress::Compression::Lz4)
@@ -387,7 +368,6 @@ impl Receiver {
             };
 
             if data.flags.contains(DataFlags::DELTA) {
-                // Lazily open original file on first delta chunk, reuse for subsequent chunks
                 if pending.original_file.is_none() {
                     let original_path = validate_path(&root, &data.path)?;
                     pending.original_file = Some(
@@ -397,14 +377,12 @@ impl Receiver {
                     );
                 }
 
-                // Apply delta using cached original file
                 let original = pending
                     .original_file
                     .as_mut()
                     .expect("original_file must be set before applying delta");
                 Self::apply_delta_with_original(file, original, &raw_data).await?;
             } else {
-                // Write raw data at offset
                 file.seek(SeekFrom::Start(data.offset)).await?;
                 file.write_all(&raw_data).await?;
             }
@@ -421,7 +399,6 @@ impl Receiver {
                 file.sync_all().await?;
             }
 
-            // Path was already validated in handle_file_entry
             let full_path = validate_path(&self.config.root, &end.path)?;
 
             if end.status == DataEnd::STATUS_OK {

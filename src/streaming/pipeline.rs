@@ -126,7 +126,6 @@ impl StreamingSync {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        // 1. Send HELLO
         let mut hello_flags = HelloFlags::empty();
         if self.dry_run {
             hello_flags |= HelloFlags::DRY_RUN;
@@ -150,7 +149,6 @@ impl StreamingSync {
         }
         let _server_hello = Hello::decode(payload)?;
 
-        // 3. Receive DEST_FILE_ENTRY messages (Initial Exchange)
         let (checksum, update_only, ignore_existing, ignore_times, size_only) =
             self.comparison_flags_tuple();
         let mut generator = Generator::new(GeneratorConfig {
@@ -191,7 +189,6 @@ impl StreamingSync {
             }
         }
 
-        // 4. Run Generator and Sender
         let (tx, rx) = file_job_channel();
 
         let gen_handle = tokio::spawn(async move { generator.run(tx).await });
@@ -202,10 +199,9 @@ impl StreamingSync {
             bwlimit: self.bwlimit,
         });
 
-        // Use unbounded channel to avoid blocking_send (panics in tokio context)
+        // Unbounded channel: blocking_send panics inside tokio::spawn
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
 
-        // Spawn sender - uses unbounded_send which never blocks
         let sender_handle = tokio::spawn(async move {
             sender
                 .run(rx, |bytes| {
@@ -216,32 +212,19 @@ impl StreamingSync {
                 .await
         });
 
-        // Pipe data to writer concurrently with sender
-        // In dry-run mode, we still run the pipeline to compute stats,
-        // but we don't send any data to the server.
+        // Pipeline computes stats even in dry-run; suppress data output.
         if !self.dry_run {
             while let Some(bytes) = data_rx.recv().await {
                 writer.write_all(&bytes).await?;
             }
         } else {
-            // Drain the channel without sending
             while data_rx.recv().await.is_some() {}
         }
 
-        // Send DONE (Wait, DONE is sent by Receiver)
-        // Wait, the Sender should send a final message to signal completion
-        // Protocol v2 uses DONE (0x10) from Receiver to Client.
-        // Client doesn't send DONE. It just finishes sending messages.
-        // But we should signal the server that we are done.
-        // Let's use DONE with 0 values or just close the stream?
-        // Actually, the protocol says DONE is from R->client.
-        // Maybe we need a message from client to server to say "I'm finished sending".
-        // Let's use Done message but client side.
-        // Wait for generator to complete first (may fail on deletion threshold)
+        // Client signals end-of-transfer to server, then waits for server DONE.
         let gen_result = gen_handle.await?;
         sender_handle.await??;
 
-        // Send DONE only after generator completes
         let client_done = Done {
             files_ok: 0,
             files_err: 0,
@@ -288,7 +271,6 @@ impl StreamingSync {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        // 1. Send HELLO with PULL flag
         let mut flags = HelloFlags::PULL;
         if self.delete_enabled {
             flags |= HelloFlags::DELETE;
@@ -317,25 +299,21 @@ impl StreamingSync {
         write_frame(writer, &hello.encode()).await?;
         writer.flush().await?;
 
-        // 2. Receive HELLO response
         let (msg_type, payload) = read_frame(reader).await?;
         if msg_type != MessageType::Hello {
             anyhow::bail!("Expected Hello response, got {:?}", msg_type);
         }
         let _server_hello = Hello::decode(payload)?;
 
-        // Ensure local root exists
         if !self.local_root.exists() {
             tokio::fs::create_dir_all(&self.local_root).await?;
         }
 
-        // 3. Send DEST_FILE_ENTRY messages (Initial Exchange)
-        // Use unbounded channel to avoid blocking_send (panics in tokio context)
+        // Unbounded channel: blocking_send panics inside tokio::spawn
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
         let receiver_root = self.local_root.clone();
         let verify = self.verify;
 
-        // Spawn scanner - uses unbounded_send which never blocks
         let scan_handle = tokio::spawn(async move {
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
@@ -351,16 +329,12 @@ impl StreamingSync {
                 .await
         });
 
-        // Write data as it arrives (concurrent with scan)
         while let Some(bytes) = data_rx.recv().await {
             writer.write_all(&bytes).await?;
         }
         writer.flush().await?;
-
-        // Wait for scanner to complete
         scan_handle.await??;
 
-        // 4. Receive and process streaming messages
         let mut receiver = Receiver::new(ReceiverConfig {
             root: self.local_root.clone(),
             block_size: 4096,

@@ -130,10 +130,9 @@ impl Generator {
         let mut total_bytes = 0u64;
         let mut files_scanned = 0u64;
 
-        // Snapshot total dest count before scan (for deletion threshold)
+        // Snapshot dest count before scan so we can check deletion threshold later
         let original_dest_count = self.dest_index.len() as u64;
 
-        // Scanner::scan() is blocking, so we run it in spawn_blocking
         let entries = tokio::task::spawn_blocking(move || scanner.scan()).await??;
 
         let mut excluded_source_dirs: Vec<PathBuf> = Vec::new();
@@ -142,15 +141,14 @@ impl Generator {
             let rel_path = entry.relative_path.as_ref().to_path_buf();
             let rel_path_str = rel_path.to_string_lossy().to_string();
 
-            // Skip root directory (empty relative path)
             if rel_path_str.is_empty() {
                 continue;
             }
 
             files_scanned += 1;
 
-            // Apply filter engine (--exclude/--include/--filter). If a directory
-            // is excluded, exclude all children as rsync users expect (`--exclude .git`).
+            // Apply filter: if a directory is excluded, exclude all children too
+            // (e.g., `--exclude .git` should exclude .git/refs, .git/hooks, etc.)
             if excluded_source_dirs
                 .iter()
                 .any(|dir| rel_path.starts_with(dir))
@@ -166,7 +164,6 @@ impl Generator {
                 }
             }
 
-            // Get destination state before removing from index
             let dest_state = self.dest_index.remove(&rel_path_str);
 
             let mtime = entry
@@ -177,7 +174,6 @@ impl Generator {
 
             let mode = entry.mode;
 
-            // Skip unchanged files based on comparison flags
             if !entry.is_dir && !entry.is_symlink {
                 let flags = &self.config.comparison;
                 let should_skip = if flags.ignore_times {
@@ -194,8 +190,8 @@ impl Generator {
                         // Compare size only
                         dest.size == entry.size
                     } else if flags.checksum {
-                        // TODO: checksum comparison requires reading file data.
-                        // For now, fall through to delta detection which does block-level checksums.
+                        // TODO: checksum comparison requires reading file data; for now,
+                        // fall through to delta detection which does block-level checksums.
                         dest.size == entry.size && dest.mtime == mtime_nanos
                     } else {
                         // Default: size + mtime match
@@ -225,7 +221,6 @@ impl Generator {
                         .unwrap_or_default(),
                 }
             } else {
-                // Check for hard link
                 let inode = entry.inode.unwrap_or(0);
                 let _link_target = if entry.nlink > 1 {
                     if let Some(existing) = self.seen_inodes.get(&inode) {

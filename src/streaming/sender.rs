@@ -154,7 +154,6 @@ impl Sender {
                 break;
             }
 
-            // Rate limit before sending
             if let Some(ref mut limiter) = limiter {
                 let sleep_dur = limiter.consume(n as u64);
                 if !sleep_dur.is_zero() {
@@ -163,7 +162,6 @@ impl Sender {
             }
 
             let mut flags = DataFlags::empty();
-            // Compress if enabled and file type benefits from compression
             let should_compress = self.config.compress != CompressionDetection::Never
                 && !crate::compress::is_compressed_extension(path_str);
             let payload = if should_compress {
@@ -201,7 +199,6 @@ impl Sender {
     where
         F: FnMut(Bytes) -> Result<()>,
     {
-        // Convert protocol checksums to delta engine checksums
         let block_size = delta_info.block_size as usize;
         let file_size = delta_info.file_size;
         let num_checksums = delta_info.checksums.len();
@@ -230,14 +227,14 @@ impl Sender {
             })
             .collect();
 
-        // generate_delta_streaming is blocking
         let p = path.to_path_buf();
         let delta = tokio::task::spawn_blocking(move || {
             generate_delta_streaming(&p, &dest_checksums, block_size)
         })
         .await??;
 
-        // Encode delta ops into DATA messages, chunking to avoid frame size limits
+        // Serialize delta ops into multiple DATA messages to avoid frame size limits.
+        // For delta, receiver ignores offset (processes ops sequentially), so always use 0.
         let mut flags = DataFlags::DELTA;
         let should_compress = self.config.compress != CompressionDetection::Never
             && !crate::compress::is_compressed_extension(path_str);
@@ -245,10 +242,6 @@ impl Sender {
             flags |= DataFlags::COMPRESSED;
         }
 
-        // Serialize delta ops, chunking into multiple messages if needed.
-        // Note: For delta operations, the receiver ignores the offset field (it processes
-        // ops sequentially), so we always use 0. The receiver appends all delta chunks
-        // to the output file in order.
         let mut delta_bytes = Vec::new();
 
         for op in delta.ops {

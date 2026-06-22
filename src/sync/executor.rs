@@ -166,7 +166,6 @@ impl<'a> TaskExecutor<'a> {
     ) -> Result<TaskResult> {
         self.dest.create_dir_all(&task.dest_path).await?;
 
-        // Preserve directory permissions if enabled
         #[cfg(unix)]
         if self.config.preserve_dir_permissions {
             use std::os::unix::fs::PermissionsExt;
@@ -192,20 +191,17 @@ impl<'a> TaskExecutor<'a> {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             let target = std::fs::read_link(&source_path)?;
 
-            // Remove existing file/symlink before creating
             if task.action == SyncAction::Update {
                 self.dest.remove(&task.dest_path, false).await?;
             }
 
             self.dest.create_symlink(&target, &task.dest_path).await?;
 
-            // Itemize if configured
             if self.config.itemize_changes {
                 let item = itemize_string(&task.action, false, true);
                 eprintln!("{} {}", item, task.dest_path.display());
             }
 
-            // Return appropriate result based on action
             if task.action == SyncAction::Create {
                 Ok(TaskResult::SymlinkCreated)
             } else {
@@ -223,7 +219,6 @@ impl<'a> TaskExecutor<'a> {
 
     /// Execute file copy with hardlink tracking, backup, xattrs, and verification.
     async fn execute_file(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
-        // Check if this is a hardlink that's already been copied
         if self.config.preserve_hardlinks && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
                 let first_path = {
@@ -231,7 +226,6 @@ impl<'a> TaskExecutor<'a> {
                     map.get(&inode).cloned()
                 };
                 if let Some(first_path) = first_path {
-                    // Remove existing file before creating hard link
                     if task.action == SyncAction::Update {
                         self.dest.remove(&task.dest_path, false).await?;
                     }
@@ -239,7 +233,6 @@ impl<'a> TaskExecutor<'a> {
                         .create_hardlink(&first_path, &task.dest_path)
                         .await?;
 
-                    // Itemize if configured
                     if self.config.itemize_changes {
                         let item = itemize_string(&task.action, false, false);
                         eprintln!("{} {}", item, task.dest_path.display());
@@ -254,12 +247,10 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
-        // Backup existing file if configured
         if self.backup.enabled && task.action == SyncAction::Update {
             self.create_backup(&task.dest_path).await?;
         }
 
-        // Check change ratio for large files (above 10MB delta threshold)
         const DELTA_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
         if task.action == SyncAction::Update && source_entry.size > DELTA_THRESHOLD {
             let abs_dest = self.abs_dest_path(&task.dest_path);
@@ -301,14 +292,12 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
-        // Read source file
         let data = self.source.read_file(&source_entry.relative_path).await?;
         let meta = self.source.metadata(&source_entry.relative_path).await?;
 
         // Write to destination
         match self.dest.write_file(&task.dest_path, &data, &meta).await {
             Ok(()) => {
-                // Record inode for hardlink tracking
                 if self.config.preserve_hardlinks && source_entry.nlink > 1 {
                     if let Some(inode) = source_entry.inode {
                         let mut map = self.hardlink_map.lock().unwrap();
@@ -322,14 +311,13 @@ impl<'a> TaskExecutor<'a> {
                     self.copy_xattrs(source_entry, &task.dest_path);
                 }
 
-                // Itemize if configured
                 if self.config.itemize_changes {
                     let item = itemize_string(&task.action, false, false);
                     eprintln!("{} {}", item, task.dest_path.display());
                 }
 
-                // Verify if configured (BEFORE removing source — a failed write
-                // must not leave the user without the original file).
+                // Verify before removing source — a failed write must not leave
+                // the user without the original file.
                 if self.verification.verify_on_write {
                     let dest_data = self.dest.read_file(&task.dest_path).await?;
                     if data != dest_data {
@@ -340,7 +328,7 @@ impl<'a> TaskExecutor<'a> {
                     }
                 }
 
-                // Remove source file only after confirmed successful transfer + verification.
+                // Remove source only after confirmed successful transfer + verification.
                 if self.config.remove_source_files {
                     let source_path = self.source.root().join(&*source_entry.relative_path);
                     if let Err(e) = std::fs::remove_file(&source_path) {
@@ -356,7 +344,6 @@ impl<'a> TaskExecutor<'a> {
                 })
             }
             Err(e) => {
-                // Clean up partial file on failure unless keep_partial
                 if !self.config.keep_partial {
                     let _ = self.dest.remove(&task.dest_path, false).await;
                 }

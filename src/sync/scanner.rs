@@ -83,7 +83,6 @@ fn detect_hardlink_info(_metadata: &std::fs::Metadata) -> (Option<u64>, u64) {
 fn read_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     let mut xattrs = HashMap::new();
 
-    // List all xattr names
     let names = match xattr::list(path) {
         Ok(names) => names,
         Err(_) => return None, // No xattrs or not supported
@@ -117,7 +116,6 @@ fn read_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>> {
 fn read_acls(path: &Path) -> Option<Vec<u8>> {
     use exacl::getfacl;
 
-    // Read ACLs from file
     match getfacl(path, None) {
         Ok(acls) => {
             let acl_vec: Vec<_> = acls.into_iter().collect();
@@ -228,7 +226,6 @@ fn process_dir_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> 
         .map(|p| p.to_path_buf())
         .map_err(|_| SyncError::InvalidPath { path: path.clone() })?;
 
-    // Check if this is a symlink
     let is_symlink = metadata.is_symlink();
     let symlink_target = if is_symlink {
         std::fs::read_link(&path).ok()
@@ -236,23 +233,15 @@ fn process_dir_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> 
         None
     };
 
-    // Detect sparse files (only for regular files, not directories or symlinks)
     let (is_sparse, allocated_size) = if !metadata.is_dir() && !is_symlink {
         detect_sparse_file(&path, &metadata)
     } else {
         (false, 0)
     };
 
-    // Detect hardlink information (inode and link count)
     let (inode, nlink) = detect_hardlink_info(&metadata);
-
-    // Read extended attributes (always scan them, writing is conditional)
     let xattrs = read_xattrs(&path);
-
-    // Read ACLs (always scan them, writing is conditional)
     let acls = read_acls(&path);
-
-    // Read BSD file flags (macOS only, None on other platforms)
     let bsd_flags = read_bsd_flags(&metadata);
 
     let modified = metadata.modified().map_err(|e| SyncError::ReadDirError {

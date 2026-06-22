@@ -6,9 +6,7 @@
 //! - StreamingPull: SSH → Local (streaming protocol)
 //! - ObjectStore: S3/GCS involved (future)
 
-// Dead-code suppressed until main.rs is rewritten to use SyncSession (Phase 3 completion).
-// Remove this allow once SyncSession is wired into main.rs.
-
+#[allow(dead_code)] // SyncSession API is public but main.rs doesn't use it yet
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
@@ -160,11 +158,9 @@ impl SyncSession {
             .as_endpoint()
             .ok_or_else(|| SyncError::Io(std::io::Error::other("Dest must be local for verify")))?;
 
-        // Scan both sides
         let source_entries = source_ep.scan(self.scan_options).await?;
         let dest_entries = dest_ep.scan(self.scan_options).await?;
 
-        // Build lookup maps
         let source_map: std::collections::HashMap<PathBuf, &FileEntry> = source_entries
             .iter()
             .map(|e| ((*e.relative_path).clone(), e))
@@ -185,22 +181,18 @@ impl SyncSession {
 
         let start = Instant::now();
 
-        // Check files in source
         for (path, source_entry) in &source_map {
             if let Some(dest_entry) = dest_map.get(path) {
-                // Both exist - compare
                 if source_entry.size == dest_entry.size {
                     result.files_matched += 1;
                 } else {
                     result.files_mismatched.push(source.join(path));
                 }
             } else {
-                // Only in source
                 result.files_only_in_source.push(source.join(path));
             }
         }
 
-        // Check files only in dest
         for path in dest_map.keys() {
             if !source_map.contains_key(path) {
                 result.files_only_in_dest.push(dest.join(path));

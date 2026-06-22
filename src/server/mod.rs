@@ -8,7 +8,6 @@
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
-use tokio::fs;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -54,7 +53,6 @@ pub async fn run_server() -> Result<()> {
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    // Read Hello frame
     let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
 
     if msg_type != MessageType::Hello {
@@ -69,12 +67,6 @@ pub async fn run_server() -> Result<()> {
 
     let hello = v2::Hello::decode(payload)?;
 
-    // Ensure root exists
-    if !root_path.exists() {
-        fs::create_dir_all(&root_path).await?;
-    }
-
-    // Send Hello response
     let resp = v2::Hello::new(HelloFlags::empty(), "");
     v2::write_frame(&mut stdout, &resp.encode()).await?;
     stdout.flush().await?;
@@ -93,7 +85,6 @@ async fn run_server_pull(
     mut stdin: impl io::AsyncRead + Unpin,
     mut stdout: impl io::AsyncWrite + Unpin,
 ) -> Result<()> {
-    // 1. Receive DEST_FILE_ENTRY messages from client (Initial Exchange)
     let scan_options = ScanOptions {
         respect_gitignore: hello.flags.contains(HelloFlags::RESPECT_GITIGNORE),
         include_git_dir: !hello.flags.contains(HelloFlags::EXCLUDE_GIT_DIR),
@@ -141,7 +132,6 @@ async fn run_server_pull(
         }
     }
 
-    // 2. Run Generator and Sender pipeline
     let (tx, rx) = file_job_channel();
     let gen_handle = tokio::spawn(async move { generator.run(tx).await });
 
@@ -155,10 +145,8 @@ async fn run_server_pull(
         bwlimit: None,
     });
 
-    // Use unbounded channel to avoid blocking_send (panics in tokio context)
+    // Unbounded channel: blocking_send panics inside tokio::spawn
     let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
-
-    // Spawn sender - uses unbounded_send which never blocks
     let sender_handle = tokio::spawn(async move {
         sender
             .run(rx, |bytes| {
@@ -169,7 +157,6 @@ async fn run_server_pull(
             .await
     });
 
-    // Stream data to client (concurrent with sender)
     while let Some(bytes) = data_rx.recv().await {
         v2::write_frame(&mut stdout, &bytes).await?;
     }
@@ -178,7 +165,6 @@ async fn run_server_pull(
     let (total_files, total_bytes, files_scanned) = gen_handle.await??;
     sender_handle.await??;
 
-    // Send DONE
     let done = v2::Done {
         files_ok: total_files,
         files_err: 0,
@@ -206,12 +192,9 @@ async fn run_server_push(
         verify,
     });
 
-    // 1. Send Initial Exchange (our files metadata)
-    // Use unbounded channel to avoid blocking_send (panics in tokio context)
+    // Unbounded channel: blocking_send panics inside tokio::spawn
     let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
     let receiver_root = root_path.clone();
-
-    // Spawn scanner - uses unbounded_send which never blocks
     let scan_handle = tokio::spawn(async move {
         let receiver = Receiver::new(ReceiverConfig {
             root: receiver_root,
@@ -227,16 +210,12 @@ async fn run_server_push(
             .await
     });
 
-    // Write data as it arrives (concurrent with scan)
     while let Some(bytes) = data_rx.recv().await {
         v2::write_frame(&mut stdout, &bytes).await?;
     }
     stdout.flush().await?;
-
-    // Wait for scanner to complete
     scan_handle.await??;
 
-    // 2. Receive streaming messages
     loop {
         let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
 
@@ -247,7 +226,6 @@ async fn run_server_push(
         receiver.handle_message(msg_type, payload).await?;
     }
 
-    // 3. Send DONE
     let done = v2::Done {
         files_ok: receiver.stats().files_ok,
         files_err: receiver.stats().files_err,
