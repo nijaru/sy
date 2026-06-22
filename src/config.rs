@@ -1,3 +1,5 @@
+#![allow(dead_code)] // WIP: config profiles not yet wired into sync flow
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

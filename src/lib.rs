@@ -1,26 +1,34 @@
-pub mod binary;
-pub mod bisync;
+// Public API — these are the stable library exports
 pub mod cli;
 pub mod compress;
-pub mod config;
 pub mod delta;
-pub mod endpoint;
 pub mod error;
-pub mod filter;
-pub mod fs_util;
-pub mod hooks;
 pub mod integrity;
-pub mod path;
-pub mod perf;
-pub mod resource;
-pub mod resume;
-pub mod retry;
-#[allow(dead_code)] // Called from binary at runtime, not from library
-pub mod server;
 pub mod sparse;
-#[cfg(feature = "ssh")]
-pub mod ssh;
-pub mod streaming;
 pub mod sync;
 pub mod temp_file;
+
+// Internal modules — public for binary/test access, not part of stable API
+#[doc(hidden)]
+pub mod bisync;
+#[doc(hidden)]
+pub mod server;
+#[cfg(feature = "ssh")]
+#[doc(hidden)]
+pub mod ssh;
+#[doc(hidden)]
 pub mod transport;
+
+// Private modules
+pub(crate) mod binary;
+pub(crate) mod config;
+pub(crate) mod endpoint;
+pub(crate) mod filter;
+pub(crate) mod fs_util;
+pub(crate) mod hooks;
+pub(crate) mod path;
+pub(crate) mod perf;
+pub(crate) mod resource;
+pub(crate) mod resume;
+pub(crate) mod retry;
+pub(crate) mod streaming;

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // WIP: hook execution not yet wired into sync flow
+
 use crate::error::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
