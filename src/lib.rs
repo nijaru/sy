@@ -15,6 +15,7 @@ pub mod perf;
 pub mod resource;
 pub mod resume;
 pub mod retry;
+#[allow(dead_code)] // Called from binary at runtime, not from library
 pub mod server;
 pub mod sparse;
 #[cfg(feature = "ssh")]

@@ -1,10 +1,6 @@
-//! Server mode - runs when invoked as `sy --server <path>`
+//! Server mode — runs when invoked as `sy --server <path>`
 //!
 //! Uses streaming protocol (v2) for all operations.
-//!
-//! Code appears "dead" to the compiler since it's only used at runtime.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};

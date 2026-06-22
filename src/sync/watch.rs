@@ -128,7 +128,6 @@ impl<T: Transport + 'static> WatchMode<T> {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::transport::local::LocalTransport;
@@ -144,44 +143,13 @@ mod tests {
         fs::create_dir_all(&destination).unwrap();
 
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false,                              // dry_run
-            false,                              // diff_mode
-            false,                              // delete
-            50,                                 // max_delete
-            false,                              // trash
-            true,                               // quiet
-            10,                                 // parallel
-            100,                                // max_errors
-            None,                               // min_size
-            None,                               // max_size
-            crate::filter::FilterEngine::new(), // filter_engine
-            None,                               // bwlimit
-            false,                              // resume
-            10,                                 // checkpoint_files
-            100,                                // checkpoint_bytes
-            false,                              // json
-            ChecksumType::None,                 // verification_mode
-            false,                              // verify_on_write
-            SymlinkMode::Preserve,              // symlink_mode
-            false,                              // preserve_xattrs
-            false,                              // preserve_hardlinks
-            false,                              // preserve_acls
-            false,                              // preserve_flags
-            false,                              // per_file_progress
-            false,                              // ignore_times
-            false,                              // size_only
-            false,                              // checksum
-            false,                              // update_only
-            false,                              // ignore_existing
-            false,                              // cache
-            false,                              // clear_cache
-            false,                              // checksum_db
-            false,                              // clear_checksum_db
-            false,                              // prune_checksum_db
-            false,                              // dest_is_remote
-            false,                              // perf
+            SyncConfig {
+                max_concurrent: 4,
+                max_errors: 100,
+                ..SyncConfig::test_default()
+            },
         );
 
         let watch_mode = WatchMode::new(
@@ -207,60 +175,13 @@ mod tests {
         fs::create_dir_all(&destination).unwrap();
 
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false, // dry_run
-            false, // diff_mode
-            false, // delete
-            50,    // max_delete
-            false, // trash
-            true,
-            10,
-            100, // max_errors
-            None,
-            None,
-            crate::filter::FilterEngine::new(),
-            None,
-            false,
-            10,
-            100,
-            false,
-            ChecksumType::None,
-            false,
-            SymlinkMode::Preserve,
-            false,
-            false,
-            false,
-            false, // preserve_flags
-            false, // per_file_progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // rsh
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                max_concurrent: 4,
+                max_errors: 100,
+                ..SyncConfig::test_default()
+            },
         );
 
         let watch_mode = WatchMode::new(engine, source, destination, Duration::from_millis(500));

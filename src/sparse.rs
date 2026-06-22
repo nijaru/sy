@@ -131,11 +131,15 @@ pub fn detect_data_regions(_path: &Path) -> io::Result<Vec<DataRegion>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static SPARSE_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_all_data() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         let temp = TempDir::new().unwrap();
         let file_path = temp.path().join("all_data.txt");
 
@@ -166,6 +170,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_empty_file() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         let temp = TempDir::new().unwrap();
         let file_path = temp.path().join("empty.txt");
 
@@ -181,6 +186,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_sparse_file() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::process::Command;
 
         let temp = TempDir::new().unwrap();
@@ -238,6 +244,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_nonexistent_file() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         let temp = TempDir::new().unwrap();
         let file_path = temp.path().join("nonexistent.txt");
 
@@ -252,6 +259,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_leading_hole() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = TempDir::new().unwrap();
@@ -290,6 +298,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_trailing_hole() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = TempDir::new().unwrap();
@@ -333,6 +342,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_multiple_data_regions() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = TempDir::new().unwrap();
@@ -394,6 +404,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_very_large_offset() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = TempDir::new().unwrap();
@@ -441,6 +452,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_single_byte() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = TempDir::new().unwrap();
@@ -477,6 +489,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_region_ordering() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         // This test verifies the DataRegion ordering invariant
         // All detected regions should be in ascending order by offset
 
@@ -525,6 +538,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_detect_data_regions_boundary_conditions() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         let temp = TempDir::new().unwrap();
 
         // Test 1: File with data exactly at offset 0
@@ -554,6 +568,7 @@ mod tests {
     #[test]
     #[cfg(not(unix))]
     fn test_detect_data_regions_unsupported_platform() {
+        let _g = SPARSE_MUTEX.lock().unwrap();
         // On non-Unix platforms, should return Unsupported error
         let temp = TempDir::new().unwrap();
         let file_path = temp.path().join("test.dat");

@@ -15,6 +15,7 @@ mod perf;
 mod resource;
 mod resume;
 mod retry;
+#[allow(dead_code)] // Server is only invoked at runtime via `sy --server`
 mod server;
 mod sparse;
 mod ssh;

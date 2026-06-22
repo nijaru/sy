@@ -26,7 +26,6 @@ pub use config::{
 pub use stats::{SyncError, SyncStats, VerificationResult};
 
 use crate::error::Result;
-use crate::filter::FilterEngine;
 use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::perf::{PerformanceMetrics, PerformanceMonitor};
 use crate::resource;
@@ -76,143 +75,6 @@ pub(crate) fn itemize_string(
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
-    #[allow(clippy::too_many_arguments)]
-    #[deprecated(note = "Use SyncEngine::with_config instead")]
-    #[allow(dead_code)]
-    pub fn new(
-        transport: T,
-        dry_run: bool,
-        diff_mode: bool,
-        delete: bool,
-        max_delete: u8,
-        trash: bool,
-        quiet: bool,
-        max_concurrent: usize,
-        max_errors: usize,
-        min_size: Option<u64>,
-        max_size: Option<u64>,
-        filter_engine: FilterEngine,
-        bwlimit: Option<u64>,
-        resume: bool,
-        checkpoint_files: usize,
-        checkpoint_bytes: u64,
-        json: bool,
-        verification_mode: crate::integrity::ChecksumType,
-        verify_on_write: bool,
-        symlink_mode: crate::cli::SymlinkMode,
-        preserve_xattrs: bool,
-        preserve_hardlinks: bool,
-        preserve_acls: bool,
-        preserve_flags: bool,
-        progress: bool,
-        ignore_times: bool,
-        size_only: bool,
-        checksum: bool,
-        update_only: bool,
-        ignore_existing: bool,
-        cache: bool,
-        clear_cache: bool,
-        checksum_db: bool,
-        clear_checksum_db: bool,
-        prune_checksum_db: bool,
-        dest_is_remote: bool,
-        perf: bool,
-        // rsync-compat flags
-        remove_source_files: bool,
-        existing: bool,
-        dirs: bool,
-        backup: Option<String>,
-        backup_dir: Option<PathBuf>,
-        suffix: String,
-        partial: Option<String>,
-        partial_dir: Option<PathBuf>,
-        timeout: Option<u64>,
-        contimeout: Option<u64>,
-        compress_level: Option<u8>,
-        itemize_changes: bool,
-        human_readable: bool,
-        stats: bool,
-    ) -> Self {
-        let config = SyncConfig {
-            dry_run,
-            diff_mode,
-            delete: if delete {
-                DeleteMode::Enabled {
-                    threshold: max_delete,
-                    force: false,
-                }
-            } else {
-                DeleteMode::Disabled
-            },
-            max_delete: if delete {
-                Some(format!("{}%", max_delete))
-            } else {
-                None
-            },
-            trash,
-            quiet,
-            max_concurrent,
-            max_errors,
-            min_size,
-            max_size,
-            filter_engine,
-            bwlimit,
-            compression_detection: crate::compress::CompressionDetection::Never,
-            resume: ResumeConfig {
-                enabled: resume,
-                // Deprecated constructor has no resume-only parameter. The main CLI path
-                // builds ResumeConfig directly and wires ResumeMode::Only.
-                only: false,
-                checkpoint_files,
-                checkpoint_bytes,
-            },
-            json,
-            verification: VerificationConfig {
-                mode: verification_mode,
-                verify_on_write,
-                checksum_db,
-                clear_checksum_db,
-                prune_checksum_db,
-            },
-            preserve: PreserveConfig {
-                xattrs: preserve_xattrs,
-                hardlinks: preserve_hardlinks,
-                acls: preserve_acls,
-                flags: preserve_flags,
-                symlink_mode,
-                permissions: false,
-            },
-            progress,
-            comparison: ComparisonConfig {
-                ignore_times,
-                size_only,
-                checksum,
-                update_only,
-                ignore_existing,
-            },
-            cache,
-            clear_cache,
-            dest_is_remote,
-            perf,
-            // rsync-compat flags
-            remove_source_files,
-            existing,
-            dirs,
-            backup,
-            backup_dir,
-            suffix,
-            partial,
-            partial_dir,
-            timeout,
-            contimeout,
-            compress_level,
-            itemize_changes,
-            human_readable,
-            stats,
-        };
-        Self::with_config(transport, config)
-    }
-
     pub fn with_config(transport: T, config: SyncConfig) -> Self {
         let perf_monitor = if config.perf {
             Some(Arc::new(Mutex::new(PerformanceMonitor::new(
@@ -2573,11 +2435,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::cli::SymlinkMode;
-    use crate::integrity::ChecksumType;
+    use crate::compress::CompressionDetection;
     use crate::transport::local::LocalTransport;
     use std::fs;
     use tempfile::TempDir;
@@ -2585,60 +2445,7 @@ mod tests {
     // Helper to create a basic sync engine for testing
     fn create_test_engine() -> SyncEngine<LocalTransport> {
         let transport = LocalTransport::new();
-        SyncEngine::new(
-            transport,
-            false,               // dry_run
-            false,               // diff_mode
-            false,               // delete
-            50,                  // max_delete
-            false,               // trash
-            true,                // quiet
-            4,                   // max_concurrent
-            100,                 // max_errors
-            None,                // min_size
-            None,                // max_size
-            FilterEngine::new(), // filter_engine
-            None,                // bwlimit
-            false,               // resume
-            0,                   // checkpoint_files
-            0,                   // checkpoint_bytes
-            false,               // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache (disabled in tests to avoid side effects)
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
-        )
+        SyncEngine::with_config(transport, SyncConfig::test_default())
     }
 
     #[tokio::test]
@@ -2711,59 +2518,12 @@ mod tests {
         fs::write(source_dir.path().join("file.txt"), "content").unwrap();
 
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            true,                // dry_run = true
-            false,               // diff_mode
-            false,               // delete
-            50,                  // max_delete
-            false,               // trash
-            true,                // quiet
-            4,                   // max_concurrent
-            100,                 // max_errors
-            None,                // min_size
-            None,                // max_size
-            FilterEngine::new(), // filter_engine
-            None,                // bwlimit
-            false,               // resume
-            0,                   // checkpoint_files
-            0,                   // checkpoint_bytes
-            false,               // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                dry_run: true,
+                ..SyncConfig::test_default()
+            },
         );
 
         let stats = engine
@@ -3077,59 +2837,13 @@ mod tests {
 
         // Create engine with max_errors = 0 (unlimited)
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false,               // dry_run
-            false,               // diff_mode
-            false,               // delete
-            50,                  // max_delete
-            false,               // trash
-            true,                // quiet
-            1,                   // max_concurrent (serial to make errors predictable)
-            0,                   // max_errors = 0 (unlimited)
-            None,                // min_size
-            None,                // max_size
-            FilterEngine::new(), // filter_engine
-            None,                // bwlimit
-            false,               // resume
-            0,                   // checkpoint_files
-            0,                   // checkpoint_bytes
-            false,               // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                max_concurrent: 1,
+                max_errors: 0,
+                ..SyncConfig::test_default()
+            },
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -3172,59 +2886,13 @@ mod tests {
 
         // Create engine with max_errors = 3
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false,               // dry_run
-            false,               // diff_mode
-            false,               // delete
-            50,                  // max_delete
-            false,               // trash
-            true,                // quiet
-            1,                   // max_concurrent (serial)
-            3,                   // max_errors = 3
-            None,                // min_size
-            None,                // max_size
-            FilterEngine::new(), // filter_engine
-            None,                // bwlimit
-            false,               // resume
-            0,                   // checkpoint_files
-            0,                   // checkpoint_bytes
-            false,               // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                max_concurrent: 1,
+                max_errors: 3,
+                ..SyncConfig::test_default()
+            },
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -3269,59 +2937,13 @@ mod tests {
 
         // Create engine with max_errors = 5 (higher than expected errors)
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false,               // dry_run
-            false,               // diff_mode
-            false,               // delete
-            50,                  // max_delete
-            false,               // trash
-            true,                // quiet
-            1,                   // max_concurrent
-            5,                   // max_errors = 5 (above expected errors)
-            None,                // min_size
-            None,                // max_size
-            FilterEngine::new(), // filter_engine
-            None,                // bwlimit
-            false,               // resume
-            0,                   // checkpoint_files
-            0,                   // checkpoint_bytes
-            false,               // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                max_concurrent: 1,
+                max_errors: 5,
+                ..SyncConfig::test_default()
+            },
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
@@ -3363,59 +2985,13 @@ mod tests {
 
         // Create engine with low threshold
         let transport = LocalTransport::new();
-        let engine = SyncEngine::new(
+        let engine = SyncEngine::with_config(
             transport,
-            false, // dry_run
-            false, // diff_mode
-            false, // delete
-            50,    // max_delete
-            false, // trash
-            true,  // quiet
-            1,     // max_concurrent
-            2,     // max_errors = 2 (will be exceeded)
-            None,  // min_size
-            None,  // max_size
-            FilterEngine::new(),
-            None,  // bwlimit
-            false, // resume
-            0,     // checkpoint_files
-            0,     // checkpoint_bytes
-            false, // json
-            ChecksumType::Fast,
-            false, // verify_on_write
-            SymlinkMode::Preserve,
-            false, // preserve_xattrs
-            false, // preserve_hardlinks
-            false, // preserve_acls
-            false, // preserve_flags
-            false, // progress
-            false, // ignore_times
-            false, // size_only
-            false, // checksum
-            false, // update_only
-            false, // ignore_existing
-            false, // cache
-            false, // clear_cache
-            false, // checksum_db
-            false, // clear_checksum_db
-            false, // prune_checksum_db
-            false, // dest_is_remote
-            false, // perf
-            // rsync-compat flags
-            false,           // remove_source_files
-            false,           // existing
-            false,           // dirs
-            None,            // backup
-            None,            // backup_dir
-            "~".to_string(), // suffix
-            None,            // partial
-            None,            // partial_dir
-            None,            // timeout
-            None,            // contimeout
-            None,            // compress_level
-            false,           // itemize_changes
-            false,           // human_readable
-            false,           // stats
+            SyncConfig {
+                max_concurrent: 1,
+                max_errors: 2,
+                ..SyncConfig::test_default()
+            },
         );
 
         let result = engine.sync(source_dir.path(), dest_dir.path()).await;
