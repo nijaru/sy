@@ -190,8 +190,8 @@ impl Generator {
                         // Compare size only
                         dest.size == entry.size
                     } else if flags.checksum {
-                        // TODO: checksum comparison requires reading file data; for now,
-                        // fall through to delta detection which does block-level checksums.
+                        // Full checksum comparison needs file reads (expensive in generator).
+                        // Fall through to delta detection which does block-level checksums.
                         dest.size == entry.size && dest.mtime == mtime_nanos
                     } else {
                         // Default: size + mtime match

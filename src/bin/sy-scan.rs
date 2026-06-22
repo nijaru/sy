@@ -20,10 +20,6 @@ fn main() {
         Ok(files) => {
             let duration = start.elapsed();
             println!("Scanned {} files in {:.2?}", files.len(), duration);
-
-            // Keep process alive to check memory
-            // println!("Press enter to exit...");
-            // std::io::stdin().read_line(&mut String::new()).unwrap();
         }
         Err(e) => eprintln!("Error: {}", e),
     }
