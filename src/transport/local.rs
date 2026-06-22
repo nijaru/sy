@@ -67,77 +67,25 @@ fn copy_sparse_file(source: &Path, dest: &Path) -> std::io::Result<u64> {
 #[cfg(unix)]
 fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::io::AsRawFd;
 
-    const SEEK_DATA: i32 = 3; // Find next data region
-    const SEEK_HOLE: i32 = 4; // Find next hole
+    let regions = crate::sparse::detect_data_regions(source)?;
 
     let mut src_file = File::open(source)?;
-    let src_meta = src_file.metadata()?;
-    let file_size = src_meta.len();
+    let file_size = src_file.metadata()?.len();
 
     if dest.exists() {
         fs::remove_file(dest)?;
     }
     let mut dst_file = File::create(dest)?;
 
-    let mut pos: i64 = 0;
-    let file_size_i64 = file_size as i64;
-    let src_fd = src_file.as_raw_fd();
+    let mut buffer = vec![0u8; 1024 * 1024];
 
-    // Try SEEK_DATA first to check if supported
-    let first_data = unsafe { libc::lseek(src_fd, 0, SEEK_DATA) };
-    if first_data < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINVAL) || err.raw_os_error() == Some(libc::ENXIO) {
-            return Err(err); // Not supported, caller will fall back
-        }
-        return Err(err);
-    }
-
-    // APFS quirk: SEEK_DATA returns file_size instead of an error.
-    // Would cause zero regions and a zero-length dest copy = data loss.
-    if first_data >= file_size_i64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SEEK_DATA returned past EOF",
-        ));
-    }
-
-    // Seek back to start
-    unsafe { libc::lseek(src_fd, 0, libc::SEEK_SET) };
-    src_file.seek(SeekFrom::Start(0))?;
-
-    // Track first region offset for APFS sanity check
-    let mut first_copied_offset: i64 = -1;
-
-    while pos < file_size_i64 {
-        let data_start = unsafe { libc::lseek(src_fd, pos, SEEK_DATA) };
-        if data_start < 0 {
-            break; // No more data (ENXIO)
-        }
-        if data_start >= file_size_i64 {
-            break;
-        }
-
-        if first_copied_offset < 0 {
-            first_copied_offset = data_start;
-        }
-
-        let hole_start = unsafe { libc::lseek(src_fd, data_start, SEEK_HOLE) };
-        let data_end = if hole_start < 0 || hole_start > file_size_i64 {
-            file_size_i64
-        } else {
-            hole_start
-        };
-
-        let data_len = (data_end - data_start) as usize;
-        src_file.seek(SeekFrom::Start(data_start as u64))?;
-        dst_file.seek(SeekFrom::Start(data_start as u64))?;
+    for region in &regions {
+        let data_len = region.length as usize;
+        src_file.seek(SeekFrom::Start(region.offset))?;
+        dst_file.seek(SeekFrom::Start(region.offset))?;
 
         let mut remaining = data_len;
-        let mut buffer = vec![0u8; 1024 * 1024];
-
         while remaining > 0 {
             let chunk_size = remaining.min(buffer.len());
             let read = src_file.read(&mut buffer[..chunk_size])?;
@@ -147,17 +95,6 @@ fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
             dst_file.write_all(&buffer[..read])?;
             remaining = remaining.saturating_sub(read);
         }
-
-        pos = data_end;
-    }
-
-    // If no regions were found or SEEK_HOLE reported data at 0 while first_data
-    // was at a non-zero offset, SEEK_HOLE is broken (APFS). Fall back.
-    if first_copied_offset < 0 || (first_data > 0 && first_copied_offset == 0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SEEK_HOLE not working — sparse detection unreliable",
-        ));
     }
 
     dst_file.set_len(file_size)?;

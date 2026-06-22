@@ -5,6 +5,7 @@ use crate::delta::{calculate_block_size, generate_delta_streaming, BlockChecksum
 use crate::error::{Result, SyncError};
 use crate::resume::{TransferState, DEFAULT_CHUNK_SIZE};
 use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::sparse;
 use crate::ssh::config::SshConfig;
 use crate::ssh::connect;
 use crate::sync::scanner::{FileEntry, ScanOptions};
@@ -19,96 +20,6 @@ use std::time::Duration;
 use std::time::{Instant, UNIX_EPOCH};
 
 // Temporary inlined sparse detection (module resolution issue workaround)
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-
-/// Represents a contiguous region of data in a sparse file
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct DataRegion {
-    offset: u64,
-    length: u64,
-}
-
-/// Detect data regions in a sparse file using SEEK_HOLE/SEEK_DATA
-#[cfg(unix)]
-fn detect_data_regions(path: &Path) -> std::io::Result<Vec<DataRegion>> {
-    const SEEK_DATA: i32 = 3;
-    const SEEK_HOLE: i32 = 4;
-
-    let file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    if file_size == 0 {
-        return Ok(Vec::new());
-    }
-
-    let fd = file.as_raw_fd();
-    let file_size_i64 = file_size as i64;
-
-    let first_data = unsafe { libc::lseek(fd, 0, SEEK_DATA) };
-    if first_data < 0 {
-        let err = std::io::Error::last_os_error();
-        let errno = err.raw_os_error();
-
-        if errno == Some(libc::EINVAL) || errno == Some(libc::ENXIO) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "SEEK_DATA not supported on this filesystem",
-            ));
-        }
-
-        return Err(err);
-    }
-
-    // APFS quirk: SEEK_DATA returns file_size instead of an error.
-    if first_data >= file_size_i64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SEEK_DATA returned past EOF",
-        ));
-    }
-
-    let mut regions = Vec::new();
-    let mut pos: i64 = 0;
-
-    while pos < file_size_i64 {
-        let data_start = unsafe { libc::lseek(fd, pos, SEEK_DATA) };
-        if data_start < 0 || data_start >= file_size_i64 {
-            break;
-        }
-
-        let hole_start = unsafe { libc::lseek(fd, data_start, SEEK_HOLE) };
-        let data_end = if hole_start < 0 || hole_start > file_size_i64 {
-            file_size_i64
-        } else {
-            hole_start
-        };
-
-        regions.push(DataRegion {
-            offset: data_start as u64,
-            length: (data_end - data_start) as u64,
-        });
-
-        pos = data_end;
-    }
-
-    if regions.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SEEK_DATA found no data regions in non-empty file",
-        ));
-    }
-
-    // APFS sanity check: SEEK_HOLE reports data at 0 but first_data was at large offset
-    if first_data > 0 && regions[0].offset == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SEEK_HOLE not working — sparse detection unreliable",
-        ));
-    }
-
-    Ok(regions)
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ScanOutput {
@@ -684,7 +595,7 @@ impl SshTransport {
 
             // Detect data regions in the sparse file
             #[cfg(unix)]
-            let data_regions = detect_data_regions(&source_path).map_err(|e| {
+            let data_regions = sparse::detect_data_regions(&source_path).map_err(|e| {
                 SyncError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
