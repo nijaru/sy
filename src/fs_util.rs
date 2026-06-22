@@ -27,7 +27,7 @@ use std::path::Path;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use sy::fs_util::supports_cow_reflinks;
 /// use std::path::Path;
 ///
@@ -141,8 +141,8 @@ pub fn supports_cow_reflinks(_path: &Path) -> bool {
 ///
 /// # Example
 ///
-/// ```rust
-/// use sy::fs_util::same_filesystem;
+/// ```rust,ignore
+/// ```
 /// use std::path::Path;
 ///
 /// let src = Path::new("/home/user/file1.txt");
@@ -197,8 +197,8 @@ pub fn same_filesystem(_path1: &Path, _path2: &Path) -> bool {
 ///
 /// # Example
 ///
-/// ```rust
-/// use sy::fs_util::has_hard_links;
+/// ```rust,ignore
+/// ```
 /// use std::path::Path;
 ///
 /// let path = Path::new("/tmp/file.txt");

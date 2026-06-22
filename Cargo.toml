@@ -187,3 +187,39 @@ path = "tests/sync/advanced.rs"
 [[test]]
 name = "sync_ssh"
 path = "tests/sync/ssh.rs"
+
+[[test]]
+name = "sync_archive"
+path = "tests/sync/archive.rs"
+
+[[test]]
+name = "sync_change_ratio"
+path = "tests/sync/change_ratio.rs"
+
+[[test]]
+name = "sync_compression"
+path = "tests/sync/compression.rs"
+
+[[test]]
+name = "sync_delta"
+path = "tests/sync/delta.rs"
+
+[[test]]
+name = "sync_hardlinks"
+path = "tests/sync/hardlinks.rs"
+
+[[test]]
+name = "sync_large_file"
+path = "tests/sync/large_file.rs"
+
+[[test]]
+name = "sync_massive_dir"
+path = "tests/sync/massive_dir.rs"
+
+[[test]]
+name = "sync_property"
+path = "tests/sync/property.rs"
+
+[[test]]
+name = "sync_symlinks"
+path = "tests/sync/symlinks.rs"

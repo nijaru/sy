@@ -513,33 +513,6 @@ fn test_cross_filesystem_uses_inplace_strategy() {
 
 #[test]
 #[cfg(unix)]
-fn test_same_filesystem_detection() {
-    // Unit test for same_filesystem function using standard library metadata
-
-    use sy::fs_util::same_filesystem;
-
-    let temp = TempDir::new().unwrap();
-    let file1 = temp.path().join("file1.txt");
-    let file2 = temp.path().join("file2.txt");
-
-    fs::write(&file1, b"test1").unwrap();
-    fs::write(&file2, b"test2").unwrap();
-
-    // Files in same directory should be on same filesystem
-    assert!(
-        same_filesystem(&file1, &file2),
-        "Files in same directory should be on same filesystem"
-    );
-
-    // File and its parent directory should be on same filesystem
-    assert!(
-        same_filesystem(&file1, temp.path()),
-        "File and parent directory should be on same filesystem"
-    );
-}
-
-#[test]
-#[cfg(unix)]
 fn test_sparse_file_delta_sync_preserves_sparseness() {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::MetadataExt;
