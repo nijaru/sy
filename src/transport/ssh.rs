@@ -50,18 +50,22 @@ fn detect_data_regions(path: &Path) -> std::io::Result<Vec<DataRegion>> {
         let err = std::io::Error::last_os_error();
         let errno = err.raw_os_error();
 
-        if errno == Some(libc::EINVAL) {
-            return Err(err);
-        }
-
-        if errno == Some(libc::ENXIO) {
+        if errno == Some(libc::EINVAL) || errno == Some(libc::ENXIO) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "SEEK_DATA not properly supported (got ENXIO)",
+                "SEEK_DATA not supported on this filesystem",
             ));
         }
 
         return Err(err);
+    }
+
+    // APFS quirk: SEEK_DATA returns file_size instead of an error.
+    if first_data >= file_size_i64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SEEK_DATA returned past EOF",
+        ));
     }
 
     let mut regions = Vec::new();
@@ -86,6 +90,21 @@ fn detect_data_regions(path: &Path) -> std::io::Result<Vec<DataRegion>> {
         });
 
         pos = data_end;
+    }
+
+    if regions.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SEEK_DATA found no data regions in non-empty file",
+        ));
+    }
+
+    // APFS sanity check: SEEK_HOLE reports data at 0 but first_data was at large offset
+    if first_data > 0 && regions[0].offset == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SEEK_HOLE not working — sparse detection unreliable",
+        ));
     }
 
     Ok(regions)

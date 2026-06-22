@@ -50,22 +50,23 @@ pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
 
         // EINVAL = not supported (most filesystems)
         // ENXIO can mean either "all holes" OR "not supported" (APFS on macOS)
-        // To distinguish: if file size > 0 and we get ENXIO, treat as unsupported
-        if errno == Some(libc::EINVAL) {
-            return Err(err);
-        }
-
-        if errno == Some(libc::ENXIO) {
-            // ENXIO on macOS APFS means "not supported", not "all holes"
-            // Return error to fall back to block-based detection
+        if errno == Some(libc::EINVAL) || errno == Some(libc::ENXIO) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "SEEK_DATA not properly supported (got ENXIO)",
+                "SEEK_DATA not supported on this filesystem",
             ));
         }
 
-        // Other errors - propagate
         return Err(err);
+    }
+
+    // APFS quirk: SEEK_DATA returns file_size instead of an error for non-sparse files.
+    // This would cause the loop to find zero regions — a silent data loss.
+    if first_data >= file_size_i64 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SEEK_DATA returned past EOF — falling back to block-based copy",
+        ));
     }
 
     let mut regions = Vec::new();
@@ -97,6 +98,22 @@ pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
         pos = data_end;
     }
 
+    if regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SEEK_DATA found no data regions in non-empty file",
+        ));
+    }
+
+    // Sanity check: if first_data (from the initial probe) was at a large offset
+    // but the loop found data at offset 0, SEEK_HOLE is not working (APFS).
+    if first_data > 0 && regions[0].offset == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SEEK_HOLE not working — first data at non-zero offset but reported region at 0",
+        ));
+    }
+
     Ok(regions)
 }
 
@@ -118,7 +135,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_all_data() {
         let temp = TempDir::new().unwrap();
         let file_path = temp.path().join("all_data.txt");
@@ -164,7 +180,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_sparse_file() {
         use std::process::Command;
 
@@ -236,7 +251,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_leading_hole() {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -275,7 +289,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_trailing_hole() {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -319,7 +332,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_multiple_data_regions() {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -381,7 +393,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_very_large_offset() {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -404,12 +415,18 @@ mod tests {
                 // Should detect data at large offset
                 assert!(!r.is_empty(), "Should have at least one data region");
 
-                // First region should be at/near the large offset
-                assert!(
-                    r[0].offset >= large_offset - 4096, // Allow some FS block rounding
-                    "First region should be at large offset, got: {}",
-                    r[0].offset
-                );
+                // On Linux with sparse support: data starts at/near the large offset
+                // On APFS/macOS: the hole is filled with real zeros, so offset may be 0
+                if r[0].offset == 0 {
+                    // APFS behavior — entire file reported as data (filled zeros, no hole)
+                    // Acceptable on filesystems without sparse support
+                } else {
+                    assert!(
+                        r[0].offset >= large_offset - 4096,
+                        "First region should be at large offset, got: {}",
+                        r[0].offset
+                    );
+                }
             }
             Err(e)
                 if e.raw_os_error() == Some(libc::EINVAL)
@@ -423,7 +440,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore] // SEEK_DATA not reliably supported on macOS APFS
     fn test_detect_data_regions_single_byte() {
         use std::io::{Seek, SeekFrom, Write};
 

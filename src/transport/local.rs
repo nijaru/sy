@@ -89,17 +89,27 @@ fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
     let first_data = unsafe { libc::lseek(src_fd, 0, SEEK_DATA) };
     if first_data < 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINVAL) {
+        if err.raw_os_error() == Some(libc::EINVAL) || err.raw_os_error() == Some(libc::ENXIO) {
             return Err(err); // Not supported, caller will fall back
         }
-        // ENXIO means file is all holes - just set size and return
-        dst_file.set_len(file_size)?;
-        return Ok(file_size);
+        return Err(err);
+    }
+
+    // APFS quirk: SEEK_DATA returns file_size instead of an error.
+    // Would cause zero regions and a zero-length dest copy = data loss.
+    if first_data >= file_size_i64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SEEK_DATA returned past EOF",
+        ));
     }
 
     // Seek back to start
     unsafe { libc::lseek(src_fd, 0, libc::SEEK_SET) };
     src_file.seek(SeekFrom::Start(0))?;
+
+    // Track first region offset for APFS sanity check
+    let mut first_copied_offset: i64 = -1;
 
     while pos < file_size_i64 {
         let data_start = unsafe { libc::lseek(src_fd, pos, SEEK_DATA) };
@@ -108,6 +118,10 @@ fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
         }
         if data_start >= file_size_i64 {
             break;
+        }
+
+        if first_copied_offset < 0 {
+            first_copied_offset = data_start;
         }
 
         let hole_start = unsafe { libc::lseek(src_fd, data_start, SEEK_HOLE) };
@@ -135,6 +149,15 @@ fn copy_sparse_file_seek(source: &Path, dest: &Path) -> std::io::Result<u64> {
         }
 
         pos = data_end;
+    }
+
+    // If no regions were found or SEEK_HOLE reported data at 0 while first_data
+    // was at a non-zero offset, SEEK_HOLE is broken (APFS). Fall back.
+    if first_copied_offset < 0 || (first_data > 0 && first_copied_offset == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SEEK_HOLE not working — sparse detection unreliable",
+        ));
     }
 
     dst_file.set_len(file_size)?;
