@@ -130,6 +130,7 @@ impl Transport for S3Transport {
                 nlink: 1,
                 acls: None,
                 bsd_flags: None,
+                mode: 0o644,
             });
         }
 
@@ -190,6 +191,7 @@ impl Transport for S3Transport {
                 nlink: 1,
                 acls: None,
                 bsd_flags: None,
+                mode: 0o644,
             })
         });
 

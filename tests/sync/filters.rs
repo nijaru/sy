@@ -182,7 +182,7 @@ fn test_filter_flag_exclude_syntax() {
 #[test]
 fn test_exclude_from_file() {
     let (source, dest) = setup_test_dir();
-    let filter_file = TempDir::new().unwrap().into_path().join("exclude.txt");
+    let filter_file = TempDir::new().unwrap().keep().join("exclude.txt");
 
     fs::write(&filter_file, "*.log\n*.tmp").unwrap();
     fs::write(source.path().join("keep.txt"), "keep").unwrap();
@@ -204,7 +204,7 @@ fn test_exclude_from_file() {
 #[test]
 fn test_include_from_file() {
     let (source, dest) = setup_test_dir();
-    let filter_file = TempDir::new().unwrap().into_path().join("include.txt");
+    let filter_file = TempDir::new().unwrap().keep().join("include.txt");
 
     fs::write(&filter_file, "*.txt").unwrap();
     fs::write(source.path().join("include.txt"), "include").unwrap();

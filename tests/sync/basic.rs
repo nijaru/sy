@@ -3,7 +3,7 @@
 //! Covers: basic sync, dry run, delete mode, nested dirs, quiet mode, error handling.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1339,8 +1339,7 @@ fn test_backup_readonly_dir() {
     );
 
     // Restore permissions for cleanup
-    let mut perms = fs::metadata(dest.path()).unwrap().permissions();
-    perms.set_readonly(false);
+    let perms = fs::Permissions::from_mode(0o644);
     fs::set_permissions(dest.path(), perms).unwrap();
 }
 

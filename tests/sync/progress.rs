@@ -165,5 +165,5 @@ fn test_progress_json_mode() {
     assert!(dest.path().join("file.txt").exists());
 
     // JSON mode should output valid JSON
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _stdout = String::from_utf8_lossy(&output.stdout);
 }

@@ -1,5 +1,5 @@
+use crate::sync::config::SyncConfig;
 use crate::sync::session::{EndpointPair, SyncSession};
-use crate::sync::SyncConfig;
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -169,13 +169,13 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&destination).unwrap();
 
-        let source_endpoint = EndpointPair::Local {
-            path: source.clone(),
-        };
-        let dest_endpoint = EndpointPair::Local {
-            path: destination.clone(),
-        };
-        let config = SyncConfig::default();
+        let source_endpoint = EndpointPair::Local(Box::new(
+            crate::endpoint::local::LocalEndpoint::new(source.clone()),
+        ));
+        let dest_endpoint = EndpointPair::Local(Box::new(
+            crate::endpoint::local::LocalEndpoint::new(destination.clone()),
+        ));
+        let config = SyncConfig::test_default();
 
         let session = SyncSession::new(source_endpoint, dest_endpoint, config);
         let watch_session = WatchSession::new(
@@ -198,13 +198,13 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&destination).unwrap();
 
-        let source_endpoint = EndpointPair::Local {
-            path: source.clone(),
-        };
-        let dest_endpoint = EndpointPair::Local {
-            path: destination.clone(),
-        };
-        let config = SyncConfig::default();
+        let source_endpoint = EndpointPair::Local(Box::new(
+            crate::endpoint::local::LocalEndpoint::new(source.clone()),
+        ));
+        let dest_endpoint = EndpointPair::Local(Box::new(
+            crate::endpoint::local::LocalEndpoint::new(destination.clone()),
+        ));
+        let config = SyncConfig::test_default();
 
         let session = SyncSession::new(source_endpoint, dest_endpoint, config);
         let watch_session =

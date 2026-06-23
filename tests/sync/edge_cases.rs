@@ -3,7 +3,7 @@
 //! Consolidates: edge_cases_test.rs, trailing_slash_behavior_test.rs, remote_to_local_parent_dirs_test.rs.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;

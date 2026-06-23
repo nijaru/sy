@@ -1164,7 +1164,7 @@ mod tests {
 
         // Execute second file (same inode)
         let entry2 = FileEntry {
-            path: Arc::new(PathBuf::from(format!("/source/link.txt"))),
+            path: Arc::new(PathBuf::from("/source/link.txt")),
             relative_path: Arc::new(PathBuf::from("link.txt")),
             size: 7,
             modified: std::time::SystemTime::now(),

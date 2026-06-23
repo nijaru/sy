@@ -1621,7 +1621,7 @@ mod tests {
             checksums.push(BlockChecksum {
                 offset: i * 4096,
                 weak: i as u32,
-                strong: i as u64,
+                strong: i,
             });
         }
         let entry = DestFileEntry {

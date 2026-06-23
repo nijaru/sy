@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 
 #[cfg(test)]
-use crate::cli::SymlinkMode;
-#[cfg(test)]
-use crate::integrity::ChecksumType;
+use crate::sync::config::SyncConfig;
 
 pub struct WatchMode<T: Transport> {
     engine: SyncEngine<T>,
