@@ -2437,7 +2437,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compress::CompressionDetection;
     use crate::transport::local::LocalTransport;
     use std::fs;
     use tempfile::TempDir;

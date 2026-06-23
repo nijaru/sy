@@ -13,7 +13,7 @@ fn sy_bin() -> String {
     env!("CARGO_BIN_EXE_sy").to_string()
 }
 
-fn setup_test_dir(name: &str) -> (TempDir, TempDir) {
+fn setup_test_dir(_name: &str) -> (TempDir, TempDir) {
     let source = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();
 
