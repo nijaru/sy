@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       dry-run:
@@ -92,10 +89,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --all
+        run: cargo test
 
   # ============================================================================
   # STAGE 2: Build binaries (parallel)
@@ -149,7 +146,7 @@ jobs:
           path: dist/${{ matrix.artifact_name }}.tar.gz*
 
   # ============================================================================
-  # STAGE 3: Create GitHub Release
+  # STAGE 3: Create GitHub Release (stays draft until manually published)
   # ============================================================================
 
   create-release:
@@ -168,7 +165,7 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
-      - name: Create Release
+      - name: Create Draft Release
         run: |
           gh release create ${{ needs.verify.outputs.tag }} \
             --title "${{ needs.verify.outputs.tag }}" \
@@ -264,29 +261,3 @@ jobs:
           git add Formula/sy.rb
           git commit -m "chore: update sy to ${{ needs.verify.outputs.tag }}"
           git push
-
-  # ============================================================================
-  # STAGE 6: Finalize release
-  # ============================================================================
-
-  finalize:
-    name: Finalize Release
-    needs: [verify, create-release, publish-crates, update-homebrew]
-    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Publish GitHub release
-        run: gh release edit ${{ needs.verify.outputs.tag }} --draft=false
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Summary
-        run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ needs.verify.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **GitHub Release**: https://github.com/nijaru/sy/releases/tag/${{ needs.verify.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **crates.io**: https://crates.io/crates/sy/${{ needs.verify.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Homebrew**: \`brew upgrade sy\`" >> $GITHUB_STEP_SUMMARY
