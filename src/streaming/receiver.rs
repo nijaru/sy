@@ -394,22 +394,18 @@ impl Receiver {
 
     async fn handle_data_end(&mut self, end: DataEnd) -> Result<()> {
         if let Some(mut pending) = self.pending_files.remove(&end.path) {
+            // Set permissions on the open FD (fchmod) before dropping it,
+            // avoiding TOCTOU race with path-based chmod + rename.
             if let Some(mut file) = pending.file.take() {
                 file.flush().await?;
                 file.sync_all().await?;
-            }
 
-            let full_path = validate_path(&self.config.root, &end.path)?;
-
-            if end.status == DataEnd::STATUS_OK {
-                // Set permissions and mtime on temp file BEFORE rename
-                // so the final path always has correct metadata
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let perms =
                         std::fs::Permissions::from_mode(safe_received_mode(pending.entry.mode));
-                    if let Err(e) = fs::set_permissions(&pending.temp_path, perms).await {
+                    if let Err(e) = file.set_permissions(perms).await {
                         tracing::warn!(
                             "Failed to set permissions on {}: {}",
                             pending.temp_path.display(),
@@ -417,7 +413,11 @@ impl Receiver {
                         );
                     }
                 }
+            }
 
+            let full_path = validate_path(&self.config.root, &end.path)?;
+
+            if end.status == DataEnd::STATUS_OK {
                 // Set mtime on temp file (mtime field stores total nanoseconds since epoch)
                 let mtime_secs = pending.entry.mtime / 1_000_000_000;
                 let mtime_nanos = (pending.entry.mtime % 1_000_000_000) as u32;

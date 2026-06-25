@@ -767,6 +767,7 @@ impl SshTransport {
         dest: &Path,
         file_size: u64,
         mtime: std::time::SystemTime,
+        mode: u32,
     ) -> Result<TransferResult> {
         let pool_size = self.connection_pool.size();
         // Use parallel transfer for files > 20MB if we have multiple connections
@@ -840,7 +841,12 @@ impl SshTransport {
                 // Note: we must open in a mode that allows random access and doesn't truncate
                 use ssh2::OpenFlags;
                 let mut remote_file = sftp
-                    .open_mode(&dest_path, OpenFlags::WRITE, 0o644, ssh2::OpenType::File)
+                    .open_mode(
+                        &dest_path,
+                        OpenFlags::WRITE,
+                        mode as i32,
+                        ssh2::OpenType::File,
+                    )
                     .map_err(|e| std::io::Error::other(format!("SFTP open failed: {}", e)))?;
 
                 remote_file
@@ -907,7 +913,7 @@ impl SshTransport {
                         size: Some(file_size),
                         uid: None,
                         gid: None,
-                        perm: None,
+                        perm: Some(mode),
                         atime: Some(mtime_secs),
                         mtime: Some(mtime_secs),
                     },
@@ -1384,6 +1390,13 @@ impl Transport for SshTransport {
                     })?;
 
                     let file_size = metadata.len();
+                    #[cfg(unix)]
+                    let source_mode = {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.mode()
+                    };
+                    #[cfg(not(unix))]
+                    let source_mode = 0o644u32;
                     let filename = source_path
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -1506,8 +1519,15 @@ impl Transport for SshTransport {
                         Compression::None => {
                             // Try parallel upload first
                             if let Ok(mtime) = metadata.modified() {
+                                #[cfg(unix)]
+                                let mode = {
+                                    use std::os::unix::fs::MetadataExt;
+                                    metadata.mode()
+                                };
+                                #[cfg(not(unix))]
+                                let mode = 0o644u32;
                                 if let Ok(result) = tokio::runtime::Handle::current().block_on(
-                                    transport.upload_file_parallel(&source_path, &dest_path, file_size, mtime)
+                                    transport.upload_file_parallel(&source_path, &dest_path, file_size, mtime, mode)
                                 ) {
                                     return Ok(result);
                                 }
@@ -1613,7 +1633,7 @@ impl Transport for SshTransport {
                                     .open_mode(
                                         &dest_path,
                                         OpenFlags::WRITE,
-                                        0o644,
+                                        source_mode as i32,
                                         ssh2::OpenType::File,
                                     )
                                     .map_err(|e| {
@@ -1731,7 +1751,7 @@ impl Transport for SshTransport {
                                 is_resuming
                             );
 
-                            // Set modification time
+                            // Set modification time and permissions
                             if let Ok(modified) = metadata.modified() {
                                 if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
                                     let mtime = duration.as_secs();
@@ -1742,7 +1762,7 @@ impl Transport for SshTransport {
                                             size: Some(bytes_written),
                                             uid: None,
                                             gid: None,
-                                            perm: None,
+                                            perm: Some(source_mode),
                                             atime: Some(atime),
                                             mtime: Some(mtime),
                                         },
