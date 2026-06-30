@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-30
+
+### Changed
+
+- All production `.unwrap()` calls converted to `.expect()` with descriptive messages (79 sites)
+
+### Fixed
+
+- Perf regression test thresholds relaxed for slower machines
+- Resume state tests use process-scoped temp dir via `SY_CACHE_DIR` to avoid parallel test races
+
+### Added
+
+- 13 new proptest/fuzz tests: delta round-trip, protocol decoder fuzzing, filter property tests, checksum round-trip
+
 ## [0.4.0] - 2026-06-23
 
 ### Highlights

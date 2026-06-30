@@ -222,7 +222,7 @@ impl<'a> TaskExecutor<'a> {
         if self.config.preserve_hardlinks && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
                 let first_path = {
-                    let map = self.hardlink_map.lock().unwrap();
+                    let map = self.hardlink_map.lock().expect("hardlink map poisoned");
                     map.get(&inode).cloned()
                 };
                 if let Some(first_path) = first_path {
@@ -300,7 +300,7 @@ impl<'a> TaskExecutor<'a> {
             Ok(()) => {
                 if self.config.preserve_hardlinks && source_entry.nlink > 1 {
                     if let Some(inode) = source_entry.inode {
-                        let mut map = self.hardlink_map.lock().unwrap();
+                        let mut map = self.hardlink_map.lock().expect("hardlink map poisoned");
                         map.insert(inode, task.dest_path.clone());
                     }
                 }

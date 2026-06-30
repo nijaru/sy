@@ -33,7 +33,7 @@ pub fn create_file_progress_bar(file_path: &Path, total_bytes: u64) -> Arc<Progr
         ProgressStyle::with_template(
             "{msg}\n[{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {bytes_per_sec} ETA: {eta}"
         )
-        .unwrap()
+        .expect("built-in template is valid")
         .progress_chars("=>-")
     );
 

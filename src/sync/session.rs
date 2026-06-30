@@ -508,8 +508,8 @@ impl SyncSession {
         // For single file sync, use the parent directory as the endpoint root
         let source_parent = source.parent().unwrap_or(Path::new("."));
         let dest_parent = dest.parent().unwrap_or(Path::new("."));
-        let source_filename = source.file_name().unwrap();
-        let dest_filename = dest.file_name().unwrap();
+        let source_filename = source.file_name().expect("source path has filename");
+        let dest_filename = dest.file_name().expect("dest path has filename");
 
         let source_ep = LocalEndpoint::new(source_parent.to_path_buf());
         let dest_ep = LocalEndpoint::new(dest_parent.to_path_buf());

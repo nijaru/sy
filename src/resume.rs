@@ -92,7 +92,10 @@ impl TransferState {
 
     /// Get resume state directory (~/.cache/sy/resume/)
     fn get_resume_dir() -> Result<PathBuf> {
-        let cache_dir = if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
+        // Allow test isolation via SY_CACHE_DIR
+        let cache_dir = if let Ok(dir) = std::env::var("SY_CACHE_DIR") {
+            PathBuf::from(dir)
+        } else if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
             PathBuf::from(xdg_cache)
         } else if let Ok(home) = std::env::var("HOME") {
             PathBuf::from(home).join(".cache")
@@ -260,7 +263,18 @@ impl TransferState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
     use std::time::Duration;
+
+    static INIT: Once = Once::new();
+
+    fn init_test_cache() {
+        INIT.call_once(|| {
+            let dir = tempfile::TempDir::new().expect("failed to create test cache dir");
+            // Keep the TempDir alive for the entire test process
+            std::env::set_var("SY_CACHE_DIR", dir.keep());
+        });
+    }
 
     #[test]
     fn test_new_transfer_state() {
@@ -376,6 +390,8 @@ mod tests {
 
     #[test]
     fn test_save_and_load() -> Result<()> {
+        init_test_cache();
+
         // Use unique paths to avoid race conditions with parallel tests
         let test_id = std::process::id();
         let source = PathBuf::from(format!("/tmp/test_source_{}.txt", test_id));
@@ -406,6 +422,8 @@ mod tests {
 
     #[test]
     fn test_load_stale_state() -> Result<()> {
+        init_test_cache();
+
         let test_id = std::process::id();
         let source = PathBuf::from(format!("/tmp/test_stale_source_{}.txt", test_id));
         let dest = PathBuf::from(format!("/tmp/test_stale_dest_{}.txt", test_id));
@@ -426,6 +444,8 @@ mod tests {
 
     #[test]
     fn test_clear_all() -> Result<()> {
+        init_test_cache();
+
         let source1 = PathBuf::from("/tmp/test_clear_source1.txt");
         let dest1 = PathBuf::from("/tmp/test_clear_dest1.txt");
         let source2 = PathBuf::from("/tmp/test_clear_source2.txt");

@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# Proptest regression files (auto-generated)
+*.proptest-regressions
+
 # IDE
 .idea/
 .vscode/

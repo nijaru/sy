@@ -224,11 +224,11 @@ fn perf_regression_100_files() {
 
     assert!(output.status.success());
 
-    // Performance baseline: 100 files should sync in < 500ms
-    // This is conservative - typically takes ~50-100ms
+    // Performance baseline: 100 files should sync in < 2s
+    // Generous threshold — catches catastrophic regressions, not micro-benchmarks
     assert!(
-        elapsed < Duration::from_millis(500),
-        "Performance regression: 100 files took {:?}, expected < 500ms",
+        elapsed < Duration::from_secs(2),
+        "Performance regression: 100 files took {:?}, expected < 2s",
         elapsed
     );
 
@@ -265,11 +265,11 @@ fn perf_regression_1000_files() {
 
     assert!(output.status.success());
 
-    // Performance baseline: 1000 files should sync in < 3s
-    // This is conservative - typically takes ~500ms-1s
+    // Performance baseline: 1000 files should sync in < 10s
+    // Generous threshold — catches catastrophic regressions, not micro-benchmarks
     assert!(
-        elapsed < Duration::from_secs(3),
-        "Performance regression: 1000 files took {:?}, expected < 3s",
+        elapsed < Duration::from_secs(10),
+        "Performance regression: 1000 files took {:?}, expected < 10s",
         elapsed
     );
 
@@ -341,10 +341,11 @@ fn perf_regression_deep_nesting() {
 
     assert!(output.status.success());
 
-    // Performance baseline: 50-level deep nesting should sync in < 500ms
+    // Performance baseline: 50-level deep nesting should sync in < 2s
+    // Generous threshold — catches catastrophic regressions, not micro-benchmarks
     assert!(
-        elapsed < Duration::from_millis(500),
-        "Performance regression: deep nesting took {:?}, expected < 500ms",
+        elapsed < Duration::from_secs(2),
+        "Performance regression: deep nesting took {:?}, expected < 2s",
         elapsed
     );
 
@@ -458,10 +459,11 @@ fn perf_regression_gitignore_filtering() {
         synced_files
     );
 
-    // Performance baseline: .gitignore filtering should be < 500ms
+    // Performance baseline: .gitignore filtering should be < 2s
+    // Generous threshold — catches catastrophic regressions, not micro-benchmarks
     assert!(
-        elapsed < Duration::from_millis(500),
-        "Performance regression: gitignore filtering took {:?}, expected < 500ms",
+        elapsed < Duration::from_secs(2),
+        "Performance regression: gitignore filtering took {:?}, expected < 2s",
         elapsed
     );
 

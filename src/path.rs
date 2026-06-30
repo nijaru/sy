@@ -135,7 +135,12 @@ impl SyncPath {
             let before_colon = &s[..colon_pos];
 
             // Check if this is a Windows drive letter (single letter followed by :)
-            if before_colon.len() == 1 && before_colon.chars().next().unwrap().is_ascii_alphabetic()
+            if before_colon.len() == 1
+                && before_colon
+                    .chars()
+                    .next()
+                    .expect("length checked above")
+                    .is_ascii_alphabetic()
             {
                 // Windows drive letter, treat as local
                 return SyncPath::Local {

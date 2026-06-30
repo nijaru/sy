@@ -594,4 +594,62 @@ mod tests {
         let restored = FilterEngine::from_rule_strings(&rules).unwrap();
         assert!(restored.should_include(Path::new("anything.txt"), false));
     }
+
+    // === Proptest: filter engine properties ===
+
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+
+    proptest! {
+        /// Adding a pattern should never panic
+        #[test]
+        fn prop_filter_add_no_panic(
+            pattern in string_regex("[a-zA-Z0-9/_.*-]{1,30}").unwrap(),
+        ) {
+            let mut filter = FilterEngine::new();
+            // May return Err for invalid globs, but must not panic
+            let _ = filter.add_exclude(&pattern);
+            let _ = filter.add_include(&pattern);
+        }
+
+        /// Empty filter engine should include everything
+        #[test]
+        fn prop_empty_filter_includes_all(
+            path in string_regex("[a-zA-Z0-9/_.-]{1,50}").unwrap(),
+            is_dir in any::<bool>(),
+        ) {
+            let filter = FilterEngine::new();
+            prop_assert!(filter.should_include(Path::new(&path), is_dir));
+        }
+
+        /// Serialization round-trip: filter rules should survive to_rule_strings -> from_rule_strings
+        #[test]
+        fn prop_filter_serialization_roundtrip(
+            patterns in prop::collection::vec(string_regex("[a-zA-Z0-9/*_.-]{1,20}").unwrap(), 0..6),
+        ) {
+            let mut filter = FilterEngine::new();
+            for (i, p) in patterns.iter().enumerate() {
+                if i % 2 == 0 {
+                    let _ = filter.add_exclude(p);
+                } else {
+                    let _ = filter.add_include(p);
+                }
+            }
+
+            // Serialize and restore
+            let rules = filter.to_rule_strings();
+            if let Ok(restored) = FilterEngine::from_rule_strings(&rules) {
+                // Test on a few paths
+                for test_path in &["src/main.rs", "target/debug/sy", ".git/config", "file.txt"] {
+                    let p = Path::new(test_path);
+                    // Both filters should agree on test paths
+                    prop_assert_eq!(
+                        filter.should_include(p, false),
+                        restored.should_include(p, false),
+                        "disagreement on {}", test_path
+                    );
+                }
+            }
+        }
+    }
 }

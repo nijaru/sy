@@ -1873,4 +1873,52 @@ mod tests {
         assert_eq!(decoded.max_delete, Some("30%".to_string()));
         assert!(decoded.filter_patterns.is_none());
     }
+
+    // === Fuzz tests — verify decoders don't panic on arbitrary input ===
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Fuzz the frame reader: arbitrary bytes must not panic
+        #[test]
+        fn prop_read_frame_no_panic(data in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut cursor = std::io::Cursor::new(data);
+                // read_frame should return Result, never panic
+                let _result = super::read_frame(&mut cursor).await;
+            });
+        }
+
+        /// MessageType::from_u8 must never panic on any u8 value
+        #[test]
+        fn prop_message_type_from_u8_no_panic(b in any::<u8>()) {
+            let _ = super::MessageType::from_u8(b);
+        }
+
+        #[test]
+        fn prop_file_entry_decode_no_panic(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = super::FileEntry::decode(bytes::Bytes::from(payload));
+        }
+
+        #[test]
+        fn prop_hello_decode_no_panic(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = super::Hello::decode(bytes::Bytes::from(payload));
+        }
+
+        #[test]
+        fn prop_dest_file_entry_decode_no_panic(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = super::DestFileEntry::decode(bytes::Bytes::from(payload));
+        }
+
+        #[test]
+        fn prop_delete_decode_no_panic(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = super::Delete::decode(bytes::Bytes::from(payload));
+        }
+
+        #[test]
+        fn prop_error_decode_no_panic(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = super::Error::decode(bytes::Bytes::from(payload));
+        }
+    }
 }

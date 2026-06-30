@@ -142,7 +142,7 @@ impl ChecksumDatabase {
         let (mtime_secs, mtime_nanos) = system_time_to_parts(mtime);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("current time is after Unix epoch")
             .as_secs() as i64;
 
         let (checksum_type, checksum_blob) = match checksum {

@@ -213,4 +213,124 @@ proptest! {
             prop_assert!(!file_path.exists());
         }
     }
+
+    #[test]
+    fn prop_checksum_roundtrip(
+        content in prop::collection::vec(any::<u8>(), 0..10000),
+    ) {
+        prop_assume!(!content.is_empty());
+
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        setup_git_repo(&source);
+
+        fs::write(source.path().join("file.bin"), &content).unwrap();
+
+        // Sync with checksum verification (directory-level)
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                "--checksum",
+            ])
+            .output()
+            .unwrap();
+
+        prop_assert!(output.status.success());
+        prop_assert!(dest.path().join("file.bin").exists());
+
+        let reconstructed = fs::read(dest.path().join("file.bin")).unwrap();
+        prop_assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn prop_sync_filters_work(
+        _pattern in "[a-zA-Z0-9_.-]{1,20}",
+        num_files in 2usize..15,
+    ) {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        setup_git_repo(&source);
+
+        // Create files, some matching the pattern
+        for i in 0..num_files {
+            let name = if i % 3 == 0 {
+                format!("{}_extra.txt", i)
+            } else {
+                format!("file_{}.txt", i)
+            };
+            fs::write(source.path().join(&name), format!("content_{}", i)).unwrap();
+        }
+
+        // Sync with exclude pattern
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                "--exclude",
+                "*extra*",
+            ])
+            .output()
+            .unwrap();
+
+        prop_assert!(output.status.success());
+
+        // Verify files without "extra" are synced, extras are excluded
+        for i in 0..num_files {
+            let name = if i % 3 == 0 {
+                format!("{}_extra.txt", i)
+            } else {
+                format!("file_{}.txt", i)
+            };
+            let dest_file = dest.path().join(&name);
+            if name.contains("extra") {
+                prop_assert!(!dest_file.exists(), "{} should be excluded", name);
+            } else {
+                prop_assert!(dest_file.exists(), "{} should exist", name);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_delete_safety_threshold(
+        source_count in 1usize..5,
+        extra_count in 5usize..20,
+    ) {
+        // When too many files would be deleted, sy should refuse (without --force-delete)
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        setup_git_repo(&source);
+
+        // Create source files
+        for i in 0..source_count {
+            fs::write(source.path().join(format!("keep_{}.txt", i)), "keep").unwrap();
+        }
+
+        // Create dest files (with many extras)
+        for i in 0..source_count {
+            fs::write(dest.path().join(format!("keep_{}.txt", i)), "keep").unwrap();
+        }
+        for i in 0..extra_count {
+            fs::write(dest.path().join(format!("extra_{}.txt", i)), "extra").unwrap();
+        }
+
+        // Sync with --delete but without --force-delete (should hit threshold)
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                "--delete",
+            ])
+            .output()
+            .unwrap();
+
+        // Should fail because deletion threshold exceeded
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        prop_assert!(
+            !output.status.success() || stderr.contains("delete") || stderr.contains("threshold"),
+            "Should refuse large deletions without --force-delete.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
 }

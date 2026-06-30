@@ -232,4 +232,46 @@ mod tests {
         let stats_ratio = stats.literal_bytes as f64 / stats.bytes_written as f64;
         assert!(stats_ratio < 0.2);
     }
+
+    // === Proptest: delta round-trip property ===
+    // For any two byte sequences, delta encode/decode should reconstruct the modified file.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_delta_roundtrip(
+            original in prop::collection::vec(any::<u8>(), 0..10000),
+            modified in prop::collection::vec(any::<u8>(), 0..10000),
+            block_size_exp in 6u32..18u32,
+        ) {
+            let block_size = 1usize << block_size_exp;
+            // Skip degenerate case where both are empty
+            prop_assume!(!original.is_empty() || !modified.is_empty());
+
+            let tmp = TempDir::new().unwrap();
+            let orig_path = tmp.path().join("orig");
+            let mod_path = tmp.path().join("modified");
+            let recon_path = tmp.path().join("reconstructed");
+
+            std::fs::write(&orig_path, &original).unwrap();
+            std::fs::write(&mod_path, &modified).unwrap();
+
+            // Generate checksums from original
+            let checksums = compute_checksums(&orig_path, block_size).unwrap();
+
+            // Generate delta (modified vs original checksums)
+            let delta = generate_delta(&mod_path, &checksums, block_size).unwrap();
+
+            // Apply delta to reconstruct
+            let _ = apply_delta(&orig_path, &delta, &recon_path).unwrap();
+
+            // Reconstructed file must match modified
+            let expected = std::fs::read(&mod_path).unwrap();
+            let actual = std::fs::read(&recon_path).unwrap();
+            prop_assert_eq!(expected, actual,
+                "delta round-trip failed: original={}B, modified={}B, block_size={}",
+                original.len(), modified.len(), block_size);
+        }
+    }
 }

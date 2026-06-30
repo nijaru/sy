@@ -203,7 +203,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Start scan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().start_scan();
+            monitor.lock().expect("perf monitor poisoned").start_scan();
         }
 
         // Scan source directory (or use cache)
@@ -339,7 +339,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // End scan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().end_scan();
+            monitor.lock().expect("perf monitor poisoned").end_scan();
         }
 
         tracing::debug!("Scan completed, about to check resources");
@@ -427,7 +427,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Start plan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().start_plan();
+            monitor.lock().expect("perf monitor poisoned").start_plan();
         }
 
         // Plan sync operations
@@ -466,7 +466,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
-                    .unwrap(),
+                    .expect("built-in template is valid"),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb
@@ -650,7 +650,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // End plan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().end_plan();
+            monitor.lock().expect("perf monitor poisoned").end_plan();
         }
 
         // Emit start event if JSON mode
@@ -714,7 +714,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     .template(
                         "{msg}\n{spinner:.green} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
                     )
-                    .unwrap()
+                    .expect("built-in template is valid")
                     .progress_chars("#>-"),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -732,7 +732,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Start transfer timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().start_transfer();
+            monitor
+                .lock()
+                .expect("perf monitor poisoned")
+                .start_transfer();
         }
 
         // Filter out Create tasks if --existing is set (only update existing files)
@@ -851,8 +854,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     // Apply rate limiting
                                     if let Some(ref limiter) = rate_limiter {
                                         if bytes_written > 0 {
-                                            let sleep_duration =
-                                                limiter.lock().unwrap().consume(bytes_written);
+                                            let sleep_duration = limiter
+                                                .lock()
+                                                .expect("rate limiter poisoned")
+                                                .consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
                                             }
@@ -928,8 +933,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     // Rate limit
                                     if let Some(ref limiter) = rate_limiter {
                                         if bytes_written > 0 {
-                                            let sleep_duration =
-                                                limiter.lock().unwrap().consume(bytes_written);
+                                            let sleep_duration = limiter
+                                                .lock()
+                                                .expect("rate limiter poisoned")
+                                                .consume(bytes_written);
                                             if sleep_duration > Duration::ZERO {
                                                 tokio::time::sleep(sleep_duration).await;
                                             }
@@ -1032,7 +1039,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             match result {
                 Ok(res) => {
                     // Successful task
-                    let mut s = stats.lock().unwrap();
+                    let mut s = stats.lock().expect("stats counter poisoned");
                     let task = &res.task;
 
                     match task.action {
@@ -1049,15 +1056,21 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             }
 
                             if let Some(monitor) = &self.perf_monitor {
-                                monitor.lock().unwrap().add_file_created();
                                 monitor
                                     .lock()
-                                    .unwrap()
+                                    .expect("perf monitor poisoned")
+                                    .add_file_created();
+                                monitor
+                                    .lock()
+                                    .expect("perf monitor poisoned")
                                     .add_bytes_transferred(res.bytes_written);
                                 if !task.source.as_ref().map(|s| s.is_dir).unwrap_or(false) {
-                                    monitor.lock().unwrap().add_bytes_read(
-                                        task.source.as_ref().map(|s| s.size).unwrap_or(0),
-                                    );
+                                    monitor
+                                        .lock()
+                                        .expect("perf monitor poisoned")
+                                        .add_bytes_read(
+                                            task.source.as_ref().map(|s| s.size).unwrap_or(0),
+                                        );
                                 }
                             }
 
@@ -1095,15 +1108,21 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             }
 
                             if let Some(monitor) = &self.perf_monitor {
-                                monitor.lock().unwrap().add_file_updated();
                                 monitor
                                     .lock()
-                                    .unwrap()
+                                    .expect("perf monitor poisoned")
+                                    .add_file_updated();
+                                monitor
+                                    .lock()
+                                    .expect("perf monitor poisoned")
                                     .add_bytes_transferred(res.bytes_written);
                                 if !task.source.as_ref().map(|s| s.is_dir).unwrap_or(false) {
-                                    monitor.lock().unwrap().add_bytes_read(
-                                        task.source.as_ref().map(|s| s.size).unwrap_or(0),
-                                    );
+                                    monitor
+                                        .lock()
+                                        .expect("perf monitor poisoned")
+                                        .add_bytes_read(
+                                            task.source.as_ref().map(|s| s.size).unwrap_or(0),
+                                        );
                                 }
                             }
 
@@ -1170,7 +1189,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             }
 
                             if let Some(monitor) = &self.perf_monitor {
-                                monitor.lock().unwrap().add_file_deleted();
+                                monitor
+                                    .lock()
+                                    .expect("perf monitor poisoned")
+                                    .add_file_deleted();
                             }
 
                             if self.config.json {
@@ -1271,7 +1293,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
                 Err((task, e)) => {
                     // Error handling
-                    let mut s = stats.lock().unwrap();
+                    let mut s = stats.lock().expect("stats counter poisoned");
                     s.errors.push(SyncError {
                         path: task.dest_path.clone(),
                         error: e.to_string(),
@@ -1298,13 +1320,19 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // End transfer timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().end_transfer();
+            monitor
+                .lock()
+                .expect("perf monitor poisoned")
+                .end_transfer();
         }
 
         pb.finish_with_message("Sync complete");
 
         // Extract final stats before reporting errors
-        let mut final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+        let mut final_stats = Arc::try_unwrap(stats)
+            .expect("stats Arc must be sole owner at cleanup")
+            .into_inner()
+            .expect("stats mutex must not be poisoned");
 
         // Print detailed error report if errors occurred
         if !final_stats.errors.is_empty() {
@@ -1548,7 +1576,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Start scan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().start_scan();
+            monitor.lock().expect("perf monitor poisoned").start_scan();
         }
 
         // Create progress bar (indeterminate since we don't know total count)
@@ -1559,7 +1587,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{msg}\n{spinner:.green} {pos} files processed")
-                    .unwrap(),
+                    .expect("built-in template is valid"),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb
@@ -1623,7 +1651,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 match entry_result {
                     Ok(file) => {
                         // Update Bloom filter for deletions later
-                        bloom_filter.lock().unwrap().insert(&file.relative_path);
+                        bloom_filter
+                            .lock()
+                            .expect("bloom filter poisoned")
+                            .insert(&file.relative_path);
 
                         // Filter exclusion logic
                         if self.should_exclude(&file.relative_path, file.is_dir) {
@@ -1659,7 +1690,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                     // Increment scanned count
                     {
-                        let mut s = stats.lock().unwrap();
+                        let mut s = stats.lock().expect("stats counter poisoned");
                         s.files_scanned += 1;
                     }
                     pb.set_message(format!("Scanning: {}", file.relative_path.display()));
@@ -1704,7 +1735,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 if matches!(task.action, SyncAction::Skip) {
                     // Skip execution for skipped files
                     {
-                        let mut s = stats.lock().unwrap();
+                        let mut s = stats.lock().expect("stats counter poisoned");
                         s.files_skipped += 1;
                     }
                     if json {
@@ -1765,7 +1796,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             };
 
                                         {
-                                            let mut stats = stats.lock().unwrap();
+                                            let mut stats =
+                                                stats.lock().expect("stats counter poisoned");
                                             stats.bytes_transferred += bytes_written;
                                             stats.files_created += 1;
 
@@ -1780,15 +1812,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
 
                                             if let Some(monitor) = &perf_monitor {
-                                                monitor.lock().unwrap().add_file_created();
                                                 monitor
                                                     .lock()
-                                                    .unwrap()
+                                                    .expect("perf monitor poisoned")
+                                                    .add_file_created();
+                                                monitor
+                                                    .lock()
+                                                    .expect("perf monitor poisoned")
                                                     .add_bytes_transferred(bytes_written);
                                                 if !source.is_dir {
                                                     monitor
                                                         .lock()
-                                                        .unwrap()
+                                                        .expect("perf monitor poisoned")
                                                         .add_bytes_read(source.size);
                                                 }
                                             }
@@ -1800,8 +1835,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                         if let Some(ref limiter) = rate_limiter {
                                             if bytes_written > 0 {
-                                                let sleep_duration =
-                                                    limiter.lock().unwrap().consume(bytes_written);
+                                                let sleep_duration = limiter
+                                                    .lock()
+                                                    .expect("rate limiter poisoned")
+                                                    .consume(bytes_written);
                                                 if sleep_duration > Duration::ZERO {
                                                     tokio::time::sleep(sleep_duration).await;
                                                 }
@@ -1819,7 +1856,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         Ok(())
                                     }
                                     Err(e) => {
-                                        let mut stats = stats.lock().unwrap();
+                                        let mut stats =
+                                            stats.lock().expect("stats counter poisoned");
                                         stats.errors.push(SyncError {
                                             path: task.dest_path.clone(),
                                             error: e.to_string(),
@@ -1844,7 +1882,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             };
 
                                         {
-                                            let mut stats = stats.lock().unwrap();
+                                            let mut stats =
+                                                stats.lock().expect("stats counter poisoned");
                                             if let Some(ref result) = transfer_result {
                                                 stats.bytes_transferred += result.bytes_written;
                                                 if result.used_delta() {
@@ -1869,15 +1908,18 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
 
                                             if let Some(monitor) = &perf_monitor {
-                                                monitor.lock().unwrap().add_file_updated();
                                                 monitor
                                                     .lock()
-                                                    .unwrap()
+                                                    .expect("perf monitor poisoned")
+                                                    .add_file_updated();
+                                                monitor
+                                                    .lock()
+                                                    .expect("perf monitor poisoned")
                                                     .add_bytes_transferred(bytes_written);
                                                 if !source.is_dir {
                                                     monitor
                                                         .lock()
-                                                        .unwrap()
+                                                        .expect("perf monitor poisoned")
                                                         .add_bytes_read(source.size);
                                                 }
                                             }
@@ -1889,8 +1931,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
                                         if let Some(ref limiter) = rate_limiter {
                                             if bytes_written > 0 {
-                                                let sleep_duration =
-                                                    limiter.lock().unwrap().consume(bytes_written);
+                                                let sleep_duration = limiter
+                                                    .lock()
+                                                    .expect("rate limiter poisoned")
+                                                    .consume(bytes_written);
                                                 if sleep_duration > Duration::ZERO {
                                                     tokio::time::sleep(sleep_duration).await;
                                                 }
@@ -1913,7 +1957,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                         Ok(())
                                     }
                                     Err(e) => {
-                                        let mut stats = stats.lock().unwrap();
+                                        let mut stats =
+                                            stats.lock().expect("stats counter poisoned");
                                         stats.errors.push(SyncError {
                                             path: task.dest_path.clone(),
                                             error: e.to_string(),
@@ -1945,7 +1990,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
             // Scan destination streaming
             // Note: We ignore errors during scan to attempt best-effort cleanup
             if let Ok(dest_stream) = self.transport.scan_streaming(destination).await {
-                let bloom = bloom_filter.lock().unwrap().clone();
+                let bloom = bloom_filter.lock().expect("bloom filter poisoned").clone();
                 let transport = self.transport.clone();
                 let stats = stats.clone();
                 let pb = pb.clone();
@@ -1984,7 +2029,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             // Dry run check
                             if dry_run {
                                 {
-                                    let mut s = stats.lock().unwrap();
+                                    let mut s = stats.lock().expect("stats counter poisoned");
                                     s.bytes_would_delete += dest_file.size;
                                     s.files_deleted += 1;
                                 }
@@ -2001,7 +2046,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                             match transport.remove(&path, is_dir).await {
                                 Ok(_) => {
                                     {
-                                        let mut s = stats.lock().unwrap();
+                                        let mut s = stats.lock().expect("stats counter poisoned");
                                         s.files_deleted += 1;
                                     }
                                     // Track perf (omitted for brevity)
@@ -2015,7 +2060,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                 }
                                 Err(e) => {
                                     {
-                                        let mut s = stats.lock().unwrap();
+                                        let mut s = stats.lock().expect("stats counter poisoned");
                                         s.errors.push(SyncError {
                                             path: (*path).clone(),
                                             error: e.to_string(),
@@ -2035,7 +2080,10 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         pb.finish_with_message("Sync complete");
 
-        let mut final_stats = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+        let mut final_stats = Arc::try_unwrap(stats)
+            .expect("stats Arc must be sole owner at cleanup")
+            .into_inner()
+            .expect("stats mutex must not be poisoned");
         final_stats.duration = start_time.elapsed();
         Ok(final_stats)
     }
@@ -2056,7 +2104,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // Start scan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().start_scan();
+            monitor.lock().expect("perf monitor poisoned").start_scan();
         }
 
         // Scan source and destination
@@ -2065,7 +2113,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         // End scan timing
         if let Some(ref monitor) = self.perf_monitor {
-            monitor.lock().unwrap().end_scan();
+            monitor.lock().expect("perf monitor poisoned").end_scan();
         }
 
         tracing::info!(
@@ -2430,7 +2478,7 @@ impl<T: Transport + 'static> SyncEngine<T> {
     pub fn get_performance_metrics(&self) -> Option<PerformanceMetrics> {
         self.perf_monitor
             .as_ref()
-            .map(|monitor| monitor.lock().unwrap().get_metrics())
+            .map(|monitor| monitor.lock().expect("perf monitor poisoned").get_metrics())
     }
 }
 
