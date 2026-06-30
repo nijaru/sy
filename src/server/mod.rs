@@ -56,7 +56,7 @@ pub async fn run_server() -> Result<()> {
             code: 1,
             message: format!("Expected HELLO, got {:?}", msg_type),
         };
-        v2::write_frame(&mut stdout, &fatal.encode()).await?;
+        v2::write_frame(&mut stdout, &fatal.encode()?).await?;
         stdout.flush().await?;
         return Ok(());
     }
@@ -64,7 +64,7 @@ pub async fn run_server() -> Result<()> {
     let hello = v2::Hello::decode(payload)?;
 
     let resp = v2::Hello::new(HelloFlags::empty(), "");
-    v2::write_frame(&mut stdout, &resp.encode()).await?;
+    v2::write_frame(&mut stdout, &resp.encode()?).await?;
     stdout.flush().await?;
 
     if hello.flags.contains(HelloFlags::PULL) {
@@ -168,7 +168,7 @@ async fn run_server_pull(
         duration_ms: 0,
         files_scanned,
     };
-    v2::write_frame(&mut stdout, &done.encode()).await?;
+    v2::write_frame(&mut stdout, &done.encode()?).await?;
     stdout.flush().await?;
 
     Ok(())
@@ -229,7 +229,7 @@ async fn run_server_push(
         duration_ms: 0,
         files_scanned: 0, // Client knows its own source count in push mode
     };
-    v2::write_frame(&mut stdout, &done.encode()).await?;
+    v2::write_frame(&mut stdout, &done.encode()?).await?;
     stdout.flush().await?;
 
     Ok(())

@@ -37,19 +37,21 @@ pub enum EndpointPair {
 impl EndpointPair {
     /// Create an EndpointPair from a SyncPath.
     #[allow(dead_code)] // Wired in by main.rs rewrite
-    pub fn from_sync_path(path: &crate::path::SyncPath) -> Self {
+    pub fn from_sync_path(path: &crate::path::SyncPath) -> Result<Self> {
         match path {
-            crate::path::SyncPath::Local { path, .. } => {
-                EndpointPair::Local(Box::new(LocalEndpoint::new(path.clone())))
-            }
+            crate::path::SyncPath::Local { path, .. } => Ok(EndpointPair::Local(Box::new(
+                LocalEndpoint::new(path.clone()),
+            ))),
             crate::path::SyncPath::Remote {
                 host, user, path, ..
-            } => EndpointPair::Ssh {
+            } => Ok(EndpointPair::Ssh {
                 host: host.clone(),
                 user: user.clone(),
                 root: path.clone(),
-            },
-            _ => panic!("S3/GCS endpoints not yet supported"),
+            }),
+            crate::path::SyncPath::S3 { .. } | crate::path::SyncPath::Gcs { .. } => Err(
+                SyncError::Config("S3/GCS endpoints not yet supported".to_string()),
+            ),
         }
     }
 }

@@ -68,12 +68,12 @@ impl MessageType {
     }
 }
 
-fn u16_len(label: &str, len: usize) -> u16 {
-    u16::try_from(len).unwrap_or_else(|_| panic!("{label} too long for protocol u16 length: {len}"))
+fn u16_len(label: &str, len: usize) -> Result<u16> {
+    u16::try_from(len).with_context(|| format!("{label} too long for protocol u16 length: {len}"))
 }
 
-fn u32_len(label: &str, len: usize) -> u32 {
-    u32::try_from(len).unwrap_or_else(|_| panic!("{label} too long for protocol u32 length: {len}"))
+fn u32_len(label: &str, len: usize) -> Result<u32> {
+    u32::try_from(len).with_context(|| format!("{label} too long for protocol u32 length: {len}"))
 }
 
 bitflags::bitflags! {
@@ -210,7 +210,7 @@ impl Hello {
         self.flags.contains(HelloFlags::PULL)
     }
 
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.root_path.as_bytes();
         // Trailing optional fields: each is u8 present + (u16 len + bytes) when present.
         let max_len = self.max_delete.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -235,18 +235,18 @@ impl Hello {
             2 + 4 + 2 + path_bytes.len() + max_field_len + filter_field_len + comp_field_len;
         let mut buf = BytesMut::with_capacity(5 + payload_len);
 
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Hello as u8);
         buf.put_u16(self.version);
         buf.put_u32(self.flags.bits());
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
 
         // Trailing max_delete: present flag + optional length-prefixed string.
         // Old peers ignore trailing bytes, so this is backwards compatible.
         if let Some(max_delete) = &self.max_delete {
             buf.put_u8(1);
-            buf.put_u16(u16_len("max_delete", max_delete.len()));
+            buf.put_u16(u16_len("max_delete", max_delete.len())?);
             buf.put_slice(max_delete.as_bytes());
         } else {
             buf.put_u8(0);
@@ -255,7 +255,7 @@ impl Hello {
         // Trailing filter_patterns: newline-separated rsync-style rules.
         if let Some(filter_patterns) = &self.filter_patterns {
             buf.put_u8(1);
-            buf.put_u16(u16_len("filter_patterns", filter_patterns.len()));
+            buf.put_u16(u16_len("filter_patterns", filter_patterns.len())?);
             buf.put_slice(filter_patterns.as_bytes());
         } else {
             buf.put_u8(0);
@@ -269,7 +269,7 @@ impl Hello {
             buf.put_u8(0);
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -373,7 +373,7 @@ impl FileEntry {
         self.flags.contains(FileFlags::HARDLINK)
     }
 
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let symlink_bytes = self.symlink_target.as_ref().map(|s| s.as_bytes());
         let link_bytes = self.link_target.as_ref().map(|s| s.as_bytes());
@@ -387,9 +387,9 @@ impl FileEntry {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::FileEntry as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u64(self.size);
         buf.put_i64(self.mtime);
@@ -398,15 +398,15 @@ impl FileEntry {
         buf.put_u8(self.flags.bits());
 
         if let Some(b) = symlink_bytes {
-            buf.put_u16(u16_len("optional path", b.len()));
+            buf.put_u16(u16_len("optional path", b.len())?);
             buf.put_slice(b);
         }
         if let Some(b) = link_bytes {
-            buf.put_u16(u16_len("optional path", b.len()));
+            buf.put_u16(u16_len("optional path", b.len())?);
             buf.put_slice(b);
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -487,13 +487,13 @@ pub struct FileEnd {
 }
 
 impl FileEnd {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(5 + 16);
         buf.put_u32(16);
         buf.put_u8(MessageType::FileEnd as u8);
         buf.put_u64(self.total_files);
         buf.put_u64(self.total_bytes);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -532,7 +532,7 @@ pub struct DestFileEntry {
 }
 
 impl DestFileEntry {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let has_checksums = self.flags.contains(DestFileFlags::HAS_CHECKSUMS);
 
@@ -542,9 +542,9 @@ impl DestFileEntry {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::DestFileEntry as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u64(self.size);
         buf.put_i64(self.mtime);
@@ -553,7 +553,7 @@ impl DestFileEntry {
 
         if has_checksums {
             buf.put_u32(self.block_size);
-            buf.put_u32(u32_len("checksums", self.checksums.len()));
+            buf.put_u32(u32_len("checksums", self.checksums.len())?);
             for cs in &self.checksums {
                 buf.put_u64(cs.offset);
                 buf.put_u32(cs.weak);
@@ -561,7 +561,7 @@ impl DestFileEntry {
             }
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -635,13 +635,13 @@ pub struct DestFileEnd {
 }
 
 impl DestFileEnd {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(5 + 16);
         buf.put_u32(16);
         buf.put_u8(MessageType::DestFileEnd as u8);
         buf.put_u64(self.total_files);
         buf.put_u64(self.total_bytes);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -666,21 +666,21 @@ pub struct Data {
 }
 
 impl Data {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let payload_len = 2 + path_bytes.len() + 8 + 1 + 4 + self.data.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Data as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u64(self.offset);
         buf.put_u8(self.flags.bits());
-        buf.put_u32(u32_len("data", self.data.len()));
+        buf.put_u32(u32_len("data", self.data.len())?);
         buf.put_slice(&self.data);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -722,18 +722,18 @@ impl DataEnd {
     pub const STATUS_OK: u8 = 0;
     pub const STATUS_ERROR: u8 = 1;
 
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let payload_len = 2 + path_bytes.len() + 1;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::DataEnd as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u8(self.status);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -761,18 +761,18 @@ pub struct Delete {
 }
 
 impl Delete {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let payload_len = 2 + path_bytes.len() + 1;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Delete as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u8(self.is_dir as u8);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -799,12 +799,12 @@ pub struct DeleteEnd {
 }
 
 impl DeleteEnd {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(5 + 8);
         buf.put_u32(8);
         buf.put_u8(MessageType::DeleteEnd as u8);
         buf.put_u64(self.count);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -826,18 +826,18 @@ pub struct Mkdir {
 }
 
 impl Mkdir {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let payload_len = 2 + path_bytes.len() + 4;
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Mkdir as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u32(self.mode);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -865,20 +865,20 @@ pub struct Symlink {
 }
 
 impl Symlink {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let target_bytes = self.target.as_bytes();
         let payload_len = 2 + path_bytes.len() + 2 + target_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Symlink as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
-        buf.put_u16(u16_len("symlink target", target_bytes.len()));
+        buf.put_u16(u16_len("symlink target", target_bytes.len())?);
         buf.put_slice(target_bytes);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -913,7 +913,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(5 + 32);
         buf.put_u32(32);
         buf.put_u8(MessageType::Progress as u8);
@@ -921,7 +921,7 @@ impl Progress {
         buf.put_u64(self.bytes);
         buf.put_u64(self.files_total);
         buf.put_u64(self.bytes_total);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -947,21 +947,21 @@ pub struct Error {
 }
 
 impl Error {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let msg_bytes = self.message.as_bytes();
         let payload_len = 2 + path_bytes.len() + 2 + 2 + msg_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Error as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
         buf.put_u16(self.code);
-        buf.put_u16(u16_len("message", msg_bytes.len()));
+        buf.put_u16(u16_len("message", msg_bytes.len())?);
         buf.put_slice(msg_bytes);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -999,18 +999,18 @@ pub struct Fatal {
 }
 
 impl Fatal {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let msg_bytes = self.message.as_bytes();
         let payload_len = 2 + 2 + msg_bytes.len();
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Fatal as u8);
         buf.put_u16(self.code);
-        buf.put_u16(u16_len("message", msg_bytes.len()));
+        buf.put_u16(u16_len("message", msg_bytes.len())?);
         buf.put_slice(msg_bytes);
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -1044,7 +1044,7 @@ pub struct Xattr {
 }
 
 impl Xattr {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let path_bytes = self.path.as_bytes();
         let mut payload_len = 2 + path_bytes.len() + 2;
         for entry in &self.entries {
@@ -1052,21 +1052,21 @@ impl Xattr {
         }
 
         let mut buf = BytesMut::with_capacity(5 + payload_len);
-        buf.put_u32(u32_len("payload", payload_len));
+        buf.put_u32(u32_len("payload", payload_len)?);
         buf.put_u8(MessageType::Xattr as u8);
-        buf.put_u16(u16_len("path", path_bytes.len()));
+        buf.put_u16(u16_len("path", path_bytes.len())?);
         buf.put_slice(path_bytes);
-        buf.put_u16(u16_len("xattr entries", self.entries.len()));
+        buf.put_u16(u16_len("xattr entries", self.entries.len())?);
 
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
-            buf.put_u16(u16_len("xattr name", name_bytes.len()));
+            buf.put_u16(u16_len("xattr name", name_bytes.len())?);
             buf.put_slice(name_bytes);
-            buf.put_u32(u32_len("xattr value", entry.value.len()));
+            buf.put_u32(u32_len("xattr value", entry.value.len())?);
             buf.put_slice(&entry.value);
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -1144,7 +1144,7 @@ pub struct Done {
 }
 
 impl Done {
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         // Fixed: 4×u64 = 32 bytes. Optional trailing: 1 + 8 = 9 bytes when present.
         let trailing_len = if self.files_scanned > 0 { 9 } else { 1 };
         let mut buf = BytesMut::with_capacity(5 + 32 + trailing_len);
@@ -1161,7 +1161,7 @@ impl Done {
         } else {
             buf.put_u8(0);
         }
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(mut payload: Bytes) -> Result<Self> {
@@ -1279,7 +1279,7 @@ mod tests {
     #[test]
     fn test_hello_roundtrip() {
         let hello = Hello::new(HelloFlags::PULL | HelloFlags::DELETE, "/tmp/dest");
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
 
         // Skip frame header (4 bytes len + 1 byte type)
         let payload = Bytes::copy_from_slice(&encoded[5..]);
@@ -1303,7 +1303,7 @@ mod tests {
             symlink_target: None,
             link_target: None,
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = FileEntry::decode(payload).unwrap();
 
@@ -1326,7 +1326,7 @@ mod tests {
             symlink_target: Some("target.txt".to_string()),
             link_target: None,
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = FileEntry::decode(payload).unwrap();
 
@@ -1346,7 +1346,7 @@ mod tests {
             symlink_target: None,
             link_target: Some("original.txt".to_string()),
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = FileEntry::decode(payload).unwrap();
 
@@ -1376,7 +1376,7 @@ mod tests {
                 },
             ],
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = DestFileEntry::decode(payload).unwrap();
 
@@ -1396,7 +1396,7 @@ mod tests {
             flags: DataFlags::COMPRESSED,
             data: Bytes::from(vec![1, 2, 3, 4, 5]),
         };
-        let encoded = data.encode();
+        let encoded = data.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Data::decode(payload).unwrap();
 
@@ -1414,7 +1414,7 @@ mod tests {
             files_total: 1000,
             bytes_total: 1024 * 1024 * 100,
         };
-        let encoded = progress.encode();
+        let encoded = progress.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Progress::decode(payload).unwrap();
 
@@ -1438,7 +1438,7 @@ mod tests {
                 },
             ],
         };
-        let encoded = xattr.encode();
+        let encoded = xattr.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Xattr::decode(payload).unwrap();
 
@@ -1456,7 +1456,7 @@ mod tests {
             duration_ms: 5000,
             files_scanned: 200,
         };
-        let encoded = done.encode();
+        let encoded = done.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Done::decode(payload).unwrap();
 
@@ -1561,7 +1561,7 @@ mod tests {
     #[test]
     fn test_hello_empty_path() {
         let hello = Hello::new(HelloFlags::empty(), "");
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
         assert_eq!(decoded.root_path, "");
@@ -1571,7 +1571,7 @@ mod tests {
     fn test_hello_long_path() {
         let long_path = "a".repeat(10000);
         let hello = Hello::new(HelloFlags::empty(), &long_path);
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
         assert_eq!(decoded.root_path, long_path);
@@ -1589,7 +1589,7 @@ mod tests {
             symlink_target: None,
             link_target: None,
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = FileEntry::decode(payload).unwrap();
         assert_eq!(decoded.path, entry.path);
@@ -1606,7 +1606,7 @@ mod tests {
             block_size: 0,
             checksums: Vec::new(),
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = DestFileEntry::decode(payload).unwrap();
         assert_eq!(decoded.path, entry.path);
@@ -1633,7 +1633,7 @@ mod tests {
             block_size: 4096,
             checksums,
         };
-        let encoded = entry.encode();
+        let encoded = entry.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = DestFileEntry::decode(payload).unwrap();
         assert_eq!(decoded.checksums.len(), 10000);
@@ -1649,7 +1649,7 @@ mod tests {
             flags: DataFlags::empty(),
             data: Bytes::new(),
         };
-        let encoded = data.encode();
+        let encoded = data.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Data::decode(payload).unwrap();
         assert!(decoded.data.is_empty());
@@ -1663,7 +1663,7 @@ mod tests {
             flags: DataFlags::COMPRESSED,
             data: Bytes::from(vec![0u8; 100]),
         };
-        let encoded = data.encode();
+        let encoded = data.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Data::decode(payload).unwrap();
         assert!(decoded.flags.contains(DataFlags::COMPRESSED));
@@ -1677,7 +1677,7 @@ mod tests {
             files_total: 0,
             bytes_total: 0,
         };
-        let encoded = progress.encode();
+        let encoded = progress.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Progress::decode(payload).unwrap();
         assert_eq!(decoded.files, 0);
@@ -1691,7 +1691,7 @@ mod tests {
             code: 1,
             message: long_msg.clone(),
         };
-        let encoded = fatal.encode();
+        let encoded = fatal.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Fatal::decode(payload).unwrap();
         assert_eq!(decoded.message, long_msg);
@@ -1770,7 +1770,7 @@ mod tests {
         let patterns = "- .git\n- .git/**\n+ *.rs\n- *.py".to_string();
         let hello =
             Hello::new(HelloFlags::PULL, "/src").with_filter_patterns(Some(patterns.clone()));
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
 
@@ -1781,7 +1781,7 @@ mod tests {
     #[test]
     fn test_hello_dirs_only_flag() {
         let hello = Hello::new(HelloFlags::PULL | HelloFlags::DIRS_ONLY, "/src");
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
 
@@ -1796,7 +1796,7 @@ mod tests {
             .with_max_delete(Some(max_delete.clone()))
             .with_filter_patterns(Some(patterns.clone()))
             .with_comparison_flags(0x1F); // all flags set
-        let encoded = hello.encode();
+        let encoded = hello.encode().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[5..]);
         let decoded = Hello::decode(payload).unwrap();
 
@@ -1829,7 +1829,7 @@ mod tests {
                 .with_comparison_flags(0x08),
         ];
         for hello in &cases {
-            let encoded = hello.encode();
+            let encoded = hello.encode().unwrap();
             let frame_len =
                 u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
             let actual_payload = encoded.len() - 5; // 4 len + 1 type

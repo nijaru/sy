@@ -53,21 +53,21 @@ impl Sender {
                         path: path.to_string_lossy().to_string(),
                         mode,
                     };
-                    on_data(msg.encode())?;
+                    on_data(msg.encode()?)?;
                 }
                 GeneratorMessage::Symlink { path, target } => {
                     let msg = Symlink {
                         path: path.to_string_lossy().to_string(),
                         target,
                     };
-                    on_data(msg.encode())?;
+                    on_data(msg.encode()?)?;
                 }
                 GeneratorMessage::Delete { path, is_dir } => {
                     let msg = Delete {
                         path: path.to_string_lossy().to_string(),
                         is_dir,
                     };
-                    on_data(msg.encode())?;
+                    on_data(msg.encode()?)?;
                 }
                 GeneratorMessage::FileEnd {
                     total_files,
@@ -77,11 +77,11 @@ impl Sender {
                         total_files,
                         total_bytes,
                     };
-                    on_data(msg.encode())?;
+                    on_data(msg.encode()?)?;
                 }
                 GeneratorMessage::DeleteEnd { count } => {
                     let msg = DeleteEnd { count };
-                    on_data(msg.encode())?;
+                    on_data(msg.encode()?)?;
                 }
             }
         }
@@ -106,7 +106,7 @@ impl Sender {
             symlink_target: None,
             link_target: None,
         };
-        on_data(entry.encode())?;
+        on_data(entry.encode()?)?;
 
         // Read and send data chunks
         if job.need_delta {
@@ -128,7 +128,7 @@ impl Sender {
             path: path_str,
             status: DataEnd::STATUS_OK,
         };
-        on_data(end.encode())?;
+        on_data(end.encode()?)?;
 
         Ok(())
     }
@@ -181,7 +181,7 @@ impl Sender {
                 flags,
                 data: payload,
             };
-            on_data(data.encode())?;
+            on_data(data.encode()?)?;
 
             offset += n as u64;
         }
@@ -281,7 +281,7 @@ impl Sender {
                     flags,
                     data: payload,
                 };
-                on_data(data.encode())?;
+                on_data(data.encode()?)?;
             }
 
             delta_bytes.extend(op_bytes);
@@ -303,7 +303,7 @@ impl Sender {
                 flags,
                 data: payload,
             };
-            on_data(data.encode())?;
+            on_data(data.encode()?)?;
         }
 
         Ok(())

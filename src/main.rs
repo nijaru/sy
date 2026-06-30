@@ -486,8 +486,8 @@ Or install from local source with: cargo install --path . --features acl"#
     };
 
     // Create SyncSession for strategy dispatch
-    let source_endpoint = EndpointPair::from_sync_path(source);
-    let dest_endpoint = EndpointPair::from_sync_path(destination);
+    let source_endpoint = EndpointPair::from_sync_path(source)?;
+    let dest_endpoint = EndpointPair::from_sync_path(destination)?;
     let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
         .with_scan_options(cli.scan_options());
 
@@ -835,8 +835,8 @@ Or install from local source with: cargo install --path . --features acl"#
         if !cli.quiet && !cli.json {
             println!("Mode: Streaming push\n");
         }
-        let source_endpoint = EndpointPair::from_sync_path(source);
-        let dest_endpoint = EndpointPair::from_sync_path(destination);
+        let source_endpoint = EndpointPair::from_sync_path(source)?;
+        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
         let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
             .with_scan_options(cli.scan_options());
         session.sync().await?
@@ -845,8 +845,8 @@ Or install from local source with: cargo install --path . --features acl"#
         if !cli.quiet && !cli.json {
             println!("Mode: Streaming pull\n");
         }
-        let source_endpoint = EndpointPair::from_sync_path(source);
-        let dest_endpoint = EndpointPair::from_sync_path(destination);
+        let source_endpoint = EndpointPair::from_sync_path(source)?;
+        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
         let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
             .with_scan_options(cli.scan_options());
         session.sync().await?
@@ -866,9 +866,9 @@ Or install from local source with: cargo install --path . --features acl"#
         let dest_endpoint = EndpointPair::from_sync_path(&crate::path::SyncPath::Local {
             path: effective_dest.clone(),
             has_trailing_slash: false,
-        });
+        })?;
         let session = SyncSession::new(
-            EndpointPair::from_sync_path(source),
+            EndpointPair::from_sync_path(source)?,
             dest_endpoint,
             config.clone(),
         )

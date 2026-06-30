@@ -139,7 +139,7 @@ impl StreamingSync {
         if let Some(flags) = self.comparison_flags {
             hello = hello.with_comparison_flags(flags);
         }
-        write_frame(writer, &hello.encode()).await?;
+        write_frame(writer, &hello.encode()?).await?;
         writer.flush().await?;
 
         // 2. Receive HELLO response
@@ -232,7 +232,7 @@ impl StreamingSync {
             duration_ms: 0,
             files_scanned: 0,
         };
-        write_frame(writer, &client_done.encode()).await?;
+        write_frame(writer, &client_done.encode()?).await?;
         writer.flush().await?;
 
         // Propagate generator error (e.g., deletion threshold exceeded)
@@ -296,7 +296,7 @@ impl StreamingSync {
         let hello = Hello::new(flags, self.remote_root.to_string_lossy().into_owned())
             .with_max_delete(self.max_delete.clone())
             .with_filter_patterns(filter_patterns);
-        write_frame(writer, &hello.encode()).await?;
+        write_frame(writer, &hello.encode()?).await?;
         writer.flush().await?;
 
         let (msg_type, payload) = read_frame(reader).await?;

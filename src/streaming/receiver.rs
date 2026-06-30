@@ -216,7 +216,7 @@ impl Receiver {
                 checksums,
             };
 
-            let encoded = dest_entry.encode();
+            let encoded = dest_entry.encode()?;
             batch.extend_from_slice(&encoded);
 
             if batch.len() >= DEST_ENTRY_BATCH_SIZE {
@@ -236,7 +236,7 @@ impl Receiver {
             total_files,
             total_bytes,
         };
-        on_entry(end.encode())?;
+        on_entry(end.encode()?)?;
 
         Ok((total_files, total_bytes))
     }
@@ -645,7 +645,7 @@ mod tests {
             link_target: None,
         };
         receiver
-            .handle_message(MessageType::FileEntry, entry.encode().slice(5..))
+            .handle_message(MessageType::FileEntry, entry.encode().unwrap().slice(5..))
             .await
             .unwrap();
 
@@ -657,7 +657,7 @@ mod tests {
             data: Bytes::from("hello world"),
         };
         receiver
-            .handle_message(MessageType::Data, data.encode().slice(5..))
+            .handle_message(MessageType::Data, data.encode().unwrap().slice(5..))
             .await
             .unwrap();
 
@@ -667,7 +667,7 @@ mod tests {
             status: DataEnd::STATUS_OK,
         };
         receiver
-            .handle_message(MessageType::DataEnd, end.encode().slice(5..))
+            .handle_message(MessageType::DataEnd, end.encode().unwrap().slice(5..))
             .await
             .unwrap();
 

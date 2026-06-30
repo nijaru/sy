@@ -40,8 +40,8 @@ impl WatchSession {
         config: SyncConfig,
         debounce: Duration,
     ) -> Result<Self> {
-        let source_endpoint = EndpointPair::from_sync_path(source);
-        let dest_endpoint = EndpointPair::from_sync_path(dest);
+        let source_endpoint = EndpointPair::from_sync_path(source)?;
+        let dest_endpoint = EndpointPair::from_sync_path(dest)?;
         let session = SyncSession::new(source_endpoint, dest_endpoint, config);
 
         Ok(Self {
