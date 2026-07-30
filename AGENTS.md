@@ -4,18 +4,18 @@
 
 ## For AI Agents
 
-1. Read `ai/STATUS.md` (current state)
-2. Read `ai/DESIGN.md` (what sy is, architecture)
+1. Read `ai/brief.md` (current snapshot & state)
+2. Read `ai/architecture.md` (what sy is, architecture)
 3. Check tasks: `tk ls`
-4. Reference `ai/DECISIONS.md` for rationale
+4. Reference `ai/decisions.md` for rationale
 
 ## Project
 
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust (edition 2021) |
-| Version | v0.4.0 (dev branch) |
-| Tests | 572 passing, 12 ignored (SSH agent) |
+| Version | v0.4.1 (main branch) |
+| Tests | 630+ passing |
 | License | MIT |
 | Positioning | "fd for find" — spiritual successor, not wire-compatible |
 
@@ -170,8 +170,8 @@ io_uring (security, complexity), CDC (backup dedup, not sync), persistent state 
 
 ## Current Focus
 
-v0.4.0 on `dev` branch. Architecture complete. Focus: correctness, atomic writes, error-path coverage. See `ai/STATUS.md`.
+v0.4.1 tagged and released on `main` branch. See `ai/brief.md`.
 
 ---
 
-**Updated**: 2026-06-17
+**Updated**: 2026-07-29
