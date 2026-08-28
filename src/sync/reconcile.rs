@@ -176,6 +176,13 @@ pub(crate) async fn run_local_sync(
         }
     }
 
+    if config.cache && !config.dry_run {
+        // Keep the CLI/cache-file contract without reviving the unsafe v0.4
+        // root-mtime shortcut. An empty current-version cache is a disposable
+        // marker until v0.5 has content-safe incremental invalidation.
+        crate::sync::dircache::DirectoryCache::new().save(dest.root())?;
+    }
+
     stats.duration = started.elapsed();
     Ok(stats)
 }
@@ -619,6 +626,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second.files_skipped, 2);
+    }
+
+    #[tokio::test]
+    async fn cache_option_writes_safe_marker_only_after_success() {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::fs::write(source.path().join("file"), b"content").unwrap();
+        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+        let mut sync_config = config();
+        sync_config.cache = true;
+
+        run_local_sync(
+            &source_endpoint,
+            &dest_endpoint,
+            &sync_config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(dest.path().join(".sy-dir-cache.json").exists());
     }
 
     #[tokio::test]
