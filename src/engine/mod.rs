@@ -1,4 +1,5 @@
 pub mod bisync;
+pub mod compression;
 pub mod domain;
 pub mod planner;
 pub mod reconcile;
