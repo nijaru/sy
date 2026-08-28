@@ -1,9 +1,0 @@
-diff --git a/src/endpoint/local_identity.rs b/src/endpoint/local_identity.rs
---- a/src/endpoint/local_identity.rs
-+++ b/src/endpoint/local_identity.rs
-@@ -1,4 +1,4 @@
--use crate::engine::domain::{EntryIdentity, EntryKind};
-+use sy::engine::domain::{EntryIdentity, EntryKind};
- 
- #[cfg(unix)]
- use std::os::unix::fs::MetadataExt;

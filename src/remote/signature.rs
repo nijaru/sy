@@ -1,4 +1,4 @@
-use crate::engine::domain::RelativePath;
+use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, SignatureBlockSize, StreamId,
     WireSignature, WireSignatureEnd, WireSignatureRequest, MAX_SIGNATURE_BLOCK_SIZE,
@@ -35,6 +35,7 @@ pub struct BlockSignature {
 pub struct SignatureSummary {
     pub file_size: u64,
     pub block_count: u64,
+    pub basis_identity: EntryIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,9 @@ pub enum SignatureProducerError {
 
     #[error("signature block count overflow")]
     BlockCountOverflow,
+
+    #[error("opened signature basis did not provide a stable identity")]
+    MissingBasisIdentity,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +124,23 @@ pub enum RemoteSignatureError {
     #[error("signature block count overflow")]
     BlockCountOverflow,
 
+    #[error("peer did not advertise rolling-signature support")]
+    UnsupportedByPeer,
+
+    #[error("rolling signatures require a regular-file basis entry")]
+    InvalidBasis,
+
+    #[error("rolling signatures require a scanned basis identity")]
+    MissingBasisIdentity,
+
+    #[error(
+        "signature basis changed since scan (expected {expected_size} bytes, observed {actual_size} bytes)"
+    )]
+    BasisChanged {
+        expected_size: u64,
+        actual_size: u64,
+    },
+
     #[error(
         "signature summary mismatch: received {actual_count} blocks/{actual_size} bytes, expected {expected_count} blocks/{expected_size} bytes"
     )]
@@ -157,6 +178,7 @@ pub async fn request_signatures(
     sender: &RouterSender,
     path: &RelativePath,
     file_size: u64,
+    expected_identity: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<(u32, SignatureStream)> {
     ensure_compatible_path_encoding(peer)?;
@@ -179,7 +201,13 @@ pub async fn request_signatures(
 
     Ok((
         block_size,
-        remote_signature_stream(inbox, sender.clone(), block_size)?,
+        remote_signature_stream(
+            inbox,
+            sender.clone(),
+            block_size,
+            file_size,
+            expected_identity,
+        )?,
     ))
 }
 
@@ -224,7 +252,11 @@ pub async fn serve_incoming_signatures(
     let summary = producer
         .await
         .map_err(|error| RemoteSignatureError::ProducerJoin(error.to_string()))??;
-    let end = WireSignatureEnd::new(summary.file_size, summary.block_count)?;
+    let end = WireSignatureEnd::new(
+        summary.file_size,
+        summary.block_count,
+        *summary.basis_identity.as_bytes(),
+    )?;
     let frame = Frame::new(
         FrameKind::SignatureEnd,
         FrameFlags::ACK_REQUIRED,
@@ -289,9 +321,15 @@ fn produce_signatures(
         }
     }
 
+    let metadata = file.metadata()?;
+    let basis_identity =
+        crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
+            .ok_or(SignatureProducerError::MissingBasisIdentity)?;
+
     Ok(SignatureSummary {
         file_size,
         block_count,
+        basis_identity,
     })
 }
 
@@ -334,6 +372,8 @@ struct SignatureReceiveState {
     sender: RouterSender,
     stream_id: StreamId,
     block_size: u32,
+    expected_file_size: u64,
+    expected_identity: EntryIdentity,
     next_index: u64,
     byte_count: u64,
     short_block_seen: bool,
@@ -344,6 +384,8 @@ fn remote_signature_stream(
     inbox: StreamInbox,
     sender: RouterSender,
     block_size: u32,
+    expected_file_size: u64,
+    expected_identity: EntryIdentity,
 ) -> Result<SignatureStream> {
     let stream_id = inbox.stream_id();
     let state = SignatureReceiveState {
@@ -351,6 +393,8 @@ fn remote_signature_stream(
         sender,
         stream_id,
         block_size,
+        expected_file_size,
+        expected_identity,
         next_index: 0,
         byte_count: 0,
         short_block_seen: false,
@@ -432,10 +476,21 @@ fn remote_signature_stream(
                     bytes::Bytes::new(),
                 )?;
                 state.sender.send(ack).await?;
+                let basis_identity = EntryIdentity::from_bytes(end.basis_identity());
+                if end.file_size() != state.expected_file_size
+                    || basis_identity != state.expected_identity
+                {
+                    return Err(RemoteSignatureError::BasisChanged {
+                        expected_size: state.expected_file_size,
+                        actual_size: end.file_size(),
+                    });
+                }
+
                 state.done = true;
                 SignatureEvent::End(SignatureSummary {
                     file_size: end.file_size(),
                     block_count: end.block_count(),
+                    basis_identity,
                 })
             }
             actual => {
@@ -492,6 +547,11 @@ mod tests {
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
     use std::path::PathBuf;
+
+    fn file_identity(path: &Path) -> EntryIdentity {
+        let metadata = std::fs::metadata(path).unwrap();
+        crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File).unwrap()
+    }
 
     #[test]
     fn adaptive_block_size_targets_bounded_power_of_two_blocks() {
@@ -553,10 +613,12 @@ mod tests {
         .unwrap();
         let sender = router.sender();
         let path = RelativePath::new(PathBuf::from("data.bin")).unwrap();
+        let expected_identity = file_identity(&root.path().join("data.bin"));
         let (block_size, mut signatures) = request_signatures(
             &sender,
             &path,
             data.len() as u64,
+            expected_identity,
             session.server.platform.os,
         )
         .await
@@ -582,13 +644,92 @@ mod tests {
             summary,
             Some(SignatureSummary {
                 file_size: 10_000,
-                block_count: 3
+                block_count: 3,
+                basis_identity: expected_identity,
             })
         );
         assert_eq!(blocks[0].weak, crate::delta::Adler32::hash(&data[..4096]));
         let digest = blake3::hash(&data[..4096]);
         assert_eq!(blocks[0].strong, digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
         assert_eq!(Platform::current().os, session.server.platform.os);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signatures_reject_same_size_basis_change_since_scan() {
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("data.bin");
+        std::fs::write(&path, b"original").unwrap();
+        let expected_identity = file_identity(&path);
+        std::fs::write(&path, b"modified").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
+        let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
+
+        let server = tokio::spawn(async move {
+            let opened = server_handshake(&mut server_reader, &mut server_writer)
+                .await
+                .unwrap();
+            let mut router = FrameRouter::start(
+                server_reader,
+                server_writer,
+                RouterRole::Server,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let incoming = router.incoming().recv().await.unwrap().unwrap();
+            let sender = router.sender();
+            serve_incoming_signatures(&opened.root, incoming, &sender, opened.client.platform.os)
+                .await
+                .unwrap();
+        });
+
+        let session = client_handshake(
+            &mut client_reader,
+            &mut client_writer,
+            Operation::Push,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        let router = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let sender = router.sender();
+        let relative = RelativePath::new(PathBuf::from("data.bin")).unwrap();
+        let (_, mut signatures) = request_signatures(
+            &sender,
+            &relative,
+            8,
+            expected_identity,
+            session.server.platform.os,
+        )
+        .await
+        .unwrap();
+
+        let mut changed = false;
+        while let Some(event) = signatures.next().await {
+            match event {
+                Ok(_) => {}
+                Err(error) => {
+                    changed = matches!(
+                        error.downcast_ref::<RemoteSignatureError>(),
+                        Some(RemoteSignatureError::BasisChanged {
+                            expected_size: 8,
+                            actual_size: 8,
+                        })
+                    );
+                    break;
+                }
+            }
+        }
+        server.await.unwrap();
+        assert!(changed);
     }
 
     #[cfg(unix)]

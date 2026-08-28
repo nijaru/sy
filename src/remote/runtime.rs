@@ -1,13 +1,17 @@
-use crate::engine::domain::RelativePath;
+use crate::engine::domain::Entry;
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady};
+use crate::protocol::{
+    CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
+};
 use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
 };
 use crate::remote::scan::{request_scan, serve_incoming_scan};
-use crate::remote::signature::{request_signatures, serve_incoming_signatures, SignatureStream};
+use crate::remote::signature::{
+    request_signatures, serve_incoming_signatures, RemoteSignatureError, SignatureStream,
+};
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -85,13 +89,26 @@ impl ClientRemoteSession {
 
     pub async fn signatures(
         &self,
-        path: &RelativePath,
-        file_size: u64,
+        basis: &Entry,
     ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
+        if !self
+            .ready
+            .capabilities
+            .contains(CapabilitySet::ROLLING_SIGNATURES)
+        {
+            return Err(RemoteSignatureError::UnsupportedByPeer);
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis);
+        }
+        let identity = basis
+            .identity
+            .ok_or(RemoteSignatureError::MissingBasisIdentity)?;
         request_signatures(
             &self.router.sender(),
-            path,
-            file_size,
+            &basis.path,
+            basis.size,
+            identity,
             self.server.platform.os,
         )
         .await
@@ -203,10 +220,27 @@ impl ServerRemoteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
     use crate::engine::scan::EntryMetadataRequest;
     use crate::remote::signature::{SignatureEvent, SignatureSummary};
     use futures::StreamExt;
     use tokio::task::JoinSet;
+
+    #[cfg(unix)]
+    fn file_entry(root: &Path, relative: &str) -> Entry {
+        let path = root.join(relative);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let identity =
+            crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File).unwrap();
+        let mut entry = Entry::file(
+            RelativePath::new(PathBuf::from(relative)).unwrap(),
+            metadata.len(),
+            Timestamp::UNIX_EPOCH,
+        );
+        entry.identity = Some(identity);
+        entry
+    }
 
     async fn collect_paths(mut entries: EntryStream) -> Vec<PathBuf> {
         let mut paths = Vec::new();
@@ -301,6 +335,7 @@ mod tests {
         assert_eq!(second, expected);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn session_runtime_multiplexes_scan_and_signatures() {
         let root = tempfile::TempDir::new().unwrap();
@@ -366,16 +401,13 @@ mod tests {
                 hardlink_group: false,
             },
         };
-        let signature_path = RelativePath::new(PathBuf::from("data.bin")).unwrap();
+        let signature_basis = file_entry(root.path(), "data.bin");
 
         // Open both operation types before consuming either. This proves the
         // runtime can interleave metadata and demand-driven signature traffic on
         // the same negotiated transport.
         let entries = session.scan(scan_request).await.unwrap();
-        let (block_size, signatures) = session
-            .signatures(&signature_path, data.len() as u64)
-            .await
-            .unwrap();
+        let (block_size, signatures) = session.signatures(&signature_basis).await.unwrap();
         let (paths, (blocks, summary)) = tokio::join!(
             collect_paths(entries),
             collect_signature_summary(signatures)
@@ -388,7 +420,8 @@ mod tests {
             summary,
             SignatureSummary {
                 file_size: 10_000,
-                block_count: 3
+                block_count: 3,
+                basis_identity: signature_basis.identity.unwrap(),
             }
         );
         assert_eq!(

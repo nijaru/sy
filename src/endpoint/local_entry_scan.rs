@@ -1,3 +1,4 @@
+use crate::endpoint::local_identity::metadata_identity;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use sy::engine::domain::{
@@ -289,30 +290,6 @@ fn system_time_to_timestamp(
 }
 
 #[cfg(unix)]
-fn metadata_identity(metadata: &std::fs::Metadata, kind: EntryKind) -> Option<EntryIdentity> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sy-entry-identity-v1\0");
-    hasher.update(&metadata.dev().to_le_bytes());
-    hasher.update(&metadata.ino().to_le_bytes());
-    hasher.update(&metadata.len().to_le_bytes());
-    hasher.update(&metadata.mode().to_le_bytes());
-    hasher.update(&metadata.mtime().to_le_bytes());
-    hasher.update(&metadata.mtime_nsec().to_le_bytes());
-    hasher.update(&metadata.ctime().to_le_bytes());
-    hasher.update(&metadata.ctime_nsec().to_le_bytes());
-    hasher.update(&[entry_kind_tag(kind)]);
-    Some(EntryIdentity::from_bytes(*hasher.finalize().as_bytes()))
-}
-
-#[cfg(not(unix))]
-fn metadata_identity(_metadata: &std::fs::Metadata, _kind: EntryKind) -> Option<EntryIdentity> {
-    // A robust Windows identity should use a file ID from an opened handle, not
-    // a best-effort size/time fingerprint. Until that endpoint implementation is
-    // added, do not advertise a token with stronger semantics than it has.
-    None
-}
-
-#[cfg(unix)]
 fn hardlink_group(metadata: &std::fs::Metadata, kind: EntryKind) -> Option<EntryIdentity> {
     if kind != EntryKind::File || metadata.nlink() <= 1 {
         return None;
@@ -328,15 +305,6 @@ fn hardlink_group(metadata: &std::fs::Metadata, kind: EntryKind) -> Option<Entry
 #[cfg(not(unix))]
 fn hardlink_group(_metadata: &std::fs::Metadata, _kind: EntryKind) -> Option<EntryIdentity> {
     None
-}
-
-#[cfg(unix)]
-const fn entry_kind_tag(kind: EntryKind) -> u8 {
-    match kind {
-        EntryKind::File => 1,
-        EntryKind::Directory => 2,
-        EntryKind::Symlink => 3,
-    }
 }
 
 #[cfg(test)]
