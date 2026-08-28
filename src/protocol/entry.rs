@@ -73,20 +73,13 @@ impl WireEntry {
                 reason: "hardlink group is only valid for regular files",
             });
         }
-        match (self.kind, self.symlink_target.is_some()) {
-            (WireEntryKind::Symlink, false) => {
-                return Err(ProtocolError::InvalidField {
-                    field: "symlink_target",
-                    reason: "symlink entry is missing its target",
-                })
-            }
-            (WireEntryKind::File | WireEntryKind::Directory, true) => {
-                return Err(ProtocolError::InvalidField {
-                    field: "symlink_target",
-                    reason: "target is only valid for symlink entries",
-                })
-            }
-            _ => {}
+        if matches!(self.kind, WireEntryKind::File | WireEntryKind::Directory)
+            && self.symlink_target.is_some()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "symlink_target",
+                reason: "target is only valid for symlink entries",
+            });
         }
         if self.kind == WireEntryKind::Directory && self.size != 0 {
             return Err(ProtocolError::InvalidField {
@@ -308,6 +301,22 @@ mod tests {
     }
 
     #[test]
+    fn symlink_entry_may_omit_unrequested_target() {
+        let entry = WireEntry {
+            path: path(),
+            kind: WireEntryKind::Symlink,
+            size: 0,
+            modified_seconds: 1,
+            modified_nanoseconds: 2,
+            unix_mode: None,
+            identity: None,
+            hardlink_group: None,
+            symlink_target: None,
+        };
+        assert_eq!(WireEntry::decode(&entry.encode().unwrap()).unwrap(), entry);
+    }
+
+    #[test]
     fn rejects_semantically_invalid_option_combinations() {
         let mut directory = WireEntry {
             path: path(),
@@ -324,6 +333,10 @@ mod tests {
         assert!(directory.encode().is_err());
 
         directory.hardlink_group = None;
+        directory.symlink_target = Some(WirePath::new(Bytes::from_static(b"target")).unwrap());
+        assert!(directory.encode().is_err());
+
+        directory.symlink_target = None;
         directory.size = 1;
         assert!(directory.encode().is_err());
     }

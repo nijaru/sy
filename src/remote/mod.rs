@@ -1,3 +1,5 @@
+pub mod scan;
+
 use crate::endpoint::{Capabilities, Endpoint};
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
