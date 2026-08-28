@@ -202,11 +202,7 @@ fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
         CapabilitySet::XATTR,
         capabilities.preserve_xattrs,
     );
-    set_capability(
-        &mut result,
-        CapabilitySet::ACL,
-        capabilities.preserve_acls,
-    );
+    set_capability(&mut result, CapabilitySet::ACL, capabilities.preserve_acls);
     set_capability(
         &mut result,
         CapabilitySet::HARDLINK,
@@ -354,7 +350,10 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     let value = path.to_string_lossy();
     if value == "~" {
         dirs::home_dir().unwrap_or(path)
-    } else if let Some(rest) = value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+    } else if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
         dirs::home_dir().map_or(path, |home| home.join(rest))
     } else {
         path
@@ -372,9 +371,9 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
 
-        let server = tokio::spawn(async move {
-            server_handshake(&mut server_reader, &mut server_writer).await
-        });
+        let server = tokio::spawn(
+            async move { server_handshake(&mut server_reader, &mut server_writer).await },
+        );
         let client = client_handshake(
             &mut client_reader,
             &mut client_writer,
@@ -404,9 +403,9 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
 
-        let server = tokio::spawn(async move {
-            server_handshake(&mut server_reader, &mut server_writer).await
-        });
+        let server = tokio::spawn(
+            async move { server_handshake(&mut server_reader, &mut server_writer).await },
+        );
         client_handshake(
             &mut client_reader,
             &mut client_writer,
