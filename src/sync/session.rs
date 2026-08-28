@@ -14,10 +14,11 @@ use crate::error::{Result, SyncError};
 use crate::sync::config::SyncConfig;
 use crate::sync::scanner::ScanOptions;
 use crate::sync::stats::{SyncError as StatError, SyncStats, VerificationResult};
-use futures::StreamExt;
-use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use sy::engine::domain::{Entry, EntryKind};
+use sy::engine::reconcile::{EngineError, OrderedReconciler, ReconcileItem};
+use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 
 /// Endpoint description used for top-level strategy dispatch.
 pub enum EndpointPair {
@@ -130,8 +131,9 @@ impl SyncSession {
         reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await
     }
 
-    /// Verify local source and destination trees without materializing either
-    /// tree into a HashMap. Regular files are compared with streaming BLAKE3.
+    /// Verify local source and destination trees through the same strict,
+    /// bounded ordered merge used by synchronization. Regular files are
+    /// compared with streaming BLAKE3 only after cheap kind/size checks.
     pub async fn verify(&self, source: &Path, dest: &Path) -> Result<VerificationResult> {
         let source_endpoint = self.source.as_endpoint().ok_or_else(|| {
             SyncError::Config("source must be local for verification".to_string())
@@ -149,65 +151,49 @@ impl SyncSession {
             errors: Vec::new(),
             duration: std::time::Duration::ZERO,
         };
-        let mut source_stream = source_endpoint.scan_ordered(self.scan_options).await?;
-        let mut dest_stream = dest_endpoint.scan_ordered(self.scan_options).await?;
-        let mut source_entry = next_entry(&mut source_stream).await?;
-        let mut dest_entry = next_entry(&mut dest_stream).await?;
+        let request = verification_scan_request(self.scan_options);
+        let source_stream = crate::endpoint::local_entry_scan::local_entry_stream(
+            source_endpoint.root().to_path_buf(),
+            request,
+        );
+        let dest_stream = crate::endpoint::local_entry_scan::local_entry_stream(
+            dest_endpoint.root().to_path_buf(),
+            request,
+        );
+        let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
 
-        while source_entry.is_some() || dest_entry.is_some() {
-            match (source_entry.as_ref(), dest_entry.as_ref()) {
-                (Some(source_entry_ref), Some(dest_entry_ref)) => match source_entry_ref
-                    .relative_path
-                    .as_path()
-                    .cmp(dest_entry_ref.relative_path.as_path())
-                {
-                    Ordering::Less => {
-                        result
-                            .files_only_in_source
-                            .push(source.join(source_entry_ref.relative_path.as_path()));
-                        source_entry = next_entry(&mut source_stream).await?;
-                    }
-                    Ordering::Greater => {
-                        result
-                            .files_only_in_dest
-                            .push(dest.join(dest_entry_ref.relative_path.as_path()));
-                        dest_entry = next_entry(&mut dest_stream).await?;
-                    }
-                    Ordering::Equal => {
-                        let relative = source_entry_ref.relative_path.as_path();
-                        match entries_match(
-                            source_endpoint,
-                            dest_endpoint,
-                            source_entry_ref,
-                            dest_entry_ref,
-                        )
-                        .await
-                        {
-                            Ok(true) => result.files_matched += 1,
-                            Ok(false) => result.files_mismatched.push(source.join(relative)),
-                            Err(error) => result.errors.push(StatError {
-                                path: source.join(relative),
-                                error: error.to_string(),
-                                action: "verify".to_string(),
-                            }),
-                        }
-                        source_entry = next_entry(&mut source_stream).await?;
-                        dest_entry = next_entry(&mut dest_stream).await?;
-                    }
-                },
-                (Some(source_entry_ref), None) => {
+        while let Some(item) = reconciler.next().await.map_err(map_engine_error)? {
+            match item {
+                ReconcileItem::SourceOnly(entry) => {
                     result
                         .files_only_in_source
-                        .push(source.join(source_entry_ref.relative_path.as_path()));
-                    source_entry = next_entry(&mut source_stream).await?;
+                        .push(source.join(entry.path.as_path()));
                 }
-                (None, Some(dest_entry_ref)) => {
-                    result
-                        .files_only_in_dest
-                        .push(dest.join(dest_entry_ref.relative_path.as_path()));
-                    dest_entry = next_entry(&mut dest_stream).await?;
+                ReconcileItem::DestinationOnly(entry) => {
+                    result.files_only_in_dest.push(dest.join(entry.path.as_path()));
                 }
-                (None, None) => break,
+                ReconcileItem::Matched {
+                    source: source_entry,
+                    destination: dest_entry,
+                } => {
+                    let relative = source_entry.path.as_path();
+                    match entries_match(
+                        source_endpoint,
+                        dest_endpoint,
+                        &source_entry,
+                        &dest_entry,
+                    )
+                    .await
+                    {
+                        Ok(true) => result.files_matched += 1,
+                        Ok(false) => result.files_mismatched.push(source.join(relative)),
+                        Err(error) => result.errors.push(StatError {
+                            path: source.join(relative),
+                            error: error.to_string(),
+                            action: "verify".to_string(),
+                        }),
+                    }
+                }
             }
         }
 
@@ -333,43 +319,42 @@ impl SyncSession {
 async fn entries_match(
     source_endpoint: &dyn Endpoint,
     dest_endpoint: &dyn Endpoint,
-    source: &crate::sync::scanner::FileEntry,
-    dest: &crate::sync::scanner::FileEntry,
+    source: &Entry,
+    dest: &Entry,
 ) -> Result<bool> {
-    if entry_kind(source) != entry_kind(dest) {
+    if source.kind != dest.kind {
         return Ok(false);
     }
-    if source.is_dir {
+    if source.kind == EntryKind::Directory {
         return Ok(true);
     }
-    if source.is_symlink {
+    if source.kind == EntryKind::Symlink {
         return Ok(source.symlink_target == dest.symlink_target);
     }
     if source.size != dest.size {
         return Ok(false);
     }
-    let source_hash = hash_file_streaming(source_endpoint, &source.relative_path).await?;
-    let dest_hash = hash_file_streaming(dest_endpoint, &dest.relative_path).await?;
+    let source_hash = hash_file_streaming(source_endpoint, source.path.as_path()).await?;
+    let dest_hash = hash_file_streaming(dest_endpoint, dest.path.as_path()).await?;
     Ok(source_hash == dest_hash)
 }
 
-fn entry_kind(entry: &crate::sync::scanner::FileEntry) -> u8 {
-    if entry.is_symlink {
-        2
-    } else if entry.is_dir {
-        1
-    } else {
-        0
+fn verification_scan_request(options: ScanOptions) -> ScanRequest {
+    ScanRequest {
+        respect_gitignore: options.respect_gitignore,
+        include_git_dir: options.include_git_dir,
+        max_depth: options.dirs_only.then_some(1),
+        metadata: EntryMetadataRequest {
+            unix_mode: false,
+            symlink_target: true,
+            identity: false,
+            hardlink_group: false,
+        },
     }
 }
 
-async fn next_entry(
-    stream: &mut crate::endpoint::EntryStream,
-) -> Result<Option<crate::sync::scanner::FileEntry>> {
-    match stream.next().await {
-        Some(entry) => entry.map(Some),
-        None => Ok(None),
-    }
+fn map_engine_error(error: EngineError) -> SyncError {
+    SyncError::Io(std::io::Error::other(error))
 }
 
 fn resolve_ssh_config(host: &str, user: &Option<String>) -> Result<crate::ssh::config::SshConfig> {
