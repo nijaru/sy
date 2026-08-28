@@ -3,6 +3,7 @@ pub mod gcs;
 pub mod io;
 pub mod local;
 pub mod local_entry_scan;
+pub(crate) mod local_identity;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "ssh")]

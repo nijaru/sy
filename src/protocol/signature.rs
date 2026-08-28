@@ -5,6 +5,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub const MIN_SIGNATURE_BLOCK_SIZE: u32 = 4 * 1024;
 pub const MAX_SIGNATURE_BLOCK_SIZE: u32 = 1024 * 1024;
 pub const STRONG_SIGNATURE_LEN: usize = 16;
+const BASIS_IDENTITY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignatureBlockSize(u32);
@@ -141,10 +142,15 @@ impl WireSignature {
 pub struct WireSignatureEnd {
     file_size: u64,
     block_count: u64,
+    basis_identity: [u8; BASIS_IDENTITY_LEN],
 }
 
 impl WireSignatureEnd {
-    pub fn new(file_size: u64, block_count: u64) -> Result<Self> {
+    pub fn new(
+        file_size: u64,
+        block_count: u64,
+        basis_identity: [u8; BASIS_IDENTITY_LEN],
+    ) -> Result<Self> {
         if (file_size == 0) != (block_count == 0) {
             return Err(ProtocolError::InvalidField {
                 field: "signature_end",
@@ -154,6 +160,7 @@ impl WireSignatureEnd {
         Ok(Self {
             file_size,
             block_count,
+            basis_identity,
         })
     }
 
@@ -165,10 +172,15 @@ impl WireSignatureEnd {
         self.block_count
     }
 
+    pub const fn basis_identity(self) -> [u8; BASIS_IDENTITY_LEN] {
+        self.basis_identity
+    }
+
     pub fn encode(self) -> Bytes {
-        let mut out = BytesMut::with_capacity(16);
+        let mut out = BytesMut::with_capacity(16 + BASIS_IDENTITY_LEN);
         out.put_u64(self.file_size);
         out.put_u64(self.block_count);
+        out.extend_from_slice(&self.basis_identity);
         out.freeze()
     }
 
@@ -176,8 +188,9 @@ impl WireSignatureEnd {
         let mut reader = SliceReader::new(payload);
         let file_size = reader.u64()?;
         let block_count = reader.u64()?;
+        let basis_identity = reader.array::<BASIS_IDENTITY_LEN>()?;
         reader.finish()?;
-        Self::new(file_size, block_count)
+        Self::new(file_size, block_count, basis_identity)
     }
 }
 
@@ -227,10 +240,12 @@ mod tests {
 
     #[test]
     fn signature_end_round_trip_and_empty_consistency() {
-        let end = WireSignatureEnd::new(10_000, 3).unwrap();
+        let identity = [0x5a; BASIS_IDENTITY_LEN];
+        let end = WireSignatureEnd::new(10_000, 3, identity).unwrap();
         assert_eq!(WireSignatureEnd::decode(&end.encode()).unwrap(), end);
-        assert!(WireSignatureEnd::new(0, 1).is_err());
-        assert!(WireSignatureEnd::new(1, 0).is_err());
-        assert!(WireSignatureEnd::new(0, 0).is_ok());
+        assert_eq!(end.basis_identity(), identity);
+        assert!(WireSignatureEnd::new(0, 1, identity).is_err());
+        assert!(WireSignatureEnd::new(1, 0, identity).is_err());
+        assert!(WireSignatureEnd::new(0, 0, identity).is_ok());
     }
 }
