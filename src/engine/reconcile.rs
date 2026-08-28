@@ -6,7 +6,7 @@ use std::fmt;
 use std::pin::Pin;
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
-pub type EntryStream = Pin<Box<dyn Stream<Item = Result<Entry, EngineError>> + Send>>;
+pub type EntryStream = Pin<Box<dyn Stream<Item = Result<Entry, BoxError>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -43,15 +43,6 @@ pub enum EngineError {
     Invariant(&'static str),
 }
 
-impl EngineError {
-    pub fn endpoint(side: Side, source: impl StdError + Send + Sync + 'static) -> Self {
-        Self::Endpoint {
-            side,
-            source: Box::new(source),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileItem {
     SourceOnly(Entry),
@@ -78,7 +69,10 @@ impl OrderedInput {
         let Some(entry) = self.stream.next().await else {
             return Ok(None);
         };
-        let entry = entry?;
+        let entry = entry.map_err(|source| EngineError::Endpoint {
+            side: self.side,
+            source,
+        })?;
 
         if let Some(previous) = self.previous.as_ref() {
             if entry.path <= *previous {
@@ -179,7 +173,10 @@ mod tests {
     }
 
     fn entries(paths: &[&str]) -> EntryStream {
-        let entries = paths.iter().map(|path| Ok(entry(path))).collect::<Vec<_>>();
+        let entries = paths
+            .iter()
+            .map(|path| Ok::<_, BoxError>(entry(path)))
+            .collect::<Vec<_>>();
         Box::pin(stream::iter(entries))
     }
 
@@ -240,6 +237,20 @@ mod tests {
             reconciler.next().await,
             Err(EngineError::EntryOrder {
                 side: Side::Destination,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attaches_side_to_endpoint_errors() {
+        let source_error = std::io::Error::other("scan failed");
+        let source = Box::pin(stream::iter([Err::<Entry, BoxError>(Box::new(source_error))]));
+        let mut reconciler = OrderedReconciler::new(source, entries(&[]));
+        assert!(matches!(
+            reconciler.next().await,
+            Err(EngineError::Endpoint {
+                side: Side::Source,
                 ..
             })
         ));
