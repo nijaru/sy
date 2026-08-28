@@ -39,9 +39,7 @@ impl<'a> SliceReader<'a> {
 
     pub(super) fn u32(&mut self) -> Result<u32> {
         let bytes = self.take(4)?;
-        Ok(u32::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]))
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     pub(super) fn u64(&mut self) -> Result<u64> {
