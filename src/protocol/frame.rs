@@ -30,21 +30,23 @@ impl StreamId {
 pub enum FrameKind {
     ClientHello = 1,
     ServerHello = 2,
-    Entry = 3,
-    EntryEnd = 4,
-    SignatureRequest = 5,
-    Signature = 6,
-    SignatureEnd = 7,
-    FileBegin = 8,
-    Data = 9,
-    DeltaCopy = 10,
-    FileEnd = 11,
-    Metadata = 12,
-    Ack = 13,
-    Error = 14,
-    Cancel = 15,
-    Ping = 16,
-    Pong = 17,
+    SessionOpen = 3,
+    SessionReady = 4,
+    Entry = 5,
+    EntryEnd = 6,
+    SignatureRequest = 7,
+    Signature = 8,
+    SignatureEnd = 9,
+    FileBegin = 10,
+    Data = 11,
+    DeltaCopy = 12,
+    FileEnd = 13,
+    Metadata = 14,
+    Ack = 15,
+    Error = 16,
+    Cancel = 17,
+    Ping = 18,
+    Pong = 19,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -54,21 +56,23 @@ impl TryFrom<u8> for FrameKind {
         match value {
             1 => Ok(Self::ClientHello),
             2 => Ok(Self::ServerHello),
-            3 => Ok(Self::Entry),
-            4 => Ok(Self::EntryEnd),
-            5 => Ok(Self::SignatureRequest),
-            6 => Ok(Self::Signature),
-            7 => Ok(Self::SignatureEnd),
-            8 => Ok(Self::FileBegin),
-            9 => Ok(Self::Data),
-            10 => Ok(Self::DeltaCopy),
-            11 => Ok(Self::FileEnd),
-            12 => Ok(Self::Metadata),
-            13 => Ok(Self::Ack),
-            14 => Ok(Self::Error),
-            15 => Ok(Self::Cancel),
-            16 => Ok(Self::Ping),
-            17 => Ok(Self::Pong),
+            3 => Ok(Self::SessionOpen),
+            4 => Ok(Self::SessionReady),
+            5 => Ok(Self::Entry),
+            6 => Ok(Self::EntryEnd),
+            7 => Ok(Self::SignatureRequest),
+            8 => Ok(Self::Signature),
+            9 => Ok(Self::SignatureEnd),
+            10 => Ok(Self::FileBegin),
+            11 => Ok(Self::Data),
+            12 => Ok(Self::DeltaCopy),
+            13 => Ok(Self::FileEnd),
+            14 => Ok(Self::Metadata),
+            15 => Ok(Self::Ack),
+            16 => Ok(Self::Error),
+            17 => Ok(Self::Cancel),
+            18 => Ok(Self::Ping),
+            19 => Ok(Self::Pong),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -294,6 +298,13 @@ mod tests {
             Frame::control(FrameKind::Data, payload),
             Err(ProtocolError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn session_control_kinds_are_reserved_before_data_plane() {
+        assert_eq!(FrameKind::SessionOpen as u8, 3);
+        assert_eq!(FrameKind::SessionReady as u8, 4);
+        assert_eq!(FrameKind::Entry as u8, 5);
     }
 
     proptest! {
