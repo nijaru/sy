@@ -309,6 +309,12 @@ async fn count_deletions(
     })
 }
 
+#[derive(Debug)]
+struct PendingDeleteDir {
+    path: PathBuf,
+    removable: bool,
+}
+
 async fn execute_deletions(
     dest: &dyn Endpoint,
     config: &SyncConfig,
@@ -321,29 +327,45 @@ async fn execute_deletions(
     let mut stream = dest.scan_ordered(scan_options).await?;
     let mut batch = Vec::with_capacity(batch_size);
     let mut protected_dest_dir: Option<PathBuf> = None;
-    let mut pending_delete_dir: Option<PathBuf> = None;
+    let mut directory_stack: Vec<PendingDeleteDir> = Vec::new();
 
     while let Some(entry) = next_entry(&mut stream).await? {
-        if let Some(directory) = pending_delete_dir.as_ref() {
-            if entry.relative_path.starts_with(directory) {
-                continue;
-            }
-            if let Some(directory) = pending_delete_dir.take() {
-                batch.push(delete_task(directory));
-                if batch.len() >= batch_size {
-                    execute_batch(executor, &mut batch, stats).await?;
+        while directory_stack
+            .last()
+            .is_some_and(|directory| !entry.relative_path.starts_with(&directory.path))
+        {
+            if let Some(directory) = directory_stack.pop() {
+                if directory.removable {
+                    batch.push(delete_task(directory.path));
+                    if batch.len() >= batch_size {
+                        execute_batch(executor, &mut batch, stats).await?;
+                    }
                 }
             }
         }
 
-        if !dest_delete_eligible(config, &entry, &mut protected_dest_dir)
-            || membership.contains(&entry.relative_path)
-        {
+        if !dest_delete_eligible(config, &entry, &mut protected_dest_dir) {
+            for directory in &mut directory_stack {
+                directory.removable = false;
+            }
+            continue;
+        }
+
+        if membership.contains(&entry.relative_path) {
+            // A real source match, or a Bloom false positive, must protect all
+            // candidate ancestors. False positives therefore retain data rather
+            // than making deletion less safe.
+            for directory in &mut directory_stack {
+                directory.removable = false;
+            }
             continue;
         }
 
         if entry.is_dir {
-            pending_delete_dir = Some((*entry.relative_path).clone());
+            directory_stack.push(PendingDeleteDir {
+                path: (*entry.relative_path).clone(),
+                removable: true,
+            });
         } else {
             batch.push(delete_task((*entry.relative_path).clone()));
             if batch.len() >= batch_size {
@@ -352,9 +374,15 @@ async fn execute_deletions(
         }
     }
 
-    if let Some(directory) = pending_delete_dir {
-        batch.push(delete_task(directory));
+    while let Some(directory) = directory_stack.pop() {
+        if directory.removable {
+            batch.push(delete_task(directory.path));
+            if batch.len() >= batch_size {
+                execute_batch(executor, &mut batch, stats).await?;
+            }
+        }
     }
+
     execute_batch(executor, &mut batch, stats).await
 }
 
@@ -650,5 +678,35 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert!(dest.path().join("keep").exists());
         assert!(!dest.path().join("delete").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_parent_with_excluded_descendant() {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::fs::create_dir(dest.path().join("extra")).unwrap();
+        std::fs::write(dest.path().join("extra").join("keep.log"), b"keep").unwrap();
+        std::fs::write(dest.path().join("extra").join("remove.tmp"), b"remove").unwrap();
+        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+        let mut sync_config = config();
+        sync_config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        sync_config.filter_engine.add_exclude("*.log");
+
+        run_local_sync(
+            &source_endpoint,
+            &dest_endpoint,
+            &sync_config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(dest.path().join("extra").join("keep.log").exists());
+        assert!(!dest.path().join("extra").join("remove.tmp").exists());
+        assert!(dest.path().join("extra").exists());
     }
 }
