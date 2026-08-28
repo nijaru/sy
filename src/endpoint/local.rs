@@ -14,8 +14,8 @@ use std::os::unix::fs::MetadataExt;
 
 /// Local filesystem endpoint.
 ///
-/// Scan options are intentionally passed per scan operation; the endpoint itself
-/// only owns stable endpoint state and capabilities.
+/// Scan options are passed per operation; the endpoint owns only stable root
+/// and capability state.
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
@@ -49,7 +49,7 @@ fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
     }
 }
 
-/// Transactional local write backed by a same-directory temporary file.
+/// Transactional local regular-file write backed by a same-directory temp file.
 struct LocalStagedWriter {
     file: Option<tokio::fs::File>,
     temp_path: PathBuf,
@@ -98,7 +98,6 @@ impl StagedWriter for LocalStagedWriter {
 
     async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()> {
         self.file_mut()?.flush().await?;
-
         filetime::set_file_mtime(
             &self.temp_path,
             filetime::FileTime::from_system_time(metadata.modified),
@@ -113,18 +112,16 @@ impl StagedWriter for LocalStagedWriter {
             )
             .await?;
         }
-
         Ok(())
     }
 
     async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
         const BUFFER_SIZE: usize = 1024 * 1024;
-
         self.file_mut()?.flush().await?;
+
         let mut file = tokio::fs::File::open(&self.temp_path).await?;
         let mut buffer = vec![0_u8; BUFFER_SIZE];
         let mut hasher = blake3::Hasher::new();
-
         loop {
             let read = file.read(&mut buffer).await?;
             if read == 0 {
@@ -132,7 +129,6 @@ impl StagedWriter for LocalStagedWriter {
             }
             hasher.update(&buffer[..read]);
         }
-
         Ok(Some(hasher.finalize()))
     }
 
@@ -141,7 +137,6 @@ impl StagedWriter for LocalStagedWriter {
             file.flush().await?;
             drop(file);
         }
-
         tokio::fs::rename(&self.temp_path, &self.final_path).await?;
         if let Some(guard) = self.guard.take() {
             guard.defuse();
@@ -195,13 +190,15 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
-        Ok(tokio::fs::try_exists(self.resolve(path))
-            .await
-            .unwrap_or(false))
+        match tokio::fs::symlink_metadata(self.resolve(path)).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
-        let meta = tokio::fs::metadata(self.resolve(path)).await?;
+        let meta = tokio::fs::symlink_metadata(self.resolve(path)).await?;
         Ok(file_metadata_from_fs(&meta))
     }
 
@@ -231,7 +228,7 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()> {
-        // Compatibility shim for callers not yet migrated to streaming I/O.
+        // Compatibility shim while remaining v0.4 auxiliary paths migrate.
         let mut writer = self.begin_write(path).await?;
         writer.write(data).await?;
         writer.set_metadata(meta).await?;
@@ -266,7 +263,14 @@ impl Endpoint for LocalEndpoint {
 
         #[cfg(unix)]
         {
-            tokio::fs::symlink(target, &full_dest).await?;
+            // Stage the directory entry and atomically rename it over an existing
+            // file/symlink. Type-changing directory replacements are rejected by
+            // reconciliation before reaching this operation.
+            let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
+            let guard = crate::temp_file::TempFileGuard::new(&temp);
+            tokio::fs::symlink(target, &temp).await?;
+            tokio::fs::rename(&temp, &full_dest).await?;
+            guard.defuse();
             Ok(())
         }
         #[cfg(not(unix))]
@@ -284,7 +288,12 @@ impl Endpoint for LocalEndpoint {
         if let Some(parent) = full_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::hard_link(full_source, full_dest).await?;
+
+        let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
+        let guard = crate::temp_file::TempFileGuard::new(&temp);
+        tokio::fs::hard_link(&full_source, &temp).await?;
+        tokio::fs::rename(&temp, &full_dest).await?;
+        guard.defuse();
         Ok(())
     }
 }
@@ -319,11 +328,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-
         let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
         writer.write(b"new").await.unwrap();
         writer.abort().await.unwrap();
-
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
     }
 
@@ -333,7 +340,6 @@ mod tests {
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
         let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
         writer.write(b"content").await.unwrap();
-
         let hash = writer.staged_hash().await.unwrap().unwrap();
         assert_eq!(hash, blake3::hash(b"content"));
         writer.abort().await.unwrap();
@@ -345,13 +351,54 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-
         let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
         writer.write(b"content").await.unwrap();
         writer.set_metadata(&make_meta()).await.unwrap();
         writer.commit().await.unwrap();
-
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_update_is_atomic_at_endpoint_boundary() {
+        let dir = TempDir::new().unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        endpoint
+            .create_symlink(Path::new("first"), Path::new("link"))
+            .await
+            .unwrap();
+        endpoint
+            .create_symlink(Path::new("second"), Path::new("link"))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_link(dir.path().join("link")).unwrap(), Path::new("second"));
+    }
+
+    #[tokio::test]
+    async fn hardlink_update_is_atomic_at_endpoint_boundary() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("first"), b"one").unwrap();
+        fs::write(dir.path().join("second"), b"two").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        endpoint
+            .create_hardlink(Path::new("first"), Path::new("link"))
+            .await
+            .unwrap();
+        endpoint
+            .create_hardlink(Path::new("second"), Path::new("link"))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(dir.path().join("link")).unwrap(), b"two");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exists_sees_dangling_symlink() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("link")).unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        assert!(endpoint.exists(Path::new("link")).await.unwrap());
+        assert!(endpoint.metadata(Path::new("link")).await.unwrap().is_symlink);
     }
 
     #[test]
