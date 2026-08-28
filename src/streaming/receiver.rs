@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::mpsc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -158,12 +159,11 @@ impl Receiver {
         }
     }
 
-    /// Scan destination and yield DEST_FILE_ENTRY messages for Initial Exchange.
-    /// Messages are batched to reduce syscalls.
-    pub async fn scan_dest<F>(&self, mut on_entry: F) -> Result<(u64, u64)>
-    where
-        F: FnMut(Bytes) -> Result<()>,
-    {
+    /// Scan destination and emit DEST_FILE_ENTRY messages through a bounded queue.
+    /// Messages are batched to reduce syscalls. Awaiting channel capacity makes
+    /// the network writer the backpressure boundary instead of buffering a full
+    /// destination scan in memory.
+    pub async fn scan_dest(&self, wire_tx: &mpsc::Sender<Bytes>) -> Result<(u64, u64)> {
         let mut total_files = 0u64;
         let mut total_bytes = 0u64;
 
@@ -220,7 +220,10 @@ impl Receiver {
             batch.extend_from_slice(&encoded);
 
             if batch.len() >= DEST_ENTRY_BATCH_SIZE {
-                on_entry(batch.split().freeze())?;
+                wire_tx
+                    .send(batch.split().freeze())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("destination scan output channel closed"))?;
             }
 
             total_files += 1;
@@ -228,7 +231,10 @@ impl Receiver {
         }
 
         if !batch.is_empty() {
-            on_entry(batch.freeze())?;
+            wire_tx
+                .send(batch.freeze())
+                .await
+                .map_err(|_| anyhow::anyhow!("destination scan output channel closed"))?;
         }
 
         // Send DEST_FILE_END (not batched - signals end of entries)
@@ -236,7 +242,10 @@ impl Receiver {
             total_files,
             total_bytes,
         };
-        on_entry(end.encode()?)?;
+        wire_tx
+            .send(end.encode()?)
+            .await
+            .map_err(|_| anyhow::anyhow!("destination scan output channel closed"))?;
 
         Ok((total_files, total_bytes))
     }
