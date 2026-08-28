@@ -26,13 +26,24 @@ impl Default for EntryMetadataRequest {
 }
 
 /// Endpoint-independent request for an ordered tree scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanRequest {
     pub respect_gitignore: bool,
     pub include_git_dir: bool,
     /// Maximum walk depth relative to the endpoint root. `None` means recursive.
     pub max_depth: Option<usize>,
     pub metadata: EntryMetadataRequest,
+}
+
+impl Default for ScanRequest {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: false,
+            include_git_dir: true,
+            max_depth: None,
+            metadata: EntryMetadataRequest::default(),
+        }
+    }
 }
 
 impl ScanRequest {
@@ -53,6 +64,7 @@ mod tests {
         assert!(request.metadata.symlink_target);
         assert!(request.metadata.identity);
         assert!(!request.metadata.hardlink_group);
+        assert!(request.include_git_dir);
         assert_eq!(request.max_depth, None);
     }
 }
