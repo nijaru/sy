@@ -51,10 +51,7 @@ pub enum RemoteScanError {
     NonEmptyAck,
 
     #[error("scan stream {stream_id} ended before {expected:?}")]
-    UnexpectedStreamEnd {
-        stream_id: u32,
-        expected: FrameKind,
-    },
+    UnexpectedStreamEnd { stream_id: u32, expected: FrameKind },
 
     #[error("scan depth {0} exceeds protocol u32 range")]
     DepthTooLarge(usize),
@@ -214,17 +211,15 @@ fn remote_entry_stream(
     require_data_stream(stream_id)?;
     ensure_compatible_path_encoding(peer)?;
 
-    let stream = futures::stream::try_unfold(
-        (inbox, sender),
-        move |(mut inbox, sender)| async move {
-            let routed =
-                inbox
-                    .recv()
-                    .await?
-                    .ok_or(RemoteScanError::UnexpectedStreamEnd {
-                        stream_id: stream_id.get(),
-                        expected: FrameKind::EntryEnd,
-                    })?;
+    let stream =
+        futures::stream::try_unfold((inbox, sender), move |(mut inbox, sender)| async move {
+            let routed = inbox
+                .recv()
+                .await?
+                .ok_or(RemoteScanError::UnexpectedStreamEnd {
+                    stream_id: stream_id.get(),
+                    expected: FrameKind::EntryEnd,
+                })?;
             let frame = routed.frame();
             require_stream(frame, stream_id)?;
 
@@ -254,9 +249,8 @@ fn remote_entry_stream(
                     actual,
                 }),
             }
-        },
-    )
-    .map(|result| result.map_err(|error| Box::new(error) as BoxError));
+        })
+        .map(|result| result.map_err(|error| Box::new(error) as BoxError));
 
     Ok(Box::pin(stream))
 }
