@@ -13,6 +13,7 @@ use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
 use futures::Stream;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
@@ -67,6 +68,7 @@ pub struct Capabilities {
     pub preserve_xattrs: bool,
     pub preserve_acls: bool,
     pub preserve_hardlinks: bool,
+    pub preserve_flags: bool,
     pub modtime_precision: Duration,
 }
 
@@ -85,6 +87,7 @@ impl Default for Capabilities {
             preserve_xattrs: false,
             preserve_acls: false,
             preserve_hardlinks: false,
+            preserve_flags: false,
             modtime_precision: Duration::ZERO,
         }
     }
@@ -106,6 +109,7 @@ impl Capabilities {
             preserve_xattrs: cfg!(unix),
             preserve_acls: cfg!(all(unix, feature = "acl")),
             preserve_hardlinks: true,
+            preserve_flags: cfg!(target_os = "macos"),
             modtime_precision: Duration::from_nanos(1),
         }
     }
@@ -148,6 +152,56 @@ pub trait Endpoint: Send + Sync {
 
     async fn exists(&self, path: &Path) -> Result<bool>;
     async fn metadata(&self, path: &Path) -> Result<FileMetadata>;
+
+    /// Read extended attributes only when preservation policy requests them.
+    async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot read xattrs for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
+    async fn write_xattrs(&self, path: &Path, _xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot write xattrs for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
+    /// Portable textual ACL representation used at the endpoint boundary.
+    async fn read_acl(&self, path: &Path) -> Result<Option<String>> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot read ACLs for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
+    async fn write_acl(&self, path: &Path, _acl: &str) -> Result<()> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot write ACLs for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
+    async fn read_bsd_flags(&self, path: &Path) -> Result<Option<u32>> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot read BSD flags for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
+    async fn write_bsd_flags(&self, path: &Path, _flags: u32) -> Result<()> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot write BSD flags for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
 
     /// Open a file for incremental reads.
     async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
