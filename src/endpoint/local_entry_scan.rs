@@ -47,6 +47,7 @@ enum LocalScanError {
         source: InvalidTimestamp,
     },
 
+    #[cfg(not(unix))]
     #[error("modification timestamp for {path} is outside the supported i64-second range")]
     TimestampRange { path: PathBuf },
 
@@ -73,9 +74,10 @@ pub fn local_entry_stream(root: PathBuf, request: ScanRequest) -> EntryStream {
         }
     });
 
-    Box::pin(futures::stream::unfold(receiver, |mut receiver| async move {
-        receiver.recv().await.map(|entry| (entry, receiver))
-    }))
+    Box::pin(futures::stream::unfold(
+        receiver,
+        |mut receiver| async move { receiver.recv().await.map(|entry| (entry, receiver)) },
+    ))
 }
 
 fn scan_worker(
@@ -148,12 +150,11 @@ fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry,
             path: path.to_path_buf(),
         })?
         .to_path_buf();
-    let relative = RelativePath::new(relative.clone()).map_err(|source| {
-        LocalScanError::RelativePath {
+    let relative =
+        RelativePath::new(relative.clone()).map_err(|source| LocalScanError::RelativePath {
             path: relative,
             source,
-        }
-    })?;
+        })?;
     let modified = metadata_timestamp(path, &metadata)?;
     let file_type = metadata.file_type();
 
@@ -202,14 +203,16 @@ fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry,
 }
 
 #[cfg(unix)]
-fn metadata_timestamp(path: &Path, metadata: &std::fs::Metadata) -> Result<Timestamp, LocalScanError> {
+fn metadata_timestamp(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<Timestamp, LocalScanError> {
     let nanoseconds = metadata.mtime_nsec();
-    let nanoseconds = u32::try_from(nanoseconds).map_err(|_| {
-        LocalScanError::TimestampNanoseconds {
+    let nanoseconds =
+        u32::try_from(nanoseconds).map_err(|_| LocalScanError::TimestampNanoseconds {
             path: path.to_path_buf(),
             nanoseconds,
-        }
-    })?;
+        })?;
     Timestamp::new(metadata.mtime(), nanoseconds).map_err(|source| LocalScanError::Timestamp {
         path: path.to_path_buf(),
         source,
@@ -217,11 +220,16 @@ fn metadata_timestamp(path: &Path, metadata: &std::fs::Metadata) -> Result<Times
 }
 
 #[cfg(not(unix))]
-fn metadata_timestamp(path: &Path, metadata: &std::fs::Metadata) -> Result<Timestamp, LocalScanError> {
-    let modified = metadata.modified().map_err(|source| LocalScanError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn metadata_timestamp(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<Timestamp, LocalScanError> {
+    let modified = metadata
+        .modified()
+        .map_err(|source| LocalScanError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
     system_time_to_timestamp(path, modified)
 }
 
@@ -234,11 +242,10 @@ fn system_time_to_timestamp(
 
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
-            let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
-                LocalScanError::TimestampRange {
+            let seconds =
+                i64::try_from(duration.as_secs()).map_err(|_| LocalScanError::TimestampRange {
                     path: path.to_path_buf(),
-                }
-            })?;
+                })?;
             Timestamp::new(seconds, duration.subsec_nanos()).map_err(|source| {
                 LocalScanError::Timestamp {
                     path: path.to_path_buf(),
@@ -248,11 +255,10 @@ fn system_time_to_timestamp(
         }
         Err(before_epoch) => {
             let duration = before_epoch.duration();
-            let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
-                LocalScanError::TimestampRange {
+            let seconds =
+                i64::try_from(duration.as_secs()).map_err(|_| LocalScanError::TimestampRange {
                     path: path.to_path_buf(),
-                }
-            })?;
+                })?;
             let nanos = duration.subsec_nanos();
             let (seconds, nanos) = if nanos == 0 {
                 (
