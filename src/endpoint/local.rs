@@ -5,6 +5,7 @@ use crate::endpoint::{
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -233,6 +234,210 @@ impl Endpoint for LocalEndpoint {
         Ok(file_metadata_from_fs(&meta))
     }
 
+    async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
+        #[cfg(unix)]
+        {
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Vec<(OsString, Vec<u8>)>> {
+                let mut result = Vec::new();
+                for name in xattr::list(&full_path)? {
+                    if let Some(value) = xattr::get(&full_path, &name)? {
+                        result.push((name, value));
+                    }
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "local extended attributes are unsupported on this platform".to_string(),
+            ))
+        }
+    }
+
+    async fn write_xattrs(&self, path: &Path, xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let full_path = self.resolve(path);
+            let xattrs = xattrs.to_vec();
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                let existing: Vec<OsString> = xattr::list(&full_path)?.collect();
+
+                for (name, value) in &xattrs {
+                    xattr::set(&full_path, name, value)?;
+                }
+
+                for name in existing {
+                    if !xattrs.iter().any(|(desired, _)| desired == &name) {
+                        xattr::remove(&full_path, &name)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (path, xattrs);
+            Err(SyncError::Config(
+                "local extended attributes are unsupported on this platform".to_string(),
+            ))
+        }
+    }
+
+    async fn read_acl(&self, path: &Path) -> Result<Option<String>> {
+        #[cfg(all(unix, feature = "acl"))]
+        {
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                let entries = exacl::getfacl(&full_path, None)?;
+                if entries.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        entries
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ))
+                }
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(all(unix, feature = "acl")))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "local ACL preservation requires the acl feature on Unix".to_string(),
+            ))
+        }
+    }
+
+    async fn write_acl(&self, path: &Path, acl: &str) -> Result<()> {
+        #[cfg(all(unix, feature = "acl"))]
+        {
+            let full_path = self.resolve(path);
+            let acl = acl.to_string();
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::str::FromStr;
+
+                let entries = if acl.is_empty() {
+                    #[cfg(target_os = "macos")]
+                    {
+                        Vec::new()
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = std::fs::metadata(&full_path)?.permissions().mode();
+                        exacl::from_mode(mode & 0o777)
+                    }
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "freebsd",
+                        target_os = "macos"
+                    )))]
+                    {
+                        Vec::new()
+                    }
+                } else {
+                    acl.lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| {
+                            exacl::AclEntry::from_str(line).map_err(|error| {
+                                SyncError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    error.to_string(),
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                exacl::setfacl(&[&full_path], &entries, None)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(all(unix, feature = "acl")))]
+        {
+            let _ = (path, acl);
+            Err(SyncError::Config(
+                "local ACL preservation requires the acl feature on Unix".to_string(),
+            ))
+        }
+    }
+
+    async fn read_bsd_flags(&self, path: &Path) -> Result<Option<u32>> {
+        #[cfg(target_os = "macos")]
+        {
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
+                use std::os::macos::fs::MetadataExt;
+                Ok(Some(std::fs::symlink_metadata(full_path)?.st_flags()))
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "BSD flags are only supported on macOS".to_string(),
+            ))
+        }
+    }
+
+    async fn write_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                let path = std::ffi::CString::new(full_path.as_os_str().as_bytes()).map_err(|_| {
+                    SyncError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "NUL in path",
+                    ))
+                })?;
+
+                // SAFETY: `path` is a live, NUL-terminated CString for the full
+                // local destination path. `chflags` only borrows the pointer for
+                // the duration of this call.
+                let result = unsafe { libc::chflags(path.as_ptr(), flags as _) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(SyncError::Io(std::io::Error::last_os_error()))
+                }
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, flags);
+            Err(SyncError::Config(
+                "BSD flags are only supported on macOS".to_string(),
+            ))
+        }
+    }
+
     async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
         let full_path = self.resolve(path);
         let file = tokio::fs::File::open(&full_path).await.map_err(|error| {
@@ -408,6 +613,33 @@ mod tests {
         writer.set_metadata(&make_meta()).await.unwrap();
         writer.commit().await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_xattrs_round_trip_and_remove_stale_values() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"content").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+
+        endpoint
+            .write_xattrs(
+                Path::new("file"),
+                &[(OsString::from("user.sy-test"), b"first".to_vec())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.read_xattrs(Path::new("file")).await.unwrap(),
+            vec![(OsString::from("user.sy-test"), b"first".to_vec())]
+        );
+
+        endpoint.write_xattrs(Path::new("file"), &[]).await.unwrap();
+        assert!(endpoint
+            .read_xattrs(Path::new("file"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(unix)]
