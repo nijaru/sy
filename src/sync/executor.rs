@@ -4,7 +4,7 @@
 //! transfer layer chooses endpoint-native fast paths when available and falls
 //! back to bounded staged streaming. Verification is explicit BLAKE3 I/O.
 
-use crate::endpoint::io::hash_file_streaming;
+use crate::endpoint::io::{hash_file_streaming, VerificationStatus};
 use crate::endpoint::transfer::{transfer_file, TransferOptions};
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
@@ -263,8 +263,8 @@ impl<'a> TaskExecutor<'a> {
             self.create_backup(&task.dest_path).await?;
         }
 
-        // The transfer layer owns staging and rollback. A read/write/metadata
-        // error never causes the executor to remove the existing destination.
+        // The transfer layer owns staging, verification, and rollback. A bad
+        // staged result never replaces the visible destination.
         let transfer = transfer_file(
             self.source,
             &source_entry.relative_path,
@@ -272,6 +272,7 @@ impl<'a> TaskExecutor<'a> {
             &task.dest_path,
             TransferOptions {
                 update: task.action == SyncAction::Update,
+                verify: self.verification.verify_on_write,
             },
         )
         .await?;
@@ -280,18 +281,15 @@ impl<'a> TaskExecutor<'a> {
             path = %task.dest_path.display(),
             strategy = ?transfer.strategy,
             bytes = transfer.bytes_written,
+            verification = ?transfer.verification,
             "file transfer complete"
         );
 
-        if self.verification.verify_on_write {
-            let source_hash = hash_file_streaming(self.source, &source_entry.relative_path).await?;
-            let dest_hash = hash_file_streaming(self.dest, &task.dest_path).await?;
-            if source_hash != dest_hash {
-                return Ok(TaskResult::VerificationFailed {
-                    expected: source_hash.to_hex().to_string(),
-                    actual: dest_hash.to_hex().to_string(),
-                });
-            }
+        if let VerificationStatus::Failed { expected, actual } = transfer.verification {
+            return Ok(TaskResult::VerificationFailed {
+                expected: expected.to_hex().to_string(),
+                actual: actual.to_hex().to_string(),
+            });
         }
 
         if self.config.preserve_hardlinks && source_entry.nlink > 1 {
@@ -387,7 +385,10 @@ impl<'a> TaskExecutor<'a> {
             path,
             self.dest,
             &backup_path,
-            TransferOptions { update: false },
+            TransferOptions {
+                update: false,
+                verify: false,
+            },
         )
         .await?;
         tracing::debug!("Backup created: {:?} -> {:?}", path, backup_path);
