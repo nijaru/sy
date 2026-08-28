@@ -224,12 +224,6 @@ pub trait Endpoint: Send + Sync {
         )))
     }
 
-    // Legacy whole-file methods retained only while auxiliary v0.4 code is
-    // migrated. New transfer code must use open_reader/begin_write or the
-    // capability-driven transfer layer.
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
-    async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()>;
-
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()>;
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
