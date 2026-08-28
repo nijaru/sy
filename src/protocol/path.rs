@@ -61,42 +61,44 @@ impl RelativeWirePath {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        let components = components
-            .into_iter()
-            .map(|component| Bytes::copy_from_slice(component.as_ref()))
-            .collect::<Vec<_>>();
-        if components.is_empty() {
-            return Err(ProtocolError::InvalidRelativePath("path is empty"));
-        }
-        if components.len() > MAX_WIRE_COMPONENTS {
-            return Err(ProtocolError::TooManyPathComponents {
-                count: components.len(),
-                max: MAX_WIRE_COMPONENTS,
-            });
-        }
+        // Reserve the count prefix and fill it after one-pass encoding. This
+        // avoids allocating a temporary Vec for every path in metadata streams.
+        let mut encoded = BytesMut::with_capacity(256);
+        encoded.put_u16(0);
+        let mut count = 0_usize;
 
-        let mut total_len = 2_usize;
-        for component in &components {
+        for component in components {
+            if count == MAX_WIRE_COMPONENTS {
+                return Err(ProtocolError::TooManyPathComponents {
+                    count: count + 1,
+                    max: MAX_WIRE_COMPONENTS,
+                });
+            }
+
+            let component = component.as_ref();
             validate_component_len(component.len())?;
-            total_len = total_len
+            let next_len = encoded
+                .len()
                 .checked_add(2)
                 .and_then(|len| len.checked_add(component.len()))
                 .ok_or(ProtocolError::InvalidMessage("wire path length overflow"))?;
-        }
-        validate_total_len(total_len)?;
+            validate_total_len(next_len)?;
 
-        let count = u16::try_from(components.len()).map_err(|_| {
-            ProtocolError::InvalidMessage("wire path component count exceeds u16")
-        })?;
-        let mut encoded = BytesMut::with_capacity(total_len);
-        encoded.put_u16(count);
-        for component in components {
             let len = u16::try_from(component.len()).map_err(|_| {
                 ProtocolError::InvalidMessage("wire path component length exceeds u16")
             })?;
             encoded.put_u16(len);
-            encoded.extend_from_slice(&component);
+            encoded.extend_from_slice(component);
+            count += 1;
         }
+
+        if count == 0 {
+            return Err(ProtocolError::InvalidRelativePath("path is empty"));
+        }
+        let count = u16::try_from(count).map_err(|_| {
+            ProtocolError::InvalidMessage("wire path component count exceeds u16")
+        })?;
+        encoded[..2].copy_from_slice(&count.to_be_bytes());
 
         Ok(Self {
             encoded: encoded.freeze(),
@@ -164,7 +166,7 @@ impl RelativeWirePath {
         self.component_count as usize
     }
 
-    pub fn components(&self) -> WireComponents<'_> {
+    pub fn components(&self) -> impl ExactSizeIterator<Item = &[u8]> + '_ {
         WireComponents {
             encoded: &self.encoded,
             offset: 2,
@@ -173,7 +175,7 @@ impl RelativeWirePath {
     }
 }
 
-pub struct WireComponents<'a> {
+struct WireComponents<'a> {
     encoded: &'a [u8],
     offset: usize,
     remaining: u16,
@@ -251,7 +253,11 @@ mod tests {
         assert_eq!(decoded, path);
         assert_eq!(
             decoded.components().collect::<Vec<_>>(),
-            vec![b"dir".as_slice(), b"\xff/file".as_slice(), b"\x00\x01".as_slice()]
+            vec![
+                b"dir".as_slice(),
+                b"\xff/file".as_slice(),
+                b"\x00\x01".as_slice()
+            ]
         );
     }
 
@@ -276,7 +282,10 @@ mod tests {
     #[test]
     fn native_root_bytes_are_not_interpreted_by_protocol() {
         let utf16_like = Bytes::from_static(&[b'C', 0, b':', 0, b'\\', 0]);
-        assert_eq!(WirePath::new(utf16_like.clone()).unwrap().into_bytes(), utf16_like);
+        assert_eq!(
+            WirePath::new(utf16_like.clone()).unwrap().into_bytes(),
+            utf16_like
+        );
     }
 
     proptest! {
