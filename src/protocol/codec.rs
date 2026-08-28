@@ -28,6 +28,22 @@ impl<'a> SliceReader<'a> {
         Ok(value)
     }
 
+    pub(super) fn take_remaining(&mut self) -> Result<&'a [u8]> {
+        let len = self
+            .bytes
+            .len()
+            .checked_sub(self.offset)
+            .ok_or(ProtocolError::InvalidMessage("message cursor exceeds payload"))?;
+        self.take(len)
+    }
+
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let bytes = self.take(N)?;
+        let mut value = [0_u8; N];
+        value.copy_from_slice(bytes);
+        Ok(value)
+    }
+
     pub(super) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
@@ -79,6 +95,14 @@ mod tests {
         let reader = SliceReader::new(&[1]);
         assert!(reader.finish().is_err());
         let reader = SliceReader::new(&[]);
+        assert!(reader.finish().is_ok());
+    }
+
+    #[test]
+    fn checked_cursor_supports_arrays_and_bounded_remainder() {
+        let mut reader = SliceReader::new(&[1, 2, 3, 4, 5]);
+        assert_eq!(reader.array::<2>().unwrap(), [1, 2]);
+        assert_eq!(reader.take_remaining().unwrap(), &[3, 4, 5]);
         assert!(reader.finish().is_ok());
     }
 }
