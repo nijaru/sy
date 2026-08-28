@@ -1,5 +1,6 @@
 use crate::endpoint::{
-    BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, ScanOptions, StagedWriter,
+    BoxReader, Capabilities, Endpoint, EndpointType, EntryStream, FileMetadata, ScanOptions,
+    StagedWriter,
 };
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
@@ -189,6 +190,40 @@ impl Endpoint for LocalEndpoint {
             .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
     }
 
+    async fn scan_ordered(&self, opts: ScanOptions) -> Result<EntryStream> {
+        const CHANNEL_CAPACITY: usize = 256;
+
+        let root = self.root.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let error_sender = sender.clone();
+
+        tokio::spawn(async move {
+            let scan = tokio::task::spawn_blocking(move || {
+                for entry in crate::endpoint::local_scan::OrderedLocalScanner::new(root, opts) {
+                    if sender.blocking_send(entry).is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+
+            if let Err(error) = scan {
+                let _ = error_sender
+                    .send(Err(SyncError::Io(std::io::Error::other(
+                        error.to_string(),
+                    ))))
+                    .await;
+            }
+        });
+
+        Ok(Box::pin(futures::stream::unfold(
+            receiver,
+            |mut receiver| async move {
+                receiver.recv().await.map(|entry| (entry, receiver))
+            },
+        )))
+    }
+
     async fn exists(&self, path: &Path) -> Result<bool> {
         match tokio::fs::symlink_metadata(self.resolve(path)).await {
             Ok(_) => Ok(true),
@@ -301,6 +336,7 @@ impl Endpoint for LocalEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     fn make_meta() -> FileMetadata {
@@ -321,6 +357,26 @@ mod tests {
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
         let entries = endpoint.scan(ScanOptions::default()).await.unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_scan_stream_preserves_path_order() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("b")).unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("z"), b"z").unwrap();
+        fs::write(dir.path().join("a").join("file"), b"a").unwrap();
+
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut stream = endpoint.scan_ordered(ScanOptions::default()).await.unwrap();
+        let mut paths = Vec::new();
+        while let Some(entry) = stream.next().await {
+            paths.push((*entry.unwrap().relative_path).clone());
+        }
+
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
     }
 
     #[tokio::test]
