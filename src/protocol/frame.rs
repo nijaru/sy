@@ -47,6 +47,7 @@ pub enum FrameKind {
     Cancel = 17,
     Ping = 18,
     Pong = 19,
+    ScanRequest = 20,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -73,6 +74,7 @@ impl TryFrom<u8> for FrameKind {
             17 => Ok(Self::Cancel),
             18 => Ok(Self::Ping),
             19 => Ok(Self::Pong),
+            20 => Ok(Self::ScanRequest),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -305,6 +307,7 @@ mod tests {
         assert_eq!(FrameKind::SessionOpen as u8, 3);
         assert_eq!(FrameKind::SessionReady as u8, 4);
         assert_eq!(FrameKind::Entry as u8, 5);
+        assert_eq!(FrameKind::ScanRequest as u8, 20);
     }
 
     proptest! {
