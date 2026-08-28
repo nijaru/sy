@@ -2,7 +2,9 @@ mod frame;
 mod handshake;
 mod path;
 
-pub use frame::{read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD};
+pub use frame::{
+    read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD,
+};
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Operation, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
