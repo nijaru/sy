@@ -29,11 +29,13 @@ impl<'a> SliceReader<'a> {
     }
 
     pub(super) fn take_remaining(&mut self) -> Result<&'a [u8]> {
-        let len = self
-            .bytes
-            .len()
-            .checked_sub(self.offset)
-            .ok_or(ProtocolError::InvalidMessage("message cursor exceeds payload"))?;
+        let len =
+            self.bytes
+                .len()
+                .checked_sub(self.offset)
+                .ok_or(ProtocolError::InvalidMessage(
+                    "message cursor exceeds payload",
+                ))?;
         self.take(len)
     }
 
