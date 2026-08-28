@@ -42,6 +42,8 @@ pub struct Capabilities {
     pub streaming_read: bool,
     /// Writes can be staged incrementally and committed transactionally.
     pub staged_write: bool,
+    /// Staged bytes can be hashed before commit.
+    pub staged_verify: bool,
     /// Efficient random reads are supported.
     pub random_read: bool,
     /// Efficient random writes to staging state are supported.
@@ -64,6 +66,7 @@ impl Default for Capabilities {
             atomic_rename: false,
             streaming_read: false,
             staged_write: false,
+            staged_verify: false,
             random_read: false,
             random_write: false,
             reflink: false,
@@ -83,6 +86,7 @@ impl Capabilities {
             atomic_rename: true,
             streaming_read: true,
             staged_write: true,
+            staged_verify: true,
             random_read: true,
             random_write: true,
             // Filesystem-specific support is probed before strategy selection.
