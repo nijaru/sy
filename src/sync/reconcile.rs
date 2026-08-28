@@ -212,7 +212,10 @@ async fn preflight_delete(
                     source_entry = next_entry(&mut source_stream).await?;
                 }
                 Ordering::Equal => {
-                    close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
+                    close_candidate_dirs(
+                        dest_entry_ref.relative_path.as_path(),
+                        &mut candidate_dirs,
+                    );
                     source_entries += 1;
                     if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
                         eligible_dest_entries += 1;
@@ -224,16 +227,15 @@ async fn preflight_delete(
                     dest_entry = next_entry(&mut dest_stream).await?;
                 }
                 Ordering::Greater => {
-                    close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
+                    close_candidate_dirs(
+                        dest_entry_ref.relative_path.as_path(),
+                        &mut candidate_dirs,
+                    );
                     if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
                         eligible_dest_entries += 1;
                         delete_candidates += 1;
-                        append_delete_candidate(
-                            &mut journal,
-                            dest_entry_ref,
-                            &mut candidate_dirs,
-                        )
-                        .await?;
+                        append_delete_candidate(&mut journal, dest_entry_ref, &mut candidate_dirs)
+                            .await?;
                     } else {
                         protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                     }
