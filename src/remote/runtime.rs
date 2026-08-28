@@ -1,12 +1,12 @@
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{ClientHello, Operation, ServerHello, SessionReady};
-use crate::remote::scan::{request_scan, serve_incoming_scan};
-use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
-use crate::remote_router::{
+use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
 };
+use crate::remote::scan::{request_scan, serve_incoming_scan};
+use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 
