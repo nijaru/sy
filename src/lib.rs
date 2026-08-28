@@ -25,6 +25,9 @@ pub mod remote;
 #[path = "remote/router.rs"]
 pub mod remote_router;
 #[doc(hidden)]
+#[path = "remote/runtime.rs"]
+pub mod remote_runtime;
+#[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
 #[doc(hidden)]
