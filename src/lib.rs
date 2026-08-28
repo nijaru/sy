@@ -1,3 +1,5 @@
+extern crate self as sy;
+
 // Public API — these are the stable library exports
 pub mod cli;
 pub mod compress;
