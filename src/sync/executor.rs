@@ -5,7 +5,9 @@
 //! back to bounded staged streaming. Verification is explicit BLAKE3 I/O.
 
 use crate::endpoint::io::{hash_file_streaming, VerificationStatus};
-use crate::endpoint::transfer::{transfer_file, TransferOptions};
+use crate::endpoint::transfer::{
+    transfer_file, TransferOptions, FILE_TRANSFER_BUFFER_BUDGET,
+};
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
 use crate::sync::config::{PreserveConfig, VerificationConfig};
@@ -17,8 +19,9 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
+use sy::engine::scheduler::{ResourceBudget, ResourceRequest, Scheduler, SchedulerError};
 
 /// Result of executing a single task.
 #[derive(Debug, Clone)]
@@ -71,7 +74,7 @@ pub struct TaskExecutor<'a> {
     dry_run: bool,
     preserve: PreserveConfig,
     verification: VerificationConfig,
-    max_concurrent: usize,
+    scheduler: Scheduler,
     backup: BackupConfig,
     config: ExecuteConfig,
     hardlink_map: Mutex<HashMap<u64, PathBuf>>,
@@ -85,14 +88,25 @@ impl<'a> TaskExecutor<'a> {
         preserve: PreserveConfig,
         verification: VerificationConfig,
         max_concurrent: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let active_files = u32::try_from(max_concurrent).map_err(|_| {
+            Error::Config(format!(
+                "max concurrent file count {max_concurrent} exceeds scheduler capacity"
+            ))
+        })?;
+        let scheduler = Scheduler::new(ResourceBudget {
+            active_files,
+            ..ResourceBudget::default()
+        })
+        .map_err(map_scheduler_error)?;
+
+        Ok(Self {
             source,
             dest,
             dry_run,
             preserve,
             verification,
-            max_concurrent,
+            scheduler,
             backup: BackupConfig {
                 enabled: false,
                 suffix: "~".to_string(),
@@ -100,7 +114,7 @@ impl<'a> TaskExecutor<'a> {
             },
             config: ExecuteConfig::default(),
             hardlink_map: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn with_backup(mut self, config: BackupConfig) -> Self {
@@ -115,7 +129,15 @@ impl<'a> TaskExecutor<'a> {
 
     pub async fn execute_task(&self, task: &SyncTask) -> Result<TaskResult> {
         self.validate_requested_capabilities()?;
+        let _permit = self
+            .scheduler
+            .acquire(self.resource_request(task))
+            .await
+            .map_err(map_scheduler_error)?;
+        self.execute_task_admitted(task).await
+    }
 
+    async fn execute_task_admitted(&self, task: &SyncTask) -> Result<TaskResult> {
         match task.action {
             SyncAction::Skip => Ok(TaskResult::Skipped),
             SyncAction::Create | SyncAction::Update => self.execute_create_or_update(task).await,
@@ -125,6 +147,36 @@ impl<'a> TaskExecutor<'a> {
                 }
                 Ok(TaskResult::Deleted)
             }
+        }
+    }
+
+    fn resource_request(&self, task: &SyncTask) -> ResourceRequest {
+        if task.action == SyncAction::Skip {
+            return ResourceRequest::default();
+        }
+
+        let regular_file = matches!(task.action, SyncAction::Create | SyncAction::Update)
+            && task
+                .source
+                .as_deref()
+                .is_some_and(|entry| !entry.is_dir && !entry.is_symlink);
+
+        ResourceRequest {
+            active_files: 1,
+            buffered_bytes: if regular_file {
+                FILE_TRANSFER_BUFFER_BUDGET
+            } else {
+                0
+            },
+            metadata_ops: 1,
+            cpu_tasks: if regular_file && self.verification.verify_on_write {
+                1
+            } else {
+                0
+            },
+            // The compatibility executor is currently local-only. Protocol v3
+            // will account network writes in the remote engine path.
+            network_writes: 0,
         }
     }
 
@@ -267,8 +319,12 @@ impl<'a> TaskExecutor<'a> {
                 Ok(TaskResult::DirCreated)
             } else if source_entry.is_symlink {
                 Ok(TaskResult::SymlinkCreated)
-            } else {
+            } else if task.action == SyncAction::Create {
                 Ok(TaskResult::Created {
+                    bytes: source_entry.size,
+                })
+            } else {
+                Ok(TaskResult::Updated {
                     bytes: source_entry.size,
                 })
             };
@@ -294,12 +350,11 @@ impl<'a> TaskExecutor<'a> {
         #[cfg(unix)]
         if self.config.preserve_dir_permissions {
             use std::os::unix::fs::PermissionsExt;
+
             let source_path = self.source.root().join(&*source_entry.relative_path);
-            if let Ok(meta) = std::fs::metadata(&source_path) {
-                let mode = meta.permissions().mode();
-                let abs_dest = self.abs_dest_path(&task.dest_path);
-                let _ = std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode));
-            }
+            let mode = tokio::fs::metadata(&source_path).await?.permissions().mode();
+            let abs_dest = self.abs_dest_path(&task.dest_path);
+            tokio::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode)).await?;
         }
 
         self.apply_preservation(&task.dest_path, preservation)
@@ -315,7 +370,7 @@ impl<'a> TaskExecutor<'a> {
         #[cfg(unix)]
         {
             let source_path = self.source.root().join(&*source_entry.relative_path);
-            let target = std::fs::read_link(&source_path)?;
+            let target = tokio::fs::read_link(&source_path).await?;
             self.dest.create_symlink(&target, &task.dest_path).await?;
 
             if self.config.itemize_changes {
@@ -342,7 +397,7 @@ impl<'a> TaskExecutor<'a> {
         if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
                 let first_path = {
-                    let map = self.hardlink_map.lock().expect("hardlink map poisoned");
+                    let map = self.hardlink_map()?;
                     map.get(&inode).cloned()
                 };
 
@@ -407,8 +462,8 @@ impl<'a> TaskExecutor<'a> {
 
         if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
-                let mut map = self.hardlink_map.lock().expect("hardlink map poisoned");
-                map.insert(inode, task.dest_path.clone());
+                self.hardlink_map()?
+                    .insert(inode, task.dest_path.clone());
             }
         }
 
@@ -418,16 +473,11 @@ impl<'a> TaskExecutor<'a> {
         }
 
         // Source removal is intentionally last. Verification or preservation
-        // failure leaves the source untouched.
+        // failure leaves the source untouched, and a removal failure is surfaced
+        // instead of reporting a successful move that left the source behind.
         if self.config.remove_source_files {
             let source_path = self.source.root().join(&*source_entry.relative_path);
-            if let Err(error) = std::fs::remove_file(&source_path) {
-                tracing::warn!(
-                    "Failed to remove source {}: {}",
-                    source_path.display(),
-                    error
-                );
-            }
+            tokio::fs::remove_file(&source_path).await?;
         }
 
         Ok(if task.action == SyncAction::Create {
@@ -438,6 +488,14 @@ impl<'a> TaskExecutor<'a> {
             TaskResult::Updated {
                 bytes: transfer.bytes_written,
             }
+        })
+    }
+
+    fn hardlink_map(&self) -> Result<MutexGuard<'_, HashMap<u64, PathBuf>>> {
+        self.hardlink_map.lock().map_err(|_| {
+            Error::Io(std::io::Error::other(
+                "hard-link preservation state was poisoned",
+            ))
         })
     }
 
@@ -496,13 +554,17 @@ impl<'a> TaskExecutor<'a> {
         let mut stats = SyncStats::default();
 
         if self.preserve_hardlinks_requested() {
+            // Link topology depends on deterministic first-seen ordering. Keep
+            // this compatibility path serial until hard-link groups are native
+            // engine operations rather than executor-side mutable state.
             for task in &tasks {
                 self.execute_and_record(task, &mut stats).await?;
             }
         } else {
+            let concurrency = tasks.len().max(1);
             let results: Vec<Result<TaskResult>> = stream::iter(tasks.iter())
                 .map(|task| async move { self.execute_task(task).await })
-                .buffer_unordered(self.max_concurrent)
+                .buffer_unordered(concurrency)
                 .collect()
                 .await;
 
@@ -553,6 +615,10 @@ impl<'a> TaskExecutor<'a> {
     }
 }
 
+fn map_scheduler_error(error: SchedulerError) -> Error {
+    Error::Config(format!("scheduler: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +643,7 @@ mod tests {
             },
             4,
         )
+        .unwrap()
     }
 
     fn make_file_entry(relative: &str, size: u64) -> FileEntry {
@@ -597,6 +664,51 @@ mod tests {
             acls: None,
             bsd_flags: None,
         }
+    }
+
+    #[test]
+    fn regular_file_request_reserves_real_transfer_working_set() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let executor = test_executor(&source, &dest);
+        let task = SyncTask {
+            source: Some(Arc::new(make_file_entry("file", 1))),
+            dest_path: PathBuf::from("file"),
+            action: SyncAction::Create,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        let request = executor.resource_request(&task);
+        assert_eq!(request.active_files, 1);
+        assert_eq!(request.buffered_bytes, FILE_TRANSFER_BUFFER_BUDGET);
+        assert_eq!(request.metadata_ops, 1);
+        assert_eq!(request.cpu_tasks, 0);
+    }
+
+    #[test]
+    fn zero_concurrency_is_rejected() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let result = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            PreserveConfig::default(),
+            VerificationConfig {
+                mode: ChecksumType::Fast,
+                verify_on_write: false,
+                checksum_db: false,
+                clear_checksum_db: false,
+                prune_checksum_db: false,
+            },
+            0,
+        );
+        assert!(matches!(result, Err(Error::Config(_))));
     }
 
     #[tokio::test]
@@ -658,7 +770,8 @@ mod tests {
                 prune_checksum_db: false,
             },
             4,
-        );
+        )
+        .unwrap();
         let entry = make_file_entry("file", 3);
         let task = SyncTask {
             source: Some(Arc::new(entry)),
@@ -723,7 +836,8 @@ mod tests {
                 prune_checksum_db: false,
             },
             4,
-        );
+        )
+        .unwrap();
 
         let entry = make_file_entry("file", 8);
         let task = SyncTask {
@@ -733,6 +847,9 @@ mod tests {
             source_checksum: None,
             dest_checksum: None,
         };
+
+        let request = executor.resource_request(&task);
+        assert_eq!(request.cpu_tasks, 1);
 
         let result = executor.execute_task(&task).await.unwrap();
         assert!(matches!(result, TaskResult::Created { bytes: 8 }));

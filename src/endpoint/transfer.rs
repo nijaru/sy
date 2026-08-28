@@ -11,6 +11,13 @@ use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
 use std::path::{Path, PathBuf};
 
+const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Conservative maximum explicit heap buffering used by one local regular-file
+/// transfer. Reflink patching compares source and destination with two buffers;
+/// the other transfer paths use at most one at a time.
+pub(crate) const FILE_TRANSFER_BUFFER_BUDGET: u64 = (TRANSFER_BUFFER_SIZE as u64) * 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStrategy {
     NativeSparseCopy,
@@ -168,7 +175,7 @@ async fn native_whole_copy(
         let temp = TempFileGuard::temp_path_for(&dest);
         let guard = TempFileGuard::new(&temp);
         let bytes_written = std::fs::copy(&source, &temp)?;
-        strip_xattrs(&temp);
+        strip_xattrs(&temp)?;
 
         let verification = verify_native_staging(&source, &temp, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
@@ -206,7 +213,7 @@ async fn reflink_patch(
         let ratio = match crate::delta::estimate_change_ratio(
             &source,
             &dest,
-            1024 * 1024,
+            TRANSFER_BUFFER_SIZE,
             Some(16),
             Some(0.25),
         ) {
@@ -230,13 +237,13 @@ async fn reflink_patch(
             return Ok(None);
         }
 
-        strip_xattrs(&temp);
-        patch_changed_blocks(&source, &dest, &temp, metadata.size)?;
+        strip_xattrs(&temp)?;
+        let bytes_written = patch_changed_blocks(&source, &dest, &temp, metadata.size)?;
 
         let verification = verify_native_staging(&source, &temp, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
             return Ok(Some(NativeTransferResult {
-                bytes_written: metadata.size,
+                bytes_written,
                 verification,
             }));
         }
@@ -245,7 +252,7 @@ async fn reflink_patch(
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
         Ok(Some(NativeTransferResult {
-            bytes_written: metadata.size,
+            bytes_written,
             verification,
         }))
     })
@@ -258,17 +265,17 @@ fn patch_changed_blocks(
     old_dest: &Path,
     staged: &Path,
     source_size: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     use std::fs::{File, OpenOptions};
-    use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
-    const BLOCK_SIZE: usize = 1024 * 1024;
-    let mut source_file = BufReader::with_capacity(BLOCK_SIZE, File::open(source)?);
-    let mut dest_file = BufReader::with_capacity(BLOCK_SIZE, File::open(old_dest)?);
+    let mut source_file = File::open(source)?;
+    let mut dest_file = File::open(old_dest)?;
     let mut staged_file = OpenOptions::new().write(true).open(staged)?;
-    let mut source_buf = vec![0_u8; BLOCK_SIZE];
-    let mut dest_buf = vec![0_u8; BLOCK_SIZE];
+    let mut source_buf = vec![0_u8; TRANSFER_BUFFER_SIZE];
+    let mut dest_buf = vec![0_u8; TRANSFER_BUFFER_SIZE];
     let mut offset = 0_u64;
+    let mut bytes_written = 0_u64;
 
     loop {
         let source_read = source_file.read(&mut source_buf)?;
@@ -280,6 +287,7 @@ fn patch_changed_blocks(
         if source_read != dest_read || source_buf[..source_read] != dest_buf[..dest_read] {
             staged_file.seek(SeekFrom::Start(offset))?;
             staged_file.write_all(&source_buf[..source_read])?;
+            bytes_written += source_read as u64;
         }
 
         offset += source_read as u64;
@@ -287,7 +295,7 @@ fn patch_changed_blocks(
 
     staged_file.set_len(source_size)?;
     staged_file.flush()?;
-    Ok(())
+    Ok(bytes_written)
 }
 
 #[cfg(target_os = "linux")]
@@ -395,21 +403,22 @@ async fn native_sparse_copy(
         let mut source_file = File::open(&source)?;
         let mut staged = File::create(&temp)?;
         staged.set_len(metadata.size)?;
-        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
+        let mut bytes_written = 0_u64;
 
         for region in regions {
             source_file.seek(SeekFrom::Start(region.offset))?;
             staged.seek(SeekFrom::Start(region.offset))?;
             let mut remaining = region.length;
             while remaining > 0 {
-                let chunk =
-                    usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                let chunk = remaining.min(buffer.len() as u64) as usize;
                 let read = source_file.read(&mut buffer[..chunk])?;
                 if read == 0 {
                     break;
                 }
                 staged.write_all(&buffer[..read])?;
                 remaining -= read as u64;
+                bytes_written += read as u64;
             }
         }
 
@@ -419,7 +428,7 @@ async fn native_sparse_copy(
         let verification = verify_native_staging(&source, &temp, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
             return Ok(Some(NativeTransferResult {
-                bytes_written: metadata.size,
+                bytes_written,
                 verification,
             }));
         }
@@ -428,7 +437,7 @@ async fn native_sparse_copy(
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
         Ok(Some(NativeTransferResult {
-            bytes_written: metadata.size,
+            bytes_written,
             verification,
         }))
     })
@@ -466,15 +475,14 @@ fn verify_native_staging(
 
 fn hash_native_file(path: &Path) -> std::io::Result<blake3::Hash> {
     use std::fs::File;
-    use std::io::{BufReader, Read};
+    use std::io::Read;
 
-    const BUFFER_SIZE: usize = 1024 * 1024;
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(path)?);
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
     let mut hasher = blake3::Hasher::new();
 
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -500,13 +508,20 @@ fn apply_metadata(path: &Path, metadata: &FileMetadata) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn strip_xattrs(path: &Path) {
-    if let Ok(attributes) = xattr::list(path) {
-        for attribute in attributes {
-            let _ = xattr::remove(path, &attribute);
-        }
+fn strip_xattrs(path: &Path) -> std::io::Result<()> {
+    let attributes = match xattr::list(path) {
+        Ok(attributes) => attributes,
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for attribute in attributes {
+        xattr::remove(path, &attribute)?;
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn strip_xattrs(_path: &Path) {}
+fn strip_xattrs(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
