@@ -175,10 +175,21 @@ fn process_capabilities() -> CapabilitySet {
     // Advertise only behavior owned by the negotiated v3 runtime. The central
     // frame router is mandatory after handshake, so multiplexing is a runtime
     // invariant rather than a reserved protocol possibility.
-    endpoint_capabilities(&Capabilities::local())
+    let capabilities = endpoint_capabilities(&Capabilities::local())
         | CapabilitySet::BLAKE3
         | CapabilitySet::RAW_PATHS
-        | CapabilitySet::MULTIPLEXING
+        | CapabilitySet::MULTIPLEXING;
+
+    // Rolling-signature basis reads are advertised only where RootedFs can
+    // enforce held-directory-FD confinement for every peer-controlled path.
+    #[cfg(unix)]
+    {
+        capabilities | CapabilitySet::ROLLING_SIGNATURES
+    }
+    #[cfg(not(unix))]
+    {
+        capabilities
+    }
 }
 
 fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
@@ -402,10 +413,13 @@ mod tests {
             .ready
             .capabilities
             .contains(CapabilitySet::MULTIPLEXING));
-        assert!(!client
-            .ready
-            .capabilities
-            .contains(CapabilitySet::ROLLING_SIGNATURES));
+        assert_eq!(
+            client
+                .ready
+                .capabilities
+                .contains(CapabilitySet::ROLLING_SIGNATURES),
+            cfg!(unix)
+        );
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
     }
 
