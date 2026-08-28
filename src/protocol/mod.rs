@@ -4,8 +4,8 @@ mod path;
 
 pub use frame::{read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD};
 pub use handshake::{
-    negotiate_version, CapabilitySet, ClientHello, Operation, Platform, ProtocolVersion,
-    ServerHello, VersionRange, PROTOCOL_V3,
+    negotiate_version, CapabilitySet, ClientHello, Operation, Platform, PlatformArch, PlatformOs,
+    ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
 pub use path::{RelativeWirePath, WirePath, MAX_WIRE_PATH_BYTES};
 
