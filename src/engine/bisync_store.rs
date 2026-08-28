@@ -153,6 +153,33 @@ impl BisyncStateStore {
         }
     }
 
+    /// Prepare an interrupted pair for an explicit recovery/resync pass.
+    ///
+    /// A crash may leave an immutable target generation after its rename but
+    /// before the current pointer advances. That generation is not trusted: the
+    /// replicas may have been only partially mutated. Remove target/temp state
+    /// so the recovery pass can reuse the reserved generation id, but retain the
+    /// durable recovery marker until a verified resync commits successfully.
+    pub fn prepare_interrupted_resync(&self) -> Result<RecoveryMarker> {
+        let marker = match self.recovery_state()? {
+            RecoveryState::Interrupted(marker) => marker,
+            RecoveryState::Clean | RecoveryState::Committed(_) => {
+                return Err(BisyncStoreError::RecoveryRequired);
+            }
+        };
+
+        let current_generation = self.current_pointer()?.map(|pointer| pointer.generation);
+        if current_generation != marker.base_generation {
+            return Err(BisyncStoreError::BaseGenerationMismatch);
+        }
+
+        remove_if_exists(&self.generation_temp_path(marker.target_generation))?;
+        remove_if_exists(&self.generation_path(marker.target_generation))?;
+        remove_if_exists(&self.directory.join(CURRENT_TEMP_FILE))?;
+        sync_directory(&self.directory)?;
+        Ok(marker)
+    }
+
     /// Start a mutation transaction by durably recording base -> target before
     /// any replica change is allowed.
     pub fn begin_run(&self, base_generation: Option<GenerationId>) -> Result<RecoveryMarker> {
@@ -537,6 +564,36 @@ mod tests {
             Err(BisyncStoreError::State(BisyncStateError::ChecksumMismatch))
                 | Err(BisyncStoreError::PointerDigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_resync_discards_untrusted_target_but_keeps_marker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = BisyncStateStore::open(temp.path()).unwrap();
+        let marker = store.begin_run(None).unwrap();
+
+        let target = store.generation_path(marker.target_generation);
+        let target_temp = store.generation_temp_path(marker.target_generation);
+        let current_temp = store.directory.join(CURRENT_TEMP_FILE);
+        fs::write(&target, b"untrusted target").unwrap();
+        fs::write(&target_temp, b"partial target").unwrap();
+        fs::write(&current_temp, b"partial pointer").unwrap();
+
+        assert_eq!(store.prepare_interrupted_resync().unwrap(), marker);
+        assert!(!target.exists());
+        assert!(!target_temp.exists());
+        assert!(!current_temp.exists());
+        assert_eq!(store.recovery_marker().unwrap(), Some(marker));
+        assert!(matches!(
+            store.recovery_state().unwrap(),
+            RecoveryState::Interrupted(found) if found == marker
+        ));
+
+        store
+            .commit_generation(marker, POLICY, [record(b"a", 1)])
+            .unwrap();
+        assert_eq!(store.recovery_state().unwrap(), RecoveryState::Clean);
     }
 
     #[test]
