@@ -14,12 +14,12 @@ use crate::ssh::config::SshConfig;
 use crate::sync::config::{DeleteMode, SyncConfig};
 use crate::sync::executor::{BackupConfig, ExecuteConfig, TaskExecutor};
 use crate::sync::scanner::{FileEntry, ScanOptions};
-use crate::sync::stats::SyncStats;
+use crate::sync::stats::{SyncError as StatsError, SyncStats};
 use crate::sync::strategy::{SyncAction, SyncTask};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Endpoint configuration owned by a sync session.
 pub enum EndpointPair {
@@ -34,9 +34,9 @@ pub enum EndpointPair {
 impl EndpointPair {
     pub fn from_sync_path(path: &crate::path::SyncPath) -> Result<Self> {
         match path {
-            crate::path::SyncPath::Local { path, .. } => Ok(Self::Local(Box::new(
-                LocalEndpoint::new(path.clone()),
-            ))),
+            crate::path::SyncPath::Local { path, .. } => {
+                Ok(Self::Local(Box::new(LocalEndpoint::new(path.clone()))))
+            }
             crate::path::SyncPath::Remote {
                 host, user, path, ..
             } => Ok(Self::Ssh {
@@ -150,7 +150,7 @@ impl SyncSession {
             files_only_in_source: Vec::new(),
             files_only_in_dest: Vec::new(),
             errors: Vec::new(),
-            duration: std::time::Duration::ZERO,
+            duration: Duration::ZERO,
         };
 
         for (path, source_entry) in &source_map {
@@ -175,18 +175,18 @@ impl SyncSession {
                     (Ok(source_hash), Ok(dest_hash)) => source_hash == dest_hash,
                     (source_result, dest_result) => {
                         if let Err(error) = source_result {
-                            result.errors.push(format!(
-                                "{}: source verification failed: {}",
-                                path.display(),
-                                error
-                            ));
+                            result.errors.push(StatsError {
+                                path: source.join(path),
+                                error: error.to_string(),
+                                action: "verify-source".to_string(),
+                            });
                         }
                         if let Err(error) = dest_result {
-                            result.errors.push(format!(
-                                "{}: destination verification failed: {}",
-                                path.display(),
-                                error
-                            ));
+                            result.errors.push(StatsError {
+                                path: dest.join(path),
+                                error: error.to_string(),
+                                action: "verify-destination".to_string(),
+                            });
                         }
                         false
                     }
@@ -216,9 +216,10 @@ impl SyncSession {
 
     async fn direct_local(&self) -> Result<SyncStats> {
         let started = Instant::now();
-        let source = self.source.as_endpoint().ok_or_else(|| {
-            SyncError::Config("source must be local for direct sync".to_string())
-        })?;
+        let source = self
+            .source
+            .as_endpoint()
+            .ok_or_else(|| SyncError::Config("source must be local for direct sync".to_string()))?;
         let dest = self.dest.as_endpoint().ok_or_else(|| {
             SyncError::Config("destination must be local for direct sync".to_string())
         })?;
@@ -285,7 +286,13 @@ impl SyncSession {
             .filter(|task| task.action == SyncAction::Skip)
             .count();
 
-        tracing::info!(creates, updates, deletes = delete_count, skips, "local plan");
+        tracing::info!(
+            creates,
+            updates,
+            deletes = delete_count,
+            skips,
+            "local plan"
+        );
 
         if self.config.dry_run {
             return Ok(SyncStats {
@@ -367,11 +374,14 @@ impl SyncSession {
             return Ok(task_for(source, dest_path, SyncAction::Skip));
         }
 
-        // A type transition must never be mistaken for an unchanged path. The
-        // executor currently rejects destructive type replacement until the path
-        // transaction layer can make it crash-safe.
+        // Refuse destructive type transitions until path replacement is a
+        // first-class transaction. This is safer than deleting a destination
+        // before the replacement is known to be valid.
         if entry_kind(source) != entry_kind(dest) {
-            return Ok(task_for(source, dest_path, SyncAction::Update));
+            return Err(SyncError::Config(format!(
+                "refusing non-transactional type replacement at {}",
+                source.relative_path.display()
+            )));
         }
 
         let action = if source.is_dir {
@@ -515,6 +525,7 @@ impl SyncSession {
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
+        let started = Instant::now();
         let (host, user, dest_root) = match &self.dest {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
             _ => {
@@ -542,17 +553,14 @@ impl SyncSession {
             .push(&mut stdout, &mut stdin)
             .await
             .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(streaming_stats(stats))
+        Ok(streaming_stats(stats, started.elapsed()))
     }
 
     async fn streaming_pull(&self) -> Result<SyncStats> {
+        let started = Instant::now();
         let (host, user, source_root) = match &self.source {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
-            _ => {
-                return Err(SyncError::Config(
-                    "source must be SSH for pull".to_string(),
-                ))
-            }
+            _ => return Err(SyncError::Config("source must be SSH for pull".to_string())),
         };
         let dest_root = self.dest.root().to_path_buf();
         let ssh_config = resolve_ssh_config(host, user)?;
@@ -573,7 +581,7 @@ impl SyncSession {
             .pull(&mut stdout, &mut stdin)
             .await
             .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(streaming_stats(stats))
+        Ok(streaming_stats(stats, started.elapsed()))
     }
 
     fn configure_streaming(
@@ -662,7 +670,7 @@ fn resolve_ssh_config(host: &str, user: &Option<String>) -> Result<SshConfig> {
     }
 }
 
-fn streaming_stats(stats: crate::streaming::StreamingStats) -> SyncStats {
+fn streaming_stats(stats: crate::streaming::SyncStats, duration: Duration) -> SyncStats {
     SyncStats {
         files_scanned: stats.files_scanned as u64,
         files_created: stats.files_ok as u64,
@@ -671,6 +679,7 @@ fn streaming_stats(stats: crate::streaming::StreamingStats) -> SyncStats {
         delta_bytes_saved: stats.delta_bytes_saved,
         dirs_created: stats.dirs_created,
         symlinks_created: stats.symlinks_created,
+        duration,
         ..Default::default()
     }
 }
@@ -779,14 +788,8 @@ mod tests {
             ..test_config()
         };
 
-        let error = local_pair(&source, &dest, config)
-            .sync()
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SyncError::DeletionThresholdExceeded { .. }
-        ));
+        let error = local_pair(&source, &dest, config).sync().await.unwrap_err();
+        assert!(matches!(error, SyncError::DeletionThresholdExceeded { .. }));
     }
 
     #[tokio::test]
