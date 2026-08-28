@@ -23,21 +23,17 @@ jobs:
           from pathlib import Path
           path = Path("src/engine/bisync_store.rs")
           text = path.read_text()
-          old = '''        if current.is_some_and(|pointer| pointer.generation == marker.target_generation) {
-              self.verify_pointer(current.expect("checked as some"))?;
-              return Ok(RecoveryState::Committed(marker));
-          }
-          '''
-          new = '''        if let Some(pointer) = current {
-              if pointer.generation == marker.target_generation {
-                  self.verify_pointer(pointer)?;
-                  return Ok(RecoveryState::Committed(marker));
-              }
-          }
-          '''
-          if old not in text:
-              raise SystemExit("expected recovery-state source not found")
-          path.write_text(text.replace(old, new, 1))
+          start = text.index("        if current.is_some_and")
+          end = text.index("\n\n        if current.map", start)
+          replacement = (
+              "        if let Some(pointer) = current {\n"
+              "            if pointer.generation == marker.target_generation {\n"
+              "                self.verify_pointer(pointer)?;\n"
+              "                return Ok(RecoveryState::Committed(marker));\n"
+              "            }\n"
+              "        }"
+          )
+          path.write_text(text[:start] + replacement + text[end:])
           PY
           cargo fmt
           git diff --check
