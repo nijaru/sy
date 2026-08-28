@@ -201,11 +201,6 @@ impl<'a> TaskExecutor<'a> {
         {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             let target = std::fs::read_link(&source_path)?;
-
-            // TODO(v0.5): stage symlink replacement so update is atomic too.
-            if task.action == SyncAction::Update {
-                self.dest.remove(&task.dest_path, false).await?;
-            }
             self.dest.create_symlink(&target, &task.dest_path).await?;
 
             if self.config.itemize_changes {
@@ -237,10 +232,6 @@ impl<'a> TaskExecutor<'a> {
                 };
 
                 if let Some(first_path) = first_path {
-                    // TODO(v0.5): stage hardlink replacement atomically.
-                    if task.action == SyncAction::Update {
-                        self.dest.remove(&task.dest_path, false).await?;
-                    }
                     self.dest
                         .create_hardlink(&first_path, &task.dest_path)
                         .await?;
