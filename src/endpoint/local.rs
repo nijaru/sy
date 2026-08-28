@@ -408,12 +408,13 @@ impl Endpoint for LocalEndpoint {
 
             let full_path = self.resolve(path);
             return tokio::task::spawn_blocking(move || -> Result<()> {
-                let path = std::ffi::CString::new(full_path.as_os_str().as_bytes()).map_err(|_| {
-                    SyncError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "NUL in path",
-                    ))
-                })?;
+                let path =
+                    std::ffi::CString::new(full_path.as_os_str().as_bytes()).map_err(|_| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "NUL in path",
+                        ))
+                    })?;
 
                 // SAFETY: `path` is a live, NUL-terminated CString for the full
                 // local destination path. `chflags` only borrows the pointer for
