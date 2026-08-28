@@ -95,9 +95,8 @@ impl RelativeWirePath {
         if count == 0 {
             return Err(ProtocolError::InvalidRelativePath("path is empty"));
         }
-        let count = u16::try_from(count).map_err(|_| {
-            ProtocolError::InvalidMessage("wire path component count exceeds u16")
-        })?;
+        let count = u16::try_from(count)
+            .map_err(|_| ProtocolError::InvalidMessage("wire path component count exceeds u16"))?;
         encoded[..2].copy_from_slice(&count.to_be_bytes());
 
         Ok(Self {
@@ -127,9 +126,12 @@ impl RelativeWirePath {
             let length_end = offset
                 .checked_add(2)
                 .ok_or(ProtocolError::InvalidMessage("wire path length overflow"))?;
-            let length_bytes = encoded.get(offset..length_end).ok_or(
-                ProtocolError::InvalidMessage("truncated wire path component length"),
-            )?;
+            let length_bytes =
+                encoded
+                    .get(offset..length_end)
+                    .ok_or(ProtocolError::InvalidMessage(
+                        "truncated wire path component length",
+                    ))?;
             let len = u16::from_be_bytes([length_bytes[0], length_bytes[1]]) as usize;
             validate_component_len(len)?;
             offset = length_end
