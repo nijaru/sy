@@ -7,7 +7,7 @@ use crate::protocol::{
     Frame, FrameFlags, FrameKind, Platform, PlatformOs, ProtocolError, RelativeWirePath, StreamId,
     WireEntry, WireEntryKind, WirePath, WireScanRequest,
 };
-use crate::remote_router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
+use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
 use futures::StreamExt;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -562,8 +562,8 @@ fn decode_native_path(_path: WirePath, peer: PlatformOs) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::protocol::Operation;
+    use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
-    use crate::remote_router::{FrameRouter, RouterConfig, RouterRole};
 
     #[test]
     fn scan_request_round_trip_matches_engine_request() {
