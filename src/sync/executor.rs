@@ -15,6 +15,7 @@ use crate::sync::stats::{SyncError, SyncStats};
 use crate::sync::strategy::{SyncAction, SyncTask};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -51,6 +52,16 @@ pub struct ExecuteConfig {
     pub itemize_changes: bool,
     pub remove_source_files: bool,
     pub print_stats: bool,
+}
+
+#[derive(Debug, Default)]
+struct PreservationState {
+    /// `None` means xattrs were not requested; `Some([])` means mirror an empty set.
+    xattrs: Option<Vec<(OsString, Vec<u8>)>>,
+    /// `None` means ACLs were not requested; an empty string means clear them.
+    acl: Option<String>,
+    /// BSD flags are always explicit when requested, including zero.
+    bsd_flags: Option<u32>,
 }
 
 /// Executes sync tasks against source and destination endpoints.
@@ -117,30 +128,131 @@ impl<'a> TaskExecutor<'a> {
         }
     }
 
+    fn preserve_xattrs_requested(&self) -> bool {
+        self.config.preserve_xattrs || self.preserve.xattrs
+    }
+
+    fn preserve_hardlinks_requested(&self) -> bool {
+        self.config.preserve_hardlinks || self.preserve.hardlinks
+    }
+
     fn validate_requested_capabilities(&self) -> Result<()> {
-        let capabilities = self.dest.capabilities();
+        let source = self.source.capabilities();
+        let dest = self.dest.capabilities();
 
-        if (self.config.preserve_xattrs || self.preserve.xattrs) && !capabilities.preserve_xattrs {
-            return Err(Error::Config(format!(
-                "{:?} destination cannot preserve extended attributes",
-                self.dest.endpoint_type()
-            )));
-        }
-        if self.preserve.acls && !capabilities.preserve_acls {
-            return Err(Error::Config(format!(
-                "{:?} destination cannot preserve ACLs",
-                self.dest.endpoint_type()
-            )));
-        }
-        if (self.config.preserve_hardlinks || self.preserve.hardlinks)
-            && !capabilities.preserve_hardlinks
-        {
-            return Err(Error::Config(format!(
-                "{:?} destination cannot preserve hard links",
-                self.dest.endpoint_type()
-            )));
+        if self.preserve_xattrs_requested() {
+            if !source.preserve_xattrs {
+                return Err(Error::Config(format!(
+                    "{:?} source cannot read extended attributes",
+                    self.source.endpoint_type()
+                )));
+            }
+            if !dest.preserve_xattrs {
+                return Err(Error::Config(format!(
+                    "{:?} destination cannot preserve extended attributes",
+                    self.dest.endpoint_type()
+                )));
+            }
         }
 
+        if self.preserve.acls {
+            if !source.preserve_acls {
+                return Err(Error::Config(format!(
+                    "{:?} source cannot read ACLs",
+                    self.source.endpoint_type()
+                )));
+            }
+            if !dest.preserve_acls {
+                return Err(Error::Config(format!(
+                    "{:?} destination cannot preserve ACLs",
+                    self.dest.endpoint_type()
+                )));
+            }
+        }
+
+        if self.preserve_hardlinks_requested() {
+            if !source.preserve_hardlinks {
+                return Err(Error::Config(format!(
+                    "{:?} source cannot describe hard-link topology",
+                    self.source.endpoint_type()
+                )));
+            }
+            if !dest.preserve_hardlinks {
+                return Err(Error::Config(format!(
+                    "{:?} destination cannot preserve hard links",
+                    self.dest.endpoint_type()
+                )));
+            }
+        }
+
+        if self.preserve.flags {
+            if !source.preserve_flags {
+                return Err(Error::Config(format!(
+                    "{:?} source cannot read BSD flags",
+                    self.source.endpoint_type()
+                )));
+            }
+            if !dest.preserve_flags {
+                return Err(Error::Config(format!(
+                    "{:?} destination cannot preserve BSD flags",
+                    self.dest.endpoint_type()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn read_preservation(&self, source_entry: &FileEntry) -> Result<PreservationState> {
+        let path = source_entry.relative_path.as_path();
+
+        let xattrs = if self.preserve_xattrs_requested() {
+            Some(self.source.read_xattrs(path).await?)
+        } else {
+            None
+        };
+
+        let acl = if self.preserve.acls {
+            Some(self.source.read_acl(path).await?.unwrap_or_default())
+        } else {
+            None
+        };
+
+        let bsd_flags = if self.preserve.flags {
+            Some(self.source.read_bsd_flags(path).await?.ok_or_else(|| {
+                Error::Config(format!(
+                    "{:?} source did not return BSD flags for {}",
+                    self.source.endpoint_type(),
+                    path.display()
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        Ok(PreservationState {
+            xattrs,
+            acl,
+            bsd_flags,
+        })
+    }
+
+    async fn apply_preservation(
+        &self,
+        dest_path: &Path,
+        preservation: PreservationState,
+    ) -> Result<()> {
+        if let Some(xattrs) = preservation.xattrs.as_deref() {
+            self.dest.write_xattrs(dest_path, xattrs).await?;
+        }
+        if let Some(acl) = preservation.acl.as_deref() {
+            self.dest.write_acl(dest_path, acl).await?;
+        }
+        if let Some(flags) = preservation.bsd_flags {
+            // BSD flags are intentionally last: immutable flags can prevent
+            // subsequent metadata updates.
+            self.dest.write_bsd_flags(dest_path, flags).await?;
+        }
         Ok(())
     }
 
@@ -176,6 +288,7 @@ impl<'a> TaskExecutor<'a> {
         source_entry: &FileEntry,
         task: &SyncTask,
     ) -> Result<TaskResult> {
+        let preservation = self.read_preservation(source_entry).await?;
         self.dest.create_dir_all(&task.dest_path).await?;
 
         #[cfg(unix)]
@@ -189,6 +302,7 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
+        self.apply_preservation(&task.dest_path, preservation).await?;
         Ok(TaskResult::DirCreated)
     }
 
@@ -224,7 +338,7 @@ impl<'a> TaskExecutor<'a> {
     }
 
     async fn execute_file(&self, source_entry: &FileEntry, task: &SyncTask) -> Result<TaskResult> {
-        if self.config.preserve_hardlinks && source_entry.nlink > 1 {
+        if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
                 let first_path = {
                     let map = self.hardlink_map.lock().expect("hardlink map poisoned");
@@ -249,6 +363,10 @@ impl<'a> TaskExecutor<'a> {
                 }
             }
         }
+
+        // Read optional metadata before any backup or destination replacement so
+        // source metadata failures cannot partially mutate the destination.
+        let preservation = self.read_preservation(source_entry).await?;
 
         if self.backup.enabled && task.action == SyncAction::Update {
             self.create_backup(&task.dest_path).await?;
@@ -283,16 +401,13 @@ impl<'a> TaskExecutor<'a> {
             });
         }
 
-        if self.config.preserve_hardlinks && source_entry.nlink > 1 {
+        self.apply_preservation(&task.dest_path, preservation).await?;
+
+        if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
                 let mut map = self.hardlink_map.lock().expect("hardlink map poisoned");
                 map.insert(inode, task.dest_path.clone());
             }
-        }
-
-        #[cfg(unix)]
-        if self.config.preserve_xattrs {
-            self.copy_xattrs(source_entry, &task.dest_path);
         }
 
         if self.config.itemize_changes {
@@ -300,8 +415,8 @@ impl<'a> TaskExecutor<'a> {
             eprintln!("{} {}", item, task.dest_path.display());
         }
 
-        // Source removal is intentionally last. Verification failure leaves the
-        // source untouched.
+        // Source removal is intentionally last. Verification or preservation
+        // failure leaves the source untouched.
         if self.config.remove_source_files {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             if let Err(error) = std::fs::remove_file(&source_path) {
@@ -322,19 +437,6 @@ impl<'a> TaskExecutor<'a> {
                 bytes: transfer.bytes_written,
             }
         })
-    }
-
-    #[cfg(unix)]
-    fn copy_xattrs(&self, source_entry: &FileEntry, dest_path: &Path) {
-        let source_path = self.source.root().join(&*source_entry.relative_path);
-        if let Ok(xattrs) = xattr::list(&source_path) {
-            for attr in xattrs {
-                if let Ok(Some(value)) = xattr::get(&source_path, &attr) {
-                    let abs_dest = self.abs_dest_path(dest_path);
-                    let _ = xattr::set(&abs_dest, &attr, &value);
-                }
-            }
-        }
     }
 
     fn abs_dest_path(&self, path: &Path) -> PathBuf {
@@ -391,7 +493,7 @@ impl<'a> TaskExecutor<'a> {
         let start = Instant::now();
         let mut stats = SyncStats::default();
 
-        if self.config.preserve_hardlinks {
+        if self.preserve_hardlinks_requested() {
             for task in &tasks {
                 self.execute_and_record(task, &mut stats).await?;
             }
@@ -522,6 +624,54 @@ mod tests {
         assert_eq!(
             std::fs::read(dst_dir.path().join("large.bin")).unwrap(),
             contents
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_transfer_preserves_xattrs_and_removes_stale_values() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        std::fs::write(src_dir.path().join("file"), b"new").unwrap();
+        std::fs::write(dst_dir.path().join("file"), b"old").unwrap();
+        xattr::set(src_dir.path().join("file"), "user.sy-source", b"source").unwrap();
+        xattr::set(dst_dir.path().join("file"), "user.sy-stale", b"stale").unwrap();
+
+        let source = LocalEndpoint::new(src_dir.path().to_path_buf());
+        let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
+        let mut preserve = PreserveConfig::default();
+        preserve.xattrs = true;
+        let executor = TaskExecutor::new(
+            &source,
+            &dest,
+            false,
+            preserve,
+            VerificationConfig {
+                mode: ChecksumType::Fast,
+                verify_on_write: false,
+                checksum_db: false,
+                clear_checksum_db: false,
+                prune_checksum_db: false,
+            },
+            4,
+        );
+        let entry = make_file_entry("file", 3);
+        let task = SyncTask {
+            source: Some(Arc::new(entry)),
+            dest_path: PathBuf::from("file"),
+            action: SyncAction::Update,
+            source_checksum: None,
+            dest_checksum: None,
+        };
+
+        executor.execute_task(&task).await.unwrap();
+        assert_eq!(
+            xattr::get(dst_dir.path().join("file"), "user.sy-source").unwrap(),
+            Some(b"source".to_vec())
+        );
+        assert_eq!(
+            xattr::get(dst_dir.path().join("file"), "user.sy-stale").unwrap(),
+            None
         );
     }
 
