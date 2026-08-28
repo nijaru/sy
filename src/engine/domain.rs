@@ -38,7 +38,10 @@ impl RelativePath {
 
 impl fmt::Debug for RelativePath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("RelativePath").field(&self.0).finish()
+        formatter
+            .debug_tuple("RelativePath")
+            .field(&self.0)
+            .finish()
     }
 }
 
