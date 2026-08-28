@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -115,6 +115,25 @@ impl StagedWriter for LocalStagedWriter {
         }
 
         Ok(())
+    }
+
+    async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
+        const BUFFER_SIZE: usize = 1024 * 1024;
+
+        self.file_mut()?.flush().await?;
+        let mut file = tokio::fs::File::open(&self.temp_path).await?;
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut hasher = blake3::Hasher::new();
+
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+
+        Ok(Some(hasher.finalize()))
     }
 
     async fn commit(mut self: Box<Self>) -> Result<()> {
@@ -306,6 +325,19 @@ mod tests {
         writer.abort().await.unwrap();
 
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn staged_hash_reads_uncommitted_bytes() {
+        let dir = TempDir::new().unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        writer.write(b"content").await.unwrap();
+
+        let hash = writer.staged_hash().await.unwrap().unwrap();
+        assert_eq!(hash, blake3::hash(b"content"));
+        writer.abort().await.unwrap();
+        assert!(!dir.path().join("file").exists());
     }
 
     #[tokio::test]
