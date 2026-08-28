@@ -20,7 +20,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply slice
-        run: python3 .github/workflows/platform-rolling-once.py
+        run: |
+          python3 .github/workflows/platform-rolling-once.py
+          python3 -c 'from pathlib import Path; p=Path("src/engine/rolling.rs"); t=p.read_text(); p.write_text(t.replace("pub const fn digest(self) -> u32 {", "pub fn digest(self) -> u32 {", 1))'
       - run: cargo fmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -36,7 +38,9 @@ jobs:
         with:
           components: rustfmt
       - name: Apply slice
-        run: python3 .github/workflows/platform-rolling-once.py
+        run: |
+          python3 .github/workflows/platform-rolling-once.py
+          python3 -c 'from pathlib import Path; p=Path("src/engine/rolling.rs"); t=p.read_text(); p.write_text(t.replace("pub const fn digest(self) -> u32 {", "pub fn digest(self) -> u32 {", 1))'
       - run: cargo fmt
       - run: cargo fmt --check
       - run: cargo test
@@ -54,6 +58,7 @@ jobs:
       - name: Apply validated slice
         run: |
           python3 .github/workflows/platform-rolling-once.py
+          python3 -c 'from pathlib import Path; p=Path("src/engine/rolling.rs"); t=p.read_text(); p.write_text(t.replace("pub const fn digest(self) -> u32 {", "pub fn digest(self) -> u32 {", 1))'
           cargo fmt
       - name: Commit validated slice
         run: |
