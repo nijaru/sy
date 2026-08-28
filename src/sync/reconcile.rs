@@ -443,15 +443,21 @@ async fn plan_local_entry(
         return Ok(task_for(source, dest_path, SyncAction::Skip));
     }
 
-    if entry_kind(source) != entry_kind(dest) {
+    // Same-directory rename gives the local endpoint an atomic replacement
+    // boundary for regular files and symlinks in either direction. Directories
+    // need a separate tree transaction and remain rejected until the new engine
+    // owns that operation explicitly.
+    if source.is_dir != dest.is_dir {
         return Err(SyncError::Config(format!(
-            "refusing non-transactional type replacement at {}",
+            "directory type replacement is not yet transactional at {}",
             source.relative_path.display()
         )));
     }
 
     let action = if source.is_dir {
         SyncAction::Skip
+    } else if source.is_symlink != dest.is_symlink {
+        SyncAction::Update
     } else if source.is_symlink {
         if source.symlink_target == dest.symlink_target {
             SyncAction::Skip
@@ -531,16 +537,6 @@ fn merge_stats(stats: &mut SyncStats, mut batch: SyncStats) {
     stats.errors.append(&mut batch.errors);
 }
 
-fn entry_kind(entry: &FileEntry) -> u8 {
-    if entry.is_symlink {
-        2
-    } else if entry.is_dir {
-        1
-    } else {
-        0
-    }
-}
-
 fn task_for(source: &FileEntry, dest_path: PathBuf, action: SyncAction) -> SyncTask {
     SyncTask {
         source: Some(Arc::new(source.clone())),
@@ -603,6 +599,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second.files_skipped, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_atomically_replaces_regular_file() {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("target", source.path().join("entry")).unwrap();
+        std::fs::write(dest.path().join("entry"), b"old").unwrap();
+        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+
+        run_local_sync(
+            &source_endpoint,
+            &dest_endpoint,
+            &config(),
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(dest.path().join("entry"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(dest.path().join("entry")).unwrap(), Path::new("target"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regular_file_atomically_replaces_symlink() {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::fs::write(source.path().join("entry"), b"new").unwrap();
+        std::os::unix::fs::symlink("missing", dest.path().join("entry")).unwrap();
+        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+
+        run_local_sync(
+            &source_endpoint,
+            &dest_endpoint,
+            &config(),
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(dest.path().join("entry"))
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(std::fs::read(dest.path().join("entry")).unwrap(), b"new");
     }
 
     #[tokio::test]
