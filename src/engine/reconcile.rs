@@ -245,7 +245,9 @@ mod tests {
     #[tokio::test]
     async fn attaches_side_to_endpoint_errors() {
         let source_error = std::io::Error::other("scan failed");
-        let source = Box::pin(stream::iter([Err::<Entry, BoxError>(Box::new(source_error))]));
+        let source = Box::pin(stream::iter([Err::<Entry, BoxError>(Box::new(
+            source_error,
+        ))]));
         let mut reconciler = OrderedReconciler::new(source, entries(&[]));
         assert!(matches!(
             reconciler.next().await,
