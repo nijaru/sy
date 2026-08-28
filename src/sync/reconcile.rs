@@ -624,7 +624,10 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(std::fs::read_link(dest.path().join("entry")).unwrap(), Path::new("target"));
+        assert_eq!(
+            std::fs::read_link(dest.path().join("entry")).unwrap(),
+            Path::new("target")
+        );
     }
 
     #[cfg(unix)]
