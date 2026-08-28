@@ -21,7 +21,6 @@ pub mod engine;
 pub mod protocol;
 #[doc(hidden)]
 pub mod remote;
-pub(crate) use remote::router as remote_router;
 #[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
