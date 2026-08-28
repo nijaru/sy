@@ -10,8 +10,7 @@ pub use handshake::{
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
 pub use path::{
-    RelativeWirePath, WirePath, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_COMPONENTS,
-    MAX_WIRE_PATH_BYTES,
+    RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
