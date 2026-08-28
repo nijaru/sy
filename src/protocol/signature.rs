@@ -195,7 +195,10 @@ mod tests {
             path: path(),
             block_size: SignatureBlockSize::new(64 * 1024).unwrap(),
         };
-        assert_eq!(WireSignatureRequest::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            WireSignatureRequest::decode(&request.encode()).unwrap(),
+            request
+        );
     }
 
     #[test]
@@ -212,7 +215,10 @@ mod tests {
     #[test]
     fn signature_round_trip_and_exact_length() {
         let signature = WireSignature::new(7, 4096, 0x1234_5678, [0x5a; 16]).unwrap();
-        assert_eq!(WireSignature::decode(&signature.encode()).unwrap(), signature);
+        assert_eq!(
+            WireSignature::decode(&signature.encode()).unwrap(),
+            signature
+        );
 
         let mut trailing = signature.encode().to_vec();
         trailing.push(0);
