@@ -143,9 +143,7 @@ fn bench_v3_chunk_decompression(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(format!("zstd-{level}"), format!("ratio={ratio:.3}")),
                 |b| {
-                    b.iter(|| {
-                        zstd::bulk::decompress(black_box(&encoded), size).unwrap()
-                    });
+                    b.iter(|| zstd::bulk::decompress(black_box(&encoded), size).unwrap());
                 },
             );
         }
@@ -159,5 +157,9 @@ fn bench_v3_chunk_decompression(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_v3_chunk_compression, bench_v3_chunk_decompression);
+criterion_group!(
+    benches,
+    bench_v3_chunk_compression,
+    bench_v3_chunk_decompression
+);
 criterion_main!(benches);
