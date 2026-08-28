@@ -157,9 +157,11 @@ pub fn estimate_transfer_time(
 
     let first_bytes = payload_bytes.min(u64::from(timing.chunk_bytes.get()));
     let first_compressed = sample.estimate_compressed_bytes(first_bytes);
-    let startup = timing.encode.duration_for(first_bytes)
-        + timing.link.duration_for(first_compressed)
-        + timing.decode.duration_for(first_bytes);
+    let startup = timing
+        .encode
+        .duration_for(first_bytes)
+        .saturating_add(timing.link.duration_for(first_compressed))
+        .saturating_add(timing.decode.duration_for(first_bytes));
 
     let remaining_bytes = payload_bytes - first_bytes;
     let remaining_compressed = sample.estimate_compressed_bytes(remaining_bytes);
@@ -171,7 +173,7 @@ pub fn estimate_transfer_time(
 
     CompressionEstimate {
         uncompressed,
-        zstd_fast: startup + steady_state,
+        zstd_fast: startup.saturating_add(steady_state),
     }
 }
 
@@ -280,5 +282,20 @@ mod tests {
             choose_for_min_elapsed(0, sample, timing),
             CompressionChoice::None
         );
+    }
+
+    #[test]
+    fn extreme_inputs_saturate_instead_of_panicking() {
+        let sample = CompressionSample::new(1, 1).unwrap();
+        let timing = CompressionTiming::new(
+            rate(1),
+            rate(1),
+            rate(1),
+            NonZeroU32::new(u32::MAX).unwrap(),
+        );
+
+        let estimate = estimate_transfer_time(u64::MAX, sample, timing);
+        assert_eq!(estimate.uncompressed, Duration::from_secs(u64::MAX));
+        assert_eq!(estimate.zstd_fast, Duration::MAX);
     }
 }
