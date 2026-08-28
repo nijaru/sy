@@ -50,7 +50,9 @@ pub enum RemoteScanError {
     #[error("wire scan depth {0} cannot be represented by this target")]
     UnsupportedDepth(u32),
 
-    #[error("peer path encoding {peer:?} cannot preserve local ordered-path semantics on {local:?}")]
+    #[error(
+        "peer path encoding {peer:?} cannot preserve local ordered-path semantics on {local:?}"
+    )]
     UnsupportedPathEncoding { local: PlatformOs, peer: PlatformOs },
 
     #[error("wire path component is not one native relative-name component")]
@@ -157,7 +159,9 @@ where
     ensure_compatible_path_encoding(peer)?;
 
     let stream = futures::stream::try_unfold(reader, move |mut reader| async move {
-        let frame = read_frame(&mut reader).await.map_err(RemoteScanError::from)?;
+        let frame = read_frame(&mut reader)
+            .await
+            .map_err(RemoteScanError::from)?;
         if frame.stream_id() != stream_id {
             return Err(RemoteScanError::StreamMismatch {
                 expected: stream_id.get(),
