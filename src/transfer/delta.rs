@@ -1,18 +1,4 @@
-from pathlib import Path
-
-
-lib = Path("src/lib.rs")
-text = lib.read_text()
-if "pub mod transfer;" not in text:
-    anchor = "#[doc(hidden)]\npub mod transport;\n"
-    if anchor not in text:
-        raise SystemExit("transfer module anchor missing")
-    text = text.replace(anchor, anchor + "#[doc(hidden)]\npub mod transfer;\n", 1)
-    lib.write_text(text)
-
-Path("src/transfer").mkdir(exist_ok=True)
-Path("src/transfer/mod.rs").write_text("pub mod delta;\n")
-Path("src/transfer/delta.rs").write_text(r'''use crate::engine::reconcile::BoxError;
+use crate::engine::reconcile::BoxError;
 use crate::engine::rolling::WeakChecksum;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -87,7 +73,7 @@ impl BasisIndex {
         block_size: u32,
         blocks: I,
         limits: BasisIndexLimits,
-    ) -> Result<Self, BasisIndexError>
+    ) -> std::result::Result<Self, BasisIndexError>
     where
         I: IntoIterator<Item = BasisBlock>,
     {
@@ -173,7 +159,7 @@ impl BasisIndex {
             .find(|candidate| candidate.size == size && candidate.strong == strong)
     }
 
-    fn offset(&self, block: BasisBlock) -> Result<u64, BasisIndexError> {
+    fn offset(&self, block: BasisBlock) -> std::result::Result<u64, BasisIndexError> {
         block
             .index
             .checked_mul(u64::from(self.block_size))
@@ -226,14 +212,17 @@ where
     F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
 {
     let block_size = usize::try_from(basis.block_size()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "delta block size does not fit usize")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delta block size does not fit usize",
+        )
     })?;
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, reader);
     let first = read_up_to(&mut reader, block_size)?;
     let mut emitter = DeltaEmitter::new(&mut sink);
 
     if first.is_empty() {
-        return Ok(emitter.finish()?);
+        return emitter.finish();
     }
     if first.len() < block_size {
         emit_final_slice(first, basis, &mut emitter)?;
@@ -300,15 +289,13 @@ fn read_up_to<R: Read>(reader: &mut R, target: usize) -> io::Result<Vec<u8>> {
 }
 
 fn read_byte<R: Read>(reader: &mut BufReader<R>) -> io::Result<Option<u8>> {
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(None);
-        }
-        let byte = available[0];
-        reader.consume(1);
-        return Ok(Some(byte));
+    let available = reader.fill_buf()?;
+    if available.is_empty() {
+        return Ok(None);
     }
+    let byte = available[0];
+    reader.consume(1);
+    Ok(Some(byte))
 }
 
 fn strong_signature(bytes: &[u8]) -> [u8; STRONG_SIGNATURE_LEN] {
@@ -481,12 +468,7 @@ mod tests {
             .enumerate()
             .map(|(index, bytes)| block(index as u64, bytes))
             .collect::<Vec<_>>();
-        BasisIndex::new(
-            block_size as u32,
-            blocks,
-            BasisIndexLimits::default(),
-        )
-        .unwrap()
+        BasisIndex::new(block_size as u32, blocks, BasisIndexLimits::default()).unwrap()
     }
 
     fn collect(source: &[u8], basis: &BasisIndex) -> (Vec<DeltaOp>, DeltaSummary) {
@@ -610,8 +592,7 @@ mod tests {
         let first = block(0, b"abcd");
         let second = block(1, b"efgh");
         assert_eq!(
-            BasisIndex::new(4, [first, second], BasisIndexLimits { max_blocks: 1 })
-                .unwrap_err(),
+            BasisIndex::new(4, [first, second], BasisIndexLimits { max_blocks: 1 }).unwrap_err(),
             BasisIndexError::TooManyBlocks { max: 1 }
         );
 
@@ -631,4 +612,3 @@ mod tests {
         );
     }
 }
-''')
