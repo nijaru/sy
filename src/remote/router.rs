@@ -1,6 +1,4 @@
-use crate::protocol::{
-    read_frame, write_frame, Frame, FrameKind, StreamId, MAX_FRAME_PAYLOAD,
-};
+use crate::protocol::{read_frame, write_frame, Frame, FrameKind, StreamId, MAX_FRAME_PAYLOAD};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,8 +26,8 @@ impl RouterRole {
     const fn local_owns(self, stream_id: StreamId) -> bool {
         !stream_id.is_control()
             && match self {
-                Self::Client => stream_id.get() % 2 == 1,
-                Self::Server => stream_id.get() % 2 == 0,
+                Self::Client => !stream_id.get().is_multiple_of(2),
+                Self::Server => stream_id.get().is_multiple_of(2),
             }
     }
 
@@ -614,9 +612,7 @@ fn ensure_stream_capacity(
         .len()
         .saturating_sub(usize::from(streams.contains_key(&StreamId::CONTROL)));
     if active >= inner.config.max_active_streams as usize {
-        return Err(RouterError::TooManyStreams(
-            inner.config.max_active_streams,
-        ));
+        return Err(RouterError::TooManyStreams(inner.config.max_active_streams));
     }
     Ok(())
 }
@@ -854,10 +850,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("expected active stream limit error"),
         };
-        assert!(matches!(
-            error.as_ref(),
-            RouterError::TooManyStreams(1)
-        ));
+        assert!(matches!(error.as_ref(), RouterError::TooManyStreams(1)));
         drop(first);
         assert!(router.sender().open_stream().is_ok());
     }
