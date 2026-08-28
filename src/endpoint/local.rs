@@ -454,24 +454,6 @@ impl Endpoint for LocalEndpoint {
         Ok(Box::new(LocalStagedWriter::new(self.resolve(path)).await?))
     }
 
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
-        let full_path = self.resolve(path);
-        tokio::fs::read(&full_path).await.map_err(|error| {
-            SyncError::Io(std::io::Error::new(
-                error.kind(),
-                format!("Failed to read file {}: {}", full_path.display(), error),
-            ))
-        })
-    }
-
-    async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()> {
-        // Compatibility shim while remaining v0.4 auxiliary paths migrate.
-        let mut writer = self.begin_write(path).await?;
-        writer.write(data).await?;
-        writer.set_metadata(meta).await?;
-        writer.commit().await
-    }
-
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
         let full_path = self.resolve(path);
         let meta = tokio::fs::symlink_metadata(&full_path).await?;
