@@ -5,7 +5,7 @@
 use crate::compress::CompressionDetection;
 use crate::filter::FilterEngine;
 use crate::streaming::{
-    channel::{file_job_channel, SyncStats},
+    channel::{file_job_channel, SyncStats, SENDER_CHANNEL_SIZE},
     protocol::{read_frame, write_frame, Done, Hello, HelloFlags, MessageType},
     Generator, GeneratorConfig, Receiver, ReceiverConfig, Sender, SenderConfig,
 };
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-/// Orchestrator for streaming sync
+/// Orchestrator for streaming sync.
 pub struct StreamingSync {
     pub local_root: PathBuf,
     pub remote_root: PathBuf,
@@ -29,9 +29,9 @@ pub struct StreamingSync {
     pub scan_options: ScanOptions,
     /// Comparison flags bitfield (checksum, update_only, ignore_existing, ignore_times, size_only)
     pub comparison_flags: Option<u8>,
-    /// Optional bandwidth limit in bytes per second
+    /// Optional bandwidth limit in bytes per second.
     pub bwlimit: Option<u64>,
-    /// Whether to verify written files by reading them back
+    /// Whether to verify written files by reading them back.
     pub verify: bool,
 }
 
@@ -58,63 +58,54 @@ impl StreamingSync {
         }
     }
 
-    /// Set max-delete threshold
     pub fn with_max_delete(mut self, max_delete: String) -> Self {
         self.max_delete = Some(max_delete);
         self
     }
 
-    /// Set force-delete to bypass threshold
     pub fn with_force_delete(mut self, force: bool) -> Self {
         self.force_delete = force;
         self
     }
 
-    /// Set filter engine for --exclude/--include/--filter
     pub fn with_filter(mut self, filter: FilterEngine) -> Self {
         self.filter = Some(filter);
         self
     }
 
-    /// Set dry-run mode
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
-    /// Set scanner options for .gitignore and VCS directory handling.
     pub fn with_scan_options(mut self, scan_options: ScanOptions) -> Self {
         self.scan_options = scan_options;
         self
     }
 
-    /// Set comparison flags (--checksum, --update, --existing, etc.)
     pub fn with_comparison_flags(mut self, flags: u8) -> Self {
         self.comparison_flags = Some(flags);
         self
     }
 
-    /// Decode comparison_flags bitfield into (checksum, update_only, ignore_existing, ignore_times, size_only).
     fn comparison_flags_tuple(&self) -> (bool, bool, bool, bool, bool) {
         match self.comparison_flags {
-            Some(f) => (
-                f & 0x01 != 0,
-                f & 0x02 != 0,
-                f & 0x04 != 0,
-                f & 0x08 != 0,
-                f & 0x10 != 0,
+            Some(flags) => (
+                flags & 0x01 != 0,
+                flags & 0x02 != 0,
+                flags & 0x04 != 0,
+                flags & 0x08 != 0,
+                flags & 0x10 != 0,
             ),
             None => (false, false, false, false, false),
         }
     }
 
-    /// Set bandwidth limit in bytes per second.
     pub fn with_bwlimit(mut self, bytes_per_second: u64) -> Self {
         self.bwlimit = Some(bytes_per_second);
         self
     }
 
-    /// Enable verify-after-write for received files.
     pub fn with_verify(mut self, verify: bool) -> Self {
         self.verify = verify;
         self
@@ -135,14 +126,15 @@ impl StreamingSync {
         }
         let mut hello = Hello::new(hello_flags, self.remote_root.to_string_lossy().into_owned())
             .with_max_delete(self.max_delete.clone())
-            .with_filter_patterns(self.filter.as_ref().map(|f| f.to_rule_strings().join("\n")));
+            .with_filter_patterns(self.filter.as_ref().map(|filter| {
+                filter.to_rule_strings().join("\n")
+            }));
         if let Some(flags) = self.comparison_flags {
             hello = hello.with_comparison_flags(flags);
         }
         write_frame(writer, &hello.encode()?).await?;
         writer.flush().await?;
 
-        // 2. Receive HELLO response
         let (msg_type, payload) = read_frame(reader).await?;
         if msg_type != MessageType::Hello {
             anyhow::bail!("Expected Hello response, got {:?}", msg_type);
@@ -173,12 +165,11 @@ impl StreamingSync {
             let (msg_type, payload) = read_frame(reader).await?;
             match msg_type {
                 MessageType::DestFileEntry => {
-                    let entry = crate::streaming::protocol::DestFileEntry::decode(payload)?;
-                    generator.add_dest_entry(entry);
+                    generator.add_dest_entry(
+                        crate::streaming::protocol::DestFileEntry::decode(payload)?,
+                    );
                 }
-                MessageType::DestFileEnd => {
-                    break;
-                }
+                MessageType::DestFileEnd => break,
                 MessageType::Fatal => {
                     let fatal = crate::streaming::protocol::Fatal::decode(payload)?;
                     anyhow::bail!("Remote fatal error: {}", fatal.message);
@@ -190,29 +181,15 @@ impl StreamingSync {
         }
 
         let (tx, rx) = file_job_channel();
-
-        let gen_handle = tokio::spawn(async move { generator.run(tx).await });
-
+        let generator_handle = tokio::spawn(async move { generator.run(tx).await });
         let sender = Sender::new(SenderConfig {
             root: self.local_root.clone(),
             compress: self.compress,
             bwlimit: self.bwlimit,
         });
+        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(SENDER_CHANNEL_SIZE);
+        let sender_handle = tokio::spawn(async move { sender.run(rx, data_tx).await });
 
-        // Unbounded channel: blocking_send panics inside tokio::spawn
-        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
-
-        let sender_handle = tokio::spawn(async move {
-            sender
-                .run(rx, |bytes| {
-                    data_tx
-                        .send(bytes)
-                        .map_err(|_| anyhow::anyhow!("Data channel closed"))
-                })
-                .await
-        });
-
-        // Pipeline computes stats even in dry-run; suppress data output.
         if !self.dry_run {
             while let Some(bytes) = data_rx.recv().await {
                 writer.write_all(&bytes).await?;
@@ -221,8 +198,7 @@ impl StreamingSync {
             while data_rx.recv().await.is_some() {}
         }
 
-        // Client signals end-of-transfer to server, then waits for server DONE.
-        let gen_result = gen_handle.await?;
+        let generator_result = generator_handle.await?;
         sender_handle.await??;
 
         let client_done = Done {
@@ -235,14 +211,10 @@ impl StreamingSync {
         write_frame(writer, &client_done.encode()?).await?;
         writer.flush().await?;
 
-        // Propagate generator error (e.g., deletion threshold exceeded)
-        let (total_files, total_bytes, source_scanned) = gen_result?;
-
-        // Finally receive DONE from server
+        let (total_files, total_bytes, source_scanned) = generator_result?;
         let (msg_type, payload) = read_frame(reader).await?;
         if msg_type == MessageType::Done {
             let done = Done::decode(payload)?;
-            // In push mode, server doesn't know source scan count — use local generator's.
             let scanned = if done.files_scanned > 0 {
                 done.files_scanned
             } else {
@@ -291,8 +263,10 @@ impl StreamingSync {
             flags |= HelloFlags::DIRS_ONLY;
         }
 
-        let filter_patterns = self.filter.as_ref().map(|f| f.to_rule_strings().join("\n"));
-
+        let filter_patterns = self
+            .filter
+            .as_ref()
+            .map(|filter| filter.to_rule_strings().join("\n"));
         let hello = Hello::new(flags, self.remote_root.to_string_lossy().into_owned())
             .with_max_delete(self.max_delete.clone())
             .with_filter_patterns(filter_patterns);
@@ -309,11 +283,11 @@ impl StreamingSync {
             tokio::fs::create_dir_all(&self.local_root).await?;
         }
 
-        // Unbounded channel: blocking_send panics inside tokio::spawn
+        // Destination scan emission is migrated to bounded backpressure in the
+        // next slice; sender data output is already bounded in push mode.
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
         let receiver_root = self.local_root.clone();
         let verify = self.verify;
-
         let scan_handle = tokio::spawn(async move {
             let receiver = Receiver::new(ReceiverConfig {
                 root: receiver_root,
@@ -343,7 +317,6 @@ impl StreamingSync {
 
         loop {
             let (msg_type, payload) = read_frame(reader).await?;
-
             if msg_type == MessageType::Done {
                 let done = Done::decode(payload)?;
                 let mut stats = receiver.stats().clone();
@@ -353,7 +326,6 @@ impl StreamingSync {
                 stats.files_scanned = done.files_scanned;
                 return Ok(stats);
             }
-
             receiver.handle_message(msg_type, payload).await?;
         }
     }
