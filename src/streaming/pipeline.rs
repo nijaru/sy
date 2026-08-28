@@ -167,9 +167,9 @@ impl StreamingSync {
             let (msg_type, payload) = read_frame(reader).await?;
             match msg_type {
                 MessageType::DestFileEntry => {
-                    generator.add_dest_entry(
-                        crate::streaming::protocol::DestFileEntry::decode(payload)?,
-                    );
+                    generator.add_dest_entry(crate::streaming::protocol::DestFileEntry::decode(
+                        payload,
+                    )?);
                 }
                 MessageType::DestFileEnd => break,
                 MessageType::Fatal => {
