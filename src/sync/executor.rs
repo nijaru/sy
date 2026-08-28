@@ -1,10 +1,11 @@
-//! v0.5 task executor built on the streaming endpoint contract.
+//! v0.5 task executor built on the capability-driven endpoint contract.
 //!
-//! This implementation deliberately avoids whole-file `Vec<u8>` transfer paths.
-//! File data flows from `Endpoint::open_reader` into transactional staged writes,
-//! and optional verification uses streaming BLAKE3 hashes.
+//! Regular-file transfers never require whole-file `Vec<u8>` buffers. The
+//! transfer layer chooses endpoint-native fast paths when available and falls
+//! back to bounded staged streaming. Verification is explicit BLAKE3 I/O.
 
-use crate::endpoint::io::{copy_file_streaming, hash_file_streaming};
+use crate::endpoint::io::hash_file_streaming;
+use crate::endpoint::transfer::{transfer_file, TransferOptions};
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
 use crate::sync::config::{PreserveConfig, VerificationConfig};
@@ -45,8 +46,7 @@ pub struct ExecuteConfig {
     pub preserve_xattrs: bool,
     pub preserve_dir_permissions: bool,
     /// Retained for CLI compatibility. Transactional staged writes do not expose
-    /// incomplete destination files; resumable staging will own this in a later
-    /// v0.5 migration step.
+    /// incomplete destination files; resumable staging will own this later.
     pub keep_partial: bool,
     pub itemize_changes: bool,
     pub remove_source_files: bool,
@@ -58,6 +58,7 @@ pub struct TaskExecutor<'a> {
     source: &'a dyn Endpoint,
     dest: &'a dyn Endpoint,
     dry_run: bool,
+    preserve: PreserveConfig,
     verification: VerificationConfig,
     max_concurrent: usize,
     backup: BackupConfig,
@@ -70,7 +71,7 @@ impl<'a> TaskExecutor<'a> {
         source: &'a dyn Endpoint,
         dest: &'a dyn Endpoint,
         dry_run: bool,
-        _preserve: PreserveConfig,
+        preserve: PreserveConfig,
         verification: VerificationConfig,
         max_concurrent: usize,
     ) -> Self {
@@ -78,6 +79,7 @@ impl<'a> TaskExecutor<'a> {
             source,
             dest,
             dry_run,
+            preserve,
             verification,
             max_concurrent,
             backup: BackupConfig {
@@ -101,6 +103,8 @@ impl<'a> TaskExecutor<'a> {
     }
 
     pub async fn execute_task(&self, task: &SyncTask) -> Result<TaskResult> {
+        self.validate_requested_capabilities()?;
+
         match task.action {
             SyncAction::Skip => Ok(TaskResult::Skipped),
             SyncAction::Create | SyncAction::Update => self.execute_create_or_update(task).await,
@@ -111,6 +115,33 @@ impl<'a> TaskExecutor<'a> {
                 Ok(TaskResult::Deleted)
             }
         }
+    }
+
+    fn validate_requested_capabilities(&self) -> Result<()> {
+        let capabilities = self.dest.capabilities();
+
+        if (self.config.preserve_xattrs || self.preserve.xattrs) && !capabilities.preserve_xattrs {
+            return Err(Error::Config(format!(
+                "{:?} destination cannot preserve extended attributes",
+                self.dest.endpoint_type()
+            )));
+        }
+        if self.preserve.acls && !capabilities.preserve_acls {
+            return Err(Error::Config(format!(
+                "{:?} destination cannot preserve ACLs",
+                self.dest.endpoint_type()
+            )));
+        }
+        if (self.config.preserve_hardlinks || self.preserve.hardlinks)
+            && !capabilities.preserve_hardlinks
+        {
+            return Err(Error::Config(format!(
+                "{:?} destination cannot preserve hard links",
+                self.dest.endpoint_type()
+            )));
+        }
+
+        Ok(())
     }
 
     async fn execute_create_or_update(&self, task: &SyncTask) -> Result<TaskResult> {
@@ -171,8 +202,7 @@ impl<'a> TaskExecutor<'a> {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             let target = std::fs::read_link(&source_path)?;
 
-            // TODO(v0.5): teach staged writes about symlinks so replacement is
-            // atomic. For now preserve legacy behavior for this non-file path.
+            // TODO(v0.5): stage symlink replacement so update is atomic too.
             if task.action == SyncAction::Update {
                 self.dest.remove(&task.dest_path, false).await?;
             }
@@ -233,21 +263,33 @@ impl<'a> TaskExecutor<'a> {
             self.create_backup(&task.dest_path).await?;
         }
 
-        // The staged writer owns rollback. A failed read, write, metadata update,
-        // or commit never triggers removal of the existing destination here.
-        let transfer = copy_file_streaming(
+        // The transfer layer owns staging and rollback. A read/write/metadata
+        // error never causes the executor to remove the existing destination.
+        let transfer = transfer_file(
             self.source,
             &source_entry.relative_path,
             self.dest,
             &task.dest_path,
+            TransferOptions {
+                update: task.action == SyncAction::Update,
+            },
         )
         .await?;
 
+        tracing::debug!(
+            path = %task.dest_path.display(),
+            strategy = ?transfer.strategy,
+            bytes = transfer.bytes_written,
+            "file transfer complete"
+        );
+
         if self.verification.verify_on_write {
+            let source_hash =
+                hash_file_streaming(self.source, &source_entry.relative_path).await?;
             let dest_hash = hash_file_streaming(self.dest, &task.dest_path).await?;
-            if transfer.source_hash != dest_hash {
+            if source_hash != dest_hash {
                 return Ok(TaskResult::VerificationFailed {
-                    expected: transfer.source_hash.to_hex().to_string(),
+                    expected: source_hash.to_hex().to_string(),
                     actual: dest_hash.to_hex().to_string(),
                 });
             }
@@ -270,8 +312,8 @@ impl<'a> TaskExecutor<'a> {
             eprintln!("{} {}", item, task.dest_path.display());
         }
 
-        // Source removal is intentionally last. A verification mismatch leaves
-        // the source untouched even though the staged destination was committed.
+        // Source removal is intentionally last. Verification failure leaves the
+        // source untouched.
         if self.config.remove_source_files {
             let source_path = self.source.root().join(&*source_entry.relative_path);
             if let Err(error) = std::fs::remove_file(&source_path) {
@@ -341,12 +383,20 @@ impl<'a> TaskExecutor<'a> {
             ))
         };
 
-        copy_file_streaming(self.dest, path, self.dest, &backup_path).await?;
+        transfer_file(
+            self.dest,
+            path,
+            self.dest,
+            &backup_path,
+            TransferOptions { update: false },
+        )
+        .await?;
         tracing::debug!("Backup created: {:?} -> {:?}", path, backup_path);
         Ok(())
     }
 
     pub async fn execute_batch(&self, tasks: Vec<SyncTask>) -> Result<SyncStats> {
+        self.validate_requested_capabilities()?;
         let start = Instant::now();
         let mut stats = SyncStats::default();
 
@@ -455,7 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_file_copy() {
+    async fn native_file_copy_is_bounded_and_atomic() {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
         let contents = vec![0x5a; 3 * 1024 * 1024 + 17];
@@ -478,7 +528,10 @@ mod tests {
             result,
             TaskResult::Created { bytes } if bytes == contents.len() as u64
         ));
-        assert_eq!(std::fs::read(dst_dir.path().join("large.bin")).unwrap(), contents);
+        assert_eq!(
+            std::fs::read(dst_dir.path().join("large.bin")).unwrap(),
+            contents
+        );
     }
 
     #[tokio::test]
