@@ -1,7 +1,5 @@
 use super::codec::SliceReader;
-use super::{
-    ProtocolError, RelativeWirePath, Result, WirePath, MAX_WIRE_PATH_BYTES,
-};
+use super::{ProtocolError, RelativeWirePath, Result, WirePath, MAX_WIRE_PATH_BYTES};
 use bitflags::bitflags;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -120,27 +118,39 @@ impl WireEntry {
 
         let mut capacity = ENTRY_FIXED_BYTES
             .checked_add(self.path.as_encoded().len())
-            .ok_or(ProtocolError::InvalidMessage("entry payload length overflow"))?;
+            .ok_or(ProtocolError::InvalidMessage(
+                "entry payload length overflow",
+            ))?;
         if self.unix_mode.is_some() {
             capacity = capacity
                 .checked_add(4)
-                .ok_or(ProtocolError::InvalidMessage("entry payload length overflow"))?;
+                .ok_or(ProtocolError::InvalidMessage(
+                    "entry payload length overflow",
+                ))?;
         }
         if self.identity.is_some() {
-            capacity = capacity
-                .checked_add(IDENTITY_BYTES)
-                .ok_or(ProtocolError::InvalidMessage("entry payload length overflow"))?;
+            capacity =
+                capacity
+                    .checked_add(IDENTITY_BYTES)
+                    .ok_or(ProtocolError::InvalidMessage(
+                        "entry payload length overflow",
+                    ))?;
         }
         if self.hardlink_group.is_some() {
-            capacity = capacity
-                .checked_add(IDENTITY_BYTES)
-                .ok_or(ProtocolError::InvalidMessage("entry payload length overflow"))?;
+            capacity =
+                capacity
+                    .checked_add(IDENTITY_BYTES)
+                    .ok_or(ProtocolError::InvalidMessage(
+                        "entry payload length overflow",
+                    ))?;
         }
         if let Some(target) = self.symlink_target.as_ref() {
             capacity = capacity
                 .checked_add(4)
                 .and_then(|value| value.checked_add(target.as_bytes().len()))
-                .ok_or(ProtocolError::InvalidMessage("entry payload length overflow"))?;
+                .ok_or(ProtocolError::InvalidMessage(
+                    "entry payload length overflow",
+                ))?;
         }
 
         let mut out = BytesMut::with_capacity(capacity);
@@ -171,11 +181,10 @@ impl WireEntry {
         let mut reader = SliceReader::new(payload);
         let kind = WireEntryKind::try_from(reader.u8()?)?;
         let raw_fields = reader.u8()?;
-        let fields = EntryFields::from_bits(raw_fields)
-            .ok_or(ProtocolError::InvalidField {
-                field: "entry_fields",
-                reason: "unknown entry field bits",
-            })?;
+        let fields = EntryFields::from_bits(raw_fields).ok_or(ProtocolError::InvalidField {
+            field: "entry_fields",
+            reason: "unknown entry field bits",
+        })?;
         let size = reader.u64()?;
         let modified_seconds = reader.i64()?;
         let modified_nanoseconds = reader.u32()?;
@@ -242,14 +251,8 @@ impl WireEntry {
         let mut fields = EntryFields::empty();
         fields.set(EntryFields::UNIX_MODE, self.unix_mode.is_some());
         fields.set(EntryFields::IDENTITY, self.identity.is_some());
-        fields.set(
-            EntryFields::HARDLINK_GROUP,
-            self.hardlink_group.is_some(),
-        );
-        fields.set(
-            EntryFields::SYMLINK_TARGET,
-            self.symlink_target.is_some(),
-        );
+        fields.set(EntryFields::HARDLINK_GROUP, self.hardlink_group.is_some());
+        fields.set(EntryFields::SYMLINK_TARGET, self.symlink_target.is_some());
         fields
     }
 }
