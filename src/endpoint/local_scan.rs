@@ -64,9 +64,7 @@ impl Iterator for OrderedLocalScanner {
             let entry = match result {
                 Ok(entry) => entry,
                 Err(error) => {
-                    return Some(Err(SyncError::Io(std::io::Error::other(
-                        error.to_string(),
-                    ))))
+                    return Some(Err(SyncError::Io(std::io::Error::other(error.to_string()))))
                 }
             };
 
@@ -128,10 +126,12 @@ fn file_entry(root: &Path, entry: ignore::DirEntry) -> Result<FileEntry> {
     #[cfg(not(target_os = "macos"))]
     let bsd_flags = None;
 
-    let modified = metadata.modified().map_err(|source| SyncError::ReadDirError {
-        path: path.clone(),
-        source,
-    })?;
+    let modified = metadata
+        .modified()
+        .map_err(|source| SyncError::ReadDirError {
+            path: path.clone(),
+            source,
+        })?;
 
     Ok(FileEntry {
         path: Arc::new(path),
@@ -167,12 +167,10 @@ mod tests {
         std::fs::write(dir.path().join("a").join("z"), b"az").unwrap();
         std::fs::write(dir.path().join("a").join("a"), b"aa").unwrap();
 
-        let entries: Vec<_> = OrderedLocalScanner::new(
-            dir.path().to_path_buf(),
-            ScanOptions::default(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+        let entries: Vec<_> =
+            OrderedLocalScanner::new(dir.path().to_path_buf(), ScanOptions::default())
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
         let paths: Vec<_> = entries
             .into_iter()
             .map(|entry| (*entry.relative_path).clone())
@@ -186,13 +184,10 @@ mod tests {
     fn reconciliation_scan_skips_expensive_metadata() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("file"), b"content").unwrap();
-        let entry = OrderedLocalScanner::new(
-            dir.path().to_path_buf(),
-            ScanOptions::default(),
-        )
-        .next()
-        .expect("one entry")
-        .unwrap();
+        let entry = OrderedLocalScanner::new(dir.path().to_path_buf(), ScanOptions::default())
+            .next()
+            .expect("one entry")
+            .unwrap();
 
         assert!(entry.xattrs.is_none());
         assert!(entry.acls.is_none());
