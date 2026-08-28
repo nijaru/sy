@@ -1,17 +1,20 @@
+mod codec;
 mod frame;
 mod handshake;
 mod path;
+mod session;
 
 pub use frame::{
     read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD,
 };
 pub use handshake::{
-    negotiate_version, CapabilitySet, ClientHello, Operation, Platform, PlatformArch, PlatformOs,
+    negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
 pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
 };
+pub use session::{Operation, SessionOpen, SessionReady};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
