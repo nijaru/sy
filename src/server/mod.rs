@@ -168,9 +168,7 @@ async fn run_server_push(
         verify,
     });
 
-    // Destination scan output remains on the legacy callback queue until the
-    // next bounded-backpressure slice.
-    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(SENDER_CHANNEL_SIZE);
     let receiver_root = root_path.clone();
     let scan_handle = tokio::spawn(async move {
         let receiver = Receiver::new(ReceiverConfig {
@@ -178,13 +176,7 @@ async fn run_server_push(
             block_size: 4096,
             verify,
         });
-        receiver
-            .scan_dest(|bytes| {
-                data_tx
-                    .send(bytes)
-                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
-            })
-            .await
+        receiver.scan_dest(&data_tx).await
     });
 
     while let Some(bytes) = data_rx.recv().await {
