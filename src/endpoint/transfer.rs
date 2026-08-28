@@ -5,7 +5,7 @@
 //! staged streaming. Local updates may use a reflink clone + patch when that
 //! reduces physical writes; non-COW local files use a normal whole-file copy.
 
-use crate::endpoint::io::copy_file_streaming;
+use crate::endpoint::io::{copy_file_streaming, VerificationStatus};
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
@@ -13,25 +13,29 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStrategy {
-    /// Native sparse-aware copy preserving holes.
     NativeSparseCopy,
-    /// Clone the old destination with COW and patch changed ranges.
     ReflinkPatch,
-    /// Use the platform's optimized whole-file copy primitive into staging.
     NativeWholeCopy,
-    /// Portable bounded source -> staged destination streaming.
     Streaming,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransferOptions {
     pub update: bool,
+    pub verify: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransferResult {
     pub bytes_written: u64,
     pub strategy: TransferStrategy,
+    pub verification: VerificationStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeTransferResult {
+    bytes_written: u64,
+    verification: VerificationStatus,
 }
 
 /// Transfer a file using endpoint capabilities rather than endpoint-specific
@@ -62,6 +66,7 @@ pub async fn transfer_file(
         dest_atomic = dest_caps.atomic_rename,
         dest_server_copy = dest_caps.server_side_copy,
         dest_mtime_precision_ns = dest_caps.modtime_precision.as_nanos(),
+        verify = options.verify,
         "selecting transfer strategy"
     );
 
@@ -72,13 +77,18 @@ pub async fn transfer_file(
             && dest_caps.sparse
             && native_file_is_sparse(&source_native).unwrap_or(false)
         {
-            if let Some(bytes_written) =
-                native_sparse_copy(source_native.clone(), dest_native.clone(), metadata.clone())
-                    .await?
+            if let Some(result) = native_sparse_copy(
+                source_native.clone(),
+                dest_native.clone(),
+                metadata.clone(),
+                options.verify,
+            )
+            .await?
             {
                 return Ok(TransferResult {
-                    bytes_written,
+                    bytes_written: result.bytes_written,
                     strategy: TransferStrategy::NativeSparseCopy,
+                    verification: result.verification,
                 });
             }
         }
@@ -92,31 +102,48 @@ pub async fn transfer_file(
             && crate::fs_util::supports_cow_reflinks(&dest_native)
             && !crate::fs_util::has_hard_links(&dest_native)
         {
-            if let Some(bytes_written) =
-                reflink_patch(source_native.clone(), dest_native.clone(), metadata.clone()).await?
+            if let Some(result) = reflink_patch(
+                source_native.clone(),
+                dest_native.clone(),
+                metadata.clone(),
+                options.verify,
+            )
+            .await?
             {
                 return Ok(TransferResult {
-                    bytes_written,
+                    bytes_written: result.bytes_written,
                     strategy: TransferStrategy::ReflinkPatch,
+                    verification: result.verification,
                 });
             }
         }
 
         if dest_caps.atomic_rename {
-            let bytes_written =
-                native_whole_copy(source_native, dest_native, metadata.clone()).await?;
+            let result =
+                native_whole_copy(source_native, dest_native, metadata.clone(), options.verify)
+                    .await?;
             return Ok(TransferResult {
-                bytes_written,
+                bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
+                verification: result.verification,
             });
         }
     }
 
     if source_caps.streaming_read && dest_caps.staged_write {
-        let result = copy_file_streaming(source, source_path, dest, dest_path).await?;
+        if options.verify && !dest_caps.staged_verify {
+            return Err(SyncError::Config(format!(
+                "{:?} destination cannot verify staged bytes before commit",
+                dest.endpoint_type()
+            )));
+        }
+
+        let result =
+            copy_file_streaming(source, source_path, dest, dest_path, options.verify).await?;
         return Ok(TransferResult {
             bytes_written: result.bytes_written,
             strategy: TransferStrategy::Streaming,
+            verification: result.verification,
         });
     }
 
@@ -127,7 +154,12 @@ pub async fn transfer_file(
     )))
 }
 
-async fn native_whole_copy(source: PathBuf, dest: PathBuf, metadata: FileMetadata) -> Result<u64> {
+async fn native_whole_copy(
+    source: PathBuf,
+    dest: PathBuf,
+    metadata: FileMetadata,
+    verify: bool,
+) -> Result<NativeTransferResult> {
     tokio::task::spawn_blocking(move || {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -137,10 +169,22 @@ async fn native_whole_copy(source: PathBuf, dest: PathBuf, metadata: FileMetadat
         let guard = TempFileGuard::new(&temp);
         let bytes_written = std::fs::copy(&source, &temp)?;
         strip_xattrs(&temp);
+
+        let verification = verify_native_staging(&source, &temp, verify)?;
+        if matches!(verification, VerificationStatus::Failed { .. }) {
+            return Ok(NativeTransferResult {
+                bytes_written,
+                verification,
+            });
+        }
+
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
-        Ok(bytes_written)
+        Ok(NativeTransferResult {
+            bytes_written,
+            verification,
+        })
     })
     .await
     .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
@@ -150,7 +194,8 @@ async fn reflink_patch(
     source: PathBuf,
     dest: PathBuf,
     metadata: FileMetadata,
-) -> Result<Option<u64>> {
+    verify: bool,
+) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         if !dest.exists() {
             return Ok(None);
@@ -187,10 +232,22 @@ async fn reflink_patch(
 
         strip_xattrs(&temp);
         patch_changed_blocks(&source, &dest, &temp, metadata.size)?;
+
+        let verification = verify_native_staging(&source, &temp, verify)?;
+        if matches!(verification, VerificationStatus::Failed { .. }) {
+            return Ok(Some(NativeTransferResult {
+                bytes_written: metadata.size,
+                verification,
+            }));
+        }
+
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
-        Ok(Some(metadata.size))
+        Ok(Some(NativeTransferResult {
+            bytes_written: metadata.size,
+            verification,
+        }))
     })
     .await
     .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
@@ -238,7 +295,6 @@ fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
     use std::fs::{File, OpenOptions};
     use std::os::fd::AsRawFd;
 
-    // Linux FICLONE from <linux/fs.h>.
     const FICLONE: libc::c_ulong = 0x4004_9409;
 
     let source_file = File::open(source)?;
@@ -311,7 +367,8 @@ async fn native_sparse_copy(
     source: PathBuf,
     dest: PathBuf,
     metadata: FileMetadata,
-) -> Result<Option<u64>> {
+    verify: bool,
+) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         use std::fs::File;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -352,10 +409,22 @@ async fn native_sparse_copy(
 
         staged.flush()?;
         drop(staged);
+
+        let verification = verify_native_staging(&source, &temp, verify)?;
+        if matches!(verification, VerificationStatus::Failed { .. }) {
+            return Ok(Some(NativeTransferResult {
+                bytes_written: metadata.size,
+                verification,
+            }));
+        }
+
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
-        Ok(Some(metadata.size))
+        Ok(Some(NativeTransferResult {
+            bytes_written: metadata.size,
+            verification,
+        }))
     })
     .await
     .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
@@ -366,8 +435,47 @@ async fn native_sparse_copy(
     _source: PathBuf,
     _dest: PathBuf,
     _metadata: FileMetadata,
-) -> Result<Option<u64>> {
+    _verify: bool,
+) -> Result<Option<NativeTransferResult>> {
     Ok(None)
+}
+
+fn verify_native_staging(
+    source: &Path,
+    staged: &Path,
+    verify: bool,
+) -> std::io::Result<VerificationStatus> {
+    if !verify {
+        return Ok(VerificationStatus::NotRequested);
+    }
+
+    let expected = hash_native_file(source)?;
+    let actual = hash_native_file(staged)?;
+    if expected == actual {
+        Ok(VerificationStatus::Verified)
+    } else {
+        Ok(VerificationStatus::Failed { expected, actual })
+    }
+}
+
+fn hash_native_file(path: &Path) -> std::io::Result<blake3::Hash> {
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let mut reader = BufReader::with_capacity(BUFFER_SIZE, File::open(path)?);
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut hasher = blake3::Hasher::new();
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize())
 }
 
 fn apply_metadata(path: &Path, metadata: &FileMetadata) -> std::io::Result<()> {
