@@ -175,21 +175,22 @@ fn process_capabilities() -> CapabilitySet {
     // Advertise only behavior owned by the negotiated v3 runtime. The central
     // frame router is mandatory after handshake, so multiplexing is a runtime
     // invariant rather than a reserved protocol possibility.
-    let capabilities = endpoint_capabilities(&Capabilities::local())
+    let mut capabilities = endpoint_capabilities(&Capabilities::local())
         | CapabilitySet::BLAKE3
         | CapabilitySet::RAW_PATHS
         | CapabilitySet::MULTIPLEXING;
 
     // Rolling-signature basis reads are advertised only where RootedFs can
-    // enforce held-directory-FD confinement for every peer-controlled path.
-    #[cfg(unix)]
-    {
-        capabilities | CapabilitySet::ROLLING_SIGNATURES
+    // enforce held-directory-FD confinement and the v3 path encoding has been
+    // validated. Linux and macOS are the supported cross-OS family for 0.5.
+    if supports_rolling_signatures(Platform::current().os) {
+        capabilities.insert(CapabilitySet::ROLLING_SIGNATURES);
     }
-    #[cfg(not(unix))]
-    {
-        capabilities
-    }
+    capabilities
+}
+
+const fn supports_rolling_signatures(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Linux | PlatformOs::Macos)
 }
 
 fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
@@ -418,9 +419,17 @@ mod tests {
                 .ready
                 .capabilities
                 .contains(CapabilitySet::ROLLING_SIGNATURES),
-            cfg!(unix)
+            supports_rolling_signatures(Platform::current().os)
         );
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
+    }
+
+    #[test]
+    fn rolling_signatures_are_scoped_to_tested_os_family() {
+        assert!(supports_rolling_signatures(PlatformOs::Linux));
+        assert!(supports_rolling_signatures(PlatformOs::Macos));
+        assert!(!supports_rolling_signatures(PlatformOs::Windows));
+        assert!(!supports_rolling_signatures(PlatformOs::Other(4)));
     }
 
     #[tokio::test]

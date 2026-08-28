@@ -148,6 +148,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_and_macos_path_encodings_are_cross_compatible() {
+        assert!(compatible_path_encoding(
+            PlatformOs::Linux,
+            PlatformOs::Linux
+        ));
+        assert!(compatible_path_encoding(
+            PlatformOs::Macos,
+            PlatformOs::Macos
+        ));
+        assert!(compatible_path_encoding(
+            PlatformOs::Linux,
+            PlatformOs::Macos
+        ));
+        assert!(compatible_path_encoding(
+            PlatformOs::Macos,
+            PlatformOs::Linux
+        ));
+        assert!(!compatible_path_encoding(
+            PlatformOs::Linux,
+            PlatformOs::Windows
+        ));
+        assert!(!compatible_path_encoding(
+            PlatformOs::Macos,
+            PlatformOs::Other(4)
+        ));
+    }
+
+    #[test]
     fn relative_path_round_trip_preserves_components() {
         let path = Path::new("dir").join("file.bin");
         let encoded = encode_relative_path(&path).unwrap();
