@@ -5,9 +5,7 @@
 //! back to bounded staged streaming. Verification is explicit BLAKE3 I/O.
 
 use crate::endpoint::io::{hash_file_streaming, VerificationStatus};
-use crate::endpoint::transfer::{
-    transfer_file, TransferOptions, FILE_TRANSFER_BUFFER_BUDGET,
-};
+use crate::endpoint::transfer::{transfer_file, TransferOptions, FILE_TRANSFER_BUFFER_BUDGET};
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
 use crate::sync::config::{PreserveConfig, VerificationConfig};
@@ -352,7 +350,10 @@ impl<'a> TaskExecutor<'a> {
             use std::os::unix::fs::PermissionsExt;
 
             let source_path = self.source.root().join(&*source_entry.relative_path);
-            let mode = tokio::fs::metadata(&source_path).await?.permissions().mode();
+            let mode = tokio::fs::metadata(&source_path)
+                .await?
+                .permissions()
+                .mode();
             let abs_dest = self.abs_dest_path(&task.dest_path);
             tokio::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(mode)).await?;
         }
@@ -462,8 +463,7 @@ impl<'a> TaskExecutor<'a> {
 
         if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
-                self.hardlink_map()?
-                    .insert(inode, task.dest_path.clone());
+                self.hardlink_map()?.insert(inode, task.dest_path.clone());
             }
         }
 
