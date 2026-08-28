@@ -284,8 +284,7 @@ impl<'a> TaskExecutor<'a> {
         );
 
         if self.verification.verify_on_write {
-            let source_hash =
-                hash_file_streaming(self.source, &source_entry.relative_path).await?;
+            let source_hash = hash_file_streaming(self.source, &source_entry.relative_path).await?;
             let dest_hash = hash_file_streaming(self.dest, &task.dest_path).await?;
             if source_hash != dest_hash {
                 return Ok(TaskResult::VerificationFailed {
