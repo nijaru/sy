@@ -32,21 +32,19 @@ pub enum EngineError {
         source: BoxError,
     },
 
-    #[error(
-        "{side} entry stream is not strictly ordered: {current} followed {previous}"
-    )]
+    #[error("{side} entry stream is not strictly ordered: {current} followed {previous}")]
     EntryOrder {
         side: Side,
         previous: RelativePath,
         current: RelativePath,
     },
+
+    #[error("engine invariant violated: {0}")]
+    Invariant(&'static str),
 }
 
 impl EngineError {
-    pub fn endpoint(
-        side: Side,
-        source: impl StdError + Send + Sync + 'static,
-    ) -> Self {
+    pub fn endpoint(side: Side, source: impl StdError + Send + Sync + 'static) -> Self {
         Self::Endpoint {
             side,
             source: Box::new(source),
@@ -57,10 +55,7 @@ impl EngineError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileItem {
     SourceOnly(Entry),
-    Matched {
-        source: Entry,
-        destination: Entry,
-    },
+    Matched { source: Entry, destination: Entry },
     DestinationOnly(Entry),
 }
 
@@ -130,33 +125,31 @@ impl OrderedReconciler {
 
         match (self.source_head.as_ref(), self.destination_head.as_ref()) {
             (None, None) => Ok(None),
-            (Some(_), None) => Ok(self
-                .source_head
-                .take()
-                .map(ReconcileItem::SourceOnly)),
+            (Some(_), None) => Ok(self.source_head.take().map(ReconcileItem::SourceOnly)),
             (None, Some(_)) => Ok(self
                 .destination_head
                 .take()
                 .map(ReconcileItem::DestinationOnly)),
             (Some(source), Some(destination)) => match source.path.cmp(&destination.path) {
-                std::cmp::Ordering::Less => Ok(self
-                    .source_head
-                    .take()
-                    .map(ReconcileItem::SourceOnly)),
+                std::cmp::Ordering::Less => {
+                    Ok(self.source_head.take().map(ReconcileItem::SourceOnly))
+                }
                 std::cmp::Ordering::Greater => Ok(self
                     .destination_head
                     .take()
                     .map(ReconcileItem::DestinationOnly)),
                 std::cmp::Ordering::Equal => {
-                    let source = self.source_head.take();
-                    let destination = self.destination_head.take();
-                    match (source, destination) {
-                        (Some(source), Some(destination)) => Ok(Some(ReconcileItem::Matched {
-                            source,
-                            destination,
-                        })),
-                        _ => Ok(None),
-                    }
+                    let source = self.source_head.take().ok_or(EngineError::Invariant(
+                        "matched source head disappeared during reconciliation",
+                    ))?;
+                    let destination =
+                        self.destination_head.take().ok_or(EngineError::Invariant(
+                            "matched destination head disappeared during reconciliation",
+                        ))?;
+                    Ok(Some(ReconcileItem::Matched {
+                        source,
+                        destination,
+                    }))
                 }
             },
         }
@@ -182,27 +175,18 @@ mod tests {
     use futures::stream;
 
     fn entry(path: &str) -> Entry {
-        Entry::file(
-            RelativePath::new(path).unwrap(),
-            1,
-            Timestamp::UNIX_EPOCH,
-        )
+        Entry::file(RelativePath::new(path).unwrap(), 1, Timestamp::UNIX_EPOCH)
     }
 
     fn entries(paths: &[&str]) -> EntryStream {
-        let entries = paths
-            .iter()
-            .map(|path| Ok(entry(path)))
-            .collect::<Vec<_>>();
+        let entries = paths.iter().map(|path| Ok(entry(path))).collect::<Vec<_>>();
         Box::pin(stream::iter(entries))
     }
 
     #[tokio::test]
     async fn merge_join_emits_all_three_relationships() {
-        let mut reconciler = OrderedReconciler::new(
-            entries(&["a", "c", "d"]),
-            entries(&["b", "c", "e"]),
-        );
+        let mut reconciler =
+            OrderedReconciler::new(entries(&["a", "c", "d"]), entries(&["b", "c", "e"]));
 
         assert!(matches!(
             reconciler.next().await.unwrap(),
