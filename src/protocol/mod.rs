@@ -5,6 +5,7 @@ mod handshake;
 mod path;
 mod scan;
 mod session;
+mod signature;
 
 pub use entry::{WireEntry, WireEntryKind};
 pub use frame::{
@@ -19,6 +20,10 @@ pub use path::{
 };
 pub use scan::WireScanRequest;
 pub use session::{Operation, SessionOpen, SessionReady};
+pub use signature::{
+    SignatureBlockSize, WireSignature, WireSignatureEnd, WireSignatureRequest,
+    MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
