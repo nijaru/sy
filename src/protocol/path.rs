@@ -1,19 +1,23 @@
 use super::{ProtocolError, Result};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
-pub const MAX_WIRE_PATH_BYTES: usize = 64 * 1024;
+pub const MAX_WIRE_PATH_BYTES: usize = 128 * 1024;
+pub const MAX_WIRE_COMPONENT_BYTES: usize = u16::MAX as usize;
+pub const MAX_WIRE_COMPONENTS: usize = u16::MAX as usize;
 
-/// Opaque filesystem path bytes carried by the protocol.
+/// Opaque native path payload carried by a control message.
 ///
-/// The wire layer does not assume UTF-8. Platform conversion happens at an
-/// endpoint boundary where the remote OS is known.
+/// Native encoding belongs to the endpoint platform. The protocol layer only
+/// enforces a byte bound; it must not reject byte patterns such as NUL before
+/// the negotiated platform interprets them (UTF-16LE names commonly contain
+/// zero bytes). Root-path semantic validation belongs at the endpoint boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WirePath(Bytes);
 
 impl WirePath {
     pub fn new(path: impl Into<Bytes>) -> Result<Self> {
         let path = path.into();
-        validate_common(&path)?;
+        validate_total_len(path.len())?;
         Ok(Self(path))
     }
 
@@ -26,68 +30,205 @@ impl WirePath {
     }
 }
 
-/// Canonical slash-delimited path relative to a negotiated endpoint root.
+/// Delimiter-free relative path represented as opaque native name components.
 ///
-/// Relative paths reject traversal, absolute paths, NULs, and ambiguous empty
-/// components before they can reach endpoint-specific resolution code. This is
-/// an input invariant, not the remote security boundary: the server must still
-/// resolve components relative to a held root directory handle without
-/// following escape symlinks.
+/// The encoding is canonical:
+///
+/// ```text
+/// component_count: u16
+/// repeated component_count times:
+///   byte_len: u16
+///   native_name_bytes: [u8; byte_len]
+/// ```
+///
+/// Separators are structural rather than encoded as bytes. This avoids assuming
+/// `/` or `\\` semantics and lets Windows names travel as raw UTF-16LE while Unix
+/// names remain arbitrary native bytes. The sender platform from the handshake
+/// determines how each component is interpreted.
+///
+/// This type validates only wire structure and resource bounds. Endpoint
+/// adapters must reject platform-specific invalid names (`.`, `..`, separators,
+/// NUL code units, reserved Windows names, and so on) before filesystem access.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RelativeWirePath(Bytes);
+pub struct RelativeWirePath {
+    encoded: Bytes,
+    component_count: u16,
+}
 
 impl RelativeWirePath {
-    pub fn new(path: impl Into<Bytes>) -> Result<Self> {
-        let path = path.into();
-        validate_common(&path)?;
-        if path.is_empty() {
+    pub fn from_components<I, B>(components: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let components = components
+            .into_iter()
+            .map(|component| Bytes::copy_from_slice(component.as_ref()))
+            .collect::<Vec<_>>();
+        if components.is_empty() {
             return Err(ProtocolError::InvalidRelativePath("path is empty"));
         }
-        if path[0] == b'/' {
-            return Err(ProtocolError::InvalidRelativePath("path is absolute"));
+        if components.len() > MAX_WIRE_COMPONENTS {
+            return Err(ProtocolError::TooManyPathComponents {
+                count: components.len(),
+                max: MAX_WIRE_COMPONENTS,
+            });
         }
 
-        for component in path.split(|byte| *byte == b'/') {
-            if component.is_empty() {
-                return Err(ProtocolError::InvalidRelativePath(
-                    "path contains an empty component",
-                ));
-            }
-            if component == b"." {
-                return Err(ProtocolError::InvalidRelativePath(
-                    "path contains a current-directory component",
-                ));
-            }
-            if component == b".." {
-                return Err(ProtocolError::InvalidRelativePath(
-                    "path contains a parent-directory component",
+        let mut total_len = 2_usize;
+        for component in &components {
+            validate_component_len(component.len())?;
+            total_len = total_len
+                .checked_add(2)
+                .and_then(|len| len.checked_add(component.len()))
+                .ok_or(ProtocolError::InvalidMessage("wire path length overflow"))?;
+        }
+        validate_total_len(total_len)?;
+
+        let count = u16::try_from(components.len()).map_err(|_| {
+            ProtocolError::InvalidMessage("wire path component count exceeds u16")
+        })?;
+        let mut encoded = BytesMut::with_capacity(total_len);
+        encoded.put_u16(count);
+        for component in components {
+            let len = u16::try_from(component.len()).map_err(|_| {
+                ProtocolError::InvalidMessage("wire path component length exceeds u16")
+            })?;
+            encoded.put_u16(len);
+            encoded.extend_from_slice(&component);
+        }
+
+        Ok(Self {
+            encoded: encoded.freeze(),
+            component_count: count,
+        })
+    }
+
+    /// Validates a path payload received from the wire without allocating one
+    /// object per component. The validated encoded bytes are retained directly.
+    pub fn decode(encoded: impl Into<Bytes>) -> Result<Self> {
+        let encoded = encoded.into();
+        validate_total_len(encoded.len())?;
+        if encoded.len() < 2 {
+            return Err(ProtocolError::InvalidMessage(
+                "truncated wire path component count",
+            ));
+        }
+
+        let component_count = u16::from_be_bytes([encoded[0], encoded[1]]);
+        if component_count == 0 {
+            return Err(ProtocolError::InvalidRelativePath("path is empty"));
+        }
+
+        let mut offset = 2_usize;
+        for _ in 0..component_count {
+            let length_end = offset
+                .checked_add(2)
+                .ok_or(ProtocolError::InvalidMessage("wire path length overflow"))?;
+            let length_bytes = encoded.get(offset..length_end).ok_or(
+                ProtocolError::InvalidMessage("truncated wire path component length"),
+            )?;
+            let len = u16::from_be_bytes([length_bytes[0], length_bytes[1]]) as usize;
+            validate_component_len(len)?;
+            offset = length_end
+                .checked_add(len)
+                .ok_or(ProtocolError::InvalidMessage("wire path length overflow"))?;
+            if offset > encoded.len() {
+                return Err(ProtocolError::InvalidMessage(
+                    "truncated wire path component bytes",
                 ));
             }
         }
 
-        Ok(Self(path))
+        if offset != encoded.len() {
+            return Err(ProtocolError::InvalidMessage(
+                "trailing bytes after wire path",
+            ));
+        }
+
+        Ok(Self {
+            encoded,
+            component_count,
+        })
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    pub fn as_encoded(&self) -> &[u8] {
+        &self.encoded
     }
 
-    pub fn into_bytes(self) -> Bytes {
-        self.0
+    pub fn into_encoded(self) -> Bytes {
+        self.encoded
+    }
+
+    pub const fn component_count(&self) -> usize {
+        self.component_count as usize
+    }
+
+    pub fn components(&self) -> WireComponents<'_> {
+        WireComponents {
+            encoded: &self.encoded,
+            offset: 2,
+            remaining: self.component_count,
+        }
     }
 }
 
-fn validate_common(path: &[u8]) -> Result<()> {
-    if path.len() > MAX_WIRE_PATH_BYTES {
+pub struct WireComponents<'a> {
+    encoded: &'a [u8],
+    offset: usize,
+    remaining: u16,
+}
+
+impl<'a> Iterator for WireComponents<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        // RelativeWirePath construction validates these bounds once. Iteration
+        // therefore needs no fallible branch or repeated semantic validation.
+        let len = u16::from_be_bytes([
+            *self.encoded.get(self.offset)?,
+            *self.encoded.get(self.offset + 1)?,
+        ]) as usize;
+        let start = self.offset + 2;
+        let end = start.checked_add(len)?;
+        let component = self.encoded.get(start..end)?;
+        self.offset = end;
+        self.remaining -= 1;
+        Some(component)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for WireComponents<'_> {}
+
+fn validate_total_len(len: usize) -> Result<()> {
+    if len > MAX_WIRE_PATH_BYTES {
         return Err(ProtocolError::PathTooLong {
-            len: path.len(),
+            len,
             max: MAX_WIRE_PATH_BYTES,
         });
     }
-    if path.contains(&0) {
-        return Err(ProtocolError::InvalidField {
-            field: "path",
-            reason: "NUL bytes are not valid filesystem path data",
+    Ok(())
+}
+
+fn validate_component_len(len: usize) -> Result<()> {
+    if len == 0 {
+        return Err(ProtocolError::InvalidRelativePath(
+            "path contains an empty component",
+        ));
+    }
+    if len > MAX_WIRE_COMPONENT_BYTES {
+        return Err(ProtocolError::PathComponentTooLong {
+            len,
+            max: MAX_WIRE_COMPONENT_BYTES,
         });
     }
     Ok(())
@@ -96,30 +237,52 @@ fn validate_common(path: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
-    fn relative_path_accepts_non_utf8_bytes() {
-        let path = RelativeWirePath::new(Bytes::from_static(b"dir/\xfffile")).unwrap();
-        assert_eq!(path.as_bytes(), b"dir/\xfffile");
+    fn relative_path_round_trip_preserves_opaque_components() {
+        let path = RelativeWirePath::from_components([
+            b"dir".as_slice(),
+            b"\xff/file".as_slice(),
+            b"\x00\x01".as_slice(),
+        ])
+        .unwrap();
+        let decoded = RelativeWirePath::decode(path.as_encoded().to_vec()).unwrap();
+        assert_eq!(decoded, path);
+        assert_eq!(
+            decoded.components().collect::<Vec<_>>(),
+            vec![b"dir".as_slice(), b"\xff/file".as_slice(), b"\x00\x01".as_slice()]
+        );
     }
 
     #[test]
-    fn relative_path_rejects_traversal_and_ambiguous_components() {
-        for path in [
-            b"../file".as_slice(),
-            b"dir/../file".as_slice(),
-            b"./file".as_slice(),
-            b"dir//file".as_slice(),
-            b"/absolute".as_slice(),
-            b"dir/".as_slice(),
-        ] {
-            assert!(RelativeWirePath::new(Bytes::copy_from_slice(path)).is_err());
+    fn relative_path_rejects_empty_component() {
+        assert!(RelativeWirePath::from_components([b"dir".as_slice(), b"".as_slice()]).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_truncation_and_trailing_bytes() {
+        let path = RelativeWirePath::from_components([b"a".as_slice(), b"b".as_slice()]).unwrap();
+        let encoded = path.as_encoded();
+        for len in 0..encoded.len() {
+            assert!(RelativeWirePath::decode(Bytes::copy_from_slice(&encoded[..len])).is_err());
         }
+
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(RelativeWirePath::decode(trailing).is_err());
     }
 
     #[test]
-    fn rejects_nul_and_oversized_paths() {
-        assert!(WirePath::new(Bytes::from_static(b"bad\0path")).is_err());
-        assert!(WirePath::new(vec![b'a'; MAX_WIRE_PATH_BYTES + 1]).is_err());
+    fn native_root_bytes_are_not_interpreted_by_protocol() {
+        let utf16_like = Bytes::from_static(&[b'C', 0, b':', 0, b'\\', 0]);
+        assert_eq!(WirePath::new(utf16_like.clone()).unwrap().into_bytes(), utf16_like);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_relative_wire_path_payload_never_panics(payload in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = RelativeWirePath::decode(payload);
+        }
     }
 }
