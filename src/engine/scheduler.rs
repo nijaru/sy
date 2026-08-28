@@ -99,7 +99,10 @@ impl Scheduler {
         self.budget
     }
 
-    pub async fn acquire(&self, request: ResourceRequest) -> Result<ResourcePermit, SchedulerError> {
+    pub async fn acquire(
+        &self,
+        request: ResourceRequest,
+    ) -> Result<ResourcePermit, SchedulerError> {
         self.validate_request(request)?;
         let requested_byte_units = request_byte_units(request.buffered_bytes)?;
 
@@ -123,12 +126,8 @@ impl Scheduler {
             "metadata_ops",
         )
         .await?;
-        let cpu_tasks = acquire(
-            Arc::clone(&self.cpu_tasks),
-            request.cpu_tasks,
-            "cpu_tasks",
-        )
-        .await?;
+        let cpu_tasks =
+            acquire(Arc::clone(&self.cpu_tasks), request.cpu_tasks, "cpu_tasks").await?;
         let network_writes = acquire(
             Arc::clone(&self.network_writes),
             request.network_writes,
@@ -185,6 +184,7 @@ impl Scheduler {
 }
 
 /// Holds scheduler capacity until the admitted work item completes.
+#[derive(Debug)]
 pub struct ResourcePermit {
     _active_files: Option<OwnedSemaphorePermit>,
     _buffered_bytes: Option<OwnedSemaphorePermit>,
