@@ -14,6 +14,8 @@ pub mod bisync;
 #[doc(hidden)]
 pub mod endpoint;
 #[doc(hidden)]
+pub mod engine;
+#[doc(hidden)]
 pub mod protocol;
 #[doc(hidden)]
 pub mod server;
