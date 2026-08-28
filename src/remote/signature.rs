@@ -12,7 +12,7 @@ use crate::rooted_fs::{RootedFs, RootedFsError};
 use futures::{Stream, StreamExt};
 use std::error::Error as StdError;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 
@@ -491,6 +491,7 @@ mod tests {
     use crate::protocol::{Operation, Platform};
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
+    use std::path::PathBuf;
 
     #[test]
     fn adaptive_block_size_targets_bounded_power_of_two_blocks() {
