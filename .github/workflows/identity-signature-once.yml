@@ -25,6 +25,8 @@ jobs:
           git apply .github/workflows/identity-signature-1.patch
           git apply --check .github/workflows/identity-signature-2.patch
           git apply .github/workflows/identity-signature-2.patch
+          git apply --check .github/workflows/identity-signature-fix.patch
+          git apply .github/workflows/identity-signature-fix.patch
       - run: cargo fmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -45,6 +47,8 @@ jobs:
           git apply .github/workflows/identity-signature-1.patch
           git apply --check .github/workflows/identity-signature-2.patch
           git apply .github/workflows/identity-signature-2.patch
+          git apply --check .github/workflows/identity-signature-fix.patch
+          git apply .github/workflows/identity-signature-fix.patch
       - run: cargo fmt
       - run: cargo fmt --check
       - run: cargo test
@@ -63,14 +67,16 @@ jobs:
         run: |
           git apply .github/workflows/identity-signature-1.patch
           git apply .github/workflows/identity-signature-2.patch
+          git apply .github/workflows/identity-signature-fix.patch
           cargo fmt
       - name: Commit validated slice
         run: |
           rm .github/workflows/identity-signature-once.yml
           rm .github/workflows/identity-signature-1.patch
           rm .github/workflows/identity-signature-2.patch
+          rm .github/workflows/identity-signature-fix.patch
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A -- src/endpoint src/protocol/signature.rs src/remote/runtime.rs src/remote/signature.rs .github/workflows/identity-signature-once.yml .github/workflows/identity-signature-1.patch .github/workflows/identity-signature-2.patch
+          git add -A -- src/endpoint src/protocol/signature.rs src/remote/runtime.rs src/remote/signature.rs .github/workflows/identity-signature-once.yml .github/workflows/identity-signature-1.patch .github/workflows/identity-signature-2.patch .github/workflows/identity-signature-fix.patch
           git commit -m "fix(remote): bind signatures to scanned basis identity"
           git push origin HEAD:v0.5-architecture
