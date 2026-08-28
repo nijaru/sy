@@ -302,7 +302,8 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
-        self.apply_preservation(&task.dest_path, preservation).await?;
+        self.apply_preservation(&task.dest_path, preservation)
+            .await?;
         Ok(TaskResult::DirCreated)
     }
 
@@ -401,7 +402,8 @@ impl<'a> TaskExecutor<'a> {
             });
         }
 
-        self.apply_preservation(&task.dest_path, preservation).await?;
+        self.apply_preservation(&task.dest_path, preservation)
+            .await?;
 
         if self.preserve_hardlinks_requested() && source_entry.nlink > 1 {
             if let Some(inode) = source_entry.inode {
@@ -639,8 +641,10 @@ mod tests {
 
         let source = LocalEndpoint::new(src_dir.path().to_path_buf());
         let dest = LocalEndpoint::new(dst_dir.path().to_path_buf());
-        let mut preserve = PreserveConfig::default();
-        preserve.xattrs = true;
+        let preserve = PreserveConfig {
+            xattrs: true,
+            ..Default::default()
+        };
         let executor = TaskExecutor::new(
             &source,
             &dest,
