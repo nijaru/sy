@@ -17,7 +17,7 @@ use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{SyncAction, SyncTask};
 use futures::StreamExt;
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -123,7 +123,8 @@ pub(crate) async fn run_local_sync(
         });
 
         if source_entry_selected(config, &current_source) {
-            let task = plan_local_entry(source, dest, config, &current_source, matching_dest).await?;
+            let task =
+                plan_local_entry(source, dest, config, &current_source, matching_dest).await?;
             if !(config.existing && task.action == SyncAction::Create) {
                 if config.dry_run {
                     record_planned_task(&task, &mut stats);
@@ -258,17 +259,12 @@ async fn preflight_delete(
     Ok(preflight)
 }
 
-fn enforce_delete_threshold(
-    counts: DeletePreflight,
-    threshold: u8,
-    force: bool,
-) -> Result<()> {
+fn enforce_delete_threshold(counts: DeletePreflight, threshold: u8, force: bool) -> Result<()> {
     if force || counts.eligible_dest_entries == 0 {
         return Ok(());
     }
 
-    let percentage =
-        counts.delete_candidates as f64 / counts.eligible_dest_entries as f64 * 100.0;
+    let percentage = counts.delete_candidates as f64 / counts.eligible_dest_entries as f64 * 100.0;
     if percentage > threshold as f64 {
         return Err(SyncError::DeletionThresholdExceeded {
             percentage,
@@ -332,12 +328,11 @@ async fn execute_deletions(
             if entry.relative_path.starts_with(directory) {
                 continue;
             }
-            let directory = pending_delete_dir
-                .take()
-                .expect("pending directory checked above");
-            batch.push(delete_task(directory));
-            if batch.len() >= batch_size {
-                execute_batch(executor, &mut batch, stats).await?;
+            if let Some(directory) = pending_delete_dir.take() {
+                batch.push(delete_task(directory));
+                if batch.len() >= batch_size {
+                    execute_batch(executor, &mut batch, stats).await?;
+                }
             }
         }
 
@@ -544,9 +539,7 @@ fn delete_task(path: PathBuf) -> SyncTask {
     }
 }
 
-async fn next_entry(
-    stream: &mut crate::endpoint::EntryStream,
-) -> Result<Option<FileEntry>> {
+async fn next_entry(stream: &mut crate::endpoint::EntryStream) -> Result<Option<FileEntry>> {
     match stream.next().await {
         Some(entry) => entry.map(Some),
         None => Ok(None),
@@ -622,7 +615,10 @@ mod tests {
             ScanOptions::default(),
         )
         .await;
-        assert!(matches!(result, Err(SyncError::DeletionThresholdExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(SyncError::DeletionThresholdExceeded { .. })
+        ));
         assert!(!dest.path().join("new").exists());
         assert!(dest.path().join("old-a").exists());
         assert!(dest.path().join("old-b").exists());
