@@ -29,6 +29,8 @@ pub mod server;
 #[doc(hidden)]
 pub mod ssh;
 #[doc(hidden)]
+pub mod transfer;
+#[doc(hidden)]
 pub mod transport;
 
 // Private modules
