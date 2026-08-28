@@ -1,6 +1,8 @@
+pub mod path;
 pub mod router;
 pub mod runtime;
 pub mod scan;
+pub mod signature;
 
 use crate::endpoint::{Capabilities, Endpoint};
 use crate::protocol::{
