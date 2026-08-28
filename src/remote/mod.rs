@@ -44,22 +44,22 @@ pub enum RemoteError {
 pub type Result<T> = std::result::Result<T, RemoteError>;
 
 #[derive(Debug, Clone)]
-pub struct ClientSession {
-    pub server: ServerHello,
-    pub ready: SessionReady,
+struct ClientSession {
+    server: ServerHello,
+    ready: SessionReady,
 }
 
 #[derive(Debug, Clone)]
-pub struct OpenedServerSession {
-    pub client: ClientHello,
-    pub operation: Operation,
-    pub root: PathBuf,
-    pub ready: SessionReady,
+struct OpenedServerSession {
+    client: ClientHello,
+    operation: Operation,
+    root: PathBuf,
+    ready: SessionReady,
 }
 
 /// Perform the v3 client control-plane handshake over an already-connected
 /// transport. No file data is exchanged here.
-pub async fn client_handshake<R, W>(
+async fn client_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     operation: Operation,
@@ -100,7 +100,7 @@ where
 
 /// Perform the server half of the v3 control-plane handshake and open the
 /// requested local root. The data plane starts only after this returns.
-pub async fn server_handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<OpenedServerSession>
+async fn server_handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<OpenedServerSession>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -170,9 +170,13 @@ fn expect_control(frame: &Frame, expected: FrameKind) -> Result<()> {
 }
 
 fn process_capabilities() -> CapabilitySet {
-    // Advertise runtime behavior only. Reserved frame kinds do not imply that a
-    // data-plane actor already implements the corresponding capability.
-    endpoint_capabilities(&Capabilities::local()) | CapabilitySet::BLAKE3 | CapabilitySet::RAW_PATHS
+    // Advertise only behavior owned by the negotiated v3 runtime. The central
+    // frame router is mandatory after handshake, so multiplexing is a runtime
+    // invariant rather than a reserved protocol possibility.
+    endpoint_capabilities(&Capabilities::local())
+        | CapabilitySet::BLAKE3
+        | CapabilitySet::RAW_PATHS
+        | CapabilitySet::MULTIPLEXING
 }
 
 fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
@@ -392,7 +396,7 @@ mod tests {
         assert_eq!(opened.root, root.path());
         assert!(client.ready.capabilities.contains(CapabilitySet::BLAKE3));
         assert!(client.ready.capabilities.contains(CapabilitySet::RAW_PATHS));
-        assert!(!client
+        assert!(client
             .ready
             .capabilities
             .contains(CapabilitySet::MULTIPLEXING));
