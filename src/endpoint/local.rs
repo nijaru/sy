@@ -1,23 +1,23 @@
-use crate::endpoint::{Capabilities, Endpoint, EndpointType, FileMetadata, ScanOptions};
-use crate::error::Result;
+use crate::endpoint::{
+    BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, ScanOptions, StagedWriter,
+};
+use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, Scanner};
 use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::io::AsyncWriteExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-// Dead-code suppressed until Phase 3 (SyncSession) wires these in.
-#[allow(dead_code)]
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
     scan_options: ScanOptions,
 }
 
-#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 impl LocalEndpoint {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -41,7 +41,6 @@ impl LocalEndpoint {
     }
 }
 
-#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
     FileMetadata {
         size: meta.len(),
@@ -56,6 +55,108 @@ fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
         gid: meta.gid(),
         #[cfg(unix)]
         nlink: meta.nlink(),
+    }
+}
+
+/// Local staged write backed by a temporary file in the destination directory.
+///
+/// Keeping staging and final paths in the same directory preserves same-filesystem
+/// rename semantics. TempFileGuard provides best-effort cleanup if the writer is
+/// dropped before commit.
+struct LocalStagedWriter {
+    file: Option<tokio::fs::File>,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    guard: Option<crate::temp_file::TempFileGuard>,
+}
+
+impl LocalStagedWriter {
+    async fn new(final_path: PathBuf) -> Result<Self> {
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&final_path);
+        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+
+        Ok(Self {
+            file: Some(file),
+            temp_path,
+            final_path,
+            guard: Some(guard),
+        })
+    }
+
+    fn file_mut(&mut self) -> Result<&mut tokio::fs::File> {
+        self.file.as_mut().ok_or_else(|| {
+            SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "staged writer is already closed",
+            ))
+        })
+    }
+}
+
+#[async_trait]
+impl StagedWriter for LocalStagedWriter {
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.file_mut()?.write_all(data).await?;
+        Ok(())
+    }
+
+    async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()> {
+        self.file_mut()?.flush().await?;
+
+        filetime::set_file_mtime(
+            &self.temp_path,
+            filetime::FileTime::from_system_time(metadata.modified),
+        )?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(metadata.mode);
+            tokio::fs::set_permissions(&self.temp_path, perms).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            drop(file);
+        }
+
+        tokio::fs::rename(&self.temp_path, &self.final_path).await?;
+        if let Some(guard) = self.guard.take() {
+            guard.defuse();
+        }
+        Ok(())
+    }
+
+    async fn abort(mut self: Box<Self>) -> Result<()> {
+        self.file.take();
+        match tokio::fs::remove_file(&self.temp_path).await {
+            Ok(()) => {
+                if let Some(guard) = self.guard.take() {
+                    guard.defuse();
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(guard) = self.guard.take() {
+                    guard.defuse();
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -81,7 +182,7 @@ impl Endpoint for LocalEndpoint {
             scanner.scan()
         })
         .await
-        .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))?
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
@@ -95,10 +196,26 @@ impl Endpoint for LocalEndpoint {
         Ok(file_metadata_from_fs(&meta))
     }
 
+    async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
+        let full_path = self.resolve(path);
+        let file = tokio::fs::File::open(&full_path).await.map_err(|e| {
+            SyncError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to open file {}: {}", full_path.display(), e),
+            ))
+        })?;
+        Ok(Box::pin(file))
+    }
+
+    async fn begin_write(&self, path: &Path) -> Result<Box<dyn StagedWriter>> {
+        let full_path = self.resolve(path);
+        Ok(Box::new(LocalStagedWriter::new(full_path).await?))
+    }
+
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
         let full_path = self.resolve(path);
         tokio::fs::read(&full_path).await.map_err(|e| {
-            crate::error::SyncError::Io(std::io::Error::new(
+            SyncError::Io(std::io::Error::new(
                 e.kind(),
                 format!("Failed to read file {}: {}", full_path.display(), e),
             ))
@@ -106,32 +223,13 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Atomic write: temp file + rename (same directory = same filesystem)
-        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&full_path);
-        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
-
-        tokio::fs::write(&temp_path, data).await?;
-        filetime::set_file_mtime(
-            &temp_path,
-            filetime::FileTime::from_system_time(meta.modified),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(meta.mode);
-            tokio::fs::set_permissions(&temp_path, perms).await?;
-        }
-
-        // Atomic rename to final path
-        tokio::fs::rename(&temp_path, &full_path).await?;
-        guard.defuse();
-
-        Ok(())
+        // Compatibility shim during the v0.5 migration. All local writes now
+        // share the staged-writer transaction path even if the caller still
+        // provides a whole in-memory buffer.
+        let mut writer = self.begin_write(path).await?;
+        writer.write(data).await?;
+        writer.set_metadata(meta).await?;
+        writer.commit().await
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
@@ -241,6 +339,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_staged_write_abort_preserves_destination() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+        fs::write(dir.path().join("test.txt"), b"old").unwrap();
+
+        let mut writer = ep.begin_write(Path::new("test.txt")).await.unwrap();
+        writer.write(b"new").await.unwrap();
+        writer.abort().await.unwrap();
+
+        assert_eq!(fs::read(dir.path().join("test.txt")).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn test_staged_write_commit_replaces_destination() {
+        let dir = TempDir::new().unwrap();
+        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+        fs::write(dir.path().join("test.txt"), b"old").unwrap();
+
+        let mut writer = ep.begin_write(Path::new("test.txt")).await.unwrap();
+        writer.write(b"content").await.unwrap();
+        writer.set_metadata(&make_meta()).await.unwrap();
+        writer.commit().await.unwrap();
+
+        assert_eq!(fs::read(dir.path().join("test.txt")).unwrap(), b"content");
+    }
+
+    #[tokio::test]
     async fn test_exists() {
         let dir = TempDir::new().unwrap();
         let ep = LocalEndpoint::new(dir.path().to_path_buf());
@@ -255,8 +380,10 @@ mod tests {
     async fn test_capabilities() {
         let ep = LocalEndpoint::new(PathBuf::from("/tmp"));
         assert_eq!(ep.endpoint_type(), EndpointType::Local);
-        assert!(ep.capabilities().cow_writes);
-        assert!(ep.capabilities().delta_sync);
+        assert!(ep.capabilities().atomic_rename);
+        assert!(ep.capabilities().streaming_read);
+        assert!(ep.capabilities().staged_write);
+        assert!(ep.capabilities().reflink);
     }
 
     #[tokio::test]
