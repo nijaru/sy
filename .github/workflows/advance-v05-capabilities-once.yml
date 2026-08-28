@@ -52,12 +52,10 @@ jobs:
       - name: Apply validated slice
         run: python3 .github/workflows/advance-v05-capabilities-once.py
       - run: cargo fmt
-      - name: Remove one-shot gate and commit
+      - name: Commit validated slice
         run: |
-          rm .github/workflows/advance-v05-capabilities-once.yml
-          rm .github/workflows/advance-v05-capabilities-once.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/remote/mod.rs agent-context/ai/0.5-design-audit.md agent-context/ai/0.5-rewrite.md .github/workflows
+          git add src/remote/mod.rs agent-context/ai/0.5-design-audit.md agent-context/ai/0.5-rewrite.md
           git commit -m "feat(remote): advertise secure rolling signatures on Unix"
           git push origin HEAD:v0.5-architecture
