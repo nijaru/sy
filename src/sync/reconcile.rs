@@ -53,7 +53,8 @@ pub(crate) async fn run_local_sync(
     let delete_plan = match config.delete {
         DeleteMode::Disabled => None,
         DeleteMode::Enabled { threshold, force } => {
-            let plan = preflight_delete(source, dest, config, scan_options, threshold, force).await?;
+            let plan =
+                preflight_delete(source, dest, config, scan_options, threshold, force).await?;
             tracing::info!(
                 source_entries = plan.source_entries,
                 eligible_dest_entries = plan.eligible_dest_entries,
@@ -125,16 +126,10 @@ pub(crate) async fn run_local_sync(
                     continue;
                 }
 
-                let operation = plan_matched(source, dest, comparison, source_entry, destination)
-                    .await?;
+                let operation =
+                    plan_matched(source, dest, comparison, source_entry, destination).await?;
                 queue_operation(
-                    source,
-                    config,
-                    operation,
-                    &mut batch,
-                    batch_size,
-                    &executor,
-                    &mut stats,
+                    source, config, operation, &mut batch, batch_size, &executor, &mut stats,
                 )
                 .await?;
                 continue;
@@ -151,13 +146,7 @@ pub(crate) async fn run_local_sync(
             }
         };
         queue_operation(
-            source,
-            config,
-            operation,
-            &mut batch,
-            batch_size,
-            &executor,
-            &mut stats,
+            source, config, operation, &mut batch, batch_size, &executor, &mut stats,
         )
         .await?;
     }
@@ -168,7 +157,7 @@ pub(crate) async fn run_local_sync(
 
     if let Some(mut plan) = delete_plan {
         if config.dry_run {
-            stats.files_deleted = plan.delete_candidates as u64;
+            stats.files_deleted = plan.delete_candidates;
         } else {
             execute_delete_journal(dest, &mut plan.journal, &mut stats).await?;
         }
@@ -195,8 +184,7 @@ async fn plan_matched(
             source,
             destination,
         } => {
-            let source_hash =
-                hash_file_streaming(source_endpoint, source.path.as_path()).await?;
+            let source_hash = hash_file_streaming(source_endpoint, source.path.as_path()).await?;
             let destination_hash =
                 hash_file_streaming(dest_endpoint, destination.path.as_path()).await?;
             Ok(finish_content_comparison(
@@ -282,7 +270,8 @@ async fn compatibility_entry(
 ) -> Result<FileEntry> {
     let relative_path = entry.path.as_path().to_path_buf();
     let absolute_path = source_endpoint.root().join(&relative_path);
-    let (inode, nlink) = hardlink_compatibility_metadata(config, &absolute_path, entry.kind).await?;
+    let (inode, nlink) =
+        hardlink_compatibility_metadata(config, &absolute_path, entry.kind).await?;
     let mode = entry.unix_mode.unwrap_or_else(|| {
         if entry.kind == EntryKind::Directory {
             0o755
@@ -460,10 +449,8 @@ async fn preflight_delete(
     force: bool,
 ) -> Result<DeletePlan> {
     let request = delete_scan_request(scan_options);
-    let source_stream = crate::endpoint::local_entry_scan::local_entry_stream(
-        source.root().to_path_buf(),
-        request,
-    );
+    let source_stream =
+        crate::endpoint::local_entry_scan::local_entry_stream(source.root().to_path_buf(), request);
     let dest_stream = destination_stream(dest.root(), request).await?;
     let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
     let mut source_entries = 0_usize;
@@ -494,7 +481,8 @@ async fn preflight_delete(
                 if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
                     eligible_dest_entries += 1;
                     delete_candidates += 1;
-                    append_delete_candidate(&mut journal, &destination, &mut candidate_dirs).await?;
+                    append_delete_candidate(&mut journal, &destination, &mut candidate_dirs)
+                        .await?;
                 } else {
                     protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                 }
