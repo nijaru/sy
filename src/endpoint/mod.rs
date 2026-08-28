@@ -143,9 +143,7 @@ pub trait Endpoint: Send + Sync {
     async fn scan_ordered(&self, opts: ScanOptions) -> Result<EntryStream> {
         let mut entries = self.scan(opts).await?;
         entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(Box::pin(futures::stream::iter(
-            entries.into_iter().map(Ok),
-        )))
+        Ok(Box::pin(futures::stream::iter(entries.into_iter().map(Ok))))
     }
 
     async fn exists(&self, path: &Path) -> Result<bool>;
