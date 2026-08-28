@@ -7,7 +7,7 @@ use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -46,6 +46,9 @@ enum LocalScanError {
         #[source]
         source: InvalidTimestamp,
     },
+
+    #[error("modification timestamp for {path} is outside the supported i64-second range")]
+    TimestampRange { path: PathBuf },
 
     #[error("invalid modification timestamp nanoseconds for {path}: {nanoseconds}")]
     TimestampNanoseconds { path: PathBuf, nanoseconds: i64 },
@@ -223,15 +226,17 @@ fn metadata_timestamp(path: &Path, metadata: &std::fs::Metadata) -> Result<Times
 }
 
 #[cfg(not(unix))]
-fn system_time_to_timestamp(path: &Path, time: std::time::SystemTime) -> Result<Timestamp, LocalScanError> {
+fn system_time_to_timestamp(
+    path: &Path,
+    time: std::time::SystemTime,
+) -> Result<Timestamp, LocalScanError> {
     use std::time::UNIX_EPOCH;
 
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
             let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
-                LocalScanError::Timestamp {
+                LocalScanError::TimestampRange {
                     path: path.to_path_buf(),
-                    source: InvalidTimestamp::range(),
                 }
             })?;
             Timestamp::new(seconds, duration.subsec_nanos()).map_err(|source| {
@@ -244,21 +249,30 @@ fn system_time_to_timestamp(path: &Path, time: std::time::SystemTime) -> Result<
         Err(before_epoch) => {
             let duration = before_epoch.duration();
             let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
-                LocalScanError::Timestamp {
+                LocalScanError::TimestampRange {
                     path: path.to_path_buf(),
-                    source: InvalidTimestamp::range(),
                 }
             })?;
             let nanos = duration.subsec_nanos();
             let (seconds, nanos) = if nanos == 0 {
-                (-seconds, 0)
+                (
+                    seconds
+                        .checked_neg()
+                        .ok_or_else(|| LocalScanError::TimestampRange {
+                            path: path.to_path_buf(),
+                        })?,
+                    0,
+                )
             } else {
-                (seconds.checked_neg().and_then(|value| value.checked_sub(1)).ok_or_else(|| {
-                    LocalScanError::Timestamp {
-                        path: path.to_path_buf(),
-                        source: InvalidTimestamp::range(),
-                    }
-                })?, 1_000_000_000 - nanos)
+                (
+                    seconds
+                        .checked_neg()
+                        .and_then(|value| value.checked_sub(1))
+                        .ok_or_else(|| LocalScanError::TimestampRange {
+                            path: path.to_path_buf(),
+                        })?,
+                    1_000_000_000 - nanos,
+                )
             };
             Timestamp::new(seconds, nanos).map_err(|source| LocalScanError::Timestamp {
                 path: path.to_path_buf(),
@@ -310,6 +324,7 @@ fn hardlink_group(_metadata: &std::fs::Metadata, _kind: EntryKind) -> Option<Ent
     None
 }
 
+#[cfg(unix)]
 const fn entry_kind_tag(kind: EntryKind) -> u8 {
     match kind {
         EntryKind::File => 1,
