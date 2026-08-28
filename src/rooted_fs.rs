@@ -125,10 +125,7 @@ impl RootedFs {
                 libc::openat(
                     parent,
                     component.as_ptr(),
-                    libc::O_RDONLY
-                        | libc::O_DIRECTORY
-                        | libc::O_CLOEXEC
-                        | libc::O_NOFOLLOW,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )
             };
             if fd < 0 {
