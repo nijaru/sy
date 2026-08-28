@@ -1,0 +1,48 @@
+name: Normalize Bisync Store Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Remove recovery panic and format
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/engine/bisync_store.rs")
+          text = path.read_text()
+          old = '''        if current.is_some_and(|pointer| pointer.generation == marker.target_generation) {
+              self.verify_pointer(current.expect("checked as some"))?;
+              return Ok(RecoveryState::Committed(marker));
+          }
+          '''
+          new = '''        if let Some(pointer) = current {
+              if pointer.generation == marker.target_generation {
+                  self.verify_pointer(pointer)?;
+                  return Ok(RecoveryState::Committed(marker));
+              }
+          }
+          '''
+          if old not in text:
+              raise SystemExit("expected recovery-state source not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/engine/bisync_store.rs
+          git commit -m "fix(engine): keep bisync recovery panic-free"
+          git push origin HEAD:v0.5-architecture
