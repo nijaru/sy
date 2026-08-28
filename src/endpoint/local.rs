@@ -1,4 +1,6 @@
-use crate::endpoint::{BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, StagedWriter};
+use crate::endpoint::{
+    BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, StagedWriter,
+};
 use crate::error::{Result, SyncError};
 use async_trait::async_trait;
 use std::ffi::OsString;
