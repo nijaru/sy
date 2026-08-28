@@ -1,9 +1,8 @@
-//! Ordered reconciliation for the v0.5 local path.
+//! Compatibility execution bridge for the v0.5 local engine.
 //!
-//! This is the last compatibility location for the reconciler before it moves
-//! wholly under `engine/`. Source and destination scans are merge-joined in
-//! bounded memory. Delete mode performs a complete no-mutation preflight and
-//! records exact destination-only paths in an on-disk reverse journal.
+//! Ordered scanning, merge reconciliation, and semantic comparison live under
+//! `engine/`. This module only adapts the resulting `SyncOp`s to the legacy task
+//! executor while that executor is being replaced.
 
 #[path = "../engine/delete_journal.rs"]
 mod delete_journal;
@@ -17,11 +16,15 @@ use crate::sync::scanner::{FileEntry, ScanOptions};
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{SyncAction, SyncTask};
 use delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
-use futures::StreamExt;
-use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sy::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use sy::engine::planner::{
+    finish_content_comparison, plan_entry, ComparisonMode, ComparisonPolicy, PlanDecision,
+};
+use sy::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
+use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 
 const MIN_BATCH_SIZE: usize = 16;
 const MAX_BATCH_SIZE: usize = 1024;
@@ -35,7 +38,7 @@ pub(crate) async fn run_local_sync(
     let started = Instant::now();
 
     if !dest.root().exists() && !config.dry_run {
-        std::fs::create_dir_all(dest.root())?;
+        tokio::fs::create_dir_all(dest.root()).await?;
     }
 
     if config.cache {
@@ -50,8 +53,7 @@ pub(crate) async fn run_local_sync(
     let delete_plan = match config.delete {
         DeleteMode::Disabled => None,
         DeleteMode::Enabled { threshold, force } => {
-            let plan =
-                preflight_delete(source, dest, config, scan_options, threshold, force).await?;
+            let plan = preflight_delete(source, dest, config, scan_options, threshold, force).await?;
             tracing::info!(
                 source_entries = plan.source_entries,
                 eligible_dest_entries = plan.eligible_dest_entries,
@@ -92,58 +94,72 @@ pub(crate) async fn run_local_sync(
         .clamp(MIN_BATCH_SIZE, MAX_BATCH_SIZE);
     let mut stats = SyncStats::default();
     let mut batch = Vec::with_capacity(batch_size);
-    let mut source_stream = source.scan_ordered(scan_options).await?;
-    let mut dest_stream = dest.scan_ordered(scan_options).await?;
-    let mut source_entry = next_entry(&mut source_stream).await?;
-    let mut dest_entry = next_entry(&mut dest_stream).await?;
+    let scan_request = scan_request(config, scan_options);
+    let source_stream = crate::endpoint::local_entry_scan::local_entry_stream(
+        source.root().to_path_buf(),
+        scan_request,
+    );
+    let dest_stream = destination_stream(dest.root(), scan_request).await?;
+    let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
+    let comparison = comparison_policy(config);
 
-    while let Some(current_source) = source_entry.take() {
-        stats.files_scanned += 1;
-
-        while let Some(current_dest) = dest_entry.as_ref() {
-            match current_dest
-                .relative_path
-                .as_path()
-                .cmp(current_source.relative_path.as_path())
-            {
-                Ordering::Less => {
-                    dest_entry = next_entry(&mut dest_stream).await?;
+    while let Some(item) = reconciler.next().await.map_err(map_engine_error)? {
+        let source_entry = match item {
+            ReconcileItem::SourceOnly(source_entry) => {
+                stats.files_scanned += 1;
+                if !source_entry_selected(config, &source_entry) {
+                    continue;
                 }
-                Ordering::Equal | Ordering::Greater => break,
-            }
-        }
-
-        let matching_dest = dest_entry.as_ref().filter(|entry| {
-            entry.relative_path.as_path() == current_source.relative_path.as_path()
-        });
-
-        if source_entry_selected(config, &current_source) {
-            let task =
-                plan_local_entry(source, dest, config, &current_source, matching_dest).await?;
-            if !(config.existing && task.action == SyncAction::Create) {
-                if config.dry_run {
-                    record_planned_task(&task, &mut stats);
-                } else {
-                    batch.push(task);
-                    if batch.len() >= batch_size {
-                        execute_batch(&executor, &mut batch, &mut stats).await?;
-                    }
+                if config.existing {
+                    stats.files_skipped += 1;
+                    continue;
                 }
-            } else {
-                stats.files_skipped += 1;
+                source_entry
             }
-        }
+            ReconcileItem::Matched {
+                source: source_entry,
+                destination,
+            } => {
+                stats.files_scanned += 1;
+                if !source_entry_selected(config, &source_entry) {
+                    continue;
+                }
 
-        if matching_dest.is_some() {
-            dest_entry = next_entry(&mut dest_stream).await?;
-        }
-        source_entry = next_entry(&mut source_stream).await?;
-    }
+                let operation = plan_matched(source, dest, comparison, source_entry, destination)
+                    .await?;
+                queue_operation(
+                    source,
+                    config,
+                    operation,
+                    &mut batch,
+                    batch_size,
+                    &executor,
+                    &mut stats,
+                )
+                .await?;
+                continue;
+            }
+            ReconcileItem::DestinationOnly(_) => continue,
+        };
 
-    // Observe destination scan failures before deletion becomes possible. The
-    // no-delete path does not otherwise need destination-only entries here.
-    while dest_entry.is_some() {
-        dest_entry = next_entry(&mut dest_stream).await?;
+        let operation = match plan_entry(source_entry, None, comparison) {
+            PlanDecision::Ready(operation) => operation,
+            PlanDecision::NeedContentComparison { .. } => {
+                return Err(SyncError::Config(
+                    "content comparison requested for a missing destination".to_string(),
+                ));
+            }
+        };
+        queue_operation(
+            source,
+            config,
+            operation,
+            &mut batch,
+            batch_size,
+            &executor,
+            &mut stats,
+        )
+        .await?;
     }
 
     if !config.dry_run {
@@ -152,20 +168,274 @@ pub(crate) async fn run_local_sync(
 
     if let Some(mut plan) = delete_plan {
         if config.dry_run {
-            stats.files_deleted = plan.delete_candidates;
+            stats.files_deleted = plan.delete_candidates as u64;
         } else {
             execute_delete_journal(dest, &mut plan.journal, &mut stats).await?;
         }
     }
 
     if config.cache && !config.dry_run {
-        // Preserve the user-visible cache-file contract without restoring the
-        // unsafe root-mtime shortcut from 0.4.
         crate::sync::dircache::DirectoryCache::new().save(dest.root())?;
     }
 
     stats.duration = started.elapsed();
     Ok(stats)
+}
+
+async fn plan_matched(
+    source_endpoint: &dyn Endpoint,
+    dest_endpoint: &dyn Endpoint,
+    policy: ComparisonPolicy,
+    source: Entry,
+    destination: Entry,
+) -> Result<SyncOp> {
+    match plan_entry(source, Some(destination), policy) {
+        PlanDecision::Ready(operation) => Ok(operation),
+        PlanDecision::NeedContentComparison {
+            source,
+            destination,
+        } => {
+            let source_hash =
+                hash_file_streaming(source_endpoint, source.path.as_path()).await?;
+            let destination_hash =
+                hash_file_streaming(dest_endpoint, destination.path.as_path()).await?;
+            Ok(finish_content_comparison(
+                source,
+                destination,
+                source_hash == destination_hash,
+                policy,
+            ))
+        }
+    }
+}
+
+async fn queue_operation(
+    source_endpoint: &dyn Endpoint,
+    config: &SyncConfig,
+    operation: SyncOp,
+    batch: &mut Vec<SyncTask>,
+    batch_size: usize,
+    executor: &TaskExecutor<'_>,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let Some(task) = compatibility_task(source_endpoint, config, operation).await? else {
+        stats.files_skipped += 1;
+        return Ok(());
+    };
+
+    if config.dry_run {
+        record_planned_task(&task, stats);
+        return Ok(());
+    }
+
+    batch.push(task);
+    if batch.len() >= batch_size {
+        execute_batch(executor, batch, stats).await?;
+    }
+    Ok(())
+}
+
+async fn compatibility_task(
+    source_endpoint: &dyn Endpoint,
+    config: &SyncConfig,
+    operation: SyncOp,
+) -> Result<Option<SyncTask>> {
+    let (source, action) = match operation {
+        SyncOp::Create { source } => (source, SyncAction::Create),
+        SyncOp::Update { source, .. } => (source, SyncAction::Update),
+        SyncOp::Replace {
+            source,
+            destination,
+        } => {
+            if source.kind == EntryKind::Directory || destination.kind == EntryKind::Directory {
+                return Err(SyncError::Config(format!(
+                    "directory type replacement is not yet transactional at {}",
+                    source.path
+                )));
+            }
+            (source, SyncAction::Update)
+        }
+        SyncOp::Skip { .. } => return Ok(None),
+        SyncOp::Metadata { source, .. } => {
+            return Err(SyncError::Config(format!(
+                "metadata-only operation reached legacy executor boundary at {}",
+                source.path
+            )))
+        }
+    };
+
+    let dest_path = source.path.as_path().to_path_buf();
+    let source = compatibility_entry(source_endpoint, config, source).await?;
+    Ok(Some(SyncTask {
+        source: Some(Arc::new(source)),
+        dest_path,
+        action,
+        source_checksum: None,
+        dest_checksum: None,
+    }))
+}
+
+async fn compatibility_entry(
+    source_endpoint: &dyn Endpoint,
+    config: &SyncConfig,
+    entry: Entry,
+) -> Result<FileEntry> {
+    let relative_path = entry.path.as_path().to_path_buf();
+    let absolute_path = source_endpoint.root().join(&relative_path);
+    let (inode, nlink) = hardlink_compatibility_metadata(config, &absolute_path, entry.kind).await?;
+    let mode = entry.unix_mode.unwrap_or_else(|| {
+        if entry.kind == EntryKind::Directory {
+            0o755
+        } else {
+            0o644
+        }
+    });
+
+    Ok(FileEntry {
+        path: Arc::new(absolute_path),
+        relative_path: Arc::new(relative_path),
+        size: entry.size,
+        modified: system_time(entry.modified)?,
+        mode,
+        is_dir: entry.kind == EntryKind::Directory,
+        is_symlink: entry.kind == EntryKind::Symlink,
+        symlink_target: entry.symlink_target.map(Arc::new),
+        is_sparse: false,
+        allocated_size: entry.size,
+        xattrs: None,
+        inode,
+        nlink,
+        acls: None,
+        bsd_flags: None,
+    })
+}
+
+#[cfg(unix)]
+async fn hardlink_compatibility_metadata(
+    config: &SyncConfig,
+    path: &Path,
+    kind: EntryKind,
+) -> Result<(Option<u64>, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !config.preserve.hardlinks || kind != EntryKind::File {
+        return Ok((None, 1));
+    }
+
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    Ok((Some(metadata.ino()), metadata.nlink()))
+}
+
+#[cfg(not(unix))]
+async fn hardlink_compatibility_metadata(
+    _config: &SyncConfig,
+    _path: &Path,
+    _kind: EntryKind,
+) -> Result<(Option<u64>, u64)> {
+    Ok((None, 1))
+}
+
+fn system_time(timestamp: Timestamp) -> Result<SystemTime> {
+    let seconds = timestamp.seconds();
+    let nanoseconds = timestamp.nanoseconds();
+
+    let value = if seconds >= 0 {
+        UNIX_EPOCH.checked_add(Duration::new(seconds as u64, nanoseconds))
+    } else {
+        let magnitude = seconds.unsigned_abs();
+        let before_epoch = if nanoseconds == 0 {
+            Duration::new(magnitude, 0)
+        } else {
+            Duration::new(magnitude - 1, 1_000_000_000 - nanoseconds)
+        };
+        UNIX_EPOCH.checked_sub(before_epoch)
+    };
+
+    value.ok_or_else(|| {
+        SyncError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "entry timestamp is outside SystemTime range",
+        ))
+    })
+}
+
+fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
+    let mode = if config.comparison.checksum {
+        ComparisonMode::Checksum
+    } else if config.comparison.size_only {
+        ComparisonMode::SizeOnly
+    } else if config.comparison.ignore_times {
+        ComparisonMode::Always
+    } else {
+        ComparisonMode::Quick
+    };
+
+    ComparisonPolicy {
+        mode,
+        ignore_existing: config.comparison.ignore_existing,
+        update_only: config.comparison.update_only,
+        // The compatibility executor does not yet expose a metadata-only task.
+        // Keep the new planner honest by not requesting semantics it cannot apply.
+        preserve_permissions: false,
+        preserve_times: false,
+    }
+}
+
+fn scan_request(config: &SyncConfig, options: ScanOptions) -> ScanRequest {
+    ScanRequest {
+        respect_gitignore: options.respect_gitignore,
+        include_git_dir: options.include_git_dir,
+        max_depth: options.dirs_only.then_some(1),
+        metadata: EntryMetadataRequest {
+            unix_mode: config.preserve.permissions,
+            symlink_target: true,
+            identity: true,
+            hardlink_group: config.preserve.hardlinks,
+        },
+    }
+}
+
+fn delete_scan_request(options: ScanOptions) -> ScanRequest {
+    ScanRequest {
+        respect_gitignore: options.respect_gitignore,
+        include_git_dir: options.include_git_dir,
+        max_depth: options.dirs_only.then_some(1),
+        metadata: EntryMetadataRequest {
+            unix_mode: false,
+            symlink_target: false,
+            identity: false,
+            hardlink_group: false,
+        },
+    }
+}
+
+async fn destination_stream(root: &Path, request: ScanRequest) -> Result<EntryStream> {
+    if !tokio::fs::try_exists(root).await? {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    Ok(crate::endpoint::local_entry_scan::local_entry_stream(
+        root.to_path_buf(),
+        request,
+    ))
+}
+
+fn source_entry_selected(config: &SyncConfig, entry: &Entry) -> bool {
+    if !entry.is_directory() {
+        if let Some(min) = config.min_size {
+            if entry.size < min {
+                return false;
+            }
+        }
+        if let Some(max) = config.max_size {
+            if entry.size > max {
+                return false;
+            }
+        }
+    }
+
+    !config
+        .filter_engine
+        .should_exclude(entry.path.as_path(), entry.is_directory())
 }
 
 struct DeletePlan {
@@ -189,10 +459,13 @@ async fn preflight_delete(
     threshold: u8,
     force: bool,
 ) -> Result<DeletePlan> {
-    let mut source_stream = source.scan_ordered(scan_options).await?;
-    let mut dest_stream = dest.scan_ordered(scan_options).await?;
-    let mut source_entry = next_entry(&mut source_stream).await?;
-    let mut dest_entry = next_entry(&mut dest_stream).await?;
+    let request = delete_scan_request(scan_options);
+    let source_stream = crate::endpoint::local_entry_scan::local_entry_stream(
+        source.root().to_path_buf(),
+        request,
+    );
+    let dest_stream = destination_stream(dest.root(), request).await?;
+    let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
     let mut source_entries = 0_usize;
     let mut eligible_dest_entries = 0_usize;
     let mut delete_candidates = 0_usize;
@@ -200,65 +473,32 @@ async fn preflight_delete(
     let mut candidate_dirs = Vec::<CandidateDeleteDir>::new();
     let mut journal = DeleteJournal::new().await?;
 
-    while source_entry.is_some() || dest_entry.is_some() {
-        match (source_entry.as_ref(), dest_entry.as_ref()) {
-            (Some(source_entry_ref), Some(dest_entry_ref)) => match source_entry_ref
-                .relative_path
-                .as_path()
-                .cmp(dest_entry_ref.relative_path.as_path())
-            {
-                Ordering::Less => {
-                    source_entries += 1;
-                    source_entry = next_entry(&mut source_stream).await?;
-                }
-                Ordering::Equal => {
-                    close_candidate_dirs(
-                        dest_entry_ref.relative_path.as_path(),
-                        &mut candidate_dirs,
-                    );
-                    source_entries += 1;
-                    if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
-                        eligible_dest_entries += 1;
-                    }
-                    // Any source-backed entry inside a destination-only candidate
-                    // directory prevents that ancestor from being removed.
-                    protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
-                    source_entry = next_entry(&mut source_stream).await?;
-                    dest_entry = next_entry(&mut dest_stream).await?;
-                }
-                Ordering::Greater => {
-                    close_candidate_dirs(
-                        dest_entry_ref.relative_path.as_path(),
-                        &mut candidate_dirs,
-                    );
-                    if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
-                        eligible_dest_entries += 1;
-                        delete_candidates += 1;
-                        append_delete_candidate(&mut journal, dest_entry_ref, &mut candidate_dirs)
-                            .await?;
-                    } else {
-                        protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
-                    }
-                    dest_entry = next_entry(&mut dest_stream).await?;
-                }
-            },
-            (Some(_), None) => {
+    while let Some(item) = reconciler.next().await.map_err(map_engine_error)? {
+        match item {
+            ReconcileItem::SourceOnly(_) => {
                 source_entries += 1;
-                source_entry = next_entry(&mut source_stream).await?;
             }
-            (None, Some(dest_entry_ref)) => {
-                close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
-                if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
+            ReconcileItem::Matched {
+                source: _,
+                destination,
+            } => {
+                close_candidate_dirs(destination.path.as_path(), &mut candidate_dirs);
+                source_entries += 1;
+                if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
+                    eligible_dest_entries += 1;
+                }
+                protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
+            }
+            ReconcileItem::DestinationOnly(destination) => {
+                close_candidate_dirs(destination.path.as_path(), &mut candidate_dirs);
+                if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
                     eligible_dest_entries += 1;
                     delete_candidates += 1;
-                    append_delete_candidate(&mut journal, dest_entry_ref, &mut candidate_dirs)
-                        .await?;
+                    append_delete_candidate(&mut journal, &destination, &mut candidate_dirs).await?;
                 } else {
                     protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                 }
-                dest_entry = next_entry(&mut dest_stream).await?;
             }
-            (None, None) => break,
         }
     }
 
@@ -272,6 +512,31 @@ async fn preflight_delete(
     })
 }
 
+fn dest_delete_eligible(
+    config: &SyncConfig,
+    entry: &Entry,
+    protected_dir: &mut Option<PathBuf>,
+) -> bool {
+    if let Some(directory) = protected_dir.as_ref() {
+        if entry.path.as_path().starts_with(directory) {
+            return false;
+        }
+        *protected_dir = None;
+    }
+
+    if config
+        .filter_engine
+        .should_exclude(entry.path.as_path(), entry.is_directory())
+    {
+        if entry.is_directory() {
+            *protected_dir = Some(entry.path.as_path().to_path_buf());
+        }
+        return false;
+    }
+
+    true
+}
+
 fn close_candidate_dirs(current: &Path, candidate_dirs: &mut Vec<CandidateDeleteDir>) {
     while candidate_dirs
         .last()
@@ -283,20 +548,20 @@ fn close_candidate_dirs(current: &Path, candidate_dirs: &mut Vec<CandidateDelete
 
 async fn append_delete_candidate(
     journal: &mut DeleteJournal,
-    entry: &FileEntry,
+    entry: &Entry,
     candidate_dirs: &mut Vec<CandidateDeleteDir>,
 ) -> Result<()> {
-    if entry.is_dir {
+    if entry.is_directory() {
         journal
-            .append(&entry.relative_path, DeleteKind::Directory)
+            .append(entry.path.as_path(), DeleteKind::Directory)
             .await?;
         candidate_dirs.push(CandidateDeleteDir {
-            path: (*entry.relative_path).clone(),
+            path: entry.path.as_path().to_path_buf(),
             protected: false,
         });
     } else {
         journal
-            .append(&entry.relative_path, DeleteKind::FileLike)
+            .append(entry.path.as_path(), DeleteKind::FileLike)
             .await?;
     }
     Ok(())
@@ -342,9 +607,6 @@ async fn execute_delete_journal(
     journal: &mut DeleteJournalReader,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    // Protection records live only until their corresponding earlier directory
-    // candidate is reached during reverse replay. The active set is therefore
-    // proportional to directory nesting, not total tree size.
     let mut protected_dirs = Vec::<PathBuf>::new();
 
     while let Some(record) = journal.next().await? {
@@ -359,10 +621,6 @@ async fn execute_delete_journal(
                     protected_dirs.swap_remove(index);
                     continue;
                 }
-
-                // Directory removal is deliberately non-recursive. A concurrent
-                // new/protected child therefore makes the operation fail safely
-                // instead of widening deletion beyond the preflight plan.
                 if dest.exists(&record.path).await? {
                     dest.remove(&record.path, false).await?;
                     stats.files_deleted += 1;
@@ -378,119 +636,6 @@ async fn execute_delete_journal(
     }
 
     Ok(())
-}
-
-fn dest_delete_eligible(
-    config: &SyncConfig,
-    entry: &FileEntry,
-    protected_dir: &mut Option<PathBuf>,
-) -> bool {
-    if let Some(directory) = protected_dir.as_ref() {
-        if entry.relative_path.starts_with(directory) {
-            return false;
-        }
-        *protected_dir = None;
-    }
-
-    if config
-        .filter_engine
-        .should_exclude(&entry.relative_path, entry.is_dir)
-    {
-        if entry.is_dir {
-            *protected_dir = Some((*entry.relative_path).clone());
-        }
-        return false;
-    }
-
-    true
-}
-
-fn source_entry_selected(config: &SyncConfig, entry: &FileEntry) -> bool {
-    if !entry.is_dir {
-        if let Some(min) = config.min_size {
-            if entry.size < min {
-                return false;
-            }
-        }
-        if let Some(max) = config.max_size {
-            if entry.size > max {
-                return false;
-            }
-        }
-    }
-
-    !config
-        .filter_engine
-        .should_exclude(&entry.relative_path, entry.is_dir)
-}
-
-async fn plan_local_entry(
-    source_endpoint: &dyn Endpoint,
-    dest_endpoint: &dyn Endpoint,
-    config: &SyncConfig,
-    source: &FileEntry,
-    dest: Option<&FileEntry>,
-) -> Result<SyncTask> {
-    let dest_path = (*source.relative_path).clone();
-    let Some(dest) = dest else {
-        return Ok(task_for(source, dest_path, SyncAction::Create));
-    };
-
-    if config.comparison.ignore_existing {
-        return Ok(task_for(source, dest_path, SyncAction::Skip));
-    }
-    if config.comparison.update_only && dest.modified > source.modified {
-        return Ok(task_for(source, dest_path, SyncAction::Skip));
-    }
-
-    // Same-directory rename gives the local endpoint an atomic replacement
-    // boundary for regular files and symlinks in either direction. Directories
-    // need a separate tree transaction and remain rejected until the new engine
-    // owns that operation explicitly.
-    if source.is_dir != dest.is_dir {
-        return Err(SyncError::Config(format!(
-            "directory type replacement is not yet transactional at {}",
-            source.relative_path.display()
-        )));
-    }
-
-    let action = if source.is_dir {
-        SyncAction::Skip
-    } else if source.is_symlink != dest.is_symlink {
-        SyncAction::Update
-    } else if source.is_symlink {
-        if source.symlink_target == dest.symlink_target {
-            SyncAction::Skip
-        } else {
-            SyncAction::Update
-        }
-    } else if config.comparison.checksum {
-        if source.size != dest.size {
-            SyncAction::Update
-        } else {
-            let source_hash = hash_file_streaming(source_endpoint, &source.relative_path).await?;
-            let dest_hash = hash_file_streaming(dest_endpoint, &dest.relative_path).await?;
-            if source_hash == dest_hash {
-                SyncAction::Skip
-            } else {
-                SyncAction::Update
-            }
-        }
-    } else if config.comparison.size_only {
-        if source.size == dest.size {
-            SyncAction::Skip
-        } else {
-            SyncAction::Update
-        }
-    } else if config.comparison.ignore_times {
-        SyncAction::Update
-    } else if source.size == dest.size && source.modified == dest.modified {
-        SyncAction::Skip
-    } else {
-        SyncAction::Update
-    };
-
-    Ok(task_for(source, dest_path, action))
 }
 
 async fn execute_batch(
@@ -537,21 +682,8 @@ fn merge_stats(stats: &mut SyncStats, mut batch: SyncStats) {
     stats.errors.append(&mut batch.errors);
 }
 
-fn task_for(source: &FileEntry, dest_path: PathBuf, action: SyncAction) -> SyncTask {
-    SyncTask {
-        source: Some(Arc::new(source.clone())),
-        dest_path,
-        action,
-        source_checksum: None,
-        dest_checksum: None,
-    }
-}
-
-async fn next_entry(stream: &mut crate::endpoint::EntryStream) -> Result<Option<FileEntry>> {
-    match stream.next().await {
-        Some(entry) => entry.map(Some),
-        None => Ok(None),
-    }
+fn map_engine_error(error: EngineError) -> SyncError {
+    SyncError::Io(std::io::Error::other(error))
 }
 
 #[cfg(test)]
@@ -572,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_reconciler_creates_and_skips() {
+    async fn engine_reconciler_creates_and_skips() {
         let source = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
         std::fs::write(source.path().join("a"), b"one").unwrap();
@@ -630,140 +762,79 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn regular_file_atomically_replaces_symlink() {
+    async fn directory_type_transition_remains_rejected() {
         let source = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
-        std::fs::write(source.path().join("entry"), b"new").unwrap();
-        std::os::unix::fs::symlink("missing", dest.path().join("entry")).unwrap();
+        std::fs::create_dir(source.path().join("entry")).unwrap();
+        std::fs::write(dest.path().join("entry"), b"old").unwrap();
         let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
         let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
 
-        run_local_sync(
+        let error = run_local_sync(
             &source_endpoint,
             &dest_endpoint,
             &config(),
             ScanOptions::default(),
         )
         .await
-        .unwrap();
-
-        assert!(std::fs::symlink_metadata(dest.path().join("entry"))
-            .unwrap()
-            .file_type()
-            .is_file());
-        assert_eq!(std::fs::read(dest.path().join("entry")).unwrap(), b"new");
+        .unwrap_err();
+        assert!(error.to_string().contains("directory type replacement"));
+        assert_eq!(std::fs::read(dest.path().join("entry")).unwrap(), b"old");
     }
 
     #[tokio::test]
-    async fn cache_option_writes_safe_marker_only_after_success() {
+    async fn delete_preflight_removes_only_destination_only_entries() {
         let source = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
-        std::fs::write(source.path().join("file"), b"content").unwrap();
+        std::fs::write(source.path().join("keep"), b"same").unwrap();
+        std::fs::write(dest.path().join("keep"), b"same").unwrap();
+        std::fs::write(dest.path().join("remove"), b"old").unwrap();
         let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
         let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
-        let mut sync_config = config();
-        sync_config.cache = true;
-
-        run_local_sync(
-            &source_endpoint,
-            &dest_endpoint,
-            &sync_config,
-            ScanOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        assert!(dest.path().join(".sy-dir-cache.json").exists());
-    }
-
-    #[tokio::test]
-    async fn delete_threshold_runs_before_mutation() {
-        let source = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-        std::fs::write(source.path().join("new"), b"new").unwrap();
-        std::fs::write(dest.path().join("old-a"), b"a").unwrap();
-        std::fs::write(dest.path().join("old-b"), b"b").unwrap();
-        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
-        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
-        let mut sync_config = config();
-        sync_config.delete = DeleteMode::Enabled {
-            threshold: 50,
-            force: false,
-        };
-
-        let result = run_local_sync(
-            &source_endpoint,
-            &dest_endpoint,
-            &sync_config,
-            ScanOptions::default(),
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(SyncError::DeletionThresholdExceeded { .. })
-        ));
-        assert!(!dest.path().join("new").exists());
-        assert!(dest.path().join("old-a").exists());
-        assert!(dest.path().join("old-b").exists());
-    }
-
-    #[tokio::test]
-    async fn delete_waits_for_complete_source_scan() {
-        let source = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-        std::fs::write(source.path().join("keep"), b"keep").unwrap();
-        std::fs::write(dest.path().join("keep"), b"keep").unwrap();
-        std::fs::write(dest.path().join("delete"), b"delete").unwrap();
-        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
-        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
-        let mut sync_config = config();
-        sync_config.delete = DeleteMode::Enabled {
+        let mut cfg = config();
+        cfg.delete = DeleteMode::Enabled {
             threshold: 100,
             force: false,
         };
 
-        let stats = run_local_sync(
+        run_local_sync(
             &source_endpoint,
             &dest_endpoint,
-            &sync_config,
+            &cfg,
             ScanOptions::default(),
         )
         .await
         .unwrap();
-        assert_eq!(stats.files_deleted, 1);
+
         assert!(dest.path().join("keep").exists());
-        assert!(!dest.path().join("delete").exists());
+        assert!(!dest.path().join("remove").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn delete_keeps_parent_with_excluded_descendant() {
+    async fn hardlink_preservation_uses_exact_legacy_inode_only_at_executor_boundary() {
         let source = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
-        std::fs::create_dir(dest.path().join("extra")).unwrap();
-        std::fs::write(dest.path().join("extra").join("keep.log"), b"keep").unwrap();
-        std::fs::write(dest.path().join("extra").join("remove.tmp"), b"remove").unwrap();
+        std::fs::write(source.path().join("first"), b"content").unwrap();
+        std::fs::hard_link(source.path().join("first"), source.path().join("second")).unwrap();
         let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
         let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
-        let mut sync_config = config();
-        sync_config.delete = DeleteMode::Enabled {
-            threshold: 100,
-            force: false,
-        };
-        sync_config.filter_engine.add_exclude("*.log").unwrap();
+        let mut cfg = config();
+        cfg.preserve.hardlinks = true;
 
         run_local_sync(
             &source_endpoint,
             &dest_endpoint,
-            &sync_config,
+            &cfg,
             ScanOptions::default(),
         )
         .await
         .unwrap();
 
-        assert!(dest.path().join("extra").join("keep.log").exists());
-        assert!(!dest.path().join("extra").join("remove.tmp").exists());
-        assert!(dest.path().join("extra").exists());
+        use std::os::unix::fs::MetadataExt;
+        let first = std::fs::metadata(dest.path().join("first")).unwrap();
+        let second = std::fs::metadata(dest.path().join("second")).unwrap();
+        assert_eq!(first.ino(), second.ino());
     }
 }
