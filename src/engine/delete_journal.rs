@@ -197,7 +197,9 @@ fn decode_path(path: Vec<u8>) -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
 
     if path.len() % 2 != 0 {
-        return Err(invalid_data("odd byte length in Windows delete journal path"));
+        return Err(invalid_data(
+            "odd byte length in Windows delete journal path",
+        ));
     }
     let wide = path
         .chunks_exact(2)
