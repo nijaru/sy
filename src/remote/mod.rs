@@ -166,11 +166,9 @@ fn expect_control(frame: &Frame, expected: FrameKind) -> Result<()> {
 }
 
 fn process_capabilities() -> CapabilitySet {
-    endpoint_capabilities(&Capabilities::local())
-        | CapabilitySet::BLAKE3
-        | CapabilitySet::ROLLING_SIGNATURES
-        | CapabilitySet::MULTIPLEXING
-        | CapabilitySet::RAW_PATHS
+    // Advertise runtime behavior only. Reserved frame kinds do not imply that a
+    // data-plane actor already implements the corresponding capability.
+    endpoint_capabilities(&Capabilities::local()) | CapabilitySet::BLAKE3 | CapabilitySet::RAW_PATHS
 }
 
 fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
@@ -339,7 +337,7 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     };
 
     match (rest, dirs::home_dir()) {
-        (Some(rest), Some(home)) if rest.is_empty() => home,
+        (Some([]), Some(home)) => home,
         (Some(rest), Some(home)) => home.join(OsString::from_vec(rest.to_vec())),
         _ => path,
     }
@@ -371,9 +369,10 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
 
-        let server = tokio::spawn(
-            async move { server_handshake(&mut server_reader, &mut server_writer).await },
-        );
+        let server =
+            tokio::spawn(
+                async move { server_handshake(&mut server_reader, &mut server_writer).await },
+            );
         let client = client_handshake(
             &mut client_reader,
             &mut client_writer,
@@ -391,7 +390,15 @@ mod tests {
         assert!(client
             .ready
             .capabilities
+            .contains(CapabilitySet::RAW_PATHS));
+        assert!(!client
+            .ready
+            .capabilities
             .contains(CapabilitySet::MULTIPLEXING));
+        assert!(!client
+            .ready
+            .capabilities
+            .contains(CapabilitySet::ROLLING_SIGNATURES));
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
     }
 
@@ -403,9 +410,10 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
 
-        let server = tokio::spawn(
-            async move { server_handshake(&mut server_reader, &mut server_writer).await },
-        );
+        let server =
+            tokio::spawn(
+                async move { server_handshake(&mut server_reader, &mut server_writer).await },
+            );
         client_handshake(
             &mut client_reader,
             &mut client_writer,
