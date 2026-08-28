@@ -117,9 +117,10 @@ impl SyncSession {
     }
 
     async fn direct_local(&self) -> Result<SyncStats> {
-        let source = self.source.as_endpoint().ok_or_else(|| {
-            SyncError::Config("source must be local for direct sync".to_string())
-        })?;
+        let source = self
+            .source
+            .as_endpoint()
+            .ok_or_else(|| SyncError::Config("source must be local for direct sync".to_string()))?;
         let dest = self.dest.as_endpoint().ok_or_else(|| {
             SyncError::Config("destination must be local for direct sync".to_string())
         })?;
@@ -221,11 +222,9 @@ impl SyncSession {
         let started = Instant::now();
         let source_parent = source.parent().unwrap_or(Path::new("."));
         let dest_parent = dest.parent().unwrap_or(Path::new("."));
-        let source_name = source
-            .file_name()
-            .ok_or_else(|| SyncError::InvalidPath {
-                path: source.to_path_buf(),
-            })?;
+        let source_name = source.file_name().ok_or_else(|| SyncError::InvalidPath {
+            path: source.to_path_buf(),
+        })?;
         let dest_name = dest.file_name().ok_or_else(|| SyncError::InvalidPath {
             path: dest.to_path_buf(),
         })?;
@@ -421,10 +420,7 @@ fn configure_streaming(
     streaming
 }
 
-fn streaming_stats(
-    stats: crate::streaming::SyncStats,
-    duration: std::time::Duration,
-) -> SyncStats {
+fn streaming_stats(stats: crate::streaming::SyncStats, duration: std::time::Duration) -> SyncStats {
     SyncStats {
         files_scanned: stats.files_scanned,
         files_created: stats.files_ok,
