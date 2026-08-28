@@ -401,9 +401,7 @@ impl<'a> SliceReader<'a> {
 
     fn u32(&mut self) -> Result<u32> {
         let bytes = self.take(4)?;
-        Ok(u32::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]))
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn u64(&mut self) -> Result<u64> {
@@ -528,13 +526,8 @@ mod tests {
     #[test]
     fn unknown_capability_bits_are_forward_compatible() {
         let capabilities = CapabilitySet::from_bits_retain(1_u64 << 63);
-        let hello = ServerHello::new(
-            PROTOCOL_V3,
-            capabilities,
-            Platform::current(),
-            "future",
-        )
-        .unwrap();
+        let hello =
+            ServerHello::new(PROTOCOL_V3, capabilities, Platform::current(), "future").unwrap();
         let decoded = ServerHello::decode(&hello.encode().unwrap()).unwrap();
         assert_eq!(decoded.capabilities.bits(), 1_u64 << 63);
     }
