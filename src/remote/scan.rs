@@ -4,21 +4,21 @@ use crate::engine::domain::{
 use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::{EntryMetadataRequest, ScanRequest};
 use crate::protocol::{
-    read_frame, write_frame, Frame, FrameFlags, FrameKind, Platform, PlatformOs, ProtocolError,
-    RelativeWirePath, StreamId, WireEntry, WireEntryKind, WirePath, WireScanRequest,
+    Frame, FrameFlags, FrameKind, Platform, PlatformOs, ProtocolError, RelativeWirePath, StreamId,
+    WireEntry, WireEntryKind, WirePath, WireScanRequest,
 };
+use crate::remote_router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
 use futures::StreamExt;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteScanError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("frame router failed: {0}")]
+    Router(SharedRouterError),
 
     #[error(transparent)]
     InvalidRelativePath(#[from] InvalidRelativePath),
@@ -41,8 +41,20 @@ pub enum RemoteScanError {
     #[error("scan frame {kind:?} used unsupported flags 0x{flags:02x}")]
     FrameFlags { kind: FrameKind, flags: u8 },
 
+    #[error("EntryEnd must use ACK_REQUIRED and no other flags, got 0x{flags:02x}")]
+    EntryEndFlags { flags: u8 },
+
     #[error("EntryEnd payload must be empty")]
     NonEmptyEntryEnd,
+
+    #[error("scan acknowledgement payload must be empty")]
+    NonEmptyAck,
+
+    #[error("scan stream {stream_id} ended before {expected:?}")]
+    UnexpectedStreamEnd {
+        stream_id: u32,
+        expected: FrameKind,
+    },
 
     #[error("scan depth {0} exceeds protocol u32 range")]
     DepthTooLarge(usize),
@@ -65,17 +77,29 @@ pub enum RemoteScanError {
     LocalScan(#[source] BoxError),
 }
 
+impl From<SharedRouterError> for RemoteScanError {
+    fn from(error: SharedRouterError) -> Self {
+        Self::Router(error)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, RemoteScanError>;
 
-pub async fn send_scan_request<W>(
-    writer: &mut W,
-    stream_id: StreamId,
+/// Open a locally initiated scan stream and expose its ordered metadata directly
+/// as the engine's `EntryStream`.
+///
+/// The caller never reads the transport directly. The central frame router owns
+/// transport I/O and keeps all active streams under one bounded memory budget.
+pub async fn request_scan(
+    sender: &RouterSender,
     request: ScanRequest,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+    peer: PlatformOs,
+) -> Result<EntryStream> {
+    ensure_compatible_path_encoding(peer)?;
+    let inbox = sender.open_stream()?;
+    let stream_id = inbox.stream_id();
     require_data_stream(stream_id)?;
+
     let wire = scan_request_to_wire(request)?;
     let frame = Frame::new(
         FrameKind::ScanRequest,
@@ -83,40 +107,38 @@ where
         stream_id,
         wire.encode(),
     )?;
-    write_frame(writer, &frame).await?;
-    writer.flush().await?;
-    Ok(())
+    sender.send(frame).await?;
+
+    remote_entry_stream(inbox, sender.clone(), peer)
 }
 
-pub async fn read_scan_request<R>(reader: &mut R) -> Result<(StreamId, ScanRequest)>
-where
-    R: AsyncRead + Unpin,
-{
-    let frame = read_frame(reader).await?;
-    if frame.kind() != FrameKind::ScanRequest {
-        return Err(RemoteScanError::UnexpectedFrame {
-            expected: FrameKind::ScanRequest,
-            actual: frame.kind(),
-        });
-    }
-    require_data_stream(frame.stream_id())?;
-    require_empty_flags(&frame)?;
-    let request = wire_to_scan_request(WireScanRequest::decode(frame.payload())?)?;
-    Ok((frame.stream_id(), request))
+/// Serve one peer-opened scan stream.
+///
+/// `EntryEnd` is an acknowledged stream boundary. Keeping the peer inbox alive
+/// until its ACK arrives prevents a short-lived server/session from tearing down
+/// the router while the final metadata frames are still queued for transport.
+pub async fn serve_incoming_scan(
+    root: &Path,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+) -> Result<()> {
+    let IncomingStream { first, mut inbox } = incoming;
+    let stream_id = inbox.stream_id();
+    let first_frame = first.frame();
+    require_stream(first_frame, stream_id)?;
+    let request = decode_scan_request(first_frame)?;
+    drop(first);
+
+    serve_scan(root, request, sender, stream_id).await?;
+    receive_scan_ack(&mut inbox, stream_id).await
 }
 
-/// Stream one local metadata enumeration to a peer without materializing the
-/// tree. Backpressure comes directly from the framed writer and the bounded
-/// local scan channel behind `local_entry_stream`.
-pub async fn serve_scan<W>(
+async fn serve_scan(
     root: &Path,
     request: ScanRequest,
-    writer: &mut W,
+    sender: &RouterSender,
     stream_id: StreamId,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<()> {
     require_data_stream(stream_id)?;
     let mut entries =
         crate::endpoint::local_entry_scan::local_entry_stream(root.to_path_buf(), request);
@@ -130,64 +152,110 @@ where
             stream_id,
             wire.encode()?,
         )?;
-        write_frame(writer, &frame).await?;
+        sender.send(frame).await?;
     }
 
     let end = Frame::new(
         FrameKind::EntryEnd,
-        FrameFlags::empty(),
+        FrameFlags::ACK_REQUIRED,
         stream_id,
         bytes::Bytes::new(),
     )?;
-    write_frame(writer, &end).await?;
-    writer.flush().await?;
+    sender.send(end).await?;
     Ok(())
 }
 
-/// Convert a single framed metadata stream into the engine's ordered entry
-/// stream. This owns the reader and intentionally supports one active stream;
-/// a future central frame router must exist before MULTIPLEXING is advertised.
-pub fn remote_entry_stream<R>(
-    reader: R,
-    stream_id: StreamId,
+async fn receive_scan_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
+    let routed = inbox
+        .recv()
+        .await?
+        .ok_or(RemoteScanError::UnexpectedStreamEnd {
+            stream_id: stream_id.get(),
+            expected: FrameKind::Ack,
+        })?;
+    let frame = routed.frame();
+    require_stream(frame, stream_id)?;
+    require_empty_flags(frame)?;
+    if frame.kind() != FrameKind::Ack {
+        return Err(RemoteScanError::UnexpectedFrame {
+            expected: FrameKind::Ack,
+            actual: frame.kind(),
+        });
+    }
+    if !frame.payload().is_empty() {
+        return Err(RemoteScanError::NonEmptyAck);
+    }
+    Ok(())
+}
+
+fn decode_scan_request(frame: &Frame) -> Result<ScanRequest> {
+    require_data_stream(frame.stream_id())?;
+    require_empty_flags(frame)?;
+    if frame.kind() != FrameKind::ScanRequest {
+        return Err(RemoteScanError::UnexpectedFrame {
+            expected: FrameKind::ScanRequest,
+            actual: frame.kind(),
+        });
+    }
+    wire_to_scan_request(WireScanRequest::decode(frame.payload())?)
+}
+
+/// Convert one routed metadata inbox into the engine's ordered entry stream.
+///
+/// Frames release their router permits immediately after conversion. `EntryEnd`
+/// is acknowledged only after every earlier entry has been yielded to the
+/// consumer, making the ACK a meaningful ordered-stream completion boundary.
+fn remote_entry_stream(
+    inbox: StreamInbox,
+    sender: RouterSender,
     peer: PlatformOs,
-) -> Result<EntryStream>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
+) -> Result<EntryStream> {
+    let stream_id = inbox.stream_id();
     require_data_stream(stream_id)?;
     ensure_compatible_path_encoding(peer)?;
 
-    let stream = futures::stream::try_unfold(reader, move |mut reader| async move {
-        let frame = read_frame(&mut reader)
-            .await
-            .map_err(RemoteScanError::from)?;
-        if frame.stream_id() != stream_id {
-            return Err(RemoteScanError::StreamMismatch {
-                expected: stream_id.get(),
-                actual: frame.stream_id().get(),
-            });
-        }
-        require_empty_flags(&frame)?;
+    let stream = futures::stream::try_unfold(
+        (inbox, sender),
+        move |(mut inbox, sender)| async move {
+            let routed =
+                inbox
+                    .recv()
+                    .await?
+                    .ok_or(RemoteScanError::UnexpectedStreamEnd {
+                        stream_id: stream_id.get(),
+                        expected: FrameKind::EntryEnd,
+                    })?;
+            let frame = routed.frame();
+            require_stream(frame, stream_id)?;
 
-        match frame.kind() {
-            FrameKind::Entry => {
-                let wire = WireEntry::decode(frame.payload())?;
-                let entry = wire_to_entry(wire, peer)?;
-                Ok(Some((entry, reader)))
-            }
-            FrameKind::EntryEnd => {
-                if !frame.payload().is_empty() {
-                    return Err(RemoteScanError::NonEmptyEntryEnd);
+            match frame.kind() {
+                FrameKind::Entry => {
+                    require_empty_flags(frame)?;
+                    let wire = WireEntry::decode(frame.payload())?;
+                    let entry = wire_to_entry(wire, peer)?;
+                    Ok(Some((entry, (inbox, sender))))
                 }
-                Ok(None)
+                FrameKind::EntryEnd => {
+                    require_entry_end_flags(frame)?;
+                    if !frame.payload().is_empty() {
+                        return Err(RemoteScanError::NonEmptyEntryEnd);
+                    }
+                    let ack = Frame::new(
+                        FrameKind::Ack,
+                        FrameFlags::empty(),
+                        stream_id,
+                        bytes::Bytes::new(),
+                    )?;
+                    sender.send(ack).await?;
+                    Ok(None)
+                }
+                actual => Err(RemoteScanError::UnexpectedFrame {
+                    expected: FrameKind::Entry,
+                    actual,
+                }),
             }
-            actual => Err(RemoteScanError::UnexpectedFrame {
-                expected: FrameKind::Entry,
-                actual,
-            }),
-        }
-    })
+        },
+    )
     .map(|result| result.map_err(|error| Box::new(error) as BoxError));
 
     Ok(Box::pin(stream))
@@ -282,12 +350,33 @@ fn require_data_stream(stream_id: StreamId) -> Result<()> {
     }
 }
 
+fn require_stream(frame: &Frame, stream_id: StreamId) -> Result<()> {
+    if frame.stream_id() == stream_id {
+        Ok(())
+    } else {
+        Err(RemoteScanError::StreamMismatch {
+            expected: stream_id.get(),
+            actual: frame.stream_id().get(),
+        })
+    }
+}
+
 fn require_empty_flags(frame: &Frame) -> Result<()> {
     if frame.flags().is_empty() {
         Ok(())
     } else {
         Err(RemoteScanError::FrameFlags {
             kind: frame.kind(),
+            flags: frame.flags().bits(),
+        })
+    }
+}
+
+fn require_entry_end_flags(frame: &Frame) -> Result<()> {
+    if frame.flags() == FrameFlags::ACK_REQUIRED {
+        Ok(())
+    } else {
+        Err(RemoteScanError::EntryEndFlags {
             flags: frame.flags().bits(),
         })
     }
@@ -480,6 +569,7 @@ mod tests {
     use super::*;
     use crate::protocol::Operation;
     use crate::remote::{client_handshake, server_handshake};
+    use crate::remote_router::{FrameRouter, RouterConfig, RouterRole};
 
     #[test]
     fn scan_request_round_trip_matches_engine_request() {
@@ -511,23 +601,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_and_scan_stream_ordered_entries() {
+    async fn handshake_and_routed_scan_stream_ordered_entries() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(root.path().join("dir")).unwrap();
         std::fs::write(root.path().join("a"), b"a").unwrap();
         std::fs::write(root.path().join("dir").join("b"), b"b").unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, mut client_writer) = tokio::io::split(client_io);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
-        let mut client_reader = tokio::io::BufReader::new(client_reader);
 
         let server = tokio::spawn(async move {
             let opened = server_handshake(&mut server_reader, &mut server_writer)
                 .await
                 .unwrap();
-            let (stream_id, request) = read_scan_request(&mut server_reader).await.unwrap();
-            serve_scan(&opened.root, request, &mut server_writer, stream_id)
+            let mut router = FrameRouter::start(
+                server_reader,
+                server_writer,
+                RouterRole::Server,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let incoming = router.incoming().recv().await.unwrap().unwrap();
+            let sender = router.sender();
+            serve_incoming_scan(&opened.root, incoming, &sender)
                 .await
                 .unwrap();
         });
@@ -540,8 +637,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let router = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let sender = router.sender();
 
-        let stream_id = StreamId::new(1);
         let request = ScanRequest {
             respect_gitignore: false,
             include_git_dir: false,
@@ -553,12 +657,9 @@ mod tests {
                 hardlink_group: false,
             },
         };
-        send_scan_request(&mut client_writer, stream_id, request)
+        let mut entries = request_scan(&sender, request, session.server.platform.os)
             .await
             .unwrap();
-
-        let mut entries =
-            remote_entry_stream(client_reader, stream_id, session.server.platform.os).unwrap();
         let mut paths = Vec::new();
         while let Some(entry) = entries.next().await {
             paths.push(entry.unwrap().path.as_path().to_path_buf());
