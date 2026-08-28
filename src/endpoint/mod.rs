@@ -6,11 +6,12 @@ pub mod local;
 pub mod s3;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+pub mod transfer;
 
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub use io::{BoxReader, StagedWriter};
@@ -18,16 +19,21 @@ pub use io::{BoxReader, StagedWriter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
     Local,
+    // These become live as their v0.5 endpoint implementations replace the
+    // current special-case transport paths.
+    #[allow(dead_code)]
     Ssh,
+    #[allow(dead_code)]
     S3,
+    #[allow(dead_code)]
     Gcs,
 }
 
 /// Operations an endpoint can perform efficiently and safely.
 ///
-/// Transfer strategy selection should be based on these capabilities rather
-/// than endpoint type checks. Endpoint type remains useful for diagnostics and
-/// protocol selection, but it should not encode transfer policy.
+/// Transfer strategy selection is based on these capabilities rather than on
+/// endpoint-type branches. Endpoint type remains useful for diagnostics and
+/// protocol negotiation.
 #[derive(Debug, Clone)]
 pub struct Capabilities {
     /// A staged object can atomically replace the destination path.
@@ -79,8 +85,7 @@ impl Capabilities {
             staged_write: true,
             random_read: true,
             random_write: true,
-            // Reflink support is filesystem-specific and must still be probed
-            // before selecting a reflink transfer strategy.
+            // Filesystem-specific support is probed before strategy selection.
             reflink: true,
             sparse: true,
             server_side_copy: false,
@@ -92,6 +97,10 @@ impl Capabilities {
     }
 }
 
+/// Metadata required to stage a regular-file transfer.
+///
+/// Ownership and link topology live at the reconciliation/preservation layer;
+/// they are intentionally not part of the byte-transfer contract.
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     pub size: u64,
@@ -100,12 +109,6 @@ pub struct FileMetadata {
     pub is_symlink: bool,
     #[cfg(unix)]
     pub mode: u32,
-    #[cfg(unix)]
-    pub uid: u32,
-    #[cfg(unix)]
-    pub gid: u32,
-    #[cfg(unix)]
-    pub nlink: u64,
 }
 
 #[async_trait]
@@ -114,15 +117,17 @@ pub trait Endpoint: Send + Sync {
     fn capabilities(&self) -> &Capabilities;
     fn root(&self) -> &Path;
 
+    /// Return a directly addressable native filesystem path when the endpoint
+    /// can safely expose one. Transfer policy must still consult capabilities.
+    fn native_path(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
+
     async fn scan(&self, opts: ScanOptions) -> Result<Vec<FileEntry>>;
     async fn exists(&self, path: &Path) -> Result<bool>;
     async fn metadata(&self, path: &Path) -> Result<FileMetadata>;
 
     /// Open a file for incremental reads.
-    ///
-    /// This is the v0.5 transfer contract. Implementations should avoid
-    /// materializing the file in memory. The default exists only to allow the
-    /// architecture migration to land endpoint-by-endpoint.
     async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
         Err(SyncError::Config(format!(
             "{:?} endpoint does not implement streaming reads for {}",
@@ -143,10 +148,9 @@ pub trait Endpoint: Send + Sync {
         )))
     }
 
-    // Legacy whole-file methods retained during the v0.5 migration. New
-    // transfer code should use open_reader/begin_write instead. They can be
-    // removed once all endpoint implementations and auxiliary features have
-    // moved to the streaming contract.
+    // Legacy whole-file methods retained only while auxiliary v0.4 code is
+    // migrated. New transfer code must use open_reader/begin_write or the
+    // capability-driven transfer layer.
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
     async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()>;
 
@@ -154,13 +158,4 @@ pub trait Endpoint: Send + Sync {
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()>;
-    async fn set_mtime(&self, path: &Path, mtime: SystemTime) -> Result<()>;
-    async fn set_permissions(&self, path: &Path, mode: u32) -> Result<()>;
-
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<u64> {
-        let data = self.read_file(source).await?;
-        let meta = self.metadata(source).await?;
-        self.write_file(dest, &data, &meta).await?;
-        Ok(data.len() as u64)
-    }
 }
