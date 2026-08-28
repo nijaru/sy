@@ -209,18 +209,14 @@ impl Endpoint for LocalEndpoint {
 
             if let Err(error) = scan {
                 let _ = error_sender
-                    .send(Err(SyncError::Io(std::io::Error::other(
-                        error.to_string(),
-                    ))))
+                    .send(Err(SyncError::Io(std::io::Error::other(error.to_string()))))
                     .await;
             }
         });
 
         Ok(Box::pin(futures::stream::unfold(
             receiver,
-            |mut receiver| async move {
-                receiver.recv().await.map(|entry| (entry, receiver))
-            },
+            |mut receiver| async move { receiver.recv().await.map(|entry| (entry, receiver)) },
         )))
     }
 
@@ -427,7 +423,10 @@ mod tests {
             .create_symlink(Path::new("second"), Path::new("link"))
             .await
             .unwrap();
-        assert_eq!(fs::read_link(dir.path().join("link")).unwrap(), Path::new("second"));
+        assert_eq!(
+            fs::read_link(dir.path().join("link")).unwrap(),
+            Path::new("second")
+        );
     }
 
     #[tokio::test]
@@ -454,7 +453,13 @@ mod tests {
         std::os::unix::fs::symlink("missing", dir.path().join("link")).unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
         assert!(endpoint.exists(Path::new("link")).await.unwrap());
-        assert!(endpoint.metadata(Path::new("link")).await.unwrap().is_symlink);
+        assert!(
+            endpoint
+                .metadata(Path::new("link"))
+                .await
+                .unwrap()
+                .is_symlink
+        );
     }
 
     #[test]
