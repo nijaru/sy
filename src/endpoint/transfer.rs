@@ -92,12 +92,8 @@ pub async fn transfer_file(
             && crate::fs_util::supports_cow_reflinks(&dest_native)
             && !crate::fs_util::has_hard_links(&dest_native)
         {
-            if let Some(bytes_written) = reflink_patch(
-                source_native.clone(),
-                dest_native.clone(),
-                metadata.clone(),
-            )
-            .await?
+            if let Some(bytes_written) =
+                reflink_patch(source_native.clone(), dest_native.clone(), metadata.clone()).await?
             {
                 return Ok(TransferResult {
                     bytes_written,
@@ -131,11 +127,7 @@ pub async fn transfer_file(
     )))
 }
 
-async fn native_whole_copy(
-    source: PathBuf,
-    dest: PathBuf,
-    metadata: FileMetadata,
-) -> Result<u64> {
+async fn native_whole_copy(source: PathBuf, dest: PathBuf, metadata: FileMetadata) -> Result<u64> {
     tokio::task::spawn_blocking(move || {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -347,7 +339,8 @@ async fn native_sparse_copy(
             staged.seek(SeekFrom::Start(region.offset))?;
             let mut remaining = region.length;
             while remaining > 0 {
-                let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                let chunk =
+                    usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
                 let read = source_file.read(&mut buffer[..chunk])?;
                 if read == 0 {
                     break;
