@@ -46,12 +46,6 @@ fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
         is_symlink: meta.is_symlink(),
         #[cfg(unix)]
         mode: meta.mode(),
-        #[cfg(unix)]
-        uid: meta.uid(),
-        #[cfg(unix)]
-        gid: meta.gid(),
-        #[cfg(unix)]
-        nlink: meta.nlink(),
     }
 }
 
@@ -170,6 +164,10 @@ impl Endpoint for LocalEndpoint {
         &self.root
     }
 
+    fn native_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(self.resolve(path))
+    }
+
     async fn scan(&self, opts: ScanOptions) -> Result<Vec<FileEntry>> {
         let path = self.root.clone();
         tokio::task::spawn_blocking(move || Scanner::new(&path).with_options(opts).scan())
@@ -178,7 +176,9 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
-        Ok(tokio::fs::try_exists(self.resolve(path)).await.unwrap_or(false))
+        Ok(tokio::fs::try_exists(self.resolve(path))
+            .await
+            .unwrap_or(false))
     }
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
@@ -217,11 +217,6 @@ impl Endpoint for LocalEndpoint {
         writer.write(data).await?;
         writer.set_metadata(meta).await?;
         writer.commit().await
-    }
-
-    async fn copy_file(&self, source: &Path, dest: &Path) -> Result<u64> {
-        let result = crate::endpoint::io::copy_file_streaming(self, source, self, dest).await?;
-        Ok(result.bytes_written)
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
@@ -273,31 +268,6 @@ impl Endpoint for LocalEndpoint {
         tokio::fs::hard_link(full_source, full_dest).await?;
         Ok(())
     }
-
-    async fn set_mtime(&self, path: &Path, mtime: SystemTime) -> Result<()> {
-        filetime::set_file_mtime(
-            self.resolve(path),
-            filetime::FileTime::from_system_time(mtime),
-        )?;
-        Ok(())
-    }
-
-    async fn set_permissions(&self, path: &Path, mode: u32) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(
-                self.resolve(path),
-                std::fs::Permissions::from_mode(mode),
-            )
-            .await?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, mode);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -313,12 +283,6 @@ mod tests {
             is_symlink: false,
             #[cfg(unix)]
             mode: 0o644,
-            #[cfg(unix)]
-            uid: 0,
-            #[cfg(unix)]
-            gid: 0,
-            #[cfg(unix)]
-            nlink: 1,
         }
     }
 
@@ -358,18 +322,12 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
     }
 
-    #[tokio::test]
-    async fn endpoint_copy_is_streaming_and_staged() {
-        let dir = TempDir::new().unwrap();
-        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-        let data = vec![7_u8; 2 * 1024 * 1024 + 3];
-        fs::write(dir.path().join("source"), &data).unwrap();
-
-        let bytes = endpoint
-            .copy_file(Path::new("source"), Path::new("dest"))
-            .await
-            .unwrap();
-        assert_eq!(bytes, data.len() as u64);
-        assert_eq!(fs::read(dir.path().join("dest")).unwrap(), data);
+    #[test]
+    fn exposes_native_path() {
+        let endpoint = LocalEndpoint::new(PathBuf::from("/tmp/root"));
+        assert_eq!(
+            endpoint.native_path(Path::new("file")),
+            Some(PathBuf::from("/tmp/root/file"))
+        );
     }
 }
