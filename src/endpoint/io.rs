@@ -2,13 +2,14 @@ use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::Result;
 use async_trait::async_trait;
 use std::path::Path;
+use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// A streaming reader returned by an endpoint.
 ///
 /// The transfer layer must consume this incrementally. Endpoint boundaries
 /// should never require materializing an entire file in memory.
-pub type BoxReader = Box<dyn AsyncRead + Send + Unpin>;
+pub type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// Transactional destination write.
 ///
@@ -64,7 +65,7 @@ pub async fn copy_file_streaming(
     let mut bytes_written = 0_u64;
 
     loop {
-        let read = match reader.read(&mut buffer).await {
+        let read = match reader.as_mut().read(&mut buffer).await {
             Ok(read) => read,
             Err(error) => {
                 let _ = writer.abort().await;
@@ -109,7 +110,7 @@ pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result
     let mut hasher = blake3::Hasher::new();
 
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = reader.as_mut().read(&mut buffer).await?;
         if read == 0 {
             break;
         }
