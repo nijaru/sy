@@ -121,9 +121,11 @@ impl BisyncStateStore {
         };
         let current = self.current_pointer()?;
 
-        if current.is_some_and(|pointer| pointer.generation == marker.target_generation) {
-            self.verify_pointer(current.expect("checked as some"))?;
-            return Ok(RecoveryState::Committed(marker));
+        if let Some(pointer) = current {
+            if pointer.generation == marker.target_generation {
+                self.verify_pointer(pointer)?;
+                return Ok(RecoveryState::Committed(marker));
+            }
         }
 
         if current.map(|pointer| pointer.generation) == marker.base_generation {
@@ -198,7 +200,8 @@ impl BisyncStateStore {
         let durable_marker = self
             .recovery_marker()?
             .ok_or(BisyncStoreError::RecoveryRequired)?;
-        if durable_marker != marker || durable_marker.target_generation != marker.target_generation {
+        if durable_marker != marker || durable_marker.target_generation != marker.target_generation
+        {
             return Err(BisyncStoreError::TargetGenerationMismatch);
         }
 
@@ -336,11 +339,12 @@ impl TrustedGenerationReader {
     pub fn next_record(&mut self) -> Result<Option<BaselineRecord>> {
         let record = self.reader.next_record()?;
         if record.is_none() && !self.verified {
-            let summary = self.reader.verified_summary().ok_or(
-                BisyncStoreError::PointerDigestMismatch {
-                    generation: self.pointer.generation.get(),
-                },
-            )?;
+            let summary =
+                self.reader
+                    .verified_summary()
+                    .ok_or(BisyncStoreError::PointerDigestMismatch {
+                        generation: self.pointer.generation.get(),
+                    })?;
             if summary.generation != self.pointer.generation
                 || summary.digest != self.pointer.generation_digest
             {
@@ -454,11 +458,7 @@ mod tests {
         ));
 
         let summary = store
-            .commit_generation(
-                marker,
-                POLICY,
-                [record(b"a", 1), record(b"nested/b", 2)],
-            )
+            .commit_generation(marker, POLICY, [record(b"a", 1), record(b"nested/b", 2)])
             .unwrap();
         assert_eq!(summary.generation, GenerationId::FIRST);
         assert_eq!(store.recovery_state().unwrap(), RecoveryState::Clean);
@@ -467,10 +467,7 @@ mod tests {
         assert_eq!(reader.header().policy, POLICY);
         assert!(!reader.is_verified());
         assert_eq!(reader.next_record().unwrap(), Some(record(b"a", 1)));
-        assert_eq!(
-            reader.next_record().unwrap(),
-            Some(record(b"nested/b", 2))
-        );
+        assert_eq!(reader.next_record().unwrap(), Some(record(b"nested/b", 2)));
         assert_eq!(reader.next_record().unwrap(), None);
         assert!(reader.is_verified());
     }
