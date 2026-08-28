@@ -4,7 +4,7 @@
 /// has changed. If the change ratio is above a threshold (e.g., >75%),
 /// delta sync would be inefficient and we should fallback to full copy.
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Result of change ratio sampling
@@ -85,13 +85,14 @@ pub fn estimate_change_ratio(
     let sample_count = sample_count.unwrap_or(20);
     let threshold = threshold.unwrap_or(0.75);
 
-    // Open files
-    let mut source_file = BufReader::with_capacity(256 * 1024, File::open(source)?);
-    let mut dest_file = BufReader::with_capacity(256 * 1024, File::open(dest)?);
+    // Explicit sample buffers already provide the desired bounded I/O. Extra
+    // BufReaders here only duplicate memory without improving random seeks.
+    let mut source_file = File::open(source)?;
+    let mut dest_file = File::open(dest)?;
 
     // Get file sizes
-    let source_size = source_file.get_ref().metadata()?.len();
-    let dest_size = dest_file.get_ref().metadata()?.len();
+    let source_size = source_file.metadata()?.len();
+    let dest_size = dest_file.metadata()?.len();
 
     // Calculate total blocks
     let total_blocks = (dest_size as usize).div_ceil(block_size);
