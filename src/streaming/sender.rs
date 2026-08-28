@@ -42,11 +42,7 @@ impl Sender {
     ///
     /// Awaiting `send` is intentional: network backpressure propagates through
     /// the sender to the generator instead of accumulating file data in memory.
-    pub async fn run(
-        self,
-        mut rx: FileJobReceiver,
-        wire_tx: mpsc::Sender<Bytes>,
-    ) -> Result<()> {
+    pub async fn run(self, mut rx: FileJobReceiver, wire_tx: mpsc::Sender<Bytes>) -> Result<()> {
         while let Some(msg) = rx.recv().await {
             match msg {
                 GeneratorMessage::File(job) => self.process_file(job, &wire_tx).await?,
@@ -217,7 +213,9 @@ impl Sender {
             .enumerate()
             .map(|(index, checksum)| {
                 let actual_size = if index + 1 == checksum_count {
-                    file_size.saturating_sub(checksum.offset).min(block_size as u64) as usize
+                    file_size
+                        .saturating_sub(checksum.offset)
+                        .min(block_size as u64) as usize
                 } else {
                     block_size
                 };
