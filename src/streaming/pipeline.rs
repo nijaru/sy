@@ -285,9 +285,7 @@ impl StreamingSync {
             tokio::fs::create_dir_all(&self.local_root).await?;
         }
 
-        // Destination scan emission is migrated to bounded backpressure in the
-        // next slice; sender data output is already bounded in push mode.
-        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(SENDER_CHANNEL_SIZE);
         let receiver_root = self.local_root.clone();
         let verify = self.verify;
         let scan_handle = tokio::spawn(async move {
@@ -296,13 +294,7 @@ impl StreamingSync {
                 block_size: 4096,
                 verify,
             });
-            receiver
-                .scan_dest(|bytes| {
-                    data_tx
-                        .send(bytes)
-                        .map_err(|_| anyhow::anyhow!("Data channel closed"))
-                })
-                .await
+            receiver.scan_dest(&data_tx).await
         });
 
         while let Some(bytes) = data_rx.recv().await {
