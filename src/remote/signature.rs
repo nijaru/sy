@@ -202,9 +202,8 @@ pub async fn serve_incoming_signatures(
 
     let path = root.join(relative.as_path());
     let (producer_tx, mut producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
-    let producer = tokio::task::spawn_blocking(move || {
-        produce_signatures(path, block_size, producer_tx)
-    });
+    let producer =
+        tokio::task::spawn_blocking(move || produce_signatures(path, block_size, producer_tx));
 
     while let Some(signature) = producer_rx.recv().await {
         let frame = Frame::new(
@@ -361,12 +360,15 @@ fn remote_signature_stream(
             return Ok(None);
         }
 
-        let routed = state.inbox.recv().await?.ok_or(
-            RemoteSignatureError::UnexpectedStreamEnd {
-                stream_id: state.stream_id.get(),
-                expected: FrameKind::SignatureEnd,
-            },
-        )?;
+        let routed =
+            state
+                .inbox
+                .recv()
+                .await?
+                .ok_or(RemoteSignatureError::UnexpectedStreamEnd {
+                    stream_id: state.stream_id.get(),
+                    expected: FrameKind::SignatureEnd,
+                })?;
         let frame = routed.frame();
         require_stream(frame, state.stream_id)?;
 
@@ -494,14 +496,19 @@ mod tests {
         assert_eq!(choose_signature_block_size(16 * 1024 * 1024), 4 * 1024);
         assert_eq!(choose_signature_block_size(16 * 1024 * 1024 + 1), 8 * 1024);
         assert_eq!(choose_signature_block_size(100 * 1024 * 1024), 32 * 1024);
-        assert_eq!(choose_signature_block_size(4 * 1024 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(
+            choose_signature_block_size(4 * 1024 * 1024 * 1024),
+            1024 * 1024
+        );
         assert_eq!(choose_signature_block_size(u64::MAX), 1024 * 1024);
     }
 
     #[tokio::test]
     async fn handshake_and_routed_signatures_stream_without_materializing() {
         let root = tempfile::TempDir::new().unwrap();
-        let data = (0..10_000).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let data = (0..10_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
         std::fs::write(root.path().join("data.bin"), &data).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -521,14 +528,9 @@ mod tests {
             .unwrap();
             let incoming = router.incoming().recv().await.unwrap().unwrap();
             let sender = router.sender();
-            serve_incoming_signatures(
-                &opened.root,
-                incoming,
-                &sender,
-                opened.client.platform.os,
-            )
-            .await
-            .unwrap();
+            serve_incoming_signatures(&opened.root, incoming, &sender, opened.client.platform.os)
+                .await
+                .unwrap();
         });
 
         let session = client_handshake(
@@ -569,8 +571,17 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks.iter().map(|block| block.size).collect::<Vec<_>>(), vec![4096, 4096, 1808]);
-        assert_eq!(summary, Some(SignatureSummary { file_size: 10_000, block_count: 3 }));
+        assert_eq!(
+            blocks.iter().map(|block| block.size).collect::<Vec<_>>(),
+            vec![4096, 4096, 1808]
+        );
+        assert_eq!(
+            summary,
+            Some(SignatureSummary {
+                file_size: 10_000,
+                block_count: 3
+            })
+        );
         assert_eq!(blocks[0].weak, crate::delta::Adler32::hash(&data[..4096]));
         let digest = blake3::hash(&data[..4096]);
         assert_eq!(blocks[0].strong, digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
