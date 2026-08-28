@@ -170,20 +170,17 @@ impl SyncSession {
                         .push(source.join(entry.path.as_path()));
                 }
                 ReconcileItem::DestinationOnly(entry) => {
-                    result.files_only_in_dest.push(dest.join(entry.path.as_path()));
+                    result
+                        .files_only_in_dest
+                        .push(dest.join(entry.path.as_path()));
                 }
                 ReconcileItem::Matched {
                     source: source_entry,
                     destination: dest_entry,
                 } => {
                     let relative = source_entry.path.as_path();
-                    match entries_match(
-                        source_endpoint,
-                        dest_endpoint,
-                        &source_entry,
-                        &dest_entry,
-                    )
-                    .await
+                    match entries_match(source_endpoint, dest_endpoint, &source_entry, &dest_entry)
+                        .await
                     {
                         Ok(true) => result.files_matched += 1,
                         Ok(false) => result.files_mismatched.push(source.join(relative)),
