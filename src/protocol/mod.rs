@@ -1,9 +1,11 @@
 mod codec;
+mod entry;
 mod frame;
 mod handshake;
 mod path;
 mod session;
 
+pub use entry::{WireEntry, WireEntryKind};
 pub use frame::{
     read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD,
 };
