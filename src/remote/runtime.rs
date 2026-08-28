@@ -172,13 +172,10 @@ mod tests {
         let (server_reader, server_writer) = tokio::io::split(server_io);
 
         let server = tokio::spawn(async move {
-            let mut session = ServerRemoteSession::accept(
-                server_reader,
-                server_writer,
-                RouterConfig::default(),
-            )
-            .await
-            .unwrap();
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
             let handler = session.scan_handler();
             let mut tasks = JoinSet::new();
             for _ in 0..2 {
