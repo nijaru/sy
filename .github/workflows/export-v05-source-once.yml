@@ -1,0 +1,22 @@
+name: Export v0.5 Source Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sy-v05-source
+          path: .
+          include-hidden-files: true
+          retention-days: 1
