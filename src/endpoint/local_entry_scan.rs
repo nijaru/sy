@@ -1,8 +1,8 @@
-use crate::engine::domain::{
+use sy::engine::domain::{
     Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, Timestamp,
 };
-use crate::engine::reconcile::{BoxError, EntryStream};
-use crate::engine::scan::ScanRequest;
+use sy::engine::reconcile::{BoxError, EntryStream};
+use sy::engine::scan::ScanRequest;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
@@ -374,7 +374,7 @@ mod tests {
         std::fs::write(dir.path().join("first"), b"content").unwrap();
         std::fs::hard_link(dir.path().join("first"), dir.path().join("second")).unwrap();
         let request = ScanRequest {
-            metadata: crate::engine::scan::EntryMetadataRequest {
+            metadata: sy::engine::scan::EntryMetadataRequest {
                 hardlink_group: true,
                 ..Default::default()
             },
@@ -393,7 +393,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::os::unix::fs::symlink("missing", dir.path().join("link")).unwrap();
         let request = ScanRequest {
-            metadata: crate::engine::scan::EntryMetadataRequest {
+            metadata: sy::engine::scan::EntryMetadataRequest {
                 unix_mode: true,
                 symlink_target: false,
                 ..Default::default()
