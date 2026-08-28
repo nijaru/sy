@@ -1,4 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 enum Candidate {
@@ -105,6 +106,12 @@ fn compression_candidates() -> [Candidate; 6] {
     ]
 }
 
+fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(150));
+    group.measurement_time(Duration::from_millis(500));
+}
+
 fn bench_v3_chunk_compression(c: &mut Criterion) {
     // Protocol v3 compresses bounded literal/data payloads, not whole files.
     // Measure representative frame/chunk sizes rather than a single 10 MiB
@@ -113,7 +120,7 @@ fn bench_v3_chunk_compression(c: &mut Criterion) {
         for corpus in Corpus::ALL {
             let data = corpus.generate(size);
             let mut group = c.benchmark_group(format!("compress/{}/{}", corpus.name(), size));
-            group.sample_size(20);
+            configure_group(&mut group);
             group.throughput(Throughput::Bytes(size as u64));
 
             for candidate in compression_candidates() {
@@ -134,7 +141,7 @@ fn bench_v3_chunk_decompression(c: &mut Criterion) {
     for corpus in [Corpus::SourceText, Corpus::Mixed, Corpus::HighEntropy] {
         let data = corpus.generate(size);
         let mut group = c.benchmark_group(format!("decompress/{}", corpus.name()));
-        group.sample_size(20);
+        configure_group(&mut group);
         group.throughput(Throughput::Bytes(size as u64));
 
         for level in [-5, -3, -1, 1, 3] {
