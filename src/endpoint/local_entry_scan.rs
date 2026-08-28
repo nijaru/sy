@@ -1,10 +1,10 @@
+use ignore::WalkBuilder;
+use std::path::{Path, PathBuf};
 use sy::engine::domain::{
     Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, Timestamp,
 };
 use sy::engine::reconcile::{BoxError, EntryStream};
 use sy::engine::scan::ScanRequest;
-use ignore::WalkBuilder;
-use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
