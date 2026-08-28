@@ -304,6 +304,9 @@ fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
         .create_new(true)
         .open(dest)?;
 
+    // SAFETY: both file descriptors are valid for the duration of the ioctl;
+    // `source_file` is open for reading and `dest_file` is a distinct, newly
+    // created writable file as required by FICLONE.
     let rc = unsafe { libc::ioctl(dest_file.as_raw_fd(), FICLONE, source_file.as_raw_fd()) };
     if rc == 0 {
         Ok(())
@@ -333,6 +336,9 @@ fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
     let dest = CString::new(dest.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
 
+    // SAFETY: both pointers come from live `CString` values and are therefore
+    // NUL-terminated and valid for this call. The destination path is a fresh
+    // staging path and flags=0 matches the documented clonefile contract.
     let rc = unsafe { clonefile(source.as_ptr(), dest.as_ptr(), 0) };
     if rc == 0 {
         Ok(())
