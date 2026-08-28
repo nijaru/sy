@@ -5,5 +5,6 @@ pub mod compression;
 pub mod domain;
 pub mod planner;
 pub mod reconcile;
+pub mod rolling;
 pub mod scan;
 pub mod scheduler;

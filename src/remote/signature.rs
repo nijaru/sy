@@ -294,7 +294,7 @@ fn produce_signatures(
         }
 
         let block = &buffer[..read];
-        let weak = crate::delta::Adler32::hash(block);
+        let weak = crate::engine::rolling::WeakChecksum::hash(block);
         let digest = blake3::hash(block);
         let mut strong = [0_u8; STRONG_SIGNATURE_LEN];
         strong.copy_from_slice(&digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
@@ -648,7 +648,10 @@ mod tests {
                 basis_identity: expected_identity,
             })
         );
-        assert_eq!(blocks[0].weak, crate::delta::Adler32::hash(&data[..4096]));
+        assert_eq!(
+            blocks[0].weak,
+            crate::engine::rolling::WeakChecksum::hash(&data[..4096])
+        );
         let digest = blake3::hash(&data[..4096]);
         assert_eq!(blocks[0].strong, digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
         assert_eq!(Platform::current().os, session.server.platform.os);
