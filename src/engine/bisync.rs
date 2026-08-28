@@ -158,7 +158,7 @@ pub fn reconcile_path(
             }
         }
         (ChangeState::NeedValue, _) | (_, ChangeState::NeedValue) => {
-            unreachable!("NeedValue is returned before final classification")
+            BisyncDecision::NeedValues(need)
         }
     }
 }
@@ -338,11 +338,7 @@ mod tests {
     #[test]
     fn equal_create_create_converges_after_values_are_known() {
         assert_eq!(
-            reconcile_path(
-                BaselineValue::Absent,
-                candidate(LEFT),
-                candidate(LEFT),
-            ),
+            reconcile_path(BaselineValue::Absent, candidate(LEFT), candidate(LEFT),),
             BisyncDecision::Converged
         );
     }
@@ -350,11 +346,7 @@ mod tests {
     #[test]
     fn different_create_create_conflicts() {
         assert_eq!(
-            reconcile_path(
-                BaselineValue::Absent,
-                candidate(LEFT),
-                candidate(RIGHT),
-            ),
+            reconcile_path(BaselineValue::Absent, candidate(LEFT), candidate(RIGHT),),
             BisyncDecision::Conflict(ConflictKind::CreateCreate)
         );
     }
