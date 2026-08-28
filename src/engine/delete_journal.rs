@@ -43,14 +43,6 @@ impl DeleteJournal {
         })
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.records
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.records == 0
-    }
-
     pub(crate) async fn append(&mut self, path: &Path, kind: DeleteKind) -> Result<()> {
         let path = encode_path(path.as_os_str());
         let payload_len = RECORD_HEADER_LEN
@@ -101,10 +93,6 @@ pub(crate) struct DeleteJournalReader {
 }
 
 impl DeleteJournalReader {
-    pub(crate) fn remaining(&self) -> usize {
-        self.remaining
-    }
-
     pub(crate) async fn next(&mut self) -> Result<Option<DeleteRecord>> {
         if self.cursor == 0 {
             if self.remaining != 0 {
@@ -242,7 +230,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .append(Path::new("parent/keep"), DeleteKind::ProtectDirectory)
+            .append(Path::new("parent"), DeleteKind::ProtectDirectory)
             .await
             .unwrap();
         journal
@@ -250,11 +238,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(journal.len(), 3);
-        assert!(!journal.is_empty());
+        assert_eq!(journal.records, 3);
 
         let mut reader = journal.seal().await.unwrap();
-        assert_eq!(reader.remaining(), 3);
+        assert_eq!(reader.remaining, 3);
         assert_eq!(
             reader.next().await.unwrap(),
             Some(DeleteRecord {
@@ -265,7 +252,7 @@ mod tests {
         assert_eq!(
             reader.next().await.unwrap(),
             Some(DeleteRecord {
-                path: PathBuf::from("parent/keep"),
+                path: PathBuf::from("parent"),
                 kind: DeleteKind::ProtectDirectory,
             })
         );
@@ -277,13 +264,13 @@ mod tests {
             })
         );
         assert_eq!(reader.next().await.unwrap(), None);
-        assert_eq!(reader.remaining(), 0);
+        assert_eq!(reader.remaining, 0);
     }
 
     #[tokio::test]
     async fn empty_journal_replays_nothing() {
         let journal = DeleteJournal::new().await.unwrap();
-        assert!(journal.is_empty());
+        assert_eq!(journal.records, 0);
         let mut reader = journal.seal().await.unwrap();
         assert_eq!(reader.next().await.unwrap(), None);
     }
