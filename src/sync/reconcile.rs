@@ -1,23 +1,25 @@
-//! Incremental local reconciliation for the v0.5 sync architecture.
+//! Ordered reconciliation for the v0.5 local path.
 //!
-//! Source and destination scans are ordered streams. The common no-delete path
-//! performs a merge join and dispatches bounded task batches before either tree
-//! is fully materialized. Delete mode performs a no-side-effect preflight first,
-//! then builds a source Bloom filter during a complete successful source pass;
-//! deletions are never attempted until that pass finishes.
+//! This is the last compatibility location for the reconciler before it moves
+//! wholly under `engine/`. Source and destination scans are merge-joined in
+//! bounded memory. Delete mode performs a complete no-mutation preflight and
+//! records exact destination-only paths in an on-disk reverse journal.
+
+#[path = "../engine/delete_journal.rs"]
+mod delete_journal;
 
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
 use crate::sync::config::{DeleteMode, SyncConfig};
 use crate::sync::executor::{BackupConfig, ExecuteConfig, TaskExecutor};
-use crate::sync::scale::FileSetBloom;
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{SyncAction, SyncTask};
+use delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
 use futures::StreamExt;
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -45,24 +47,20 @@ pub(crate) async fn run_local_sync(
         let _ = crate::sync::dircache::DirectoryCache::delete(dest.root());
     }
 
-    let delete_preflight = match config.delete {
+    let delete_plan = match config.delete {
         DeleteMode::Disabled => None,
         DeleteMode::Enabled { threshold, force } => {
-            let preflight =
+            let plan =
                 preflight_delete(source, dest, config, scan_options, threshold, force).await?;
             tracing::info!(
-                source_entries = preflight.source_entries,
-                eligible_dest_entries = preflight.eligible_dest_entries,
-                delete_candidates = preflight.delete_candidates,
+                source_entries = plan.source_entries,
+                eligible_dest_entries = plan.eligible_dest_entries,
+                delete_candidates = plan.delete_candidates,
                 "delete preflight complete"
             );
-            Some(preflight)
+            Some(plan)
         }
     };
-
-    let mut source_membership = delete_preflight
-        .as_ref()
-        .map(|preflight| FileSetBloom::new(preflight.source_entries.max(1)));
 
     let executor = TaskExecutor::new(
         source,
@@ -101,9 +99,6 @@ pub(crate) async fn run_local_sync(
 
     while let Some(current_source) = source_entry.take() {
         stats.files_scanned += 1;
-        if let Some(ref mut membership) = source_membership {
-            membership.insert(&current_source.relative_path);
-        }
 
         while let Some(current_dest) = dest_entry.as_ref() {
             match current_dest
@@ -145,9 +140,8 @@ pub(crate) async fn run_local_sync(
         source_entry = next_entry(&mut source_stream).await?;
     }
 
-    // Drain the destination stream so scan failures are observed before delete
-    // mode can proceed. No-delete sync does not otherwise need destination-only
-    // entries.
+    // Observe destination scan failures before deletion becomes possible. The
+    // no-delete path does not otherwise need destination-only entries here.
     while dest_entry.is_some() {
         dest_entry = next_entry(&mut dest_stream).await?;
     }
@@ -156,30 +150,17 @@ pub(crate) async fn run_local_sync(
         execute_batch(&executor, &mut batch, &mut stats).await?;
     }
 
-    if let (Some(preflight), Some(membership)) = (delete_preflight, source_membership.as_ref()) {
-        let current = count_deletions(dest, config, scan_options, membership).await?;
-        enforce_delete_threshold(current, preflight.threshold, preflight.force)?;
-
+    if let Some(mut plan) = delete_plan {
         if config.dry_run {
-            stats.files_deleted = current.delete_candidates;
+            stats.files_deleted = plan.delete_candidates;
         } else {
-            execute_deletions(
-                dest,
-                config,
-                scan_options,
-                membership,
-                &executor,
-                batch_size,
-                &mut stats,
-            )
-            .await?;
+            execute_delete_journal(dest, &mut plan.journal, &mut stats).await?;
         }
     }
 
     if config.cache && !config.dry_run {
-        // Keep the CLI/cache-file contract without reviving the unsafe v0.4
-        // root-mtime shortcut. An empty current-version cache is a disposable
-        // marker until v0.5 has content-safe incremental invalidation.
+        // Preserve the user-visible cache-file contract without restoring the
+        // unsafe root-mtime shortcut from 0.4.
         crate::sync::dircache::DirectoryCache::new().save(dest.root())?;
     }
 
@@ -187,13 +168,17 @@ pub(crate) async fn run_local_sync(
     Ok(stats)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DeletePreflight {
+struct DeletePlan {
     source_entries: usize,
     eligible_dest_entries: usize,
     delete_candidates: usize,
-    threshold: u8,
-    force: bool,
+    journal: DeleteJournalReader,
+}
+
+#[derive(Debug)]
+struct CandidateDeleteDir {
+    path: PathBuf,
+    protected: bool,
 }
 
 async fn preflight_delete(
@@ -203,7 +188,7 @@ async fn preflight_delete(
     scan_options: ScanOptions,
     threshold: u8,
     force: bool,
-) -> Result<DeletePreflight> {
+) -> Result<DeletePlan> {
     let mut source_stream = source.scan_ordered(scan_options).await?;
     let mut dest_stream = dest.scan_ordered(scan_options).await?;
     let mut source_entry = next_entry(&mut source_stream).await?;
@@ -212,30 +197,45 @@ async fn preflight_delete(
     let mut eligible_dest_entries = 0_usize;
     let mut delete_candidates = 0_usize;
     let mut protected_dest_dir: Option<PathBuf> = None;
+    let mut candidate_dirs = Vec::<CandidateDeleteDir>::new();
+    let mut journal = DeleteJournal::new().await?;
 
     while source_entry.is_some() || dest_entry.is_some() {
         match (source_entry.as_ref(), dest_entry.as_ref()) {
-            (Some(source), Some(dest)) => match source
+            (Some(source_entry_ref), Some(dest_entry_ref)) => match source_entry_ref
                 .relative_path
                 .as_path()
-                .cmp(dest.relative_path.as_path())
+                .cmp(dest_entry_ref.relative_path.as_path())
             {
                 Ordering::Less => {
                     source_entries += 1;
                     source_entry = next_entry(&mut source_stream).await?;
                 }
                 Ordering::Equal => {
+                    close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
                     source_entries += 1;
-                    if dest_delete_eligible(config, dest, &mut protected_dest_dir) {
+                    if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
                         eligible_dest_entries += 1;
                     }
+                    // Any source-backed entry inside a destination-only candidate
+                    // directory prevents that ancestor from being removed.
+                    protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                     source_entry = next_entry(&mut source_stream).await?;
                     dest_entry = next_entry(&mut dest_stream).await?;
                 }
                 Ordering::Greater => {
-                    if dest_delete_eligible(config, dest, &mut protected_dest_dir) {
+                    close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
+                    if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
                         eligible_dest_entries += 1;
                         delete_candidates += 1;
+                        append_delete_candidate(
+                            &mut journal,
+                            dest_entry_ref,
+                            &mut candidate_dirs,
+                        )
+                        .await?;
+                    } else {
+                        protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                     }
                     dest_entry = next_entry(&mut dest_stream).await?;
                 }
@@ -244,10 +244,15 @@ async fn preflight_delete(
                 source_entries += 1;
                 source_entry = next_entry(&mut source_stream).await?;
             }
-            (None, Some(dest)) => {
-                if dest_delete_eligible(config, dest, &mut protected_dest_dir) {
+            (None, Some(dest_entry_ref)) => {
+                close_candidate_dirs(dest_entry_ref.relative_path.as_path(), &mut candidate_dirs);
+                if dest_delete_eligible(config, dest_entry_ref, &mut protected_dest_dir) {
                     eligible_dest_entries += 1;
                     delete_candidates += 1;
+                    append_delete_candidate(&mut journal, dest_entry_ref, &mut candidate_dirs)
+                        .await?;
+                } else {
+                    protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
                 }
                 dest_entry = next_entry(&mut dest_stream).await?;
             }
@@ -255,23 +260,72 @@ async fn preflight_delete(
         }
     }
 
-    let preflight = DeletePreflight {
+    enforce_delete_threshold(eligible_dest_entries, delete_candidates, threshold, force)?;
+    let journal = journal.seal().await?;
+    Ok(DeletePlan {
         source_entries,
         eligible_dest_entries,
         delete_candidates,
-        threshold,
-        force,
-    };
-    enforce_delete_threshold(preflight, threshold, force)?;
-    Ok(preflight)
+        journal,
+    })
 }
 
-fn enforce_delete_threshold(counts: DeletePreflight, threshold: u8, force: bool) -> Result<()> {
-    if force || counts.eligible_dest_entries == 0 {
+fn close_candidate_dirs(current: &Path, candidate_dirs: &mut Vec<CandidateDeleteDir>) {
+    while candidate_dirs
+        .last()
+        .is_some_and(|candidate| !current.starts_with(&candidate.path))
+    {
+        candidate_dirs.pop();
+    }
+}
+
+async fn append_delete_candidate(
+    journal: &mut DeleteJournal,
+    entry: &FileEntry,
+    candidate_dirs: &mut Vec<CandidateDeleteDir>,
+) -> Result<()> {
+    if entry.is_dir {
+        journal
+            .append(&entry.relative_path, DeleteKind::Directory)
+            .await?;
+        candidate_dirs.push(CandidateDeleteDir {
+            path: (*entry.relative_path).clone(),
+            protected: false,
+        });
+    } else {
+        journal
+            .append(&entry.relative_path, DeleteKind::FileLike)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn protect_candidate_dirs(
+    journal: &mut DeleteJournal,
+    candidate_dirs: &mut [CandidateDeleteDir],
+) -> Result<()> {
+    for candidate in candidate_dirs {
+        if !candidate.protected {
+            journal
+                .append(&candidate.path, DeleteKind::ProtectDirectory)
+                .await?;
+            candidate.protected = true;
+        }
+    }
+    Ok(())
+}
+
+fn enforce_delete_threshold(
+    eligible_dest_entries: usize,
+    delete_candidates: usize,
+    threshold: u8,
+    force: bool,
+) -> Result<()> {
+    if force || eligible_dest_entries == 0 {
         return Ok(());
     }
 
-    let percentage = counts.delete_candidates as f64 / counts.eligible_dest_entries as f64 * 100.0;
+    let percentage = delete_candidates as f64 / eligible_dest_entries as f64 * 100.0;
     if percentage > threshold as f64 {
         return Err(SyncError::DeletionThresholdExceeded {
             percentage,
@@ -281,116 +335,47 @@ fn enforce_delete_threshold(counts: DeletePreflight, threshold: u8, force: bool)
     Ok(())
 }
 
-async fn count_deletions(
+async fn execute_delete_journal(
     dest: &dyn Endpoint,
-    config: &SyncConfig,
-    scan_options: ScanOptions,
-    membership: &FileSetBloom,
-) -> Result<DeletePreflight> {
-    let mut stream = dest.scan_ordered(scan_options).await?;
-    let mut eligible_dest_entries = 0_usize;
-    let mut delete_candidates = 0_usize;
-    let mut protected_dest_dir: Option<PathBuf> = None;
-
-    while let Some(entry) = next_entry(&mut stream).await? {
-        if !dest_delete_eligible(config, &entry, &mut protected_dest_dir) {
-            continue;
-        }
-        eligible_dest_entries += 1;
-        if !membership.contains(&entry.relative_path) {
-            delete_candidates += 1;
-        }
-    }
-
-    let (threshold, force) = match config.delete {
-        DeleteMode::Enabled { threshold, force } => (threshold, force),
-        DeleteMode::Disabled => (100, true),
-    };
-
-    Ok(DeletePreflight {
-        source_entries: membership.expected_items(),
-        eligible_dest_entries,
-        delete_candidates,
-        threshold,
-        force,
-    })
-}
-
-#[derive(Debug)]
-struct PendingDeleteDir {
-    path: PathBuf,
-    removable: bool,
-}
-
-async fn execute_deletions(
-    dest: &dyn Endpoint,
-    config: &SyncConfig,
-    scan_options: ScanOptions,
-    membership: &FileSetBloom,
-    executor: &TaskExecutor<'_>,
-    batch_size: usize,
+    journal: &mut DeleteJournalReader,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    let mut stream = dest.scan_ordered(scan_options).await?;
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut protected_dest_dir: Option<PathBuf> = None;
-    let mut directory_stack: Vec<PendingDeleteDir> = Vec::new();
+    // Protection records live only until their corresponding earlier directory
+    // candidate is reached during reverse replay. The active set is therefore
+    // proportional to directory nesting, not total tree size.
+    let mut protected_dirs = Vec::<PathBuf>::new();
 
-    while let Some(entry) = next_entry(&mut stream).await? {
-        while directory_stack
-            .last()
-            .is_some_and(|directory| !entry.relative_path.starts_with(&directory.path))
-        {
-            if let Some(directory) = directory_stack.pop() {
-                if directory.removable {
-                    batch.push(delete_task(directory.path));
-                    if batch.len() >= batch_size {
-                        execute_batch(executor, &mut batch, stats).await?;
-                    }
+    while let Some(record) = journal.next().await? {
+        match record.kind {
+            DeleteKind::ProtectDirectory => {
+                if !protected_dirs.iter().any(|path| path == &record.path) {
+                    protected_dirs.push(record.path);
+                }
+            }
+            DeleteKind::Directory => {
+                if let Some(index) = protected_dirs.iter().rposition(|path| path == &record.path) {
+                    protected_dirs.swap_remove(index);
+                    continue;
+                }
+
+                // Directory removal is deliberately non-recursive. A concurrent
+                // new/protected child therefore makes the operation fail safely
+                // instead of widening deletion beyond the preflight plan.
+                if dest.exists(&record.path).await? {
+                    dest.remove(&record.path, false).await?;
+                    stats.files_deleted += 1;
+                }
+            }
+            DeleteKind::FileLike => {
+                if dest.exists(&record.path).await? {
+                    dest.remove(&record.path, false).await?;
+                    stats.files_deleted += 1;
                 }
             }
         }
-
-        if !dest_delete_eligible(config, &entry, &mut protected_dest_dir) {
-            for directory in &mut directory_stack {
-                directory.removable = false;
-            }
-            continue;
-        }
-
-        if membership.contains(&entry.relative_path) {
-            // A real source match, or a Bloom false positive, must protect all
-            // candidate ancestors. False positives therefore retain data rather
-            // than making deletion less safe.
-            for directory in &mut directory_stack {
-                directory.removable = false;
-            }
-            continue;
-        }
-
-        if entry.is_dir {
-            directory_stack.push(PendingDeleteDir {
-                path: (*entry.relative_path).clone(),
-                removable: true,
-            });
-        } else {
-            batch.push(delete_task((*entry.relative_path).clone()));
-            if batch.len() >= batch_size {
-                execute_batch(executor, &mut batch, stats).await?;
-            }
-        }
     }
 
-    while let Some(directory) = directory_stack.pop() {
-        if directory.removable {
-            batch.push(delete_task(directory.path));
-            if batch.len() >= batch_size {
-                execute_batch(executor, &mut batch, stats).await?;
-            }
-        }
-    }
-
-    execute_batch(executor, &mut batch, stats).await
+    Ok(())
 }
 
 fn dest_delete_eligible(
@@ -559,16 +544,6 @@ fn task_for(source: &FileEntry, dest_path: PathBuf, action: SyncAction) -> SyncT
         source: Some(Arc::new(source.clone())),
         dest_path,
         action,
-        source_checksum: None,
-        dest_checksum: None,
-    }
-}
-
-fn delete_task(path: PathBuf) -> SyncTask {
-    SyncTask {
-        source: None,
-        dest_path: path,
-        action: SyncAction::Delete,
         source_checksum: None,
         dest_checksum: None,
     }
