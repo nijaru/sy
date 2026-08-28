@@ -694,7 +694,7 @@ mod tests {
             threshold: 100,
             force: false,
         };
-        sync_config.filter_engine.add_exclude("*.log");
+        sync_config.filter_engine.add_exclude("*.log").unwrap();
 
         run_local_sync(
             &source_endpoint,
