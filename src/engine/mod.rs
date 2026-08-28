@@ -1,5 +1,6 @@
 pub mod bisync;
 pub mod bisync_state;
+pub mod bisync_store;
 pub mod compression;
 pub mod domain;
 pub mod planner;
