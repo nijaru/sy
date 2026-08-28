@@ -29,6 +29,7 @@ pub(crate) mod fs_util;
 pub(crate) mod hooks;
 pub mod path;
 pub(crate) mod perf;
+pub(crate) mod reconcile;
 pub(crate) mod resource;
 pub(crate) mod resume;
 pub mod retry;
