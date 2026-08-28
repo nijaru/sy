@@ -72,7 +72,7 @@ pub(crate) async fn run_local_sync(
         config.preserve.clone(),
         config.verification.clone(),
         config.max_concurrent.max(1),
-    )
+    )?
     .with_backup(BackupConfig {
         enabled: config.backup.is_some(),
         suffix: config.suffix.clone(),
