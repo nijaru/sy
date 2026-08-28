@@ -1,11 +1,13 @@
+use crate::engine::domain::RelativePath;
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{ClientHello, Operation, ServerHello, SessionReady};
+use crate::protocol::{ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady};
 use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
 };
 use crate::remote::scan::{request_scan, serve_incoming_scan};
+use crate::remote::signature::{request_signatures, serve_incoming_signatures, SignatureStream};
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,6 +22,9 @@ pub enum RemoteSessionError {
 
     #[error("frame router failed: {0}")]
     Router(SharedRouterError),
+
+    #[error("unsupported v3 request opener: {0:?}")]
+    UnsupportedRequest(FrameKind),
 }
 
 impl From<SharedRouterError> for RemoteSessionError {
@@ -77,6 +82,26 @@ impl ClientRemoteSession {
     pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
         request_scan(&self.router.sender(), request, self.server.platform.os).await
     }
+
+    pub async fn signatures(
+        &self,
+        path: &RelativePath,
+        file_size: u64,
+    ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
+        request_signatures(
+            &self.router.sender(),
+            path,
+            file_size,
+            self.server.platform.os,
+        )
+        .await
+    }
+}
+
+/// Peer-opened operations currently implemented by the v3 session runtime.
+pub enum IncomingRequest {
+    Scan(IncomingStream),
+    Signatures(IncomingStream),
 }
 
 /// Cloneable server-side context for servicing scan streams concurrently.
@@ -89,6 +114,20 @@ pub struct ServerScanHandler {
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
         serve_incoming_scan(&self.root, incoming, &self.sender).await
+    }
+}
+
+/// Cloneable server-side context for demand-driven rolling signatures.
+#[derive(Clone)]
+pub struct ServerSignatureHandler {
+    root: PathBuf,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerSignatureHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::signature::Result<()> {
+        serve_incoming_signatures(&self.root, incoming, &self.sender, self.peer).await
     }
 }
 
@@ -140,8 +179,24 @@ impl ServerRemoteSession {
         }
     }
 
-    pub async fn next_stream(&mut self) -> Result<Option<IncomingStream>> {
-        self.router.incoming().recv().await.map_err(Into::into)
+    pub fn signature_handler(&self) -> ServerSignatureHandler {
+        ServerSignatureHandler {
+            root: self.opened.root.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
+    pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
+        let Some(incoming) = self.router.incoming().recv().await? else {
+            return Ok(None);
+        };
+
+        match incoming.first.frame().kind() {
+            FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
+            FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
+            actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
+        }
     }
 }
 
@@ -149,6 +204,7 @@ impl ServerRemoteSession {
 mod tests {
     use super::*;
     use crate::engine::scan::EntryMetadataRequest;
+    use crate::remote::signature::{SignatureEvent, SignatureSummary};
     use futures::StreamExt;
     use tokio::task::JoinSet;
 
@@ -158,6 +214,20 @@ mod tests {
             paths.push(entry.unwrap().path.as_path().to_path_buf());
         }
         paths
+    }
+
+    async fn collect_signature_summary(
+        mut signatures: SignatureStream,
+    ) -> (usize, SignatureSummary) {
+        let mut block_count = 0_usize;
+        let mut summary = None;
+        while let Some(event) = signatures.next().await {
+            match event.unwrap() {
+                SignatureEvent::Block(_) => block_count += 1,
+                SignatureEvent::End(end) => summary = Some(end),
+            }
+        }
+        (block_count, summary.unwrap())
     }
 
     #[tokio::test]
@@ -179,12 +249,17 @@ mod tests {
             let handler = session.scan_handler();
             let mut tasks = JoinSet::new();
             for _ in 0..2 {
-                let incoming = session.next_stream().await.unwrap().unwrap();
+                let request = session.next_request().await.unwrap().unwrap();
+                let IncomingRequest::Scan(incoming) = request else {
+                    panic!("expected scan request");
+                };
                 let handler = handler.clone();
-                tasks.spawn(async move { handler.serve(incoming).await });
+                tasks.spawn(async move {
+                    handler.serve(incoming).await.unwrap();
+                });
             }
             while let Some(result) = tasks.join_next().await {
-                result.unwrap().unwrap();
+                result.unwrap();
             }
         });
 
@@ -224,5 +299,105 @@ mod tests {
         ];
         assert_eq!(first, expected);
         assert_eq!(second, expected);
+    }
+
+    #[tokio::test]
+    async fn session_runtime_multiplexes_scan_and_signatures() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("a"), b"a").unwrap();
+        let data = (0..10_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(root.path().join("data.bin"), &data).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan_handler = session.scan_handler();
+            let signature_handler = session.signature_handler();
+            let mut tasks = JoinSet::new();
+
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        let handler = scan_handler.clone();
+                        tasks.spawn(async move {
+                            handler.serve(incoming).await.unwrap();
+                        });
+                    }
+                    IncomingRequest::Signatures(incoming) => {
+                        let handler = signature_handler.clone();
+                        tasks.spawn(async move {
+                            handler.serve(incoming).await.unwrap();
+                        });
+                    }
+                }
+            }
+
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let scan_request = ScanRequest {
+            respect_gitignore: false,
+            include_git_dir: false,
+            max_depth: None,
+            metadata: EntryMetadataRequest {
+                unix_mode: cfg!(unix),
+                symlink_target: true,
+                identity: true,
+                hardlink_group: false,
+            },
+        };
+        let signature_path = RelativePath::new(PathBuf::from("data.bin")).unwrap();
+
+        // Open both operation types before consuming either. This proves the
+        // runtime can interleave metadata and demand-driven signature traffic on
+        // the same negotiated transport.
+        let entries = session.scan(scan_request).await.unwrap();
+        let (block_size, signatures) = session
+            .signatures(&signature_path, data.len() as u64)
+            .await
+            .unwrap();
+        let (paths, (blocks, summary)) = tokio::join!(
+            collect_paths(entries),
+            collect_signature_summary(signatures)
+        );
+        server.await.unwrap();
+
+        assert_eq!(block_size, 4 * 1024);
+        assert_eq!(blocks, 3);
+        assert_eq!(
+            summary,
+            SignatureSummary {
+                file_size: 10_000,
+                block_count: 3
+            }
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("data.bin"),
+                PathBuf::from("dir")
+            ]
+        );
     }
 }
