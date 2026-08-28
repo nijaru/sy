@@ -66,7 +66,8 @@ impl WireSignatureRequest {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let block_size = SignatureBlockSize::new(reader.u32()?)?;
-        let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.remaining()))?;
+        let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take_remaining()?))?;
+        reader.finish()?;
         Ok(Self { path, block_size })
     }
 }
