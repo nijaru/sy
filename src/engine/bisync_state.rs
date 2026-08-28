@@ -212,9 +212,7 @@ impl<W: Write> GenerationWriter<W> {
         let record_len = 4_usize
             .checked_add(record.key.as_bytes().len())
             .and_then(|length| length.checked_add(32 + 1))
-            .and_then(|length| {
-                length.checked_add(32 * usize::from(record.left_identity.is_some()))
-            })
+            .and_then(|length| length.checked_add(32 * usize::from(record.left_identity.is_some())))
             .and_then(|length| {
                 length.checked_add(32 * usize::from(record.right_identity.is_some()))
             })
@@ -229,12 +227,11 @@ impl<W: Write> GenerationWriter<W> {
             });
         }
 
-        let record_len_u32 = u32::try_from(record_len).map_err(|_| {
-            BisyncStateError::RecordTooLarge {
+        let record_len_u32 =
+            u32::try_from(record_len).map_err(|_| BisyncStateError::RecordTooLarge {
                 actual: record_len,
                 maximum: MAX_RECORD_BYTES,
-            }
-        })?;
+            })?;
         let key_len = u32::try_from(record.key.as_bytes().len()).map_err(|_| {
             BisyncStateError::NamespaceKeyTooLarge {
                 actual: record.key.as_bytes().len(),
@@ -322,7 +319,8 @@ impl<R: Read> GenerationReader<R> {
             return Err(BisyncStateError::NonZeroReserved);
         }
         let generation_raw = u64::from_be_bytes(state.read_hashed_array()?);
-        let generation = GenerationId::new(generation_raw).ok_or(BisyncStateError::ZeroGeneration)?;
+        let generation =
+            GenerationId::new(generation_raw).ok_or(BisyncStateError::ZeroGeneration)?;
         let policy = PolicyFingerprint::from_bytes(state.read_hashed_array()?);
         state.header = GenerationHeader { generation, policy };
         Ok(state)
@@ -419,7 +417,11 @@ impl CurrentPointer {
         put(&mut bytes, &mut cursor, &POINTER_MAGIC);
         put(&mut bytes, &mut cursor, &FORMAT_VERSION.to_be_bytes());
         put(&mut bytes, &mut cursor, &RESERVED.to_be_bytes());
-        put(&mut bytes, &mut cursor, &self.generation.get().to_be_bytes());
+        put(
+            &mut bytes,
+            &mut cursor,
+            &self.generation.get().to_be_bytes(),
+        );
         put(&mut bytes, &mut cursor, &self.generation_digest);
         let checksum = blake3::hash(&bytes[..cursor]);
         put(&mut bytes, &mut cursor, checksum.as_bytes());
@@ -443,7 +445,8 @@ impl CurrentPointer {
             return Err(BisyncStateError::InvalidMagic);
         }
         validate_version_and_reserved(&mut cursor)?;
-        let generation = GenerationId::new(cursor.u64()?).ok_or(BisyncStateError::ZeroGeneration)?;
+        let generation =
+            GenerationId::new(cursor.u64()?).ok_or(BisyncStateError::ZeroGeneration)?;
         let generation_digest = cursor.array()?;
         cursor.finish()?;
         Ok(Self {
@@ -474,7 +477,10 @@ impl RecoveryMarker {
         put(
             &mut bytes,
             &mut cursor,
-            &self.base_generation.map_or(0, GenerationId::get).to_be_bytes(),
+            &self
+                .base_generation
+                .map_or(0, GenerationId::get)
+                .to_be_bytes(),
         );
         put(
             &mut bytes,
@@ -755,7 +761,10 @@ mod tests {
             base_generation: Some(GenerationId::FIRST),
             target_generation: GenerationId::FIRST.next().unwrap(),
         };
-        assert_eq!(RecoveryMarker::decode(&existing.encode()).unwrap(), existing);
+        assert_eq!(
+            RecoveryMarker::decode(&existing.encode()).unwrap(),
+            existing
+        );
     }
 
     #[test]
