@@ -20,6 +20,8 @@ pub mod engine;
 #[doc(hidden)]
 pub mod protocol;
 #[doc(hidden)]
+pub mod remote;
+#[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
 #[doc(hidden)]
