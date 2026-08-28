@@ -2,6 +2,7 @@
 pub mod gcs;
 pub mod io;
 pub mod local;
+pub mod local_entry_scan;
 mod local_scan;
 #[cfg(feature = "s3")]
 pub mod s3;
