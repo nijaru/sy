@@ -25,10 +25,7 @@ pub struct ComparisonPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanDecision {
     Ready(SyncOp),
-    NeedContentComparison {
-        source: Entry,
-        destination: Entry,
-    },
+    NeedContentComparison { source: Entry, destination: Entry },
 }
 
 /// Plans one source-backed path without choosing a byte-transfer strategy.
@@ -67,9 +64,7 @@ pub fn plan_entry(
     }
 
     match source.kind {
-        EntryKind::Directory => {
-            PlanDecision::Ready(metadata_or_skip(source, destination, policy))
-        }
+        EntryKind::Directory => PlanDecision::Ready(metadata_or_skip(source, destination, policy)),
         EntryKind::Symlink => {
             if source.symlink_target != destination.symlink_target {
                 PlanDecision::Ready(SyncOp::Update {
@@ -146,7 +141,8 @@ fn plan_file(source: Entry, destination: Entry, policy: ComparisonPolicy) -> Pla
 }
 
 fn metadata_or_skip(source: Entry, destination: Entry, policy: ComparisonPolicy) -> SyncOp {
-    let permission_change = policy.preserve_permissions && source.unix_mode != destination.unix_mode;
+    let permission_change =
+        policy.preserve_permissions && source.unix_mode != destination.unix_mode;
     let time_change = policy.preserve_times && source.modified != destination.modified;
 
     if permission_change || time_change {
