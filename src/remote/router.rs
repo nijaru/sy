@@ -365,8 +365,9 @@ impl FrameRouter {
         };
 
         let reader_inner = Arc::clone(&inner);
+        let reader_shutdown = shutdown_rx.clone();
         let reader_task = tokio::spawn(async move {
-            match reader_loop(reader, &reader_inner, shutdown_rx.clone()).await {
+            match reader_loop(reader, &reader_inner, reader_shutdown).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let error = Arc::new(error);
@@ -849,7 +850,10 @@ mod tests {
         let (reader, writer) = tokio::io::split(router_io);
         let router = FrameRouter::start(reader, writer, RouterRole::Client, config).unwrap();
         let first = router.sender().open_stream().unwrap();
-        let error = router.sender().open_stream().unwrap_err();
+        let error = match router.sender().open_stream() {
+            Err(error) => error,
+            Ok(_) => panic!("expected active stream limit error"),
+        };
         assert!(matches!(
             error.as_ref(),
             RouterError::TooManyStreams(1)
