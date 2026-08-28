@@ -11,6 +11,9 @@ const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 pub(crate) enum DeleteKind {
     FileLike,
     Directory,
+    /// Marks an earlier candidate directory as non-deletable because the
+    /// destination subtree contains a source-backed or excluded descendant.
+    ProtectDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,7 @@ impl DeleteJournal {
             .write_u8(match kind {
                 DeleteKind::FileLike => 0,
                 DeleteKind::Directory => 1,
+                DeleteKind::ProtectDirectory => 2,
             })
             .await?;
         self.file.write_u32(path_len).await?;
@@ -138,6 +142,7 @@ impl DeleteJournalReader {
         let kind = match self.file.read_u8().await? {
             0 => DeleteKind::FileLike,
             1 => DeleteKind::Directory,
+            2 => DeleteKind::ProtectDirectory,
             value => {
                 return Err(invalid_data(format!(
                     "invalid delete journal entry kind: {value}"
@@ -237,11 +242,11 @@ mod tests {
             .await
             .unwrap();
         journal
-            .append(Path::new("parent/file"), DeleteKind::FileLike)
+            .append(Path::new("parent/keep"), DeleteKind::ProtectDirectory)
             .await
             .unwrap();
         journal
-            .append(Path::new("other"), DeleteKind::FileLike)
+            .append(Path::new("parent/file"), DeleteKind::FileLike)
             .await
             .unwrap();
 
@@ -253,15 +258,15 @@ mod tests {
         assert_eq!(
             reader.next().await.unwrap(),
             Some(DeleteRecord {
-                path: PathBuf::from("other"),
+                path: PathBuf::from("parent/file"),
                 kind: DeleteKind::FileLike,
             })
         );
         assert_eq!(
             reader.next().await.unwrap(),
             Some(DeleteRecord {
-                path: PathBuf::from("parent/file"),
-                kind: DeleteKind::FileLike,
+                path: PathBuf::from("parent/keep"),
+                kind: DeleteKind::ProtectDirectory,
             })
         );
         assert_eq!(
