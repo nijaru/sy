@@ -4,6 +4,9 @@
 //! synchronization keeps the existing SSH streaming protocol until its v0.5
 //! protocol migration is ready.
 
+#[path = "reconcile.rs"]
+mod reconcile;
+
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
@@ -124,7 +127,7 @@ impl SyncSession {
         let dest = self.dest.as_endpoint().ok_or_else(|| {
             SyncError::Config("destination must be local for direct sync".to_string())
         })?;
-        crate::reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await
+        reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await
     }
 
     /// Verify local source and destination trees without materializing either
