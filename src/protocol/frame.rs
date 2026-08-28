@@ -143,21 +143,21 @@ struct FrameHeader {
 
 impl FrameHeader {
     fn decode(bytes: [u8; HEADER_LEN]) -> Result<Self> {
-        let payload_len = u32::from_be_bytes(bytes[0..4].try_into().expect("fixed header slice"));
+        let payload_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let payload_len = usize::try_from(payload_len)
             .map_err(|_| ProtocolError::InvalidMessage("payload length does not fit usize"))?;
         validate_payload_len(payload_len)?;
 
         let kind = FrameKind::try_from(bytes[4])?;
-        let flags = FrameFlags::from_bits(bytes[5])
-            .ok_or(ProtocolError::UnknownFrameFlags(bytes[5]))?;
+        let flags =
+            FrameFlags::from_bits(bytes[5]).ok_or(ProtocolError::UnknownFrameFlags(bytes[5]))?;
         let reserved = u16::from_be_bytes([bytes[6], bytes[7]]);
         if reserved != 0 {
             return Err(ProtocolError::NonZeroReserved(reserved));
         }
-        let stream_id = StreamId::new(u32::from_be_bytes(
-            bytes[8..12].try_into().expect("fixed header slice"),
-        ));
+        let stream_id = StreamId::new(u32::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+        ]));
 
         Ok(Self {
             payload_len,
