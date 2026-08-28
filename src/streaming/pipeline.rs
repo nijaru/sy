@@ -126,9 +126,11 @@ impl StreamingSync {
         }
         let mut hello = Hello::new(hello_flags, self.remote_root.to_string_lossy().into_owned())
             .with_max_delete(self.max_delete.clone())
-            .with_filter_patterns(self.filter.as_ref().map(|filter| {
-                filter.to_rule_strings().join("\n")
-            }));
+            .with_filter_patterns(
+                self.filter
+                    .as_ref()
+                    .map(|filter| filter.to_rule_strings().join("\n")),
+            );
         if let Some(flags) = self.comparison_flags {
             hello = hello.with_comparison_flags(flags);
         }
