@@ -3,6 +3,7 @@ mod entry;
 mod frame;
 mod handshake;
 mod path;
+mod scan;
 mod session;
 
 pub use entry::{WireEntry, WireEntryKind};
@@ -16,6 +17,7 @@ pub use handshake::{
 pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
 };
+pub use scan::WireScanRequest;
 pub use session::{Operation, SessionOpen, SessionReady};
 
 #[derive(Debug, thiserror::Error)]
