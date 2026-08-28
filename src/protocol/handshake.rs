@@ -1,4 +1,5 @@
-use super::{ProtocolError, Result, WirePath};
+use super::codec::SliceReader;
+use super::{ProtocolError, Result};
 use bitflags::bitflags;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -46,28 +47,6 @@ pub fn negotiate_version(client: VersionRange, server: VersionRange) -> Result<P
     Ok(upper)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Operation {
-    Push = 1,
-    Pull = 2,
-}
-
-impl TryFrom<u8> for Operation {
-    type Error = ProtocolError;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::Push),
-            2 => Ok(Self::Pull),
-            _ => Err(ProtocolError::InvalidField {
-                field: "operation",
-                reason: "unknown operation value",
-            }),
-        }
-    }
-}
-
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct CapabilitySet: u64 {
@@ -97,7 +76,7 @@ pub enum PlatformOs {
 }
 
 impl PlatformOs {
-    fn encode(self) -> u8 {
+    pub(super) const fn encode(self) -> u8 {
         match self {
             Self::Linux => 1,
             Self::Macos => 2,
@@ -106,7 +85,7 @@ impl PlatformOs {
         }
     }
 
-    fn decode(value: u8) -> Self {
+    pub(super) const fn decode(value: u8) -> Self {
         match value {
             1 => Self::Linux,
             2 => Self::Macos,
@@ -125,7 +104,7 @@ pub enum PlatformArch {
 }
 
 impl PlatformArch {
-    fn encode(self) -> u8 {
+    pub(super) const fn encode(self) -> u8 {
         match self {
             Self::X86_64 => 1,
             Self::Aarch64 => 2,
@@ -134,7 +113,7 @@ impl PlatformArch {
         }
     }
 
-    fn decode(value: u8) -> Self {
+    pub(super) const fn decode(value: u8) -> Self {
         match value {
             1 => Self::X86_64,
             2 => Self::Aarch64,
@@ -156,6 +135,18 @@ impl Platform {
             os: current_os(),
             arch: current_arch(),
         }
+    }
+
+    fn encode_into(self, out: &mut BytesMut) {
+        out.put_u8(self.os.encode());
+        out.put_u8(self.arch.encode());
+    }
+
+    fn decode_from(reader: &mut SliceReader<'_>) -> Result<Self> {
+        Ok(Self {
+            os: PlatformOs::decode(reader.u8()?),
+            arch: PlatformArch::decode(reader.u8()?),
+        })
     }
 }
 
@@ -193,31 +184,32 @@ const fn current_arch() -> PlatformArch {
     PlatformArch::Other(0)
 }
 
+/// First client control message. It negotiates protocol mechanics only.
+///
+/// Remote roots and operation direction deliberately do not appear here. The
+/// peer platform must be known before a target-native root path is interpreted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
     pub versions: VersionRange,
-    pub operation: Operation,
     pub capabilities: CapabilitySet,
+    pub platform: Platform,
     pub build_id: String,
-    pub root: WirePath,
 }
 
 impl ClientHello {
     pub fn new(
         versions: VersionRange,
-        operation: Operation,
         capabilities: CapabilitySet,
+        platform: Platform,
         build_id: impl Into<String>,
-        root: WirePath,
     ) -> Result<Self> {
         let build_id = build_id.into();
         validate_build_id(&build_id)?;
         Ok(Self {
             versions,
-            operation,
             capabilities,
+            platform,
             build_id,
-            root,
         })
     }
 
@@ -228,51 +220,28 @@ impl ClientHello {
             field: "build_id",
             reason: "build identifier length exceeds u16",
         })?;
-        let root_len =
-            u32::try_from(self.root.as_bytes().len()).map_err(|_| ProtocolError::InvalidField {
-                field: "root",
-                reason: "root path length exceeds u32",
-            })?;
 
-        let mut out = BytesMut::with_capacity(25 + build.len() + self.root.as_bytes().len());
+        let mut out = BytesMut::with_capacity(20 + build.len());
         put_version(&mut out, self.versions.min);
         put_version(&mut out, self.versions.max);
-        out.put_u8(self.operation as u8);
         out.put_u64(self.capabilities.bits());
+        self.platform.encode_into(&mut out);
         out.put_u16(build_len);
-        out.put_u32(root_len);
         out.extend_from_slice(build);
-        out.extend_from_slice(self.root.as_bytes());
         Ok(out.freeze())
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
-        let min = reader.version()?;
-        let max = reader.version()?;
+        let min = read_version(&mut reader)?;
+        let max = read_version(&mut reader)?;
         let versions = VersionRange::new(min, max)?;
-        let operation = Operation::try_from(reader.u8()?)?;
         let capabilities = CapabilitySet::from_bits_retain(reader.u64()?);
-        let build_len = reader.u16()? as usize;
-        if build_len > MAX_BUILD_ID_BYTES {
-            return Err(ProtocolError::InvalidField {
-                field: "build_id",
-                reason: "build identifier exceeds maximum length",
-            });
-        }
-        let root_len = reader.u32()? as usize;
-        let build = reader.bytes(build_len)?;
-        let build_id = std::str::from_utf8(build)
-            .map_err(|_| ProtocolError::InvalidField {
-                field: "build_id",
-                reason: "build identifier is not UTF-8",
-            })?
-            .to_owned();
-        validate_build_id(&build_id)?;
-        let root = WirePath::new(Bytes::copy_from_slice(reader.bytes(root_len)?))?;
+        let platform = Platform::decode_from(&mut reader)?;
+        let build_id = read_build_id(&mut reader)?;
         reader.finish()?;
 
-        Self::new(versions, operation, capabilities, build_id, root)
+        Self::new(versions, capabilities, platform, build_id)
     }
 }
 
@@ -312,8 +281,7 @@ impl ServerHello {
         let mut out = BytesMut::with_capacity(16 + build.len());
         put_version(&mut out, self.version);
         out.put_u64(self.capabilities.bits());
-        out.put_u8(self.platform.os.encode());
-        out.put_u8(self.platform.arch.encode());
+        self.platform.encode_into(&mut out);
         out.put_u16(build_len);
         out.extend_from_slice(build);
         Ok(out.freeze())
@@ -321,25 +289,10 @@ impl ServerHello {
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
-        let version = reader.version()?;
+        let version = read_version(&mut reader)?;
         let capabilities = CapabilitySet::from_bits_retain(reader.u64()?);
-        let platform = Platform {
-            os: PlatformOs::decode(reader.u8()?),
-            arch: PlatformArch::decode(reader.u8()?),
-        };
-        let build_len = reader.u16()? as usize;
-        if build_len > MAX_BUILD_ID_BYTES {
-            return Err(ProtocolError::InvalidField {
-                field: "build_id",
-                reason: "build identifier exceeds maximum length",
-            });
-        }
-        let build_id = std::str::from_utf8(reader.bytes(build_len)?)
-            .map_err(|_| ProtocolError::InvalidField {
-                field: "build_id",
-                reason: "build identifier is not UTF-8",
-            })?
-            .to_owned();
+        let platform = Platform::decode_from(&mut reader)?;
+        let build_id = read_build_id(&mut reader)?;
         reader.finish()?;
 
         Self::new(version, capabilities, platform, build_id)
@@ -362,74 +315,34 @@ fn validate_build_id(build_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_build_id(reader: &mut SliceReader<'_>) -> Result<String> {
+    let build_len = reader.u16()? as usize;
+    if build_len > MAX_BUILD_ID_BYTES {
+        return Err(ProtocolError::InvalidField {
+            field: "build_id",
+            reason: "build identifier exceeds maximum length",
+        });
+    }
+    let build_id = std::str::from_utf8(reader.take(build_len)?)
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "build_id",
+            reason: "build identifier is not UTF-8",
+        })?
+        .to_owned();
+    validate_build_id(&build_id)?;
+    Ok(build_id)
+}
+
 fn put_version(out: &mut BytesMut, version: ProtocolVersion) {
     out.put_u16(version.major);
     out.put_u16(version.minor);
 }
 
-struct SliceReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> SliceReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or(ProtocolError::InvalidMessage("message length overflow"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(ProtocolError::InvalidMessage("truncated handshake payload"))?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        let bytes = self.take(8)?;
-        Ok(u64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn version(&mut self) -> Result<ProtocolVersion> {
-        Ok(ProtocolVersion {
-            major: self.u16()?,
-            minor: self.u16()?,
-        })
-    }
-
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        self.take(len)
-    }
-
-    fn finish(self) -> Result<()> {
-        if self.offset != self.bytes.len() {
-            return Err(ProtocolError::InvalidMessage(
-                "trailing bytes after handshake payload",
-            ));
-        }
-        Ok(())
-    }
+fn read_version(reader: &mut SliceReader<'_>) -> Result<ProtocolVersion> {
+    Ok(ProtocolVersion {
+        major: reader.u16()?,
+        minor: reader.u16()?,
+    })
 }
 
 #[cfg(test)]
@@ -473,13 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn client_hello_round_trip_preserves_raw_root() {
+    fn client_hello_round_trip_includes_client_platform() {
         let hello = ClientHello::new(
             VersionRange::exact(PROTOCOL_V3),
-            Operation::Push,
             capabilities(),
+            Platform {
+                os: PlatformOs::Macos,
+                arch: PlatformArch::Aarch64,
+            },
             "0.5.0-test",
-            WirePath::new(Bytes::from_static(b"/tmp/\xffroot")).unwrap(),
         )
         .unwrap();
         let decoded = ClientHello::decode(&hello.encode().unwrap()).unwrap();
@@ -506,10 +421,9 @@ mod tests {
     fn decode_rejects_truncation_and_trailing_data() {
         let hello = ClientHello::new(
             VersionRange::exact(PROTOCOL_V3),
-            Operation::Pull,
             capabilities(),
+            Platform::current(),
             "build",
-            WirePath::new(Bytes::from_static(b"/root")).unwrap(),
         )
         .unwrap();
         let encoded = hello.encode().unwrap();
