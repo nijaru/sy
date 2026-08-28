@@ -22,6 +22,9 @@ pub mod protocol;
 #[doc(hidden)]
 pub mod remote;
 #[doc(hidden)]
+#[path = "remote/router.rs"]
+pub mod remote_router;
+#[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
 #[doc(hidden)]
