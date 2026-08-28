@@ -3,7 +3,6 @@ pub mod gcs;
 pub mod io;
 pub mod local;
 pub mod local_entry_scan;
-mod local_scan;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "ssh")]
@@ -11,22 +10,12 @@ pub mod ssh;
 pub mod transfer;
 
 use crate::error::{Result, SyncError};
-use crate::sync::scanner::{FileEntry, ScanOptions};
 use async_trait::async_trait;
-use futures::Stream;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
 pub use io::{BoxReader, StagedWriter};
-
-/// Ordered entry stream used by incremental reconciliation.
-///
-/// Implementations must yield entries in ascending relative-path order. Local
-/// endpoints provide a bounded producer; the default implementation is a
-/// compatibility fallback for endpoints that have not migrated yet.
-pub type EntryStream = Pin<Box<dyn Stream<Item = Result<FileEntry>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
@@ -140,15 +129,6 @@ pub trait Endpoint: Send + Sync {
     /// can safely expose one. Transfer policy must still consult capabilities.
     fn native_path(&self, _path: &Path) -> Option<PathBuf> {
         None
-    }
-
-    async fn scan(&self, opts: ScanOptions) -> Result<Vec<FileEntry>>;
-
-    /// Scan in ascending relative-path order for merge reconciliation.
-    async fn scan_ordered(&self, opts: ScanOptions) -> Result<EntryStream> {
-        let mut entries = self.scan(opts).await?;
-        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(Box::pin(futures::stream::iter(entries.into_iter().map(Ok))))
     }
 
     async fn exists(&self, path: &Path) -> Result<bool>;
