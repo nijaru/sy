@@ -12,6 +12,8 @@ pub mod temp_file;
 #[doc(hidden)]
 pub mod bisync;
 #[doc(hidden)]
+pub mod endpoint;
+#[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
 #[doc(hidden)]
@@ -22,7 +24,6 @@ pub mod transport;
 // Private modules
 pub(crate) mod binary;
 pub(crate) mod config;
-pub(crate) mod endpoint;
 pub(crate) mod filter;
 pub(crate) mod fs_util;
 pub(crate) mod hooks;
