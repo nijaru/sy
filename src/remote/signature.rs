@@ -8,9 +8,9 @@ use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
 };
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
+use crate::rooted_fs::{RootedFs, RootedFsError};
 use futures::{Stream, StreamExt};
 use std::error::Error as StdError;
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -51,11 +51,11 @@ pub enum SignatureProducerError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
+    #[error(transparent)]
+    RootedFs(#[from] RootedFsError),
+
     #[error("signature consumer closed while producer was still running")]
     ConsumerClosed,
-
-    #[error("signature target is not a regular file: {0}")]
-    NotRegularFile(PathBuf),
 
     #[error("signature byte count overflow")]
     ByteCountOverflow,
@@ -74,6 +74,9 @@ pub enum RemoteSignatureError {
 
     #[error(transparent)]
     Path(#[from] RemotePathError),
+
+    #[error(transparent)]
+    RootedFs(#[from] RootedFsError),
 
     #[error(transparent)]
     Producer(#[from] SignatureProducerError),
@@ -182,9 +185,11 @@ pub async fn request_signatures(
 
 /// Serve one peer-opened destination signature request.
 ///
-/// Filesystem reads and hashing run on a blocking worker. A small bounded
-/// channel is the only producer queue; router frame/byte budgets then bound the
-/// async transport side independently.
+/// The root is pinned before peer-controlled relative-path resolution. File
+/// opening and hashing run on a blocking worker; every relative component is
+/// opened beneath the held root with no-follow semantics. A small bounded
+/// channel is the only producer queue, followed by the router's byte/frame
+/// budgets.
 pub async fn serve_incoming_signatures(
     root: &Path,
     incoming: IncomingStream,
@@ -200,10 +205,11 @@ pub async fn serve_incoming_signatures(
     let block_size = request.block_size;
     drop(first);
 
-    let path = root.join(relative.as_path());
+    let rooted = RootedFs::open(root.to_path_buf()).await?;
     let (producer_tx, mut producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
-    let producer =
-        tokio::task::spawn_blocking(move || produce_signatures(path, block_size, producer_tx));
+    let producer = tokio::task::spawn_blocking(move || {
+        produce_signatures(rooted, relative, block_size, producer_tx)
+    });
 
     while let Some(signature) = producer_rx.recv().await {
         let frame = Frame::new(
@@ -230,16 +236,12 @@ pub async fn serve_incoming_signatures(
 }
 
 fn produce_signatures(
-    path: PathBuf,
+    rooted: RootedFs,
+    relative: RelativePath,
     block_size: SignatureBlockSize,
     sender: mpsc::Sender<WireSignature>,
 ) -> std::result::Result<SignatureSummary, SignatureProducerError> {
-    let metadata = std::fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_file() {
-        return Err(SignatureProducerError::NotRegularFile(path));
-    }
-
-    let mut file = File::open(&path)?;
+    let mut file = rooted.open_regular_blocking(&relative)?;
     let block_size = block_size.get() as usize;
     let mut buffer = vec![0_u8; block_size];
     let mut file_size = 0_u64;
@@ -586,5 +588,26 @@ mod tests {
         let digest = blake3::hash(&data[..4096]);
         assert_eq!(blocks[0].strong, digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
         assert_eq!(Platform::current().os, session.server.platform.os);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signature_basis_refuses_parent_symlink_escape() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("escape/secret")).unwrap();
+        let block_size = SignatureBlockSize::new(4 * 1024).unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+
+        let error = tokio::task::spawn_blocking(move || {
+            produce_signatures(rooted, relative, block_size, sender)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(error, SignatureProducerError::RootedFs(_)));
     }
 }
