@@ -19,36 +19,22 @@ pub type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
 /// provide atomic replacement semantics.
 #[async_trait]
 pub trait StagedWriter: Send {
-    /// Append a chunk of file data to the staged object.
     async fn write(&mut self, data: &[u8]) -> Result<()>;
-
-    /// Apply file metadata to the staged object before it becomes visible.
     async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()>;
-
-    /// Make the staged object visible at its final destination.
     async fn commit(self: Box<Self>) -> Result<()>;
-
-    /// Explicitly discard staged state.
-    ///
-    /// Dropping a writer without committing must also clean up best-effort.
     async fn abort(self: Box<Self>) -> Result<()>;
 }
 
 /// Result of a bounded streaming copy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct StreamCopyResult {
     pub bytes_written: u64,
-    /// BLAKE3 of the source bytes as they passed through the transfer pipeline.
-    /// This can be compared with a destination stream hash when verification is
-    /// requested without rereading the source.
-    pub source_hash: blake3::Hash,
 }
 
 /// Copy one file between endpoints without whole-file buffering.
 ///
-/// Data is read in fixed-size chunks, hashed as it passes through the pipeline,
-/// written to endpoint-private staging state, and made visible only by commit.
-/// Any read/write/metadata failure aborts the staged destination best-effort.
+/// Hashing is deliberately not part of the normal transfer path. Verification
+/// is an explicit policy and uses `hash_file_streaming` only when requested.
 pub async fn copy_file_streaming(
     source: &dyn Endpoint,
     source_path: &Path,
@@ -61,7 +47,6 @@ pub async fn copy_file_streaming(
     let mut reader = source.open_reader(source_path).await?;
     let mut writer = dest.begin_write(dest_path).await?;
     let mut buffer = vec![0_u8; BUFFER_SIZE];
-    let mut hasher = blake3::Hasher::new();
     let mut bytes_written = 0_u64;
 
     loop {
@@ -77,7 +62,6 @@ pub async fn copy_file_streaming(
             break;
         }
 
-        hasher.update(&buffer[..read]);
         if let Err(error) = writer.write(&buffer[..read]).await {
             let _ = writer.abort().await;
             return Err(error);
@@ -91,17 +75,12 @@ pub async fn copy_file_streaming(
     }
 
     writer.commit().await?;
-
-    Ok(StreamCopyResult {
-        bytes_written,
-        source_hash: hasher.finalize(),
-    })
+    Ok(StreamCopyResult { bytes_written })
 }
 
 /// Hash a file through the endpoint streaming API.
 ///
-/// Used by transfer verification so the destination can be checked without
-/// ever materializing the file in memory.
+/// Verification pays this cost only when explicitly requested.
 pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result<blake3::Hash> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
