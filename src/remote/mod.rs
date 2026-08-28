@@ -387,10 +387,7 @@ mod tests {
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
         assert!(client.ready.capabilities.contains(CapabilitySet::BLAKE3));
-        assert!(client
-            .ready
-            .capabilities
-            .contains(CapabilitySet::RAW_PATHS));
+        assert!(client.ready.capabilities.contains(CapabilitySet::RAW_PATHS));
         assert!(!client
             .ready
             .capabilities
