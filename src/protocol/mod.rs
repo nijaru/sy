@@ -9,7 +9,10 @@ pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Operation, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
-pub use path::{RelativeWirePath, WirePath, MAX_WIRE_PATH_BYTES};
+pub use path::{
+    RelativeWirePath, WirePath, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_COMPONENTS,
+    MAX_WIRE_PATH_BYTES,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -39,6 +42,12 @@ pub enum ProtocolError {
 
     #[error("wire path exceeds maximum length: {len} bytes (maximum {max})")]
     PathTooLong { len: usize, max: usize },
+
+    #[error("wire path component exceeds maximum length: {len} bytes (maximum {max})")]
+    PathComponentTooLong { len: usize, max: usize },
+
+    #[error("wire path has too many components: {count} (maximum {max})")]
+    TooManyPathComponents { count: usize, max: usize },
 
     #[error("invalid relative wire path: {0}")]
     InvalidRelativePath(&'static str),
