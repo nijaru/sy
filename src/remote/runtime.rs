@@ -256,14 +256,9 @@ impl ClientRemoteSession {
 
     pub async fn replace_symlink(&self, path: &RelativePath, target: &Path) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
-        request_replace_symlink(
-            &self.router.sender(),
-            path,
-            target,
-            self.server.platform.os,
-        )
-        .await
-        .map_err(Into::into)
+        request_replace_symlink(&self.router.sender(), path, target, self.server.platform.os)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn remove(&self, path: &RelativePath, is_directory: bool) -> Result<()> {
@@ -321,7 +316,8 @@ pub struct ServerSignatureHandler {
 
 impl ServerSignatureHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::signature::Result<()> {
-        serve_incoming_signatures_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+        serve_incoming_signatures_rooted(self.rooted.clone(), incoming, &self.sender, self.peer)
+            .await
     }
 }
 
