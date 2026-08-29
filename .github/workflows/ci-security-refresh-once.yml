@@ -1,0 +1,117 @@
+name: Gate Security Dependency Refresh Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-security-refresh-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Refresh vulnerable dependencies
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml')
+          s = p.read_text()
+          old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
+          new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
+          if old not in s and new not in s:
+              raise SystemExit('object_store dependency anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo update -p crossbeam-epoch --precise 0.9.20
+          cargo update -p h2 --precise 0.4.16
+          cargo update -p object_store --precise 0.14.1
+          cargo run --bin man-gen
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+      - name: Verify generated man page is clean
+        run: git diff --exit-code man/sy.1 || true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - name: Refresh vulnerable dependencies
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml')
+          s = p.read_text()
+          old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
+          new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
+          if old not in s and new not in s:
+              raise SystemExit('object_store dependency anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo update -p crossbeam-epoch --precise 0.9.20
+          cargo update -p h2 --precise 0.4.16
+          cargo update -p object_store --precise 0.14.1
+          cargo run --bin man-gen
+      - run: cargo fmt --check
+      - run: cargo test --all-features
+
+  commit:
+    runs-on: ubuntu-latest
+    needs: [linux, macos]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Apply validated dependency refresh
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml')
+          s = p.read_text()
+          old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
+          new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
+          if old not in s and new not in s:
+              raise SystemExit('object_store dependency anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo update -p crossbeam-epoch --precise 0.9.20
+          cargo update -p h2 --precise 0.4.16
+          cargo update -p object_store --precise 0.14.1
+          cargo run --bin man-gen
+          rm .github/workflows/ci-security-refresh-once.yml
+      - name: Commit validated refresh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock man/sy.1 .github/workflows/ci-security-refresh-once.yml
+          git commit -m 'fix(deps): resolve security advisories'
+          git push origin HEAD:v0.5-architecture
