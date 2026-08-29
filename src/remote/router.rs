@@ -281,7 +281,7 @@ impl Drop for StreamInbox {
         };
         if let Ok(mut streams) = inner.streams.lock() {
             streams.remove(&self.stream_id);
-        };
+        }
     }
 }
 
@@ -573,6 +573,7 @@ fn is_stream_opening_kind(kind: FrameKind) -> bool {
         FrameKind::ScanRequest
             | FrameKind::SignatureRequest
             | FrameKind::FileBegin
+            | FrameKind::Metadata
             | FrameKind::Mutation
     )
 }
