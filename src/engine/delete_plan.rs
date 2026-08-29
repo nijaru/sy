@@ -85,11 +85,8 @@ impl DeleteTracker {
     pub async fn observe_matched(&mut self, destination: &Entry, in_scope: bool) -> Result<()> {
         self.close_candidate_directories(&destination.path);
         if self.destination_is_eligible(destination, in_scope) {
-            self.eligible_destination_entries = checked_add(
-                self.eligible_destination_entries,
-                1,
-                "eligible destination",
-            )?;
+            self.eligible_destination_entries =
+                checked_add(self.eligible_destination_entries, 1, "eligible destination")?;
         }
         self.protect_candidate_directories().await
     }
@@ -101,11 +98,8 @@ impl DeleteTracker {
     ) -> Result<()> {
         self.close_candidate_directories(&destination.path);
         if self.destination_is_eligible(destination, in_scope) {
-            self.eligible_destination_entries = checked_add(
-                self.eligible_destination_entries,
-                1,
-                "eligible destination",
-            )?;
+            self.eligible_destination_entries =
+                checked_add(self.eligible_destination_entries, 1, "eligible destination")?;
             self.delete_candidates = checked_add(self.delete_candidates, 1, "delete candidate")?;
             self.append_candidate(destination).await
         } else {
@@ -190,8 +184,7 @@ impl DeleteTracker {
                 .append(candidate.path.as_path(), DeleteKind::ProtectDirectory)
                 .await?;
             candidate.protected = true;
-            self.delete_candidates =
-                checked_sub(self.delete_candidates, 1, "delete candidate")?;
+            self.delete_candidates = checked_sub(self.delete_candidates, 1, "delete candidate")?;
         }
         Ok(())
     }
