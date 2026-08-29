@@ -1,4 +1,4 @@
-use crate::engine::domain::RelativePath;
+use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use std::ffi::{CString, OsStr};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
@@ -31,6 +33,15 @@ pub enum RootedFsError {
 
     #[error("rooted file is not a regular file: {0}")]
     NotRegularFile(PathBuf),
+
+    #[error("rooted entry kind mismatch for {path}: expected {expected:?}")]
+    EntryKindMismatch { path: PathBuf, expected: EntryKind },
+
+    #[error("symlink permissions are not a mutable portable property")]
+    UnsupportedSymlinkMode,
+
+    #[error("timestamp seconds are not representable by this platform")]
+    TimestampOutOfRange,
 
     #[error("could not allocate a unique staging file after {0} attempts")]
     StagingNameExhausted(usize),
@@ -96,6 +107,25 @@ impl std::fmt::Debug for RootedStagedFile {
 impl RootedStagedFile {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    /// Apply requested regular-file metadata to the still-private staging inode.
+    /// This is intentionally performed before `commit`, so a metadata failure
+    /// cannot expose a newly reconstructed file with temporary permissions.
+    pub fn apply_metadata_blocking(
+        &mut self,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            apply_fd_metadata(self.file.as_raw_fd(), unix_mode, modified)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (unix_mode, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -187,6 +217,22 @@ impl RootedFs {
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn remove_blocking(&self, relative: &RelativePath, is_directory: bool) -> Result<()> {
         self.remove_path_blocking(relative.as_path(), is_directory)
+    }
+
+    /// Apply requested metadata to an existing entry beneath the pinned root.
+    /// Regular files and directories are opened without following the leaf;
+    /// symlink timestamps use `utimensat(..., AT_SYMLINK_NOFOLLOW)` and never
+    /// affect the symlink target.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn apply_metadata_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        self.apply_metadata_path_blocking(relative.as_path(), kind, unix_mode, modified)
     }
 
     #[cfg(unix)]
@@ -349,6 +395,54 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
+    fn apply_metadata_path_blocking(
+        &self,
+        relative: &Path,
+        kind: EntryKind,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        let (parent, leaf) = self.open_parent_blocking(relative)?;
+        match kind {
+            EntryKind::File => {
+                let file = open_file_at(parent.as_raw_fd(), &leaf)?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(RootedFsError::EntryKindMismatch {
+                        path: relative.to_path_buf(),
+                        expected: kind,
+                    });
+                }
+                apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)
+            }
+            EntryKind::Directory => {
+                let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
+                apply_fd_metadata(directory.as_raw_fd(), unix_mode, modified)
+            }
+            EntryKind::Symlink => {
+                if unix_mode.is_some() {
+                    return Err(RootedFsError::UnsupportedSymlinkMode);
+                }
+                ensure_symlink_at(parent.as_raw_fd(), &leaf, relative)?;
+                if let Some(modified) = modified {
+                    set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn apply_metadata_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _unix_mode: Option<u32>,
+        _modified: Option<Timestamp>,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
     fn open_parent_blocking(&self, relative: &Path) -> Result<(OwnedFd, OsString)> {
         let mut components = relative.components().peekable();
         if components.peek().is_none() {
@@ -454,6 +548,99 @@ fn create_staging_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
 }
 
 #[cfg(unix)]
+fn apply_fd_metadata(fd: RawFd, unix_mode: Option<u32>, modified: Option<Timestamp>) -> Result<()> {
+    if let Some(mode) = unix_mode {
+        let result = unsafe {
+            // SAFETY: `fd` is live for this call. chmod ignores file-type bits;
+            // explicitly retaining only permission/special bits makes the wire
+            // contract independent of platform-specific stat type constants.
+            libc::fchmod(fd, (mode & 0o7777) as libc::mode_t)
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    if let Some(modified) = modified {
+        let times = modified_timespecs(modified)?;
+        let result = unsafe {
+            // SAFETY: `fd` is live and `times` contains exactly two initialized
+            // timespec values. UTIME_OMIT preserves the existing access time.
+            libc::futimens(fd, times.as_ptr())
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_symlink_at(parent: RawFd, component: &OsStr, relative: &Path) -> Result<()> {
+    let component = component_cstring(component)?;
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        // SAFETY: `parent` is live, `component` is a live single component, and
+        // `stat` points to writable storage for one libc::stat value.
+        libc::fstatat(
+            parent,
+            component.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe {
+        // SAFETY: successful fstatat initialized the stat buffer.
+        stat.assume_init()
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+        return Err(RootedFsError::EntryKindMismatch {
+            path: relative.to_path_buf(),
+            expected: EntryKind::Symlink,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_symlink_mtime_at(parent: RawFd, component: &OsStr, modified: Timestamp) -> Result<()> {
+    let component = component_cstring(component)?;
+    let times = modified_timespecs(modified)?;
+    let result = unsafe {
+        // SAFETY: `parent` is live, `component` is one live relative leaf, and
+        // AT_SYMLINK_NOFOLLOW applies the timestamp to the link itself.
+        libc::utimensat(
+            parent,
+            component.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn modified_timespecs(modified: Timestamp) -> Result<[libc::timespec; 2]> {
+    let seconds = libc::time_t::try_from(modified.seconds())
+        .map_err(|_| RootedFsError::TimestampOutOfRange)?;
+    Ok([
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT as _,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: modified.nanoseconds().into(),
+        },
+    ])
+}
+
+#[cfg(unix)]
 fn rename_at(parent: RawFd, from: &OsStr, to: &OsStr) -> Result<()> {
     let from = component_cstring(from)?;
     let to = component_cstring(to)?;
@@ -489,6 +676,7 @@ fn unlink_at(parent: RawFd, component: &OsStr, is_directory: bool) -> Result<()>
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
 
     fn relative(path: &str) -> RelativePath {
         RelativePath::new(PathBuf::from(path)).unwrap()
@@ -546,6 +734,98 @@ mod tests {
         assert_eq!(std::fs::read(root.path().join("dir/file")).unwrap(), b"old");
         staged.commit().unwrap();
         assert_eq!(std::fs::read(root.path().join("dir/file")).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn staged_metadata_is_applied_before_atomic_commit() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let modified = Timestamp::new(1_600_000_000, 123_456_789).unwrap();
+
+        let mut staged = rooted.begin_staged_file_blocking(&relative("file")).unwrap();
+        staged.file_mut().write_all(b"new").unwrap();
+        staged
+            .apply_metadata_blocking(Some(0o640), Some(modified))
+            .unwrap();
+        staged.commit().unwrap();
+
+        let metadata = std::fs::metadata(root.path().join("file")).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mtime(), modified.seconds());
+        assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+    }
+
+    #[tokio::test]
+    async fn rooted_metadata_updates_file_directory_and_symlink_without_following() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(outside.path().join("target"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target"), root.path().join("link"))
+            .unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let file_time = Timestamp::new(1_600_000_001, 0).unwrap();
+        let dir_time = Timestamp::new(1_600_000_002, 0).unwrap();
+        let link_time = Timestamp::new(1_600_000_003, 0).unwrap();
+        let outside_before = std::fs::metadata(outside.path().join("target")).unwrap().mtime();
+
+        rooted
+            .apply_metadata_blocking(
+                &relative("file"),
+                EntryKind::File,
+                Some(0o600),
+                Some(file_time),
+            )
+            .unwrap();
+        rooted
+            .apply_metadata_blocking(
+                &relative("dir"),
+                EntryKind::Directory,
+                Some(0o750),
+                Some(dir_time),
+            )
+            .unwrap();
+        rooted
+            .apply_metadata_blocking(&relative("link"), EntryKind::Symlink, None, Some(link_time))
+            .unwrap();
+
+        let file = std::fs::metadata(root.path().join("file")).unwrap();
+        assert_eq!(file.mode() & 0o7777, 0o600);
+        assert_eq!(file.mtime(), file_time.seconds());
+        let dir = std::fs::metadata(root.path().join("dir")).unwrap();
+        assert_eq!(dir.mode() & 0o7777, 0o750);
+        assert_eq!(dir.mtime(), dir_time.seconds());
+        let link = std::fs::symlink_metadata(root.path().join("link")).unwrap();
+        assert_eq!(link.mtime(), link_time.seconds());
+        assert_eq!(
+            std::fs::metadata(outside.path().join("target")).unwrap().mtime(),
+            outside_before
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_metadata_refuses_parent_symlink_escape() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("file"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let before = std::fs::metadata(outside.path().join("file")).unwrap().mode();
+
+        assert!(rooted
+            .apply_metadata_blocking(
+                &relative("escape/file"),
+                EntryKind::File,
+                Some(0o600),
+                None,
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::metadata(outside.path().join("file")).unwrap().mode(),
+            before
+        );
     }
 
     #[tokio::test]
