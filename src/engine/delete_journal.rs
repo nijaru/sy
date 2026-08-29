@@ -1,11 +1,13 @@
-use crate::error::{Result, SyncError};
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const TRAILER_LEN: u64 = 4;
 const RECORD_HEADER_LEN: usize = 5;
 const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
+
+pub type Result<T> = std::result::Result<T, io::Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteKind {
@@ -71,7 +73,10 @@ impl DeleteJournal {
         self.file.write_u32(path_len).await?;
         self.file.write_all(&path).await?;
         self.file.write_u32(payload_len).await?;
-        self.records += 1;
+        self.records = self
+            .records
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("delete journal record count overflow"))?;
         Ok(())
     }
 
@@ -158,15 +163,12 @@ impl DeleteJournalReader {
     }
 }
 
-fn join_error(error: tokio::task::JoinError) -> SyncError {
-    SyncError::Io(std::io::Error::other(error.to_string()))
+fn join_error(error: tokio::task::JoinError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
-fn invalid_data(message: impl Into<String>) -> SyncError {
-    SyncError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
-    ))
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(unix)]
