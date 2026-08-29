@@ -253,9 +253,7 @@ impl RootedFs {
             }
         }
 
-        Err(RootedFsError::StagingNameExhausted(
-            TEMP_CREATE_ATTEMPTS,
-        ))
+        Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
     }
 
     #[cfg(not(unix))]
@@ -348,11 +346,7 @@ fn create_staging_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         libc::openat(
             parent,
             component.as_ptr(),
-            libc::O_WRONLY
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
     };
@@ -483,7 +477,13 @@ mod tests {
             .unwrap();
         staged.file_mut().write_all(b"committed").unwrap();
         staged.commit().unwrap();
-        assert_eq!(std::fs::read(moved_path.join("file")).unwrap(), b"committed");
-        assert_eq!(std::fs::read(outside.path().join("file")).unwrap(), b"outside");
+        assert_eq!(
+            std::fs::read(moved_path.join("file")).unwrap(),
+            b"committed"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("file")).unwrap(),
+            b"outside"
+        );
     }
 }
