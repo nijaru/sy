@@ -154,12 +154,12 @@ impl FinalizeJournalReader {
             .ok_or(FinalizeJournalError::InvalidRecord(
                 "record total length overflow",
             ))?;
-        let start = self
-            .cursor
-            .checked_sub(total_len)
-            .ok_or(FinalizeJournalError::InvalidRecord(
-                "record extends before file start",
-            ))?;
+        let start =
+            self.cursor
+                .checked_sub(total_len)
+                .ok_or(FinalizeJournalError::InvalidRecord(
+                    "record extends before file start",
+                ))?;
 
         self.file.seek(SeekFrom::Start(start)).await?;
         let mut payload = vec![0_u8; payload_len];
@@ -167,12 +167,12 @@ impl FinalizeJournalReader {
         let metadata = decode_metadata(&payload)?;
 
         self.cursor = start;
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or(FinalizeJournalError::InvalidRecord(
-                "journal contains more records than expected",
-            ))?;
+        self.remaining =
+            self.remaining
+                .checked_sub(1)
+                .ok_or(FinalizeJournalError::InvalidRecord(
+                    "journal contains more records than expected",
+                ))?;
         Ok(Some(metadata))
     }
 }
@@ -212,11 +212,7 @@ fn decode_metadata(payload: &[u8]) -> Result<FinalizeMetadata> {
         0 => EntryKind::File,
         1 => EntryKind::Directory,
         2 => EntryKind::Symlink,
-        _ => {
-            return Err(FinalizeJournalError::InvalidRecord(
-                "unknown entry kind",
-            ))
-        }
+        _ => return Err(FinalizeJournalError::InvalidRecord("unknown entry kind")),
     };
     let fields = reader.u8()?;
     if fields == 0 {
@@ -332,7 +328,9 @@ impl<'a> SliceReader<'a> {
         let end = self
             .offset
             .checked_add(len)
-            .ok_or(FinalizeJournalError::InvalidRecord("record length overflow"))?;
+            .ok_or(FinalizeJournalError::InvalidRecord(
+                "record length overflow",
+            ))?;
         let value = self
             .payload
             .get(self.offset..end)
@@ -422,10 +420,8 @@ mod tests {
     async fn preserves_non_utf8_paths() {
         use std::os::unix::ffi::OsStringExt;
 
-        let path = RelativePath::new(PathBuf::from(OsString::from_vec(vec![
-            b'd', 0x80, b'r',
-        ])))
-        .unwrap();
+        let path =
+            RelativePath::new(PathBuf::from(OsString::from_vec(vec![b'd', 0x80, b'r']))).unwrap();
         let metadata = FinalizeMetadata {
             path,
             kind: EntryKind::Directory,
