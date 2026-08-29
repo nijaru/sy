@@ -12,6 +12,7 @@ use crate::rooted_fs::{RootedFs, RootedFsError};
 use futures::{Stream, StreamExt};
 use std::error::Error as StdError;
 use std::io::{self, Read};
+#[cfg(test)]
 use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::mpsc;
