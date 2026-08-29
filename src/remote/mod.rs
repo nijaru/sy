@@ -395,8 +395,14 @@ mod tests {
                 .contains(CapabilitySet::STAGED_WRITE),
             supports_staged_files(Platform::current().os)
         );
-        assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_READ));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_WRITE));
+        assert!(!client
+            .ready
+            .capabilities
+            .contains(CapabilitySet::RANDOM_READ));
+        assert!(!client
+            .ready
+            .capabilities
+            .contains(CapabilitySet::RANDOM_WRITE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
         assert!(!client.ready.capabilities.contains(CapabilitySet::SPARSE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::XATTR));
