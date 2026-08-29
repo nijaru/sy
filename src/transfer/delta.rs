@@ -451,12 +451,7 @@ where
         self.copy_slices(basis_offset, len, (source, &[]))
     }
 
-    fn copy_slices(
-        &mut self,
-        basis_offset: u64,
-        len: u32,
-        source: (&[u8], &[u8]),
-    ) -> Result<()> {
+    fn copy_slices(&mut self, basis_offset: u64, len: u32, source: (&[u8], &[u8])) -> Result<()> {
         debug_assert_eq!(source.0.len() + source.1.len(), len as usize);
         self.flush_literal()?;
         self.source_hasher.update(source.0);
