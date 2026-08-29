@@ -47,6 +47,10 @@ jobs:
                   raise SystemExit('expected apply_metadata anchor not found')
               s = s.replace(anchor, method + anchor, 1)
           client.write_text(s)
+          push = Path('src/remote/push.rs')
+          s = push.read_text()
+          s = s.replace('.path.to_path_buf()', '.path.as_path().to_path_buf()')
+          push.write_text(s)
           PY
           cargo fmt --all
       - name: Strict Clippy
