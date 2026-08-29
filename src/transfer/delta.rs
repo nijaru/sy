@@ -68,6 +68,88 @@ pub struct BasisIndex {
     by_weak: HashMap<u32, Vec<BasisBlock>>,
 }
 
+/// Incrementally builds a bounded signature index as remote signatures arrive.
+/// No temporary whole-file signature vector is required.
+#[derive(Debug)]
+pub struct BasisIndexBuilder {
+    block_size: u32,
+    limits: BasisIndexLimits,
+    block_count: usize,
+    expected_index: u64,
+    short_seen: bool,
+    by_weak: HashMap<u32, Vec<BasisBlock>>,
+}
+
+impl BasisIndexBuilder {
+    pub fn new(
+        block_size: u32,
+        limits: BasisIndexLimits,
+    ) -> std::result::Result<Self, BasisIndexError> {
+        if block_size == 0 {
+            return Err(BasisIndexError::ZeroBlockSize);
+        }
+        if limits.max_blocks == 0 {
+            return Err(BasisIndexError::ZeroBlockLimit);
+        }
+        Ok(Self {
+            block_size,
+            limits,
+            block_count: 0,
+            expected_index: 0,
+            short_seen: false,
+            by_weak: HashMap::new(),
+        })
+    }
+
+    pub fn push(&mut self, block: BasisBlock) -> std::result::Result<(), BasisIndexError> {
+        if self.block_count == self.limits.max_blocks {
+            return Err(BasisIndexError::TooManyBlocks {
+                max: self.limits.max_blocks,
+            });
+        }
+        if block.index != self.expected_index {
+            return Err(BasisIndexError::IndexMismatch {
+                expected: self.expected_index,
+                actual: block.index,
+            });
+        }
+        if block.size == 0 {
+            return Err(BasisIndexError::EmptyBlock { index: block.index });
+        }
+        if block.size > self.block_size {
+            return Err(BasisIndexError::BlockTooLarge {
+                index: block.index,
+                size: block.size,
+                block_size: self.block_size,
+            });
+        }
+        if self.short_seen {
+            return Err(BasisIndexError::BlockAfterShort { index: block.index });
+        }
+
+        self.short_seen = block.size < self.block_size;
+        self.by_weak.entry(block.weak).or_default().push(block);
+        self.block_count += 1;
+        self.expected_index = self
+            .expected_index
+            .checked_add(1)
+            .ok_or(BasisIndexError::OffsetOverflow { index: block.index })?;
+        Ok(())
+    }
+
+    pub const fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    pub fn finish(self) -> BasisIndex {
+        BasisIndex {
+            block_size: self.block_size,
+            block_count: self.block_count,
+            by_weak: self.by_weak,
+        }
+    }
+}
+
 impl BasisIndex {
     pub fn new<I>(
         block_size: u32,
@@ -77,57 +159,11 @@ impl BasisIndex {
     where
         I: IntoIterator<Item = BasisBlock>,
     {
-        if block_size == 0 {
-            return Err(BasisIndexError::ZeroBlockSize);
-        }
-        if limits.max_blocks == 0 {
-            return Err(BasisIndexError::ZeroBlockLimit);
-        }
-
-        let mut by_weak: HashMap<u32, Vec<BasisBlock>> = HashMap::new();
-        let mut block_count = 0_usize;
-        let mut expected_index = 0_u64;
-        let mut short_seen = false;
-
+        let mut builder = BasisIndexBuilder::new(block_size, limits)?;
         for block in blocks {
-            if block_count == limits.max_blocks {
-                return Err(BasisIndexError::TooManyBlocks {
-                    max: limits.max_blocks,
-                });
-            }
-            if block.index != expected_index {
-                return Err(BasisIndexError::IndexMismatch {
-                    expected: expected_index,
-                    actual: block.index,
-                });
-            }
-            if block.size == 0 {
-                return Err(BasisIndexError::EmptyBlock { index: block.index });
-            }
-            if block.size > block_size {
-                return Err(BasisIndexError::BlockTooLarge {
-                    index: block.index,
-                    size: block.size,
-                    block_size,
-                });
-            }
-            if short_seen {
-                return Err(BasisIndexError::BlockAfterShort { index: block.index });
-            }
-
-            short_seen = block.size < block_size;
-            by_weak.entry(block.weak).or_default().push(block);
-            block_count += 1;
-            expected_index = expected_index
-                .checked_add(1)
-                .ok_or(BasisIndexError::OffsetOverflow { index: block.index })?;
+            builder.push(block)?;
         }
-
-        Ok(Self {
-            block_size,
-            block_count,
-            by_weak,
-        })
+        Ok(builder.finish())
     }
 
     pub const fn block_size(&self) -> u32 {
@@ -585,6 +621,17 @@ mod tests {
         }));
         assert_eq!(summary.literal_bytes, source.len() as u64);
         assert_eq!(reconstruct(&ops, &[]), source);
+    }
+
+    #[test]
+    fn incremental_builder_matches_constructor_shape() {
+        let mut builder = BasisIndexBuilder::new(4, BasisIndexLimits::default()).unwrap();
+        builder.push(block(0, b"abcd")).unwrap();
+        builder.push(block(1, b"efgh")).unwrap();
+        assert_eq!(builder.block_count(), 2);
+        let index = builder.finish();
+        assert_eq!(index.block_size(), 4);
+        assert_eq!(index.block_count(), 2);
     }
 
     #[test]
