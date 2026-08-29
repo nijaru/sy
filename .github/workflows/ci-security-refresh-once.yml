@@ -30,13 +30,23 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('Cargo.toml')
-          s = p.read_text()
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text()
           old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
           new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
-          if old not in s and new not in s:
+          if old not in text and new not in text:
               raise SystemExit('object_store dependency anchor missing')
-          p.write_text(s.replace(old, new, 1))
+          cargo.write_text(text.replace(old, new, 1))
+
+          for name in ('src/transport/s3.rs', 'src/transport/gcs.rs'):
+              path = Path(name)
+              text = path.read_text()
+              old = 'use object_store::ObjectStore;'
+              new = 'use object_store::{ObjectStore, ObjectStoreExt};'
+              if old not in text and new not in text:
+                  raise SystemExit(f'ObjectStore import anchor missing in {name}')
+              path.write_text(text.replace(old, new, 1))
           PY
           cargo update -p crossbeam-epoch --precise 0.9.20
           cargo update -p h2 --precise 0.4.16
@@ -52,8 +62,6 @@ jobs:
         with:
           command: check
           arguments: --all-features
-      - name: Verify generated man page is clean
-        run: git diff --exit-code man/sy.1 || true
 
   macos:
     runs-on: macos-latest
@@ -68,13 +76,23 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('Cargo.toml')
-          s = p.read_text()
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text()
           old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
           new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
-          if old not in s and new not in s:
+          if old not in text and new not in text:
               raise SystemExit('object_store dependency anchor missing')
-          p.write_text(s.replace(old, new, 1))
+          cargo.write_text(text.replace(old, new, 1))
+
+          for name in ('src/transport/s3.rs', 'src/transport/gcs.rs'):
+              path = Path(name)
+              text = path.read_text()
+              old = 'use object_store::ObjectStore;'
+              new = 'use object_store::{ObjectStore, ObjectStoreExt};'
+              if old not in text and new not in text:
+                  raise SystemExit(f'ObjectStore import anchor missing in {name}')
+              path.write_text(text.replace(old, new, 1))
           PY
           cargo update -p crossbeam-epoch --precise 0.9.20
           cargo update -p h2 --precise 0.4.16
@@ -95,13 +113,23 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('Cargo.toml')
-          s = p.read_text()
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text()
           old = 'object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }'
           new = 'object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }'
-          if old not in s and new not in s:
+          if old not in text and new not in text:
               raise SystemExit('object_store dependency anchor missing')
-          p.write_text(s.replace(old, new, 1))
+          cargo.write_text(text.replace(old, new, 1))
+
+          for name in ('src/transport/s3.rs', 'src/transport/gcs.rs'):
+              path = Path(name)
+              text = path.read_text()
+              old = 'use object_store::ObjectStore;'
+              new = 'use object_store::{ObjectStore, ObjectStoreExt};'
+              if old not in text and new not in text:
+                  raise SystemExit(f'ObjectStore import anchor missing in {name}')
+              path.write_text(text.replace(old, new, 1))
           PY
           cargo update -p crossbeam-epoch --precise 0.9.20
           cargo update -p h2 --precise 0.4.16
@@ -112,6 +140,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock man/sy.1 .github/workflows/ci-security-refresh-once.yml
+          git add Cargo.toml Cargo.lock man/sy.1 src/transport/s3.rs src/transport/gcs.rs .github/workflows/ci-security-refresh-once.yml
           git commit -m 'fix(deps): resolve security advisories'
           git push origin HEAD:v0.5-architecture
