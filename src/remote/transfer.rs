@@ -1,4 +1,4 @@
-use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::BoxError;
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireData, WireDeltaCopy,
@@ -24,6 +24,12 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 pub struct RemoteDeltaBasis {
     pub entry: Entry,
     pub index: BasisIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransferMetadata {
+    pub unix_mode: Option<u32>,
+    pub modified: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +184,25 @@ pub async fn request_file_transfer(
     delta_basis: Option<RemoteDeltaBasis>,
     peer: PlatformOs,
 ) -> Result<TransferSummary> {
+    request_file_transfer_with_metadata(
+        sender,
+        source_root,
+        source,
+        delta_basis,
+        TransferMetadata::default(),
+        peer,
+    )
+    .await
+}
+
+pub async fn request_file_transfer_with_metadata(
+    sender: &RouterSender,
+    source_root: PathBuf,
+    source: Entry,
+    delta_basis: Option<RemoteDeltaBasis>,
+    metadata: TransferMetadata,
+    peer: PlatformOs,
+) -> Result<TransferSummary> {
     ensure_compatible_path_encoding(peer)?;
     if !source.is_file() {
         return Err(RemoteTransferError::InvalidSource);
@@ -215,6 +240,12 @@ pub async fn request_file_transfer(
         }
         None => (WireFileBegin::whole(encoded_path, source.size), None),
     };
+    let begin = begin.with_metadata(
+        metadata.unix_mode,
+        metadata
+            .modified
+            .map(|value| (value.seconds(), value.nanoseconds())),
+    )?;
 
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
@@ -537,6 +568,17 @@ fn reconstruct_file(
                 if let Some((basis, expected)) = prepared.basis.as_ref() {
                     validate_basis(basis, *expected)?;
                 }
+                let modified = begin
+                    .modified()
+                    .map(|(seconds, nanoseconds)| Timestamp::new(seconds, nanoseconds))
+                    .transpose()
+                    .map_err(|_| ProtocolError::InvalidField {
+                        field: "modified_nanoseconds",
+                        reason: "nanoseconds must be below 1,000,000,000",
+                    })?;
+                prepared
+                    .staged
+                    .apply_metadata_blocking(begin.unix_mode(), modified)?;
                 prepared.staged.commit()?;
                 return Ok(TransferSummary {
                     file_size,
@@ -687,12 +729,12 @@ fn require_file_end_flags(frame: &Frame) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::engine::domain::Timestamp;
     use crate::engine::rolling::WeakChecksum;
     use crate::protocol::Operation;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
     use crate::transfer::delta::{BasisBlock, BasisIndexLimits};
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     fn file_entry(root: &Path, relative: &str) -> Entry {
@@ -774,11 +816,16 @@ mod tests {
             RouterConfig::default(),
         )
         .unwrap();
-        let summary = request_file_transfer(
+        let modified = Timestamp::new(1_600_000_030, 0).unwrap();
+        let summary = request_file_transfer_with_metadata(
             &router.sender(),
             source_root.path().to_path_buf(),
             source,
             None,
+            TransferMetadata {
+                unix_mode: Some(0o640),
+                modified: Some(modified),
+            },
             session.server.platform.os,
         )
         .await
@@ -793,6 +840,9 @@ mod tests {
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             data
         );
+        let metadata = std::fs::metadata(destination_root.path().join("file.bin")).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mtime(), modified.seconds());
     }
 
     #[tokio::test]
@@ -870,6 +920,9 @@ mod tests {
     async fn bad_digest_drops_stage_and_preserves_destination() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"old").unwrap();
+        let original = std::fs::metadata(root.path().join("file")).unwrap();
+        let original_mode = original.mode();
+        let original_mtime = original.mtime();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let relative = RelativePath::new(PathBuf::from("file")).unwrap();
         let prepared = tokio::task::spawn_blocking({
@@ -880,7 +933,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let wire_path = encode_relative_path(relative.as_path()).unwrap();
-        let begin = WireFileBegin::whole(wire_path, 3);
+        let begin = WireFileBegin::whole(wire_path, 3)
+            .with_metadata(
+                Some(0o600),
+                Some((1_600_000_040, 0)),
+            )
+            .unwrap();
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
         tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
@@ -896,6 +954,9 @@ mod tests {
             Err(RemoteTransferError::DigestMismatch)
         ));
         assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+        let preserved = std::fs::metadata(root.path().join("file")).unwrap();
+        assert_eq!(preserved.mode(), original_mode);
+        assert_eq!(preserved.mtime(), original_mtime);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
