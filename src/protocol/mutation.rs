@@ -43,45 +43,74 @@ pub struct WireMutation {
 
 impl WireMutation {
     pub const fn create_directory(path: RelativeWirePath) -> Self {
-        Self { path, kind: WireMutationKind::CreateDirectory, symlink_target: None }
+        Self {
+            path,
+            kind: WireMutationKind::CreateDirectory,
+            symlink_target: None,
+        }
     }
 
     pub const fn replace_symlink(path: RelativeWirePath, target: WirePath) -> Self {
-        Self { path, kind: WireMutationKind::ReplaceSymlink, symlink_target: Some(target) }
+        Self {
+            path,
+            kind: WireMutationKind::ReplaceSymlink,
+            symlink_target: Some(target),
+        }
     }
 
     pub const fn remove_file_like(path: RelativeWirePath) -> Self {
-        Self { path, kind: WireMutationKind::RemoveFileLike, symlink_target: None }
+        Self {
+            path,
+            kind: WireMutationKind::RemoveFileLike,
+            symlink_target: None,
+        }
     }
 
     pub const fn remove_directory(path: RelativeWirePath) -> Self {
-        Self { path, kind: WireMutationKind::RemoveDirectory, symlink_target: None }
+        Self {
+            path,
+            kind: WireMutationKind::RemoveDirectory,
+            symlink_target: None,
+        }
     }
 
-    pub const fn kind(&self) -> WireMutationKind { self.kind }
+    pub const fn kind(&self) -> WireMutationKind {
+        self.kind
+    }
 
-    pub fn symlink_target(&self) -> Option<&WirePath> { self.symlink_target.as_ref() }
+    pub fn symlink_target(&self) -> Option<&WirePath> {
+        self.symlink_target.as_ref()
+    }
 
     pub fn encode(&self) -> Result<Bytes> {
         self.validate()?;
-        let path_len = u32::try_from(self.path.as_encoded().len()).map_err(|_| ProtocolError::InvalidField {
-            field: "mutation_path",
-            reason: "encoded relative path length exceeds u32",
+        let path_len = u32::try_from(self.path.as_encoded().len()).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "mutation_path",
+                reason: "encoded relative path length exceeds u32",
+            }
         })?;
-        let target_len = self.symlink_target.as_ref().map(|target| {
-            u32::try_from(target.as_bytes().len()).map_err(|_| ProtocolError::InvalidField {
-                field: "symlink_target",
-                reason: "symlink target length exceeds u32",
+        let target_len = self
+            .symlink_target
+            .as_ref()
+            .map(|target| {
+                u32::try_from(target.as_bytes().len()).map_err(|_| ProtocolError::InvalidField {
+                    field: "symlink_target",
+                    reason: "symlink target length exceeds u32",
+                })
             })
-        }).transpose()?;
+            .transpose()?;
 
         let mut capacity = 5_usize.checked_add(self.path.as_encoded().len()).ok_or(
             ProtocolError::InvalidMessage("mutation payload length overflow"),
         )?;
         if let Some(target) = self.symlink_target.as_ref() {
-            capacity = capacity.checked_add(4).and_then(|value| value.checked_add(target.as_bytes().len())).ok_or(
-                ProtocolError::InvalidMessage("mutation payload length overflow"),
-            )?;
+            capacity = capacity
+                .checked_add(4)
+                .and_then(|value| value.checked_add(target.as_bytes().len()))
+                .ok_or(ProtocolError::InvalidMessage(
+                    "mutation payload length overflow",
+                ))?;
         }
 
         let mut out = BytesMut::with_capacity(capacity);
@@ -100,20 +129,32 @@ impl WireMutation {
         let kind = WireMutationKind::try_from(reader.u8()?)?;
         let path_len = reader.u32()? as usize;
         if path_len > MAX_WIRE_PATH_BYTES {
-            return Err(ProtocolError::PathTooLong { len: path_len, max: MAX_WIRE_PATH_BYTES });
+            return Err(ProtocolError::PathTooLong {
+                len: path_len,
+                max: MAX_WIRE_PATH_BYTES,
+            });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
         let symlink_target = if kind == WireMutationKind::ReplaceSymlink {
             let target_len = reader.u32()? as usize;
             if target_len > MAX_WIRE_PATH_BYTES {
-                return Err(ProtocolError::PathTooLong { len: target_len, max: MAX_WIRE_PATH_BYTES });
+                return Err(ProtocolError::PathTooLong {
+                    len: target_len,
+                    max: MAX_WIRE_PATH_BYTES,
+                });
             }
-            Some(WirePath::new(Bytes::copy_from_slice(reader.take(target_len)?))?)
+            Some(WirePath::new(Bytes::copy_from_slice(
+                reader.take(target_len)?,
+            ))?)
         } else {
             None
         };
         reader.finish()?;
-        let mutation = Self { path, kind, symlink_target };
+        let mutation = Self {
+            path,
+            kind,
+            symlink_target,
+        };
         mutation.validate()?;
         Ok(mutation)
     }
@@ -121,7 +162,12 @@ impl WireMutation {
     fn validate(&self) -> Result<()> {
         match (self.kind, self.symlink_target.is_some()) {
             (WireMutationKind::ReplaceSymlink, true)
-            | (WireMutationKind::CreateDirectory | WireMutationKind::RemoveFileLike | WireMutationKind::RemoveDirectory, false) => Ok(()),
+            | (
+                WireMutationKind::CreateDirectory
+                | WireMutationKind::RemoveFileLike
+                | WireMutationKind::RemoveDirectory,
+                false,
+            ) => Ok(()),
             (WireMutationKind::ReplaceSymlink, false) => Err(ProtocolError::InvalidField {
                 field: "symlink_target",
                 reason: "replace-symlink mutation requires a target",
@@ -153,7 +199,10 @@ mod tests {
             WireMutation::remove_directory(path()),
         ];
         for mutation in mutations {
-            assert_eq!(WireMutation::decode(&mutation.encode().unwrap()).unwrap(), mutation);
+            assert_eq!(
+                WireMutation::decode(&mutation.encode().unwrap()).unwrap(),
+                mutation
+            );
         }
     }
 
@@ -165,7 +214,13 @@ mod tests {
         }
         let mut unknown = encoded.to_vec();
         unknown[0] = u8::MAX;
-        assert!(matches!(WireMutation::decode(&unknown), Err(ProtocolError::InvalidField { field: "mutation_kind", .. })));
+        assert!(matches!(
+            WireMutation::decode(&unknown),
+            Err(ProtocolError::InvalidField {
+                field: "mutation_kind",
+                ..
+            })
+        ));
         let mut trailing = encoded.to_vec();
         trailing.push(0);
         assert!(WireMutation::decode(&trailing).is_err());
