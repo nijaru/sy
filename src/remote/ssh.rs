@@ -51,10 +51,6 @@ impl SshRemoteSession {
     pub const fn remote(&self) -> &ClientRemoteSession {
         &self.remote
     }
-
-    pub fn child_id(&self) -> Option<u32> {
-        self.child.id()
-    }
 }
 
 fn ssh_arguments(config: &SshConfig) -> Vec<OsString> {
