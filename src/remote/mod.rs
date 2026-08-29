@@ -11,6 +11,7 @@ use crate::protocol::{
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
     VersionRange, WirePath, PROTOCOL_V3,
 };
+use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -24,6 +25,9 @@ pub enum RemoteError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    RootedFs(#[from] RootedFsError),
 
     #[error("expected control frame {expected:?}, got {actual:?}")]
     UnexpectedFrame {
@@ -57,6 +61,7 @@ struct OpenedServerSession {
     client: ClientHello,
     operation: Operation,
     root: PathBuf,
+    rooted: RootedFs,
     ready: SessionReady,
 }
 
@@ -101,7 +106,7 @@ where
     Ok(ClientSession { server, ready })
 }
 
-/// Perform the server half of the v3 control-plane handshake and open the
+/// Perform the server half of the v3 control-plane handshake and pin the
 /// requested local root. The data plane starts only after this returns.
 async fn server_handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<OpenedServerSession>
 where
@@ -128,6 +133,10 @@ where
     let open = SessionOpen::decode(frame.payload())?;
     let root = expand_tilde(decode_native_root(open.root)?);
     prepare_root(open.operation, &root).await?;
+    // Linux/macOS v0.5 data-plane authority is descriptor-backed. Open the
+    // trusted session root exactly once so later pathname swaps cannot redirect
+    // signatures, file reconstruction, or namespace mutations.
+    let rooted = RootedFs::open(root.clone()).await?;
 
     let endpoint = crate::endpoint::local::LocalEndpoint::new(root.clone());
     let capabilities = negotiated_capabilities(client.capabilities);
@@ -142,6 +151,7 @@ where
         client,
         operation: open.operation,
         root,
+        rooted,
         ready,
     })
 }
@@ -368,6 +378,7 @@ mod tests {
         assert_eq!(client.server.version, PROTOCOL_V3);
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
+        assert_eq!(opened.rooted.root_path(), root.path());
         assert!(client.ready.capabilities.contains(CapabilitySet::BLAKE3));
         assert!(client.ready.capabilities.contains(CapabilitySet::RAW_PATHS));
         assert!(client
