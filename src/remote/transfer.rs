@@ -309,11 +309,10 @@ pub async fn serve_incoming_file(
 
     let rooted = RootedFs::open(root).await?;
     let basis = begin.basis();
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_reconstruction(rooted, &relative, basis)
-    })
-    .await
-    .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??;
+    let prepared =
+        tokio::task::spawn_blocking(move || prepare_reconstruction(rooted, &relative, basis))
+            .await
+            .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??;
 
     let (reconstruction_tx, reconstruction_rx) = mpsc::channel(RECONSTRUCTION_QUEUE_DEPTH);
     let begin_for_worker = begin.clone();
@@ -510,7 +509,7 @@ fn reconstruct_file(
                 };
                 file_size = checked_output_size(
                     file_size,
-                    usize::try_from(copy.len())
+                    usize::try_from(copy.copy_len())
                         .map_err(|_| RemoteTransferError::ByteCountOverflow)?,
                     begin.file_size(),
                 )?;
@@ -522,7 +521,7 @@ fn reconstruct_file(
                     &mut hasher,
                 )?;
                 reused_bytes = reused_bytes
-                    .checked_add(u64::from(copy.len()))
+                    .checked_add(u64::from(copy.copy_len()))
                     .ok_or(RemoteTransferError::ByteCountOverflow)?;
             }
             ReconstructionOp::End(end) => {
@@ -571,8 +570,8 @@ fn copy_basis_range(
     }
 
     basis.seek(SeekFrom::Start(copy.basis_offset()))?;
-    let mut remaining = usize::try_from(copy.len())
-        .map_err(|_| RemoteTransferError::ByteCountOverflow)?;
+    let mut remaining =
+        usize::try_from(copy.copy_len()).map_err(|_| RemoteTransferError::ByteCountOverflow)?;
     let mut buffer = [0_u8; COPY_BUFFER_SIZE];
     while remaining != 0 {
         let take = remaining.min(buffer.len());
@@ -610,9 +609,7 @@ fn validate_source(file: &File, expected: EntryIdentity, expected_size: u64) -> 
 fn validate_basis(file: &File, expected: WireFileBasis) -> Result<()> {
     let metadata = file.metadata()?;
     let identity = opened_identity(&metadata)?;
-    if metadata.len() != expected.file_size()
-        || identity.as_bytes() != &expected.identity()
-    {
+    if metadata.len() != expected.file_size() || identity.as_bytes() != &expected.identity() {
         return Err(RemoteTransferError::BasisChanged {
             expected_size: expected.file_size(),
             actual_size: metadata.len(),
@@ -730,12 +727,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        BasisIndex::new(
-            block_size as u32,
-            blocks,
-            BasisIndexLimits::default(),
-        )
-        .unwrap()
+        BasisIndex::new(block_size as u32, blocks, BasisIndexLimits::default()).unwrap()
     }
 
     #[tokio::test]
@@ -764,14 +756,9 @@ mod tests {
             .unwrap();
             let incoming = router.incoming().recv().await.unwrap().unwrap();
             let sender = router.sender();
-            serve_incoming_file(
-                opened.root,
-                incoming,
-                &sender,
-                opened.client.platform.os,
-            )
-            .await
-            .unwrap()
+            serve_incoming_file(opened.root, incoming, &sender, opened.client.platform.os)
+                .await
+                .unwrap()
         });
 
         let session = client_handshake(
@@ -804,7 +791,10 @@ mod tests {
         assert_eq!(summary.file_size, data.len() as u64);
         assert_eq!(summary.literal_bytes, data.len() as u64);
         assert_eq!(summary.reused_bytes, 0);
-        assert_eq!(std::fs::read(destination_root.path().join("file.bin")).unwrap(), data);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("file.bin")).unwrap(),
+            data
+        );
     }
 
     #[tokio::test]
@@ -838,14 +828,9 @@ mod tests {
             .unwrap();
             let incoming = router.incoming().recv().await.unwrap().unwrap();
             let sender = router.sender();
-            serve_incoming_file(
-                opened.root,
-                incoming,
-                &sender,
-                opened.client.platform.os,
-            )
-            .await
-            .unwrap()
+            serve_incoming_file(opened.root, incoming, &sender, opened.client.platform.os)
+                .await
+                .unwrap()
         });
 
         let session = client_handshake(
