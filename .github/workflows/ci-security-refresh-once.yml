@@ -54,7 +54,8 @@ jobs:
           cargo run --bin man-gen
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - name: Run all-feature tests serially for dependency validation
+        run: cargo test --all-features -- --test-threads=1
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
