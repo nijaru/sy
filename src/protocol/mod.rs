@@ -6,6 +6,7 @@ mod path;
 mod scan;
 mod session;
 mod signature;
+mod transfer;
 
 pub use entry::{WireEntry, WireEntryKind};
 pub use frame::{
@@ -23,6 +24,10 @@ pub use session::{Operation, SessionOpen, SessionReady};
 pub use signature::{
     SignatureBlockSize, WireSignature, WireSignatureEnd, WireSignatureRequest,
     MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,
+};
+pub use transfer::{
+    WireData, WireDeltaCopy, WireFileBasis, WireFileBegin, WireFileEnd, MAX_TRANSFER_DATA_SIZE,
+    TRANSFER_BASIS_IDENTITY_LEN, TRANSFER_DIGEST_LEN,
 };
 
 #[derive(Debug, thiserror::Error)]
