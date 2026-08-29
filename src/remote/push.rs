@@ -1,4 +1,5 @@
 use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::WorkItem;
 use crate::protocol::CapabilitySet;
@@ -401,6 +402,26 @@ impl RemotePushExecutor {
                 Ok(None)
             }
         }
+    }
+
+    pub async fn execute_finalize(&self, metadata: FinalizeMetadata) -> Result<()> {
+        let _permit = self
+            .scheduler
+            .acquire(ResourceRequest {
+                metadata_ops: 1,
+                network_writes: 1,
+                ..ResourceRequest::default()
+            })
+            .await?;
+        self.remote
+            .apply_metadata(
+                &metadata.path,
+                metadata.kind,
+                metadata.unix_mode,
+                metadata.modified,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn prepare_delta_basis(
