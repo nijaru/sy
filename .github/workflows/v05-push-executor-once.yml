@@ -1,0 +1,120 @@
+name: Validate bounded v3 push executor once
+on:
+  push:
+    paths:
+      - '.github/workflows/v05-push-executor-once.yml'
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Wire work and push executor
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          engine = Path('src/engine/mod.rs')
+          s = engine.read_text()
+          if 'pub mod work;' not in s:
+              s += 'pub mod work;\n'
+          engine.write_text(s)
+
+          remote = Path('src/remote/mod.rs')
+          s = remote.read_text()
+          if 'pub mod push;' not in s:
+              s = s.replace('pub mod path;\n', 'pub mod path;\npub mod push;\n', 1)
+          remote.write_text(s)
+
+          client = Path('src/remote/client.rs')
+          s = client.read_text()
+          old_import = 'use crate::remote::transfer::{request_file_transfer, RemoteDeltaBasis, TransferSummary};'
+          new_import = 'use crate::remote::transfer::{\n    request_file_transfer, request_file_transfer_with_metadata, RemoteDeltaBasis, TransferMetadata,\n    TransferSummary,\n};'
+          if old_import in s:
+              s = s.replace(old_import, new_import, 1)
+          old_method = '''    pub async fn transfer_file(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer(
+            &self.sender,
+            source_root,
+            source,
+            delta_basis,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+'''
+          new_method = '''    pub async fn transfer_file(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer(
+            &self.sender,
+            source_root,
+            source,
+            delta_basis,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn transfer_file_with_metadata(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+        metadata: TransferMetadata,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer_with_metadata(
+            &self.sender,
+            source_root,
+            source,
+            delta_basis,
+            metadata,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+'''
+          if old_method not in s:
+              raise SystemExit('expected client transfer method not found')
+          s = s.replace(old_method, new_method, 1)
+          client.write_text(s)
+          PY
+          cargo fmt --all
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: Push lowering tests
+        run: cargo test --workspace --all-features --locked remote::push::tests
+      - name: Handle concurrency regression
+        run: cargo test --workspace --all-features --locked remote::runtime::tests::session_runtime_multiplexes_two_ordered_scans
+      - name: Commit validated wiring
+        shell: bash
+        run: |
+          git rm .github/workflows/v05-push-executor-once.yml
+          git add src/engine/mod.rs src/engine/work.rs src/remote/mod.rs src/remote/client.rs src/remote/push.rs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(remote): add bounded v3 push executor'
+          git push origin HEAD:v0.5-architecture
