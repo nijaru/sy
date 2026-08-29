@@ -1,7 +1,9 @@
+#[path = "metadata.rs"]
+mod metadata;
 #[path = "mutation.rs"]
 mod mutation;
 
-use crate::engine::domain::{Entry, RelativePath};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{
@@ -26,6 +28,7 @@ use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
 use futures::StreamExt;
+use metadata::{request_metadata, serve_incoming_metadata_rooted, RemoteMetadataError};
 use mutation::{
     request_create_directory, request_remove, request_replace_symlink,
     serve_incoming_mutation_rooted, RemoteMutationError,
@@ -58,6 +61,9 @@ pub enum RemoteSessionError {
 
     #[error(transparent)]
     Transfer(#[from] RemoteTransferError),
+
+    #[error(transparent)]
+    Metadata(#[from] RemoteMetadataError),
 
     #[error(transparent)]
     Mutation(#[from] RemoteMutationError),
@@ -247,6 +253,26 @@ impl ClientRemoteSession {
         .map_err(Into::into)
     }
 
+    pub async fn apply_metadata(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Metadata)?;
+        request_metadata(
+            &self.router.sender(),
+            path,
+            kind,
+            unix_mode,
+            modified,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn create_directory(&self, path: &RelativePath) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_create_directory(&self.router.sender(), path, self.server.platform.os)
@@ -289,6 +315,7 @@ pub enum IncomingRequest {
     Scan(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
+    Metadata(IncomingStream),
     Mutation(IncomingStream),
 }
 
@@ -337,6 +364,21 @@ impl ServerFileHandler {
         incoming: IncomingStream,
     ) -> crate::remote::transfer::Result<TransferSummary> {
         serve_incoming_file_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Metadata-only updates use the same session-pinned root descriptor and never
+/// resolve the root pathname after SessionOpen.
+#[derive(Clone)]
+pub struct ServerMetadataHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerMetadataHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> metadata::Result<()> {
+        serve_incoming_metadata_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
@@ -414,6 +456,14 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn metadata_handler(&self) -> ServerMetadataHandler {
+        ServerMetadataHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
     pub fn mutation_handler(&self) -> ServerMutationHandler {
         ServerMutationHandler {
             rooted: self.opened.rooted.clone(),
@@ -433,10 +483,13 @@ impl ServerRemoteSession {
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
             }
+            FrameKind::Metadata if self.opened.operation == Operation::Push => {
+                Ok(Some(IncomingRequest::Metadata(incoming)))
+            }
             FrameKind::Mutation if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::Mutation(incoming)))
             }
-            FrameKind::FileBegin | FrameKind::Mutation => {
+            FrameKind::FileBegin | FrameKind::Metadata | FrameKind::Mutation => {
                 Err(RemoteSessionError::OperationMismatch {
                     operation: self.opened.operation,
                     kind: incoming.first.frame().kind(),
@@ -592,7 +645,9 @@ mod tests {
                             handler.serve(incoming).await.unwrap();
                         });
                     }
-                    IncomingRequest::File(_) | IncomingRequest::Mutation(_) => {
+                    IncomingRequest::File(_)
+                    | IncomingRequest::Metadata(_)
+                    | IncomingRequest::Mutation(_) => {
                         panic!("unexpected mutation request")
                     }
                 }
@@ -691,6 +746,56 @@ mod tests {
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             data
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_metadata_update() {
+        use std::os::unix::fs::MetadataExt;
+
+        let destination_root = tempfile::TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("file"), b"data").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.metadata_handler();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::Metadata(incoming) = request else {
+                panic!("expected metadata request");
+            };
+            handler.serve(incoming).await.unwrap();
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let modified = Timestamp::new(1_600_000_020, 0).unwrap();
+        session
+            .apply_metadata(
+                &RelativePath::new("file").unwrap(),
+                EntryKind::File,
+                Some(0o640),
+                Some(modified),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let metadata = std::fs::metadata(destination_root.path().join("file")).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mtime(), modified.seconds());
     }
 
     #[cfg(unix)]
