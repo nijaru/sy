@@ -26,8 +26,8 @@ pub use signature::{
     MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,
 };
 pub use transfer::{
-    WireData, WireDeltaCopy, WireFileBasis, WireFileBegin, WireFileEnd, MAX_TRANSFER_DATA_SIZE,
-    TRANSFER_BASIS_IDENTITY_LEN, TRANSFER_DIGEST_LEN,
+    WireData, WireDeltaCopy, WireFileBasis, WireFileBegin, WireFileEnd, MAX_DELTA_COPY_SIZE,
+    MAX_TRANSFER_DATA_SIZE, TRANSFER_BASIS_IDENTITY_LEN, TRANSFER_DIGEST_LEN,
 };
 
 #[derive(Debug, thiserror::Error)]

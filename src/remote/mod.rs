@@ -3,6 +3,7 @@ pub mod router;
 pub mod runtime;
 pub mod scan;
 pub mod signature;
+pub mod transfer;
 
 use crate::endpoint::Endpoint;
 use crate::protocol::{
