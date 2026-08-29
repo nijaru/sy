@@ -1,13 +1,12 @@
 use super::domain::{
-    Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, SkipReason,
-    SyncOp, Timestamp,
+    Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath,
+    SkipReason, SyncOp, Timestamp,
 };
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-const RECORD_LEN_BYTES: u64 = 4;
 const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 const ENTRY_OPTION_MODE: u8 = 1 << 0;
 const ENTRY_OPTION_SYMLINK_TARGET: u8 = 1 << 1;
@@ -76,8 +75,8 @@ impl PlanJournal {
                 maximum: MAX_RECORD_PAYLOAD,
             });
         }
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| PlanJournalError::RecordTooLarge {
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| PlanJournalError::RecordTooLarge {
                 actual: payload.len(),
                 maximum: MAX_RECORD_PAYLOAD,
             })?;
@@ -85,7 +84,10 @@ impl PlanJournal {
         self.file.write_u32(payload_len).await?;
         self.file.write_all(&payload).await?;
         self.records = self.records.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "plan journal record count overflow")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plan journal record count overflow",
+            )
         })?;
         Ok(())
     }
@@ -435,7 +437,9 @@ impl<'a> SliceReader<'a> {
         let value = self
             .payload
             .get(self.offset..end)
-            .ok_or(PlanJournalError::InvalidRecord("truncated plan journal record"))?;
+            .ok_or(PlanJournalError::InvalidRecord(
+                "truncated plan journal record",
+            ))?;
         self.offset = end;
         Ok(value)
     }

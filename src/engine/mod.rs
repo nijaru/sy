@@ -3,6 +3,7 @@ pub mod bisync_state;
 pub mod bisync_store;
 pub mod compression;
 pub mod domain;
+pub mod plan_journal;
 pub mod planner;
 pub mod reconcile;
 pub mod rolling;
