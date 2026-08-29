@@ -1,0 +1,36 @@
+name: Finalize private v3 agent once
+
+on:
+  push:
+    branches:
+      - v0.5-architecture
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - name: Apply final wiring
+        run: python3 .github/v05_private_agent_finalize.py
+      - name: Validate wired v3 surface
+        run: |
+          cargo fmt --all
+          cargo check --all-features
+      - name: Commit final wiring
+        run: |
+          rm -f .github/v05_private_agent_finalize.py
+          rm -f .github/workflows/v05-private-agent-finalize-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "feat(remote): expose private v3 ssh agent"
+          git push origin HEAD:v0.5-architecture
