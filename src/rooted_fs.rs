@@ -743,7 +743,9 @@ mod tests {
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let modified = Timestamp::new(1_600_000_000, 123_456_789).unwrap();
 
-        let mut staged = rooted.begin_staged_file_blocking(&relative("file")).unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("file"))
+            .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
         staged
             .apply_metadata_blocking(Some(0o640), Some(modified))
@@ -769,7 +771,9 @@ mod tests {
         let file_time = Timestamp::new(1_600_000_001, 0).unwrap();
         let dir_time = Timestamp::new(1_600_000_002, 0).unwrap();
         let link_time = Timestamp::new(1_600_000_003, 0).unwrap();
-        let outside_before = std::fs::metadata(outside.path().join("target")).unwrap().mtime();
+        let outside_before = std::fs::metadata(outside.path().join("target"))
+            .unwrap()
+            .mtime();
 
         rooted
             .apply_metadata_blocking(
@@ -800,7 +804,9 @@ mod tests {
         let link = std::fs::symlink_metadata(root.path().join("link")).unwrap();
         assert_eq!(link.mtime(), link_time.seconds());
         assert_eq!(
-            std::fs::metadata(outside.path().join("target")).unwrap().mtime(),
+            std::fs::metadata(outside.path().join("target"))
+                .unwrap()
+                .mtime(),
             outside_before
         );
     }
@@ -812,18 +818,17 @@ mod tests {
         std::fs::write(outside.path().join("file"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let before = std::fs::metadata(outside.path().join("file")).unwrap().mode();
+        let before = std::fs::metadata(outside.path().join("file"))
+            .unwrap()
+            .mode();
 
         assert!(rooted
-            .apply_metadata_blocking(
-                &relative("escape/file"),
-                EntryKind::File,
-                Some(0o600),
-                None,
-            )
+            .apply_metadata_blocking(&relative("escape/file"), EntryKind::File, Some(0o600), None,)
             .is_err());
         assert_eq!(
-            std::fs::metadata(outside.path().join("file")).unwrap().mode(),
+            std::fs::metadata(outside.path().join("file"))
+                .unwrap()
+                .mode(),
             before
         );
     }

@@ -934,10 +934,7 @@ mod tests {
         .unwrap();
         let wire_path = encode_relative_path(relative.as_path()).unwrap();
         let begin = WireFileBegin::whole(wire_path, 3)
-            .with_metadata(
-                Some(0o600),
-                Some((1_600_000_040, 0)),
-            )
+            .with_metadata(Some(0o600), Some((1_600_000_040, 0)))
             .unwrap();
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
