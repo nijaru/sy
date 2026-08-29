@@ -1,0 +1,38 @@
+name: Validate exact delete preflight once
+on:
+  push:
+    paths:
+      - '.github/workflows/v05-delete-plan-once.yml'
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Wire delete plan
+        run: |
+          python3 -c "from pathlib import Path; p=Path('src/engine/mod.rs'); s=p.read_text(); s=s.replace('pub mod domain;\n', 'pub(crate) mod delete_journal;\npub mod delete_plan;\npub mod domain;\n', 1) if 'mod delete_journal;' not in s else s; p.write_text(s)"
+          cargo fmt --all
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: Delete plan tests
+        run: cargo test --workspace --all-features --locked engine::delete_plan::tests
+      - name: Existing local delete regression
+        run: cargo test --workspace --all-features --locked sync::reconcile::tests::delete_preflight_removes_only_destination_only_entries
+      - name: Commit validated source
+        shell: bash
+        run: |
+          git rm .github/workflows/v05-delete-plan-once.yml
+          git add src/engine/mod.rs src/engine/delete_plan.rs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(engine): add exact bounded delete preflight'
+          git push origin HEAD:v0.5-architecture
