@@ -103,10 +103,7 @@ fn scan_worker(
     }
 }
 
-fn send_error(
-    sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
-    error: RootedScanError,
-) {
+fn send_error(sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>, error: RootedScanError) {
     let _ = sender.blocking_send(Err(Box::new(error) as BoxError));
 }
 
@@ -289,17 +286,47 @@ struct SymlinkSnapshot {
     identity: EntryIdentity,
 }
 
+#[cfg(target_os = "linux")]
+const fn stat_mode_u32(stat: &libc::stat) -> u32 {
+    stat.st_mode
+}
+
+#[cfg(target_os = "macos")]
+const fn stat_mode_u32(stat: &libc::stat) -> u32 {
+    stat.st_mode as u32
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn stat_mode_u32(stat: &libc::stat) -> u32 {
+    stat.st_mode as u32
+}
+
+#[cfg(target_os = "linux")]
+const fn stat_device_u64(stat: &libc::stat) -> u64 {
+    stat.st_dev
+}
+
+#[cfg(target_os = "macos")]
+const fn stat_device_u64(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn stat_device_u64(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
+}
+
 fn symlink_snapshot(stat: &libc::stat, path: &Path) -> Result<SymlinkSnapshot, RootedScanError> {
     let (mtime, mtime_nsec, ctime, ctime_nsec) = stat_times(stat)?;
     let modified = Timestamp::new(mtime, mtime_nsec)
         .map_err(|_| RootedScanError::InvalidTimestamp(path.to_path_buf()))?;
     let size = u64::try_from(stat.st_size)
         .map_err(|_| RootedScanError::NegativeSize(path.to_path_buf()))?;
-    let mode = stat.st_mode as u32;
+    let mode = stat_mode_u32(stat);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sy-entry-identity-v1\0");
-    hasher.update(&(stat.st_dev as u64).to_le_bytes());
-    hasher.update(&(stat.st_ino as u64).to_le_bytes());
+    hasher.update(&stat_device_u64(stat).to_le_bytes());
+    hasher.update(&stat.st_ino.to_le_bytes());
     hasher.update(&size.to_le_bytes());
     hasher.update(&mode.to_le_bytes());
     hasher.update(&mtime.to_le_bytes());
@@ -611,8 +638,10 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let mut request = ScanRequest::default();
-        request.max_depth = Some(0);
+        let request = ScanRequest {
+            max_depth: Some(0),
+            ..ScanRequest::default()
+        };
 
         assert!(collect(&rooted, request).await.is_empty());
     }
@@ -640,8 +669,10 @@ mod tests {
     async fn scan_refuses_gitignore_mode_until_it_is_descriptor_safe() {
         let root = tempfile::TempDir::new().unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let mut request = ScanRequest::default();
-        request.respect_gitignore = true;
+        let request = ScanRequest {
+            respect_gitignore: true,
+            ..ScanRequest::default()
+        };
         let mut entries = rooted.entry_stream(request);
         assert!(entries.next().await.unwrap().is_err());
     }
