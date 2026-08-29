@@ -4,7 +4,7 @@ pub mod runtime;
 pub mod scan;
 pub mod signature;
 
-use crate::endpoint::{Capabilities, Endpoint};
+use crate::endpoint::Endpoint;
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
@@ -129,11 +129,7 @@ where
     prepare_root(open.operation, &root).await?;
 
     let endpoint = crate::endpoint::local::LocalEndpoint::new(root.clone());
-    let mut capabilities = process_capabilities();
-    // `Capabilities::local()` means reflink support can be probed, not that the
-    // concrete filesystem at this root supports it. Keep SessionReady
-    // conservative until a real per-filesystem probe is part of endpoint open.
-    capabilities.remove(CapabilitySet::REFLINK);
+    let capabilities = negotiated_capabilities(client.capabilities);
     let precision = endpoint.capabilities().modtime_precision.as_nanos();
     let modtime_precision_ns = u64::try_from(precision).unwrap_or(u64::MAX);
     let ready = SessionReady::new(capabilities, modtime_precision_ns);
@@ -172,13 +168,11 @@ fn expect_control(frame: &Frame, expected: FrameKind) -> Result<()> {
 }
 
 fn process_capabilities() -> CapabilitySet {
-    // Advertise only behavior owned by the negotiated v3 runtime. The central
-    // frame router is mandatory after handshake, so multiplexing is a runtime
-    // invariant rather than a reserved protocol possibility.
-    let mut capabilities = endpoint_capabilities(&Capabilities::local())
-        | CapabilitySet::BLAKE3
-        | CapabilitySet::RAW_PATHS
-        | CapabilitySet::MULTIPLEXING;
+    // Advertise only behavior that the negotiated v3 runtime actually owns.
+    // Endpoint-local filesystem capabilities become negotiable only when their
+    // corresponding v3 operations exist.
+    let mut capabilities =
+        CapabilitySet::BLAKE3 | CapabilitySet::RAW_PATHS | CapabilitySet::MULTIPLEXING;
 
     // Rolling-signature basis reads are advertised only where RootedFs can
     // enforce held-directory-FD confinement and the v3 path encoding has been
@@ -189,57 +183,12 @@ fn process_capabilities() -> CapabilitySet {
     capabilities
 }
 
+fn negotiated_capabilities(peer: CapabilitySet) -> CapabilitySet {
+    process_capabilities() & peer
+}
+
 const fn supports_rolling_signatures(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
-}
-
-fn endpoint_capabilities(capabilities: &Capabilities) -> CapabilitySet {
-    let mut result = CapabilitySet::empty();
-    set_capability(
-        &mut result,
-        CapabilitySet::ATOMIC_REPLACE,
-        capabilities.atomic_rename,
-    );
-    set_capability(
-        &mut result,
-        CapabilitySet::STAGED_WRITE,
-        capabilities.staged_write,
-    );
-    set_capability(
-        &mut result,
-        CapabilitySet::RANDOM_READ,
-        capabilities.random_read,
-    );
-    set_capability(
-        &mut result,
-        CapabilitySet::RANDOM_WRITE,
-        capabilities.random_write,
-    );
-    set_capability(&mut result, CapabilitySet::REFLINK, capabilities.reflink);
-    set_capability(&mut result, CapabilitySet::SPARSE, capabilities.sparse);
-    set_capability(
-        &mut result,
-        CapabilitySet::XATTR,
-        capabilities.preserve_xattrs,
-    );
-    set_capability(&mut result, CapabilitySet::ACL, capabilities.preserve_acls);
-    set_capability(
-        &mut result,
-        CapabilitySet::HARDLINK,
-        capabilities.preserve_hardlinks,
-    );
-    set_capability(
-        &mut result,
-        CapabilitySet::BSD_FLAGS,
-        capabilities.preserve_flags,
-    );
-    result
-}
-
-fn set_capability(set: &mut CapabilitySet, capability: CapabilitySet, enabled: bool) {
-    if enabled {
-        set.insert(capability);
-    }
 }
 
 async fn prepare_root(operation: Operation, root: &Path) -> Result<()> {
@@ -421,7 +370,39 @@ mod tests {
                 .contains(CapabilitySet::ROLLING_SIGNATURES),
             supports_rolling_signatures(Platform::current().os)
         );
+        assert!(!client.ready.capabilities.contains(CapabilitySet::ATOMIC_REPLACE));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::STAGED_WRITE));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_READ));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_WRITE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::SPARSE));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::XATTR));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::ACL));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::HARDLINK));
+        assert!(!client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS));
+    }
+
+    #[test]
+    fn process_capabilities_are_runtime_backed_and_peer_bounded() {
+        let local = process_capabilities();
+        assert!(local.contains(CapabilitySet::BLAKE3));
+        assert!(local.contains(CapabilitySet::RAW_PATHS));
+        assert!(local.contains(CapabilitySet::MULTIPLEXING));
+        assert!(!local.intersects(
+            CapabilitySet::ATOMIC_REPLACE
+                | CapabilitySet::STAGED_WRITE
+                | CapabilitySet::RANDOM_READ
+                | CapabilitySet::RANDOM_WRITE
+                | CapabilitySet::REFLINK
+                | CapabilitySet::SPARSE
+                | CapabilitySet::XATTR
+                | CapabilitySet::ACL
+                | CapabilitySet::HARDLINK
+                | CapabilitySet::BSD_FLAGS
+        ));
+
+        let peer = CapabilitySet::BLAKE3 | CapabilitySet::MULTIPLEXING;
+        assert_eq!(negotiated_capabilities(peer), peer);
     }
 
     #[test]
