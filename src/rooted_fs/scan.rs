@@ -103,6 +103,13 @@ fn scan_worker(
     }
 }
 
+fn send_error(
+    sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
+    error: RootedScanError,
+) {
+    let _ = sender.blocking_send(Err(Box::new(error) as BoxError));
+}
+
 fn walk_directory(
     directory: &OwnedFd,
     relative_dir: &Path,
