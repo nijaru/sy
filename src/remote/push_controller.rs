@@ -1,4 +1,4 @@
-use crate::engine::domain::{RelativePath, SyncOp};
+use crate::engine::domain::RelativePath;
 use crate::engine::finalize_journal::{
     FinalizeJournal, FinalizeJournalError, FinalizeMetadata,
 };
@@ -243,7 +243,7 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::domain::{Entry, EntryKind, Timestamp};
+    use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
     use crate::engine::reconcile::BoxError;
     use futures::stream;
     use std::path::PathBuf;
