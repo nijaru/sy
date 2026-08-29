@@ -1,3 +1,6 @@
+#[cfg(unix)]
+mod scan;
+
 use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
 use std::ffi::OsString;
 use std::fs::File;

@@ -13,7 +13,7 @@ use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
 };
-use crate::remote::scan::{request_scan, serve_incoming_scan};
+use crate::remote::scan::{request_scan, serve_incoming_scan_rooted};
 use crate::remote::signature::{
     choose_signature_block_size, request_signatures, serve_incoming_signatures_rooted,
     RemoteSignatureError, SignatureEvent, SignatureStream,
@@ -321,13 +321,13 @@ pub enum IncomingRequest {
 
 #[derive(Clone)]
 pub struct ServerScanHandler {
-    root: PathBuf,
+    rooted: RootedFs,
     sender: RouterSender,
 }
 
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
-        serve_incoming_scan(&self.root, incoming, &self.sender).await
+        serve_incoming_scan_rooted(self.rooted.clone(), incoming, &self.sender).await
     }
 }
 
@@ -435,7 +435,7 @@ impl ServerRemoteSession {
 
     pub fn scan_handler(&self) -> ServerScanHandler {
         ServerScanHandler {
-            root: self.opened.root.clone(),
+            rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
         }
     }

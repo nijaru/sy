@@ -64,15 +64,17 @@ impl RootedFs {
         let join_sender = sender.clone();
 
         tokio::spawn(async move {
-            let scan = tokio::task::spawn_blocking(move || scan_worker(rooted, request, sender)).await;
+            let scan =
+                tokio::task::spawn_blocking(move || scan_worker(rooted, request, sender)).await;
             if let Err(error) = scan {
                 let _ = join_sender.send(Err(Box::new(error) as BoxError)).await;
             }
         });
 
-        Box::pin(futures::stream::unfold(receiver, |mut receiver| async move {
-            receiver.recv().await.map(|entry| (entry, receiver))
-        }))
+        Box::pin(futures::stream::unfold(
+            receiver,
+            |mut receiver| async move { receiver.recv().await.map(|entry| (entry, receiver)) },
+        ))
     }
 }
 
@@ -154,15 +156,23 @@ fn inspect_entry(
 
     if file_type == libc::S_IFDIR {
         let directory = open_dir_at(parent, name, relative.as_path())?;
-        let file = File::from(directory.try_clone().map_err(|source| RootedScanError::Metadata {
-            path: relative.as_path().to_path_buf(),
-            source,
-        })?);
-        let metadata = file.metadata().map_err(|source| RootedScanError::Metadata {
-            path: relative.as_path().to_path_buf(),
-            source,
-        })?;
-        let entry = entry_from_metadata(relative.clone(), EntryKind::Directory, &metadata, request)?;
+        let file =
+            File::from(
+                directory
+                    .try_clone()
+                    .map_err(|source| RootedScanError::Metadata {
+                        path: relative.as_path().to_path_buf(),
+                        source,
+                    })?,
+            );
+        let metadata = file
+            .metadata()
+            .map_err(|source| RootedScanError::Metadata {
+                path: relative.as_path().to_path_buf(),
+                source,
+            })?;
+        let entry =
+            entry_from_metadata(relative.clone(), EntryKind::Directory, &metadata, request)?;
         return Ok(InspectedEntry {
             entry,
             directory: Some(directory),
@@ -171,10 +181,12 @@ fn inspect_entry(
 
     if file_type == libc::S_IFREG {
         let file = open_regular_at(parent, name, relative.as_path())?;
-        let metadata = file.metadata().map_err(|source| RootedScanError::Metadata {
-            path: relative.as_path().to_path_buf(),
-            source,
-        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| RootedScanError::Metadata {
+                path: relative.as_path().to_path_buf(),
+                source,
+            })?;
         if !metadata.file_type().is_file() {
             return Err(RootedScanError::UnstableSymlink(
                 relative.as_path().to_path_buf(),
@@ -294,8 +306,10 @@ fn symlink_snapshot(stat: &libc::stat, path: &Path) -> Result<SymlinkSnapshot, R
 
 #[cfg(target_os = "linux")]
 fn stat_times(stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
-    let mtime_nsec = u32::try_from(stat.st_mtime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
-    let ctime_nsec = u32::try_from(stat.st_ctime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
+    let mtime_nsec =
+        u32::try_from(stat.st_mtime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
+    let ctime_nsec =
+        u32::try_from(stat.st_ctime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
     Ok((stat.st_mtime, mtime_nsec, stat.st_ctime, ctime_nsec))
 }
 
@@ -351,7 +365,9 @@ fn directory_names(fd: RawFd) -> Result<Vec<OsString>, RootedScanError> {
         if entry.is_null() {
             let errno = get_errno();
             if errno != 0 {
-                return Err(RootedScanError::ReadDirectory(io::Error::from_raw_os_error(errno)));
+                return Err(RootedScanError::ReadDirectory(
+                    io::Error::from_raw_os_error(errno),
+                ));
             }
             break;
         }
@@ -505,10 +521,12 @@ fn readlink_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<PathBuf, Root
 }
 
 fn component_cstring(name: &OsStr) -> Result<CString, RootedScanError> {
-    CString::new(name.as_bytes()).map_err(|_| RootedScanError::ReadDirectory(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "directory entry contains NUL",
-    )))
+    CString::new(name.as_bytes()).map_err(|_| {
+        RootedScanError::ReadDirectory(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory entry contains NUL",
+        ))
+    })
 }
 
 #[cfg(target_os = "linux")]

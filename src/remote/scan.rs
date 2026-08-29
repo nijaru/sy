@@ -8,6 +8,7 @@ use crate::protocol::{
     WireEntry, WireEntryKind, WirePath, WireScanRequest,
 };
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
+use crate::rooted_fs::RootedFs;
 use futures::StreamExt;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -114,8 +115,8 @@ pub async fn request_scan(
 /// `EntryEnd` is an acknowledged stream boundary. Keeping the peer inbox alive
 /// until its ACK arrives prevents a short-lived server/session from tearing down
 /// the router while the final metadata frames are still queued for transport.
-pub async fn serve_incoming_scan(
-    root: &Path,
+pub async fn serve_incoming_scan_rooted(
+    rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
 ) -> Result<()> {
@@ -126,19 +127,30 @@ pub async fn serve_incoming_scan(
     let request = decode_scan_request(first_frame)?;
     drop(first);
 
-    serve_scan(root, request, sender, stream_id).await?;
+    serve_scan(rooted, request, sender, stream_id).await?;
     receive_scan_ack(&mut inbox, stream_id).await
 }
 
-async fn serve_scan(
+#[cfg(test)]
+pub async fn serve_incoming_scan(
     root: &Path,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+) -> Result<()> {
+    let rooted = RootedFs::open(root.to_path_buf())
+        .await
+        .map_err(|error| RemoteScanError::LocalScan(Box::new(error)))?;
+    serve_incoming_scan_rooted(rooted, incoming, sender).await
+}
+
+async fn serve_scan(
+    rooted: RootedFs,
     request: ScanRequest,
     sender: &RouterSender,
     stream_id: StreamId,
 ) -> Result<()> {
     require_data_stream(stream_id)?;
-    let mut entries =
-        crate::endpoint::local_entry_scan::local_entry_stream(root.to_path_buf(), request);
+    let mut entries = rooted.entry_stream(request);
 
     while let Some(entry) = entries.next().await {
         let entry = entry.map_err(RemoteScanError::LocalScan)?;
