@@ -13,6 +13,10 @@ use crate::remote::signature::{
     choose_signature_block_size, request_signatures, serve_incoming_signatures,
     RemoteSignatureError, SignatureEvent, SignatureStream,
 };
+use crate::remote::transfer::{
+    request_file_transfer, serve_incoming_file, RemoteDeltaBasis, RemoteTransferError,
+    TransferSummary,
+};
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
@@ -35,8 +39,17 @@ pub enum RemoteSessionError {
     #[error("unsupported v3 request opener: {0:?}")]
     UnsupportedRequest(FrameKind),
 
+    #[error("v3 request {kind:?} is invalid for {operation:?} session direction")]
+    OperationMismatch {
+        operation: Operation,
+        kind: FrameKind,
+    },
+
     #[error(transparent)]
     Signature(#[from] RemoteSignatureError),
+
+    #[error(transparent)]
+    Transfer(#[from] RemoteTransferError),
 
     #[error(transparent)]
     BasisIndex(#[from] BasisIndexError),
@@ -67,6 +80,7 @@ pub type Result<T> = std::result::Result<T, RemoteSessionError>;
 /// handshake succeeds, only the central `FrameRouter` can read or write frames.
 /// This makes raw post-handshake transport I/O impossible by construction.
 pub struct ClientRemoteSession {
+    operation: Operation,
     server: ServerHello,
     ready: SessionReady,
     router: FrameRouter,
@@ -87,10 +101,15 @@ impl ClientRemoteSession {
         let negotiated = client_handshake(&mut reader, &mut writer, operation, root).await?;
         let router = FrameRouter::start(reader, writer, RouterRole::Client, config)?;
         Ok(Self {
+            operation,
             server: negotiated.server,
             ready: negotiated.ready,
             router,
         })
+    }
+
+    pub const fn operation(&self) -> Operation {
+        self.operation
     }
 
     pub fn server(&self) -> &ServerHello {
@@ -207,12 +226,39 @@ impl ClientRemoteSession {
             Ok(Some(builder.finish()))
         }
     }
+
+    /// Transfer one regular file from a pinned local source root into this
+    /// remote Push session. Delta mode reuses a previously validated remote
+    /// basis/index without collecting transfer operations in memory.
+    pub async fn transfer_file(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+    ) -> Result<TransferSummary> {
+        if self.operation != Operation::Push {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind: FrameKind::FileBegin,
+            });
+        }
+        request_file_transfer(
+            &self.router.sender(),
+            source_root,
+            source,
+            delta_basis,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
 }
 
 /// Peer-opened operations currently implemented by the v3 session runtime.
 pub enum IncomingRequest {
     Scan(IncomingStream),
     Signatures(IncomingStream),
+    File(IncomingStream),
 }
 
 /// Cloneable server-side context for servicing scan streams concurrently.
@@ -239,6 +285,23 @@ pub struct ServerSignatureHandler {
 impl ServerSignatureHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::signature::Result<()> {
         serve_incoming_signatures(&self.root, incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Cloneable server-side context for verified staged file reconstruction.
+#[derive(Clone)]
+pub struct ServerFileHandler {
+    root: PathBuf,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerFileHandler {
+    pub async fn serve(
+        &self,
+        incoming: IncomingStream,
+    ) -> crate::remote::transfer::Result<TransferSummary> {
+        serve_incoming_file(self.root.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
@@ -298,6 +361,14 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn file_handler(&self) -> ServerFileHandler {
+        ServerFileHandler {
+            root: self.opened.root.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
@@ -306,6 +377,13 @@ impl ServerRemoteSession {
         match incoming.first.frame().kind() {
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
+            FrameKind::FileBegin if self.opened.operation == Operation::Push => {
+                Ok(Some(IncomingRequest::File(incoming)))
+            }
+            FrameKind::FileBegin => Err(RemoteSessionError::OperationMismatch {
+                operation: self.opened.operation,
+                kind: FrameKind::FileBegin,
+            }),
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
         }
     }
@@ -460,6 +538,7 @@ mod tests {
                             handler.serve(incoming).await.unwrap();
                         });
                     }
+                    IncomingRequest::File(_) => panic!("unexpected file request"),
                 }
             }
 
@@ -510,6 +589,54 @@ mod tests {
                 PathBuf::from("data.bin"),
                 PathBuf::from("dir")
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_verified_file_transfer() {
+        let source_root = tempfile::TempDir::new().unwrap();
+        let destination_root = tempfile::TempDir::new().unwrap();
+        let data = b"runtime-transfer";
+        std::fs::write(source_root.path().join("file.bin"), data).unwrap();
+        std::fs::write(destination_root.path().join("file.bin"), b"old").unwrap();
+        let source = file_entry(source_root.path(), "file.bin");
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.file_handler();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::File(incoming) = request else {
+                panic!("expected file request");
+            };
+            handler.serve(incoming).await.unwrap()
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let sent = session
+            .transfer_file(source_root.path().to_path_buf(), source, None)
+            .await
+            .unwrap();
+        let received = server.await.unwrap();
+
+        assert_eq!(sent, received);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("file.bin")).unwrap(),
+            data
         );
     }
 }

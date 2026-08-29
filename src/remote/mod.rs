@@ -174,12 +174,18 @@ fn process_capabilities() -> CapabilitySet {
     // corresponding v3 operations exist.
     let mut capabilities =
         CapabilitySet::BLAKE3 | CapabilitySet::RAW_PATHS | CapabilitySet::MULTIPLEXING;
+    let os = Platform::current().os;
 
     // Rolling-signature basis reads are advertised only where RootedFs can
     // enforce held-directory-FD confinement and the v3 path encoding has been
     // validated. Linux and macOS are the supported cross-OS family for 0.5.
-    if supports_rolling_signatures(Platform::current().os) {
+    if supports_rolling_signatures(os) {
         capabilities.insert(CapabilitySet::ROLLING_SIGNATURES);
+    }
+    // File transfers now reconstruct into a same-directory no-follow staging
+    // file and rename it through the held parent descriptor after verification.
+    if supports_staged_files(os) {
+        capabilities.insert(CapabilitySet::STAGED_WRITE | CapabilitySet::ATOMIC_REPLACE);
     }
     capabilities
 }
@@ -189,6 +195,10 @@ fn negotiated_capabilities(peer: CapabilitySet) -> CapabilitySet {
 }
 
 const fn supports_rolling_signatures(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+const fn supports_staged_files(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
 }
 
@@ -371,8 +381,20 @@ mod tests {
                 .contains(CapabilitySet::ROLLING_SIGNATURES),
             supports_rolling_signatures(Platform::current().os)
         );
-        assert!(!client.ready.capabilities.contains(CapabilitySet::ATOMIC_REPLACE));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::STAGED_WRITE));
+        assert_eq!(
+            client
+                .ready
+                .capabilities
+                .contains(CapabilitySet::ATOMIC_REPLACE),
+            supports_staged_files(Platform::current().os)
+        );
+        assert_eq!(
+            client
+                .ready
+                .capabilities
+                .contains(CapabilitySet::STAGED_WRITE),
+            supports_staged_files(Platform::current().os)
+        );
         assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_READ));
         assert!(!client.ready.capabilities.contains(CapabilitySet::RANDOM_WRITE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
@@ -389,10 +411,16 @@ mod tests {
         assert!(local.contains(CapabilitySet::BLAKE3));
         assert!(local.contains(CapabilitySet::RAW_PATHS));
         assert!(local.contains(CapabilitySet::MULTIPLEXING));
+        assert_eq!(
+            local.contains(CapabilitySet::ATOMIC_REPLACE),
+            supports_staged_files(Platform::current().os)
+        );
+        assert_eq!(
+            local.contains(CapabilitySet::STAGED_WRITE),
+            supports_staged_files(Platform::current().os)
+        );
         assert!(!local.intersects(
-            CapabilitySet::ATOMIC_REPLACE
-                | CapabilitySet::STAGED_WRITE
-                | CapabilitySet::RANDOM_READ
+            CapabilitySet::RANDOM_READ
                 | CapabilitySet::RANDOM_WRITE
                 | CapabilitySet::REFLINK
                 | CapabilitySet::SPARSE
@@ -412,6 +440,14 @@ mod tests {
         assert!(supports_rolling_signatures(PlatformOs::Macos));
         assert!(!supports_rolling_signatures(PlatformOs::Windows));
         assert!(!supports_rolling_signatures(PlatformOs::Other(4)));
+    }
+
+    #[test]
+    fn staged_files_are_scoped_to_tested_os_family() {
+        assert!(supports_staged_files(PlatformOs::Linux));
+        assert!(supports_staged_files(PlatformOs::Macos));
+        assert!(!supports_staged_files(PlatformOs::Windows));
+        assert!(!supports_staged_files(PlatformOs::Other(4)));
     }
 
     #[tokio::test]
