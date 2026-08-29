@@ -160,8 +160,6 @@ impl From<SharedRouterError> for RemoteSignatureError {
 
 pub type Result<T> = std::result::Result<T, RemoteSignatureError>;
 
-/// Choose a power-of-two block size targeting roughly 4096 signatures per file.
-/// The protocol bounds keep the common case between 4 KiB and 1 MiB.
 pub fn choose_signature_block_size(file_size: u64) -> u32 {
     let ideal = file_size.div_ceil(TARGET_SIGNATURE_BLOCKS).max(1);
     let rounded = ideal.checked_next_power_of_two().unwrap_or(u64::MAX);
@@ -171,9 +169,6 @@ pub fn choose_signature_block_size(file_size: u64) -> u32 {
     ) as u32
 }
 
-/// Request destination rolling signatures without materializing the signature
-/// set. The returned stream validates order, block sizing, and final byte/count
-/// totals before acknowledging completion.
 pub async fn request_signatures(
     sender: &RouterSender,
     path: &RelativePath,
@@ -191,13 +186,14 @@ pub async fn request_signatures(
         path: encode_relative_path(path.as_path())?,
         block_size: block_size_wire,
     };
-    let frame = Frame::new(
-        FrameKind::SignatureRequest,
-        FrameFlags::empty(),
-        stream_id,
-        request.encode(),
-    )?;
-    sender.send(frame).await?;
+    sender
+        .send(Frame::new(
+            FrameKind::SignatureRequest,
+            FrameFlags::empty(),
+            stream_id,
+            request.encode(),
+        )?)
+        .await?;
 
     Ok((
         block_size,
@@ -211,15 +207,11 @@ pub async fn request_signatures(
     ))
 }
 
-/// Serve one peer-opened destination signature request.
-///
-/// The root is pinned before peer-controlled relative-path resolution. File
-/// opening and hashing run on a blocking worker; every relative component is
-/// opened beneath the held root with no-follow semantics. A small bounded
-/// channel is the only producer queue, followed by the router's byte/frame
-/// budgets.
-pub async fn serve_incoming_signatures(
-    root: &Path,
+/// Serve one peer-opened destination signature request beneath a root that was
+/// pinned when the v3 session was opened. No request-time root pathname lookup
+/// is performed.
+pub async fn serve_incoming_signatures_rooted(
+    rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
@@ -233,20 +225,20 @@ pub async fn serve_incoming_signatures(
     let block_size = request.block_size;
     drop(first);
 
-    let rooted = RootedFs::open(root.to_path_buf()).await?;
     let (producer_tx, mut producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
         produce_signatures(rooted, relative, block_size, producer_tx)
     });
 
     while let Some(signature) = producer_rx.recv().await {
-        let frame = Frame::new(
-            FrameKind::Signature,
-            FrameFlags::empty(),
-            stream_id,
-            signature.encode(),
-        )?;
-        sender.send(frame).await?;
+        sender
+            .send(Frame::new(
+                FrameKind::Signature,
+                FrameFlags::empty(),
+                stream_id,
+                signature.encode(),
+            )?)
+            .await?;
     }
 
     let summary = producer
@@ -257,14 +249,26 @@ pub async fn serve_incoming_signatures(
         summary.block_count,
         *summary.basis_identity.as_bytes(),
     )?;
-    let frame = Frame::new(
-        FrameKind::SignatureEnd,
-        FrameFlags::ACK_REQUIRED,
-        stream_id,
-        end.encode(),
-    )?;
-    sender.send(frame).await?;
+    sender
+        .send(Frame::new(
+            FrameKind::SignatureEnd,
+            FrameFlags::ACK_REQUIRED,
+            stream_id,
+            end.encode(),
+        )?)
+        .await?;
     receive_signature_ack(&mut inbox, stream_id).await
+}
+
+#[cfg(test)]
+async fn serve_incoming_signatures(
+    root: &Path,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+    peer: PlatformOs,
+) -> Result<()> {
+    let rooted = RootedFs::open(root.to_path_buf()).await?;
+    serve_incoming_signatures_rooted(rooted, incoming, sender, peer).await
 }
 
 fn produce_signatures(
@@ -469,13 +473,15 @@ fn remote_signature_stream(
                     });
                 }
 
-                let ack = Frame::new(
-                    FrameKind::Ack,
-                    FrameFlags::empty(),
-                    state.stream_id,
-                    bytes::Bytes::new(),
-                )?;
-                state.sender.send(ack).await?;
+                state
+                    .sender
+                    .send(Frame::new(
+                        FrameKind::Ack,
+                        FrameFlags::empty(),
+                        state.stream_id,
+                        bytes::Bytes::new(),
+                    )?)
+                    .await?;
                 let basis_identity = EntryIdentity::from_bytes(end.basis_identity());
                 if end.file_size() != state.expected_file_size
                     || basis_identity != state.expected_identity
