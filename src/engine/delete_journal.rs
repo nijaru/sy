@@ -8,7 +8,7 @@ const RECORD_HEADER_LEN: usize = 5;
 const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeleteKind {
+pub enum DeleteKind {
     FileLike,
     Directory,
     /// Marks an earlier candidate directory as non-deletable because the
@@ -17,9 +17,9 @@ pub(crate) enum DeleteKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeleteRecord {
-    pub(crate) path: PathBuf,
-    pub(crate) kind: DeleteKind,
+pub struct DeleteRecord {
+    pub path: PathBuf,
+    pub kind: DeleteKind,
 }
 
 /// Exact, bounded-memory spool for destination-only paths.
@@ -27,13 +27,13 @@ pub(crate) struct DeleteRecord {
 /// Records are appended in reconciliation order and replayed from the end. The
 /// trailing record length makes reverse iteration possible without retaining an
 /// in-memory offset index, so memory use is independent of deletion count.
-pub(crate) struct DeleteJournal {
+pub struct DeleteJournal {
     file: tokio::fs::File,
     records: usize,
 }
 
 impl DeleteJournal {
-    pub(crate) async fn new() -> Result<Self> {
+    pub async fn new() -> Result<Self> {
         let file = tokio::task::spawn_blocking(tempfile::tempfile)
             .await
             .map_err(join_error)??;
@@ -43,7 +43,7 @@ impl DeleteJournal {
         })
     }
 
-    pub(crate) async fn append(&mut self, path: &Path, kind: DeleteKind) -> Result<()> {
+    pub async fn append(&mut self, path: &Path, kind: DeleteKind) -> Result<()> {
         let path = encode_path(path.as_os_str());
         let payload_len = RECORD_HEADER_LEN
             .checked_add(path.len())
@@ -75,7 +75,7 @@ impl DeleteJournal {
         Ok(())
     }
 
-    pub(crate) async fn seal(mut self) -> Result<DeleteJournalReader> {
+    pub async fn seal(mut self) -> Result<DeleteJournalReader> {
         self.file.flush().await?;
         let cursor = self.file.metadata().await?.len();
         Ok(DeleteJournalReader {
@@ -86,14 +86,14 @@ impl DeleteJournal {
     }
 }
 
-pub(crate) struct DeleteJournalReader {
+pub struct DeleteJournalReader {
     file: tokio::fs::File,
     cursor: u64,
     remaining: usize,
 }
 
 impl DeleteJournalReader {
-    pub(crate) async fn next(&mut self) -> Result<Option<DeleteRecord>> {
+    pub async fn next(&mut self) -> Result<Option<DeleteRecord>> {
         if self.cursor == 0 {
             if self.remaining != 0 {
                 return Err(invalid_data(
