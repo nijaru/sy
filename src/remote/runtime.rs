@@ -10,9 +10,14 @@ use crate::remote::router::{
 };
 use crate::remote::scan::{request_scan, serve_incoming_scan};
 use crate::remote::signature::{
-    request_signatures, serve_incoming_signatures, RemoteSignatureError, SignatureStream,
+    choose_signature_block_size, request_signatures, serve_incoming_signatures,
+    RemoteSignatureError, SignatureEvent, SignatureStream,
 };
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
+use crate::transfer::delta::{
+    BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
+};
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -29,6 +34,23 @@ pub enum RemoteSessionError {
 
     #[error("unsupported v3 request opener: {0:?}")]
     UnsupportedRequest(FrameKind),
+
+    #[error(transparent)]
+    Signature(#[from] RemoteSignatureError),
+
+    #[error(transparent)]
+    BasisIndex(#[from] BasisIndexError),
+
+    #[error("remote signature stream failed: {0}")]
+    SignatureStream(String),
+
+    #[error("remote signature stream ended without SignatureEnd")]
+    MissingSignatureEnd,
+
+    #[error(
+        "signature block-size selection changed unexpectedly: expected {expected}, got {actual}"
+    )]
+    SignatureBlockSizeMismatch { expected: u32, actual: u32 },
 }
 
 impl From<SharedRouterError> for RemoteSessionError {
@@ -112,6 +134,78 @@ impl ClientRemoteSession {
             self.server.platform.os,
         )
         .await
+    }
+
+    /// Build the bounded rolling-delta basis index directly from the validated
+    /// remote signature stream. If an honest basis would exceed the configured
+    /// signature budget, return `None` before opening a remote stream so the
+    /// planner can fall back to whole-file transfer without wasting bandwidth.
+    pub async fn delta_basis(
+        &self,
+        basis: &Entry,
+        limits: BasisIndexLimits,
+    ) -> Result<Option<BasisIndex>> {
+        if !self
+            .ready
+            .capabilities
+            .contains(CapabilitySet::ROLLING_SIGNATURES)
+        {
+            return Err(RemoteSignatureError::UnsupportedByPeer.into());
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis.into());
+        }
+        if basis.identity.is_none() {
+            return Err(RemoteSignatureError::MissingBasisIdentity.into());
+        }
+
+        let block_size = choose_signature_block_size(basis.size);
+        let mut builder = BasisIndexBuilder::new(block_size, limits)?;
+        let max_blocks = u64::try_from(limits.max_blocks).unwrap_or(u64::MAX);
+        let expected_blocks = basis.size.div_ceil(u64::from(block_size));
+        if expected_blocks > max_blocks {
+            return Ok(None);
+        }
+
+        let (actual_block_size, mut signatures) = self.signatures(basis).await?;
+        if actual_block_size != block_size {
+            return Err(RemoteSessionError::SignatureBlockSizeMismatch {
+                expected: block_size,
+                actual: actual_block_size,
+            });
+        }
+
+        let mut over_limit = false;
+        loop {
+            let Some(event) = signatures.next().await else {
+                return Err(RemoteSessionError::MissingSignatureEnd);
+            };
+            let event =
+                event.map_err(|error| RemoteSessionError::SignatureStream(error.to_string()))?;
+            match event {
+                SignatureEvent::Block(block) if !over_limit => {
+                    let block = BasisBlock {
+                        index: block.index,
+                        size: block.size,
+                        weak: block.weak,
+                        strong: block.strong,
+                    };
+                    match builder.push(block) {
+                        Ok(()) => {}
+                        Err(BasisIndexError::TooManyBlocks { .. }) => over_limit = true,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                SignatureEvent::Block(_) => {}
+                SignatureEvent::End(_) => break,
+            }
+        }
+
+        if over_limit {
+            Ok(None)
+        } else {
+            Ok(Some(builder.finish()))
+        }
     }
 }
 
@@ -223,8 +317,7 @@ mod tests {
     #[cfg(unix)]
     use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
     use crate::engine::scan::EntryMetadataRequest;
-    use crate::remote::signature::{SignatureEvent, SignatureSummary};
-    use futures::StreamExt;
+    use crate::transfer::delta::BasisIndexLimits;
     use tokio::task::JoinSet;
 
     #[cfg(unix)]
@@ -248,20 +341,6 @@ mod tests {
             paths.push(entry.unwrap().path.as_path().to_path_buf());
         }
         paths
-    }
-
-    async fn collect_signature_summary(
-        mut signatures: SignatureStream,
-    ) -> (usize, SignatureSummary) {
-        let mut block_count = 0_usize;
-        let mut summary = None;
-        while let Some(event) = signatures.next().await {
-            match event.unwrap() {
-                SignatureEvent::Block(_) => block_count += 1,
-                SignatureEvent::End(end) => summary = Some(end),
-            }
-        }
-        (block_count, summary.unwrap())
     }
 
     #[tokio::test]
@@ -333,6 +412,14 @@ mod tests {
         ];
         assert_eq!(first, expected);
         assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn signature_budget_preflight_avoids_unbounded_index_growth() {
+        let block_size = choose_signature_block_size(80 * 1024 * 1024 * 1024);
+        assert_eq!(block_size, 1024 * 1024);
+        let expected_blocks = (80_u64 * 1024 * 1024 * 1024).div_ceil(u64::from(block_size));
+        assert!(expected_blocks > u64::try_from(BasisIndexLimits::default().max_blocks).unwrap());
     }
 
     #[cfg(unix)]
@@ -407,23 +494,15 @@ mod tests {
         // runtime can interleave metadata and demand-driven signature traffic on
         // the same negotiated transport.
         let entries = session.scan(scan_request).await.unwrap();
-        let (block_size, signatures) = session.signatures(&signature_basis).await.unwrap();
-        let (paths, (blocks, summary)) = tokio::join!(
+        let (paths, delta_basis) = tokio::join!(
             collect_paths(entries),
-            collect_signature_summary(signatures)
+            session.delta_basis(&signature_basis, BasisIndexLimits::default())
         );
         server.await.unwrap();
 
-        assert_eq!(block_size, 4 * 1024);
-        assert_eq!(blocks, 3);
-        assert_eq!(
-            summary,
-            SignatureSummary {
-                file_size: 10_000,
-                block_count: 3,
-                basis_identity: signature_basis.identity.unwrap(),
-            }
-        );
+        let delta_basis = delta_basis.unwrap().unwrap();
+        assert_eq!(delta_basis.block_size(), 4 * 1024);
+        assert_eq!(delta_basis.block_count(), 3);
         assert_eq!(
             paths,
             vec![
