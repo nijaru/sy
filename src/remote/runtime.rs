@@ -10,14 +10,15 @@ use crate::remote::router::{
 };
 use crate::remote::scan::{request_scan, serve_incoming_scan};
 use crate::remote::signature::{
-    choose_signature_block_size, request_signatures, serve_incoming_signatures,
+    choose_signature_block_size, request_signatures, serve_incoming_signatures_rooted,
     RemoteSignatureError, SignatureEvent, SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, serve_incoming_file, RemoteDeltaBasis, RemoteTransferError,
+    request_file_transfer, serve_incoming_file_rooted, RemoteDeltaBasis, RemoteTransferError,
     TransferSummary,
 };
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
+use crate::rooted_fs::RootedFs;
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
@@ -74,11 +75,6 @@ impl From<SharedRouterError> for RemoteSessionError {
 
 pub type Result<T> = std::result::Result<T, RemoteSessionError>;
 
-/// Client-side owner for one negotiated v3 remote session.
-///
-/// Construction consumes the transport halves: after the control-plane
-/// handshake succeeds, only the central `FrameRouter` can read or write frames.
-/// This makes raw post-handshake transport I/O impossible by construction.
 pub struct ClientRemoteSession {
     operation: Operation,
     server: ServerHello,
@@ -155,10 +151,6 @@ impl ClientRemoteSession {
         .await
     }
 
-    /// Build the bounded rolling-delta basis index directly from the validated
-    /// remote signature stream. If an honest basis would exceed the configured
-    /// signature budget, return `None` before opening a remote stream so the
-    /// planner can fall back to whole-file transfer without wasting bandwidth.
     pub async fn delta_basis(
         &self,
         basis: &Entry,
@@ -227,9 +219,6 @@ impl ClientRemoteSession {
         }
     }
 
-    /// Transfer one regular file from a pinned local source root into this
-    /// remote Push session. Delta mode reuses a previously validated remote
-    /// basis/index without collecting transfer operations in memory.
     pub async fn transfer_file(
         &self,
         source_root: PathBuf,
@@ -254,14 +243,12 @@ impl ClientRemoteSession {
     }
 }
 
-/// Peer-opened operations currently implemented by the v3 session runtime.
 pub enum IncomingRequest {
     Scan(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
 }
 
-/// Cloneable server-side context for servicing scan streams concurrently.
 #[derive(Clone)]
 pub struct ServerScanHandler {
     root: PathBuf,
@@ -274,24 +261,28 @@ impl ServerScanHandler {
     }
 }
 
-/// Cloneable server-side context for demand-driven rolling signatures.
+/// Signature requests share the root descriptor opened at SessionOpen. Cloning
+/// this handler duplicates authority to that same held directory, not the root
+/// pathname.
 #[derive(Clone)]
 pub struct ServerSignatureHandler {
-    root: PathBuf,
+    rooted: RootedFs,
     sender: RouterSender,
     peer: PlatformOs,
 }
 
 impl ServerSignatureHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::signature::Result<()> {
-        serve_incoming_signatures(&self.root, incoming, &self.sender, self.peer).await
+        serve_incoming_signatures_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
-/// Cloneable server-side context for verified staged file reconstruction.
+/// File reconstruction shares the root descriptor opened at SessionOpen, so a
+/// later rename or symlink replacement of the root pathname cannot redirect a
+/// transfer.
 #[derive(Clone)]
 pub struct ServerFileHandler {
-    root: PathBuf,
+    rooted: RootedFs,
     sender: RouterSender,
     peer: PlatformOs,
 }
@@ -301,15 +292,10 @@ impl ServerFileHandler {
         &self,
         incoming: IncomingStream,
     ) -> crate::remote::transfer::Result<TransferSummary> {
-        serve_incoming_file(self.root.clone(), incoming, &self.sender, self.peer).await
+        serve_incoming_file_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
-/// Server-side owner for one negotiated v3 remote session.
-///
-/// The session owns the transport router while cloneable operation handlers own
-/// only endpoint context plus a router sender. This lets the daemon accept new
-/// streams while existing operations run without exposing the raw transport.
 pub struct ServerRemoteSession {
     opened: OpenedServerSession,
     router: FrameRouter,
@@ -355,7 +341,7 @@ impl ServerRemoteSession {
 
     pub fn signature_handler(&self) -> ServerSignatureHandler {
         ServerSignatureHandler {
-            root: self.opened.root.clone(),
+            rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
         }
@@ -363,7 +349,7 @@ impl ServerRemoteSession {
 
     pub fn file_handler(&self) -> ServerFileHandler {
         ServerFileHandler {
-            root: self.opened.root.clone(),
+            rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
         }
@@ -474,10 +460,6 @@ mod tests {
                 hardlink_group: false,
             },
         };
-
-        // Both streams are opened before either is consumed. The server also
-        // services them concurrently, proving the session runtime owns genuine
-        // multiplexing rather than merely serial stream IDs.
         let first = session.scan(request).await.unwrap();
         let second = session.scan(request).await.unwrap();
         let (first, second) = tokio::join!(collect_paths(first), collect_paths(second));
@@ -569,9 +551,6 @@ mod tests {
         };
         let signature_basis = file_entry(root.path(), "data.bin");
 
-        // Open both operation types before consuming either. This proves the
-        // runtime can interleave metadata and demand-driven signature traffic on
-        // the same negotiated transport.
         let entries = session.scan(scan_request).await.unwrap();
         let (paths, delta_basis) = tokio::join!(
             collect_paths(entries),
@@ -637,6 +616,67 @@ mod tests {
         assert_eq!(
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             data
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_handler_survives_root_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let source_root = tempfile::TempDir::new().unwrap();
+        let parent = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let root_path = parent.path().join("root");
+        let moved_path = parent.path().join("moved");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("file.bin"), b"pinned-old").unwrap();
+        std::fs::write(outside.path().join("file.bin"), b"outside").unwrap();
+        std::fs::write(source_root.path().join("file.bin"), b"new").unwrap();
+        let source = file_entry(source_root.path(), "file.bin");
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.file_handler();
+            ready_tx.send(()).unwrap();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::File(incoming) = request else {
+                panic!("expected file request");
+            };
+            handler.serve(incoming).await.unwrap();
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            &root_path,
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        ready_rx.await.unwrap();
+        std::fs::rename(&root_path, &moved_path).unwrap();
+        symlink(outside.path(), &root_path).unwrap();
+
+        session
+            .transfer_file(source_root.path().to_path_buf(), source, None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(moved_path.join("file.bin")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(outside.path().join("file.bin")).unwrap(),
+            b"outside"
         );
     }
 }
