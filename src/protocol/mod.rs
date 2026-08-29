@@ -2,6 +2,7 @@ mod codec;
 mod entry;
 mod frame;
 mod handshake;
+mod metadata;
 mod mutation;
 mod path;
 mod scan;
@@ -17,6 +18,7 @@ pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
+pub use metadata::WireMetadata;
 pub use mutation::{WireMutation, WireMutationKind};
 pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
