@@ -66,9 +66,7 @@ impl WireFileBegin {
     }
 
     pub fn encode(&self) -> Bytes {
-        let basis_len = self
-            .basis
-            .map_or(0, |_| 8 + TRANSFER_BASIS_IDENTITY_LEN);
+        let basis_len = self.basis.map_or(0, |_| 8 + TRANSFER_BASIS_IDENTITY_LEN);
         let mut out = BytesMut::with_capacity(1 + 8 + basis_len + self.path.as_encoded().len());
         out.put_u8(if self.basis.is_some() {
             DELTA_FILE_MODE
@@ -167,7 +165,7 @@ impl WireDeltaCopy {
         self.basis_offset
     }
 
-    pub const fn len(self) -> u32 {
+    pub const fn copy_len(self) -> u32 {
         self.len
     }
 
