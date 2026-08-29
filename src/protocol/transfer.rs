@@ -1,5 +1,6 @@
 use super::codec::SliceReader;
 use super::{ProtocolError, RelativeWirePath, Result};
+use bitflags::bitflags;
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub const TRANSFER_DIGEST_LEN: usize = 32;
@@ -9,6 +10,14 @@ pub const MAX_DELTA_COPY_SIZE: u32 = 1024 * 1024;
 
 const WHOLE_FILE_MODE: u8 = 0;
 const DELTA_FILE_MODE: u8 = 1;
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FileMetadataFields: u8 {
+        const UNIX_MODE = 1 << 0;
+        const MODIFIED = 1 << 1;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireFileBasis {
@@ -38,6 +47,8 @@ pub struct WireFileBegin {
     pub path: RelativeWirePath,
     file_size: u64,
     basis: Option<WireFileBasis>,
+    unix_mode: Option<u32>,
+    modified: Option<(i64, u32)>,
 }
 
 impl WireFileBegin {
@@ -46,6 +57,8 @@ impl WireFileBegin {
             path,
             file_size,
             basis: None,
+            unix_mode: None,
+            modified: None,
         }
     }
 
@@ -54,7 +67,20 @@ impl WireFileBegin {
             path,
             file_size,
             basis: Some(basis),
+            unix_mode: None,
+            modified: None,
         }
+    }
+
+    pub fn with_metadata(
+        mut self,
+        unix_mode: Option<u32>,
+        modified: Option<(i64, u32)>,
+    ) -> Result<Self> {
+        validate_modified(modified)?;
+        self.unix_mode = unix_mode;
+        self.modified = modified;
+        Ok(self)
     }
 
     pub const fn file_size(&self) -> u64 {
@@ -65,18 +91,38 @@ impl WireFileBegin {
         self.basis
     }
 
+    pub const fn unix_mode(&self) -> Option<u32> {
+        self.unix_mode
+    }
+
+    pub const fn modified(&self) -> Option<(i64, u32)> {
+        self.modified
+    }
+
     pub fn encode(&self) -> Bytes {
         let basis_len = self.basis.map_or(0, |_| 8 + TRANSFER_BASIS_IDENTITY_LEN);
-        let mut out = BytesMut::with_capacity(1 + 8 + basis_len + self.path.as_encoded().len());
+        let metadata_len = usize::from(self.unix_mode.is_some()) * 4
+            + usize::from(self.modified.is_some()) * 12;
+        let mut out = BytesMut::with_capacity(
+            2 + 8 + basis_len + metadata_len + self.path.as_encoded().len(),
+        );
         out.put_u8(if self.basis.is_some() {
             DELTA_FILE_MODE
         } else {
             WHOLE_FILE_MODE
         });
+        out.put_u8(self.metadata_fields().bits());
         out.put_u64(self.file_size);
         if let Some(basis) = self.basis {
             out.put_u64(basis.file_size);
             out.extend_from_slice(&basis.identity);
+        }
+        if let Some(mode) = self.unix_mode {
+            out.put_u32(mode);
+        }
+        if let Some((seconds, nanoseconds)) = self.modified {
+            out.put_i64(seconds);
+            out.put_u32(nanoseconds);
         }
         out.extend_from_slice(self.path.as_encoded());
         out.freeze()
@@ -85,6 +131,13 @@ impl WireFileBegin {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let mode = reader.u8()?;
+        let raw_metadata_fields = reader.u8()?;
+        let metadata_fields = FileMetadataFields::from_bits(raw_metadata_fields).ok_or(
+            ProtocolError::InvalidField {
+                field: "file_begin_metadata_fields",
+                reason: "unknown metadata field bits",
+            },
+        )?;
         let file_size = reader.u64()?;
         let basis = match mode {
             WHOLE_FILE_MODE => None,
@@ -99,13 +152,32 @@ impl WireFileBegin {
                 });
             }
         };
+        let unix_mode = metadata_fields
+            .contains(FileMetadataFields::UNIX_MODE)
+            .then(|| reader.u32())
+            .transpose()?;
+        let modified = if metadata_fields.contains(FileMetadataFields::MODIFIED) {
+            Some((reader.i64()?, reader.u32()?))
+        } else {
+            None
+        };
+        validate_modified(modified)?;
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take_remaining()?))?;
         reader.finish()?;
         Ok(Self {
             path,
             file_size,
             basis,
+            unix_mode,
+            modified,
         })
+    }
+
+    fn metadata_fields(&self) -> FileMetadataFields {
+        let mut fields = FileMetadataFields::empty();
+        fields.set(FileMetadataFields::UNIX_MODE, self.unix_mode.is_some());
+        fields.set(FileMetadataFields::MODIFIED, self.modified.is_some());
+        fields
     }
 }
 
@@ -229,6 +301,16 @@ impl WireFileEnd {
     }
 }
 
+fn validate_modified(modified: Option<(i64, u32)>) -> Result<()> {
+    if modified.is_some_and(|(_, nanoseconds)| nanoseconds >= 1_000_000_000) {
+        return Err(ProtocolError::InvalidField {
+            field: "modified_nanoseconds",
+            reason: "nanoseconds must be below 1,000,000,000",
+        });
+    }
+    Ok(())
+}
+
 fn validate_data_len(len: usize) -> Result<()> {
     if len == 0 {
         return Err(ProtocolError::InvalidField {
@@ -267,6 +349,20 @@ mod tests {
     }
 
     #[test]
+    fn file_begin_round_trips_requested_metadata() {
+        let begin = WireFileBegin::whole(path(), 123)
+            .with_metadata(Some(0o100640), Some((-1, 999_999_999)))
+            .unwrap();
+        let decoded = WireFileBegin::decode(&begin.encode()).unwrap();
+        assert_eq!(decoded, begin);
+        assert_eq!(decoded.unix_mode(), Some(0o100640));
+        assert_eq!(decoded.modified(), Some((-1, 999_999_999)));
+        assert!(WireFileBegin::whole(path(), 1)
+            .with_metadata(None, Some((0, 1_000_000_000)))
+            .is_err());
+    }
+
+    #[test]
     fn file_begin_rejects_unknown_mode_and_truncation() {
         let encoded = WireFileBegin::whole(path(), 123).encode();
         for len in 0..encoded.len() {
@@ -279,6 +375,16 @@ mod tests {
             WireFileBegin::decode(&invalid),
             Err(ProtocolError::InvalidField {
                 field: "file_begin_mode",
+                ..
+            })
+        ));
+
+        let mut invalid_fields = encoded.to_vec();
+        invalid_fields[1] = u8::MAX;
+        assert!(matches!(
+            WireFileBegin::decode(&invalid_fields),
+            Err(ProtocolError::InvalidField {
+                field: "file_begin_metadata_fields",
                 ..
             })
         ));
