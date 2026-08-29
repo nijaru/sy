@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 /// detached-child lifetime. `kill_on_drop` ensures an abandoned local session
 /// cannot leave a private `sy __serve` process behind indefinitely.
 pub struct SshRemoteSession {
-    child: Child,
+    _child: Child,
     remote: ClientRemoteSession,
 }
 
@@ -45,7 +45,10 @@ impl SshRemoteSession {
                 .await
                 .context("v3 SSH handshake failed")?;
 
-        Ok(Self { child, remote })
+        Ok(Self {
+            _child: child,
+            remote,
+        })
     }
 
     pub const fn remote(&self) -> &ClientRemoteSession {
