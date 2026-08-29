@@ -87,6 +87,9 @@ fn scan_worker(
         send_error(&sender, RootedScanError::GitignoreUnsupported);
         return;
     }
+    if request.max_depth == Some(0) {
+        return;
+    }
 
     let root = match rooted.root_fd.try_clone() {
         Ok(root) => root,
@@ -594,6 +597,17 @@ mod tests {
         let entries = collect(&rooted, ScanRequest::default()).await;
         assert!(entries.windows(2).all(|pair| pair[0].path < pair[1].path));
         assert!(entries.iter().all(|entry| entry.identity.is_some()));
+    }
+
+    #[tokio::test]
+    async fn zero_depth_scan_emits_no_entries() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut request = ScanRequest::default();
+        request.max_depth = Some(0);
+
+        assert!(collect(&rooted, request).await.is_empty());
     }
 
     #[tokio::test]
