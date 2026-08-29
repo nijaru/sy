@@ -1,6 +1,6 @@
 use crate::engine::domain::RelativePath;
 use crate::protocol::{
-    Frame, FrameFlags, FrameKind, Platform, PlatformOs, ProtocolError, StreamId, WireMutation,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireMutation,
     WireMutationKind, WirePath,
 };
 use crate::remote::path::{
@@ -299,6 +299,7 @@ fn decode_native_target(_path: WirePath, peer: PlatformOs) -> Result<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::protocol::Platform;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
 
     #[test]
@@ -363,6 +364,9 @@ mod tests {
 
         assert!(!root.path().join("old").exists());
         assert!(!root.path().join("dir").exists());
-        assert_eq!(std::fs::read_link(root.path().join("link")).unwrap(), Path::new("../target"));
+        assert_eq!(
+            std::fs::read_link(root.path().join("link")).unwrap(),
+            Path::new("../target")
+        );
     }
 }
