@@ -5,6 +5,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub const TRANSFER_DIGEST_LEN: usize = 32;
 pub const TRANSFER_BASIS_IDENTITY_LEN: usize = 32;
 pub const MAX_TRANSFER_DATA_SIZE: usize = 256 * 1024;
+pub const MAX_DELTA_COPY_SIZE: u32 = 1024 * 1024;
 
 const WHOLE_FILE_MODE: u8 = 0;
 const DELTA_FILE_MODE: u8 = 1;
@@ -145,6 +146,12 @@ impl WireDeltaCopy {
             return Err(ProtocolError::InvalidField {
                 field: "delta_copy_len",
                 reason: "copy length must be non-zero",
+            });
+        }
+        if len > MAX_DELTA_COPY_SIZE {
+            return Err(ProtocolError::InvalidField {
+                field: "delta_copy_len",
+                reason: "copy length exceeds the protocol maximum",
             });
         }
         basis_offset
@@ -295,6 +302,7 @@ mod tests {
         assert_eq!(WireDeltaCopy::decode(&copy.encode()).unwrap(), copy);
         assert_eq!(copy.end().unwrap(), 12_288);
         assert!(WireDeltaCopy::new(0, 0).is_err());
+        assert!(WireDeltaCopy::new(0, MAX_DELTA_COPY_SIZE + 1).is_err());
         assert!(WireDeltaCopy::new(u64::MAX, 1).is_err());
 
         let mut trailing = copy.encode().to_vec();
