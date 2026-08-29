@@ -8,3 +8,4 @@ pub mod reconcile;
 pub mod rolling;
 pub mod scan;
 pub mod scheduler;
+pub mod work;

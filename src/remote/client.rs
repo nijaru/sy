@@ -11,7 +11,10 @@ use crate::remote::signature::{
     choose_signature_block_size, request_signatures, RemoteSignatureError, SignatureEvent,
     SignatureStream,
 };
-use crate::remote::transfer::{request_file_transfer, RemoteDeltaBasis, TransferSummary};
+use crate::remote::transfer::{
+    request_file_transfer, request_file_transfer_with_metadata, RemoteDeltaBasis, TransferMetadata,
+    TransferSummary,
+};
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
@@ -158,6 +161,26 @@ impl ClientRemoteHandle {
         request_file_transfer(&self.sender, source_root, source, delta_basis, self.peer)
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn transfer_file_with_metadata(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+        metadata: TransferMetadata,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer_with_metadata(
+            &self.sender,
+            source_root,
+            source,
+            delta_basis,
+            metadata,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn apply_metadata(
