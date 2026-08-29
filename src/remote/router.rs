@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 const BYTE_QUANTUM: u64 = 64 * 1024;
@@ -134,6 +134,7 @@ enum IncomingMessage {
 
 struct OutboundFrame {
     frame: Frame,
+    written: Option<oneshot::Sender<()>>,
     _frame_permit: OwnedSemaphorePermit,
     _byte_permit: Option<OwnedSemaphorePermit>,
 }
@@ -205,7 +206,9 @@ impl RouterSender {
     ///
     /// Frame-count and byte permits are acquired before enqueueing and remain
     /// held until the writer finishes the frame, providing backpressure without
-    /// a second hidden buffering policy.
+    /// a second hidden buffering policy. Acknowledgements additionally wait for
+    /// the writer to flush them so a completed operation cannot lose its final
+    /// success signal when the router is dropped immediately afterward.
     pub async fn send(&self, frame: Frame) -> Result<(), SharedRouterError> {
         if let Some(failure) = current_failure(&self.inner)? {
             return Err(failure);
@@ -220,14 +223,27 @@ impl RouterSender {
         )
         .await
         .map_err(Arc::new)?;
+        let (written, completion) = if frame.kind() == FrameKind::Ack {
+            let (written, completion) = oneshot::channel();
+            (Some(written), Some(completion))
+        } else {
+            (None, None)
+        };
         let queued = OutboundFrame {
             frame,
+            written,
             _frame_permit: frame_permit,
             _byte_permit: byte_permit,
         };
         self.outbound_tx
             .send(queued)
-            .map_err(|_| Arc::new(RouterError::WriterClosed))
+            .map_err(|_| Arc::new(RouterError::WriterClosed))?;
+        if let Some(completion) = completion {
+            completion
+                .await
+                .map_err(|_| Arc::new(RouterError::WriterClosed))?;
+        }
+        Ok(())
     }
 }
 
@@ -265,7 +281,7 @@ impl Drop for StreamInbox {
         };
         if let Ok(mut streams) = inner.streams.lock() {
             streams.remove(&self.stream_id);
-        };
+        }
     }
 }
 
@@ -476,7 +492,7 @@ where
             }
             queued = receiver.recv() => queued,
         };
-        let Some(queued) = queued else {
+        let Some(mut queued) = queued else {
             writer
                 .flush()
                 .await
@@ -484,6 +500,13 @@ where
             return Ok(());
         };
         write_frame(&mut writer, &queued.frame).await?;
+        if let Some(written) = queued.written.take() {
+            writer
+                .flush()
+                .await
+                .map_err(crate::protocol::ProtocolError::from)?;
+            let _ = written.send(());
+        }
         // `queued` drops here, releasing frame and byte capacity only after the
         // bytes have been accepted by the underlying AsyncWrite.
     }
