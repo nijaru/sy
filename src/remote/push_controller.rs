@@ -1,7 +1,5 @@
 use crate::engine::domain::RelativePath;
-use crate::engine::finalize_journal::{
-    FinalizeJournal, FinalizeJournalError, FinalizeMetadata,
-};
+use crate::engine::finalize_journal::{FinalizeJournal, FinalizeJournalError, FinalizeMetadata};
 use crate::engine::plan_journal::{PlanJournal, PlanJournalError, PlanJournalReader};
 use crate::engine::planner::{plan_entry, ComparisonPolicy, PlanDecision};
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
@@ -157,8 +155,7 @@ impl RemotePushController {
             let Some(main) = lowered.main else {
                 continue;
             };
-            summary.main_operations =
-                checked_add(summary.main_operations, 1, "main operation")?;
+            summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
 
             if matches!(main.action(), RemotePushAction::CreateDirectory { .. }) {
                 let result = self.executor.execute(main).await?;
@@ -216,7 +213,10 @@ async fn collect_one(
     record_transfer(summary, result)
 }
 
-fn record_transfer(summary: &mut RemotePushSummary, transfer: Option<TransferSummary>) -> Result<()> {
+fn record_transfer(
+    summary: &mut RemotePushSummary,
+    transfer: Option<TransferSummary>,
+) -> Result<()> {
     let Some(transfer) = transfer else {
         return Ok(());
     };
@@ -226,11 +226,7 @@ fn record_transfer(summary: &mut RemotePushSummary, transfer: Option<TransferSum
         transfer.literal_bytes,
         "literal-byte",
     )?;
-    summary.reused_bytes = checked_add(
-        summary.reused_bytes,
-        transfer.reused_bytes,
-        "reused-byte",
-    )?;
+    summary.reused_bytes = checked_add(summary.reused_bytes, transfer.reused_bytes, "reused-byte")?;
     Ok(())
 }
 
@@ -253,11 +249,7 @@ mod tests {
     }
 
     fn file(value: &str, size: u64, modified: i64) -> Entry {
-        let mut entry = Entry::file(
-            path(value),
-            size,
-            Timestamp::new(modified, 0).unwrap(),
-        );
+        let mut entry = Entry::file(path(value), size, Timestamp::new(modified, 0).unwrap());
         entry.unix_mode = Some(0o644);
         entry
     }
@@ -269,9 +261,7 @@ mod tests {
     }
 
     fn entries(values: Vec<Entry>) -> EntryStream {
-        Box::pin(stream::iter(
-            values.into_iter().map(Ok::<Entry, BoxError>),
-        ))
+        Box::pin(stream::iter(values.into_iter().map(Ok::<Entry, BoxError>)))
     }
 
     #[tokio::test]
