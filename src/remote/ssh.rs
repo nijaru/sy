@@ -40,15 +40,10 @@ impl SshRemoteSession {
             .stdout
             .take()
             .context("failed to open v3 SSH stdout")?;
-        let remote = ClientRemoteSession::connect(
-            reader,
-            writer,
-            operation,
-            remote_root,
-            router_config,
-        )
-        .await
-        .context("v3 SSH handshake failed")?;
+        let remote =
+            ClientRemoteSession::connect(reader, writer, operation, remote_root, router_config)
+                .await
+                .context("v3 SSH handshake failed")?;
 
         Ok(Self { child, remote })
     }

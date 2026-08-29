@@ -103,11 +103,21 @@ fn spawn_request(
     match request {
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
-            tasks.spawn(async move { handler.serve(incoming).await.map_err(|error| error.to_string()) });
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
         IncomingRequest::Signatures(incoming) => {
             let handler = handlers.signatures.clone();
-            tasks.spawn(async move { handler.serve(incoming).await.map_err(|error| error.to_string()) });
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
         IncomingRequest::File(incoming) => {
             let handler = handlers.file.clone();
@@ -121,11 +131,21 @@ fn spawn_request(
         }
         IncomingRequest::Metadata(incoming) => {
             let handler = handlers.metadata.clone();
-            tasks.spawn(async move { handler.serve(incoming).await.map_err(|error| error.to_string()) });
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
         IncomingRequest::Mutation(incoming) => {
             let handler = handlers.mutation.clone();
-            tasks.spawn(async move { handler.serve(incoming).await.map_err(|error| error.to_string()) });
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
     }
 }
@@ -134,7 +154,9 @@ async fn join_one(tasks: &mut JoinSet<RequestResult>) -> Result<()> {
     check_joined(tasks.join_next().await)
 }
 
-fn check_joined(joined: Option<std::result::Result<RequestResult, tokio::task::JoinError>>) -> Result<()> {
+fn check_joined(
+    joined: Option<std::result::Result<RequestResult, tokio::task::JoinError>>,
+) -> Result<()> {
     let Some(joined) = joined else {
         return Ok(());
     };
