@@ -180,7 +180,10 @@ mod tests {
             Some((-1, 999_999_999)),
         )
         .unwrap();
-        assert_eq!(WireMetadata::decode(&metadata.encode().unwrap()).unwrap(), metadata);
+        assert_eq!(
+            WireMetadata::decode(&metadata.encode().unwrap()).unwrap(),
+            metadata
+        );
     }
 
     #[test]
@@ -198,15 +201,11 @@ mod tests {
 
     #[test]
     fn decoder_rejects_truncation_and_trailing_data() {
-        let encoded = WireMetadata::new(
-            path(),
-            WireEntryKind::Directory,
-            Some(0o755),
-            Some((1, 2)),
-        )
-        .unwrap()
-        .encode()
-        .unwrap();
+        let encoded =
+            WireMetadata::new(path(), WireEntryKind::Directory, Some(0o755), Some((1, 2)))
+                .unwrap()
+                .encode()
+                .unwrap();
         for len in 0..encoded.len() {
             assert!(WireMetadata::decode(&encoded[..len]).is_err());
         }

@@ -101,8 +101,8 @@ impl WireFileBegin {
 
     pub fn encode(&self) -> Bytes {
         let basis_len = self.basis.map_or(0, |_| 8 + TRANSFER_BASIS_IDENTITY_LEN);
-        let metadata_len = usize::from(self.unix_mode.is_some()) * 4
-            + usize::from(self.modified.is_some()) * 12;
+        let metadata_len =
+            usize::from(self.unix_mode.is_some()) * 4 + usize::from(self.modified.is_some()) * 12;
         let mut out = BytesMut::with_capacity(
             2 + 8 + basis_len + metadata_len + self.path.as_encoded().len(),
         );
