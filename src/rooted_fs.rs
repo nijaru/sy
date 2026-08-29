@@ -107,24 +107,11 @@ impl RootedStagedFile {
 
     #[cfg(unix)]
     fn commit_blocking(&mut self) -> Result<()> {
-        let temp = component_cstring(&self.temp_name)?;
-        let destination = component_cstring(&self.destination_name)?;
-        let result = unsafe {
-            // SAFETY: `parent_fd` remains open for the call and both pathnames
-            // are live NUL-terminated single components. `renameat` operates in
-            // the already-resolved directory and atomically replaces an
-            // existing non-directory destination where the platform permits it.
-            libc::renameat(
-                self.parent_fd.as_raw_fd(),
-                temp.as_ptr(),
-                self.parent_fd.as_raw_fd(),
-                destination.as_ptr(),
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        rename_at(
+            self.parent_fd.as_raw_fd(),
+            &self.temp_name,
+            &self.destination_name,
+        )
     }
 
     #[cfg(not(unix))]
@@ -140,15 +127,7 @@ impl Drop for RootedStagedFile {
         }
         #[cfg(unix)]
         {
-            let Ok(temp) = component_cstring(&self.temp_name) else {
-                return;
-            };
-            unsafe {
-                // SAFETY: `parent_fd` remains owned by this value and `temp` is
-                // a live NUL-terminated single component. Cleanup is best effort
-                // and intentionally ignores ENOENT after a failed/partial path.
-                libc::unlinkat(self.parent_fd.as_raw_fd(), temp.as_ptr(), 0);
-            }
+            let _ = unlink_at(self.parent_fd.as_raw_fd(), &self.temp_name, false);
         }
     }
 }
@@ -181,6 +160,33 @@ impl RootedFs {
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn begin_staged_file_blocking(&self, relative: &RelativePath) -> Result<RootedStagedFile> {
         self.begin_staged_path_blocking(relative.as_path())
+    }
+
+    /// Create one directory beneath the pinned root without following any
+    /// peer-controlled parent symlink. Existing real directories are accepted
+    /// so repeated create requests are idempotent; files and symlinks are not.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn create_directory_blocking(&self, relative: &RelativePath) -> Result<()> {
+        self.create_directory_path_blocking(relative.as_path())
+    }
+
+    /// Atomically replace a non-directory destination with a symlink while the
+    /// resolved parent directory remains pinned. The symlink target is stored as
+    /// opaque native path data and is never resolved by this operation.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn replace_symlink_blocking(&self, relative: &RelativePath, target: &Path) -> Result<()> {
+        self.replace_symlink_path_blocking(relative.as_path(), target)
+    }
+
+    /// Remove one file-like or directory leaf beneath the pinned root. Parent
+    /// components are opened with no-follow semantics and `unlinkat` never
+    /// follows the destination leaf.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn remove_blocking(&self, relative: &RelativePath, is_directory: bool) -> Result<()> {
+        self.remove_path_blocking(relative.as_path(), is_directory)
     }
 
     #[cfg(unix)]
@@ -236,8 +242,7 @@ impl RootedFs {
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
 
         for _ in 0..TEMP_CREATE_ATTEMPTS {
-            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let temp_name = OsString::from(format!(".sy-stage-{}-{id}", std::process::id()));
+            let temp_name = next_temp_name();
             match create_staging_file_at(parent_fd.as_raw_fd(), &temp_name) {
                 Ok(file) => {
                     return Ok(RootedStagedFile {
@@ -258,6 +263,88 @@ impl RootedFs {
 
     #[cfg(not(unix))]
     fn begin_staged_path_blocking(&self, _relative: &Path) -> Result<RootedStagedFile> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn create_directory_path_blocking(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent_blocking(relative)?;
+        let leaf_c = component_cstring(&leaf)?;
+        let result = unsafe {
+            // SAFETY: `parent` remains open and `leaf_c` is a live single
+            // component. mkdirat creates only beneath the already-resolved
+            // parent; the process umask applies to the requested default mode.
+            libc::mkdirat(parent.as_raw_fd(), leaf_c.as_ptr(), 0o777)
+        };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            open_dir_at(parent.as_raw_fd(), &leaf)?;
+            return Ok(());
+        }
+        Err(error.into())
+    }
+
+    #[cfg(not(unix))]
+    fn create_directory_path_blocking(&self, _relative: &Path) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn replace_symlink_path_blocking(&self, relative: &Path, target: &Path) -> Result<()> {
+        let (parent, destination_name) = self.open_parent_blocking(relative)?;
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| RootedFsError::PathContainsNul)?;
+
+        for _ in 0..TEMP_CREATE_ATTEMPTS {
+            let temp_name = next_temp_name();
+            let temp = component_cstring(&temp_name)?;
+            let result = unsafe {
+                // SAFETY: `target` and `temp` are live NUL-terminated strings,
+                // and `parent` pins the destination directory. symlinkat stores
+                // the target bytes verbatim and does not resolve them.
+                libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), temp.as_ptr())
+            };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(error.into());
+            }
+
+            match rename_at(parent.as_raw_fd(), &temp_name, &destination_name) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
+    }
+
+    #[cfg(not(unix))]
+    fn replace_symlink_path_blocking(&self, _relative: &Path, _target: &Path) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn remove_path_blocking(&self, relative: &Path, is_directory: bool) -> Result<()> {
+        let (parent, leaf) = self.open_parent_blocking(relative)?;
+        match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
+            Ok(()) => Ok(()),
+            Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn remove_path_blocking(&self, _relative: &Path, _is_directory: bool) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -284,6 +371,12 @@ impl RootedFs {
         let leaf = leaf.ok_or(RootedFsError::InvalidRelativePath)?;
         Ok((current_fd, leaf))
     }
+}
+
+#[cfg(unix)]
+fn next_temp_name() -> OsString {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!(".sy-stage-{}-{id}", std::process::id()))
 }
 
 #[cfg(unix)]
@@ -358,6 +451,38 @@ fn create_staging_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         OwnedFd::from_raw_fd(fd)
     };
     Ok(File::from(owned))
+}
+
+#[cfg(unix)]
+fn rename_at(parent: RawFd, from: &OsStr, to: &OsStr) -> Result<()> {
+    let from = component_cstring(from)?;
+    let to = component_cstring(to)?;
+    let result = unsafe {
+        // SAFETY: `parent` remains open for the call and both names are live
+        // NUL-terminated single components. Both lookups stay inside the held
+        // directory descriptor.
+        libc::renameat(parent, from.as_ptr(), parent, to.as_ptr())
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_at(parent: RawFd, component: &OsStr, is_directory: bool) -> Result<()> {
+    let component = component_cstring(component)?;
+    let flags = if is_directory { libc::AT_REMOVEDIR } else { 0 };
+    let result = unsafe {
+        // SAFETY: `parent` remains open and `component` is one live
+        // NUL-terminated leaf. unlinkat removes the directory entry itself and
+        // does not follow a symlink leaf.
+        libc::unlinkat(parent, component.as_ptr(), flags)
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -451,6 +576,66 @@ mod tests {
             .begin_staged_file_blocking(&relative("escape/file"))
             .is_err());
         assert!(!outside.path().join("file").exists());
+    }
+
+    #[tokio::test]
+    async fn confined_directory_create_refuses_parent_symlink_escape() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        assert!(rooted
+            .create_directory_blocking(&relative("escape/new-dir"))
+            .is_err());
+        assert!(!outside.path().join("new-dir").exists());
+    }
+
+    #[tokio::test]
+    async fn confined_symlink_replace_is_atomic_and_preserves_target_bytes() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("entry"), b"old").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        rooted
+            .replace_symlink_blocking(&relative("entry"), Path::new("../target"))
+            .unwrap();
+        let metadata = std::fs::symlink_metadata(root.path().join("entry")).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(root.path().join("entry")).unwrap(),
+            Path::new("../target")
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_remove_never_follows_parent_symlink() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("keep"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        assert!(rooted
+            .remove_blocking(&relative("escape/keep"), false)
+            .is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("keep")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_remove_handles_filelike_and_directory_leaves() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        rooted.remove_blocking(&relative("file"), false).unwrap();
+        rooted.remove_blocking(&relative("dir"), true).unwrap();
+        assert!(!root.path().join("file").exists());
+        assert!(!root.path().join("dir").exists());
     }
 
     #[tokio::test]
