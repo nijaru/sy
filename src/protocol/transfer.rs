@@ -341,6 +341,8 @@ mod tests {
         let whole = WireFileBegin::whole(path(), 123);
         assert_eq!(WireFileBegin::decode(&whole.encode()).unwrap(), whole);
         assert_eq!(whole.basis(), None);
+        assert_eq!(whole.unix_mode(), None);
+        assert_eq!(whole.modified(), None);
 
         let basis = WireFileBasis::new(456, [0x5a; TRANSFER_BASIS_IDENTITY_LEN]);
         let delta = WireFileBegin::delta(path(), 123, basis);
