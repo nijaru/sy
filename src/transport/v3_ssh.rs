@@ -58,7 +58,7 @@ impl V3SshSession {
         &self.remote
     }
 
-    pub const fn child_id(&self) -> Option<u32> {
+    pub fn child_id(&self) -> Option<u32> {
         self.child.id()
     }
 }
