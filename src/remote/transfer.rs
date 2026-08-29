@@ -171,15 +171,6 @@ struct PreparedReconstruction {
     basis: Option<(File, WireFileBasis)>,
 }
 
-/// Stream one local regular file to a negotiated peer without materializing the
-/// file or a delta plan in memory.
-///
-/// The source is opened beneath a pinned local root and checked against its scan
-/// identity before any FileBegin is sent. A blocking producer feeds a small
-/// bounded channel; the router supplies the second bounded backpressure layer.
-/// Delta mode consumes the already-bounded signature index and emits Data or
-/// DeltaCopy frames directly. The source handle is revalidated after the single
-/// read/match pass before FileEnd is sent.
 pub async fn request_file_transfer(
     sender: &RouterSender,
     source_root: PathBuf,
@@ -280,14 +271,11 @@ pub async fn request_file_transfer(
     Ok(summary)
 }
 
-/// Reconstruct one peer-opened file stream into a same-directory staging file.
-///
-/// FileBegin is decoded and any delta basis is securely opened and identity-
-/// checked before follow-up frames are accepted. The blocking reconstruction
-/// worker owns the pinned basis and staged writer. FileEnd size and BLAKE3 are
-/// verified before atomic rename, and ACK is emitted only after that commit.
-pub async fn serve_incoming_file(
-    root: PathBuf,
+/// Reconstruct one peer-opened file stream beneath the root pinned when the v3
+/// session was opened. FileBegin may securely reopen a destination basis through
+/// that descriptor, but the session root pathname is never resolved again.
+pub async fn serve_incoming_file_rooted(
+    rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
@@ -307,7 +295,6 @@ pub async fn serve_incoming_file(
     let relative = decode_relative_path(begin.path.clone(), peer)?;
     drop(first);
 
-    let rooted = RootedFs::open(root).await?;
     let basis = begin.basis();
     let prepared =
         tokio::task::spawn_blocking(move || prepare_reconstruction(rooted, &relative, basis))
@@ -382,6 +369,17 @@ pub async fn serve_incoming_file(
             return Ok(summary);
         }
     }
+}
+
+#[cfg(test)]
+async fn serve_incoming_file(
+    root: PathBuf,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+    peer: PlatformOs,
+) -> Result<TransferSummary> {
+    let rooted = RootedFs::open(root).await?;
+    serve_incoming_file_rooted(rooted, incoming, sender, peer).await
 }
 
 fn produce_source(
