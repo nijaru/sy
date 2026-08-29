@@ -1,3 +1,4 @@
+# Controller source lint fix is committed before this one-shot validation.
 name: Validate bounded v3 push controller once
 on:
   push:
