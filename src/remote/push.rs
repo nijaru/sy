@@ -61,9 +61,7 @@ pub enum RemotePushLowerError {
     #[error("metadata preservation requires Unix mode metadata for {0}")]
     MissingPreservedMode(PathBuf),
 
-    #[error(
-        "transactional type replacement is not implemented for directory transition at {0}"
-    )]
+    #[error("transactional type replacement is not implemented for directory transition at {0}")]
     TransactionalDirectoryReplace(PathBuf),
 }
 
@@ -121,9 +119,9 @@ fn lower_create(source: Entry, policy: RemotePushPolicy) -> LowerResult<LoweredP
             // always needs an explicit sane final mode even when -p is absent.
             // Source mode matches sy 0.4's create behavior; -p additionally
             // controls metadata-only reconciliation of already-equal files.
-            let mode = source
-                .unix_mode
-                .ok_or_else(|| RemotePushLowerError::MissingFileMode(source.path.to_path_buf()))?;
+            let mode = source.unix_mode.ok_or_else(|| {
+                RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
+            })?;
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
@@ -159,7 +157,9 @@ fn lower_update(
             } else {
                 destination.unix_mode
             }
-            .ok_or_else(|| RemotePushLowerError::MissingFileMode(source.path.to_path_buf()))?;
+            .ok_or_else(|| {
+                RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
+            })?;
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
@@ -191,15 +191,15 @@ fn lower_replace(
 ) -> LowerResult<LoweredPush> {
     if source.is_directory() || destination.is_directory() {
         return Err(RemotePushLowerError::TransactionalDirectoryReplace(
-            source.path.to_path_buf(),
+            source.path.as_path().to_path_buf(),
         ));
     }
 
     match source.kind {
         EntryKind::File => {
-            let mode = source
-                .unix_mode
-                .ok_or_else(|| RemotePushLowerError::MissingFileMode(source.path.to_path_buf()))?;
+            let mode = source.unix_mode.ok_or_else(|| {
+                RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
+            })?;
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
@@ -232,7 +232,8 @@ fn lower_metadata(
     destination: Entry,
     policy: RemotePushPolicy,
 ) -> LowerResult<LoweredPush> {
-    let Some((unix_mode, modified)) = requested_metadata(&source, Some(&destination), policy, false)?
+    let Some((unix_mode, modified)) =
+        requested_metadata(&source, Some(&destination), policy, false)?
     else {
         return Ok(LoweredPush::default());
     };
@@ -261,7 +262,7 @@ fn requested_metadata(
             || destination.is_some_and(|entry| entry.unix_mode != source.unix_mode))
     {
         Some(source.unix_mode.ok_or_else(|| {
-            RemotePushLowerError::MissingPreservedMode(source.path.to_path_buf())
+            RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
         })?)
     } else {
         None
@@ -348,7 +349,10 @@ impl RemotePushExecutor {
         self
     }
 
-    pub async fn execute(&self, item: WorkItem<RemotePushAction>) -> Result<Option<TransferSummary>> {
+    pub async fn execute(
+        &self,
+        item: WorkItem<RemotePushAction>,
+    ) -> Result<Option<TransferSummary>> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
@@ -376,17 +380,12 @@ impl RemotePushExecutor {
             }
             RemotePushAction::ReplaceSymlink { source, modified } => {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
-                    RemotePushError::MissingSymlinkTarget(source.path.to_path_buf())
+                    RemotePushError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
                 self.remote.replace_symlink(&source.path, target).await?;
                 if let Some(modified) = modified {
                     self.remote
-                        .apply_metadata(
-                            &source.path,
-                            EntryKind::Symlink,
-                            None,
-                            Some(modified),
-                        )
+                        .apply_metadata(&source.path, EntryKind::Symlink, None, Some(modified))
                         .await?;
                 }
                 Ok(None)
@@ -404,7 +403,10 @@ impl RemotePushExecutor {
         }
     }
 
-    async fn prepare_delta_basis(&self, destination: Option<Entry>) -> Result<Option<RemoteDeltaBasis>> {
+    async fn prepare_delta_basis(
+        &self,
+        destination: Option<Entry>,
+    ) -> Result<Option<RemoteDeltaBasis>> {
         let Some(destination) = destination else {
             return Ok(None);
         };
@@ -415,7 +417,11 @@ impl RemotePushExecutor {
         ) {
             return Ok(None);
         }
-        let Some(index) = self.remote.delta_basis(&destination, self.delta_limits).await? else {
+        let Some(index) = self
+            .remote
+            .delta_basis(&destination, self.delta_limits)
+            .await?
+        else {
             return Ok(None);
         };
         Ok(Some(RemoteDeltaBasis {
@@ -469,8 +475,7 @@ mod tests {
             RemotePushPolicy::default(),
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } =
-            lowered.main.unwrap().into_action()
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
         else {
             panic!("expected file transfer");
         };
@@ -490,8 +495,7 @@ mod tests {
             RemotePushPolicy::default(),
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } =
-            lowered.main.unwrap().into_action()
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
         else {
             panic!("expected file transfer");
         };
@@ -514,8 +518,7 @@ mod tests {
             },
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } =
-            lowered.main.unwrap().into_action()
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
         else {
             panic!("expected file transfer");
         };
@@ -566,11 +569,8 @@ mod tests {
     #[test]
     fn file_resource_reservation_is_bounded_independent_of_file_size() {
         let source = file("huge", 80 * 1024 * 1024 * 1024, 0o644);
-        let lowered = lower_sync_op(
-            SyncOp::Create { source },
-            RemotePushPolicy::default(),
-        )
-        .unwrap();
+        let lowered =
+            lower_sync_op(SyncOp::Create { source }, RemotePushPolicy::default()).unwrap();
         let resources = lowered.main.unwrap().resources();
         assert_eq!(resources.active_files, 1);
         assert_eq!(resources.buffered_bytes, REMOTE_FILE_WORKING_SET);
@@ -601,13 +601,9 @@ mod tests {
     #[test]
     fn symlink_create_is_main_phase_and_preserves_target() {
         let source = symlink("link", "../target");
-        let lowered = lower_sync_op(
-            SyncOp::Create { source },
-            RemotePushPolicy::default(),
-        )
-        .unwrap();
-        let RemotePushAction::ReplaceSymlink { source, .. } =
-            lowered.main.unwrap().into_action()
+        let lowered =
+            lower_sync_op(SyncOp::Create { source }, RemotePushPolicy::default()).unwrap();
+        let RemotePushAction::ReplaceSymlink { source, .. } = lowered.main.unwrap().into_action()
         else {
             panic!("expected symlink replacement");
         };
