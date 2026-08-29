@@ -68,14 +68,30 @@ fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBu
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI arguments
-    let mut cli = Cli::parse();
-
-    // Set RUST_BACKTRACE=0 unless user explicitly set it
+    // Set RUST_BACKTRACE=0 unless user explicitly set it.
     if std::env::var("RUST_BACKTRACE").is_err() {
         std::env::set_var("RUST_BACKTRACE", "0");
     }
 
+    // The private v3 SSH agent bypasses Clap and all normal CLI setup so stdout
+    // remains protocol-only from the first byte. The remote root is negotiated
+    // in SessionOpen; it is deliberately not accepted as an argv pathname.
+    let mut raw_args = std::env::args_os();
+    let _program = raw_args.next();
+    if raw_args.next().as_deref() == Some(std::ffi::OsStr::new("__serve")) {
+        if raw_args.next().is_some() {
+            eprintln!("Error: __serve does not accept command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = sy::remote::serve::run_stdio().await {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Parse user-facing CLI arguments only after private-agent dispatch.
+    let mut cli = Cli::parse();
     if let Err(e) = run(&mut cli).await {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
