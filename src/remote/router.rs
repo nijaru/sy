@@ -281,7 +281,7 @@ impl Drop for StreamInbox {
         };
         if let Ok(mut streams) = inner.streams.lock() {
             streams.remove(&self.stream_id);
-        }
+        };
     }
 }
 
