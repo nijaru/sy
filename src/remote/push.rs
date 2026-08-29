@@ -1,3 +1,4 @@
+use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
@@ -402,6 +403,21 @@ impl RemotePushExecutor {
                 Ok(None)
             }
         }
+    }
+
+    pub async fn execute_delete(&self, action: DeleteAction) -> Result<()> {
+        let _permit = self
+            .scheduler
+            .acquire(ResourceRequest {
+                metadata_ops: 1,
+                network_writes: 1,
+                ..ResourceRequest::default()
+            })
+            .await?;
+        self.remote
+            .remove(&action.path, action.is_directory)
+            .await?;
+        Ok(())
     }
 
     pub async fn execute_finalize(&self, metadata: FinalizeMetadata) -> Result<()> {
