@@ -341,7 +341,7 @@ fn symlink_snapshot(stat: &libc::stat, path: &Path) -> Result<SymlinkSnapshot, R
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stat_times(stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
     let mtime_nsec =
         u32::try_from(stat.st_mtime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
@@ -350,44 +350,36 @@ fn stat_times(stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError
     Ok((stat.st_mtime, mtime_nsec, stat.st_ctime, ctime_nsec))
 }
 
-#[cfg(target_os = "macos")]
-fn stat_times(stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
-    let mtime_nsec = u32::try_from(stat.st_mtimespec.tv_nsec)
-        .map_err(|_| RootedScanError::UnsupportedPlatform)?;
-    let ctime_nsec = u32::try_from(stat.st_ctimespec.tv_nsec)
-        .map_err(|_| RootedScanError::UnsupportedPlatform)?;
-    Ok((
-        stat.st_mtimespec.tv_sec,
-        mtime_nsec,
-        stat.st_ctimespec.tv_sec,
-        ctime_nsec,
-    ))
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn stat_times(_stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
     Err(RootedScanError::UnsupportedPlatform)
 }
 
 fn directory_names(fd: RawFd) -> Result<Vec<OsString>, RootedScanError> {
-    let duplicate = unsafe {
-        // SAFETY: `fd` is a live directory descriptor and dup creates an
-        // independent descriptor for fdopendir to own.
-        libc::dup(fd)
+    let scan_fd = unsafe {
+        // SAFETY: `fd` is a live directory descriptor and `.` is a fixed native
+        // component. Reopening it creates a distinct open file description, so
+        // concurrent scans do not share the directory offset as they would with
+        // dup(2).
+        libc::openat(
+            fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
-    if duplicate < 0 {
+    if scan_fd < 0 {
         return Err(RootedScanError::ReadDirectory(io::Error::last_os_error()));
     }
     let dir = unsafe {
-        // SAFETY: `duplicate` is a fresh directory descriptor. fdopendir takes
+        // SAFETY: `scan_fd` is a fresh directory descriptor. fdopendir takes
         // ownership on success.
-        libc::fdopendir(duplicate)
+        libc::fdopendir(scan_fd)
     };
     if dir.is_null() {
         let error = io::Error::last_os_error();
         unsafe {
             // SAFETY: fdopendir failed, so ownership remained with us.
-            libc::close(duplicate);
+            libc::close(scan_fd);
         }
         return Err(RootedScanError::ReadDirectory(error));
     }
@@ -631,6 +623,28 @@ mod tests {
         let entries = collect(&rooted, ScanRequest::default()).await;
         assert!(entries.windows(2).all(|pair| pair[0].path < pair[1].path));
         assert!(entries.iter().all(|entry| entry.identity.is_some()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_scans_have_independent_directory_cursors() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("a"), b"a").unwrap();
+        std::fs::write(root.path().join("dir/b"), b"b").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            collect(&rooted, ScanRequest::default()),
+            collect(&rooted, ScanRequest::default()),
+        );
+        let expected = [Path::new("a"), Path::new("dir"), Path::new("dir/b")];
+        for entries in [&left, &right] {
+            assert_eq!(entries.len(), expected.len());
+            assert!(entries
+                .iter()
+                .zip(expected)
+                .all(|(entry, path)| entry.path.as_path() == path));
+        }
     }
 
     #[tokio::test]
