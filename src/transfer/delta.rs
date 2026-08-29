@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 
 pub const STRONG_SIGNATURE_LEN: usize = 16;
+pub const SOURCE_DIGEST_LEN: usize = 32;
 pub const DEFAULT_MAX_BASIS_BLOCKS: usize = 65_536;
 pub const MAX_LITERAL_BYTES: usize = 64 * 1024;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -209,12 +210,13 @@ pub enum DeltaOp {
     Copy { basis_offset: u64, len: u32 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaSummary {
     pub source_bytes: u64,
     pub literal_bytes: u64,
     pub reused_bytes: u64,
     pub operation_count: u64,
+    pub source_digest: [u8; SOURCE_DIGEST_LEN],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -242,6 +244,8 @@ pub type Result<T> = std::result::Result<T, DeltaMatchError>;
 /// Memory is bounded by the signature index, one adaptive-size rolling window,
 /// the reader buffer, and at most `MAX_LITERAL_BYTES` of pending literal data.
 /// Operations are emitted directly to `sink`; no whole-file delta plan exists.
+/// The full source BLAKE3 digest is accumulated in output order during the same
+/// pass, so a successful transfer does not need to reopen or reread the source.
 pub fn match_delta<R, F>(reader: R, basis: &BasisIndex, mut sink: F) -> Result<DeltaSummary>
 where
     R: Read,
@@ -270,7 +274,7 @@ where
 
     loop {
         if let Some(block) = basis.find_window(weak.digest(), &window) {
-            emitter.copy(basis.offset(block)?, block.size)?;
+            emitter.copy_slices(basis.offset(block)?, block.size, window.slices())?;
             let next = read_up_to(&mut reader, block_size)?;
             if next.is_empty() {
                 return emitter.finish();
@@ -303,7 +307,7 @@ where
     F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
 {
     if let Some(block) = basis.find_slice(&bytes) {
-        emitter.copy(basis.offset(block)?, block.size)
+        emitter.copy_slice(basis.offset(block)?, block.size, &bytes)
     } else {
         emitter.literal_slice(&bytes)
     }
@@ -391,7 +395,11 @@ impl RollingWindow {
 struct DeltaEmitter<'a, F> {
     sink: &'a mut F,
     literal: Vec<u8>,
-    summary: DeltaSummary,
+    source_hasher: blake3::Hasher,
+    source_bytes: u64,
+    literal_bytes: u64,
+    reused_bytes: u64,
+    operation_count: u64,
 }
 
 impl<'a, F> DeltaEmitter<'a, F>
@@ -402,11 +410,16 @@ where
         Self {
             sink,
             literal: Vec::with_capacity(MAX_LITERAL_BYTES),
-            summary: DeltaSummary::default(),
+            source_hasher: blake3::Hasher::new(),
+            source_bytes: 0,
+            literal_bytes: 0,
+            reused_bytes: 0,
+            operation_count: 0,
         }
     }
 
     fn literal_byte(&mut self, byte: u8) -> Result<()> {
+        self.source_hasher.update(&[byte]);
         self.literal.push(byte);
         if self.literal.len() == MAX_LITERAL_BYTES {
             self.flush_literal()?;
@@ -415,6 +428,7 @@ where
     }
 
     fn literal_slice(&mut self, mut bytes: &[u8]) -> Result<()> {
+        self.source_hasher.update(bytes);
         while !bytes.is_empty() {
             let available = MAX_LITERAL_BYTES - self.literal.len();
             let take = available.min(bytes.len());
@@ -432,16 +446,27 @@ where
         self.literal_slice(slices.1)
     }
 
-    fn copy(&mut self, basis_offset: u64, len: u32) -> Result<()> {
+    fn copy_slice(&mut self, basis_offset: u64, len: u32, source: &[u8]) -> Result<()> {
+        debug_assert_eq!(source.len(), len as usize);
+        self.copy_slices(basis_offset, len, (source, &[]))
+    }
+
+    fn copy_slices(
+        &mut self,
+        basis_offset: u64,
+        len: u32,
+        source: (&[u8], &[u8]),
+    ) -> Result<()> {
+        debug_assert_eq!(source.0.len() + source.1.len(), len as usize);
         self.flush_literal()?;
+        self.source_hasher.update(source.0);
+        self.source_hasher.update(source.1);
         (self.sink)(DeltaOp::Copy { basis_offset, len }).map_err(DeltaMatchError::Sink)?;
-        self.summary.reused_bytes = self
-            .summary
+        self.reused_bytes = self
             .reused_bytes
             .checked_add(u64::from(len))
             .ok_or(DeltaMatchError::ByteCountOverflow)?;
-        self.summary.source_bytes = self
-            .summary
+        self.source_bytes = self
             .source_bytes
             .checked_add(u64::from(len))
             .ok_or(DeltaMatchError::ByteCountOverflow)?;
@@ -455,13 +480,11 @@ where
         let bytes = Bytes::from(std::mem::take(&mut self.literal));
         let len = u64::try_from(bytes.len()).map_err(|_| DeltaMatchError::ByteCountOverflow)?;
         (self.sink)(DeltaOp::Literal(bytes)).map_err(DeltaMatchError::Sink)?;
-        self.summary.literal_bytes = self
-            .summary
+        self.literal_bytes = self
             .literal_bytes
             .checked_add(len)
             .ok_or(DeltaMatchError::ByteCountOverflow)?;
-        self.summary.source_bytes = self
-            .summary
+        self.source_bytes = self
             .source_bytes
             .checked_add(len)
             .ok_or(DeltaMatchError::ByteCountOverflow)?;
@@ -471,8 +494,7 @@ where
     }
 
     fn increment_ops(&mut self) -> Result<()> {
-        self.summary.operation_count = self
-            .summary
+        self.operation_count = self
             .operation_count
             .checked_add(1)
             .ok_or(DeltaMatchError::OperationCountOverflow)?;
@@ -481,7 +503,13 @@ where
 
     fn finish(mut self) -> Result<DeltaSummary> {
         self.flush_literal()?;
-        Ok(self.summary)
+        Ok(DeltaSummary {
+            source_bytes: self.source_bytes,
+            literal_bytes: self.literal_bytes,
+            reused_bytes: self.reused_bytes,
+            operation_count: self.operation_count,
+            source_digest: *self.source_hasher.finalize().as_bytes(),
+        })
     }
 }
 
@@ -514,6 +542,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        assert_eq!(summary.source_digest, *blake3::hash(source).as_bytes());
         (ops, summary)
     }
 
@@ -530,6 +559,15 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn empty_source_reports_blake3_digest_without_ops() {
+        let index = BasisIndex::new(4096, [], BasisIndexLimits::default()).unwrap();
+        let (ops, summary) = collect(&[], &index);
+        assert!(ops.is_empty());
+        assert_eq!(summary.source_bytes, 0);
+        assert_eq!(summary.operation_count, 0);
     }
 
     #[test]
