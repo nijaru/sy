@@ -38,11 +38,14 @@ jobs:
           new_import = 'use crate::remote::transfer::{\n    request_file_transfer, request_file_transfer_with_metadata, RemoteDeltaBasis, TransferMetadata,\n    TransferSummary,\n};'
           if old_import in s:
               s = s.replace(old_import, new_import, 1)
-          old_method = '    pub async fn transfer_file(\n        &self,\n        source_root: PathBuf,\n        source: Entry,\n        delta_basis: Option<RemoteDeltaBasis>,\n    ) -> Result<TransferSummary> {\n        self.require_push(FrameKind::FileBegin)?;\n        request_file_transfer(\n            &self.sender,\n            source_root,\n            source,\n            delta_basis,\n            self.peer,\n        )\n        .await\n        .map_err(Into::into)\n    }\n'
-          new_method = old_method + '\n    pub async fn transfer_file_with_metadata(\n        &self,\n        source_root: PathBuf,\n        source: Entry,\n        delta_basis: Option<RemoteDeltaBasis>,\n        metadata: TransferMetadata,\n    ) -> Result<TransferSummary> {\n        self.require_push(FrameKind::FileBegin)?;\n        request_file_transfer_with_metadata(\n            &self.sender,\n            source_root,\n            source,\n            delta_basis,\n            metadata,\n            self.peer,\n        )\n        .await\n        .map_err(Into::into)\n    }\n'
-          if old_method not in s:
-              raise SystemExit('expected client transfer method not found')
-          s = s.replace(old_method, new_method, 1)
+          elif 'request_file_transfer_with_metadata' not in s:
+              raise SystemExit('expected client transfer import not found')
+          anchor = '    pub async fn apply_metadata(\n'
+          method = '    pub async fn transfer_file_with_metadata(\n        &self,\n        source_root: PathBuf,\n        source: Entry,\n        delta_basis: Option<RemoteDeltaBasis>,\n        metadata: TransferMetadata,\n    ) -> Result<TransferSummary> {\n        self.require_push(FrameKind::FileBegin)?;\n        request_file_transfer_with_metadata(\n            &self.sender,\n            source_root,\n            source,\n            delta_basis,\n            metadata,\n            self.peer,\n        )\n        .await\n        .map_err(Into::into)\n    }\n\n'
+          if 'pub async fn transfer_file_with_metadata' not in s:
+              if anchor not in s:
+                  raise SystemExit('expected apply_metadata anchor not found')
+              s = s.replace(anchor, method + anchor, 1)
           client.write_text(s)
           PY
           cargo fmt --all
