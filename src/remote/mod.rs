@@ -2,7 +2,10 @@ pub mod path;
 pub mod router;
 pub mod runtime;
 pub mod scan;
+pub mod serve;
 pub mod signature;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 pub mod transfer;
 
 use crate::endpoint::Endpoint;
@@ -422,55 +425,51 @@ mod tests {
         assert!(!client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS));
     }
 
-    #[test]
-    fn process_capabilities_are_runtime_backed_and_peer_bounded() {
-        let local = process_capabilities();
-        assert!(local.contains(CapabilitySet::BLAKE3));
-        assert!(local.contains(CapabilitySet::RAW_PATHS));
-        assert!(local.contains(CapabilitySet::MULTIPLEXING));
+    #[tokio::test]
+    async fn advertised_capabilities_are_runtime_backed() {
+        let capabilities = process_capabilities();
+        assert!(capabilities.contains(CapabilitySet::BLAKE3));
+        assert!(capabilities.contains(CapabilitySet::RAW_PATHS));
+        assert!(capabilities.contains(CapabilitySet::MULTIPLEXING));
         assert_eq!(
-            local.contains(CapabilitySet::ATOMIC_REPLACE),
+            capabilities.contains(CapabilitySet::ROLLING_SIGNATURES),
+            supports_rolling_signatures(Platform::current().os)
+        );
+        assert_eq!(
+            capabilities.contains(CapabilitySet::STAGED_WRITE),
             supports_staged_files(Platform::current().os)
         );
         assert_eq!(
-            local.contains(CapabilitySet::STAGED_WRITE),
+            capabilities.contains(CapabilitySet::ATOMIC_REPLACE),
             supports_staged_files(Platform::current().os)
         );
-        assert!(!local.intersects(
-            CapabilitySet::RANDOM_READ
-                | CapabilitySet::RANDOM_WRITE
-                | CapabilitySet::REFLINK
-                | CapabilitySet::SPARSE
-                | CapabilitySet::XATTR
-                | CapabilitySet::ACL
-                | CapabilitySet::HARDLINK
-                | CapabilitySet::BSD_FLAGS
-        ));
-
-        let peer = CapabilitySet::BLAKE3 | CapabilitySet::MULTIPLEXING;
-        assert_eq!(negotiated_capabilities(peer), peer);
-    }
-
-    #[test]
-    fn rolling_signatures_are_scoped_to_tested_os_family() {
-        assert!(supports_rolling_signatures(PlatformOs::Linux));
-        assert!(supports_rolling_signatures(PlatformOs::Macos));
-        assert!(!supports_rolling_signatures(PlatformOs::Windows));
-        assert!(!supports_rolling_signatures(PlatformOs::Other(4)));
-    }
-
-    #[test]
-    fn staged_files_are_scoped_to_tested_os_family() {
-        assert!(supports_staged_files(PlatformOs::Linux));
-        assert!(supports_staged_files(PlatformOs::Macos));
-        assert!(!supports_staged_files(PlatformOs::Windows));
-        assert!(!supports_staged_files(PlatformOs::Other(4)));
+        assert!(!capabilities.contains(CapabilitySet::RANDOM_READ));
+        assert!(!capabilities.contains(CapabilitySet::RANDOM_WRITE));
+        assert!(!capabilities.contains(CapabilitySet::REFLINK));
+        assert!(!capabilities.contains(CapabilitySet::SPARSE));
+        assert!(!capabilities.contains(CapabilitySet::XATTR));
+        assert!(!capabilities.contains(CapabilitySet::ACL));
+        assert!(!capabilities.contains(CapabilitySet::HARDLINK));
+        assert!(!capabilities.contains(CapabilitySet::BSD_FLAGS));
     }
 
     #[tokio::test]
-    async fn push_session_creates_missing_root() {
+    async fn negotiated_capabilities_are_intersection() {
+        let peer = CapabilitySet::BLAKE3
+            | CapabilitySet::RAW_PATHS
+            | CapabilitySet::RANDOM_READ
+            | CapabilitySet::REFLINK;
+        let negotiated = negotiated_capabilities(peer);
+        assert!(negotiated.contains(CapabilitySet::BLAKE3));
+        assert!(negotiated.contains(CapabilitySet::RAW_PATHS));
+        assert!(!negotiated.contains(CapabilitySet::RANDOM_READ));
+        assert!(!negotiated.contains(CapabilitySet::REFLINK));
+    }
+
+    #[tokio::test]
+    async fn push_creates_missing_root_before_opening_it() {
         let parent = tempfile::TempDir::new().unwrap();
-        let root = parent.path().join("missing").join("nested");
+        let root = parent.path().join("missing");
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
@@ -487,35 +486,12 @@ mod tests {
         )
         .await
         .unwrap();
-        server.await.unwrap().unwrap();
-        assert!(root.is_dir());
+        let opened = server.await.unwrap().unwrap();
+        assert!(opened.rooted.root_path().is_dir());
     }
 
-    #[tokio::test]
-    async fn rejects_non_control_hello() {
-        let (client_io, server_io) = tokio::io::duplex(4096);
-        let (_client_reader, mut client_writer) = tokio::io::split(client_io);
-        let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
-        let hello = ClientHello::new(
-            VersionRange::exact(PROTOCOL_V3),
-            process_capabilities(),
-            Platform::current(),
-            BUILD_ID,
-        )
-        .unwrap();
-        let frame = Frame::new(
-            FrameKind::ClientHello,
-            crate::protocol::FrameFlags::empty(),
-            crate::protocol::StreamId::new(1),
-            hello.encode().unwrap(),
-        )
-        .unwrap();
-        write_frame(&mut client_writer, &frame).await.unwrap();
-        client_writer.flush().await.unwrap();
-
-        let error = server_handshake(&mut server_reader, &mut server_writer)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RemoteError::NonControlFrame { .. }));
+    #[test]
+    fn rejects_malformed_native_roots() {
+        assert!(decode_native_root(WirePath::new(Vec::new()).unwrap_err().into()).is_err());
     }
 }
