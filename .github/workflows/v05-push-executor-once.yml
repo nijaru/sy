@@ -22,81 +22,24 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           engine = Path('src/engine/mod.rs')
           s = engine.read_text()
           if 'pub mod work;' not in s:
               s += 'pub mod work;\n'
           engine.write_text(s)
-
           remote = Path('src/remote/mod.rs')
           s = remote.read_text()
           if 'pub mod push;' not in s:
               s = s.replace('pub mod path;\n', 'pub mod path;\npub mod push;\n', 1)
           remote.write_text(s)
-
           client = Path('src/remote/client.rs')
           s = client.read_text()
           old_import = 'use crate::remote::transfer::{request_file_transfer, RemoteDeltaBasis, TransferSummary};'
           new_import = 'use crate::remote::transfer::{\n    request_file_transfer, request_file_transfer_with_metadata, RemoteDeltaBasis, TransferMetadata,\n    TransferSummary,\n};'
           if old_import in s:
               s = s.replace(old_import, new_import, 1)
-          old_method = '''    pub async fn transfer_file(
-        &self,
-        source_root: PathBuf,
-        source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
-    ) -> Result<TransferSummary> {
-        self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer(
-            &self.sender,
-            source_root,
-            source,
-            delta_basis,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
-    }
-'''
-          new_method = '''    pub async fn transfer_file(
-        &self,
-        source_root: PathBuf,
-        source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
-    ) -> Result<TransferSummary> {
-        self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer(
-            &self.sender,
-            source_root,
-            source,
-            delta_basis,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    pub async fn transfer_file_with_metadata(
-        &self,
-        source_root: PathBuf,
-        source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
-        metadata: TransferMetadata,
-    ) -> Result<TransferSummary> {
-        self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer_with_metadata(
-            &self.sender,
-            source_root,
-            source,
-            delta_basis,
-            metadata,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
-    }
-'''
+          old_method = '    pub async fn transfer_file(\n        &self,\n        source_root: PathBuf,\n        source: Entry,\n        delta_basis: Option<RemoteDeltaBasis>,\n    ) -> Result<TransferSummary> {\n        self.require_push(FrameKind::FileBegin)?;\n        request_file_transfer(\n            &self.sender,\n            source_root,\n            source,\n            delta_basis,\n            self.peer,\n        )\n        .await\n        .map_err(Into::into)\n    }\n'
+          new_method = old_method + '\n    pub async fn transfer_file_with_metadata(\n        &self,\n        source_root: PathBuf,\n        source: Entry,\n        delta_basis: Option<RemoteDeltaBasis>,\n        metadata: TransferMetadata,\n    ) -> Result<TransferSummary> {\n        self.require_push(FrameKind::FileBegin)?;\n        request_file_transfer_with_metadata(\n            &self.sender,\n            source_root,\n            source,\n            delta_basis,\n            metadata,\n            self.peer,\n        )\n        .await\n        .map_err(Into::into)\n    }\n'
           if old_method not in s:
               raise SystemExit('expected client transfer method not found')
           s = s.replace(old_method, new_method, 1)
