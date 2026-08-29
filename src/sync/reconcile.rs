@@ -4,9 +4,6 @@
 //! `engine/`. This module only adapts the resulting `SyncOp`s to the legacy task
 //! executor while that executor is being replaced.
 
-#[path = "../engine/delete_journal.rs"]
-mod delete_journal;
-
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
@@ -15,10 +12,10 @@ use crate::sync::executor::{BackupConfig, ExecuteConfig, TaskExecutor};
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{SyncAction, SyncTask};
-use delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sy::engine::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
 use sy::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
 use sy::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonMode, ComparisonPolicy, PlanDecision,
