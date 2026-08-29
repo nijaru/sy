@@ -1,7 +1,10 @@
+#[path = "client.rs"]
+mod client;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "mutation.rs"]
 mod mutation;
+pub use client::ClientRemoteHandle;
 
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
@@ -585,9 +588,19 @@ mod tests {
                 hardlink_group: false,
             },
         };
-        let first = session.scan(request).await.unwrap();
-        let second = session.scan(request).await.unwrap();
-        let (first, second) = tokio::join!(collect_paths(first), collect_paths(second));
+        let first_handle = session.request_handle();
+        let second_handle = first_handle.clone();
+        let first =
+            tokio::spawn(
+                async move { collect_paths(first_handle.scan(request).await.unwrap()).await },
+            );
+        let second =
+            tokio::spawn(
+                async move { collect_paths(second_handle.scan(request).await.unwrap()).await },
+            );
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
         server.await.unwrap();
 
         let expected = vec![
