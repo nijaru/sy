@@ -1,6 +1,6 @@
 use super::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
 use super::domain::{Entry, InvalidRelativePath, RelativePath};
-use crate::error::SyncError;
+use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeletePolicy {
@@ -17,7 +17,7 @@ pub struct DeleteAction {
 #[derive(Debug, thiserror::Error)]
 pub enum DeletePlanError {
     #[error(transparent)]
-    Journal(#[from] SyncError),
+    Journal(#[from] io::Error),
 
     #[error(transparent)]
     InvalidPath(#[from] InvalidRelativePath),
@@ -33,6 +33,9 @@ pub enum DeletePlanError {
 
     #[error("delete preflight {0} counter overflow")]
     CounterOverflow(&'static str),
+
+    #[error("delete preflight {0} counter underflow")]
+    CounterUnderflow(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, DeletePlanError>;
@@ -71,7 +74,13 @@ impl DeleteTracker {
         })
     }
 
-    pub fn observe_source_only(&mut self) {}
+    /// A source-backed descendant makes any still-open destination-only parent
+    /// non-deletable even when the source-side directory entry itself was
+    /// filtered before reconciliation.
+    pub async fn observe_source_only(&mut self, source: &Entry) -> Result<()> {
+        self.close_candidate_directories(&source.path);
+        self.protect_candidate_directories().await
+    }
 
     pub async fn observe_matched(&mut self, destination: &Entry, in_scope: bool) -> Result<()> {
         self.close_candidate_directories(&destination.path);
@@ -181,6 +190,8 @@ impl DeleteTracker {
                 .append(candidate.path.as_path(), DeleteKind::ProtectDirectory)
                 .await?;
             candidate.protected = true;
+            self.delete_candidates =
+                checked_sub(self.delete_candidates, 1, "delete candidate")?;
         }
         Ok(())
     }
@@ -197,6 +208,9 @@ impl DeletePlan {
         self.eligible_destination_entries
     }
 
+    /// Number of entries that will actually be removed after protection markers
+    /// are accounted for, not merely the number initially observed as
+    /// destination-only.
     pub const fn delete_candidates(&self) -> u64 {
         self.delete_candidates
     }
@@ -259,10 +273,16 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
         .ok_or(DeletePlanError::CounterOverflow(counter))
 }
 
+fn checked_sub(value: u64, decrement: u64, counter: &'static str) -> Result<u64> {
+    value
+        .checked_sub(decrement)
+        .ok_or(DeletePlanError::CounterUnderflow(counter))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::domain::Timestamp;
+    use super::*;
     use std::path::PathBuf;
 
     fn path(value: &str) -> RelativePath {
@@ -318,8 +338,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matched_descendant_protects_candidate_parent() {
-        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+    async fn matched_descendant_protects_parent_and_candidate_count() {
+        let mut tracker = DeleteTracker::new(DeletePolicy {
+            threshold: 0,
+            force: false,
+        })
+        .await
+        .unwrap();
         tracker
             .observe_destination_only(&directory("parent"), true)
             .await
@@ -329,7 +354,25 @@ mod tests {
             .await
             .unwrap();
         let plan = tracker.finish().await.unwrap();
-        assert_eq!(plan.delete_candidates(), 1);
+        assert_eq!(plan.delete_candidates(), 0);
+
+        let mut replay = plan.into_replay();
+        assert_eq!(replay.next_action().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn source_only_descendant_protects_candidate_parent() {
+        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+        tracker
+            .observe_destination_only(&directory("parent"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_source_only(&file("parent/new"))
+            .await
+            .unwrap();
+        let plan = tracker.finish().await.unwrap();
+        assert_eq!(plan.delete_candidates(), 0);
 
         let mut replay = plan.into_replay();
         assert_eq!(replay.next_action().await.unwrap(), None);
@@ -352,7 +395,7 @@ mod tests {
             .unwrap();
         let plan = tracker.finish().await.unwrap();
         assert_eq!(plan.eligible_destination_entries(), 1);
-        assert_eq!(plan.delete_candidates(), 1);
+        assert_eq!(plan.delete_candidates(), 0);
 
         let mut replay = plan.into_replay();
         assert_eq!(replay.next_action().await.unwrap(), None);
