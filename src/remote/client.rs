@@ -77,14 +77,7 @@ impl ClientRemoteHandle {
         let identity = basis
             .identity
             .ok_or(RemoteSignatureError::MissingBasisIdentity)?;
-        request_signatures(
-            &self.sender,
-            &basis.path,
-            basis.size,
-            identity,
-            self.peer,
-        )
-        .await
+        request_signatures(&self.sender, &basis.path, basis.size, identity, self.peer).await
     }
 
     pub async fn delta_basis(
@@ -162,15 +155,9 @@ impl ClientRemoteHandle {
         delta_basis: Option<RemoteDeltaBasis>,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer(
-            &self.sender,
-            source_root,
-            source,
-            delta_basis,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
+        request_file_transfer(&self.sender, source_root, source, delta_basis, self.peer)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn apply_metadata(
