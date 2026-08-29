@@ -22,13 +22,11 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           remote = Path('src/remote/mod.rs')
           s = remote.read_text()
           if 'pub mod push_controller;' not in s:
               s = s.replace('pub mod push;\n', 'pub mod push;\npub mod push_controller;\n', 1)
           remote.write_text(s)
-
           push = Path('src/remote/push.rs')
           s = push.read_text()
           import_anchor = 'use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};\n'
@@ -37,29 +35,8 @@ jobs:
               if import_anchor not in s:
                   raise SystemExit('push domain import anchor not found')
               s = s.replace(import_anchor, import_anchor + finalize_import, 1)
-
           method_anchor = '    async fn prepare_delta_basis(\n'
-          method = '''    pub async fn execute_finalize(&self, metadata: FinalizeMetadata) -> Result<()> {
-        let _permit = self
-            .scheduler
-            .acquire(ResourceRequest {
-                metadata_ops: 1,
-                network_writes: 1,
-                ..ResourceRequest::default()
-            })
-            .await?;
-        self.remote
-            .apply_metadata(
-                &metadata.path,
-                metadata.kind,
-                metadata.unix_mode,
-                metadata.modified,
-            )
-            .await?;
-        Ok(())
-    }
-
-'''
+          method = '    pub async fn execute_finalize(&self, metadata: FinalizeMetadata) -> Result<()> {\n        let _permit = self\n            .scheduler\n            .acquire(ResourceRequest {\n                metadata_ops: 1,\n                network_writes: 1,\n                ..ResourceRequest::default()\n            })\n            .await?;\n        self.remote\n            .apply_metadata(\n                &metadata.path,\n                metadata.kind,\n                metadata.unix_mode,\n                metadata.modified,\n            )\n            .await?;\n        Ok(())\n    }\n\n'
           if 'pub async fn execute_finalize' not in s:
               if method_anchor not in s:
                   raise SystemExit('prepare_delta_basis anchor not found')
