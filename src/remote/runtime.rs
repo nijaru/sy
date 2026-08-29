@@ -1,4 +1,7 @@
-use crate::engine::domain::Entry;
+#[path = "mutation.rs"]
+mod mutation;
+
+use crate::engine::domain::{Entry, RelativePath};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{
@@ -23,6 +26,10 @@ use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
 use futures::StreamExt;
+use mutation::{
+    request_create_directory, request_remove, request_replace_symlink,
+    serve_incoming_mutation_rooted, RemoteMutationError,
+};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -51,6 +58,9 @@ pub enum RemoteSessionError {
 
     #[error(transparent)]
     Transfer(#[from] RemoteTransferError),
+
+    #[error(transparent)]
+    Mutation(#[from] RemoteMutationError),
 
     #[error(transparent)]
     BasisIndex(#[from] BasisIndexError),
@@ -225,12 +235,7 @@ impl ClientRemoteSession {
         source: Entry,
         delta_basis: Option<RemoteDeltaBasis>,
     ) -> Result<TransferSummary> {
-        if self.operation != Operation::Push {
-            return Err(RemoteSessionError::OperationMismatch {
-                operation: self.operation,
-                kind: FrameKind::FileBegin,
-            });
-        }
+        self.require_push(FrameKind::FileBegin)?;
         request_file_transfer(
             &self.router.sender(),
             source_root,
@@ -241,12 +246,55 @@ impl ClientRemoteSession {
         .await
         .map_err(Into::into)
     }
+
+    pub async fn create_directory(&self, path: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_create_directory(&self.router.sender(), path, self.server.platform.os)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replace_symlink(&self, path: &RelativePath, target: &Path) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_replace_symlink(
+            &self.router.sender(),
+            path,
+            target,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn remove(&self, path: &RelativePath, is_directory: bool) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_remove(
+            &self.router.sender(),
+            path,
+            is_directory,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    fn require_push(&self, kind: FrameKind) -> Result<()> {
+        if self.operation == Operation::Push {
+            Ok(())
+        } else {
+            Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind,
+            })
+        }
+    }
 }
 
 pub enum IncomingRequest {
     Scan(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
+    Mutation(IncomingStream),
 }
 
 #[derive(Clone)]
@@ -293,6 +341,21 @@ impl ServerFileHandler {
         incoming: IncomingStream,
     ) -> crate::remote::transfer::Result<TransferSummary> {
         serve_incoming_file_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Namespace mutations use the same session-pinned root descriptor as file
+/// reconstruction. The mutation request never reopens the root pathname.
+#[derive(Clone)]
+pub struct ServerMutationHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerMutationHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> mutation::Result<()> {
+        serve_incoming_mutation_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
@@ -355,6 +418,14 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn mutation_handler(&self) -> ServerMutationHandler {
+        ServerMutationHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
@@ -366,10 +437,15 @@ impl ServerRemoteSession {
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
             }
-            FrameKind::FileBegin => Err(RemoteSessionError::OperationMismatch {
-                operation: self.opened.operation,
-                kind: FrameKind::FileBegin,
-            }),
+            FrameKind::Mutation if self.opened.operation == Operation::Push => {
+                Ok(Some(IncomingRequest::Mutation(incoming)))
+            }
+            FrameKind::FileBegin | FrameKind::Mutation => {
+                Err(RemoteSessionError::OperationMismatch {
+                    operation: self.opened.operation,
+                    kind: incoming.first.frame().kind(),
+                })
+            }
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
         }
     }
@@ -379,7 +455,7 @@ impl ServerRemoteSession {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
+    use crate::engine::domain::{EntryKind, Timestamp};
     use crate::engine::scan::EntryMetadataRequest;
     use crate::transfer::delta::BasisIndexLimits;
     use tokio::task::JoinSet;
@@ -520,7 +596,9 @@ mod tests {
                             handler.serve(incoming).await.unwrap();
                         });
                     }
-                    IncomingRequest::File(_) => panic!("unexpected file request"),
+                    IncomingRequest::File(_) | IncomingRequest::Mutation(_) => {
+                        panic!("unexpected mutation request")
+                    }
                 }
             }
 
@@ -616,6 +694,61 @@ mod tests {
         assert_eq!(
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             data
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_namespace_mutations() {
+        let destination_root = tempfile::TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("old"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.mutation_handler();
+            for _ in 0..4 {
+                let request = session.next_request().await.unwrap().unwrap();
+                let IncomingRequest::Mutation(incoming) = request else {
+                    panic!("expected mutation request");
+                };
+                handler.serve(incoming).await.unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let dir = RelativePath::new("dir").unwrap();
+        session.create_directory(&dir).await.unwrap();
+        let link = RelativePath::new("link").unwrap();
+        session
+            .replace_symlink(&link, Path::new("../target"))
+            .await
+            .unwrap();
+        session
+            .remove(&RelativePath::new("old").unwrap(), false)
+            .await
+            .unwrap();
+        session.remove(&dir, true).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!destination_root.path().join("old").exists());
+        assert!(!destination_root.path().join("dir").exists());
+        assert_eq!(
+            std::fs::read_link(destination_root.path().join("link")).unwrap(),
+            Path::new("../target")
         );
     }
 
