@@ -25,7 +25,7 @@ jobs:
           engine = Path('src/engine/mod.rs')
           s = engine.read_text()
           if 'mod delete_journal;' not in s:
-              s = s.replace('pub mod domain;\n', 'pub(crate) mod delete_journal;\npub mod delete_plan;\npub mod domain;\n', 1)
+              s = s.replace('pub mod domain;\n', '#[doc(hidden)]\npub mod delete_journal;\npub mod delete_plan;\npub mod domain;\n', 1)
           engine.write_text(s)
           reconcile = Path('src/sync/reconcile.rs')
           s = reconcile.read_text()
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           git rm .github/workflows/v05-delete-plan-once.yml
-          git add src/engine/mod.rs src/engine/delete_plan.rs src/sync/reconcile.rs
+          git add src/engine/mod.rs src/engine/delete_journal.rs src/engine/delete_plan.rs src/sync/reconcile.rs
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m 'feat(engine): add exact bounded delete preflight'
