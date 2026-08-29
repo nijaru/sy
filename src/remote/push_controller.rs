@@ -1,10 +1,11 @@
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
 use crate::engine::domain::{Entry, RelativePath};
-use crate::engine::finalize_journal::{FinalizeJournal, FinalizeJournalError, FinalizeMetadata};
+use crate::engine::finalize_journal::{
+    FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
+};
 use crate::engine::plan_journal::{PlanJournal, PlanJournalError, PlanJournalReader};
 use crate::engine::planner::{plan_entry, ComparisonPolicy, PlanDecision};
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
-use crate::engine::work::WorkItem;
 use crate::remote::push::{
     lower_sync_op, RemotePushAction, RemotePushError, RemotePushExecutor, RemotePushLowerError,
     RemotePushPolicy,
@@ -40,9 +41,6 @@ pub enum RemotePushControllerError {
     #[error("remote push worker failed: {0}")]
     Worker(String),
 
-    #[error("lowered finalize work was not a metadata action")]
-    InvalidFinalizeWork,
-
     #[error("remote push {0} counter overflow")]
     CounterOverflow(&'static str),
 }
@@ -51,14 +49,17 @@ pub type Result<T> = std::result::Result<T, RemotePushControllerError>;
 
 /// Disk-backed semantic result of a complete no-mutation ordered merge.
 ///
-/// Source-backed semantic work and exact destination-only deletion candidates
-/// are derived from the same ordered stream. Returning this value means the
+/// Source-backed semantic work, requested directory final metadata, and exact
+/// destination-only deletion candidates are derived from the same ordered stream.
+/// Returning this value means the
 /// whole merge completed and any enabled deletion threshold passed without
 /// mutating either endpoint.
 pub struct RemotePushPlan {
     reader: PlanJournalReader,
+    finalize: FinalizeJournalReader,
     operations: u64,
     delete: Option<DeletePlan>,
+    execution_policy: RemotePushPolicy,
 }
 
 impl RemotePushPlan {
@@ -94,6 +95,11 @@ pub async fn preflight_remote_push(
 ) -> Result<RemotePushPlan> {
     let mut reconciler = OrderedReconciler::new(source, destination);
     let mut journal = PlanJournal::new().await?;
+    let mut finalize = FinalizeJournal::new().await?;
+    let execution_policy = RemotePushPolicy {
+        preserve_permissions: policy.preserve_permissions,
+        preserve_times: policy.preserve_times,
+    };
     let mut delete = match delete_policy {
         Some(policy) => Some(DeleteTracker::new(policy).await?),
         None => None,
@@ -103,6 +109,7 @@ pub async fn preflight_remote_push(
     while let Some(item) = reconciler.next().await? {
         let decision = match item {
             ReconcileItem::SourceOnly(source) => {
+                append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 if let Some(delete) = &mut delete {
                     delete.observe_source_only(&source).await?;
                 }
@@ -112,6 +119,8 @@ pub async fn preflight_remote_push(
                 source,
                 destination,
             } => {
+                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
+                    .await?;
                 if let Some(delete) = &mut delete {
                     let in_scope = delete_in_scope(&destination);
                     delete.observe_matched(&destination, in_scope).await?;
@@ -146,8 +155,10 @@ pub async fn preflight_remote_push(
     };
     Ok(RemotePushPlan {
         reader: journal.seal().await?,
+        finalize: finalize.seal().await?,
         operations,
         delete,
+        execution_policy,
     })
 }
 
@@ -168,23 +179,17 @@ pub struct RemotePushSummary {
 /// Directory creation is awaited in preorder before reconciliation advances to
 /// descendants. Independent leaf work may run concurrently, but at most
 /// `max_in_flight` worker futures exist even before scheduler admission. All
-/// directory metadata is journaled and replayed child-before-parent only after
-/// main work completes.
+/// directory metadata is preflighted into a reverse journal and replayed
+/// child-before-parent only after main work and reverse deletes complete.
 pub struct RemotePushController {
     executor: Arc<RemotePushExecutor>,
-    policy: RemotePushPolicy,
     max_in_flight: NonZeroUsize,
 }
 
 impl RemotePushController {
-    pub fn new(
-        executor: RemotePushExecutor,
-        policy: RemotePushPolicy,
-        max_in_flight: NonZeroUsize,
-    ) -> Self {
+    pub fn new(executor: RemotePushExecutor, max_in_flight: NonZeroUsize) -> Self {
         Self {
             executor: Arc::new(executor),
-            policy,
             max_in_flight,
         }
     }
@@ -192,8 +197,10 @@ impl RemotePushController {
     pub async fn execute(&self, plan: RemotePushPlan) -> Result<RemotePushSummary> {
         let RemotePushPlan {
             mut reader,
+            mut finalize,
             operations,
             delete,
+            execution_policy,
         } = plan;
         let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
         let mut summary = RemotePushSummary {
@@ -201,18 +208,10 @@ impl RemotePushController {
             delete_candidates,
             ..RemotePushSummary::default()
         };
-        let mut finalize = FinalizeJournal::new().await?;
         let mut workers = JoinSet::new();
 
         while let Some(operation) = reader.next().await? {
-            let lowered = lower_sync_op(operation, self.policy)?;
-
-            if let Some(finalize_work) = lowered.finalize {
-                let metadata = finalize_metadata(finalize_work)?;
-                finalize.append(&metadata).await?;
-            }
-
-            let Some(main) = lowered.main else {
+            let Some(main) = lower_sync_op(operation, execution_policy)?.main else {
                 continue;
             };
             summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
@@ -242,7 +241,6 @@ impl RemotePushController {
             }
         }
 
-        let mut finalize = finalize.seal().await?;
         while let Some(metadata) = finalize.next().await? {
             self.executor.execute_finalize(metadata).await?;
             summary.finalized_metadata =
@@ -253,22 +251,55 @@ impl RemotePushController {
     }
 }
 
-fn finalize_metadata(item: WorkItem<RemotePushAction>) -> Result<FinalizeMetadata> {
-    match item.into_action() {
-        RemotePushAction::ApplyMetadata {
-            source,
-            unix_mode,
-            modified,
-        } => Ok(FinalizeMetadata {
-            path: source.path,
-            kind: source.kind,
-            unix_mode,
-            modified,
-        }),
-        _ => Err(RemotePushControllerError::InvalidFinalizeWork),
+async fn append_directory_finalize(
+    journal: &mut FinalizeJournal,
+    source: &Entry,
+    destination: Option<&Entry>,
+    policy: ComparisonPolicy,
+) -> Result<()> {
+    if let Some(metadata) = directory_finalize_metadata(source, destination, policy)? {
+        journal.append(&metadata).await?;
     }
+    Ok(())
 }
 
+fn directory_finalize_metadata(
+    source: &Entry,
+    destination: Option<&Entry>,
+    policy: ComparisonPolicy,
+) -> Result<Option<FinalizeMetadata>> {
+    if !source.is_directory()
+        || destination.is_some_and(|entry| !entry.is_directory())
+        || (!policy.preserve_permissions && !policy.preserve_times)
+    {
+        return Ok(None);
+    }
+
+    let final_entry = match destination {
+        Some(destination)
+            if policy.ignore_existing
+                || (policy.update_only && destination.modified > source.modified) =>
+        {
+            destination
+        }
+        _ => source,
+    };
+    let unix_mode = if policy.preserve_permissions {
+        Some(final_entry.unix_mode.ok_or_else(|| {
+            RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
+        })?)
+    } else {
+        None
+    };
+    let modified = policy.preserve_times.then_some(final_entry.modified);
+
+    Ok(Some(FinalizeMetadata {
+        path: source.path.clone(),
+        kind: source.kind,
+        unix_mode,
+        modified,
+    }))
+}
 async fn collect_one(
     workers: &mut JoinSet<std::result::Result<Option<TransferSummary>, RemotePushError>>,
     summary: &mut RemotePushSummary,
@@ -436,24 +467,185 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn directory_finalize_work_becomes_endpoint_neutral_record() {
-        let source = directory("parent/child", 0o700);
-        let lowered = lower_sync_op(
-            SyncOp::Create {
-                source: source.clone(),
-            },
-            RemotePushPolicy {
-                preserve_permissions: true,
+    #[tokio::test]
+    async fn preflight_journals_equal_directory_time_for_post_namespace_restore() {
+        let modified = Timestamp::new(123, 456).unwrap();
+        let mut source_directory = directory("parent", 0o755);
+        source_directory.modified = modified;
+        let destination_directory = source_directory.clone();
+        let mut plan = preflight_remote_push(
+            entries(vec![source_directory]),
+            entries(vec![destination_directory]),
+            ComparisonPolicy {
                 preserve_times: true,
+                ..ComparisonPolicy::default()
             },
+            None,
+            |_| true,
         )
+        .await
         .unwrap();
-        let metadata = finalize_metadata(lowered.finalize.unwrap()).unwrap();
 
-        assert_eq!(metadata.path, source.path);
-        assert_eq!(metadata.kind, EntryKind::Directory);
-        assert_eq!(metadata.unix_mode, Some(0o700));
-        assert_eq!(metadata.modified, Some(Timestamp::UNIX_EPOCH));
+        assert!(matches!(
+            plan.reader.next().await.unwrap(),
+            Some(SyncOp::Skip { path: value, .. }) if value == path("parent")
+        ));
+        assert_eq!(
+            plan.finalize.next().await.unwrap(),
+            Some(FinalizeMetadata {
+                path: path("parent"),
+                kind: EntryKind::Directory,
+                unix_mode: None,
+                modified: Some(modified),
+            })
+        );
+        assert!(plan.finalize.next().await.unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_push_commits_delete_before_restoring_parent_metadata() {
+        use crate::endpoint::local_entry_scan::local_entry_stream;
+        use crate::engine::scan::{EntryMetadataRequest, ScanRequest};
+        use crate::engine::scheduler::{ResourceBudget, Scheduler};
+        use crate::protocol::Operation;
+        use crate::remote::router::RouterConfig;
+        use crate::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
+        use crate::transfer::delta::BasisIndexLimits;
+        use std::fs::{File, FileTimes, Permissions};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::{Duration, SystemTime};
+
+        let source_root = tempfile::TempDir::new().unwrap();
+        let destination_root = tempfile::TempDir::new().unwrap();
+        let source_parent = source_root.path().join("parent");
+        let destination_parent = destination_root.path().join("parent");
+        std::fs::create_dir(&source_parent).unwrap();
+        std::fs::create_dir(&destination_parent).unwrap();
+        std::fs::write(source_parent.join("new"), b"new").unwrap();
+        std::fs::write(destination_parent.join("remove"), b"old").unwrap();
+        std::fs::set_permissions(&source_parent, Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&destination_parent, Permissions::from_mode(0o755)).unwrap();
+
+        let fixed_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        File::open(&source_parent)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(fixed_time))
+            .unwrap();
+        File::open(&destination_parent)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(fixed_time))
+            .unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan_handler = session.scan_handler();
+            let file_handler = session.file_handler();
+            let mutation_handler = session.mutation_handler();
+            let metadata_handler = session.metadata_handler();
+            let mut order = Vec::new();
+
+            for _ in 0..4 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        order.push("scan");
+                        scan_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::File(incoming) => {
+                        order.push("file");
+                        file_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        order.push("mutation");
+                        mutation_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        order.push("metadata");
+                        metadata_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
+                }
+            }
+            order
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let handle = session.request_handle();
+        let scan_request = ScanRequest {
+            respect_gitignore: false,
+            include_git_dir: true,
+            max_depth: None,
+            metadata: EntryMetadataRequest {
+                unix_mode: true,
+                symlink_target: true,
+                identity: true,
+                hardlink_group: false,
+            },
+        };
+        let destination = handle.scan(scan_request).await.unwrap();
+        let source = local_entry_stream(source_root.path().to_path_buf(), scan_request);
+        let comparison = ComparisonPolicy {
+            preserve_permissions: true,
+            preserve_times: true,
+            ..ComparisonPolicy::default()
+        };
+        let plan = preflight_remote_push(
+            source,
+            destination,
+            comparison,
+            Some(DeletePolicy {
+                threshold: 100,
+                force: false,
+            }),
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let executor = RemotePushExecutor::new(
+            source_root.path().to_path_buf(),
+            handle,
+            Scheduler::new(ResourceBudget::default()).unwrap(),
+            BasisIndexLimits::default(),
+        );
+        let controller = RemotePushController::new(executor, NonZeroUsize::new(4).unwrap());
+        let summary = controller.execute(plan).await.unwrap();
+        let order = server.await.unwrap();
+
+        assert_eq!(order, vec!["scan", "file", "mutation", "metadata"]);
+        assert_eq!(summary.planned_operations, 2);
+        assert_eq!(summary.main_operations, 1);
+        assert_eq!(summary.delete_candidates, 1);
+        assert_eq!(summary.deleted_entries, 1);
+        assert_eq!(summary.finalized_metadata, 1);
+        assert_eq!(summary.files_transferred, 1);
+        assert_eq!(
+            std::fs::read(destination_parent.join("new")).unwrap(),
+            b"new"
+        );
+        assert!(!destination_parent.join("remove").exists());
+
+        let source_metadata = std::fs::metadata(&source_parent).unwrap();
+        let destination_metadata = std::fs::metadata(&destination_parent).unwrap();
+        assert_eq!(destination_metadata.mode() & 0o7777, 0o700);
+        assert_eq!(destination_metadata.mtime(), source_metadata.mtime());
+        assert_eq!(
+            destination_metadata.mtime_nsec(),
+            source_metadata.mtime_nsec()
+        );
     }
 }
