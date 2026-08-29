@@ -22,6 +22,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
 
           def replace_one(text: str, old: str, new: str, label: str) -> str:
               count = text.count(old)
@@ -38,22 +39,24 @@ jobs:
               'push delete import',
           )
           marker = '    pub async fn execute_finalize(&self, metadata: FinalizeMetadata) -> Result<()> {\n'
-          method = '''    pub async fn execute_delete(&self, action: DeleteAction) -> Result<()> {
-              let _permit = self
-                  .scheduler
-                  .acquire(ResourceRequest {
-                      metadata_ops: 1,
-                      network_writes: 1,
-                      ..ResourceRequest::default()
-                  })
-                  .await?;
-              self.remote
-                  .remove(&action.path, action.is_directory)
-                  .await?;
-              Ok(())
-          }
+          method = dedent('''\
+              pub async fn execute_delete(&self, action: DeleteAction) -> Result<()> {
+                  let _permit = self
+                      .scheduler
+                      .acquire(ResourceRequest {
+                          metadata_ops: 1,
+                          network_writes: 1,
+                          ..ResourceRequest::default()
+                      })
+                      .await?;
+                  self.remote
+                      .remove(&action.path, action.is_directory)
+                      .await?;
+                  Ok(())
+              }
 
-'''
+          ''')
+          method = ''.join(f'    {line}\n' if line else '\n' for line in method.splitlines())
           s = replace_one(s, marker, method + marker, 'execute_delete insertion')
           push.write_text(s)
 
@@ -74,111 +77,111 @@ jobs:
 
           start = s.index('/// Disk-backed semantic result of a complete no-mutation ordered merge.')
           end = s.index('#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]', start)
-          preflight = '''/// Disk-backed semantic result of a complete no-mutation ordered merge.
-///
-/// Source-backed semantic work and exact destination-only deletion candidates
-/// are derived from the same ordered stream. Returning this value means the
-/// whole merge completed and any enabled deletion threshold passed without
-/// mutating either endpoint.
-pub struct RemotePushPlan {
-    reader: PlanJournalReader,
-    operations: u64,
-    delete: Option<DeletePlan>,
-}
+          preflight = dedent('''\
+              /// Disk-backed semantic result of a complete no-mutation ordered merge.
+              ///
+              /// Source-backed semantic work and exact destination-only deletion candidates
+              /// are derived from the same ordered stream. Returning this value means the
+              /// whole merge completed and any enabled deletion threshold passed without
+              /// mutating either endpoint.
+              pub struct RemotePushPlan {
+                  reader: PlanJournalReader,
+                  operations: u64,
+                  delete: Option<DeletePlan>,
+              }
 
-impl RemotePushPlan {
-    pub const fn operations(&self) -> u64 {
-        self.operations
-    }
+              impl RemotePushPlan {
+                  pub const fn operations(&self) -> u64 {
+                      self.operations
+                  }
 
-    pub fn eligible_destination_entries(&self) -> u64 {
-        self.delete
-            .as_ref()
-            .map_or(0, DeletePlan::eligible_destination_entries)
-    }
+                  pub fn eligible_destination_entries(&self) -> u64 {
+                      self.delete
+                          .as_ref()
+                          .map_or(0, DeletePlan::eligible_destination_entries)
+                  }
 
-    pub fn delete_candidates(&self) -> u64 {
-        self.delete
-            .as_ref()
-            .map_or(0, DeletePlan::delete_candidates)
-    }
-}
+                  pub fn delete_candidates(&self) -> u64 {
+                      self.delete
+                          .as_ref()
+                          .map_or(0, DeletePlan::delete_candidates)
+                  }
+              }
 
-/// Complete the source/destination merge without mutating either endpoint and
-/// spool semantic planner output plus any exact delete plan to disk.
-///
-/// `delete_in_scope` is evaluated only when deletion is enabled. Keeping scope
-/// policy at this boundary lets excluded destination subtrees protect candidate
-/// ancestors while the engine retains ownership of exact counting and replay.
-pub async fn preflight_remote_push(
-    source: EntryStream,
-    destination: EntryStream,
-    policy: ComparisonPolicy,
-    delete_policy: Option<DeletePolicy>,
-    mut delete_in_scope: impl FnMut(&Entry) -> bool,
-) -> Result<RemotePushPlan> {
-    let mut reconciler = OrderedReconciler::new(source, destination);
-    let mut journal = PlanJournal::new().await?;
-    let mut delete = match delete_policy {
-        Some(policy) => Some(DeleteTracker::new(policy).await?),
-        None => None,
-    };
-    let mut operations = 0_u64;
+              /// Complete the source/destination merge without mutating either endpoint and
+              /// spool semantic planner output plus any exact delete plan to disk.
+              ///
+              /// `delete_in_scope` is evaluated only when deletion is enabled. Keeping scope
+              /// policy at this boundary lets excluded destination subtrees protect candidate
+              /// ancestors while the engine retains ownership of exact counting and replay.
+              pub async fn preflight_remote_push(
+                  source: EntryStream,
+                  destination: EntryStream,
+                  policy: ComparisonPolicy,
+                  delete_policy: Option<DeletePolicy>,
+                  mut delete_in_scope: impl FnMut(&Entry) -> bool,
+              ) -> Result<RemotePushPlan> {
+                  let mut reconciler = OrderedReconciler::new(source, destination);
+                  let mut journal = PlanJournal::new().await?;
+                  let mut delete = match delete_policy {
+                      Some(policy) => Some(DeleteTracker::new(policy).await?),
+                      None => None,
+                  };
+                  let mut operations = 0_u64;
 
-    while let Some(item) = reconciler.next().await? {
-        let decision = match item {
-            ReconcileItem::SourceOnly(source) => {
-                if let Some(delete) = &mut delete {
-                    delete.observe_source_only(&source).await?;
-                }
-                plan_entry(source, None, policy)
-            }
-            ReconcileItem::Matched {
-                source,
-                destination,
-            } => {
-                if let Some(delete) = &mut delete {
-                    let in_scope = delete_in_scope(&destination);
-                    delete.observe_matched(&destination, in_scope).await?;
-                }
-                plan_entry(source, Some(destination), policy)
-            }
-            ReconcileItem::DestinationOnly(destination) => {
-                if let Some(delete) = &mut delete {
-                    let in_scope = delete_in_scope(&destination);
-                    delete
-                        .observe_destination_only(&destination, in_scope)
-                        .await?;
-                }
-                continue;
-            }
-        };
-        let operation = match decision {
-            PlanDecision::Ready(operation) => operation,
-            PlanDecision::NeedContentComparison { source, .. } => {
-                return Err(RemotePushControllerError::UnsupportedContentComparison(
-                    source.path,
-                ));
-            }
-        };
-        journal.append(&operation).await?;
-        operations = checked_add(operations, 1, "operation")?;
-    }
+                  while let Some(item) = reconciler.next().await? {
+                      let decision = match item {
+                          ReconcileItem::SourceOnly(source) => {
+                              if let Some(delete) = &mut delete {
+                                  delete.observe_source_only(&source).await?;
+                              }
+                              plan_entry(source, None, policy)
+                          }
+                          ReconcileItem::Matched {
+                              source,
+                              destination,
+                          } => {
+                              if let Some(delete) = &mut delete {
+                                  let in_scope = delete_in_scope(&destination);
+                                  delete.observe_matched(&destination, in_scope).await?;
+                              }
+                              plan_entry(source, Some(destination), policy)
+                          }
+                          ReconcileItem::DestinationOnly(destination) => {
+                              if let Some(delete) = &mut delete {
+                                  let in_scope = delete_in_scope(&destination);
+                                  delete
+                                      .observe_destination_only(&destination, in_scope)
+                                      .await?;
+                              }
+                              continue;
+                          }
+                      };
+                      let operation = match decision {
+                          PlanDecision::Ready(operation) => operation,
+                          PlanDecision::NeedContentComparison { source, .. } => {
+                              return Err(RemotePushControllerError::UnsupportedContentComparison(
+                                  source.path,
+                              ));
+                          }
+                      };
+                      journal.append(&operation).await?;
+                      operations = checked_add(operations, 1, "operation")?;
+                  }
 
-    let delete = match delete {
-        Some(delete) => Some(delete.finish().await?),
-        None => None,
-    };
-    Ok(RemotePushPlan {
-        reader: journal.seal().await?,
-        operations,
-        delete,
-    })
-}
+                  let delete = match delete {
+                      Some(delete) => Some(delete.finish().await?),
+                      None => None,
+                  };
+                  Ok(RemotePushPlan {
+                      reader: journal.seal().await?,
+                      operations,
+                      delete,
+                  })
+              }
 
-'''
+          ''')
           s = s[:start] + preflight + s[end:]
-
           s = replace_one(
               s,
               '    pub main_operations: u64,\n    pub finalized_metadata: u64,\n',
@@ -189,69 +192,71 @@ pub async fn preflight_remote_push(
           execute_start = s.index('    pub async fn execute(&self, mut plan: RemotePushPlan) -> Result<RemotePushSummary> {')
           execute_end_marker = '\n    }\n}\n\nfn finalize_metadata'
           execute_end = s.index(execute_end_marker, execute_start) + len('\n    }')
-          execute = '''    pub async fn execute(&self, plan: RemotePushPlan) -> Result<RemotePushSummary> {
-        let RemotePushPlan {
-            mut reader,
-            operations,
-            delete,
-        } = plan;
-        let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
-        let mut summary = RemotePushSummary {
-            planned_operations: operations,
-            delete_candidates,
-            ..RemotePushSummary::default()
-        };
-        let mut finalize = FinalizeJournal::new().await?;
-        let mut workers = JoinSet::new();
+          execute = dedent('''\
+                  pub async fn execute(&self, plan: RemotePushPlan) -> Result<RemotePushSummary> {
+                      let RemotePushPlan {
+                          mut reader,
+                          operations,
+                          delete,
+                      } = plan;
+                      let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
+                      let mut summary = RemotePushSummary {
+                          planned_operations: operations,
+                          delete_candidates,
+                          ..RemotePushSummary::default()
+                      };
+                      let mut finalize = FinalizeJournal::new().await?;
+                      let mut workers = JoinSet::new();
 
-        while let Some(operation) = reader.next().await? {
-            let lowered = lower_sync_op(operation, self.policy)?;
+                      while let Some(operation) = reader.next().await? {
+                          let lowered = lower_sync_op(operation, self.policy)?;
 
-            if let Some(finalize_work) = lowered.finalize {
-                let metadata = finalize_metadata(finalize_work)?;
-                finalize.append(&metadata).await?;
-            }
+                          if let Some(finalize_work) = lowered.finalize {
+                              let metadata = finalize_metadata(finalize_work)?;
+                              finalize.append(&metadata).await?;
+                          }
 
-            let Some(main) = lowered.main else {
-                continue;
-            };
-            summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
+                          let Some(main) = lowered.main else {
+                              continue;
+                          };
+                          summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
 
-            if matches!(main.action(), RemotePushAction::CreateDirectory { .. }) {
-                let result = self.executor.execute(main).await?;
-                record_transfer(&mut summary, result)?;
-                continue;
-            }
+                          if matches!(main.action(), RemotePushAction::CreateDirectory { .. }) {
+                              let result = self.executor.execute(main).await?;
+                              record_transfer(&mut summary, result)?;
+                              continue;
+                          }
 
-            while workers.len() >= self.max_in_flight.get() {
-                collect_one(&mut workers, &mut summary).await?;
-            }
-            let executor = Arc::clone(&self.executor);
-            workers.spawn(async move { executor.execute(main).await });
-        }
+                          while workers.len() >= self.max_in_flight.get() {
+                              collect_one(&mut workers, &mut summary).await?;
+                          }
+                          let executor = Arc::clone(&self.executor);
+                          workers.spawn(async move { executor.execute(main).await });
+                      }
 
-        while !workers.is_empty() {
-            collect_one(&mut workers, &mut summary).await?;
-        }
+                      while !workers.is_empty() {
+                          collect_one(&mut workers, &mut summary).await?;
+                      }
 
-        if let Some(delete) = delete {
-            let mut replay = delete.into_replay();
-            while let Some(action) = replay.next_action().await? {
-                self.executor.execute_delete(action).await?;
-                summary.deleted_entries =
-                    checked_add(summary.deleted_entries, 1, "deleted entry")?;
-            }
-        }
+                      if let Some(delete) = delete {
+                          let mut replay = delete.into_replay();
+                          while let Some(action) = replay.next_action().await? {
+                              self.executor.execute_delete(action).await?;
+                              summary.deleted_entries =
+                                  checked_add(summary.deleted_entries, 1, "deleted entry")?;
+                          }
+                      }
 
-        let mut finalize = finalize.seal().await?;
-        while let Some(metadata) = finalize.next().await? {
-            self.executor.execute_finalize(metadata).await?;
-            summary.finalized_metadata =
-                checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
-        }
+                      let mut finalize = finalize.seal().await?;
+                      while let Some(metadata) = finalize.next().await? {
+                          self.executor.execute_finalize(metadata).await?;
+                          summary.finalized_metadata =
+                              checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
+                      }
 
-        Ok(summary)
-    }'''
+                      Ok(summary)
+                  }
+          ''')
           s = s[:execute_start] + execute + s[execute_end:]
 
           s = s.replace(
@@ -264,69 +269,70 @@ pub async fn preflight_remote_push(
           )
 
           test_marker = '    #[test]\n    fn directory_finalize_work_becomes_endpoint_neutral_record() {'
-          tests = '''    #[tokio::test]
-    async fn preflight_integrates_exact_delete_plan_from_same_merge() {
-        let source = entries(vec![file("parent/keep", 1, 1)]);
-        let destination = entries(vec![
-            directory("parent", 0o755),
-            file("parent/keep", 1, 1),
-            file("remove", 1, 1),
-        ]);
-        let mut plan = preflight_remote_push(
-            source,
-            destination,
-            ComparisonPolicy::default(),
-            Some(DeletePolicy {
-                threshold: 100,
-                force: false,
-            }),
-            |_| true,
-        )
-        .await
-        .unwrap();
+          tests = dedent('''\
+                  #[tokio::test]
+                  async fn preflight_integrates_exact_delete_plan_from_same_merge() {
+                      let source = entries(vec![file("parent/keep", 1, 1)]);
+                      let destination = entries(vec![
+                          directory("parent", 0o755),
+                          file("parent/keep", 1, 1),
+                          file("remove", 1, 1),
+                      ]);
+                      let mut plan = preflight_remote_push(
+                          source,
+                          destination,
+                          ComparisonPolicy::default(),
+                          Some(DeletePolicy {
+                              threshold: 100,
+                              force: false,
+                          }),
+                          |_| true,
+                      )
+                      .await
+                      .unwrap();
 
-        assert_eq!(plan.operations(), 1);
-        assert_eq!(plan.eligible_destination_entries(), 3);
-        assert_eq!(plan.delete_candidates(), 1);
-        let mut replay = plan.delete.take().unwrap().into_replay();
-        assert_eq!(
-            replay.next_action().await.unwrap(),
-            Some(crate::engine::delete_plan::DeleteAction {
-                path: path("remove"),
-                is_directory: false,
-            })
-        );
-        assert_eq!(replay.next_action().await.unwrap(), None);
-    }
+                      assert_eq!(plan.operations(), 1);
+                      assert_eq!(plan.eligible_destination_entries(), 3);
+                      assert_eq!(plan.delete_candidates(), 1);
+                      let mut replay = plan.delete.take().unwrap().into_replay();
+                      assert_eq!(
+                          replay.next_action().await.unwrap(),
+                          Some(crate::engine::delete_plan::DeleteAction {
+                              path: path("remove"),
+                              is_directory: false,
+                          })
+                      );
+                      assert_eq!(replay.next_action().await.unwrap(), None);
+                  }
 
-    #[tokio::test]
-    async fn integrated_delete_threshold_fails_before_plan_is_returned() {
-        let source = entries(vec![file("keep", 1, 1)]);
-        let destination = entries(vec![file("keep", 1, 1), file("remove", 1, 1)]);
+                  #[tokio::test]
+                  async fn integrated_delete_threshold_fails_before_plan_is_returned() {
+                      let source = entries(vec![file("keep", 1, 1)]);
+                      let destination = entries(vec![file("keep", 1, 1), file("remove", 1, 1)]);
 
-        assert!(matches!(
-            preflight_remote_push(
-                source,
-                destination,
-                ComparisonPolicy::default(),
-                Some(DeletePolicy {
-                    threshold: 49,
-                    force: false,
-                }),
-                |_| true,
-            )
-            .await,
-            Err(RemotePushControllerError::DeletePlan(
-                DeletePlanError::ThresholdExceeded {
-                    eligible_destination_entries: 2,
-                    delete_candidates: 1,
-                    threshold: 49,
-                }
-            ))
-        ));
-    }
+                      assert!(matches!(
+                          preflight_remote_push(
+                              source,
+                              destination,
+                              ComparisonPolicy::default(),
+                              Some(DeletePolicy {
+                                  threshold: 49,
+                                  force: false,
+                              }),
+                              |_| true,
+                          )
+                          .await,
+                          Err(RemotePushControllerError::DeletePlan(
+                              DeletePlanError::ThresholdExceeded {
+                                  eligible_destination_entries: 2,
+                                  delete_candidates: 1,
+                                  threshold: 49,
+                              }
+                          ))
+                      ));
+                  }
 
-'''
+          ''')
           s = replace_one(s, test_marker, tests + test_marker, 'delete integration tests')
           controller.write_text(s)
           PY
