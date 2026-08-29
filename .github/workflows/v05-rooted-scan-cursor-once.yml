@@ -1,0 +1,58 @@
+name: Validate rooted scan cursor fix once
+
+on:
+  push:
+    branches:
+      - v0.5-architecture
+
+permissions:
+  contents: write
+
+jobs:
+  validate-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Apply patch
+        run: python3 .github/v05_rooted_scan_cursor_fix.py
+      - name: Validate concurrent scan
+        run: cargo test --lib rooted_fs::scan::tests::concurrent_scans_have_independent_directory_cursors
+
+  validate-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Apply patch
+        run: python3 .github/v05_rooted_scan_cursor_fix.py
+      - name: Validate macOS rooted scanner
+        run: cargo test --lib rooted_fs::scan::tests::scan_is_ordered_and_identity_safe
+
+  commit:
+    needs: [validate-linux, validate-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v0.5-architecture
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - name: Apply and format patch
+        run: |
+          python3 .github/v05_rooted_scan_cursor_fix.py
+          cargo fmt --all
+      - name: Commit validated patch
+        run: |
+          rm -f .github/v05_rooted_scan_cursor_fix.py
+          rm -f .github/workflows/v05-rooted-scan-cursor-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix(remote): isolate concurrent scan cursors"
+          git push origin HEAD:v0.5-architecture
