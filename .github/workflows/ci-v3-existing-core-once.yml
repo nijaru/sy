@@ -85,6 +85,12 @@ jobs:
                '        ignore_existing: config.comparison.ignore_existing,\n        update_only: config.comparison.update_only,',
                '        ignore_existing: config.comparison.ignore_existing,\n        existing_only: config.existing,\n        update_only: config.comparison.update_only,'),
           ])
+
+          patch('src/sync/v3_push.rs', [
+              ('v3 policy mapping',
+               '        ignore_existing: config.comparison.ignore_existing,\n        update_only: config.comparison.update_only,',
+               '        ignore_existing: config.comparison.ignore_existing,\n        existing_only: config.existing,\n        update_only: config.comparison.update_only,'),
+          ])
           PY
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -99,6 +105,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm .github/workflows/ci-v3-existing-core-once.yml
-          git add src/engine/domain.rs src/engine/plan_journal.rs src/engine/planner.rs src/remote/push_controller.rs src/sync/reconcile.rs .github/workflows/ci-v3-existing-core-once.yml
+          git add src/engine/domain.rs src/engine/plan_journal.rs src/engine/planner.rs src/remote/push_controller.rs src/sync/reconcile.rs src/sync/v3_push.rs .github/workflows/ci-v3-existing-core-once.yml
           git commit -m 'feat: add existing-only v3 planning semantics'
           git push origin HEAD:v0.5-architecture
