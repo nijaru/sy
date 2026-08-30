@@ -1,0 +1,104 @@
+name: Validate V3 Existing-Only Core Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-existing-core-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Add existing-only core semantics
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path_name, replacements):
+              path = Path(path_name)
+              text = path.read_text()
+              for label, old, new in replacements:
+                  count = text.count(old)
+                  if count != 1:
+                      raise SystemExit(f'{path_name} {label}: expected one anchor, found {count}')
+                  text = text.replace(old, new, 1)
+              path.write_text(text)
+
+          patch('src/engine/domain.rs', [
+              ('skip reason',
+               '    ExistingOnly,\n    DestinationNewer,',
+               '    ExistingOnly,\n    MissingDestination,\n    DestinationNewer,'),
+          ])
+
+          patch('src/engine/plan_journal.rs', [
+              ('encode skip reason',
+               '                SkipReason::ExistingOnly => 2,\n                SkipReason::DestinationNewer => 3,',
+               '                SkipReason::ExistingOnly => 2,\n                SkipReason::DestinationNewer => 3,\n                SkipReason::MissingDestination => 4,'),
+              ('decode skip reason',
+               '                2 => SkipReason::ExistingOnly,\n                3 => SkipReason::DestinationNewer,',
+               '                2 => SkipReason::ExistingOnly,\n                3 => SkipReason::DestinationNewer,\n                4 => SkipReason::MissingDestination,'),
+              ('journal round trip',
+               '            SyncOp::Skip {\n                path: path("skip"),\n                reason: SkipReason::DestinationNewer,\n            },',
+               '            SyncOp::Skip {\n                path: path("skip"),\n                reason: SkipReason::DestinationNewer,\n            },\n            SyncOp::Skip {\n                path: path("missing"),\n                reason: SkipReason::MissingDestination,\n            },'),
+          ])
+
+          patch('src/engine/planner.rs', [
+              ('policy field',
+               '    pub ignore_existing: bool,\n    pub update_only: bool,',
+               '    pub ignore_existing: bool,\n    pub existing_only: bool,\n    pub update_only: bool,'),
+              ('missing destination',
+               '    let Some(destination) = destination else {\n        return PlanDecision::Ready(SyncOp::Create { source });\n    };',
+               '    let Some(destination) = destination else {\n        return PlanDecision::Ready(if policy.existing_only {\n            SyncOp::Skip {\n                path: source.path,\n                reason: SkipReason::MissingDestination,\n            }\n        } else {\n            SyncOp::Create { source }\n        });\n    };'),
+              ('planner test anchor',
+               '    #[test]\n    fn type_change_is_semantic_replace() {',
+               '    #[test]\n    fn existing_only_skips_missing_but_updates_existing_destination() {\n        let policy = ComparisonPolicy {\n            existing_only: true,\n            mode: ComparisonMode::Always,\n            ..ComparisonPolicy::default()\n        };\n        assert!(matches!(\n            plan_entry(file("missing", 8, 1), None, policy),\n            PlanDecision::Ready(SyncOp::Skip {\n                reason: SkipReason::MissingDestination,\n                ..\n            })\n        ));\n        assert!(matches!(\n            plan_entry(file("a", 8, 1), Some(file("a", 9, 2)), policy),\n            PlanDecision::Ready(SyncOp::Update { .. })\n        ));\n    }\n\n    #[test]\n    fn type_change_is_semantic_replace() {'),
+          ])
+
+          patch('src/remote/push_controller.rs', [
+              ('source-only finalize guard',
+               '                append_directory_finalize(&mut finalize, &source, None, policy).await?;\n                plan_entry(source, None, policy)',
+               '                if !policy.existing_only {\n                    append_directory_finalize(&mut finalize, &source, None, policy).await?;\n                }\n                plan_entry(source, None, policy)'),
+              ('controller test anchor',
+               '    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {',
+               '    #[tokio::test]\n    async fn existing_only_source_directory_does_not_queue_finalize_metadata() {\n        let mut plan = preflight_remote_push(\n            entries(vec![directory("missing", 0o755)]),\n            entries(vec![]),\n            ComparisonPolicy {\n                existing_only: true,\n                preserve_times: true,\n                ..ComparisonPolicy::default()\n            },\n            None,\n            |_| true,\n        )\n        .await\n        .unwrap();\n\n        assert!(matches!(\n            plan.reader.next().await.unwrap(),\n            Some(SyncOp::Skip {\n                path: value,\n                reason: crate::engine::domain::SkipReason::MissingDestination,\n            }) if value == path("missing")\n        ));\n        assert!(plan.reader.next().await.unwrap().is_none());\n        assert!(plan.finalize.next().await.unwrap().is_none());\n    }\n\n    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {'),
+          ])
+
+          patch('src/sync/reconcile.rs', [
+              ('local policy mapping',
+               '        ignore_existing: config.comparison.ignore_existing,\n        update_only: config.comparison.update_only,',
+               '        ignore_existing: config.comparison.ignore_existing,\n        existing_only: config.existing,\n        update_only: config.comparison.update_only,'),
+          ])
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run existing-only planner test
+        run: cargo test --all-features existing_only_skips_missing_but_updates_existing_destination
+      - name: Run plan journal round-trip test
+        run: cargo test --all-features semantic_operations_round_trip_in_forward_order
+      - name: Run existing-only finalize safety test
+        run: cargo test --all-features existing_only_source_directory_does_not_queue_finalize_metadata
+      - name: Commit validated core semantics
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm .github/workflows/ci-v3-existing-core-once.yml
+          git add src/engine/domain.rs src/engine/plan_journal.rs src/engine/planner.rs src/remote/push_controller.rs src/sync/reconcile.rs .github/workflows/ci-v3-existing-core-once.yml
+          git commit -m 'feat: add existing-only v3 planning semantics'
+          git push origin HEAD:v0.5-architecture
