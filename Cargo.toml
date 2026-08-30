@@ -92,7 +92,7 @@ futures = "0.3.31"
 fjall = "2.11.2"
 
 # S3 / Cloud Storage - Optional feature
-object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }
+object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
 memmap2 = "0.9.9"
