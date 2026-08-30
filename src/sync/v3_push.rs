@@ -19,8 +19,8 @@ use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
-    preflight_remote_push, preflight_remote_push_scoped, RemotePushController,
-    RemotePushControllerError, RemotePushSummary,
+    preflight_remote_push_scoped, RemotePushController, RemotePushControllerError,
+    RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
@@ -311,8 +311,7 @@ fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u6
         return true;
     }
 
-    min_size.is_none_or(|min| entry.size >= min)
-        && max_size.is_none_or(|max| entry.size <= max)
+    min_size.is_none_or(|min| entry.size >= min) && max_size.is_none_or(|max| entry.size <= max)
 }
 
 fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
@@ -397,6 +396,7 @@ mod tests {
     use std::path::PathBuf;
     use sy::engine::domain::Timestamp;
     use sy::engine::reconcile::{BoxError, EngineError, Side};
+    use sy::remote::push_controller::preflight_remote_push;
     use sy::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
     use tempfile::TempDir;
 
@@ -759,7 +759,9 @@ mod tests {
             for _ in 0..3 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => file.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
                     IncomingRequest::Mutation(incoming) => {
                         mutation.serve(incoming).await.unwrap();
                     }
