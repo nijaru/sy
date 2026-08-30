@@ -1,5 +1,5 @@
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
-use crate::engine::domain::{Entry, RelativePath};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use crate::engine::finalize_journal::{
     FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
@@ -170,6 +170,12 @@ pub struct RemotePushSummary {
     pub deleted_entries: u64,
     pub finalized_metadata: u64,
     pub files_transferred: u64,
+    pub files_created: u64,
+    pub files_updated: u64,
+    pub files_skipped: u64,
+    pub dirs_created: u64,
+    pub symlinks_created: u64,
+    pub delta_files: u64,
     pub literal_bytes: u64,
     pub reused_bytes: u64,
 }
@@ -211,6 +217,7 @@ impl RemotePushController {
         let mut workers = JoinSet::new();
 
         while let Some(operation) = reader.next().await? {
+            record_semantic_operation(&mut summary, &operation)?;
             let Some(main) = lower_sync_op(operation, execution_policy)?.main else {
                 continue;
             };
@@ -320,12 +327,51 @@ fn record_transfer(
         return Ok(());
     };
     summary.files_transferred = checked_add(summary.files_transferred, 1, "file transfer")?;
+    if transfer.reused_bytes > 0 {
+        summary.delta_files = checked_add(summary.delta_files, 1, "delta file")?;
+    }
     summary.literal_bytes = checked_add(
         summary.literal_bytes,
         transfer.literal_bytes,
         "literal-byte",
     )?;
     summary.reused_bytes = checked_add(summary.reused_bytes, transfer.reused_bytes, "reused-byte")?;
+    Ok(())
+}
+
+fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {
+    match operation {
+        SyncOp::Create { source } => match source.kind {
+            EntryKind::File => {
+                summary.files_created = checked_add(summary.files_created, 1, "created file")?;
+            }
+            EntryKind::Directory => {
+                summary.dirs_created = checked_add(summary.dirs_created, 1, "created directory")?;
+            }
+            EntryKind::Symlink => {
+                summary.symlinks_created =
+                    checked_add(summary.symlinks_created, 1, "created symlink")?;
+            }
+        },
+        SyncOp::Update { source, .. } | SyncOp::Replace { source, .. } => match source.kind {
+            EntryKind::File => {
+                summary.files_updated = checked_add(summary.files_updated, 1, "updated file")?;
+            }
+            EntryKind::Directory => {}
+            EntryKind::Symlink => {
+                summary.symlinks_created =
+                    checked_add(summary.symlinks_created, 1, "replaced symlink")?;
+            }
+        },
+        SyncOp::Metadata { source, .. } => {
+            if !matches!(source.kind, EntryKind::Directory) {
+                summary.files_updated = checked_add(summary.files_updated, 1, "metadata update")?;
+            }
+        }
+        SyncOp::Skip { .. } => {
+            summary.files_skipped = checked_add(summary.files_skipped, 1, "skipped entry")?;
+        }
+    }
     Ok(())
 }
 

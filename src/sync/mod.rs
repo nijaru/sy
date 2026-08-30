@@ -14,6 +14,7 @@ pub mod session;
 pub mod stats;
 pub mod strategy;
 pub mod transfer;
+mod v3_push;
 #[cfg(feature = "watch")]
 #[cfg(feature = "watch")]
 pub mod watch;
