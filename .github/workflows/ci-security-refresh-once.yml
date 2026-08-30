@@ -142,6 +142,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock man/sy.1 src/transport/s3.rs src/transport/gcs.rs .github/workflows/ci-security-refresh-once.yml
+          git add Cargo.toml Cargo.lock src/transport/s3.rs src/transport/gcs.rs .github/workflows/ci-security-refresh-once.yml
+          git add -f man/sy.1
           git commit -m 'fix(deps): resolve security advisories'
           git push origin HEAD:v0.5-architecture
