@@ -1,0 +1,45 @@
+name: Fix v3 push adapter validator once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/v3-push-adapter-validator-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Correct patch generator
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/v3-push-adapter-once.yml')
+          text = path.read_text()
+          old = """          replace_once(\n              'src/sync/config.rs',\n              '''    pub symlink_mode: SymlinkMode;\\n'''.replace(';', ','),\n              '''    pub symlink_mode: SymlinkMode,\\n    pub permissions: bool,\\n    pub times: bool,\\n    pub group: bool,\\n    pub owner: bool,\\n    pub devices: bool,\\n    pub keep_dirlinks: bool,\\n''',\n          )\n          # The first replacement intentionally consumes the existing permissions line too.\n          config = Path('src/sync/config.rs')\n          text = config.read_text()\n          duplicate = '    pub permissions: bool,\\n    pub permissions: bool,\\n'\n          if duplicate in text:\n              text = text.replace(duplicate, '    pub permissions: bool,\\n', 1)\n          config.write_text(text)\n"""
+          new = """          replace_once(\n              'src/sync/config.rs',\n              '''    pub symlink_mode: SymlinkMode,\\n    pub permissions: bool,\\n''',\n              '''    pub symlink_mode: SymlinkMode,\\n    pub permissions: bool,\\n    pub times: bool,\\n    pub group: bool,\\n    pub owner: bool,\\n    pub devices: bool,\\n    pub keep_dirlinks: bool,\\n''',\n          )\n"""
+          if old not in text:
+              raise SystemExit('PreserveConfig patch anchor missing')
+          text = text.replace(old, new, 1)
+          old_import = '          use crate::remote::client::ClientRemoteHandle;'
+          new_import = '          use crate::remote::runtime::ClientRemoteHandle;'
+          if old_import not in text:
+              raise SystemExit('ClientRemoteHandle import anchor missing')
+          text = text.replace(old_import, new_import, 1)
+          path.write_text(text)
+          PY
+          rm .github/workflows/v3-push-adapter-validator-fix-once.yml
+      - name: Commit validator correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/v3-push-adapter-once.yml .github/workflows/v3-push-adapter-validator-fix-once.yml
+          git commit -m 'ci: correct v3 push adapter validator'
+          git push origin HEAD:v0.5-architecture
