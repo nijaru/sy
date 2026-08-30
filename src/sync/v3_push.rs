@@ -39,8 +39,8 @@ pub(super) fn legacy_fallback_reason(
     if config.min_size.is_some() || config.max_size.is_some() {
         return Some("size selection is not yet mapped to the v3 scanner");
     }
-    if scan_options.respect_gitignore || !scan_options.include_git_dir {
-        return Some("gitignore/VCS selection is not yet mapped to v3 deletion scope");
+    if scan_options.respect_gitignore {
+        return Some("gitignore selection is not yet mapped to v3 deletion scope");
     }
     if config.trash {
         return Some("trash deletion is not yet implemented by v3");
@@ -222,6 +222,7 @@ async fn execute_with_handle(
     );
     let delete_filter = config.filter_engine.clone();
     let max_depth = selection_max_depth(config, scan_options);
+    let include_git_dir = scan_options.include_git_dir;
     let plan = preflight_remote_push(
         source,
         destination,
@@ -230,6 +231,7 @@ async fn execute_with_handle(
         move |entry| {
             delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                 && entry_in_depth_scope(entry, max_depth)
+                && entry_in_vcs_scope(entry, include_git_dir)
         },
     )
     .await
@@ -292,6 +294,15 @@ fn selection_max_depth(config: &SyncConfig, scan_options: ScanOptions) -> Option
 
 fn entry_in_depth_scope(entry: &Entry, max_depth: Option<usize>) -> bool {
     max_depth.is_none_or(|depth| entry.path.as_path().components().count() <= depth)
+}
+
+fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
+    include_git_dir
+        || !entry
+            .path
+            .as_path()
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
 }
 
 fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
@@ -441,6 +452,19 @@ mod tests {
             Some(1)
         );
         assert_eq!(destination_scan_request(&config).max_depth, None);
+    }
+
+    #[test]
+    fn exclude_vcs_selection_maps_to_v3_without_fallback() {
+        let config = supported_config();
+        let scan_options = ScanOptions {
+            include_git_dir: false,
+            ..ScanOptions::default()
+        };
+
+        assert_eq!(legacy_fallback_reason(&config, scan_options), None);
+        assert!(!entry_in_vcs_scope(&file_entry(".git/config"), false));
+        assert!(entry_in_vcs_scope(&file_entry("src/.gitkeep"), false));
     }
 
     #[tokio::test]
@@ -603,6 +627,70 @@ mod tests {
         server.await.unwrap();
         assert_eq!(stats.files_deleted, 1);
         assert!(protected.join("keep").exists());
+        assert!(!destination_root.path().join("remove").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exclude_vcs_delete_preserves_git_subtree() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let git_dir = destination_root.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("config"), b"keep").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"remove").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let mutation = session.mutation_handler();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected exclude-vcs v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        let scan_options = ScanOptions {
+            include_git_dir: false,
+            ..ScanOptions::default()
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            scan_options,
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_deleted, 1);
+        assert!(git_dir.join("config").exists());
         assert!(!destination_root.path().join("remove").exists());
     }
 
