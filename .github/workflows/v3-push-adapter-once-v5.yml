@@ -1,0 +1,110 @@
+name: Validate v3 adapter error mapping once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/v3-push-adapter-once-v5.yml'
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PATCH_RUN_ID: 33284430899
+
+jobs:
+  validate:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: actions/download-artifact@v4
+        with:
+          name: v3-push-patch-v2
+          run-id: ${{ env.PATCH_RUN_ID }}
+          github-token: ${{ github.token }}
+      - run: git apply v3-push.patch
+      - name: Apply validated adapter corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/v3-push-adapter-once-v4.yml').read_text()
+          marker = '      - name: Apply adapter corrections\n        run: |\n'
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index('      - name: Install Linux system dependencies\n', start)
+          block = workflow[start:end]
+          lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
+          Path('/tmp/apply-v3-corrections.sh').write_text('\n'.join(lines) + '\n')
+          PY
+          bash /tmp/apply-v3-corrections.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/sync/v3_push.rs')
+          text = path.read_text()
+          old = '        sy::ssh::config::parse_ssh_config(host)\n'
+          new = '''        sy::ssh::config::parse_ssh_config(host)\n            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))\n'''
+          if old not in text:
+              raise SystemExit('SSH error mapping anchor missing')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo test --all-features sync::v3_push -- --nocapture
+      - run: cargo test --all-features remote::push_controller -- --nocapture
+
+  commit:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: actions/download-artifact@v4
+        with:
+          name: v3-push-patch-v2
+          run-id: ${{ env.PATCH_RUN_ID }}
+          github-token: ${{ github.token }}
+      - run: git apply v3-push.patch
+      - name: Apply corrections and commit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/v3-push-adapter-once-v4.yml').read_text()
+          marker = '      - name: Apply validated corrections\n        run: |\n'
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index('          git config user.name', start)
+          block = workflow[start:end]
+          lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
+          Path('/tmp/apply-v3-corrections.sh').write_text('\n'.join(lines) + '\n')
+          PY
+          bash /tmp/apply-v3-corrections.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/sync/v3_push.rs')
+          text = path.read_text()
+          old = '        sy::ssh::config::parse_ssh_config(host)\n'
+          new = '''        sy::ssh::config::parse_ssh_config(host)\n            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))\n'''
+          if old not in text:
+              raise SystemExit('SSH error mapping anchor missing')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/sync/mod.rs src/sync/config.rs src/sync/session.rs src/sync/v3_push.rs src/remote/push_controller.rs
+          git commit -m 'feat(remote): route supported pushes through v3'
+          git push origin HEAD:v0.5-architecture
