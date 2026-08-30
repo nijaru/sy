@@ -193,6 +193,7 @@ fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
                 SkipReason::Filtered => 1,
                 SkipReason::ExistingOnly => 2,
                 SkipReason::DestinationNewer => 3,
+                SkipReason::MissingDestination => 4,
             });
         }
     }
@@ -224,6 +225,7 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
                 1 => SkipReason::Filtered,
                 2 => SkipReason::ExistingOnly,
                 3 => SkipReason::DestinationNewer,
+                4 => SkipReason::MissingDestination,
                 _ => {
                     return Err(PlanJournalError::InvalidRecord(
                         "unknown plan journal skip reason",
@@ -525,6 +527,10 @@ mod tests {
             SyncOp::Skip {
                 path: path("skip"),
                 reason: SkipReason::DestinationNewer,
+            },
+            SyncOp::Skip {
+                path: path("missing"),
+                reason: SkipReason::MissingDestination,
             },
         ];
 

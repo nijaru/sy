@@ -17,6 +17,7 @@ pub enum ComparisonMode {
 pub struct ComparisonPolicy {
     pub mode: ComparisonMode,
     pub ignore_existing: bool,
+    pub existing_only: bool,
     pub update_only: bool,
     pub preserve_permissions: bool,
     pub preserve_times: bool,
@@ -39,7 +40,14 @@ pub fn plan_entry(
     policy: ComparisonPolicy,
 ) -> PlanDecision {
     let Some(destination) = destination else {
-        return PlanDecision::Ready(SyncOp::Create { source });
+        return PlanDecision::Ready(if policy.existing_only {
+            SyncOp::Skip {
+                path: source.path,
+                reason: SkipReason::MissingDestination,
+            }
+        } else {
+            SyncOp::Create { source }
+        });
     };
 
     if policy.ignore_existing {
@@ -177,6 +185,26 @@ mod tests {
         assert!(matches!(
             plan_entry(file("a", 3, 1), None, ComparisonPolicy::default()),
             PlanDecision::Ready(SyncOp::Create { .. })
+        ));
+    }
+
+    #[test]
+    fn existing_only_skips_missing_but_updates_existing_destination() {
+        let policy = ComparisonPolicy {
+            existing_only: true,
+            mode: ComparisonMode::Always,
+            ..ComparisonPolicy::default()
+        };
+        assert!(matches!(
+            plan_entry(file("missing", 8, 1), None, policy),
+            PlanDecision::Ready(SyncOp::Skip {
+                reason: SkipReason::MissingDestination,
+                ..
+            })
+        ));
+        assert!(matches!(
+            plan_entry(file("a", 8, 1), Some(file("a", 9, 2)), policy),
+            PlanDecision::Ready(SyncOp::Update { .. })
         ));
     }
 

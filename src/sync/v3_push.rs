@@ -327,6 +327,7 @@ fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
     ComparisonPolicy {
         mode,
         ignore_existing: config.comparison.ignore_existing,
+        existing_only: config.existing,
         update_only: config.comparison.update_only,
         preserve_permissions: config.preserve.permissions,
         preserve_times: config.preserve.times,
