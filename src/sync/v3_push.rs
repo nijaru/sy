@@ -227,9 +227,7 @@ async fn execute_with_handle(
         destination,
         comparison_policy(config),
         delete_policy(&config.delete),
-        move |entry| {
-            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-        },
+        move |entry| delete_filter.should_include(entry.path.as_path(), entry.is_directory()),
     )
     .await
     .map_err(map_controller_error)?;
@@ -426,9 +424,7 @@ mod tests {
                 threshold: 100,
                 force: false,
             }),
-            move |entry| {
-                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-            },
+            move |entry| delete_filter.should_include(entry.path.as_path(), entry.is_directory()),
         )
         .await;
 
