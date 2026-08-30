@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
