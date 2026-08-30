@@ -1,0 +1,595 @@
+name: Validate v3 push adapter once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/v3-push-adapter-once.yml'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Build source patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f'anchor missing in {path}: {old[:80]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              'src/sync/mod.rs',
+              'pub mod transfer;\n',
+              'pub mod transfer;\nmod v3_push;\n',
+          )
+
+          replace_once(
+              'src/sync/config.rs',
+              '''    pub symlink_mode: SymlinkMode;\n'''.replace(';', ','),
+              '''    pub symlink_mode: SymlinkMode,\n    pub permissions: bool,\n    pub times: bool,\n    pub group: bool,\n    pub owner: bool,\n    pub devices: bool,\n    pub keep_dirlinks: bool,\n''',
+          )
+          # The first replacement intentionally consumes the existing permissions line too.
+          config = Path('src/sync/config.rs')
+          text = config.read_text()
+          duplicate = '    pub permissions: bool,\n    pub permissions: bool,\n'
+          if duplicate in text:
+              text = text.replace(duplicate, '    pub permissions: bool,\n', 1)
+          config.write_text(text)
+
+          replace_once(
+              'src/sync/config.rs',
+              '''            symlink_mode: SymlinkMode::Preserve,\n            permissions: false,\n''',
+              '''            symlink_mode: SymlinkMode::Preserve,\n            permissions: false,\n            times: false,\n            group: false,\n            owner: false,\n            devices: false,\n            keep_dirlinks: false,\n''',
+          )
+
+          replace_once(
+              'src/main.rs',
+              '''            symlink_mode,\n            permissions: cli.should_preserve_permissions(),\n''',
+              '''            symlink_mode,\n            permissions: cli.should_preserve_permissions(),\n            times: cli.should_preserve_times(),\n            group: cli.should_preserve_group(),\n            owner: cli.should_preserve_owner(),\n            devices: cli.should_preserve_devices(),\n            keep_dirlinks: cli.keep_dirlinks,\n''',
+          )
+
+          wrapper = dedent('''\
+              async fn streaming_push(&self) -> Result<SyncStats> {
+                  if let Some(reason) = super::v3_push::legacy_fallback_reason(&self.config, self.scan_options) {
+                      tracing::debug!(reason, "using legacy remote push compatibility path");
+                      return self.streaming_push_legacy().await;
+                  }
+
+                  let (host, user, dest_root) = match &self.dest {
+                      EndpointPair::Ssh { host, user, root } => (host, user, root),
+                      _ => {
+                          return Err(SyncError::Config(
+                              "destination must be SSH for push".to_string(),
+                          ))
+                      }
+                  };
+                  let ssh_config = resolve_ssh_config(host, user)?;
+                  super::v3_push::run(
+                      self.source.root(),
+                      dest_root,
+                      &ssh_config,
+                      &self.config,
+                      self.scan_options,
+                  )
+                  .await
+              }
+
+              async fn streaming_push_legacy(&self) -> Result<SyncStats> {
+          ''')
+          wrapper = ''.join('    ' + line if line else line for line in wrapper.splitlines(True))
+          replace_once(
+              'src/sync/session.rs',
+              '    async fn streaming_push(&self) -> Result<SyncStats> {\n',
+              wrapper,
+          )
+
+          replace_once(
+              'src/remote/push_controller.rs',
+              'use crate::engine::domain::{Entry, RelativePath};\n',
+              'use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};\n',
+          )
+          replace_once(
+              'src/remote/push_controller.rs',
+              '''    pub finalized_metadata: u64,\n    pub files_transferred: u64,\n    pub literal_bytes: u64,\n    pub reused_bytes: u64,\n''',
+              '''    pub finalized_metadata: u64,\n    pub files_transferred: u64,\n    pub files_created: u64,\n    pub files_updated: u64,\n    pub files_skipped: u64,\n    pub dirs_created: u64,\n    pub symlinks_created: u64,\n    pub delta_files: u64,\n    pub literal_bytes: u64,\n    pub reused_bytes: u64,\n''',
+          )
+          replace_once(
+              'src/remote/push_controller.rs',
+              '''        while let Some(operation) = reader.next().await? {\n            let Some(main) = lower_sync_op(operation, execution_policy)?.main else {\n''',
+              '''        while let Some(operation) = reader.next().await? {\n            record_semantic_operation(&mut summary, &operation)?;\n            let Some(main) = lower_sync_op(operation, execution_policy)?.main else {\n''',
+          )
+          replace_once(
+              'src/remote/push_controller.rs',
+              '''    summary.files_transferred = checked_add(summary.files_transferred, 1, "file transfer")?;\n    summary.literal_bytes = checked_add(\n''',
+              '''    summary.files_transferred = checked_add(summary.files_transferred, 1, "file transfer")?;\n    if transfer.reused_bytes > 0 {\n        summary.delta_files = checked_add(summary.delta_files, 1, "delta file")?;\n    }\n    summary.literal_bytes = checked_add(\n''',
+          )
+          marker = '''fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64> {\n'''
+          helper = dedent('''\
+          fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {
+              match operation {
+                  SyncOp::Create { source } => match source.kind {
+                      EntryKind::File => {
+                          summary.files_created = checked_add(summary.files_created, 1, "created file")?;
+                      }
+                      EntryKind::Directory => {
+                          summary.dirs_created = checked_add(summary.dirs_created, 1, "created directory")?;
+                      }
+                      EntryKind::Symlink => {
+                          summary.symlinks_created =
+                              checked_add(summary.symlinks_created, 1, "created symlink")?;
+                      }
+                  },
+                  SyncOp::Update { source, .. } | SyncOp::Replace { source, .. } => match source.kind {
+                      EntryKind::File => {
+                          summary.files_updated = checked_add(summary.files_updated, 1, "updated file")?;
+                      }
+                      EntryKind::Directory => {}
+                      EntryKind::Symlink => {
+                          summary.symlinks_created =
+                              checked_add(summary.symlinks_created, 1, "replaced symlink")?;
+                      }
+                  },
+                  SyncOp::Metadata { source, .. } => {
+                      if !matches!(source.kind, EntryKind::Directory) {
+                          summary.files_updated = checked_add(summary.files_updated, 1, "metadata update")?;
+                      }
+                  }
+                  SyncOp::Skip { .. } => {
+                      summary.files_skipped = checked_add(summary.files_skipped, 1, "skipped entry")?;
+                  }
+              }
+              Ok(())
+          }
+
+          ''')
+          replace_once('src/remote/push_controller.rs', marker, helper + marker)
+
+          Path('src/sync/v3_push.rs').write_text(dedent(r'''
+          use crate::cli::SymlinkMode;
+          use crate::compress::CompressionDetection;
+          use crate::endpoint::local_entry_scan::local_entry_stream;
+          use crate::engine::delete_plan::{DeletePlanError, DeletePolicy};
+          use crate::engine::planner::{ComparisonMode, ComparisonPolicy};
+          use crate::engine::scan::{EntryMetadataRequest, ScanRequest};
+          use crate::engine::scheduler::{ResourceBudget, Scheduler};
+          use crate::error::{Result, SyncError};
+          use crate::integrity::ChecksumType;
+          use crate::protocol::Operation;
+          use crate::remote::client::ClientRemoteHandle;
+          use crate::remote::push::RemotePushExecutor;
+          use crate::remote::push_controller::{
+              preflight_remote_push, RemotePushController, RemotePushControllerError,
+              RemotePushSummary,
+          };
+          use crate::remote::router::RouterConfig;
+          use crate::remote::ssh::SshRemoteSession;
+          use crate::sync::scanner::ScanOptions;
+          use crate::sync::{DeleteMode, SyncConfig, SyncStats};
+          use crate::transfer::delta::BasisIndexLimits;
+          use std::num::NonZeroUsize;
+          use std::path::Path;
+          use std::time::Instant;
+
+          pub(super) fn legacy_fallback_reason(
+              config: &SyncConfig,
+              scan_options: ScanOptions,
+          ) -> Option<&'static str> {
+              if config.dry_run || config.diff_mode {
+                  return Some("dry-run/diff semantics are not yet mapped to v3");
+              }
+              if config.comparison.checksum {
+                  return Some("checksum comparison is not yet implemented in v3 preflight");
+              }
+              if !config.filter_engine.is_empty() {
+                  return Some("include/exclude filters are not yet mapped to the v3 scanner");
+              }
+              if config.min_size.is_some() || config.max_size.is_some() {
+                  return Some("size selection is not yet mapped to the v3 scanner");
+              }
+              if scan_options.respect_gitignore
+                  || !scan_options.include_git_dir
+                  || scan_options.dirs_only
+                  || config.dirs
+              {
+                  return Some("non-default scan selection is not yet mapped to v3 deletion scope");
+              }
+              if config.trash {
+                  return Some("trash deletion is not yet implemented by v3");
+              }
+              if config.bwlimit.is_some() {
+                  return Some("bandwidth limiting is not yet scheduler-integrated in v3");
+              }
+              if config.resume.only {
+                  return Some("resume-only control flow is not implemented by v3");
+              }
+              if config.cache {
+                  return Some("legacy directory-cache semantics are not part of the v3 adapter");
+              }
+              if config.verification.mode != ChecksumType::None
+                  || config.verification.verify_on_write
+                  || config.verification.checksum_db
+                  || config.verification.clear_checksum_db
+                  || config.verification.prune_checksum_db
+              {
+                  return Some("legacy verification/checksum-database options are not mapped to v3");
+              }
+              if config.preserve.xattrs
+                  || config.preserve.hardlinks
+                  || config.preserve.acls
+                  || config.preserve.flags
+                  || config.preserve.group
+                  || config.preserve.owner
+                  || config.preserve.devices
+                  || config.preserve.keep_dirlinks
+              {
+                  return Some("requested preservation semantics exceed current v3 mode/mtime support");
+              }
+              if config.preserve.symlink_mode != SymlinkMode::Preserve {
+                  return Some("non-preserving symlink modes are not yet mapped to v3");
+              }
+              if config.remove_source_files {
+                  return Some("post-success source removal is not yet implemented by v3");
+              }
+              if config.existing {
+                  return Some("existing-only selection is not yet implemented by v3");
+              }
+              if config.backup.is_some() || config.backup_dir.is_some() {
+                  return Some("backup semantics are not yet implemented by v3");
+              }
+              if config.partial.is_some() || config.partial_dir.is_some() {
+                  return Some("legacy partial-file semantics are not mapped to transactional v3 writes");
+              }
+              if config.timeout.is_some() || config.contimeout.is_some() {
+                  return Some("CLI timeout overrides are not yet mapped to the v3 OpenSSH session");
+              }
+              if config.compress_level.is_some()
+                  || !matches!(config.compression_detection, CompressionDetection::Never)
+              {
+                  return Some("compression policy is not yet integrated with the v3 transfer path");
+              }
+              if config.itemize_changes {
+                  return Some("itemized change output is not yet emitted from v3 plans");
+              }
+              if config.progress {
+                  return Some("legacy progress reporting is not yet mapped to v3 streams");
+              }
+              if config.json {
+                  return Some("legacy JSON event output is not yet emitted by the v3 adapter");
+              }
+              if config.perf {
+                  return Some("legacy performance metrics are not yet mapped to the v3 adapter");
+              }
+              if config.max_errors != 100 {
+                  return Some("custom max-error policy is not yet mapped to v3 fail-fast execution");
+              }
+              if config.delete.is_enabled()
+                  && config
+                      .max_delete
+                      .as_deref()
+                      .is_some_and(|value| !value.ends_with('%'))
+              {
+                  return Some("absolute delete limits are not yet represented by the v3 delete policy");
+              }
+              None
+          }
+
+          pub(super) async fn run(
+              source_root: &Path,
+              destination_root: &Path,
+              ssh_config: &crate::ssh::config::SshConfig,
+              config: &SyncConfig,
+              scan_options: ScanOptions,
+          ) -> Result<SyncStats> {
+              let started = Instant::now();
+              let session = SshRemoteSession::connect(
+                  ssh_config,
+                  Operation::Push,
+                  destination_root,
+                  RouterConfig::default(),
+              )
+              .await
+              .map_err(map_io)?;
+              let remote = session.remote().request_handle();
+              let mut stats = execute_with_handle(source_root, remote, config, scan_options).await?;
+              stats.duration = started.elapsed();
+              Ok(stats)
+          }
+
+          async fn execute_with_handle(
+              source_root: &Path,
+              remote: ClientRemoteHandle,
+              config: &SyncConfig,
+              scan_options: ScanOptions,
+          ) -> Result<SyncStats> {
+              let scan_request = scan_request(config, scan_options);
+              let destination = remote.scan(scan_request).await.map_err(map_io)?;
+              let source = local_entry_stream(source_root.to_path_buf(), scan_request);
+              let plan = preflight_remote_push(
+                  source,
+                  destination,
+                  comparison_policy(config),
+                  delete_policy(&config.delete),
+                  |_| true,
+              )
+              .await
+              .map_err(map_controller_error)?;
+
+              let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
+                  SyncError::Config("parallel transfer count must be greater than zero".to_string())
+              })?;
+              let active_files = u32::try_from(config.max_concurrent).map_err(|_| {
+                  SyncError::Config("parallel transfer count exceeds v3 scheduler range".to_string())
+              })?;
+              let mut budget = ResourceBudget::default();
+              budget.active_files = active_files;
+              let scheduler = Scheduler::new(budget).map_err(map_io)?;
+              let executor = RemotePushExecutor::new(
+                  source_root.to_path_buf(),
+                  remote,
+                  scheduler,
+                  BasisIndexLimits::default(),
+              );
+              let summary = RemotePushController::new(executor, max_in_flight)
+                  .execute(plan)
+                  .await
+                  .map_err(map_controller_error)?;
+              summary_stats(summary)
+          }
+
+          fn scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
+              ScanRequest {
+                  respect_gitignore: scan_options.respect_gitignore,
+                  include_git_dir: scan_options.include_git_dir,
+                  max_depth: scan_options.dirs_only.then_some(1),
+                  metadata: EntryMetadataRequest {
+                      unix_mode: true,
+                      symlink_target: true,
+                      identity: true,
+                      hardlink_group: config.preserve.hardlinks,
+                  },
+              }
+          }
+
+          fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
+              let mode = if config.comparison.checksum {
+                  ComparisonMode::Checksum
+              } else if config.comparison.ignore_times {
+                  ComparisonMode::Always
+              } else if config.comparison.size_only {
+                  ComparisonMode::SizeOnly
+              } else {
+                  ComparisonMode::Quick
+              };
+              ComparisonPolicy {
+                  mode,
+                  ignore_existing: config.comparison.ignore_existing,
+                  update_only: config.comparison.update_only,
+                  preserve_permissions: config.preserve.permissions,
+                  preserve_times: config.preserve.times,
+              }
+          }
+
+          fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
+              match mode {
+                  DeleteMode::Disabled => None,
+                  DeleteMode::Enabled { threshold, force } => Some(DeletePolicy {
+                      threshold: *threshold,
+                      force: *force,
+                  }),
+              }
+          }
+
+          fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
+              Ok(SyncStats {
+                  files_scanned: summary.planned_operations,
+                  files_created: summary.files_created,
+                  files_updated: summary.files_updated,
+                  files_skipped: to_usize(summary.files_skipped, "skipped entries")?,
+                  files_deleted: to_usize(summary.deleted_entries, "deleted entries")?,
+                  bytes_transferred: summary.literal_bytes,
+                  files_delta_synced: to_usize(summary.delta_files, "delta files")?,
+                  delta_bytes_saved: summary.reused_bytes,
+                  dirs_created: summary.dirs_created,
+                  symlinks_created: summary.symlinks_created,
+                  ..SyncStats::default()
+              })
+          }
+
+          fn to_usize(value: u64, counter: &'static str) -> Result<usize> {
+              usize::try_from(value).map_err(|_| {
+                  SyncError::Config(format!("v3 {counter} counter exceeds platform usize range"))
+              })
+          }
+
+          fn map_controller_error(error: RemotePushControllerError) -> SyncError {
+              if let RemotePushControllerError::DeletePlan(DeletePlanError::ThresholdExceeded {
+                  eligible_destination_entries,
+                  delete_candidates,
+                  threshold,
+              }) = &error
+              {
+                  let percentage = if *eligible_destination_entries == 0 {
+                      0.0
+                  } else {
+                      (*delete_candidates as f64 * 100.0) / *eligible_destination_entries as f64
+                  };
+                  return SyncError::DeletionThresholdExceeded {
+                      percentage,
+                      threshold: *threshold,
+                  };
+              }
+              map_io(error)
+          }
+
+          fn map_io(error: impl std::fmt::Display) -> SyncError {
+              SyncError::Io(std::io::Error::other(error.to_string()))
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+              use crate::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
+              use tempfile::TempDir;
+
+              fn supported_config() -> SyncConfig {
+                  let mut config = SyncConfig::test_default();
+                  config.max_concurrent = 2;
+                  config.max_errors = 100;
+                  config.verification.mode = ChecksumType::None;
+                  config
+              }
+
+              #[test]
+              fn supported_policy_maps_to_v3_without_fallback() {
+                  let mut config = supported_config();
+                  config.comparison.size_only = true;
+                  config.comparison.update_only = true;
+                  config.preserve.permissions = true;
+                  config.preserve.times = true;
+                  assert_eq!(legacy_fallback_reason(&config, ScanOptions::default()), None);
+
+                  let policy = comparison_policy(&config);
+                  assert_eq!(policy.mode, ComparisonMode::SizeOnly);
+                  assert!(policy.update_only);
+                  assert!(policy.preserve_permissions);
+                  assert!(policy.preserve_times);
+              }
+
+              #[test]
+              fn unsupported_selection_stays_on_legacy_path() {
+                  let mut config = supported_config();
+                  config.filter_engine.add_exclude("*.tmp").unwrap();
+                  assert!(legacy_fallback_reason(&config, ScanOptions::default()).is_some());
+              }
+
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn adapter_executes_real_v3_runtime_and_maps_stats() {
+                  let source_root = TempDir::new().unwrap();
+                  let destination_root = TempDir::new().unwrap();
+                  std::fs::write(source_root.path().join("new"), b"new").unwrap();
+
+                  let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                  let (client_reader, client_writer) = tokio::io::split(client_io);
+                  let (server_reader, server_writer) = tokio::io::split(server_io);
+                  let server = tokio::spawn(async move {
+                      let mut session = ServerRemoteSession::accept(
+                          server_reader,
+                          server_writer,
+                          RouterConfig::default(),
+                      )
+                      .await
+                      .unwrap();
+                      let scan = session.scan_handler();
+                      let file = session.file_handler();
+                      for _ in 0..2 {
+                          match session.next_request().await.unwrap().unwrap() {
+                              IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                              IncomingRequest::File(incoming) => {
+                                  file.serve(incoming).await.unwrap();
+                              }
+                              _ => panic!("unexpected v3 adapter request"),
+                          }
+                      }
+                  });
+
+                  let session = ClientRemoteSession::connect(
+                      client_reader,
+                      client_writer,
+                      Operation::Push,
+                      destination_root.path(),
+                      RouterConfig::default(),
+                  )
+                  .await
+                  .unwrap();
+                  let config = supported_config();
+                  let stats = execute_with_handle(
+                      source_root.path(),
+                      session.request_handle(),
+                      &config,
+                      ScanOptions::default(),
+                  )
+                  .await
+                  .unwrap();
+
+                  server.await.unwrap();
+                  assert_eq!(stats.files_scanned, 1);
+                  assert_eq!(stats.files_created, 1);
+                  assert_eq!(stats.files_updated, 0);
+                  assert_eq!(stats.bytes_transferred, 3);
+                  assert_eq!(std::fs::read(destination_root.path().join("new")).unwrap(), b"new");
+              }
+          }
+          '''))
+          PY
+          cargo fmt --all
+          git add src/main.rs src/sync/mod.rs src/sync/config.rs src/sync/session.rs src/sync/v3_push.rs src/remote/push_controller.rs
+          git diff --cached --check
+          git diff --cached --binary > v3-push.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v3-push-patch
+          path: v3-push.patch
+
+  validate:
+    needs: prepare
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: actions/download-artifact@v4
+        with:
+          name: v3-push-patch
+      - run: git apply v3-push.patch
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo test --all-features sync::v3_push -- --nocapture
+      - run: cargo test --all-features remote::push_controller -- --nocapture
+
+  commit:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - uses: actions/download-artifact@v4
+        with:
+          name: v3-push-patch
+      - name: Commit validated adapter
+        run: |
+          git apply v3-push.patch
+          rm .github/workflows/v3-push-adapter-once.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/sync/mod.rs src/sync/config.rs src/sync/session.rs src/sync/v3_push.rs src/remote/push_controller.rs .github/workflows/v3-push-adapter-once.yml
+          git commit -m 'feat(remote): route supported pushes through v3'
+          git push origin HEAD:v0.5-architecture
