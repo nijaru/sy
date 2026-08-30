@@ -24,6 +24,7 @@ allow = [
     "BSL-1.0",
     "OpenSSL",
     "0BSD",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
