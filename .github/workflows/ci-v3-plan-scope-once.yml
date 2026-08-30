@@ -34,151 +34,28 @@ jobs:
           path = Path('src/remote/push_controller.rs')
           text = path.read_text()
 
-          def replace_once(old: str, new: str, label: str) -> None:
+          def replace_once(old, new, label):
               global text
               count = text.count(old)
               if count != 1:
                   raise SystemExit(f'{label}: expected one anchor, found {count}')
               text = text.replace(old, new, 1)
 
-          replace_once(
-              """pub async fn preflight_remote_push(
-              source: EntryStream,
-              destination: EntryStream,
-              policy: ComparisonPolicy,
-              delete_policy: Option<DeletePolicy>,
-              mut delete_in_scope: impl FnMut(&Entry) -> bool,
-          ) -> Result<RemotePushPlan> {""".replace("              ", "    "),
-              """pub async fn preflight_remote_push(
-              source: EntryStream,
-              destination: EntryStream,
-              policy: ComparisonPolicy,
-              delete_policy: Option<DeletePolicy>,
-              delete_in_scope: impl FnMut(&Entry) -> bool,
-          ) -> Result<RemotePushPlan> {
-              preflight_remote_push_scoped(
-                  source,
-                  destination,
-                  policy,
-                  delete_policy,
-                  |_| true,
-                  delete_in_scope,
-              )
-              .await
-          }
+          old = "pub async fn preflight_remote_push(\n    source: EntryStream,\n    destination: EntryStream,\n    policy: ComparisonPolicy,\n    delete_policy: Option<DeletePolicy>,\n    mut delete_in_scope: impl FnMut(&Entry) -> bool,\n) -> Result<RemotePushPlan> {"
+          new = "pub async fn preflight_remote_push(\n    source: EntryStream,\n    destination: EntryStream,\n    policy: ComparisonPolicy,\n    delete_policy: Option<DeletePolicy>,\n    delete_in_scope: impl FnMut(&Entry) -> bool,\n) -> Result<RemotePushPlan> {\n    preflight_remote_push_scoped(\n        source,\n        destination,\n        policy,\n        delete_policy,\n        |_| true,\n        delete_in_scope,\n    )\n    .await\n}\n\n/// Complete remote-push preflight while independently controlling semantic work\n/// and deletion scope.\n///\n/// `plan_in_scope` is evaluated for every source-backed entry. Entries outside\n/// semantic scope remain visible to deletion tracking, so a selection rule can\n/// suppress transfer work without making existing destination content appear\n/// source-absent. `delete_in_scope` continues to define which destination entries\n/// may participate in deletion.\npub async fn preflight_remote_push_scoped(\n    source: EntryStream,\n    destination: EntryStream,\n    policy: ComparisonPolicy,\n    delete_policy: Option<DeletePolicy>,\n    mut plan_in_scope: impl FnMut(&Entry) -> bool,\n    mut delete_in_scope: impl FnMut(&Entry) -> bool,\n) -> Result<RemotePushPlan> {"
+          replace_once(old, new, 'preflight signature')
 
-          /// Complete remote-push preflight while independently controlling semantic work
-          /// and deletion scope.
-          ///
-          /// `plan_in_scope` is evaluated for every source-backed entry. Entries outside
-          /// semantic scope remain visible to deletion tracking, so a selection rule can
-          /// suppress transfer work without making existing destination content appear
-          /// source-absent. `delete_in_scope` continues to define which destination entries
-          /// may participate in deletion.
-          pub async fn preflight_remote_push_scoped(
-              source: EntryStream,
-              destination: EntryStream,
-              policy: ComparisonPolicy,
-              delete_policy: Option<DeletePolicy>,
-              mut plan_in_scope: impl FnMut(&Entry) -> bool,
-              mut delete_in_scope: impl FnMut(&Entry) -> bool,
-          ) -> Result<RemotePushPlan> {""".replace("          ", ""),
-              'preflight signature',
-          )
+          old = "            ReconcileItem::SourceOnly(source) => {\n                append_directory_finalize(&mut finalize, &source, None, policy).await?;\n                if let Some(delete) = &mut delete {\n                    delete.observe_source_only(&source).await?;\n                }\n                plan_entry(source, None, policy)\n            }"
+          new = "            ReconcileItem::SourceOnly(source) => {\n                if let Some(delete) = &mut delete {\n                    delete.observe_source_only(&source).await?;\n                }\n                if !plan_in_scope(&source) {\n                    continue;\n                }\n                append_directory_finalize(&mut finalize, &source, None, policy).await?;\n                plan_entry(source, None, policy)\n            }"
+          replace_once(old, new, 'source-only arm')
 
-          replace_once(
-              """            ReconcileItem::SourceOnly(source) => {
-                append_directory_finalize(&mut finalize, &source, None, policy).await?;
-                if let Some(delete) = &mut delete {
-                    delete.observe_source_only(&source).await?;
-                }
-                plan_entry(source, None, policy)
-            }""",
-              """            ReconcileItem::SourceOnly(source) => {
-                if let Some(delete) = &mut delete {
-                    delete.observe_source_only(&source).await?;
-                }
-                if !plan_in_scope(&source) {
-                    continue;
-                }
-                append_directory_finalize(&mut finalize, &source, None, policy).await?;
-                plan_entry(source, None, policy)
-            }""",
-              'source-only arm',
-          )
+          old = "            ReconcileItem::Matched {\n                source,\n                destination,\n            } => {\n                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)\n                    .await?;\n                if let Some(delete) = &mut delete {\n                    let in_scope = delete_in_scope(&destination);\n                    delete.observe_matched(&destination, in_scope).await?;\n                }\n                plan_entry(source, Some(destination), policy)\n            }"
+          new = "            ReconcileItem::Matched {\n                source,\n                destination,\n            } => {\n                if let Some(delete) = &mut delete {\n                    let in_scope = delete_in_scope(&destination);\n                    delete.observe_matched(&destination, in_scope).await?;\n                }\n                if !plan_in_scope(&source) {\n                    continue;\n                }\n                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)\n                    .await?;\n                plan_entry(source, Some(destination), policy)\n            }"
+          replace_once(old, new, 'matched arm')
 
-          replace_once(
-              """            ReconcileItem::Matched {
-                source,
-                destination,
-            } => {
-                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
-                    .await?;
-                if let Some(delete) = &mut delete {
-                    let in_scope = delete_in_scope(&destination);
-                    delete.observe_matched(&destination, in_scope).await?;
-                }
-                plan_entry(source, Some(destination), policy)
-            }""",
-              """            ReconcileItem::Matched {
-                source,
-                destination,
-            } => {
-                if let Some(delete) = &mut delete {
-                    let in_scope = delete_in_scope(&destination);
-                    delete.observe_matched(&destination, in_scope).await?;
-                }
-                if !plan_in_scope(&source) {
-                    continue;
-                }
-                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
-                    .await?;
-                plan_entry(source, Some(destination), policy)
-            }""",
-              'matched arm',
-          )
-
-          replace_once(
-              """    #[tokio::test]
-    async fn checksum_preflight_fails_before_execution() {""",
-              """    #[tokio::test]
-    async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {
-        let source = entries(vec![file("parent/keep", 1, 1)]);
-        let destination = entries(vec![directory("parent", 0o755), file("remove", 1, 1)]);
-        let mut plan = preflight_remote_push_scoped(
-            source,
-            destination,
-            ComparisonPolicy::default(),
-            Some(DeletePolicy {
-                threshold: 100,
-                force: false,
-            }),
-            |_| false,
-            |_| true,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(plan.operations(), 0);
-        assert_eq!(plan.eligible_destination_entries(), 2);
-        assert_eq!(plan.delete_candidates(), 1);
-        assert!(plan.reader.next().await.unwrap().is_none());
-
-        let mut replay = plan.delete.take().unwrap().into_replay();
-        assert_eq!(
-            replay.next_action().await.unwrap(),
-            Some(crate::engine::delete_plan::DeleteAction {
-                path: path("remove"),
-                is_directory: false,
-            })
-        );
-        assert_eq!(replay.next_action().await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn checksum_preflight_fails_before_execution() {""",
-              'semantic scope test',
-          )
+          anchor = "    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {"
+          test = "    #[tokio::test]\n    async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {\n        let source = entries(vec![file(\"parent/keep\", 1, 1)]);\n        let destination = entries(vec![directory(\"parent\", 0o755), file(\"remove\", 1, 1)]);\n        let mut plan = preflight_remote_push_scoped(\n            source,\n            destination,\n            ComparisonPolicy::default(),\n            Some(DeletePolicy {\n                threshold: 100,\n                force: false,\n            }),\n            |_| false,\n            |_| true,\n        )\n        .await\n        .unwrap();\n\n        assert_eq!(plan.operations(), 0);\n        assert_eq!(plan.eligible_destination_entries(), 2);\n        assert_eq!(plan.delete_candidates(), 1);\n        assert!(plan.reader.next().await.unwrap().is_none());\n\n        let mut replay = plan.delete.take().unwrap().into_replay();\n        assert_eq!(\n            replay.next_action().await.unwrap(),\n            Some(crate::engine::delete_plan::DeleteAction {\n                path: path(\"remove\"),\n                is_directory: false,\n            })\n        );\n        assert_eq!(replay.next_action().await.unwrap(), None);\n    }\n\n    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {"
+          replace_once(anchor, test, 'semantic scope test')
 
           path.write_text(text)
           PY
