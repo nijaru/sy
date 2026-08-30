@@ -237,6 +237,7 @@ pub enum SkipReason {
     Unchanged,
     Filtered,
     ExistingOnly,
+    MissingDestination,
     DestinationNewer,
 }
 

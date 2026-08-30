@@ -359,6 +359,7 @@ fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
     ComparisonPolicy {
         mode,
         ignore_existing: config.comparison.ignore_existing,
+        existing_only: config.existing,
         update_only: config.comparison.update_only,
         // The compatibility executor does not yet expose a metadata-only task.
         // Keep the new planner honest by not requesting semantics it cannot apply.

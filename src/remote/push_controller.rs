@@ -142,7 +142,9 @@ pub async fn preflight_remote_push_scoped(
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                append_directory_finalize(&mut finalize, &source, None, policy).await?;
+                if !policy.existing_only {
+                    append_directory_finalize(&mut finalize, &source, None, policy).await?;
+                }
                 plan_entry(source, None, policy)
             }
             ReconcileItem::Matched {
@@ -500,6 +502,33 @@ mod tests {
             })
         );
         assert_eq!(replay.next_action().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn existing_only_source_directory_does_not_queue_finalize_metadata() {
+        let mut plan = preflight_remote_push(
+            entries(vec![directory("missing", 0o755)]),
+            entries(vec![]),
+            ComparisonPolicy {
+                existing_only: true,
+                preserve_times: true,
+                ..ComparisonPolicy::default()
+            },
+            None,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            plan.reader.next().await.unwrap(),
+            Some(SyncOp::Skip {
+                path: value,
+                reason: crate::engine::domain::SkipReason::MissingDestination,
+            }) if value == path("missing")
+        ));
+        assert!(plan.reader.next().await.unwrap().is_none());
+        assert!(plan.finalize.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
