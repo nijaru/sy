@@ -77,9 +77,6 @@ pub(super) fn legacy_fallback_reason(
     if config.remove_source_files {
         return Some("post-success source removal is not yet implemented by v3");
     }
-    if config.existing {
-        return Some("existing-only selection is not yet implemented by v3");
-    }
     if config.backup.is_some() || config.backup_dir.is_some() {
         return Some("backup semantics are not yet implemented by v3");
     }
@@ -509,6 +506,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn existing_only_selection_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.existing = true;
+
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            None
+        );
+        assert!(comparison_policy(&config).existing_only);
+    }
+
     #[tokio::test]
     async fn filtered_source_error_aborts_preflight_before_delete_plan() {
         let mut filter = FilterEngine::new();
@@ -807,6 +816,67 @@ mod tests {
             b"OLD!"
         );
         assert!(!destination_root.path().join("remove").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_only_skips_missing_source_entries_and_updates_matches() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("matched"), b"new").unwrap();
+        std::fs::write(source_root.path().join("missing"), b"missing").unwrap();
+        std::fs::write(destination_root.path().join("matched"), b"older").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected existing-only v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.existing = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 0);
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert!(!destination_root.path().join("missing").exists());
+        assert_eq!(
+            std::fs::read(destination_root.path().join("matched")).unwrap(),
+            b"new"
+        );
     }
 
     #[cfg(unix)]
