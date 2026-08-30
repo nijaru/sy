@@ -39,12 +39,8 @@ pub(super) fn legacy_fallback_reason(
     if config.min_size.is_some() || config.max_size.is_some() {
         return Some("size selection is not yet mapped to the v3 scanner");
     }
-    if scan_options.respect_gitignore
-        || !scan_options.include_git_dir
-        || scan_options.dirs_only
-        || config.dirs
-    {
-        return Some("non-default scan selection is not yet mapped to v3 deletion scope");
+    if scan_options.respect_gitignore || !scan_options.include_git_dir {
+        return Some("gitignore/VCS selection is not yet mapped to v3 deletion scope");
     }
     if config.trash {
         return Some("trash deletion is not yet implemented by v3");
@@ -215,19 +211,26 @@ async fn execute_with_handle(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
-    let scan_request = scan_request(config, scan_options);
-    let destination = remote.scan(scan_request).await.map_err(map_io)?;
+    let source_request = source_scan_request(config, scan_options);
+    let destination = remote
+        .scan(destination_scan_request(config))
+        .await
+        .map_err(map_io)?;
     let source = filtered_source_stream(
-        local_entry_stream(source_root.to_path_buf(), scan_request),
+        local_entry_stream(source_root.to_path_buf(), source_request),
         config.filter_engine.clone(),
     );
     let delete_filter = config.filter_engine.clone();
+    let max_depth = selection_max_depth(config, scan_options);
     let plan = preflight_remote_push(
         source,
         destination,
         comparison_policy(config),
         delete_policy(&config.delete),
-        move |entry| delete_filter.should_include(entry.path.as_path(), entry.is_directory()),
+        move |entry| {
+            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                && entry_in_depth_scope(entry, max_depth)
+        },
     )
     .await
     .map_err(map_controller_error)?;
@@ -256,18 +259,39 @@ async fn execute_with_handle(
     summary_stats(summary)
 }
 
-fn scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
+fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: scan_options.respect_gitignore,
         include_git_dir: scan_options.include_git_dir,
-        max_depth: scan_options.dirs_only.then_some(1),
-        metadata: EntryMetadataRequest {
-            unix_mode: true,
-            symlink_target: true,
-            identity: true,
-            hardlink_group: config.preserve.hardlinks,
-        },
+        max_depth: selection_max_depth(config, scan_options),
+        metadata: metadata_request(config),
     }
+}
+
+fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
+    ScanRequest {
+        respect_gitignore: false,
+        include_git_dir: true,
+        max_depth: None,
+        metadata: metadata_request(config),
+    }
+}
+
+fn metadata_request(config: &SyncConfig) -> EntryMetadataRequest {
+    EntryMetadataRequest {
+        unix_mode: true,
+        symlink_target: true,
+        identity: true,
+        hardlink_group: config.preserve.hardlinks,
+    }
+}
+
+fn selection_max_depth(config: &SyncConfig, scan_options: ScanOptions) -> Option<usize> {
+    (config.dirs || scan_options.dirs_only).then_some(1)
+}
+
+fn entry_in_depth_scope(entry: &Entry, max_depth: Option<usize>) -> bool {
+    max_depth.is_none_or(|depth| entry.path.as_path().components().count() <= depth)
 }
 
 fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
@@ -402,6 +426,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dirs_selection_uses_shallow_source_and_complete_destination_scan() {
+        let mut config = supported_config();
+        config.dirs = true;
+        let scan_options = ScanOptions {
+            dirs_only: true,
+            ..ScanOptions::default()
+        };
+
+        assert_eq!(legacy_fallback_reason(&config, scan_options), None);
+        assert_eq!(source_scan_request(&config, scan_options).max_depth, Some(1));
+        assert_eq!(destination_scan_request(&config).max_depth, None);
+    }
+
     #[tokio::test]
     async fn filtered_source_error_aborts_preflight_before_delete_plan() {
         let mut filter = FilterEngine::new();
@@ -497,6 +535,71 @@ mod tests {
         server.await.unwrap();
         assert_eq!(stats.files_deleted, 1);
         assert!(excluded.join("keep").exists());
+        assert!(!destination_root.path().join("remove").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dirs_delete_preserves_deeper_destination_subtree() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let protected = destination_root.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::write(protected.join("keep"), b"keep").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"remove").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let mutation = session.mutation_handler();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected dirs-only v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.dirs = true;
+        config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        let scan_options = ScanOptions {
+            dirs_only: true,
+            ..ScanOptions::default()
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            scan_options,
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_deleted, 1);
+        assert!(protected.join("keep").exists());
         assert!(!destination_root.path().join("remove").exists());
     }
 
