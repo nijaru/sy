@@ -251,6 +251,33 @@ impl SyncSession {
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
+        if let Some(reason) =
+            super::v3_push::legacy_fallback_reason(&self.config, self.scan_options)
+        {
+            tracing::debug!(reason, "using legacy remote push compatibility path");
+            return self.streaming_push_legacy().await;
+        }
+
+        let (host, user, dest_root) = match &self.dest {
+            EndpointPair::Ssh { host, user, root } => (host, user, root),
+            _ => {
+                return Err(SyncError::Config(
+                    "destination must be SSH for push".to_string(),
+                ))
+            }
+        };
+        super::v3_push::run(
+            self.source.root(),
+            dest_root,
+            host,
+            user,
+            &self.config,
+            self.scan_options,
+        )
+        .await
+    }
+
+    async fn streaming_push_legacy(&self) -> Result<SyncStats> {
         let (host, user, dest_root) = match &self.dest {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
             _ => {
