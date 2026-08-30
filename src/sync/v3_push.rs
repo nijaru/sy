@@ -1,15 +1,19 @@
 use crate::cli::SymlinkMode;
 use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
+use crate::filter::FilterEngine;
 use crate::integrity::ChecksumType;
 use crate::sync::scanner::ScanOptions;
 use crate::sync::{DeleteMode, SyncConfig, SyncStats};
+use futures::{future, StreamExt};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
+use sy::engine::domain::{Entry, RelativePath};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
+use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
@@ -31,9 +35,6 @@ pub(super) fn legacy_fallback_reason(
     }
     if config.comparison.checksum {
         return Some("checksum comparison is not yet implemented in v3 preflight");
-    }
-    if !config.filter_engine.is_empty() {
-        return Some("include/exclude filters are not yet mapped to the v3 scanner");
     }
     if config.min_size.is_some() || config.max_size.is_some() {
         return Some("size selection is not yet mapped to the v3 scanner");
@@ -162,6 +163,52 @@ fn resolve_v3_ssh_config(host: &str, user: &Option<String>) -> Result<sy::ssh::c
     }
 }
 
+struct SourceFilterSelection {
+    filter: FilterEngine,
+    excluded_subtree: Option<RelativePath>,
+}
+
+impl SourceFilterSelection {
+    fn new(filter: FilterEngine) -> Self {
+        Self {
+            filter,
+            excluded_subtree: None,
+        }
+    }
+
+    fn includes(&mut self, entry: &Entry) -> bool {
+        if let Some(excluded) = self.excluded_subtree.as_ref() {
+            if entry.path.as_path().starts_with(excluded.as_path()) {
+                return false;
+            }
+            self.excluded_subtree = None;
+        }
+
+        let included = self
+            .filter
+            .should_include(entry.path.as_path(), entry.is_directory());
+        if !included && entry.is_directory() {
+            self.excluded_subtree = Some(entry.path.clone());
+        }
+        included
+    }
+}
+
+fn filtered_source_stream(source: EntryStream, filter: FilterEngine) -> EntryStream {
+    if filter.is_empty() {
+        return source;
+    }
+
+    let mut selection = SourceFilterSelection::new(filter);
+    Box::pin(source.filter_map(move |item| {
+        let keep = match item.as_ref() {
+            Ok(entry) => selection.includes(entry),
+            Err(_) => true,
+        };
+        future::ready(keep.then_some(item))
+    }))
+}
+
 async fn execute_with_handle(
     source_root: &Path,
     remote: ClientRemoteHandle,
@@ -170,13 +217,19 @@ async fn execute_with_handle(
 ) -> Result<SyncStats> {
     let scan_request = scan_request(config, scan_options);
     let destination = remote.scan(scan_request).await.map_err(map_io)?;
-    let source = local_entry_stream(source_root.to_path_buf(), scan_request);
+    let source = filtered_source_stream(
+        local_entry_stream(source_root.to_path_buf(), scan_request),
+        config.filter_engine.clone(),
+    );
+    let delete_filter = config.filter_engine.clone();
     let plan = preflight_remote_push(
         source,
         destination,
         comparison_policy(config),
         delete_policy(&config.delete),
-        |_| true,
+        move |entry| {
+            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+        },
     )
     .await
     .map_err(map_controller_error)?;
@@ -297,6 +350,10 @@ fn map_io(error: impl std::fmt::Display) -> SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
+    use std::path::PathBuf;
+    use sy::engine::domain::Timestamp;
+    use sy::engine::reconcile::{BoxError, EngineError, Side};
     use sy::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
     use tempfile::TempDir;
 
@@ -306,6 +363,16 @@ mod tests {
         config.max_errors = 100;
         config.verification.mode = ChecksumType::None;
         config
+    }
+
+    fn file_entry(value: &str) -> Entry {
+        let mut entry = Entry::file(
+            RelativePath::new(PathBuf::from(value)).unwrap(),
+            1,
+            Timestamp::UNIX_EPOCH,
+        );
+        entry.unix_mode = Some(0o644);
+        entry
     }
 
     #[test]
@@ -328,10 +395,113 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_selection_stays_on_legacy_path() {
+    fn filter_selection_maps_to_v3_without_fallback() {
         let mut config = supported_config();
         config.filter_engine.add_exclude("*.tmp").unwrap();
-        assert!(legacy_fallback_reason(&config, ScanOptions::default()).is_some());
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_source_error_aborts_preflight_before_delete_plan() {
+        let mut filter = FilterEngine::new();
+        filter.add_exclude("*.tmp").unwrap();
+        let source_items: Vec<std::result::Result<Entry, BoxError>> = vec![
+            Ok(file_entry("skip.tmp")),
+            Err(Box::new(std::io::Error::other("source scan failed"))),
+        ];
+        let source: EntryStream = Box::pin(stream::iter(source_items));
+        let destination: EntryStream = Box::pin(stream::iter(vec![Ok::<Entry, BoxError>(
+            file_entry("remove"),
+        )]));
+        let delete_filter = filter.clone();
+
+        let result = preflight_remote_push(
+            filtered_source_stream(source, filter),
+            destination,
+            ComparisonPolicy::default(),
+            Some(DeletePolicy {
+                threshold: 100,
+                force: false,
+            }),
+            move |entry| {
+                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RemotePushControllerError::Reconcile(
+                EngineError::Endpoint {
+                    side: Side::Source,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filtered_delete_preserves_excluded_subtree_and_removes_in_scope_entry() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let excluded = destination_root.path().join("excluded");
+        std::fs::create_dir(&excluded).unwrap();
+        std::fs::write(excluded.join("keep"), b"keep").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"remove").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let mutation = session.mutation_handler();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected filtered v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.filter_engine.add_exclude("excluded/").unwrap();
+        config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_deleted, 1);
+        assert!(excluded.join("keep").exists());
+        assert!(!destination_root.path().join("remove").exists());
     }
 
     #[cfg(unix)]
