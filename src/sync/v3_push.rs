@@ -19,7 +19,8 @@ use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
-    preflight_remote_push, RemotePushController, RemotePushControllerError, RemotePushSummary,
+    preflight_remote_push, preflight_remote_push_scoped, RemotePushController,
+    RemotePushControllerError, RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
@@ -35,9 +36,6 @@ pub(super) fn legacy_fallback_reason(
     }
     if config.comparison.checksum {
         return Some("checksum comparison is not yet implemented in v3 preflight");
-    }
-    if config.min_size.is_some() || config.max_size.is_some() {
-        return Some("size selection is not yet mapped to the v3 scanner");
     }
     if scan_options.respect_gitignore {
         return Some("gitignore selection is not yet mapped to v3 deletion scope");
@@ -220,14 +218,17 @@ async fn execute_with_handle(
         local_entry_stream(source_root.to_path_buf(), source_request),
         config.filter_engine.clone(),
     );
+    let min_size = config.min_size;
+    let max_size = config.max_size;
     let delete_filter = config.filter_engine.clone();
     let max_depth = selection_max_depth(config, scan_options);
     let include_git_dir = scan_options.include_git_dir;
-    let plan = preflight_remote_push(
+    let plan = preflight_remote_push_scoped(
         source,
         destination,
         comparison_policy(config),
         delete_policy(&config.delete),
+        move |entry| entry_in_size_scope(entry, min_size, max_size),
         move |entry| {
             delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                 && entry_in_depth_scope(entry, max_depth)
@@ -303,6 +304,15 @@ fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
             .as_path()
             .components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
+}
+
+fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u64>) -> bool {
+    if entry.is_directory() {
+        return true;
+    }
+
+    min_size.is_none_or(|min| entry.size >= min)
+        && max_size.is_none_or(|max| entry.size <= max)
 }
 
 fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
@@ -398,14 +408,18 @@ mod tests {
         config
     }
 
-    fn file_entry(value: &str) -> Entry {
+    fn sized_file_entry(value: &str, size: u64) -> Entry {
         let mut entry = Entry::file(
             RelativePath::new(PathBuf::from(value)).unwrap(),
-            1,
+            size,
             Timestamp::UNIX_EPOCH,
         );
         entry.unix_mode = Some(0o644);
         entry
+    }
+
+    fn file_entry(value: &str) -> Entry {
+        sized_file_entry(value, 1)
     }
 
     #[test]
@@ -465,6 +479,33 @@ mod tests {
         assert_eq!(legacy_fallback_reason(&config, scan_options), None);
         assert!(!entry_in_vcs_scope(&file_entry(".git/config"), false));
         assert!(entry_in_vcs_scope(&file_entry("src/.gitkeep"), false));
+    }
+
+    #[test]
+    fn size_selection_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.min_size = Some(3);
+        config.max_size = Some(10);
+
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            None
+        );
+        assert!(!entry_in_size_scope(
+            &sized_file_entry("small", 2),
+            config.min_size,
+            config.max_size
+        ));
+        assert!(entry_in_size_scope(
+            &sized_file_entry("kept", 5),
+            config.min_size,
+            config.max_size
+        ));
+        assert!(!entry_in_size_scope(
+            &sized_file_entry("large", 11),
+            config.min_size,
+            config.max_size
+        ));
     }
 
     #[tokio::test]
@@ -691,6 +732,77 @@ mod tests {
         server.await.unwrap();
         assert_eq!(stats.files_deleted, 1);
         assert!(git_dir.join("config").exists());
+        assert!(!destination_root.path().join("remove").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn size_selection_skips_semantic_work_without_hiding_source_from_delete() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("large"), b"hello world!").unwrap();
+        std::fs::write(source_root.path().join("small"), b"hi").unwrap();
+        std::fs::write(destination_root.path().join("small"), b"OLD!").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"x").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let mutation = session.mutation_handler();
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => file.serve(incoming).await.unwrap(),
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected size-filtered v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.min_size = Some(10);
+        config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("large")).unwrap(),
+            b"hello world!"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("small")).unwrap(),
+            b"OLD!"
+        );
         assert!(!destination_root.path().join("remove").exists());
     }
 
