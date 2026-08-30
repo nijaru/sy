@@ -42,14 +42,14 @@ jobs:
               text = text.replace(old, new, 1)
 
           replace_once(
-              '''pub async fn preflight_remote_push(
+              """pub async fn preflight_remote_push(
               source: EntryStream,
               destination: EntryStream,
               policy: ComparisonPolicy,
               delete_policy: Option<DeletePolicy>,
               mut delete_in_scope: impl FnMut(&Entry) -> bool,
-          ) -> Result<RemotePushPlan> {'''.replace('          ', ''),
-              '''pub async fn preflight_remote_push(
+          ) -> Result<RemotePushPlan> {""".replace("              ", "    "),
+              """pub async fn preflight_remote_push(
               source: EntryStream,
               destination: EntryStream,
               policy: ComparisonPolicy,
@@ -82,101 +82,103 @@ jobs:
               delete_policy: Option<DeletePolicy>,
               mut plan_in_scope: impl FnMut(&Entry) -> bool,
               mut delete_in_scope: impl FnMut(&Entry) -> bool,
-          ) -> Result<RemotePushPlan> {'''.replace('          ', ''),
+          ) -> Result<RemotePushPlan> {""".replace("          ", ""),
               'preflight signature',
           )
 
           replace_once(
-              '''            ReconcileItem::SourceOnly(source) => {
-                  append_directory_finalize(&mut finalize, &source, None, policy).await?;
-                  if let Some(delete) = &mut delete {
-                      delete.observe_source_only(&source).await?;
-                  }
-                  plan_entry(source, None, policy)
-              }'''.replace('              ', ''),
-              '''            ReconcileItem::SourceOnly(source) => {
-                  if let Some(delete) = &mut delete {
-                      delete.observe_source_only(&source).await?;
-                  }
-                  if !plan_in_scope(&source) {
-                      continue;
-                  }
-                  append_directory_finalize(&mut finalize, &source, None, policy).await?;
-                  plan_entry(source, None, policy)
-              }'''.replace('              ', ''),
+              """            ReconcileItem::SourceOnly(source) => {
+                append_directory_finalize(&mut finalize, &source, None, policy).await?;
+                if let Some(delete) = &mut delete {
+                    delete.observe_source_only(&source).await?;
+                }
+                plan_entry(source, None, policy)
+            }""",
+              """            ReconcileItem::SourceOnly(source) => {
+                if let Some(delete) = &mut delete {
+                    delete.observe_source_only(&source).await?;
+                }
+                if !plan_in_scope(&source) {
+                    continue;
+                }
+                append_directory_finalize(&mut finalize, &source, None, policy).await?;
+                plan_entry(source, None, policy)
+            }""",
               'source-only arm',
           )
 
           replace_once(
-              '''            ReconcileItem::Matched {
-                  source,
-                  destination,
-              } => {
-                  append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
-                      .await?;
-                  if let Some(delete) = &mut delete {
-                      let in_scope = delete_in_scope(&destination);
-                      delete.observe_matched(&destination, in_scope).await?;
-                  }
-                  plan_entry(source, Some(destination), policy)
-              }'''.replace('              ', ''),
-              '''            ReconcileItem::Matched {
-                  source,
-                  destination,
-              } => {
-                  if let Some(delete) = &mut delete {
-                      let in_scope = delete_in_scope(&destination);
-                      delete.observe_matched(&destination, in_scope).await?;
-                  }
-                  if !plan_in_scope(&source) {
-                      continue;
-                  }
-                  append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
-                      .await?;
-                  plan_entry(source, Some(destination), policy)
-              }'''.replace('              ', ''),
+              """            ReconcileItem::Matched {
+                source,
+                destination,
+            } => {
+                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
+                    .await?;
+                if let Some(delete) = &mut delete {
+                    let in_scope = delete_in_scope(&destination);
+                    delete.observe_matched(&destination, in_scope).await?;
+                }
+                plan_entry(source, Some(destination), policy)
+            }""",
+              """            ReconcileItem::Matched {
+                source,
+                destination,
+            } => {
+                if let Some(delete) = &mut delete {
+                    let in_scope = delete_in_scope(&destination);
+                    delete.observe_matched(&destination, in_scope).await?;
+                }
+                if !plan_in_scope(&source) {
+                    continue;
+                }
+                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
+                    .await?;
+                plan_entry(source, Some(destination), policy)
+            }""",
               'matched arm',
           )
 
-          test_anchor = '''    #[tokio::test]
-              async fn checksum_preflight_fails_before_execution() {'''.replace('              ', '')
-          test = '''    #[tokio::test]
-              async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {
-                  let source = entries(vec![file("parent/keep", 1, 1)]);
-                  let destination = entries(vec![directory("parent", 0o755), file("remove", 1, 1)]);
-                  let mut plan = preflight_remote_push_scoped(
-                      source,
-                      destination,
-                      ComparisonPolicy::default(),
-                      Some(DeletePolicy {
-                          threshold: 100,
-                          force: false,
-                      }),
-                      |_| false,
-                      |_| true,
-                  )
-                  .await
-                  .unwrap();
+          replace_once(
+              """    #[tokio::test]
+    async fn checksum_preflight_fails_before_execution() {""",
+              """    #[tokio::test]
+    async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {
+        let source = entries(vec![file("parent/keep", 1, 1)]);
+        let destination = entries(vec![directory("parent", 0o755), file("remove", 1, 1)]);
+        let mut plan = preflight_remote_push_scoped(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(DeletePolicy {
+                threshold: 100,
+                force: false,
+            }),
+            |_| false,
+            |_| true,
+        )
+        .await
+        .unwrap();
 
-                  assert_eq!(plan.operations(), 0);
-                  assert_eq!(plan.eligible_destination_entries(), 2);
-                  assert_eq!(plan.delete_candidates(), 1);
-                  assert!(plan.reader.next().await.unwrap().is_none());
+        assert_eq!(plan.operations(), 0);
+        assert_eq!(plan.eligible_destination_entries(), 2);
+        assert_eq!(plan.delete_candidates(), 1);
+        assert!(plan.reader.next().await.unwrap().is_none());
 
-                  let mut replay = plan.delete.take().unwrap().into_replay();
-                  assert_eq!(
-                      replay.next_action().await.unwrap(),
-                      Some(crate::engine::delete_plan::DeleteAction {
-                          path: path("remove"),
-                          is_directory: false,
-                      })
-                  );
-                  assert_eq!(replay.next_action().await.unwrap(), None);
-              }
+        let mut replay = plan.delete.take().unwrap().into_replay();
+        assert_eq!(
+            replay.next_action().await.unwrap(),
+            Some(crate::engine::delete_plan::DeleteAction {
+                path: path("remove"),
+                is_directory: false,
+            })
+        );
+        assert_eq!(replay.next_action().await.unwrap(), None);
+    }
 
-              #[tokio::test]
-              async fn checksum_preflight_fails_before_execution() {'''.replace('              ', '')
-          replace_once(test_anchor, test, 'semantic scope test')
+    #[tokio::test]
+    async fn checksum_preflight_fails_before_execution() {""",
+              'semantic scope test',
+          )
 
           path.write_text(text)
           PY
