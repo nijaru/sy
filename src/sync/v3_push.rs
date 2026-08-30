@@ -436,7 +436,10 @@ mod tests {
         };
 
         assert_eq!(legacy_fallback_reason(&config, scan_options), None);
-        assert_eq!(source_scan_request(&config, scan_options).max_depth, Some(1));
+        assert_eq!(
+            source_scan_request(&config, scan_options).max_depth,
+            Some(1)
+        );
         assert_eq!(destination_scan_request(&config).max_depth, None);
     }
 
