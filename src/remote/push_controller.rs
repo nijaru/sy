@@ -91,6 +91,33 @@ pub async fn preflight_remote_push(
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    delete_in_scope: impl FnMut(&Entry) -> bool,
+) -> Result<RemotePushPlan> {
+    preflight_remote_push_scoped(
+        source,
+        destination,
+        policy,
+        delete_policy,
+        |_| true,
+        delete_in_scope,
+    )
+    .await
+}
+
+/// Complete remote-push preflight while independently controlling semantic work
+/// and deletion scope.
+///
+/// `plan_in_scope` is evaluated for every source-backed entry. Entries outside
+/// semantic scope remain visible to deletion tracking, so a selection rule can
+/// suppress transfer work without making existing destination content appear
+/// source-absent. `delete_in_scope` continues to define which destination entries
+/// may participate in deletion.
+pub async fn preflight_remote_push_scoped(
+    source: EntryStream,
+    destination: EntryStream,
+    policy: ComparisonPolicy,
+    delete_policy: Option<DeletePolicy>,
+    mut plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: impl FnMut(&Entry) -> bool,
 ) -> Result<RemotePushPlan> {
     let mut reconciler = OrderedReconciler::new(source, destination);
@@ -109,22 +136,28 @@ pub async fn preflight_remote_push(
     while let Some(item) = reconciler.next().await? {
         let decision = match item {
             ReconcileItem::SourceOnly(source) => {
-                append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 if let Some(delete) = &mut delete {
                     delete.observe_source_only(&source).await?;
                 }
+                if !plan_in_scope(&source) {
+                    continue;
+                }
+                append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 plan_entry(source, None, policy)
             }
             ReconcileItem::Matched {
                 source,
                 destination,
             } => {
-                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
-                    .await?;
                 if let Some(delete) = &mut delete {
                     let in_scope = delete_in_scope(&destination);
                     delete.observe_matched(&destination, in_scope).await?;
                 }
+                if !plan_in_scope(&source) {
+                    continue;
+                }
+                append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
+                    .await?;
                 plan_entry(source, Some(destination), policy)
             }
             ReconcileItem::DestinationOnly(destination) => {
@@ -433,6 +466,40 @@ mod tests {
             Some(SyncOp::Skip { path: value, .. }) if value == path("c")
         ));
         assert!(plan.reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {
+        let source = entries(vec![file("parent/keep", 1, 1)]);
+        let destination = entries(vec![directory("parent", 0o755), file("remove", 1, 1)]);
+        let mut plan = preflight_remote_push_scoped(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(DeletePolicy {
+                threshold: 100,
+                force: false,
+            }),
+            |_| false,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(plan.operations(), 0);
+        assert_eq!(plan.eligible_destination_entries(), 2);
+        assert_eq!(plan.delete_candidates(), 1);
+        assert!(plan.reader.next().await.unwrap().is_none());
+
+        let mut replay = plan.delete.take().unwrap().into_replay();
+        assert_eq!(
+            replay.next_action().await.unwrap(),
+            Some(crate::engine::delete_plan::DeleteAction {
+                path: path("remove"),
+                is_directory: false,
+            })
+        );
+        assert_eq!(replay.next_action().await.unwrap(), None);
     }
 
     #[tokio::test]
