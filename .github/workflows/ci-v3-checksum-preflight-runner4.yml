@@ -1,0 +1,235 @@
+name: Run V3 Checksum Preflight Validation 4
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-checksum-preflight-runner4.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Apply checksum preflight patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          payload = Path('.github/workflows/ci-v3-checksum-preflight-once.yml').read_text()
+          start_marker = "          from pathlib import Path\n"
+          start = payload.index(start_marker)
+          end = payload.index("\n          PY", start)
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in payload[start:end].splitlines()
+          )
+
+          old = '''def replace_once(text, old, new, label):
+              if text.count(old) != 1:
+                  raise SystemExit(f'{label}: expected one anchor, found {text.count(old)}')
+              return text.replace(old, new, 1)'''
+          new = '''def replace_once(text, old, new, label):
+              if text.count(old) == 1:
+                  return text.replace(old, new, 1)
+              for width in (4, 8, 12):
+                  prefix = ' ' * width
+                  indented_old = textwrap.indent(old, prefix)
+                  if text.count(indented_old) == 1:
+                      return text.replace(indented_old, textwrap.indent(new, prefix), 1)
+              raise SystemExit(f'{label}: expected one anchor, found {text.count(old)}')'''
+          if script.count(old) != 1:
+              raise SystemExit('validator helper anchor mismatch')
+          script = script.replace(old, new, 1)
+          exec(script)
+
+          path = Path('src/sync/v3_push.rs')
+          source = path.read_text()
+
+          def replace_server(source, test_name, replacement):
+              test_start = source.index(f'async fn {test_name}()')
+              server_start = source.index('let server = tokio::spawn(async move {', test_start)
+              session_start = source.index('let session = ClientRemoteSession::connect(', server_start)
+              server_end = source.rfind('});', server_start, session_start)
+              if server_end < server_start:
+                  raise SystemExit(f'{test_name}: could not locate server task boundary')
+              line_start = source.rfind('\n', 0, server_start) + 1
+              indent = source[line_start:server_start]
+              rendered = textwrap.indent(textwrap.dedent(replacement), indent)
+              return source[:server_start] + rendered + source[server_end + 3:]
+
+          source = replace_server(
+              source,
+              'checksum_mode_hashes_matches_and_transfers_only_changed_content',
+              '''\
+              let server = tokio::spawn(async move {
+                  let mut session = ServerRemoteSession::accept(
+                      server_reader,
+                      server_writer,
+                      RouterConfig::default(),
+                  )
+                  .await
+                  .unwrap();
+                  let scan = session.scan_handler();
+                  let hash = session.hash_handler();
+                  let file = session.file_handler();
+                  let mut tasks = tokio::task::JoinSet::new();
+                  let mut hashes = 0;
+                  let mut files = 0;
+                  for _ in 0..4 {
+                      match session.next_request().await.unwrap().unwrap() {
+                          IncomingRequest::Scan(incoming) => {
+                              let scan = scan.clone();
+                              tasks.spawn(async move {
+                                  scan.serve(incoming)
+                                      .await
+                                      .map_err(|error| error.to_string())
+                              });
+                          }
+                          IncomingRequest::Hash(incoming) => {
+                              hashes += 1;
+                              let hash = hash.clone();
+                              tasks.spawn(async move {
+                                  hash.serve(incoming)
+                                      .await
+                                      .map_err(|error| error.to_string())
+                              });
+                          }
+                          IncomingRequest::File(incoming) => {
+                              files += 1;
+                              let file = file.clone();
+                              tasks.spawn(async move {
+                                  file.serve(incoming)
+                                      .await
+                                      .map(|_| ())
+                                      .map_err(|error| error.to_string())
+                              });
+                          }
+                          _ => panic!("unexpected checksum v3 adapter request"),
+                      }
+                  }
+                  while let Some(joined) = tasks.join_next().await {
+                      joined.unwrap().unwrap();
+                  }
+                  (hashes, files)
+              });''',
+          )
+
+          source = replace_server(
+              source,
+              'checksum_dry_run_hashes_but_emits_no_mutation_request',
+              '''\
+              let server = tokio::spawn(async move {
+                  let mut session = ServerRemoteSession::accept(
+                      server_reader,
+                      server_writer,
+                      RouterConfig::default(),
+                  )
+                  .await
+                  .unwrap();
+                  let scan = session.scan_handler();
+                  let hash = session.hash_handler();
+                  let mut tasks = tokio::task::JoinSet::new();
+                  for _ in 0..2 {
+                      match session.next_request().await.unwrap().unwrap() {
+                          IncomingRequest::Scan(incoming) => {
+                              let scan = scan.clone();
+                              tasks.spawn(async move {
+                                  scan.serve(incoming)
+                                      .await
+                                      .map_err(|error| error.to_string())
+                              });
+                          }
+                          IncomingRequest::Hash(incoming) => {
+                              let hash = hash.clone();
+                              tasks.spawn(async move {
+                                  hash.serve(incoming)
+                                      .await
+                                      .map_err(|error| error.to_string())
+                              });
+                          }
+                          _ => panic!("checksum dry-run emitted a mutation-capable request"),
+                      }
+                  }
+                  while let Some(joined) = tasks.join_next().await {
+                      joined.unwrap().unwrap();
+                  }
+              });''',
+          )
+          path.write_text(source)
+
+          context = Path('agent-context/ai/0.5-rewrite.md')
+          text = context.read_text()
+          replacements = [
+              (
+                  'Checksum mode deliberately returns `NeedContentComparison` when same-size files require content comparison. Remote v3 currently leaves that state unsupported rather than pretending rolling signatures are a whole-file checksum.',
+                  'Checksum mode deliberately returns `NeedContentComparison` when same-size files require content comparison. Remote v3 resolves that state during complete no-mutation preflight with explicit identity-checked whole-file BLAKE3 hashes; rolling signatures remain a separate delta-transfer mechanism.',
+              ),
+              (
+                  '- `--size-only`;\n',
+                  '- `--size-only`;\n- `--checksum`;\n',
+              ),
+              (
+                  'To route `--checksum` through v3, add an explicit bounded remote content-hash request/result using the already-negotiated BLAKE3 capability, validate the scanned destination identity while opening/hash-reading it, compute the local source hash without whole-file buffering, then feed equality into `finish_content_comparison`. Content comparison must still complete during the no-mutation preflight barrier.',
+                  'Protocol v3 now has an explicit bounded whole-file BLAKE3 content-hash request/result using the negotiated BLAKE3 capability. Both local source and remote destination hashing validate the scanned identity while opening/reading, stream without whole-file buffering, and feed equality into `finish_content_comparison` before preflight can return. Dry-run performs the same hash preflight but emits no mutation request.',
+              ),
+              (
+                  '- checksum comparison;\n',
+                  '',
+              ),
+              (
+                  '2. Add explicit v3 whole-file BLAKE3 comparison and route checksum mode through complete preflight.\n3. Define a typed deletion-limit contract and only then migrate absolute max-delete.\n4. Design source-derived gitignore selection/deletion scope; never destination-filter it blindly.\n5. Audit remaining legacy-only policy one behavior at a time; migrate only semantics that fit 0.5.\n6. Continue source/destination identity hardening and exact destructive replay validation.\n7. Finish directory transaction/type-transition design where required.\n8. Move local execution wholly onto the same engine/controller/capability architecture.\n9. Delete v2, transport/ssh2, `sy-remote`, legacy `SyncEngine`, duplicate planner/stats/transfer code, and obsolete tests.\n10. Migrate CLI to usage-rs, then consider Edition 2024 on the cleaned baseline.\n11. Run `cargo machete`, finish dependency cleanup, and add musl release/bootstrap support.\n12. Add realistic OpenSSH localhost integration, cross-platform release gates, and benchmarks before merge.',
+                  '2. Define a typed deletion-limit contract and only then migrate absolute max-delete.\n3. Design source-derived gitignore selection/deletion scope; never destination-filter it blindly.\n4. Audit remaining legacy-only policy one behavior at a time; migrate only semantics that fit 0.5.\n5. Continue source/destination identity hardening and exact destructive replay validation.\n6. Finish directory transaction/type-transition design where required.\n7. Move local execution wholly onto the same engine/controller/capability architecture.\n8. Delete v2, transport/ssh2, `sy-remote`, legacy `SyncEngine`, duplicate planner/stats/transfer code, and obsolete tests.\n9. Migrate CLI to usage-rs, then consider Edition 2024 on the cleaned baseline.\n10. Run `cargo machete`, finish dependency cleanup, and add musl release/bootstrap support.\n11. Add realistic OpenSSH localhost integration, cross-platform release gates, and benchmarks before merge.',
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'context anchor mismatch for: {old[:60]!r}')
+              text = text.replace(old, new, 1)
+          context.write_text(text)
+          PY
+      - name: Run cargo fmt --all
+        run: cargo fmt --all
+      - name: Run cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run checksum preflight controller test
+        run: timeout 30s cargo test --workspace --all-features checksum_preflight_finishes_async_content_decisions_before_plan_return
+      - name: Run checksum runtime update test
+        run: timeout 30s cargo test --workspace --all-features checksum_mode_hashes_matches_and_transfers_only_changed_content
+      - name: Run checksum dry-run test
+        run: timeout 30s cargo test --workspace --all-features checksum_dry_run_hashes_but_emits_no_mutation_request
+      - name: Run v3 push controller tests
+        run: cargo test --workspace --all-features remote::push_controller::tests
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit validated checksum preflight
+        run: |
+          rm -f \
+            .github/workflows/ci-v3-checksum-preflight-once.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner2.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner3.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner4.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/remote/push_controller.rs src/sync/v3_push.rs agent-context/ai/0.5-rewrite.md .github/workflows
+          git commit -m 'feat: integrate checksum comparison into v3 preflight'
+          git push origin HEAD:v0.5-architecture
