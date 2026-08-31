@@ -1,0 +1,73 @@
+name: Run V3 Checksum Preflight Validation 5
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-checksum-preflight-runner5.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Apply validated checksum candidate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/ci-v3-checksum-preflight-runner4.yml').read_text()
+          start_marker = "          from pathlib import Path\n"
+          start = workflow.index(start_marker)
+          end = workflow.index("\n          PY", start)
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in workflow[start:end].splitlines()
+          )
+          exec(script)
+          PY
+      - name: Run cargo fmt --all
+        run: cargo fmt --all
+      - name: Run cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Warm test profile and run checksum controller test
+        run: cargo test --workspace --all-features checksum_preflight_finishes_async_content_decisions_before_plan_return
+      - name: Run checksum runtime update test
+        run: timeout 60s cargo test --workspace --all-features checksum_mode_hashes_matches_and_transfers_only_changed_content
+      - name: Run checksum dry-run test
+        run: timeout 60s cargo test --workspace --all-features checksum_dry_run_hashes_but_emits_no_mutation_request
+      - name: Run v3 push controller tests
+        run: cargo test --workspace --all-features remote::push_controller::tests
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit validated checksum preflight
+        run: |
+          rm -f \
+            .github/workflows/ci-v3-checksum-preflight-once.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner2.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner3.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner4.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner5.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/remote/push_controller.rs src/sync/v3_push.rs agent-context/ai/0.5-rewrite.md .github/workflows
+          git commit -m 'feat: integrate checksum comparison into v3 preflight'
+          git push origin HEAD:v0.5-architecture
