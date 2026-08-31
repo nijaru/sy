@@ -1,0 +1,473 @@
+name: Validate V3 Checksum Preflight Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-checksum-preflight-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Integrate checksum comparison into complete v3 preflight
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          def replace_once(text, old, new, label):
+              if text.count(old) != 1:
+                  raise SystemExit(f'{label}: expected one anchor, found {text.count(old)}')
+              return text.replace(old, new, 1)
+
+          controller = Path('src/remote/push_controller.rs')
+          text = controller.read_text()
+          text = replace_once(
+              text,
+              'use crate::engine::planner::{plan_entry, ComparisonPolicy, PlanDecision};',
+              'use crate::engine::planner::{\n    finish_content_comparison, plan_entry, ComparisonPolicy, PlanDecision,\n};',
+              'controller planner import',
+          )
+          text = replace_once(
+              text,
+              'use std::num::NonZeroUsize;\n',
+              'use std::future::Future;\nuse std::num::NonZeroUsize;\n',
+              'controller Future import',
+          )
+          text = replace_once(
+              text,
+              '    #[error(transparent)]\n    Execute(#[from] RemotePushError),\n\n    #[error("v3 remote checksum comparison is not implemented for {0}")]\n',
+              '    #[error(transparent)]\n    Execute(#[from] RemotePushError),\n\n    #[error(transparent)]\n    Hash(#[from] crate::remote::hash::RemoteHashError),\n\n    #[error("v3 remote checksum comparison is not implemented for {0}")]\n',
+              'controller hash error',
+          )
+
+          old_signature = textwrap.dedent('''\
+          pub async fn preflight_remote_push_scoped(
+              source: EntryStream,
+              destination: EntryStream,
+              policy: ComparisonPolicy,
+              delete_policy: Option<DeletePolicy>,
+              mut plan_in_scope: impl FnMut(&Entry) -> bool,
+              mut delete_in_scope: impl FnMut(&Entry) -> bool,
+          ) -> Result<RemotePushPlan> {
+          ''')
+          new_signature = textwrap.dedent('''\
+          pub async fn preflight_remote_push_scoped(
+              source: EntryStream,
+              destination: EntryStream,
+              policy: ComparisonPolicy,
+              delete_policy: Option<DeletePolicy>,
+              plan_in_scope: impl FnMut(&Entry) -> bool,
+              delete_in_scope: impl FnMut(&Entry) -> bool,
+          ) -> Result<RemotePushPlan> {
+              preflight_remote_push_scoped_with_content(
+                  source,
+                  destination,
+                  policy,
+                  delete_policy,
+                  plan_in_scope,
+                  delete_in_scope,
+                  |source, _destination| async move {
+                      Err::<bool, _>(RemotePushControllerError::UnsupportedContentComparison(
+                          source.path,
+                      ))
+                  },
+              )
+              .await
+          }
+
+          /// Complete remote-push preflight with asynchronous content comparison
+          /// for planner decisions that cannot be resolved from scan metadata.
+          ///
+          /// The comparison future runs while the controller is still in the
+          /// no-mutation phase. A comparison failure therefore prevents a plan,
+          /// delete replay, and all namespace or file mutations.
+          pub async fn preflight_remote_push_scoped_with_content<F, Fut>(
+              source: EntryStream,
+              destination: EntryStream,
+              policy: ComparisonPolicy,
+              delete_policy: Option<DeletePolicy>,
+              mut plan_in_scope: impl FnMut(&Entry) -> bool,
+              mut delete_in_scope: impl FnMut(&Entry) -> bool,
+              mut compare_content: F,
+          ) -> Result<RemotePushPlan>
+          where
+              F: FnMut(Entry, Entry) -> Fut,
+              Fut: Future<Output = Result<bool>>,
+          {
+          ''')
+          text = replace_once(text, old_signature, new_signature, 'controller preflight signature')
+
+          old_decision = textwrap.dedent('''\
+                  let operation = match decision {
+                      PlanDecision::Ready(operation) => operation,
+                      PlanDecision::NeedContentComparison { source, .. } => {
+                          return Err(RemotePushControllerError::UnsupportedContentComparison(
+                              source.path,
+                          ));
+                      }
+                  };
+          ''')
+          new_decision = textwrap.dedent('''\
+                  let operation = match decision {
+                      PlanDecision::Ready(operation) => operation,
+                      PlanDecision::NeedContentComparison {
+                          source,
+                          destination,
+                      } => {
+                          let contents_equal = compare_content(source.clone(), destination.clone()).await?;
+                          finish_content_comparison(source, destination, contents_equal, policy)
+                      }
+                  };
+          ''')
+          text = replace_once(text, old_decision, new_decision, 'controller content decision')
+
+          checksum_test_anchor = textwrap.dedent('''\
+              #[tokio::test]
+              async fn preflight_integrates_exact_delete_plan_from_same_merge() {
+          ''')
+          checksum_test = textwrap.dedent('''\
+              #[tokio::test]
+              async fn checksum_preflight_finishes_async_content_decisions_before_plan_return() {
+                  let policy = ComparisonPolicy {
+                      mode: crate::engine::planner::ComparisonMode::Checksum,
+                      ..ComparisonPolicy::default()
+                  };
+                  let mut equal = preflight_remote_push_scoped_with_content(
+                      entries(vec![file("a", 4, 1)]),
+                      entries(vec![file("a", 4, 2)]),
+                      policy,
+                      None,
+                      |_| true,
+                      |_| true,
+                      |_source, _destination| async { Ok(true) },
+                  )
+                  .await
+                  .unwrap();
+                  assert!(matches!(
+                      equal.reader.next().await.unwrap(),
+                      Some(SyncOp::Skip { path: value, .. }) if value == path("a")
+                  ));
+
+                  let mut changed = preflight_remote_push_scoped_with_content(
+                      entries(vec![file("b", 4, 1)]),
+                      entries(vec![file("b", 4, 2)]),
+                      policy,
+                      None,
+                      |_| true,
+                      |_| true,
+                      |_source, _destination| async { Ok(false) },
+                  )
+                  .await
+                  .unwrap();
+                  assert!(matches!(
+                      changed.reader.next().await.unwrap(),
+                      Some(SyncOp::Update { source, .. }) if source.path == path("b")
+                  ));
+              }
+
+          ''') + checksum_test_anchor
+          text = replace_once(text, checksum_test_anchor, checksum_test, 'controller checksum test anchor')
+          controller.write_text(text)
+
+          adapter = Path('src/sync/v3_push.rs')
+          text = adapter.read_text()
+          text = replace_once(
+              text,
+              '    if config.comparison.checksum {\n        return Some("checksum comparison is not yet implemented in v3 preflight");\n    }\n',
+              '',
+              'adapter checksum fallback',
+          )
+          text = replace_once(
+              text,
+              'use sy::remote::push::RemotePushExecutor;\n',
+              'use sy::remote::hash::{hash_rooted_file, RemoteHashError};\nuse sy::remote::push::RemotePushExecutor;\n',
+              'adapter hash import',
+          )
+          text = replace_once(
+              text,
+              '    preflight_remote_push_scoped, preview_remote_push, RemotePushController,\n',
+              '    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content,\n    preview_remote_push, RemotePushController,\n',
+              'adapter controller import',
+          )
+          text = replace_once(
+              text,
+              'use sy::remote::ssh::SshRemoteSession;\n',
+              'use sy::remote::ssh::SshRemoteSession;\nuse sy::rooted_fs::RootedFs;\n',
+              'adapter rooted import',
+          )
+
+          old_plan = textwrap.dedent('''\
+              let plan = preflight_remote_push_scoped(
+                  source,
+                  destination,
+                  comparison_policy(config),
+                  delete_policy(&config.delete),
+                  move |entry| entry_in_size_scope(entry, min_size, max_size),
+                  move |entry| {
+                      delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                          && entry_in_depth_scope(entry, max_depth)
+                          && entry_in_vcs_scope(entry, include_git_dir)
+                  },
+              )
+              .await
+              .map_err(map_controller_error)?;
+          ''')
+          new_plan = textwrap.dedent('''\
+              let plan = if config.comparison.checksum {
+                  let source_rooted = RootedFs::open(source_root.to_path_buf())
+                      .await
+                      .map_err(map_io)?;
+                  let hash_remote = remote.clone();
+                  preflight_remote_push_scoped_with_content(
+                      source,
+                      destination,
+                      comparison_policy(config),
+                      delete_policy(&config.delete),
+                      move |entry| entry_in_size_scope(entry, min_size, max_size),
+                      move |entry| {
+                          delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                              && entry_in_depth_scope(entry, max_depth)
+                              && entry_in_vcs_scope(entry, include_git_dir)
+                      },
+                      move |source, destination| {
+                          let source_rooted = source_rooted.clone();
+                          let hash_remote = hash_remote.clone();
+                          async move {
+                              let source_identity = source
+                                  .identity
+                                  .ok_or(RemoteHashError::MissingBasisIdentity)?;
+                              let source_hash = hash_rooted_file(
+                                  source_rooted,
+                                  source.path.clone(),
+                                  source.size,
+                                  source_identity,
+                              );
+                              let destination_hash = hash_remote.content_hash(&destination);
+                              let (source_hash, destination_hash) =
+                                  tokio::try_join!(source_hash, destination_hash)?;
+                              Ok(source_hash == destination_hash)
+                          }
+                      },
+                  )
+                  .await
+                  .map_err(map_controller_error)?
+              } else {
+                  preflight_remote_push_scoped(
+                      source,
+                      destination,
+                      comparison_policy(config),
+                      delete_policy(&config.delete),
+                      move |entry| entry_in_size_scope(entry, min_size, max_size),
+                      move |entry| {
+                          delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                              && entry_in_depth_scope(entry, max_depth)
+                              && entry_in_vcs_scope(entry, include_git_dir)
+                      },
+                  )
+                  .await
+                  .map_err(map_controller_error)?
+              };
+          ''')
+          text = replace_once(text, old_plan, new_plan, 'adapter preflight block')
+
+          routing_anchor = textwrap.dedent('''\
+              #[test]
+              fn existing_only_selection_maps_to_v3_without_fallback() {
+          ''')
+          routing_test = textwrap.dedent('''\
+              #[test]
+              fn checksum_comparison_maps_to_v3_without_fallback() {
+                  let mut config = supported_config();
+                  config.comparison.checksum = true;
+
+                  assert_eq!(
+                      legacy_fallback_reason(&config, ScanOptions::default()),
+                      None
+                  );
+                  assert_eq!(comparison_policy(&config).mode, ComparisonMode::Checksum);
+              }
+
+          ''') + routing_anchor
+          text = replace_once(text, routing_anchor, routing_test, 'adapter routing test anchor')
+
+          runtime_anchor = textwrap.dedent('''\
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn adapter_executes_real_v3_runtime_and_maps_stats() {
+          ''')
+          runtime_tests = textwrap.dedent('''\
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn checksum_mode_hashes_matches_and_transfers_only_changed_content() {
+                  let source_root = TempDir::new().unwrap();
+                  let destination_root = TempDir::new().unwrap();
+                  std::fs::write(source_root.path().join("equal"), b"same").unwrap();
+                  std::fs::write(destination_root.path().join("equal"), b"same").unwrap();
+                  std::fs::write(source_root.path().join("changed"), b"new!").unwrap();
+                  std::fs::write(destination_root.path().join("changed"), b"old!").unwrap();
+
+                  let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                  let (client_reader, client_writer) = tokio::io::split(client_io);
+                  let (server_reader, server_writer) = tokio::io::split(server_io);
+                  let server = tokio::spawn(async move {
+                      let mut session = ServerRemoteSession::accept(
+                          server_reader,
+                          server_writer,
+                          RouterConfig::default(),
+                      )
+                      .await
+                      .unwrap();
+                      let scan = session.scan_handler();
+                      let hash = session.hash_handler();
+                      let file = session.file_handler();
+                      let mut hashes = 0;
+                      let mut files = 0;
+                      for _ in 0..4 {
+                          match session.next_request().await.unwrap().unwrap() {
+                              IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                              IncomingRequest::Hash(incoming) => {
+                                  hashes += 1;
+                                  hash.serve(incoming).await.unwrap();
+                              }
+                              IncomingRequest::File(incoming) => {
+                                  files += 1;
+                                  file.serve(incoming).await.unwrap();
+                              }
+                              _ => panic!("unexpected checksum v3 adapter request"),
+                          }
+                      }
+                      (hashes, files)
+                  });
+
+                  let session = ClientRemoteSession::connect(
+                      client_reader,
+                      client_writer,
+                      Operation::Push,
+                      destination_root.path(),
+                      RouterConfig::default(),
+                  )
+                  .await
+                  .unwrap();
+                  let mut config = supported_config();
+                  config.comparison.checksum = true;
+                  let stats = execute_with_handle(
+                      source_root.path(),
+                      session.request_handle(),
+                      &config,
+                      ScanOptions::default(),
+                  )
+                  .await
+                  .unwrap();
+
+                  assert_eq!(server.await.unwrap(), (2, 1));
+                  assert_eq!(stats.files_updated, 1);
+                  assert_eq!(stats.files_skipped, 1);
+                  assert_eq!(
+                      std::fs::read(destination_root.path().join("equal")).unwrap(),
+                      b"same"
+                  );
+                  assert_eq!(
+                      std::fs::read(destination_root.path().join("changed")).unwrap(),
+                      b"new!"
+                  );
+              }
+
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn checksum_dry_run_hashes_but_emits_no_mutation_request() {
+                  let source_root = TempDir::new().unwrap();
+                  let destination_root = TempDir::new().unwrap();
+                  std::fs::write(source_root.path().join("changed"), b"new!").unwrap();
+                  std::fs::write(destination_root.path().join("changed"), b"old!").unwrap();
+
+                  let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                  let (client_reader, client_writer) = tokio::io::split(client_io);
+                  let (server_reader, server_writer) = tokio::io::split(server_io);
+                  let server = tokio::spawn(async move {
+                      let mut session = ServerRemoteSession::accept(
+                          server_reader,
+                          server_writer,
+                          RouterConfig::default(),
+                      )
+                      .await
+                      .unwrap();
+                      let scan = session.scan_handler();
+                      let hash = session.hash_handler();
+                      for _ in 0..2 {
+                          match session.next_request().await.unwrap().unwrap() {
+                              IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                              IncomingRequest::Hash(incoming) => hash.serve(incoming).await.unwrap(),
+                              _ => panic!("checksum dry-run emitted a mutation-capable request"),
+                          }
+                      }
+                  });
+
+                  let session = ClientRemoteSession::connect(
+                      client_reader,
+                      client_writer,
+                      Operation::Push,
+                      destination_root.path(),
+                      RouterConfig::default(),
+                  )
+                  .await
+                  .unwrap();
+                  let mut config = supported_config();
+                  config.comparison.checksum = true;
+                  config.dry_run = true;
+                  let stats = execute_with_handle(
+                      source_root.path(),
+                      session.request_handle(),
+                      &config,
+                      ScanOptions::default(),
+                  )
+                  .await
+                  .unwrap();
+
+                  server.await.unwrap();
+                  assert_eq!(stats.files_updated, 1);
+                  assert_eq!(stats.bytes_would_change, 4);
+                  assert_eq!(
+                      std::fs::read(destination_root.path().join("changed")).unwrap(),
+                      b"old!"
+                  );
+              }
+
+          ''') + runtime_anchor
+          text = replace_once(text, runtime_anchor, runtime_tests, 'adapter runtime test anchor')
+          adapter.write_text(text)
+          PY
+      - run: cargo fmt --all
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run checksum-focused tests
+        run: cargo test --workspace --all-features checksum
+      - name: Run v3 push controller tests
+        run: cargo test --workspace --all-features remote::push_controller
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit validated checksum preflight
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm .github/workflows/ci-v3-checksum-preflight-once.yml
+          git add src/remote/push_controller.rs src/sync/v3_push.rs .github/workflows/ci-v3-checksum-preflight-once.yml
+          git commit -m 'feat: integrate checksum comparison into v3 preflight'
+          git push origin HEAD:v0.5-architecture
