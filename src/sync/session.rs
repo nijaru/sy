@@ -423,8 +423,8 @@ fn configure_streaming(
     if let Some(limit) = config.bwlimit {
         streaming = streaming.with_bwlimit(limit);
     }
-    if let Some(ref max_delete) = config.max_delete {
-        streaming = streaming.with_max_delete(max_delete.clone());
+    if let Some(limit) = config.delete.limit() {
+        streaming = streaming.with_max_delete(crate::sync::config::format_delete_limit(limit));
     }
     if config.delete.is_forced() {
         streaming = streaming.with_force_delete(true);

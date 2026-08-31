@@ -22,7 +22,8 @@ pub mod watch;
 pub mod watch_session;
 
 pub use config::{
-    ComparisonConfig, DeleteMode, PreserveConfig, ResumeConfig, SyncConfig, VerificationConfig,
+    parse_delete_limit, ComparisonConfig, DeleteLimit, DeleteMode, PreserveConfig, ResumeConfig,
+    SyncConfig, VerificationConfig,
 };
 pub use stats::{SyncError, SyncStats, VerificationResult};
 
@@ -73,6 +74,59 @@ pub(crate) fn itemize_string(
         crate::sync::strategy::SyncAction::Skip => '.',
     };
     format!("{}{}..........", file_type, update_type)
+}
+
+fn enforce_configured_delete_limit(
+    delete: &DeleteMode,
+    eligible_destination_entries: usize,
+    delete_candidates: usize,
+) -> Result<()> {
+    let Some(limit) = delete.limit() else {
+        return Ok(());
+    };
+    let eligible_destination_entries =
+        u64::try_from(eligible_destination_entries).map_err(|_| {
+            crate::error::SyncError::Config("eligible delete count exceeds u64 range".to_string())
+        })?;
+    let delete_candidates = u64::try_from(delete_candidates).map_err(|_| {
+        crate::error::SyncError::Config("delete candidate count exceeds u64 range".to_string())
+    })?;
+    let policy = sy::engine::delete_plan::DeletePolicy {
+        limit,
+        force: delete.is_forced(),
+    };
+    match sy::engine::delete_plan::enforce_delete_policy(
+        policy,
+        eligible_destination_entries,
+        delete_candidates,
+    ) {
+        Ok(()) => Ok(()),
+        Err(sy::engine::delete_plan::DeletePlanError::ThresholdExceeded {
+            eligible_destination_entries,
+            delete_candidates,
+            threshold,
+        }) => {
+            let percentage = if eligible_destination_entries == 0 {
+                0.0
+            } else {
+                delete_candidates as f64 * 100.0 / eligible_destination_entries as f64
+            };
+            Err(crate::error::SyncError::DeletionThresholdExceeded {
+                percentage,
+                threshold,
+            })
+        }
+        Err(sy::engine::delete_plan::DeletePlanError::CountExceeded {
+            delete_candidates,
+            limit,
+        }) => Err(crate::error::SyncError::DeletionCountExceeded {
+            delete_candidates,
+            limit,
+        }),
+        Err(other) => Err(crate::error::SyncError::Io(std::io::Error::other(
+            other.to_string(),
+        ))),
+    }
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -532,37 +586,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     .scan()
                     .map(|files| files.len())
                     .unwrap_or(0);
-
-                // Check threshold: prevent mass deletion
-                if dest_file_count > 0 && !self.config.delete.is_forced() {
-                    let delete_percentage =
-                        (deletions.len() as f64 / dest_file_count as f64) * 100.0;
-
-                    if delete_percentage > self.config.delete.threshold() as f64 {
-                        tracing::error!(
-                            "Refusing to delete {:.1}% of destination files ({} files). Threshold: {}%. Use --force-delete to override.",
-                            delete_percentage,
-                            deletions.len(),
-                            self.config.delete.threshold()
-                        );
-
-                        if !self.config.quiet {
-                            eprintln!(
-                                "⚠️  ERROR: Would delete {:.1}% of files ({}/{}), exceeding threshold of {}%",
-                                delete_percentage,
-                                deletions.len(),
-                                dest_file_count,
-                                self.config.delete.threshold()
-                            );
-                            eprintln!("Use --force-delete to skip safety checks (dangerous!)");
-                        }
-
-                        return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
-                            "Deletion threshold exceeded: {:.1}% > {}%",
-                            delete_percentage,
-                            self.config.delete.threshold()
-                        ))));
+                if let Err(error) = enforce_configured_delete_limit(
+                    &self.config.delete,
+                    dest_file_count,
+                    deletions.len(),
+                ) {
+                    tracing::error!(%error, "refusing unsafe deletion plan");
+                    if !self.config.quiet {
+                        eprintln!("ERROR: {error}");
+                        eprintln!("Use --force-delete to skip safety checks (dangerous!)");
                     }
+                    return Err(error);
                 }
 
                 // CRITICAL SAFETY NET: Even with --force-delete, require confirmation for catastrophic deletions
@@ -1997,8 +2031,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let pb = pb.clone();
                 let dry_run = self.config.dry_run;
                 let json = self.config.json;
-                let _force_delete = self.config.delete.is_forced();
-                let _delete_threshold = self.config.delete.threshold();
 
                 // We need to count deletions to check threshold (which requires buffering or estimation)
                 // In streaming mode, strict threshold enforcement is hard before starting.

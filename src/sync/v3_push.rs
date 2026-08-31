@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
-use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
+use sy::engine::delete_plan::{DeleteLimit, DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, RelativePath};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
@@ -105,14 +105,16 @@ pub(super) fn legacy_fallback_reason(
     if config.max_errors != 100 {
         return Some("custom max-error policy is not yet mapped to v3 fail-fast execution");
     }
-    if config.delete.is_enabled()
-        && config
-            .max_delete
-            .as_deref()
-            .is_some_and(|value| !value.ends_with('%'))
-    {
-        return Some("absolute delete limits are not yet represented by the v3 delete policy");
+    if matches!(
+        &config.delete,
+        DeleteMode::Enabled {
+            limit: DeleteLimit::Count(_),
+            ..
+        }
+    ) {
+        return Some("absolute delete limits are not yet enabled by the v3 adapter");
     }
+
     None
 }
 
@@ -380,8 +382,8 @@ fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
 fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
     match mode {
         DeleteMode::Disabled => None,
-        DeleteMode::Enabled { threshold, force } => Some(DeletePolicy {
-            threshold: *threshold,
+        DeleteMode::Enabled { limit, force } => Some(DeletePolicy {
+            limit: *limit,
             force: *force,
         }),
     }
@@ -441,6 +443,16 @@ fn map_controller_error(error: RemotePushControllerError) -> SyncError {
             threshold: *threshold,
         };
     }
+    if let RemotePushControllerError::DeletePlan(DeletePlanError::CountExceeded {
+        delete_candidates,
+        limit,
+    }) = &error
+    {
+        return SyncError::DeletionCountExceeded {
+            delete_candidates: *delete_candidates,
+            limit: *limit,
+        };
+    }
     map_io(error)
 }
 
@@ -498,6 +510,19 @@ mod tests {
         assert!(policy.update_only);
         assert!(policy.preserve_permissions);
         assert!(policy.preserve_times);
+    }
+
+    #[test]
+    fn absolute_delete_limit_remains_typed_fallback_until_adapter_slice() {
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Count(1),
+            force: false,
+        };
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            Some("absolute delete limits are not yet enabled by the v3 adapter")
+        );
     }
 
     #[test]
@@ -626,7 +651,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(DeletePolicy {
-                threshold: 100,
+                limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
             move |entry| delete_filter.should_include(entry.path.as_path(), entry.is_directory()),
@@ -687,7 +712,7 @@ mod tests {
         let mut config = supported_config();
         config.filter_engine.add_exclude("excluded/").unwrap();
         config.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
         let stats = execute_with_handle(
@@ -748,7 +773,7 @@ mod tests {
         let mut config = supported_config();
         config.dirs = true;
         config.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
         let scan_options = ScanOptions {
@@ -812,7 +837,7 @@ mod tests {
         .unwrap();
         let mut config = supported_config();
         config.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
         let scan_options = ScanOptions {
@@ -881,7 +906,7 @@ mod tests {
         let mut config = supported_config();
         config.min_size = Some(10);
         config.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
         let stats = execute_with_handle(
@@ -1005,7 +1030,7 @@ mod tests {
         let mut config = supported_config();
         config.dry_run = true;
         config.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
         let stats = execute_with_handle(

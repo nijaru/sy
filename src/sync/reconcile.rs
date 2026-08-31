@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sy::engine::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
+use sy::engine::delete_plan::{enforce_delete_policy, DeleteLimit, DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
 use sy::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonMode, ComparisonPolicy, PlanDecision,
@@ -49,9 +50,9 @@ pub(crate) async fn run_local_sync(
 
     let delete_plan = match config.delete {
         DeleteMode::Disabled => None,
-        DeleteMode::Enabled { threshold, force } => {
-            let plan =
-                preflight_delete(source, dest, config, scan_options, threshold, force).await?;
+        DeleteMode::Enabled { limit, force } => {
+            let plan = preflight_delete(source, dest, config, scan_options, limit, force).await?;
+
             tracing::info!(
                 source_entries = plan.source_entries,
                 eligible_dest_entries = plan.eligible_dest_entries,
@@ -443,7 +444,7 @@ async fn preflight_delete(
     dest: &dyn Endpoint,
     config: &SyncConfig,
     scan_options: ScanOptions,
-    threshold: u8,
+    limit: DeleteLimit,
     force: bool,
 ) -> Result<DeletePlan> {
     let request = delete_scan_request(scan_options);
@@ -472,7 +473,8 @@ async fn preflight_delete(
                 if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
                     eligible_dest_entries += 1;
                 }
-                protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
+                protect_candidate_dirs(&mut journal, &mut candidate_dirs, &mut delete_candidates)
+                    .await?;
             }
             ReconcileItem::DestinationOnly(destination) => {
                 close_candidate_dirs(destination.path.as_path(), &mut candidate_dirs);
@@ -482,13 +484,23 @@ async fn preflight_delete(
                     append_delete_candidate(&mut journal, &destination, &mut candidate_dirs)
                         .await?;
                 } else {
-                    protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;
+                    protect_candidate_dirs(
+                        &mut journal,
+                        &mut candidate_dirs,
+                        &mut delete_candidates,
+                    )
+                    .await?;
                 }
             }
         }
     }
 
-    enforce_delete_threshold(eligible_dest_entries, delete_candidates, threshold, force)?;
+    let eligible = u64::try_from(eligible_dest_entries)
+        .map_err(|_| SyncError::Config("eligible delete count exceeds u64 range".to_string()))?;
+    let candidates = u64::try_from(delete_candidates)
+        .map_err(|_| SyncError::Config("delete candidate count exceeds u64 range".to_string()))?;
+    enforce_delete_policy(DeletePolicy { limit, force }, eligible, candidates)
+        .map_err(map_delete_plan_error)?;
     let journal = journal.seal().await?;
     Ok(DeletePlan {
         source_entries,
@@ -556,36 +568,49 @@ async fn append_delete_candidate(
 async fn protect_candidate_dirs(
     journal: &mut DeleteJournal,
     candidate_dirs: &mut [CandidateDeleteDir],
+    delete_candidates: &mut usize,
 ) -> Result<()> {
     for candidate in candidate_dirs {
-        if !candidate.protected {
-            journal
-                .append(&candidate.path, DeleteKind::ProtectDirectory)
-                .await?;
-            candidate.protected = true;
+        if candidate.protected {
+            continue;
         }
+        journal
+            .append(&candidate.path, DeleteKind::ProtectDirectory)
+            .await?;
+        candidate.protected = true;
+        *delete_candidates = delete_candidates
+            .checked_sub(1)
+            .ok_or_else(|| SyncError::Config("delete candidate count underflow".to_string()))?;
     }
     Ok(())
 }
 
-fn enforce_delete_threshold(
-    eligible_dest_entries: usize,
-    delete_candidates: usize,
-    threshold: u8,
-    force: bool,
-) -> Result<()> {
-    if force || eligible_dest_entries == 0 {
-        return Ok(());
-    }
-
-    let percentage = delete_candidates as f64 / eligible_dest_entries as f64 * 100.0;
-    if percentage > threshold as f64 {
-        return Err(SyncError::DeletionThresholdExceeded {
-            percentage,
+fn map_delete_plan_error(error: DeletePlanError) -> SyncError {
+    match error {
+        DeletePlanError::ThresholdExceeded {
+            eligible_destination_entries,
+            delete_candidates,
             threshold,
-        });
+        } => {
+            let percentage = if eligible_destination_entries == 0 {
+                0.0
+            } else {
+                delete_candidates as f64 * 100.0 / eligible_destination_entries as f64
+            };
+            SyncError::DeletionThresholdExceeded {
+                percentage,
+                threshold,
+            }
+        }
+        DeletePlanError::CountExceeded {
+            delete_candidates,
+            limit,
+        } => SyncError::DeletionCountExceeded {
+            delete_candidates,
+            limit,
+        },
+        other => SyncError::Io(std::io::Error::other(other.to_string())),
     }
-    Ok(())
 }
 
 async fn execute_delete_journal(
@@ -780,7 +805,7 @@ mod tests {
         let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
         let mut cfg = config();
         cfg.delete = DeleteMode::Enabled {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         };
 
@@ -795,6 +820,36 @@ mod tests {
 
         assert!(dest.path().join("keep").exists());
         assert!(!dest.path().join("remove").exists());
+    }
+
+    #[tokio::test]
+    async fn protected_candidate_parent_is_not_counted_against_delete_limit() {
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let excluded = dest.path().join("parent/excluded");
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::write(excluded.join("keep"), b"keep").unwrap();
+        let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+        let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+        let mut cfg = config();
+        cfg.filter_engine.add_exclude("parent/excluded/").unwrap();
+        cfg.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Percentage(0),
+            force: false,
+        };
+
+        let stats = run_local_sync(
+            &source_endpoint,
+            &dest_endpoint,
+            &cfg,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_deleted, 0);
+        assert!(excluded.join("keep").exists());
+        assert!(dest.path().join("parent").exists());
     }
 
     #[cfg(unix)]

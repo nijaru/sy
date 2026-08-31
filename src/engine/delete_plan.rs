@@ -3,8 +3,15 @@ use super::domain::{Entry, InvalidRelativePath, RelativePath};
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteLimit {
+    Unlimited,
+    Percentage(u8),
+    Count(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeletePolicy {
-    pub threshold: u8,
+    pub limit: DeleteLimit,
     pub force: bool,
 }
 
@@ -31,6 +38,9 @@ pub enum DeletePlanError {
         threshold: u8,
     },
 
+    #[error("deletion count limit exceeded: {delete_candidates} candidates exceeds limit {limit}")]
+    CountExceeded { delete_candidates: u64, limit: u64 },
+
     #[error("delete preflight {0} counter overflow")]
     CounterOverflow(&'static str),
 
@@ -39,6 +49,44 @@ pub enum DeletePlanError {
 }
 
 pub type Result<T> = std::result::Result<T, DeletePlanError>;
+
+pub fn enforce_delete_policy(
+    policy: DeletePolicy,
+    eligible_destination_entries: u64,
+    delete_candidates: u64,
+) -> Result<()> {
+    if policy.force {
+        return Ok(());
+    }
+
+    match policy.limit {
+        DeleteLimit::Unlimited => Ok(()),
+        DeleteLimit::Percentage(threshold) => {
+            if eligible_destination_entries != 0
+                && u128::from(delete_candidates) * 100
+                    > u128::from(eligible_destination_entries) * u128::from(threshold)
+            {
+                Err(DeletePlanError::ThresholdExceeded {
+                    eligible_destination_entries,
+                    delete_candidates,
+                    threshold,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        DeleteLimit::Count(limit) => {
+            if delete_candidates > limit {
+                Err(DeletePlanError::CountExceeded {
+                    delete_candidates,
+                    limit,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct CandidateDirectory {
@@ -108,17 +156,11 @@ impl DeleteTracker {
     }
 
     pub async fn finish(self) -> Result<DeletePlan> {
-        if !self.policy.force
-            && self.eligible_destination_entries != 0
-            && u128::from(self.delete_candidates) * 100
-                > u128::from(self.eligible_destination_entries) * u128::from(self.policy.threshold)
-        {
-            return Err(DeletePlanError::ThresholdExceeded {
-                eligible_destination_entries: self.eligible_destination_entries,
-                delete_candidates: self.delete_candidates,
-                threshold: self.policy.threshold,
-            });
-        }
+        enforce_delete_policy(
+            self.policy,
+            self.eligible_destination_entries,
+            self.delete_candidates,
+        )?;
 
         Ok(DeletePlan {
             eligible_destination_entries: self.eligible_destination_entries,
@@ -292,7 +334,7 @@ mod tests {
 
     fn policy() -> DeletePolicy {
         DeletePolicy {
-            threshold: 100,
+            limit: DeleteLimit::Percentage(100),
             force: false,
         }
     }
@@ -333,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn matched_descendant_protects_parent_and_candidate_count() {
         let mut tracker = DeleteTracker::new(DeletePolicy {
-            threshold: 0,
+            limit: DeleteLimit::Percentage(0),
             force: false,
         })
         .await
@@ -397,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn threshold_is_checked_before_replay() {
         let mut tracker = DeleteTracker::new(DeletePolicy {
-            threshold: 49,
+            limit: DeleteLimit::Percentage(49),
             force: false,
         })
         .await
@@ -419,9 +461,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_bypasses_threshold() {
+    async fn count_limit_uses_final_protected_candidate_count() {
         let mut tracker = DeleteTracker::new(DeletePolicy {
-            threshold: 0,
+            limit: DeleteLimit::Count(0),
+            force: false,
+        })
+        .await
+        .unwrap();
+        tracker
+            .observe_destination_only(&directory("parent"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_destination_only(&directory("parent/excluded"), false)
+            .await
+            .unwrap();
+        let plan = tracker.finish().await.unwrap();
+        assert_eq!(plan.delete_candidates(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_limit_rejects_exact_excess_before_replay() {
+        let mut tracker = DeleteTracker::new(DeletePolicy {
+            limit: DeleteLimit::Count(1),
+            force: false,
+        })
+        .await
+        .unwrap();
+        tracker
+            .observe_destination_only(&file("first"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_destination_only(&file("second"), true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tracker.finish().await,
+            Err(DeletePlanError::CountExceeded {
+                delete_candidates: 2,
+                limit: 1,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn force_bypasses_limit() {
+        let mut tracker = DeleteTracker::new(DeletePolicy {
+            limit: DeleteLimit::Count(0),
             force: true,
         })
         .await
