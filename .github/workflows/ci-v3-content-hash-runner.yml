@@ -62,6 +62,16 @@ jobs:
               remote_mod_text = remote_mod_text.replace(anchor, 'pub mod hash;\npub mod path;\n', 1)
               remote_mod.write_text(remote_mod_text)
 
+          client = Path('src/remote/client.rs')
+          client_text = client.read_text()
+          bad_import = 'use super::hash::{request_content_hash, require_blake3};\n'
+          good_import = 'use crate::remote::hash::{request_content_hash, require_blake3};\n'
+          if bad_import in client_text:
+              client_text = client_text.replace(bad_import, good_import, 1)
+              client.write_text(client_text)
+          elif good_import not in client_text:
+              raise SystemExit('remote/client.rs hash import anchor mismatch')
+
           controller = Path('src/remote/push_controller.rs')
           controller_text = controller.read_text()
           old = '                    IncomingRequest::Signatures(_) => panic!("unexpected signature request"),\n'
