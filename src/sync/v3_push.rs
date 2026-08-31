@@ -19,8 +19,8 @@ use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
-    preflight_remote_push_scoped, RemotePushController, RemotePushControllerError,
-    RemotePushSummary,
+    preflight_remote_push_scoped, preview_remote_push, RemotePushController,
+    RemotePushControllerError, RemotePushPreview, RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
@@ -31,8 +31,8 @@ pub(super) fn legacy_fallback_reason(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Option<&'static str> {
-    if config.dry_run || config.diff_mode {
-        return Some("dry-run/diff semantics are not yet mapped to v3");
+    if config.diff_mode {
+        return Some("diff-mode byte accounting is not yet mapped to v3");
     }
     if config.comparison.checksum {
         return Some("checksum comparison is not yet implemented in v3 preflight");
@@ -235,6 +235,13 @@ async fn execute_with_handle(
     .await
     .map_err(map_controller_error)?;
 
+    if config.dry_run {
+        let preview = preview_remote_push(plan)
+            .await
+            .map_err(map_controller_error)?;
+        return preview_stats(preview);
+    }
+
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
         SyncError::Config("parallel transfer count must be greater than zero".to_string())
     })?;
@@ -339,6 +346,21 @@ fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
             force: *force,
         }),
     }
+}
+
+fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
+    Ok(SyncStats {
+        files_scanned: preview.planned_operations,
+        files_created: preview.files_created,
+        files_updated: preview.files_updated,
+        files_skipped: to_usize(preview.files_skipped, "preview skipped entries")?,
+        files_deleted: to_usize(preview.delete_candidates, "preview deleted entries")?,
+        bytes_would_add: preview.bytes_to_create,
+        bytes_would_change: preview.bytes_to_update,
+        dirs_created: preview.dirs_created,
+        symlinks_created: preview.symlinks_created,
+        ..SyncStats::default()
+    })
 }
 
 fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
@@ -504,6 +526,22 @@ mod tests {
             config.min_size,
             config.max_size
         ));
+    }
+
+    #[test]
+    fn dry_run_maps_to_v3_while_diff_mode_still_falls_back() {
+        let mut config = supported_config();
+        config.dry_run = true;
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            None
+        );
+
+        config.diff_mode = true;
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            Some("diff-mode byte accounting is not yet mapped to v3")
+        );
     }
 
     #[test]
@@ -877,6 +915,69 @@ mod tests {
             std::fs::read(destination_root.path().join("matched")).unwrap(),
             b"new"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_run_previews_remote_push_without_mutation_requests() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("create"), b"create").unwrap();
+        std::fs::write(source_root.path().join("update"), b"new-value").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"remove").unwrap();
+        std::fs::write(destination_root.path().join("update"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            match session.next_request().await.unwrap().unwrap() {
+                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                _ => panic!("dry-run emitted a mutation-capable v3 request"),
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.dry_run = true;
+        config.delete = DeleteMode::Enabled {
+            threshold: 100,
+            force: false,
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(stats.bytes_would_add, 6);
+        assert_eq!(stats.bytes_would_change, 9);
+        assert!(!destination_root.path().join("create").exists());
+        assert_eq!(
+            std::fs::read(destination_root.path().join("update")).unwrap(),
+            b"old"
+        );
+        assert!(destination_root.path().join("remove").exists());
     }
 
     #[cfg(unix)]
