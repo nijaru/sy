@@ -1,0 +1,117 @@
+name: Validate Typed Delete Limit Core Runner 3
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-delete-limit-core-runner3.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Apply typed delete-limit core
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/ci-delete-limit-core-runner2.yml').read_text()
+          start_marker = "          from pathlib import Path\n"
+          start = workflow.index(start_marker)
+          end = workflow.index("\n          PY", start)
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in workflow[start:end].splitlines()
+          )
+          exec(script)
+
+          path = Path('src/remote/push_controller.rs')
+          text = path.read_text()
+          production = 'use crate::engine::delete_plan::{\n    DeleteLimit, DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker,\n};'
+          original = 'use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};'
+          if text.count(production) == 1:
+              text = text.replace(production, original, 1)
+          elif text.count('DeleteLimit, DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker') == 1:
+              text = text.replace(
+                  'DeleteLimit, DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker',
+                  'DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker',
+                  1,
+              )
+          else:
+              raise SystemExit('production DeleteLimit import repair mismatch')
+
+          test_anchor = '    use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};\n'
+          if text.count(test_anchor) != 1:
+              raise SystemExit('test import anchor mismatch')
+          text = text.replace(
+              test_anchor,
+              test_anchor + '    use crate::engine::delete_plan::DeleteLimit;\n',
+              1,
+          )
+
+          bad_pattern = '''                DeletePlanError::ThresholdExceeded {
+                      eligible_destination_entries: 2,
+                      delete_candidates: 1,
+                      limit: DeleteLimit::Percentage(49),
+                  }
+          '''
+          good_pattern = '''                DeletePlanError::ThresholdExceeded {
+                      eligible_destination_entries: 2,
+                      delete_candidates: 1,
+                      threshold: 49,
+                  }
+          '''
+          if text.count(bad_pattern) != 1:
+              # The extracted transformer can flatten indentation; repair by field context.
+              needle = 'delete_candidates: 1,\n                    limit: DeleteLimit::Percentage(49),'
+              if text.count(needle) != 1:
+                  raise SystemExit('ThresholdExceeded pattern repair mismatch')
+              text = text.replace(
+                  needle,
+                  'delete_candidates: 1,\n                    threshold: 49,',
+                  1,
+              )
+          else:
+              text = text.replace(bad_pattern, good_pattern, 1)
+          path.write_text(text)
+          PY
+      - name: Run cargo fmt --all
+        run: cargo fmt --all
+      - name: Run cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run typed delete-limit tests
+        run: |
+          cargo test --workspace --all-features delete_limit_tests
+          cargo test --workspace --all-features count_limit_
+          cargo test --workspace --all-features protected_candidate_parent_is_not_counted_against_delete_limit
+          cargo test --workspace --all-features remote::push_controller
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit typed delete-limit core
+        run: |
+          git fetch origin v0.5-architecture
+          test "$(git rev-parse origin/v0.5-architecture)" = "$(git rev-parse HEAD)" || { echo 'branch advanced during validation'; exit 1; }
+          rm -f .github/workflows/ci-delete-limit-core-once.yml .github/workflows/ci-delete-limit-core-runner.yml .github/workflows/ci-delete-limit-core-runner2.yml .github/workflows/ci-delete-limit-core-runner3.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/engine/delete_plan.rs src/sync/config.rs src/sync/mod.rs src/main.rs src/sync/reconcile.rs src/sync/session.rs src/error.rs src/sync/v3_push.rs src/remote/push_controller.rs .github/workflows
+          git commit -m 'refactor: type delete safety limits'
+          git push origin HEAD:v0.5-architecture
