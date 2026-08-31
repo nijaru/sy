@@ -52,6 +52,25 @@ jobs:
               for line in remainder.splitlines()
           )
           exec(remainder)
+
+          remote_mod = Path('src/remote/mod.rs')
+          remote_mod_text = remote_mod.read_text()
+          if 'pub mod hash;\n' not in remote_mod_text:
+              anchor = 'pub mod path;\n'
+              if remote_mod_text.count(anchor) != 1:
+                  raise SystemExit('remote/mod.rs hash module anchor mismatch')
+              remote_mod_text = remote_mod_text.replace(anchor, 'pub mod hash;\npub mod path;\n', 1)
+              remote_mod.write_text(remote_mod_text)
+
+          controller = Path('src/remote/push_controller.rs')
+          controller_text = controller.read_text()
+          old = '                    IncomingRequest::Signatures(_) => panic!("unexpected signature request"),\n'
+          new = '                    IncomingRequest::Hash(_) => panic!("unexpected hash request"),\n                    IncomingRequest::Signatures(_) => panic!("unexpected signature request"),\n'
+          if old in controller_text:
+              controller_text = controller_text.replace(old, new, 1)
+              controller.write_text(controller_text)
+          elif new not in controller_text:
+              raise SystemExit('push_controller hash exhaustiveness anchor mismatch')
           PY
       - run: cargo fmt --all
       - run: cargo fmt --all -- --check
@@ -68,6 +87,6 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm .github/workflows/ci-v3-content-hash-once.yml
           rm .github/workflows/ci-v3-content-hash-runner.yml
-          git add src/protocol/hash.rs src/protocol/frame.rs src/protocol/mod.rs src/remote/hash.rs src/remote/mod.rs src/remote/router.rs src/remote/runtime.rs src/remote/client.rs src/remote/serve.rs .github/workflows/ci-v3-content-hash-once.yml .github/workflows/ci-v3-content-hash-runner.yml
+          git add src/protocol/hash.rs src/protocol/frame.rs src/protocol/mod.rs src/remote/hash.rs src/remote/mod.rs src/remote/router.rs src/remote/runtime.rs src/remote/client.rs src/remote/serve.rs src/remote/push_controller.rs .github/workflows/ci-v3-content-hash-once.yml .github/workflows/ci-v3-content-hash-runner.yml
           git commit -m 'feat: add identity-checked v3 content hash'
           git push origin HEAD:v0.5-architecture
