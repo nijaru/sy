@@ -1,7 +1,8 @@
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
-    IncomingRequest, RemoteSessionError, ServerFileHandler, ServerMetadataHandler,
-    ServerMutationHandler, ServerRemoteSession, ServerScanHandler, ServerSignatureHandler,
+    IncomingRequest, RemoteSessionError, ServerFileHandler, ServerHashHandler,
+    ServerMetadataHandler, ServerMutationHandler, ServerRemoteSession, ServerScanHandler,
+    ServerSignatureHandler,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
@@ -25,6 +26,7 @@ type RequestResult = std::result::Result<(), String>;
 #[derive(Clone)]
 struct RequestHandlers {
     scan: ServerScanHandler,
+    hash: ServerHashHandler,
     signatures: ServerSignatureHandler,
     file: ServerFileHandler,
     metadata: ServerMetadataHandler,
@@ -46,6 +48,7 @@ where
     let mut session = ServerRemoteSession::accept(reader, writer, config).await?;
     let handlers = RequestHandlers {
         scan: session.scan_handler(),
+        hash: session.hash_handler(),
         signatures: session.signature_handler(),
         file: session.file_handler(),
         metadata: session.metadata_handler(),
@@ -103,6 +106,15 @@ fn spawn_request(
     match request {
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::Hash(incoming) => {
+            let handler = handlers.hash.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
