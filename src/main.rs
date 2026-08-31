@@ -420,26 +420,13 @@ Or install from local source with: cargo install --path . --features acl"#
         dry_run: cli.dry_run,
         diff_mode: cli.diff,
         delete: if cli.delete {
-            let threshold = if cli.max_delete.ends_with('%') {
-                cli.max_delete
-                    .trim_end_matches('%')
-                    .parse::<u8>()
-                    .unwrap_or(50)
-            } else {
-                // For absolute counts, we'll use 100% (no threshold) since the limit is handled elsewhere
-                100
-            };
+            let limit = sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)?;
             sync::DeleteMode::Enabled {
-                threshold,
+                limit,
                 force: cli.force_delete,
             }
         } else {
             sync::DeleteMode::Disabled
-        },
-        max_delete: if cli.delete {
-            Some(cli.max_delete.clone())
-        } else {
-            None
         },
         trash: cli.trash,
         quiet: cli.quiet || cli.json,
@@ -785,15 +772,14 @@ Or install from local source with: cargo install --path . --features acl"#
         };
 
         let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
-        let max_delete_percent = if cli.max_delete.ends_with('%') {
-            cli.max_delete
-                .trim_end_matches('%')
-                .parse::<u8>()
-                .unwrap_or(50)
-        } else {
-            // For absolute counts, convert to percentage (assuming 100% means no limit)
-            100
-        };
+        let max_delete_percent =
+            match sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)? {
+                sync::DeleteLimit::Unlimited => 100,
+                sync::DeleteLimit::Percentage(value) => value,
+                sync::DeleteLimit::Count(_) => anyhow::bail!(
+        "absolute --max-delete counts are not supported with --bidirectional; use a percentage"
+    ),
+            };
         let bisync_opts = bisync::BisyncOptions {
             conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
                 .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,

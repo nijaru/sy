@@ -544,6 +544,7 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::delete_plan::DeleteLimit;
     use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
     use crate::engine::reconcile::BoxError;
     use futures::stream;
@@ -604,7 +605,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(DeletePolicy {
-                threshold: 100,
+                limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
             |_| false,
@@ -673,7 +674,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(DeletePolicy {
-                threshold: 100,
+                limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
             |_| true,
@@ -759,7 +760,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(DeletePolicy {
-                threshold: 100,
+                limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
             |_| true,
@@ -792,7 +793,7 @@ mod tests {
                 destination,
                 ComparisonPolicy::default(),
                 Some(DeletePolicy {
-                    threshold: 49,
+                    limit: DeleteLimit::Percentage(49),
                     force: false,
                 }),
                 |_| true,
@@ -950,7 +951,7 @@ mod tests {
             destination,
             comparison,
             Some(DeletePolicy {
-                threshold: 100,
+                limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
             |_| true,

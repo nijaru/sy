@@ -4,14 +4,13 @@ use crate::compress::CompressionDetection;
 use crate::filter::FilterEngine;
 use crate::integrity::ChecksumType;
 use std::path::PathBuf;
+pub use sy::engine::delete_plan::DeleteLimit;
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub dry_run: bool,
     pub diff_mode: bool,
     pub delete: DeleteMode,
-    /// Maximum deletions (absolute count or percentage string like "50%")
-    pub max_delete: Option<String>,
     #[allow(dead_code)]
     pub trash: bool,
     pub quiet: bool,
@@ -56,7 +55,6 @@ impl SyncConfig {
             dry_run: false,
             diff_mode: false,
             delete: DeleteMode::Disabled,
-            max_delete: None,
             trash: false,
             quiet: true,
             max_concurrent: 4,
@@ -104,7 +102,7 @@ impl SyncConfig {
 #[derive(Debug, Clone)]
 pub enum DeleteMode {
     Disabled,
-    Enabled { threshold: u8, force: bool },
+    Enabled { limit: DeleteLimit, force: bool },
 }
 
 impl DeleteMode {
@@ -112,10 +110,10 @@ impl DeleteMode {
         matches!(self, DeleteMode::Enabled { .. })
     }
 
-    pub fn threshold(&self) -> u8 {
+    pub fn limit(&self) -> Option<DeleteLimit> {
         match self {
-            DeleteMode::Disabled => 0,
-            DeleteMode::Enabled { threshold, .. } => *threshold,
+            DeleteMode::Disabled => None,
+            DeleteMode::Enabled { limit, .. } => Some(*limit),
         }
     }
 
@@ -124,6 +122,37 @@ impl DeleteMode {
             DeleteMode::Disabled => false,
             DeleteMode::Enabled { force, .. } => *force,
         }
+    }
+}
+
+pub fn parse_delete_limit(value: &str) -> std::result::Result<DeleteLimit, String> {
+    if let Some(percent) = value.strip_suffix('%') {
+        let percentage = percent
+            .parse::<u8>()
+            .map_err(|_| format!("--max-delete must be a number or percentage (got: '{value}')"))?;
+        if percentage > 100 {
+            return Err(format!(
+                "--max-delete percentage must be between 0% and 100% (got: '{value}')"
+            ));
+        }
+        return Ok(DeleteLimit::Percentage(percentage));
+    }
+
+    let count = value
+        .parse::<u64>()
+        .map_err(|_| format!("--max-delete must be a number or percentage (got: '{value}')"))?;
+    if count == 0 {
+        Ok(DeleteLimit::Unlimited)
+    } else {
+        Ok(DeleteLimit::Count(count))
+    }
+}
+
+pub fn format_delete_limit(limit: DeleteLimit) -> String {
+    match limit {
+        DeleteLimit::Unlimited => "0".to_string(),
+        DeleteLimit::Percentage(value) => format!("{value}%"),
+        DeleteLimit::Count(value) => value.to_string(),
     }
 }
 
@@ -195,5 +224,37 @@ impl ResumeConfig {
             checkpoint_files: 0,
             checkpoint_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_limit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_typed_delete_limits_without_ambiguous_zero() {
+        assert_eq!(parse_delete_limit("0").unwrap(), DeleteLimit::Unlimited);
+        assert_eq!(format_delete_limit(DeleteLimit::Unlimited), "0");
+        assert_eq!(format_delete_limit(DeleteLimit::Percentage(50)), "50%");
+        assert_eq!(format_delete_limit(DeleteLimit::Count(1000)), "1000");
+        assert_eq!(
+            parse_delete_limit("0%").unwrap(),
+            DeleteLimit::Percentage(0)
+        );
+        assert_eq!(
+            parse_delete_limit("50%").unwrap(),
+            DeleteLimit::Percentage(50)
+        );
+        assert_eq!(
+            parse_delete_limit("1000").unwrap(),
+            DeleteLimit::Count(1000)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_delete_limits() {
+        assert!(parse_delete_limit("101%").is_err());
+        assert!(parse_delete_limit("%").is_err());
+        assert!(parse_delete_limit("many").is_err());
     }
 }
