@@ -198,6 +198,44 @@ pub async fn preflight_remote_push_scoped(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RemotePushPreview {
+    pub planned_operations: u64,
+    pub delete_candidates: u64,
+    pub files_created: u64,
+    pub files_updated: u64,
+    pub files_skipped: u64,
+    pub dirs_created: u64,
+    pub symlinks_created: u64,
+    pub bytes_to_create: u64,
+    pub bytes_to_update: u64,
+}
+
+/// Consume a completed remote-push plan without executing endpoint mutations.
+///
+/// Dry-run uses the exact same full-tree preflight as execution, including
+/// deletion protection and threshold checks, then reads only the disk-backed
+/// semantic journal. Dropping the delete/finalize journals performs no remote
+/// operations.
+pub async fn preview_remote_push(plan: RemotePushPlan) -> Result<RemotePushPreview> {
+    let RemotePushPlan {
+        mut reader,
+        operations,
+        delete,
+        ..
+    } = plan;
+    let mut preview = RemotePushPreview {
+        planned_operations: operations,
+        delete_candidates: delete.as_ref().map_or(0, DeletePlan::delete_candidates),
+        ..RemotePushPreview::default()
+    };
+
+    while let Some(operation) = reader.next().await? {
+        record_preview_operation(&mut preview, &operation)?;
+    }
+    Ok(preview)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RemotePushSummary {
     pub planned_operations: u64,
     pub main_operations: u64,
@@ -374,6 +412,50 @@ fn record_transfer(
     Ok(())
 }
 
+fn record_preview_operation(preview: &mut RemotePushPreview, operation: &SyncOp) -> Result<()> {
+    match operation {
+        SyncOp::Create { source } => match source.kind {
+            EntryKind::File => {
+                preview.files_created =
+                    checked_add(preview.files_created, 1, "preview created file")?;
+                preview.bytes_to_create =
+                    checked_add(preview.bytes_to_create, source.size, "preview create byte")?;
+            }
+            EntryKind::Directory => {
+                preview.dirs_created =
+                    checked_add(preview.dirs_created, 1, "preview created directory")?;
+            }
+            EntryKind::Symlink => {
+                preview.symlinks_created =
+                    checked_add(preview.symlinks_created, 1, "preview created symlink")?;
+            }
+        },
+        SyncOp::Update { source, .. } | SyncOp::Replace { source, .. } => match source.kind {
+            EntryKind::File => {
+                preview.files_updated =
+                    checked_add(preview.files_updated, 1, "preview updated file")?;
+                preview.bytes_to_update =
+                    checked_add(preview.bytes_to_update, source.size, "preview update byte")?;
+            }
+            EntryKind::Directory => {}
+            EntryKind::Symlink => {
+                preview.symlinks_created =
+                    checked_add(preview.symlinks_created, 1, "preview replaced symlink")?;
+            }
+        },
+        SyncOp::Metadata { source, .. } => {
+            if !matches!(source.kind, EntryKind::Directory) {
+                preview.files_updated =
+                    checked_add(preview.files_updated, 1, "preview metadata update")?;
+            }
+        }
+        SyncOp::Skip { .. } => {
+            preview.files_skipped = checked_add(preview.files_skipped, 1, "preview skipped entry")?;
+        }
+    }
+    Ok(())
+}
+
 fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {
     match operation {
         SyncOp::Create { source } => match source.kind {
@@ -529,6 +611,41 @@ mod tests {
         ));
         assert!(plan.reader.next().await.unwrap().is_none());
         assert!(plan.finalize.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preview_counts_semantic_work_and_exact_deletes_without_execution() {
+        let source = entries(vec![
+            file("create", 4, 1),
+            file("skip", 1, 1),
+            file("update", 5, 2),
+        ]);
+        let destination = entries(vec![
+            file("remove", 3, 1),
+            file("skip", 1, 1),
+            file("update", 3, 1),
+        ]);
+        let plan = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(DeletePolicy {
+                threshold: 100,
+                force: false,
+            }),
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let preview = preview_remote_push(plan).await.unwrap();
+        assert_eq!(preview.planned_operations, 3);
+        assert_eq!(preview.files_created, 1);
+        assert_eq!(preview.files_updated, 1);
+        assert_eq!(preview.files_skipped, 1);
+        assert_eq!(preview.delete_candidates, 1);
+        assert_eq!(preview.bytes_to_create, 4);
+        assert_eq!(preview.bytes_to_update, 5);
     }
 
     #[tokio::test]
