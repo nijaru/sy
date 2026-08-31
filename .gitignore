@@ -32,7 +32,7 @@ PERFORMANCE_ANALYSIS.md
 man/
 __pycache__
 
-# AI agent context
+# AI agent local context; canonical tracked context under agent-context/ai may be force-added.
 ai/
 .pi/
 .tasks/
