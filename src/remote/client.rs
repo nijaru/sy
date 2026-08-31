@@ -5,6 +5,7 @@ use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{CapabilitySet, FrameKind, Operation, PlatformOs, SessionReady};
+use crate::remote::hash::{request_content_hash, require_blake3};
 use crate::remote::router::RouterSender;
 use crate::remote::scan::request_scan;
 use crate::remote::signature::{
@@ -61,6 +62,14 @@ impl ClientRemoteHandle {
 
     pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
         request_scan(&self.sender, request, self.peer).await
+    }
+
+    pub async fn content_hash(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
+        require_blake3(self.ready.capabilities)?;
+        request_content_hash(&self.sender, basis, self.peer).await
     }
 
     pub async fn signatures(

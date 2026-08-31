@@ -46,6 +46,8 @@ pub enum FrameKind {
     Pong = 19,
     ScanRequest = 20,
     Mutation = 21,
+    HashRequest = 22,
+    HashResult = 23,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -73,6 +75,8 @@ impl TryFrom<u8> for FrameKind {
             19 => Ok(Self::Pong),
             20 => Ok(Self::ScanRequest),
             21 => Ok(Self::Mutation),
+            22 => Ok(Self::HashRequest),
+            23 => Ok(Self::HashResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -288,6 +292,8 @@ mod tests {
         assert_eq!(FrameKind::Entry as u8, 5);
         assert_eq!(FrameKind::ScanRequest as u8, 20);
         assert_eq!(FrameKind::Mutation as u8, 21);
+        assert_eq!(FrameKind::HashRequest as u8, 22);
+        assert_eq!(FrameKind::HashResult as u8, 23);
     }
 
     proptest! {

@@ -2,6 +2,7 @@ mod codec;
 mod entry;
 mod frame;
 mod handshake;
+mod hash;
 mod metadata;
 mod mutation;
 mod path;
@@ -18,6 +19,7 @@ pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
 };
+pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::WireMetadata;
 pub use mutation::{WireMutation, WireMutationKind};
 pub use path::{

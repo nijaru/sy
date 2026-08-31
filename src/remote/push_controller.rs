@@ -828,6 +828,7 @@ mod tests {
                         order.push("metadata");
                         metadata_handler.serve(incoming).await.unwrap();
                     }
+                    IncomingRequest::Hash(_) => panic!("unexpected hash request"),
                     IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
                 }
             }

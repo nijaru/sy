@@ -12,6 +12,7 @@ use crate::engine::scan::ScanRequest;
 use crate::protocol::{
     CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
 };
+use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
 use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
@@ -58,6 +59,9 @@ pub enum RemoteSessionError {
         operation: Operation,
         kind: FrameKind,
     },
+
+    #[error(transparent)]
+    Hash(#[from] RemoteHashError),
 
     #[error(transparent)]
     Signature(#[from] RemoteSignatureError),
@@ -141,6 +145,14 @@ impl ClientRemoteSession {
 
     pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
         request_scan(&self.router.sender(), request, self.server.platform.os).await
+    }
+
+    pub async fn content_hash(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
+        crate::remote::hash::require_blake3(self.ready.capabilities)?;
+        request_content_hash(&self.router.sender(), basis, self.server.platform.os).await
     }
 
     pub async fn signatures(
@@ -316,6 +328,7 @@ impl ClientRemoteSession {
 
 pub enum IncomingRequest {
     Scan(IncomingStream),
+    Hash(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
     Metadata(IncomingStream),
@@ -331,6 +344,19 @@ pub struct ServerScanHandler {
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
         serve_incoming_scan_rooted(self.rooted.clone(), incoming, &self.sender).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerHashHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerHashHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::hash::Result<()> {
+        serve_incoming_hash_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
@@ -443,6 +469,14 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn hash_handler(&self) -> ServerHashHandler {
+        ServerHashHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
     pub fn signature_handler(&self) -> ServerSignatureHandler {
         ServerSignatureHandler {
             rooted: self.opened.rooted.clone(),
@@ -482,6 +516,7 @@ impl ServerRemoteSession {
 
         match incoming.first.frame().kind() {
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
+            FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
@@ -658,7 +693,8 @@ mod tests {
                             handler.serve(incoming).await.unwrap();
                         });
                     }
-                    IncomingRequest::File(_)
+                    IncomingRequest::Hash(_)
+                    | IncomingRequest::File(_)
                     | IncomingRequest::Metadata(_)
                     | IncomingRequest::Mutation(_) => {
                         panic!("unexpected mutation request")

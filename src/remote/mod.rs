@@ -1,3 +1,4 @@
+pub mod hash;
 pub mod path;
 pub mod push;
 pub mod push_controller;
