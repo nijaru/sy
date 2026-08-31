@@ -1,0 +1,110 @@
+name: Validate V3 Dry-Run Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-dry-run-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Add non-mutating v3 dry-run preview
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path_name, replacements):
+              path = Path(path_name)
+              text = path.read_text()
+              for label, old, new in replacements:
+                  count = text.count(old)
+                  if count != 1:
+                      raise SystemExit(f'{path_name} {label}: expected one anchor, found {count}')
+                  text = text.replace(old, new, 1)
+              path.write_text(text)
+
+          patch('src/remote/push_controller.rs', [
+              (
+                  'preview struct and function',
+                  '#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\npub struct RemotePushSummary {',
+                  '#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\npub struct RemotePushPreview {\n    pub planned_operations: u64,\n    pub delete_candidates: u64,\n    pub files_created: u64,\n    pub files_updated: u64,\n    pub files_skipped: u64,\n    pub dirs_created: u64,\n    pub symlinks_created: u64,\n    pub bytes_to_create: u64,\n    pub bytes_to_update: u64,\n}\n\n/// Consume a completed remote-push plan without executing endpoint mutations.\n///\n/// Dry-run uses the exact same full-tree preflight as execution, including\n/// deletion protection and threshold checks, then reads only the disk-backed\n/// semantic journal. Dropping the delete/finalize journals performs no remote\n/// operations.\npub async fn preview_remote_push(plan: RemotePushPlan) -> Result<RemotePushPreview> {\n    let RemotePushPlan {\n        mut reader,\n        operations,\n        delete,\n        ..\n    } = plan;\n    let mut preview = RemotePushPreview {\n        planned_operations: operations,\n        delete_candidates: delete.as_ref().map_or(0, DeletePlan::delete_candidates),\n        ..RemotePushPreview::default()\n    };\n\n    while let Some(operation) = reader.next().await? {\n        record_preview_operation(&mut preview, &operation)?;\n    }\n    Ok(preview)\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\npub struct RemotePushSummary {',
+              ),
+              (
+                  'preview recorder',
+                  'fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {',
+                  'fn record_preview_operation(preview: &mut RemotePushPreview, operation: &SyncOp) -> Result<()> {\n    match operation {\n        SyncOp::Create { source } => match source.kind {\n            EntryKind::File => {\n                preview.files_created = checked_add(preview.files_created, 1, "preview created file")?;\n                preview.bytes_to_create = checked_add(\n                    preview.bytes_to_create,\n                    source.size,\n                    "preview create byte",\n                )?;\n            }\n            EntryKind::Directory => {\n                preview.dirs_created = checked_add(preview.dirs_created, 1, "preview created directory")?;\n            }\n            EntryKind::Symlink => {\n                preview.symlinks_created = checked_add(preview.symlinks_created, 1, "preview created symlink")?;\n            }\n        },\n        SyncOp::Update { source, .. } | SyncOp::Replace { source, .. } => match source.kind {\n            EntryKind::File => {\n                preview.files_updated = checked_add(preview.files_updated, 1, "preview updated file")?;\n                preview.bytes_to_update = checked_add(\n                    preview.bytes_to_update,\n                    source.size,\n                    "preview update byte",\n                )?;\n            }\n            EntryKind::Directory => {}\n            EntryKind::Symlink => {\n                preview.symlinks_created = checked_add(preview.symlinks_created, 1, "preview replaced symlink")?;\n            }\n        },\n        SyncOp::Metadata { source, .. } => {\n            if !matches!(source.kind, EntryKind::Directory) {\n                preview.files_updated = checked_add(preview.files_updated, 1, "preview metadata update")?;\n            }\n        }\n        SyncOp::Skip { .. } => {\n            preview.files_skipped = checked_add(preview.files_skipped, 1, "preview skipped entry")?;\n        }\n    }\n    Ok(())\n}\n\nfn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {',
+              ),
+              (
+                  'preview test',
+                  '    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {',
+                  '    #[tokio::test]\n    async fn preview_counts_semantic_work_and_exact_deletes_without_execution() {\n        let source = entries(vec![\n            file("create", 4, 1),\n            file("skip", 1, 1),\n            file("update", 5, 2),\n        ]);\n        let destination = entries(vec![\n            file("remove", 3, 1),\n            file("skip", 1, 1),\n            file("update", 3, 1),\n        ]);\n        let plan = preflight_remote_push(\n            source,\n            destination,\n            ComparisonPolicy::default(),\n            Some(DeletePolicy {\n                threshold: 100,\n                force: false,\n            }),\n            |_| true,\n        )\n        .await\n        .unwrap();\n\n        let preview = preview_remote_push(plan).await.unwrap();\n        assert_eq!(preview.planned_operations, 3);\n        assert_eq!(preview.files_created, 1);\n        assert_eq!(preview.files_updated, 1);\n        assert_eq!(preview.files_skipped, 1);\n        assert_eq!(preview.delete_candidates, 1);\n        assert_eq!(preview.bytes_to_create, 4);\n        assert_eq!(preview.bytes_to_update, 5);\n    }\n\n    #[tokio::test]\n    async fn checksum_preflight_fails_before_execution() {',
+              ),
+          ])
+
+          patch('src/sync/v3_push.rs', [
+              (
+                  'preview import',
+                  '    preflight_remote_push_scoped, RemotePushController, RemotePushControllerError,\n    RemotePushSummary,\n',
+                  '    preflight_remote_push_scoped, preview_remote_push, RemotePushController,\n    RemotePushControllerError, RemotePushPreview, RemotePushSummary,\n',
+              ),
+              (
+                  'dry-run fallback',
+                  '    if config.dry_run || config.diff_mode {\n        return Some("dry-run/diff semantics are not yet mapped to v3");\n    }',
+                  '    if config.diff_mode {\n        return Some("diff-mode byte accounting is not yet mapped to v3");\n    }',
+              ),
+              (
+                  'preview execution branch',
+                  '    .await\n    .map_err(map_controller_error)?;\n\n    let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {',
+                  '    .await\n    .map_err(map_controller_error)?;\n\n    if config.dry_run {\n        let preview = preview_remote_push(plan).await.map_err(map_controller_error)?;\n        return preview_stats(preview);\n    }\n\n    let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {',
+              ),
+              (
+                  'preview stats mapper',
+                  'fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {',
+                  'fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {\n    Ok(SyncStats {\n        files_scanned: preview.planned_operations,\n        files_created: preview.files_created,\n        files_updated: preview.files_updated,\n        files_skipped: to_usize(preview.files_skipped, "preview skipped entries")?,\n        files_deleted: to_usize(preview.delete_candidates, "preview deleted entries")?,\n        bytes_would_add: preview.bytes_to_create,\n        bytes_would_change: preview.bytes_to_update,\n        dirs_created: preview.dirs_created,\n        symlinks_created: preview.symlinks_created,\n        ..SyncStats::default()\n    })\n}\n\nfn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {',
+              ),
+              (
+                  'dry-run routing test',
+                  '    #[test]\n    fn existing_only_selection_maps_to_v3_without_fallback() {',
+                  '    #[test]\n    fn dry_run_maps_to_v3_while_diff_mode_still_falls_back() {\n        let mut config = supported_config();\n        config.dry_run = true;\n        assert_eq!(\n            legacy_fallback_reason(&config, ScanOptions::default()),\n            None\n        );\n\n        config.diff_mode = true;\n        assert_eq!(\n            legacy_fallback_reason(&config, ScanOptions::default()),\n            Some("diff-mode byte accounting is not yet mapped to v3")\n        );\n    }\n\n    #[test]\n    fn existing_only_selection_maps_to_v3_without_fallback() {',
+              ),
+              (
+                  'dry-run runtime test',
+                  '    #[cfg(unix)]\n    #[tokio::test]\n    async fn adapter_executes_real_v3_runtime_and_maps_stats() {',
+                  '    #[cfg(unix)]\n    #[tokio::test]\n    async fn dry_run_previews_remote_push_without_mutation_requests() {\n        let source_root = TempDir::new().unwrap();\n        let destination_root = TempDir::new().unwrap();\n        std::fs::write(source_root.path().join("create"), b"create").unwrap();\n        std::fs::write(source_root.path().join("update"), b"new-value").unwrap();\n        std::fs::write(destination_root.path().join("remove"), b"remove").unwrap();\n        std::fs::write(destination_root.path().join("update"), b"old").unwrap();\n\n        let (client_io, server_io) = tokio::io::duplex(64 * 1024);\n        let (client_reader, client_writer) = tokio::io::split(client_io);\n        let (server_reader, server_writer) = tokio::io::split(server_io);\n        let server = tokio::spawn(async move {\n            let mut session =\n                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())\n                    .await\n                    .unwrap();\n            let scan = session.scan_handler();\n            match session.next_request().await.unwrap().unwrap() {\n                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),\n                _ => panic!("dry-run emitted a mutation-capable v3 request"),\n            }\n        });\n\n        let session = ClientRemoteSession::connect(\n            client_reader,\n            client_writer,\n            Operation::Push,\n            destination_root.path(),\n            RouterConfig::default(),\n        )\n        .await\n        .unwrap();\n        let mut config = supported_config();\n        config.dry_run = true;\n        config.delete = DeleteMode::Enabled {\n            threshold: 100,\n            force: false,\n        };\n        let stats = execute_with_handle(\n            source_root.path(),\n            session.request_handle(),\n            &config,\n            ScanOptions::default(),\n        )\n        .await\n        .unwrap();\n\n        server.await.unwrap();\n        assert_eq!(stats.files_created, 1);\n        assert_eq!(stats.files_updated, 1);\n        assert_eq!(stats.files_deleted, 1);\n        assert_eq!(stats.bytes_would_add, 6);\n        assert_eq!(stats.bytes_would_change, 9);\n        assert!(!destination_root.path().join("create").exists());\n        assert_eq!(\n            std::fs::read(destination_root.path().join("update")).unwrap(),\n            b"old"\n        );\n        assert!(destination_root.path().join("remove").exists());\n    }\n\n    #[cfg(unix)]\n    #[tokio::test]\n    async fn adapter_executes_real_v3_runtime_and_maps_stats() {',
+              ),
+          ])
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run dry-run focused tests
+        run: cargo test --workspace --all-features dry_run
+      - name: Run preview focused test
+        run: cargo test --workspace --all-features preview_counts_semantic_work_and_exact_deletes_without_execution
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit validated dry-run semantics
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm .github/workflows/ci-v3-dry-run-once.yml
+          git add src/remote/push_controller.rs src/sync/v3_push.rs .github/workflows/ci-v3-dry-run-once.yml
+          git commit -m 'feat: preview remote pushes through v3'
+          git push origin HEAD:v0.5-architecture
