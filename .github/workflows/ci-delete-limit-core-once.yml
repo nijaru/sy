@@ -1,0 +1,805 @@
+name: Validate Typed Delete Limit Core Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-delete-limit-core-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Apply typed delete-limit core
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one anchor, found {count}')
+              return text.replace(old, new, 1)
+
+          # Core engine policy.
+          path = Path('src/engine/delete_plan.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct DeletePolicy {
+              pub threshold: u8,
+              pub force: bool,
+          }
+          ''',
+              '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum DeleteLimit {
+              Unlimited,
+              Percentage(u8),
+              Count(u64),
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct DeletePolicy {
+              pub limit: DeleteLimit,
+              pub force: bool,
+          }
+          ''',
+              'engine delete policy',
+          )
+          text = replace_once(
+              text,
+              '''    ThresholdExceeded {
+                  eligible_destination_entries: u64,
+                  delete_candidates: u64,
+                  threshold: u8,
+              },
+
+              #[error("delete preflight {0} counter overflow")]
+          ''',
+              '''    ThresholdExceeded {
+                  eligible_destination_entries: u64,
+                  delete_candidates: u64,
+                  threshold: u8,
+              },
+
+              #[error(
+                  "deletion count limit exceeded: {delete_candidates} candidates exceeds limit {limit}"
+              )]
+              CountExceeded {
+                  delete_candidates: u64,
+                  limit: u64,
+              },
+
+              #[error("delete preflight {0} counter overflow")]
+          ''',
+              'engine count error',
+          )
+          text = replace_once(
+              text,
+              'pub type Result<T> = std::result::Result<T, DeletePlanError>;\n',
+              '''pub type Result<T> = std::result::Result<T, DeletePlanError>;
+
+          pub fn enforce_delete_policy(
+              policy: DeletePolicy,
+              eligible_destination_entries: u64,
+              delete_candidates: u64,
+          ) -> Result<()> {
+              if policy.force {
+                  return Ok(());
+              }
+
+              match policy.limit {
+                  DeleteLimit::Unlimited => Ok(()),
+                  DeleteLimit::Percentage(threshold) => {
+                      if eligible_destination_entries != 0
+                          && u128::from(delete_candidates) * 100
+                              > u128::from(eligible_destination_entries) * u128::from(threshold)
+                      {
+                          Err(DeletePlanError::ThresholdExceeded {
+                              eligible_destination_entries,
+                              delete_candidates,
+                              threshold,
+                          })
+                      } else {
+                          Ok(())
+                      }
+                  }
+                  DeleteLimit::Count(limit) => {
+                      if delete_candidates > limit {
+                          Err(DeletePlanError::CountExceeded {
+                              delete_candidates,
+                              limit,
+                          })
+                      } else {
+                          Ok(())
+                      }
+                  }
+              }
+          }
+          ''',
+              'engine policy enforcement insertion',
+          )
+          old_finish = '''    pub async fn finish(self) -> Result<DeletePlan> {
+              if !self.policy.force
+                  && self.eligible_destination_entries != 0
+                  && u128::from(self.delete_candidates) * 100
+                      > u128::from(self.eligible_destination_entries) * u128::from(self.policy.threshold)
+              {
+                  return Err(DeletePlanError::ThresholdExceeded {
+                      eligible_destination_entries: self.eligible_destination_entries,
+                      delete_candidates: self.delete_candidates,
+                      threshold: self.policy.threshold,
+                  });
+              }
+
+              Ok(DeletePlan {
+          '''
+          new_finish = '''    pub async fn finish(self) -> Result<DeletePlan> {
+              enforce_delete_policy(
+                  self.policy,
+                  self.eligible_destination_entries,
+                  self.delete_candidates,
+              )?;
+
+              Ok(DeletePlan {
+          '''
+          text = replace_once(text, old_finish, new_finish, 'engine finish enforcement')
+          text = replace_once(
+              text,
+              '''    fn policy() -> DeletePolicy {
+                  DeletePolicy {
+                      threshold: 100,
+                      force: false,
+                  }
+              }
+          ''',
+              '''    fn policy() -> DeletePolicy {
+                  DeletePolicy {
+                      limit: DeleteLimit::Percentage(100),
+                      force: false,
+                  }
+              }
+          ''',
+              'engine test policy helper',
+          )
+          text = replace_once(
+              text,
+              '''        let mut tracker = DeleteTracker::new(DeletePolicy {
+                      threshold: 0,
+                      force: false,
+                  })
+          ''',
+              '''        let mut tracker = DeleteTracker::new(DeletePolicy {
+                      limit: DeleteLimit::Percentage(0),
+                      force: false,
+                  })
+          ''',
+              'engine protected-parent policy test',
+          )
+          text = replace_once(
+              text,
+              '''        let mut tracker = DeleteTracker::new(DeletePolicy {
+                      threshold: 49,
+                      force: false,
+                  })
+          ''',
+              '''        let mut tracker = DeleteTracker::new(DeletePolicy {
+                      limit: DeleteLimit::Percentage(49),
+                      force: false,
+                  })
+          ''',
+              'engine percentage threshold test',
+          )
+          text = replace_once(
+              text,
+              '''    #[tokio::test]
+              async fn force_bypasses_threshold() {
+                  let mut tracker = DeleteTracker::new(DeletePolicy {
+                      threshold: 0,
+                      force: true,
+                  })
+          ''',
+              '''    #[tokio::test]
+              async fn count_limit_uses_final_protected_candidate_count() {
+                  let mut tracker = DeleteTracker::new(DeletePolicy {
+                      limit: DeleteLimit::Count(0),
+                      force: false,
+                  })
+                  .await
+                  .unwrap();
+                  tracker
+                      .observe_destination_only(&directory("parent"), true)
+                      .await
+                      .unwrap();
+                  tracker
+                      .observe_destination_only(&directory("parent/excluded"), false)
+                      .await
+                      .unwrap();
+                  let plan = tracker.finish().await.unwrap();
+                  assert_eq!(plan.delete_candidates(), 0);
+              }
+
+              #[tokio::test]
+              async fn count_limit_rejects_exact_excess_before_replay() {
+                  let mut tracker = DeleteTracker::new(DeletePolicy {
+                      limit: DeleteLimit::Count(1),
+                      force: false,
+                  })
+                  .await
+                  .unwrap();
+                  tracker
+                      .observe_destination_only(&file("first"), true)
+                      .await
+                      .unwrap();
+                  tracker
+                      .observe_destination_only(&file("second"), true)
+                      .await
+                      .unwrap();
+                  assert!(matches!(
+                      tracker.finish().await,
+                      Err(DeletePlanError::CountExceeded {
+                          delete_candidates: 2,
+                          limit: 1,
+                      })
+                  ));
+              }
+
+              #[tokio::test]
+              async fn force_bypasses_limit() {
+                  let mut tracker = DeleteTracker::new(DeletePolicy {
+                      limit: DeleteLimit::Count(0),
+                      force: true,
+                  })
+          ''',
+              'engine force/count tests',
+          )
+          path.write_text(text)
+
+          # Typed sync configuration and CLI parser.
+          path = Path('src/sync/config.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              'use std::path::PathBuf;\n',
+              'use std::path::PathBuf;\npub use sy::engine::delete_plan::DeleteLimit;\n',
+              'config delete limit import',
+          )
+          text = replace_once(
+              text,
+              '    /// Maximum deletions (absolute count or percentage string like "50%")\n    pub max_delete: Option<String>,\n',
+              '',
+              'remove raw max_delete field',
+          )
+          text = replace_once(text, '            max_delete: None,\n', '', 'remove max_delete default')
+          old_mode = '''#[derive(Debug, Clone)]
+          pub enum DeleteMode {
+              Disabled,
+              Enabled { threshold: u8, force: bool },
+          }
+
+          impl DeleteMode {
+              pub fn is_enabled(&self) -> bool {
+                  matches!(self, DeleteMode::Enabled { .. })
+              }
+
+              pub fn threshold(&self) -> u8 {
+                  match self {
+                      DeleteMode::Disabled => 0,
+                      DeleteMode::Enabled { threshold, .. } => *threshold,
+                  }
+              }
+
+              pub fn is_forced(&self) -> bool {
+                  match self {
+                      DeleteMode::Disabled => false,
+                      DeleteMode::Enabled { force, .. } => *force,
+                  }
+              }
+          }
+          '''
+          new_mode = '''#[derive(Debug, Clone)]
+          pub enum DeleteMode {
+              Disabled,
+              Enabled { limit: DeleteLimit, force: bool },
+          }
+
+          impl DeleteMode {
+              pub fn is_enabled(&self) -> bool {
+                  matches!(self, DeleteMode::Enabled { .. })
+              }
+
+              pub fn limit(&self) -> Option<DeleteLimit> {
+                  match self {
+                      DeleteMode::Disabled => None,
+                      DeleteMode::Enabled { limit, .. } => Some(*limit),
+                  }
+              }
+
+              pub fn is_forced(&self) -> bool {
+                  match self {
+                      DeleteMode::Disabled => false,
+                      DeleteMode::Enabled { force, .. } => *force,
+                  }
+              }
+          }
+
+          pub fn parse_delete_limit(value: &str) -> std::result::Result<DeleteLimit, String> {
+              if let Some(percent) = value.strip_suffix('%') {
+                  let percentage = percent.parse::<u8>().map_err(|_| {
+                      format!(
+                          "--max-delete must be a number or percentage (got: '{value}')"
+                      )
+                  })?;
+                  if percentage > 100 {
+                      return Err(format!(
+                          "--max-delete percentage must be between 0% and 100% (got: '{value}')"
+                      ));
+                  }
+                  return Ok(DeleteLimit::Percentage(percentage));
+              }
+
+              let count = value.parse::<u64>().map_err(|_| {
+                  format!("--max-delete must be a number or percentage (got: '{value}')")
+              })?;
+              if count == 0 {
+                  Ok(DeleteLimit::Unlimited)
+              } else {
+                  Ok(DeleteLimit::Count(count))
+              }
+          }
+          '''
+          text = replace_once(text, old_mode, new_mode, 'typed DeleteMode')
+          text += '''
+
+          #[cfg(test)]
+          mod delete_limit_tests {
+              use super::*;
+
+              #[test]
+              fn parses_typed_delete_limits_without_ambiguous_zero() {
+                  assert_eq!(parse_delete_limit("0").unwrap(), DeleteLimit::Unlimited);
+                  assert_eq!(
+                      parse_delete_limit("0%").unwrap(),
+                      DeleteLimit::Percentage(0)
+                  );
+                  assert_eq!(
+                      parse_delete_limit("50%").unwrap(),
+                      DeleteLimit::Percentage(50)
+                  );
+                  assert_eq!(
+                      parse_delete_limit("1000").unwrap(),
+                      DeleteLimit::Count(1000)
+                  );
+              }
+
+              #[test]
+              fn rejects_invalid_delete_limits() {
+                  assert!(parse_delete_limit("101%").is_err());
+                  assert!(parse_delete_limit("%").is_err());
+                  assert!(parse_delete_limit("many").is_err());
+              }
+          }
+          '''
+          path.write_text(text)
+
+          # Re-export the typed boundary.
+          path = Path('src/sync/mod.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              '''pub use config::{
+              ComparisonConfig, DeleteMode, PreserveConfig, ResumeConfig, SyncConfig, VerificationConfig,
+          };
+          ''',
+              '''pub use config::{
+              parse_delete_limit, ComparisonConfig, DeleteLimit, DeleteMode, PreserveConfig, ResumeConfig,
+              SyncConfig, VerificationConfig,
+          };
+          ''',
+              'sync config re-export',
+          )
+          path.write_text(text)
+
+          # CLI/application construction: one parser, no silent absolute->100% conversion.
+          path = Path('src/main.rs')
+          text = path.read_text()
+          delete_pattern = re.compile(
+              r'''        delete: if cli\.delete \{\n            let threshold = if cli\.max_delete\.ends_with\('%'\) \{.*?        \} else \{\n            sync::DeleteMode::Disabled\n        \},\n        max_delete: if cli\.delete \{\n            Some\(cli\.max_delete\.clone\(\)\)\n        \} else \{\n            None\n        \},\n''',
+              re.S,
+          )
+          replacement = '''        delete: if cli.delete {
+              let limit = sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)?;
+              sync::DeleteMode::Enabled {
+                  limit,
+                  force: cli.force_delete,
+              }
+          } else {
+              sync::DeleteMode::Disabled
+          },
+          '''
+          text, count = delete_pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'main delete config: expected one anchor, found {count}')
+
+          bisync_pattern = re.compile(
+              r'''        let max_delete_percent = if cli\.max_delete\.ends_with\('%'\) \{.*?        \};\n        let bisync_opts = bisync::BisyncOptions \{''',
+              re.S,
+          )
+          bisync_replacement = '''        let max_delete_percent = match sync::parse_delete_limit(&cli.max_delete)
+              .map_err(anyhow::Error::msg)?
+          {
+              sync::DeleteLimit::Unlimited => 100,
+              sync::DeleteLimit::Percentage(value) => value,
+              sync::DeleteLimit::Count(_) => anyhow::bail!(
+                  "absolute --max-delete counts are not supported with --bidirectional; use a percentage"
+              ),
+          };
+          let bisync_opts = bisync::BisyncOptions {'''
+          text, count = bisync_pattern.subn(bisync_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'main bisync delete config: expected one anchor, found {count}')
+          path.write_text(text)
+
+          # Local compatibility preflight uses the same core policy and exact final candidate count.
+          path = Path('src/sync/reconcile.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              'use sy::engine::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};\n',
+              '''use sy::engine::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
+          use sy::engine::delete_plan::{
+              enforce_delete_policy, DeleteLimit, DeletePlanError, DeletePolicy,
+          };
+          ''',
+              'local delete policy imports',
+          )
+          text = replace_once(
+              text,
+              '''        DeleteMode::Enabled { threshold, force } => {
+                  let plan =
+                      preflight_delete(source, dest, config, scan_options, threshold, force).await?;
+          ''',
+              '''        DeleteMode::Enabled { limit, force } => {
+                  let plan = preflight_delete(source, dest, config, scan_options, limit, force).await?;
+          ''',
+              'local delete mode dispatch',
+          )
+          text = replace_once(
+              text,
+              '''    scan_options: ScanOptions,
+              threshold: u8,
+              force: bool,
+          ) -> Result<DeletePlan> {
+          ''',
+              '''    scan_options: ScanOptions,
+              limit: DeleteLimit,
+              force: bool,
+          ) -> Result<DeletePlan> {
+          ''',
+              'local preflight signature',
+          )
+          old_protect = 'protect_candidate_dirs(&mut journal, &mut candidate_dirs).await?;'
+          if text.count(old_protect) != 2:
+              raise SystemExit(f'local protect call count: {text.count(old_protect)}')
+          text = text.replace(
+              old_protect,
+              'protect_candidate_dirs(&mut journal, &mut candidate_dirs, &mut delete_candidates).await?;',
+          )
+          text = replace_once(
+              text,
+              '''    enforce_delete_threshold(eligible_dest_entries, delete_candidates, threshold, force)?;
+              let journal = journal.seal().await?;
+          ''',
+              '''    let eligible = u64::try_from(eligible_dest_entries).map_err(|_| {
+                  SyncError::Config("eligible delete count exceeds u64 range".to_string())
+              })?;
+              let candidates = u64::try_from(delete_candidates).map_err(|_| {
+                  SyncError::Config("delete candidate count exceeds u64 range".to_string())
+              })?;
+              enforce_delete_policy(DeletePolicy { limit, force }, eligible, candidates)
+                  .map_err(map_delete_plan_error)?;
+              let journal = journal.seal().await?;
+          ''',
+              'local shared delete enforcement',
+          )
+          old_protect_fn = '''async fn protect_candidate_dirs(
+              journal: &mut DeleteJournal,
+              candidate_dirs: &mut [CandidateDeleteDir],
+          ) -> Result<()> {
+              for candidate in candidate_dirs {
+                  if !candidate.protected {
+                      journal
+                          .append(&candidate.path, DeleteKind::ProtectDirectory)
+                          .await?;
+                      candidate.protected = true;
+                  }
+              }
+              Ok(())
+          }
+
+          fn enforce_delete_threshold(
+              eligible_dest_entries: usize,
+              delete_candidates: usize,
+              threshold: u8,
+              force: bool,
+          ) -> Result<()> {
+              if force || eligible_dest_entries == 0 {
+                  return Ok(());
+              }
+
+              let percentage = delete_candidates as f64 / eligible_dest_entries as f64 * 100.0;
+              if percentage > threshold as f64 {
+                  return Err(SyncError::DeletionThresholdExceeded {
+                      percentage,
+                      threshold,
+                  });
+              }
+              Ok(())
+          }
+          '''
+          new_protect_fn = '''async fn protect_candidate_dirs(
+              journal: &mut DeleteJournal,
+              candidate_dirs: &mut [CandidateDeleteDir],
+              delete_candidates: &mut usize,
+          ) -> Result<()> {
+              for candidate in candidate_dirs {
+                  if candidate.protected {
+                      continue;
+                  }
+                  journal
+                      .append(&candidate.path, DeleteKind::ProtectDirectory)
+                      .await?;
+                  candidate.protected = true;
+                  *delete_candidates = delete_candidates.checked_sub(1).ok_or_else(|| {
+                      SyncError::Config("delete candidate count underflow".to_string())
+                  })?;
+              }
+              Ok(())
+          }
+
+          fn map_delete_plan_error(error: DeletePlanError) -> SyncError {
+              match error {
+                  DeletePlanError::ThresholdExceeded {
+                      eligible_destination_entries,
+                      delete_candidates,
+                      threshold,
+                  } => {
+                      let percentage = if eligible_destination_entries == 0 {
+                          0.0
+                      } else {
+                          delete_candidates as f64 * 100.0 / eligible_destination_entries as f64
+                      };
+                      SyncError::DeletionThresholdExceeded {
+                          percentage,
+                          threshold,
+                      }
+                  }
+                  DeletePlanError::CountExceeded {
+                      delete_candidates,
+                      limit,
+                  } => SyncError::DeletionCountExceeded {
+                      delete_candidates,
+                      limit,
+                  },
+                  other => SyncError::Io(std::io::Error::other(other.to_string())),
+              }
+          }
+          '''
+          text = replace_once(text, old_protect_fn, new_protect_fn, 'local protected candidate accounting')
+          text = replace_once(
+              text,
+              '''        cfg.delete = DeleteMode::Enabled {
+                  threshold: 100,
+                  force: false,
+              };
+          ''',
+              '''        cfg.delete = DeleteMode::Enabled {
+                  limit: DeleteLimit::Percentage(100),
+                  force: false,
+              };
+          ''',
+              'local delete test config',
+          )
+          hardlink_anchor = '''    #[cfg(unix)]
+              #[tokio::test]
+              async fn hardlink_preservation_uses_exact_legacy_inode_only_at_executor_boundary() {
+          '''
+          local_regression = '''    #[tokio::test]
+              async fn protected_candidate_parent_is_not_counted_against_delete_limit() {
+                  let source = TempDir::new().unwrap();
+                  let dest = TempDir::new().unwrap();
+                  let excluded = dest.path().join("parent/excluded");
+                  std::fs::create_dir_all(&excluded).unwrap();
+                  std::fs::write(excluded.join("keep"), b"keep").unwrap();
+                  let source_endpoint = LocalEndpoint::new(source.path().to_path_buf());
+                  let dest_endpoint = LocalEndpoint::new(dest.path().to_path_buf());
+                  let mut cfg = config();
+                  cfg.filter_engine.add_exclude("parent/excluded/").unwrap();
+                  cfg.delete = DeleteMode::Enabled {
+                      limit: DeleteLimit::Percentage(0),
+                      force: false,
+                  };
+
+                  let stats = run_local_sync(
+                      &source_endpoint,
+                      &dest_endpoint,
+                      &cfg,
+                      ScanOptions::default(),
+                  )
+                  .await
+                  .unwrap();
+
+                  assert_eq!(stats.files_deleted, 0);
+                  assert!(excluded.join("keep").exists());
+                  assert!(dest.path().join("parent").exists());
+              }
+
+          ''' + hardlink_anchor
+          text = replace_once(text, hardlink_anchor, local_regression, 'local protected parent regression')
+          path.write_text(text)
+
+          # User-facing mapped error for absolute count limits.
+          path = Path('src/error.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              '''    #[error("Deletion threshold exceeded: {percentage:.1}% > {threshold}% (use --force-delete to override)")]
+              DeletionThresholdExceeded { percentage: f64, threshold: u8 },
+          ''',
+              '''    #[error("Deletion threshold exceeded: {percentage:.1}% > {threshold}% (use --force-delete to override)")]
+              DeletionThresholdExceeded { percentage: f64, threshold: u8 },
+
+              #[error(
+                  "Deletion count limit exceeded: {delete_candidates} > {limit} (use --force-delete to override)"
+              )]
+              DeletionCountExceeded {
+                  delete_candidates: u64,
+                  limit: u64,
+              },
+          ''',
+              'application count error',
+          )
+          path.write_text(text)
+
+          # V3 understands the typed policy but deliberately retains Count fallback for next slice.
+          path = Path('src/sync/v3_push.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              'use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};\n',
+              'use sy::engine::delete_plan::{DeleteLimit, DeletePlanError, DeletePolicy};\n',
+              'v3 delete imports',
+          )
+          old_fallback = '''    if config.delete.is_enabled()
+              && config
+                  .max_delete
+                  .as_deref()
+                  .is_some_and(|value| !value.ends_with('%'))
+          {
+              return Some("absolute delete limits are not yet represented by the v3 delete policy");
+          }
+          '''
+          new_fallback = '''    if matches!(
+              &config.delete,
+              DeleteMode::Enabled {
+                  limit: DeleteLimit::Count(_),
+                  ..
+              }
+          ) {
+              return Some("absolute delete limits are not yet enabled by the v3 adapter");
+          }
+          '''
+          text = replace_once(text, old_fallback, new_fallback, 'typed v3 count fallback')
+          text = replace_once(
+              text,
+              '''        DeleteMode::Enabled { threshold, force } => Some(DeletePolicy {
+                  threshold: *threshold,
+                  force: *force,
+              }),
+          ''',
+              '''        DeleteMode::Enabled { limit, force } => Some(DeletePolicy {
+                  limit: *limit,
+                  force: *force,
+              }),
+          ''',
+              'v3 delete policy mapping',
+          )
+          text = text.replace(
+              'threshold: 100,\n                force: false,',
+              'limit: DeleteLimit::Percentage(100),\n                force: false,',
+          )
+          text = text.replace(
+              'threshold: 100,\n            force: false,',
+              'limit: DeleteLimit::Percentage(100),\n            force: false,',
+          )
+          text = replace_once(
+              text,
+              '''        return SyncError::DeletionThresholdExceeded {
+                  percentage,
+                  threshold: *threshold,
+              };
+              }
+              map_io(error)
+          }
+          ''',
+              '''        return SyncError::DeletionThresholdExceeded {
+                  percentage,
+                  threshold: *threshold,
+              };
+              }
+              if let RemotePushControllerError::DeletePlan(DeletePlanError::CountExceeded {
+                  delete_candidates,
+                  limit,
+              }) = &error
+              {
+                  return SyncError::DeletionCountExceeded {
+                      delete_candidates: *delete_candidates,
+                      limit: *limit,
+                  };
+              }
+              map_io(error)
+          }
+          ''',
+              'v3 count error mapping',
+          )
+          routing_anchor = '''    #[test]
+              fn filter_selection_maps_to_v3_without_fallback() {
+          '''
+          routing_test = '''    #[test]
+              fn absolute_delete_limit_remains_typed_fallback_until_adapter_slice() {
+                  let mut config = supported_config();
+                  config.delete = DeleteMode::Enabled {
+                      limit: DeleteLimit::Count(1),
+                      force: false,
+                  };
+                  assert_eq!(
+                      legacy_fallback_reason(&config, ScanOptions::default()),
+                      Some("absolute delete limits are not yet enabled by the v3 adapter")
+                  );
+              }
+
+          ''' + routing_anchor
+          text = replace_once(text, routing_anchor, routing_test, 'v3 typed count fallback test')
+          path.write_text(text)
+          PY
+      - name: Run cargo fmt --all
+        run: cargo fmt --all
+      - name: Run cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run typed delete-limit tests
+        run: |
+          cargo test --workspace --all-features delete_limit_tests
+          cargo test --workspace --all-features count_limit_
+          cargo test --workspace --all-features protected_candidate_parent_is_not_counted_against_delete_limit
+          cargo test --workspace --all-features absolute_delete_limit_remains_typed_fallback_until_adapter_slice
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit typed delete-limit core
+        run: |
+          rm .github/workflows/ci-delete-limit-core-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/engine/delete_plan.rs src/sync/config.rs src/sync/mod.rs src/main.rs src/sync/reconcile.rs src/error.rs src/sync/v3_push.rs .github/workflows/ci-delete-limit-core-once.yml
+          git commit -m 'refactor: type delete safety limits'
+          git push origin HEAD:v0.5-architecture
