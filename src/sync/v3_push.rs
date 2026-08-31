@@ -17,14 +17,17 @@ use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
+use sy::remote::hash::{hash_rooted_file, RemoteHashError};
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
-    preflight_remote_push_scoped, preview_remote_push, RemotePushController,
+    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content,
+    preview_remote_push, RemotePushController,
     RemotePushControllerError, RemotePushPreview, RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::SshRemoteSession;
+use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(
@@ -33,9 +36,6 @@ pub(super) fn legacy_fallback_reason(
 ) -> Option<&'static str> {
     if config.diff_mode {
         return Some("diff-mode byte accounting is not yet mapped to v3");
-    }
-    if config.comparison.checksum {
-        return Some("checksum comparison is not yet implemented in v3 preflight");
     }
     if scan_options.respect_gitignore {
         return Some("gitignore selection is not yet mapped to v3 deletion scope");
@@ -220,20 +220,60 @@ async fn execute_with_handle(
     let delete_filter = config.filter_engine.clone();
     let max_depth = selection_max_depth(config, scan_options);
     let include_git_dir = scan_options.include_git_dir;
-    let plan = preflight_remote_push_scoped(
-        source,
-        destination,
-        comparison_policy(config),
-        delete_policy(&config.delete),
-        move |entry| entry_in_size_scope(entry, min_size, max_size),
-        move |entry| {
-            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-                && entry_in_depth_scope(entry, max_depth)
-                && entry_in_vcs_scope(entry, include_git_dir)
-        },
-    )
-    .await
-    .map_err(map_controller_error)?;
+    let plan = if config.comparison.checksum {
+        let source_rooted = RootedFs::open(source_root.to_path_buf())
+            .await
+            .map_err(map_io)?;
+        let hash_remote = remote.clone();
+        preflight_remote_push_scoped_with_content(
+            source,
+            destination,
+            comparison_policy(config),
+            delete_policy(&config.delete),
+            move |entry| entry_in_size_scope(entry, min_size, max_size),
+            move |entry| {
+                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                    && entry_in_depth_scope(entry, max_depth)
+                    && entry_in_vcs_scope(entry, include_git_dir)
+            },
+            move |source, destination| {
+                let source_rooted = source_rooted.clone();
+                let hash_remote = hash_remote.clone();
+                async move {
+                    let source_identity = source
+                        .identity
+                        .ok_or(RemoteHashError::MissingBasisIdentity)?;
+                    let source_hash = hash_rooted_file(
+                        source_rooted,
+                        source.path.clone(),
+                        source.size,
+                        source_identity,
+                    );
+                    let destination_hash = hash_remote.content_hash(&destination);
+                    let (source_hash, destination_hash) =
+                        tokio::try_join!(source_hash, destination_hash)?;
+                    Ok(source_hash == destination_hash)
+                }
+            },
+        )
+        .await
+        .map_err(map_controller_error)?
+    } else {
+        preflight_remote_push_scoped(
+            source,
+            destination,
+            comparison_policy(config),
+            delete_policy(&config.delete),
+            move |entry| entry_in_size_scope(entry, min_size, max_size),
+            move |entry| {
+                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                    && entry_in_depth_scope(entry, max_depth)
+                    && entry_in_vcs_scope(entry, include_git_dir)
+            },
+        )
+        .await
+        .map_err(map_controller_error)?
+    };
 
     if config.dry_run {
         let preview = preview_remote_push(plan)
@@ -542,6 +582,18 @@ mod tests {
             legacy_fallback_reason(&config, ScanOptions::default()),
             Some("diff-mode byte accounting is not yet mapped to v3")
         );
+    }
+
+    #[test]
+    fn checksum_comparison_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.comparison.checksum = true;
+
+        assert_eq!(
+            legacy_fallback_reason(&config, ScanOptions::default()),
+            None
+        );
+        assert_eq!(comparison_policy(&config).mode, ComparisonMode::Checksum);
     }
 
     #[test]
@@ -978,6 +1030,182 @@ mod tests {
             b"old"
         );
         assert!(destination_root.path().join("remove").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checksum_mode_hashes_matches_and_transfers_only_changed_content() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("equal"), b"same").unwrap();
+        std::fs::write(destination_root.path().join("equal"), b"same").unwrap();
+        std::fs::write(source_root.path().join("changed"), b"new!").unwrap();
+        std::fs::write(destination_root.path().join("changed"), b"old!").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+                let server = tokio::spawn(async move {
+            let mut session = ServerRemoteSession::accept(
+                server_reader,
+                server_writer,
+                RouterConfig::default(),
+            )
+            .await
+            .unwrap();
+            let scan = session.scan_handler();
+            let hash = session.hash_handler();
+            let file = session.file_handler();
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut hashes = 0;
+            let mut files = 0;
+            for _ in 0..4 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = scan.clone();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::Hash(incoming) => {
+                        hashes += 1;
+                        let hash = hash.clone();
+                        tasks.spawn(async move {
+                            hash.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::File(incoming) => {
+                        files += 1;
+                        let file = file.clone();
+                        tasks.spawn(async move {
+                            file.serve(incoming)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    _ => panic!("unexpected checksum v3 adapter request"),
+                }
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.unwrap().unwrap();
+            }
+            (hashes, files)
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.comparison.checksum = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(server.await.unwrap(), (2, 1));
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("equal")).unwrap(),
+            b"same"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("changed")).unwrap(),
+            b"new!"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checksum_dry_run_hashes_but_emits_no_mutation_request() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("changed"), b"new!").unwrap();
+        std::fs::write(destination_root.path().join("changed"), b"old!").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+                let server = tokio::spawn(async move {
+            let mut session = ServerRemoteSession::accept(
+                server_reader,
+                server_writer,
+                RouterConfig::default(),
+            )
+            .await
+            .unwrap();
+            let scan = session.scan_handler();
+            let hash = session.hash_handler();
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = scan.clone();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::Hash(incoming) => {
+                        let hash = hash.clone();
+                        tasks.spawn(async move {
+                            hash.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    _ => panic!("checksum dry-run emitted a mutation-capable request"),
+                }
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.unwrap().unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.comparison.checksum = true;
+        config.dry_run = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.bytes_would_change, 4);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("changed")).unwrap(),
+            b"old!"
+        );
     }
 
     #[cfg(unix)]
