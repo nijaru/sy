@@ -4,13 +4,16 @@ use crate::engine::finalize_journal::{
     FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
 use crate::engine::plan_journal::{PlanJournal, PlanJournalError, PlanJournalReader};
-use crate::engine::planner::{plan_entry, ComparisonPolicy, PlanDecision};
+use crate::engine::planner::{
+    finish_content_comparison, plan_entry, ComparisonPolicy, PlanDecision,
+};
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
 use crate::remote::push::{
     lower_sync_op, RemotePushAction, RemotePushError, RemotePushExecutor, RemotePushLowerError,
     RemotePushPolicy,
 };
 use crate::remote::transfer::TransferSummary;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -34,6 +37,9 @@ pub enum RemotePushControllerError {
 
     #[error(transparent)]
     Execute(#[from] RemotePushError),
+
+    #[error(transparent)]
+    Hash(#[from] crate::remote::hash::RemoteHashError),
 
     #[error("v3 remote checksum comparison is not implemented for {0}")]
     UnsupportedContentComparison(RelativePath),
@@ -117,9 +123,44 @@ pub async fn preflight_remote_push_scoped(
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    plan_in_scope: impl FnMut(&Entry) -> bool,
+    delete_in_scope: impl FnMut(&Entry) -> bool,
+) -> Result<RemotePushPlan> {
+    preflight_remote_push_scoped_with_content(
+        source,
+        destination,
+        policy,
+        delete_policy,
+        plan_in_scope,
+        delete_in_scope,
+        |source, _destination| async move {
+            Err::<bool, _>(RemotePushControllerError::UnsupportedContentComparison(
+                source.path,
+            ))
+        },
+    )
+    .await
+}
+
+/// Complete remote-push preflight with asynchronous content comparison
+/// for planner decisions that cannot be resolved from scan metadata.
+///
+/// The comparison future runs while the controller is still in the
+/// no-mutation phase. A comparison failure therefore prevents a plan,
+/// delete replay, and all namespace or file mutations.
+pub async fn preflight_remote_push_scoped_with_content<F, Fut>(
+    source: EntryStream,
+    destination: EntryStream,
+    policy: ComparisonPolicy,
+    delete_policy: Option<DeletePolicy>,
     mut plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: impl FnMut(&Entry) -> bool,
-) -> Result<RemotePushPlan> {
+    mut compare_content: F,
+) -> Result<RemotePushPlan>
+where
+    F: FnMut(Entry, Entry) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
     let mut reconciler = OrderedReconciler::new(source, destination);
     let mut journal = PlanJournal::new().await?;
     let mut finalize = FinalizeJournal::new().await?;
@@ -174,10 +215,12 @@ pub async fn preflight_remote_push_scoped(
         };
         let operation = match decision {
             PlanDecision::Ready(operation) => operation,
-            PlanDecision::NeedContentComparison { source, .. } => {
-                return Err(RemotePushControllerError::UnsupportedContentComparison(
-                    source.path,
-                ));
+            PlanDecision::NeedContentComparison {
+                source,
+                destination,
+            } => {
+                let contents_equal = compare_content(source.clone(), destination.clone()).await?;
+                finish_content_comparison(source, destination, contents_equal, policy)
             }
         };
         journal.append(&operation).await?;
@@ -661,6 +704,45 @@ mod tests {
             preflight_remote_push(source, destination, policy, None, |_| true).await,
             Err(RemotePushControllerError::UnsupportedContentComparison(value))
                 if value == path("a")
+        ));
+    }
+
+    #[tokio::test]
+    async fn checksum_preflight_finishes_async_content_decisions_before_plan_return() {
+        let policy = ComparisonPolicy {
+            mode: crate::engine::planner::ComparisonMode::Checksum,
+            ..ComparisonPolicy::default()
+        };
+        let mut equal = preflight_remote_push_scoped_with_content(
+            entries(vec![file("a", 4, 1)]),
+            entries(vec![file("a", 4, 2)]),
+            policy,
+            None,
+            |_| true,
+            |_| true,
+            |_source, _destination| async { Ok(true) },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            equal.reader.next().await.unwrap(),
+            Some(SyncOp::Skip { path: value, .. }) if value == path("a")
+        ));
+
+        let mut changed = preflight_remote_push_scoped_with_content(
+            entries(vec![file("b", 4, 1)]),
+            entries(vec![file("b", 4, 2)]),
+            policy,
+            None,
+            |_| true,
+            |_| true,
+            |_source, _destination| async { Ok(false) },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            changed.reader.next().await.unwrap(),
+            Some(SyncOp::Update { source, .. }) if source.path == path("b")
         ));
     }
 
