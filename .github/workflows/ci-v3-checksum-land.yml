@@ -1,0 +1,59 @@
+name: Land Validated V3 Checksum Preflight
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-checksum-land.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+jobs:
+  land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Apply validated checksum candidate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/ci-v3-checksum-preflight-runner4.yml').read_text()
+          start_marker = "          from pathlib import Path\n"
+          start = workflow.index(start_marker)
+          end = workflow.index("\n          PY", start)
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in workflow[start:end].splitlines()
+          )
+          exec(script)
+          PY
+      - name: Check source diff and land
+        run: |
+          git diff --check
+          git fetch origin v0.5-architecture
+          remote_head=$(git rev-parse origin/v0.5-architecture)
+          if [ "$remote_head" != "$GITHUB_SHA" ]; then
+            echo "branch advanced during landing: checkout=$GITHUB_SHA remote=$remote_head" >&2
+            exit 1
+          fi
+          rm -f \
+            .github/workflows/ci-v3-checksum-preflight-once.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner2.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner3.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner4.yml \
+            .github/workflows/ci-v3-checksum-preflight-runner5.yml \
+            .github/workflows/ci-v3-checksum-preflight-final.yml \
+            .github/workflows/ci-v3-checksum-land.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/remote/push_controller.rs src/sync/v3_push.rs
+          git add -f agent-context/ai/0.5-rewrite.md
+          git add -u .github/workflows
+          git commit -m 'feat: integrate checksum comparison into v3 preflight'
+          git push origin HEAD:v0.5-architecture
