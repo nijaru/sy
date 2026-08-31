@@ -1,0 +1,697 @@
+name: Validate V3 Content Hash Once
+
+on:
+  push:
+    branches: [v0.5-architecture]
+    paths:
+      - '.github/workflows/ci-v3-content-hash-once.yml'
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.5-architecture
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt,clippy
+      - name: Add bounded whole-file hash protocol and runtime
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          Path('src/protocol/hash.rs').write_text(r'''use super::codec::SliceReader;
+use super::{ProtocolError, RelativeWirePath, Result, MAX_WIRE_PATH_BYTES};
+use bytes::{BufMut, Bytes, BytesMut};
+
+pub const HASH_DIGEST_LEN: usize = 32;
+pub const HASH_IDENTITY_LEN: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireHashRequest {
+    pub path: RelativeWirePath,
+    file_size: u64,
+    identity: [u8; HASH_IDENTITY_LEN],
+}
+
+impl WireHashRequest {
+    pub const fn new(
+        path: RelativeWirePath,
+        file_size: u64,
+        identity: [u8; HASH_IDENTITY_LEN],
+    ) -> Self {
+        Self {
+            path,
+            file_size,
+            identity,
+        }
+    }
+
+    pub const fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    pub const fn identity(&self) -> &[u8; HASH_IDENTITY_LEN] {
+        &self.identity
+    }
+
+    pub fn encode(&self) -> Result<Bytes> {
+        let path_len = u32::try_from(self.path.as_encoded().len()).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "hash_path",
+                reason: "encoded relative path length exceeds u32",
+            }
+        })?;
+        let capacity = 4_usize
+            .checked_add(self.path.as_encoded().len())
+            .and_then(|value| value.checked_add(8 + HASH_IDENTITY_LEN))
+            .ok_or(ProtocolError::InvalidMessage(
+                "hash request payload length overflow",
+            ))?;
+        let mut out = BytesMut::with_capacity(capacity);
+        out.put_u32(path_len);
+        out.extend_from_slice(self.path.as_encoded());
+        out.put_u64(self.file_size);
+        out.extend_from_slice(&self.identity);
+        Ok(out.freeze())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = SliceReader::new(payload);
+        let path_len = reader.u32()? as usize;
+        if path_len > MAX_WIRE_PATH_BYTES {
+            return Err(ProtocolError::PathTooLong {
+                len: path_len,
+                max: MAX_WIRE_PATH_BYTES,
+            });
+        }
+        let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
+        let file_size = reader.u64()?;
+        let identity = reader.array::<HASH_IDENTITY_LEN>()?;
+        reader.finish()?;
+        Ok(Self::new(path, file_size, identity))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireHashResult {
+    file_size: u64,
+    identity: [u8; HASH_IDENTITY_LEN],
+    digest: [u8; HASH_DIGEST_LEN],
+}
+
+impl WireHashResult {
+    pub const fn new(
+        file_size: u64,
+        identity: [u8; HASH_IDENTITY_LEN],
+        digest: [u8; HASH_DIGEST_LEN],
+    ) -> Self {
+        Self {
+            file_size,
+            identity,
+            digest,
+        }
+    }
+
+    pub const fn file_size(self) -> u64 {
+        self.file_size
+    }
+
+    pub const fn identity(self) -> [u8; HASH_IDENTITY_LEN] {
+        self.identity
+    }
+
+    pub const fn digest(self) -> [u8; HASH_DIGEST_LEN] {
+        self.digest
+    }
+
+    pub fn encode(self) -> Bytes {
+        let mut out = BytesMut::with_capacity(8 + HASH_IDENTITY_LEN + HASH_DIGEST_LEN);
+        out.put_u64(self.file_size);
+        out.extend_from_slice(&self.identity);
+        out.extend_from_slice(&self.digest);
+        out.freeze()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = SliceReader::new(payload);
+        let file_size = reader.u64()?;
+        let identity = reader.array::<HASH_IDENTITY_LEN>()?;
+        let digest = reader.array::<HASH_DIGEST_LEN>()?;
+        reader.finish()?;
+        Ok(Self::new(file_size, identity, digest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn path() -> RelativeWirePath {
+        RelativeWirePath::from_components([b"dir".as_slice(), b"file".as_slice()]).unwrap()
+    }
+
+    #[test]
+    fn hash_messages_round_trip() {
+        let request = WireHashRequest::new(path(), 42, [7; HASH_IDENTITY_LEN]);
+        assert_eq!(
+            WireHashRequest::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
+
+        let result = WireHashResult::new(42, [7; HASH_IDENTITY_LEN], [9; HASH_DIGEST_LEN]);
+        assert_eq!(WireHashResult::decode(&result.encode()).unwrap(), result);
+    }
+
+    #[test]
+    fn hash_decoders_reject_truncation_and_trailing_data() {
+        let request = WireHashRequest::new(path(), 42, [7; HASH_IDENTITY_LEN])
+            .encode()
+            .unwrap();
+        for len in 0..request.len() {
+            assert!(WireHashRequest::decode(&request[..len]).is_err());
+        }
+        let mut trailing = request.to_vec();
+        trailing.push(0);
+        assert!(WireHashRequest::decode(&trailing).is_err());
+
+        let result = WireHashResult::new(42, [7; HASH_IDENTITY_LEN], [9; HASH_DIGEST_LEN]).encode();
+        for len in 0..result.len() {
+            assert!(WireHashResult::decode(&result[..len]).is_err());
+        }
+        let mut trailing = result.to_vec();
+        trailing.push(0);
+        assert!(WireHashResult::decode(&trailing).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_hash_payloads_never_panic(payload in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = WireHashRequest::decode(&payload);
+            let _ = WireHashResult::decode(&payload);
+        }
+    }
+}
+''')
+
+          Path('src/remote/hash.rs').write_text(r'''use crate::endpoint::local_identity::metadata_identity;
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
+use crate::protocol::{
+    CapabilitySet, Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId,
+    WireHashRequest, WireHashResult, HASH_DIGEST_LEN,
+};
+use crate::remote::path::{
+    decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
+};
+use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
+use crate::rooted_fs::{RootedFs, RootedFsError};
+use bytes::Bytes;
+use std::io::Read;
+
+const HASH_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteHashError {
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+
+    #[error("frame router failed: {0}")]
+    Router(SharedRouterError),
+
+    #[error(transparent)]
+    Path(#[from] RemotePathError),
+
+    #[error(transparent)]
+    RootedFs(#[from] RootedFsError),
+
+    #[error("content-hash worker failed: {0}")]
+    Worker(String),
+
+    #[error("peer did not advertise BLAKE3 support")]
+    UnsupportedByPeer,
+
+    #[error("content hashing requires a regular-file entry")]
+    InvalidBasis,
+
+    #[error("content hashing requires a scanned file identity")]
+    MissingBasisIdentity,
+
+    #[error("opened file did not provide a stable identity")]
+    MissingObservedIdentity,
+
+    #[error(
+        "content-hash file size changed since scan (expected {expected} bytes, observed {actual} bytes)"
+    )]
+    SizeChanged { expected: u64, actual: u64 },
+
+    #[error("content-hash file identity changed since scan")]
+    IdentityChanged,
+
+    #[error("content-hash stream {stream_id} ended before {expected:?}")]
+    UnexpectedStreamEnd { stream_id: u32, expected: FrameKind },
+
+    #[error("expected content-hash frame {expected:?}, got {actual:?}")]
+    UnexpectedFrame {
+        expected: FrameKind,
+        actual: FrameKind,
+    },
+
+    #[error("content-hash frame arrived on stream {actual}, expected {expected}")]
+    StreamMismatch { expected: u32, actual: u32 },
+
+    #[error("HashRequest must use FINAL and no other flags, got 0x{flags:02x}")]
+    RequestFlags { flags: u8 },
+
+    #[error("HashResult must use FINAL|ACK_REQUIRED and no other flags, got 0x{flags:02x}")]
+    ResultFlags { flags: u8 },
+
+    #[error("content-hash acknowledgement must be an empty unflagged frame")]
+    InvalidAck,
+
+    #[error("content-hash result did not match the requested scan snapshot")]
+    ResultSnapshotMismatch,
+}
+
+impl From<SharedRouterError> for RemoteHashError {
+    fn from(error: SharedRouterError) -> Self {
+        Self::Router(error)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, RemoteHashError>;
+
+pub async fn request_content_hash(
+    sender: &RouterSender,
+    basis: &Entry,
+    peer: PlatformOs,
+) -> Result<[u8; HASH_DIGEST_LEN]> {
+    ensure_compatible_path_encoding(peer)?;
+    if !basis.is_file() {
+        return Err(RemoteHashError::InvalidBasis);
+    }
+    let identity = basis
+        .identity
+        .ok_or(RemoteHashError::MissingBasisIdentity)?;
+    let request = WireHashRequest::new(
+        encode_relative_path(basis.path.as_path())?,
+        basis.size,
+        *identity.as_bytes(),
+    );
+    let mut inbox = sender.open_stream()?;
+    let stream_id = inbox.stream_id();
+    sender
+        .send(Frame::new(
+            FrameKind::HashRequest,
+            FrameFlags::FINAL,
+            stream_id,
+            request.encode()?,
+        )?)
+        .await?;
+
+    let routed = inbox
+        .recv()
+        .await?
+        .ok_or(RemoteHashError::UnexpectedStreamEnd {
+            stream_id: stream_id.get(),
+            expected: FrameKind::HashResult,
+        })?;
+    let frame = routed.frame();
+    require_stream(frame, stream_id)?;
+    require_result_flags(frame)?;
+    if frame.kind() != FrameKind::HashResult {
+        return Err(RemoteHashError::UnexpectedFrame {
+            expected: FrameKind::HashResult,
+            actual: frame.kind(),
+        });
+    }
+    let result = WireHashResult::decode(frame.payload())?;
+    if result.file_size() != basis.size || result.identity() != *identity.as_bytes() {
+        return Err(RemoteHashError::ResultSnapshotMismatch);
+    }
+    let digest = result.digest();
+    drop(routed);
+    sender
+        .send(Frame::new(
+            FrameKind::Ack,
+            FrameFlags::empty(),
+            stream_id,
+            Bytes::new(),
+        )?)
+        .await?;
+    Ok(digest)
+}
+
+pub async fn serve_incoming_hash_rooted(
+    rooted: RootedFs,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+    peer: PlatformOs,
+) -> Result<()> {
+    ensure_compatible_path_encoding(peer)?;
+    let IncomingStream { first, mut inbox } = incoming;
+    let stream_id = inbox.stream_id();
+    let frame = first.frame();
+    require_stream(frame, stream_id)?;
+    require_request_flags(frame)?;
+    if frame.kind() != FrameKind::HashRequest {
+        return Err(RemoteHashError::UnexpectedFrame {
+            expected: FrameKind::HashRequest,
+            actual: frame.kind(),
+        });
+    }
+    let request = WireHashRequest::decode(frame.payload())?;
+    let path = decode_relative_path(request.path.clone(), peer)?;
+    let expected_size = request.file_size();
+    let expected_identity = EntryIdentity::from_bytes(*request.identity());
+    drop(first);
+
+    let digest = hash_rooted_file(rooted, path, expected_size, expected_identity).await?;
+    let result = WireHashResult::new(expected_size, *expected_identity.as_bytes(), digest);
+    sender
+        .send(Frame::new(
+            FrameKind::HashResult,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            result.encode(),
+        )?)
+        .await?;
+    receive_ack(&mut inbox, stream_id).await
+}
+
+pub async fn hash_rooted_file(
+    rooted: RootedFs,
+    path: RelativePath,
+    expected_size: u64,
+    expected_identity: EntryIdentity,
+) -> Result<[u8; HASH_DIGEST_LEN]> {
+    tokio::task::spawn_blocking(move || {
+        hash_rooted_file_blocking(&rooted, &path, expected_size, expected_identity)
+    })
+    .await
+    .map_err(|error| RemoteHashError::Worker(error.to_string()))?
+}
+
+fn hash_rooted_file_blocking(
+    rooted: &RootedFs,
+    path: &RelativePath,
+    expected_size: u64,
+    expected_identity: EntryIdentity,
+) -> Result<[u8; HASH_DIGEST_LEN]> {
+    let mut file = rooted.open_regular_blocking(path)?;
+    validate_snapshot(&file, expected_size, expected_identity)?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(RootedFsError::Io(error).into()),
+        };
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    validate_snapshot(&file, expected_size, expected_identity)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn validate_snapshot(
+    file: &std::fs::File,
+    expected_size: u64,
+    expected_identity: EntryIdentity,
+) -> Result<()> {
+    let metadata = file.metadata().map_err(RootedFsError::Io)?;
+    if metadata.len() != expected_size {
+        return Err(RemoteHashError::SizeChanged {
+            expected: expected_size,
+            actual: metadata.len(),
+        });
+    }
+    let actual = metadata_identity(&metadata, EntryKind::File)
+        .ok_or(RemoteHashError::MissingObservedIdentity)?;
+    if actual != expected_identity {
+        return Err(RemoteHashError::IdentityChanged);
+    }
+    Ok(())
+}
+
+async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
+    let routed = inbox
+        .recv()
+        .await?
+        .ok_or(RemoteHashError::UnexpectedStreamEnd {
+            stream_id: stream_id.get(),
+            expected: FrameKind::Ack,
+        })?;
+    let frame = routed.frame();
+    require_stream(frame, stream_id)?;
+    if frame.kind() != FrameKind::Ack || !frame.flags().is_empty() || !frame.payload().is_empty() {
+        return Err(RemoteHashError::InvalidAck);
+    }
+    Ok(())
+}
+
+fn require_stream(frame: &Frame, stream_id: StreamId) -> Result<()> {
+    if frame.stream_id() == stream_id {
+        Ok(())
+    } else {
+        Err(RemoteHashError::StreamMismatch {
+            expected: stream_id.get(),
+            actual: frame.stream_id().get(),
+        })
+    }
+}
+
+fn require_request_flags(frame: &Frame) -> Result<()> {
+    if frame.flags() == FrameFlags::FINAL {
+        Ok(())
+    } else {
+        Err(RemoteHashError::RequestFlags {
+            flags: frame.flags().bits(),
+        })
+    }
+}
+
+fn require_result_flags(frame: &Frame) -> Result<()> {
+    let expected = FrameFlags::FINAL | FrameFlags::ACK_REQUIRED;
+    if frame.flags() == expected {
+        Ok(())
+    } else {
+        Err(RemoteHashError::ResultFlags {
+            flags: frame.flags().bits(),
+        })
+    }
+}
+
+pub fn require_blake3(capabilities: CapabilitySet) -> Result<()> {
+    if capabilities.contains(CapabilitySet::BLAKE3) {
+        Ok(())
+    } else {
+        Err(RemoteHashError::UnsupportedByPeer)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::engine::domain::Timestamp;
+    use crate::protocol::Platform;
+    use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
+
+    fn file_entry(root: &std::path::Path, relative: &str) -> Entry {
+        let metadata = std::fs::metadata(root.join(relative)).unwrap();
+        let identity = metadata_identity(&metadata, EntryKind::File).unwrap();
+        let mut entry = Entry::file(
+            RelativePath::new(relative).unwrap(),
+            metadata.len(),
+            Timestamp::UNIX_EPOCH,
+        );
+        entry.identity = Some(identity);
+        entry
+    }
+
+    #[tokio::test]
+    async fn content_hash_stream_round_trips_confined_digest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let data = b"whole-file-content-hash";
+        std::fs::write(root.path().join("file"), data).unwrap();
+        let basis = file_entry(root.path(), "file");
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let client = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let mut server = FrameRouter::start(
+            server_reader,
+            server_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let sender = server.sender();
+        let peer = Platform::current().os;
+        let server_task = tokio::spawn(async move {
+            let incoming = server.incoming().recv().await.unwrap().unwrap();
+            serve_incoming_hash_rooted(rooted, incoming, &sender, peer)
+                .await
+                .unwrap();
+        });
+
+        let digest = request_content_hash(&client.sender(), &basis, peer)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+        assert_eq!(digest, *blake3::hash(data).as_bytes());
+    }
+
+    #[tokio::test]
+    async fn rooted_hash_rejects_scan_snapshot_change() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"before").unwrap();
+        let basis = file_entry(root.path(), "file");
+        std::fs::write(root.path().join("file"), b"after-change").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let error = hash_rooted_file(
+            rooted,
+            basis.path,
+            basis.size,
+            basis.identity.unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RemoteHashError::SizeChanged { .. } | RemoteHashError::IdentityChanged
+        ));
+    }
+}
+''')
+
+          def patch(path_name, replacements):
+              path = Path(path_name)
+              text = path.read_text()
+              for label, old, new in replacements:
+                  count = text.count(old)
+                  if count != 1:
+                      raise SystemExit(f'{path_name} {label}: expected one anchor, found {count}')
+                  text = text.replace(old, new, 1)
+              path.write_text(text)
+
+          patch('src/protocol/frame.rs', [
+              ('frame kinds',
+               '    ScanRequest = 20,\n    Mutation = 21,',
+               '    ScanRequest = 20,\n    Mutation = 21,\n    HashRequest = 22,\n    HashResult = 23,'),
+              ('frame decode',
+               '            20 => Ok(Self::ScanRequest),\n            21 => Ok(Self::Mutation),',
+               '            20 => Ok(Self::ScanRequest),\n            21 => Ok(Self::Mutation),\n            22 => Ok(Self::HashRequest),\n            23 => Ok(Self::HashResult),'),
+              ('frame test',
+               '        assert_eq!(FrameKind::Mutation as u8, 21);',
+               '        assert_eq!(FrameKind::Mutation as u8, 21);\n        assert_eq!(FrameKind::HashRequest as u8, 22);\n        assert_eq!(FrameKind::HashResult as u8, 23);'),
+          ])
+
+          patch('src/protocol/mod.rs', [
+              ('hash module', 'mod handshake;\n', 'mod handshake;\nmod hash;\n'),
+              ('hash export',
+               'pub use handshake::{\n',
+               'pub use hash::{\n    WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN,\n};\npub use handshake::{\n'),
+          ])
+
+          patch('src/remote/mod.rs', [
+              ('hash module', 'pub mod path;\n', 'pub mod hash;\npub mod path;\n'),
+          ])
+
+          patch('src/remote/router.rs', [
+              ('opening hash',
+               '        FrameKind::ScanRequest\n            | FrameKind::SignatureRequest',
+               '        FrameKind::ScanRequest\n            | FrameKind::HashRequest\n            | FrameKind::SignatureRequest'),
+          ])
+
+          patch('src/remote/runtime.rs', [
+              ('hash import',
+               'use crate::remote::router::{\n',
+               'use crate::remote::hash::{\n    request_content_hash, serve_incoming_hash_rooted, RemoteHashError,\n};\nuse crate::remote::router::{\n'),
+              ('hash error',
+               '    #[error(transparent)]\n    Signature(#[from] RemoteSignatureError),',
+               '    #[error(transparent)]\n    Hash(#[from] RemoteHashError),\n\n    #[error(transparent)]\n    Signature(#[from] RemoteSignatureError),'),
+              ('session hash method',
+               '    pub async fn signatures(\n',
+               '    pub async fn content_hash(\n        &self,\n        basis: &Entry,\n    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {\n        crate::remote::hash::require_blake3(self.ready.capabilities)?;\n        request_content_hash(&self.router.sender(), basis, self.server.platform.os).await\n    }\n\n    pub async fn signatures(\n'),
+              ('incoming hash variant',
+               'pub enum IncomingRequest {\n    Scan(IncomingStream),',
+               'pub enum IncomingRequest {\n    Scan(IncomingStream),\n    Hash(IncomingStream),'),
+              ('hash handler struct',
+               '/// Signature requests share the root descriptor opened at SessionOpen.',
+               '#[derive(Clone)]\npub struct ServerHashHandler {\n    rooted: RootedFs,\n    sender: RouterSender,\n    peer: PlatformOs,\n}\n\nimpl ServerHashHandler {\n    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::hash::Result<()> {\n        serve_incoming_hash_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await\n    }\n}\n\n/// Signature requests share the root descriptor opened at SessionOpen.'),
+              ('hash handler accessor',
+               '    pub fn signature_handler(&self) -> ServerSignatureHandler {',
+               '    pub fn hash_handler(&self) -> ServerHashHandler {\n        ServerHashHandler {\n            rooted: self.opened.rooted.clone(),\n            sender: self.router.sender(),\n            peer: self.opened.client.platform.os,\n        }\n    }\n\n    pub fn signature_handler(&self) -> ServerSignatureHandler {'),
+              ('hash dispatch',
+               '            FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),\n            FrameKind::SignatureRequest',
+               '            FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),\n            FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),\n            FrameKind::SignatureRequest'),
+              ('runtime test exhaustive hash',
+               '                    IncomingRequest::File(_)\n                    | IncomingRequest::Metadata(_)',
+               '                    IncomingRequest::Hash(_)\n                    | IncomingRequest::File(_)\n                    | IncomingRequest::Metadata(_)'),
+          ])
+
+          patch('src/remote/client.rs', [
+              ('hash import',
+               'use super::metadata::request_metadata;\n',
+               'use super::hash::{request_content_hash, require_blake3};\nuse super::metadata::request_metadata;\n'),
+              ('handle hash method',
+               '    pub async fn signatures(\n',
+               '    pub async fn content_hash(\n        &self,\n        basis: &Entry,\n    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {\n        require_blake3(self.ready.capabilities)?;\n        request_content_hash(&self.sender, basis, self.peer).await\n    }\n\n    pub async fn signatures(\n'),
+          ])
+
+          patch('src/remote/serve.rs', [
+              ('hash handler import',
+               '    IncomingRequest, RemoteSessionError, ServerFileHandler, ServerMetadataHandler,\n',
+               '    IncomingRequest, RemoteSessionError, ServerFileHandler, ServerHashHandler,\n    ServerMetadataHandler,\n'),
+              ('handler field',
+               'struct RequestHandlers {\n    scan: ServerScanHandler,',
+               'struct RequestHandlers {\n    scan: ServerScanHandler,\n    hash: ServerHashHandler,'),
+              ('handler init',
+               '        scan: session.scan_handler(),\n        signatures:',
+               '        scan: session.scan_handler(),\n        hash: session.hash_handler(),\n        signatures:'),
+              ('spawn hash',
+               '        IncomingRequest::Signatures(incoming) => {',
+               '        IncomingRequest::Hash(incoming) => {\n            let handler = handlers.hash.clone();\n            tasks.spawn(async move {\n                handler\n                    .serve(incoming)\n                    .await\n                    .map_err(|error| error.to_string())\n            });\n        }\n        IncomingRequest::Signatures(incoming) => {'),
+          ])
+          PY
+      - run: cargo fmt --all
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run hash protocol/runtime tests
+        run: cargo test --workspace --all-features hash
+      - name: Run remote runtime tests
+        run: cargo test --workspace --all-features remote::runtime
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+      - name: Commit validated content hash primitive
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm .github/workflows/ci-v3-content-hash-once.yml
+          git add src/protocol/hash.rs src/protocol/frame.rs src/protocol/mod.rs src/remote/hash.rs src/remote/mod.rs src/remote/router.rs src/remote/runtime.rs src/remote/client.rs src/remote/serve.rs .github/workflows/ci-v3-content-hash-once.yml
+          git commit -m 'feat: add identity-checked v3 content hash'
+          git push origin HEAD:v0.5-architecture
