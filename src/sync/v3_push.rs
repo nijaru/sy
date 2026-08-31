@@ -20,9 +20,8 @@ use sy::protocol::Operation;
 use sy::remote::hash::{hash_rooted_file, RemoteHashError};
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
-    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content,
-    preview_remote_push, RemotePushController,
-    RemotePushControllerError, RemotePushPreview, RemotePushSummary,
+    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content, preview_remote_push,
+    RemotePushController, RemotePushControllerError, RemotePushPreview, RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
@@ -1045,14 +1044,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-                let server = tokio::spawn(async move {
-            let mut session = ServerRemoteSession::accept(
-                server_reader,
-                server_writer,
-                RouterConfig::default(),
-            )
-            .await
-            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
             let scan = session.scan_handler();
             let hash = session.hash_handler();
             let file = session.file_handler();
@@ -1141,14 +1137,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-                let server = tokio::spawn(async move {
-            let mut session = ServerRemoteSession::accept(
-                server_reader,
-                server_writer,
-                RouterConfig::default(),
-            )
-            .await
-            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
             let scan = session.scan_handler();
             let hash = session.hash_handler();
             let mut tasks = tokio::task::JoinSet::new();
