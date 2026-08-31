@@ -500,11 +500,17 @@ where
             return Ok(());
         };
         write_frame(&mut writer, &queued.frame).await?;
+        // Every frame is flushed, not only acknowledgements: the contract of a
+        // completed frame is that its bytes reached the transport, but process
+        // stdio implementations buffer binary payloads (std::io::Stdout is a
+        // LineWriter under tokio::io::stdout()) and would otherwise hold
+        // newlineless frames — including EntryEnd — until an unrelated Ack
+        // forces a flush, deadlocking the session.
+        writer
+            .flush()
+            .await
+            .map_err(crate::protocol::ProtocolError::from)?;
         if let Some(written) = queued.written.take() {
-            writer
-                .flush()
-                .await
-                .map_err(crate::protocol::ProtocolError::from)?;
             let _ = written.send(());
         }
         // `queued` drops here, releasing frame and byte capacity only after the
