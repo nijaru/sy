@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
-use sy::engine::delete_plan::{DeleteLimit, DeletePlanError, DeletePolicy};
+use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, RelativePath};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
@@ -105,16 +105,6 @@ pub(super) fn legacy_fallback_reason(
     if config.max_errors != 100 {
         return Some("custom max-error policy is not yet mapped to v3 fail-fast execution");
     }
-    if matches!(
-        &config.delete,
-        DeleteMode::Enabled {
-            limit: DeleteLimit::Count(_),
-            ..
-        }
-    ) {
-        return Some("absolute delete limits are not yet enabled by the v3 adapter");
-    }
-
     None
 }
 
@@ -465,6 +455,7 @@ mod tests {
     use super::*;
     use futures::stream;
     use std::path::PathBuf;
+    use sy::engine::delete_plan::DeleteLimit;
     use sy::engine::domain::Timestamp;
     use sy::engine::reconcile::{BoxError, EngineError, Side};
     use sy::remote::push_controller::preflight_remote_push;
@@ -513,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_delete_limit_remains_typed_fallback_until_adapter_slice() {
+    fn absolute_delete_limit_maps_to_v3_without_fallback() {
         let mut config = supported_config();
         config.delete = DeleteMode::Enabled {
             limit: DeleteLimit::Count(1),
@@ -521,7 +512,14 @@ mod tests {
         };
         assert_eq!(
             legacy_fallback_reason(&config, ScanOptions::default()),
-            Some("absolute delete limits are not yet enabled by the v3 adapter")
+            None
+        );
+        assert_eq!(
+            delete_policy(&config.delete),
+            Some(DeletePolicy {
+                limit: DeleteLimit::Count(1),
+                force: false,
+            })
         );
     }
 
@@ -667,6 +665,125 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absolute_delete_limit_rejects_before_mutation_requests() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("first"), b"first").unwrap();
+        std::fs::write(destination_root.path().join("second"), b"second").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            match session.next_request().await.unwrap().unwrap() {
+                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                _ => panic!("absolute delete limit emitted a mutation-capable request before preflight rejection"),
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Count(1),
+            force: false,
+        };
+        let error = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        server.await.unwrap();
+        assert!(matches!(
+            error,
+            SyncError::DeletionCountExceeded {
+                delete_candidates: 2,
+                limit: 1,
+            }
+        ));
+        assert!(destination_root.path().join("first").exists());
+        assert!(destination_root.path().join("second").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absolute_delete_limit_allows_exact_boundary() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("first"), b"first").unwrap();
+        std::fs::write(destination_root.path().join("second"), b"second").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let mutation = session.mutation_handler();
+            let mut mutations = 0_usize;
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Mutation(incoming) => {
+                        mutations += 1;
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected absolute delete limit request"),
+                }
+            }
+            mutations
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Count(2),
+            force: false,
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(server.await.unwrap(), 2);
+        assert_eq!(stats.files_deleted, 2);
+        assert!(!destination_root.path().join("first").exists());
+        assert!(!destination_root.path().join("second").exists());
     }
 
     #[cfg(unix)]
