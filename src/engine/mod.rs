@@ -7,6 +7,7 @@ pub mod delete_journal;
 pub mod delete_plan;
 pub mod domain;
 pub mod finalize_journal;
+pub mod ignore_scope;
 pub mod plan_journal;
 pub mod planner;
 pub mod reconcile;
