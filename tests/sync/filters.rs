@@ -726,3 +726,119 @@ fn test_size_filter_with_directories() {
     assert!(!dest.path().join("subdir/small.txt").exists());
     assert!(dest.path().join("subdir/large.txt").exists());
 }
+
+/// Source gitignore rules protect destination-only entries from deletion.
+#[test]
+fn test_gitignore_delete_protects_ignored_dest_entries() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+
+    // Destination strays: ignored file, ignored subtree, and deletable file.
+    fs::write(dest.path().join("stray.log"), "log").unwrap();
+    fs::create_dir_all(dest.path().join("target/debug")).unwrap();
+    fs::write(dest.path().join("target/debug/stale"), "stale").unwrap();
+    fs::write(dest.path().join("remove.txt"), "x").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--gitignore",
+            "--delete",
+            // The only eligible candidate is remove.txt: a 100% change ratio,
+            // which the default 50% safety limit rightly rejects.
+            "--max-delete=100%",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        dest.path().join("stray.log").exists(),
+        "ignored dest-only file must survive --delete"
+    );
+    assert!(
+        dest.path().join("target/debug/stale").exists(),
+        "ignored dest-only subtree must survive --delete"
+    );
+    assert!(
+        !dest.path().join("remove.txt").exists(),
+        "non-ignored dest-only file must be deleted"
+    );
+    assert!(dest.path().join("keep.txt").exists());
+}
+
+/// The destination's own .gitignore must not influence deletion scope: only
+/// source-derived rules protect. This pins the architecture contract that the
+/// destination scan is never ignore-filtered.
+#[test]
+fn test_destination_gitignore_does_not_protect_from_delete() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+    // Destination-only rules claiming to ignore the stray: irrelevant, the
+    // source has no rule for it.
+    fs::write(dest.path().join(".gitignore"), "stray.txt\n").unwrap();
+    fs::write(dest.path().join("stray.txt"), "stray").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--gitignore",
+            "--delete",
+            "--max-delete=100%",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        !dest.path().join("stray.txt").exists(),
+        "dest-only gitignore rules must not protect entries from deletion"
+    );
+    assert!(
+        !dest.path().join(".gitignore").exists(),
+        "dest .gitignore is itself dest-only and deletable"
+    );
+    assert!(dest.path().join("keep.txt").exists());
+}
+
+/// Ignored destination entries must not inflate the eligible denominator of
+/// delete-limit accounting.
+#[test]
+fn test_gitignore_delete_limit_denominator_excludes_ignored() {
+    let (source, dest) = setup_test_dir();
+
+    fs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+    fs::write(dest.path().join("keep.txt"), "keep").unwrap();
+
+    // Two ignored strays plus one deletable file: with correct accounting
+    // one candidate over two eligible entries is 50%; without exclusion the
+    // plan is three candidates over four eligible (75%) and 50% rejects.
+    fs::write(dest.path().join("a.log"), "a").unwrap();
+    fs::write(dest.path().join("b.log"), "b").unwrap();
+    fs::write(dest.path().join("c.txt"), "c").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--gitignore",
+            "--delete",
+            "--max-delete=50%",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "ignored entries must not count toward the delete-limit denominator"
+    );
+    assert!(!dest.path().join("c.txt").exists());
+    assert!(dest.path().join("a.log").exists());
+    assert!(dest.path().join("b.log").exists());
+}

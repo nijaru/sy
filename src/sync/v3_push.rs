@@ -29,15 +29,9 @@ use sy::remote::ssh::SshRemoteSession;
 use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
-pub(super) fn legacy_fallback_reason(
-    config: &SyncConfig,
-    scan_options: ScanOptions,
-) -> Option<&'static str> {
+pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
     if config.diff_mode {
         return Some("diff-mode byte accounting is not yet mapped to v3");
-    }
-    if scan_options.respect_gitignore {
-        return Some("gitignore selection is not yet mapped to v3 deletion scope");
     }
     if config.trash {
         return Some("trash deletion is not yet implemented by v3");
@@ -211,6 +205,15 @@ async fn execute_with_handle(
     let delete_filter = config.filter_engine.clone();
     let max_depth = selection_max_depth(config, scan_options);
     let include_git_dir = scan_options.include_git_dir;
+    // Source-derived ignore scope: destination-only paths the source rules
+    // would ignore are protected from deletion instead of being filtered
+    // out of the destination scan (see `engine::ignore_scope`).
+    let ignore_scope = std::sync::Arc::new(std::sync::Mutex::new(
+        sy::engine::ignore_scope::SourceIgnoreScope::new(
+            source_root,
+            scan_options.respect_gitignore,
+        ),
+    ));
     let plan = if config.comparison.checksum {
         let source_rooted = RootedFs::open(source_root.to_path_buf())
             .await
@@ -226,6 +229,7 @@ async fn execute_with_handle(
                 delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
                     && entry_in_vcs_scope(entry, include_git_dir)
+                    && entry_not_source_ignored(&ignore_scope, entry)
             },
             move |source, destination| {
                 let source_rooted = source_rooted.clone();
@@ -260,6 +264,7 @@ async fn execute_with_handle(
                 delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
                     && entry_in_vcs_scope(entry, include_git_dir)
+                    && entry_not_source_ignored(&ignore_scope, entry)
             },
         )
         .await
@@ -339,6 +344,22 @@ fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
             .as_path()
             .components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
+}
+
+/// Destination-only entries the source tree's ignore rules would exclude are
+/// out of deletion scope. The lock is uncontended: one preflight task owns
+/// the scope; the mutex exists because scope state is cached across calls
+/// while the closure is `FnMut`.
+fn entry_not_source_ignored(
+    scope: &std::sync::Arc<std::sync::Mutex<sy::engine::ignore_scope::SourceIgnoreScope>>,
+    entry: &Entry,
+) -> bool {
+    let Ok(mut scope) = scope.lock() else {
+        // A poisoned cache lock means we cannot prove the entry is safe to
+        // delete; protecting it is the only conservative choice.
+        return false;
+    };
+    !scope.protects(entry)
 }
 
 fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u64>) -> bool {
@@ -491,10 +512,7 @@ mod tests {
         config.comparison.update_only = true;
         config.preserve.permissions = true;
         config.preserve.times = true;
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
 
         let policy = comparison_policy(&config);
         assert_eq!(policy.mode, ComparisonMode::SizeOnly);
@@ -510,10 +528,7 @@ mod tests {
             limit: DeleteLimit::Count(1),
             force: false,
         };
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(
             delete_policy(&config.delete),
             Some(DeletePolicy {
@@ -527,10 +542,7 @@ mod tests {
     fn filter_selection_maps_to_v3_without_fallback() {
         let mut config = supported_config();
         config.filter_engine.add_exclude("*.tmp").unwrap();
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]
@@ -542,7 +554,7 @@ mod tests {
             ..ScanOptions::default()
         };
 
-        assert_eq!(legacy_fallback_reason(&config, scan_options), None);
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(
             source_scan_request(&config, scan_options).max_depth,
             Some(1)
@@ -553,12 +565,8 @@ mod tests {
     #[test]
     fn exclude_vcs_selection_maps_to_v3_without_fallback() {
         let config = supported_config();
-        let scan_options = ScanOptions {
-            include_git_dir: false,
-            ..ScanOptions::default()
-        };
 
-        assert_eq!(legacy_fallback_reason(&config, scan_options), None);
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert!(!entry_in_vcs_scope(&file_entry(".git/config"), false));
         assert!(entry_in_vcs_scope(&file_entry("src/.gitkeep"), false));
     }
@@ -569,10 +577,7 @@ mod tests {
         config.min_size = Some(3);
         config.max_size = Some(10);
 
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert!(!entry_in_size_scope(
             &sized_file_entry("small", 2),
             config.min_size,
@@ -594,14 +599,11 @@ mod tests {
     fn dry_run_maps_to_v3_while_diff_mode_still_falls_back() {
         let mut config = supported_config();
         config.dry_run = true;
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
 
         config.diff_mode = true;
         assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
+            legacy_fallback_reason(&config),
             Some("diff-mode byte accounting is not yet mapped to v3")
         );
     }
@@ -611,10 +613,7 @@ mod tests {
         let mut config = supported_config();
         config.comparison.checksum = true;
 
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(comparison_policy(&config).mode, ComparisonMode::Checksum);
     }
 
@@ -623,10 +622,7 @@ mod tests {
         let mut config = supported_config();
         config.existing = true;
 
-        assert_eq!(
-            legacy_fallback_reason(&config, ScanOptions::default()),
-            None
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
         assert!(comparison_policy(&config).existing_only);
     }
 
@@ -784,6 +780,199 @@ mod tests {
         assert_eq!(stats.files_deleted, 2);
         assert!(!destination_root.path().join("first").exists());
         assert!(!destination_root.path().join("second").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitignore_scoped_delete_protects_ignored_destination_entries() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        // Source is a repository whose rules ignore build artifacts. `.git`
+        // is a worktree pointer file: repository detection sees it, the
+        // walker's `.git` name filter excludes it, and no repository
+        // internals enter the transfer plan.
+        std::fs::create_dir(source_root.path().join(".git")).unwrap();
+        std::fs::write(source_root.path().join(".gitignore"), b"*.log\n").unwrap();
+        std::fs::write(source_root.path().join("keep.txt"), b"keep").unwrap();
+
+        let ignored_dir = destination_root.path().join("cache");
+        std::fs::create_dir(&ignored_dir).unwrap();
+        std::fs::write(ignored_dir.join("stale.log"), b"log").unwrap();
+        std::fs::write(destination_root.path().join("stray.log"), b"log").unwrap();
+        std::fs::write(destination_root.path().join("remove-me.txt"), b"x").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let mutation = session.mutation_handler();
+            let mut mutations = 0_usize;
+            for _ in 0..4 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        mutations += 1;
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected gitignore-scoped v3 adapter request kind"),
+                }
+            }
+            mutations
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Percentage(100),
+            force: false,
+        };
+        let scan_options = ScanOptions {
+            respect_gitignore: true,
+            include_git_dir: false,
+            ..ScanOptions::default()
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            scan_options,
+        )
+        .await
+        .unwrap();
+
+        // One deletion (remove-me.txt) plus creates (.gitignore, keep.txt).
+        assert_eq!(server.await.unwrap(), 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert!(
+            ignored_dir.join("stale.log").exists(),
+            "ignored destination subtree must survive deletion"
+        );
+        assert!(
+            destination_root.path().join("stray.log").exists(),
+            "ignored destination file must survive deletion"
+        );
+        assert!(!destination_root.path().join("remove-me.txt").exists());
+        assert_eq!(stats.files_created, 2, ".gitignore and keep.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitignore_delete_limit_denominator_excludes_ignored_entries() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::create_dir(source_root.path().join(".git")).unwrap();
+        std::fs::write(source_root.path().join(".gitignore"), b"*.log\n").unwrap();
+
+        // A matched pair (eligible but never a candidate), two ignored
+        // strays, and one deletable file. With ignored entries excluded,
+        // one candidate over two eligible entries is 50% and passes; without
+        // exclusion three candidates over four eligible entries is 75% and
+        // the same limit rejects. The matched entry makes the denominator
+        // observable.
+        std::fs::write(source_root.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(destination_root.path().join("keep.txt"), b"keep").unwrap();
+        // Identical mtimes make the matched pair a quick-compare skip, so
+        // the request sequence stays deterministic: scan, create, delete.
+        let matched_mtime = std::time::SystemTime::UNIX_EPOCH;
+        let times = std::fs::FileTimes::new().set_modified(matched_mtime);
+        std::fs::File::options()
+            .write(true)
+            .open(source_root.path().join("keep.txt"))
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(destination_root.path().join("keep.txt"))
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::fs::write(destination_root.path().join("a.log"), b"a").unwrap();
+        std::fs::write(destination_root.path().join("b.log"), b"b").unwrap();
+        std::fs::write(destination_root.path().join("c.txt"), b"c").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let mutation = session.mutation_handler();
+            let mut mutations = 0_usize;
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        mutations += 1;
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected gitignore limit v3 adapter request"),
+                }
+            }
+            mutations
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.delete = DeleteMode::Enabled {
+            // 50% of 1 eligible candidate: the lone deletable file passes;
+            // without ignored-entry exclusion the denominator would be 3
+            // and the same deletion would exceed the threshold.
+            limit: DeleteLimit::Percentage(50),
+            force: false,
+        };
+        let scan_options = ScanOptions {
+            respect_gitignore: true,
+            include_git_dir: false,
+            ..ScanOptions::default()
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            scan_options,
+        )
+        .await
+        .unwrap();
+
+        // Requests: scan, create .gitignore, delete c.txt.
+        assert_eq!(server.await.unwrap(), 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert!(!destination_root.path().join("c.txt").exists());
+        assert!(destination_root.path().join("a.log").exists());
+        assert!(destination_root.path().join("b.log").exists());
     }
 
     #[cfg(unix)]

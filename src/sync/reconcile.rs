@@ -397,6 +397,23 @@ fn delete_scan_request(options: ScanOptions) -> ScanRequest {
     }
 }
 
+/// Destination-side delete scans are always complete: gitignore selection is
+/// never destination-filtered, and ignore narrowing happens in
+/// `dest_delete_eligible` through the source-derived scope.
+fn complete_delete_scan_request() -> ScanRequest {
+    ScanRequest {
+        respect_gitignore: false,
+        include_git_dir: true,
+        max_depth: None,
+        metadata: EntryMetadataRequest {
+            unix_mode: false,
+            symlink_target: false,
+            identity: false,
+            hardlink_group: false,
+        },
+    }
+}
+
 async fn destination_stream(root: &Path, request: ScanRequest) -> Result<EntryStream> {
     if !tokio::fs::try_exists(root).await? {
         return Ok(Box::pin(futures::stream::empty()));
@@ -447,10 +464,18 @@ async fn preflight_delete(
     limit: DeleteLimit,
     force: bool,
 ) -> Result<DeletePlan> {
+    // The destination scan stays complete; every narrowing happens in
+    // `dest_delete_eligible` through the filter engine and the source-derived
+    // ignore scope. Filtering the destination walk would hide entries from
+    // protection accounting (see `engine::ignore_scope`).
     let request = delete_scan_request(scan_options);
     let source_stream =
         crate::endpoint::local_entry_scan::local_entry_stream(source.root().to_path_buf(), request);
-    let dest_stream = destination_stream(dest.root(), request).await?;
+    let dest_stream = destination_stream(dest.root(), complete_delete_scan_request()).await?;
+    let mut ignore_scope = sy::engine::ignore_scope::SourceIgnoreScope::new(
+        source.root(),
+        scan_options.respect_gitignore,
+    );
     let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
     let mut source_entries = 0_usize;
     let mut eligible_dest_entries = 0_usize;
@@ -470,7 +495,12 @@ async fn preflight_delete(
             } => {
                 close_candidate_dirs(destination.path.as_path(), &mut candidate_dirs);
                 source_entries += 1;
-                if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
+                if dest_delete_eligible(
+                    config,
+                    &mut ignore_scope,
+                    &destination,
+                    &mut protected_dest_dir,
+                ) {
                     eligible_dest_entries += 1;
                 }
                 protect_candidate_dirs(&mut journal, &mut candidate_dirs, &mut delete_candidates)
@@ -478,7 +508,12 @@ async fn preflight_delete(
             }
             ReconcileItem::DestinationOnly(destination) => {
                 close_candidate_dirs(destination.path.as_path(), &mut candidate_dirs);
-                if dest_delete_eligible(config, &destination, &mut protected_dest_dir) {
+                if dest_delete_eligible(
+                    config,
+                    &mut ignore_scope,
+                    &destination,
+                    &mut protected_dest_dir,
+                ) {
                     eligible_dest_entries += 1;
                     delete_candidates += 1;
                     append_delete_candidate(&mut journal, &destination, &mut candidate_dirs)
@@ -512,6 +547,7 @@ async fn preflight_delete(
 
 fn dest_delete_eligible(
     config: &SyncConfig,
+    ignore_scope: &mut sy::engine::ignore_scope::SourceIgnoreScope,
     entry: &Entry,
     protected_dir: &mut Option<PathBuf>,
 ) -> bool {
@@ -526,6 +562,15 @@ fn dest_delete_eligible(
         .filter_engine
         .should_exclude(entry.path.as_path(), entry.is_directory())
     {
+        if entry.is_directory() {
+            *protected_dir = Some(entry.path.as_path().to_path_buf());
+        }
+        return false;
+    }
+
+    // Source-derived ignore rules protect destination-only entries the
+    // source walk would have omitted (e.g. `--gitignore` build artifacts).
+    if ignore_scope.protects(entry) {
         if entry.is_directory() {
             *protected_dir = Some(entry.path.as_path().to_path_buf());
         }

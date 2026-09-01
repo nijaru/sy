@@ -251,9 +251,7 @@ impl SyncSession {
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
-        if let Some(reason) =
-            super::v3_push::legacy_fallback_reason(&self.config, self.scan_options)
-        {
+        if let Some(reason) = super::v3_push::legacy_fallback_reason(&self.config) {
             tracing::debug!(reason, "using legacy remote push compatibility path");
             return self.streaming_push_legacy().await;
         }
