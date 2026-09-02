@@ -31,12 +31,6 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.resume.only {
-        return Some("resume-only control flow is not implemented by v3");
-    }
-    if config.cache {
-        return Some("legacy directory-cache semantics are not part of the v3 adapter");
-    }
     if config.verification.mode != ChecksumType::None
         || config.verification.verify_on_write
         || config.verification.checksum_db
