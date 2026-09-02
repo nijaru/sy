@@ -18,6 +18,14 @@ pub struct SshRemoteSession {
     remote: ClientRemoteSession,
 }
 
+/// SSH session launch options that the v3 adapter maps from CLI flags.
+#[derive(Debug, Clone, Default)]
+pub struct SshLaunchOptions {
+    /// `--contimeout`: passed to OpenSSH as `-o ConnectTimeout=N`. `None`
+    /// leaves OpenSSH's own default (the system TCP connect timeout).
+    pub connect_timeout: Option<u64>,
+}
+
 impl SshRemoteSession {
     pub async fn connect(
         config: &SshConfig,
@@ -25,8 +33,25 @@ impl SshRemoteSession {
         remote_root: &Path,
         router_config: RouterConfig,
     ) -> Result<Self> {
+        Self::connect_with_options(
+            config,
+            operation,
+            remote_root,
+            router_config,
+            SshLaunchOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_with_options(
+        config: &SshConfig,
+        operation: Operation,
+        remote_root: &Path,
+        router_config: RouterConfig,
+        launch: SshLaunchOptions,
+    ) -> Result<Self> {
         let mut command = Command::new("ssh");
-        command.args(ssh_arguments(config));
+        command.args(ssh_arguments(config, &launch));
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::inherit());
@@ -56,7 +81,7 @@ impl SshRemoteSession {
     }
 }
 
-fn ssh_arguments(config: &SshConfig) -> Vec<OsString> {
+fn ssh_arguments(config: &SshConfig, launch: &SshLaunchOptions) -> Vec<OsString> {
     let mut args = Vec::new();
 
     if !config.user.is_empty() {
@@ -93,6 +118,10 @@ fn ssh_arguments(config: &SshConfig) -> Vec<OsString> {
             control_persist.as_secs()
         )));
     }
+    if let Some(connect_timeout) = launch.connect_timeout {
+        args.push(OsString::from("-o"));
+        args.push(OsString::from(format!("ConnectTimeout={connect_timeout}")));
+    }
     if config.compression {
         args.push(OsString::from("-C"));
     }
@@ -123,7 +152,7 @@ mod tests {
             compression: true,
         };
 
-        let args = ssh_arguments(&config);
+        let args = ssh_arguments(&config, &SshLaunchOptions::default());
         assert_eq!(
             &args[args.len() - 3..],
             [
@@ -135,5 +164,28 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "/remote/root"));
         assert!(args.iter().any(|arg| arg == "-J"));
         assert!(args.iter().any(|arg| arg == "-C"));
+        // No --contimeout: OpenSSH's own default connect timeout applies.
+        assert!(!args.iter().any(|arg| arg == "ConnectTimeout=10"));
+    }
+
+    #[test]
+    fn contimeout_maps_to_openssh_connect_timeout() {
+        let config = SshConfig {
+            hostname: "host.example".to_string(),
+            ..Default::default()
+        };
+        let launch = SshLaunchOptions {
+            connect_timeout: Some(10),
+        };
+        let args = ssh_arguments(&config, &launch);
+        let options: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let index = options
+            .iter()
+            .position(|arg| arg == "-o")
+            .expect("ConnectTimeout must be passed as an -o option");
+        assert_eq!(options[index + 1], "ConnectTimeout=10");
     }
 }
