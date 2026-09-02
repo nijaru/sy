@@ -31,9 +31,6 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.trash {
-        return Some("trash deletion is not yet implemented by v3");
-    }
     if config.bwlimit.is_some() {
         return Some("bandwidth limiting is not yet scheduler-integrated in v3");
     }
