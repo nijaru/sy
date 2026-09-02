@@ -12,7 +12,6 @@ pub struct SyncConfig {
     pub diff_mode: bool,
     pub delete: DeleteMode,
     #[allow(dead_code)]
-    pub trash: bool,
     pub quiet: bool,
     pub max_concurrent: usize,
     pub max_errors: usize,
@@ -55,7 +54,6 @@ impl SyncConfig {
             dry_run: false,
             diff_mode: false,
             delete: DeleteMode::Disabled,
-            trash: false,
             quiet: true,
             max_concurrent: 4,
             max_errors: 100,

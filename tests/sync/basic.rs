@@ -1477,3 +1477,29 @@ fn test_diff_without_dry_run_fails() {
     // Nothing was mutated: the command must not have synced before failing.
     assert!(!dest.path().join("file.txt").exists());
 }
+
+/// --trash was never implemented in any engine and was removed; passing it
+/// must fail as an unknown argument rather than silently doing nothing.
+#[test]
+fn test_trash_flag_removed() {
+    let (source, dest) = setup_test_dir("trash_removed");
+
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--trash",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains("--trash"),
+        "got:\n{stderr}"
+    );
+    assert!(!dest.path().join("keep.txt").exists());
+}
