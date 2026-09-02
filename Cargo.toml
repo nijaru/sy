@@ -133,10 +133,6 @@ name = "scale_bench"
 harness = false
 
 [[bench]]
-name = "checksumdb_bench"
-harness = false
-
-[[bench]]
 name = "scanner_bench"
 harness = false
 

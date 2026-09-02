@@ -2,7 +2,6 @@ use crate::cli::SymlinkMode;
 use crate::compress::CompressionDetection;
 use crate::error::{Result, SyncError};
 use crate::filter::FilterEngine;
-use crate::integrity::ChecksumType;
 use crate::sync::scanner::ScanOptions;
 use crate::sync::{DeleteMode, SyncConfig, SyncStats};
 use futures::{future, StreamExt};
@@ -31,14 +30,6 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.verification.mode != ChecksumType::None
-        || config.verification.verify_on_write
-        || config.verification.checksum_db
-        || config.verification.clear_checksum_db
-        || config.verification.prune_checksum_db
-    {
-        return Some("legacy verification/checksum-database options are not mapped to v3");
-    }
     if config.preserve.xattrs
         || config.preserve.hardlinks
         || config.preserve.acls
@@ -530,7 +521,7 @@ mod tests {
         let mut config = SyncConfig::test_default();
         config.max_concurrent = 2;
         config.max_errors = 100;
-        config.verification.mode = ChecksumType::None;
+        config.verification.mode = crate::integrity::ChecksumType::None;
         config
     }
 

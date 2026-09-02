@@ -423,9 +423,6 @@ Or install from local source with: cargo install --path . --features acl"#
         verification: sync::VerificationConfig {
             mode: checksum_type,
             verify_on_write,
-            checksum_db: cli.checksum_db,
-            clear_checksum_db: cli.clear_checksum_db,
-            prune_checksum_db: cli.prune_checksum_db,
         },
         preserve: sync::PreserveConfig {
             xattrs: cli.preserve_xattrs,

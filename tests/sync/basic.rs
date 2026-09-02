@@ -1404,3 +1404,92 @@ fn test_bwlimit_paces_local_transfer() {
         "transfer must be paced: 40 KiB at 16 KiB/s needs ~1.5 s, took {elapsed:?}"
     );
 }
+
+/// --verify enables post-write verification on the local engine: committed
+/// files are hashed against the source and counted. The 0.4 wiring computed
+/// verification from a helper hard-coded to false, silently ignoring the flag.
+#[test]
+fn test_verify_counts_verified_files() {
+    let (source, dest) = setup_test_dir("verify_counts");
+
+    fs::write(source.path().join("a.txt"), "alpha").unwrap();
+    fs::write(source.path().join("b.txt"), "beta").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--verify=after",
+            "--stats",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The source is a fresh git repository, so the exact count includes git
+    // internals; what matters is that every created file was verified.
+    let created = stdout
+        .lines()
+        .find(|line| line.contains("Files created:"))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|v| v.parse::<usize>().ok())
+        .expect("created count");
+    // "Verification:    N files (xxHash3)" - N is the token before "files".
+    let verified = stdout
+        .lines()
+        .find(|line| line.contains("Verification:"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .zip(line.split_whitespace().skip(1))
+                .find(|(_, next)| *next == "files" || next.starts_with("files"))
+                .and_then(|(token, _)| token.parse::<usize>().ok())
+        })
+        .expect("verified count");
+    assert!(
+        stdout.contains("Verification:"),
+        "--verify=after must report verification, got:\n{stdout}"
+    );
+    assert_eq!(
+        created, verified,
+        "every created file must be verified under --verify=after"
+    );
+    assert!(
+        verified >= 2,
+        "the two data files must be among the verified"
+    );
+}
+
+/// The checksum database was consumed only by the unreachable legacy engine
+/// and is removed; passing its flags must fail as unknown arguments.
+#[test]
+fn test_checksum_db_flags_removed() {
+    let (source, dest) = setup_test_dir("checksum_db_removed");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    for flag in [
+        "--checksum-db",
+        "--clear-checksum-db",
+        "--prune-checksum-db",
+    ] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
+    assert!(!dest.path().join("file.txt").exists());
+}
