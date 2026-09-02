@@ -45,6 +45,12 @@ pub struct RouterConfig {
     pub max_inbound_bytes: u64,
     pub max_outbound_frames: u32,
     pub max_outbound_bytes: u64,
+    /// Optional outbound `Data` payload pacing in bytes per second across all
+    /// multiplexed streams (`--bwlimit`). Token-bucket with a one-second
+    /// burst, matching the legacy limiter. Applies to file-content bytes only;
+    /// acknowledgements, scans, and metadata are never throttled so control
+    /// traffic cannot starve behind bulk data.
+    pub outbound_payload_limit: Option<u64>,
 }
 
 impl Default for RouterConfig {
@@ -55,6 +61,7 @@ impl Default for RouterConfig {
             max_inbound_bytes: 16 * 1024 * 1024,
             max_outbound_frames: 128,
             max_outbound_bytes: 16 * 1024 * 1024,
+            outbound_payload_limit: None,
         }
     }
 }
@@ -366,6 +373,7 @@ impl FrameRouter {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outbound_payload_limit = config.outbound_payload_limit;
         let inner = Arc::new(RouterInner {
             streams: Mutex::new(HashMap::new()),
             failure: Mutex::new(None),
@@ -401,7 +409,7 @@ impl FrameRouter {
 
         let writer_inner = Arc::clone(&inner);
         let writer_task = tokio::spawn(async move {
-            match writer_loop(writer, outbound_rx, shutdown_rx).await {
+            match writer_loop(writer, outbound_rx, shutdown_rx, outbound_payload_limit).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let error = Arc::new(error);
@@ -498,10 +506,14 @@ async fn writer_loop<W>(
     mut writer: W,
     mut receiver: mpsc::UnboundedReceiver<OutboundFrame>,
     mut shutdown: watch::Receiver<bool>,
+    payload_limit: Option<u64>,
 ) -> Result<(), RouterError>
 where
     W: AsyncWrite + Unpin,
 {
+    // Sole consumer of the limiter: the writer is the single point where all
+    // multiplexed streams converge, so no synchronization is needed.
+    let mut limiter = payload_limit.map(crate::sync::ratelimit::RateLimiter::new);
     loop {
         let queued = tokio::select! {
             changed = shutdown.changed() => {
@@ -519,6 +531,15 @@ where
                 .map_err(crate::protocol::ProtocolError::from)?;
             return Ok(());
         };
+        // --bwlimit pacing: bulk `Data` frames sleep for their token deficit
+        // before the write; control frames (Ack/Scan/Metadata) skip the
+        // limiter entirely so they cannot starve behind a large transfer.
+        if let (Some(limiter), FrameKind::Data) = (limiter.as_mut(), queued.frame.kind()) {
+            let sleep = limiter.consume(u64::try_from(queued.frame.payload().len()).unwrap_or(0));
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
+        }
         write_frame(&mut writer, &queued.frame).await?;
         // Every frame is flushed, not only acknowledgements: the contract of a
         // completed frame is that its bytes reached the transport, but process
@@ -1118,5 +1139,65 @@ mod tests {
         .unwrap();
         let routed = router.control().recv().await.unwrap().unwrap();
         assert_eq!(routed.frame().kind(), FrameKind::Ping);
+    }
+
+    /// --bwlimit paces outbound `Data` payload bytes across all streams while
+    /// control frames bypass the limiter entirely.
+    #[tokio::test]
+    async fn data_frames_are_paced_by_payload_limit() {
+        let config = RouterConfig {
+            // 1 KiB/s with a 1 KiB burst: the first frame is free, the second
+            // identical frame must wait a full second.
+            outbound_payload_limit: Some(1024),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (mut peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        let data = frame(FrameKind::Data, stream_id, &[0_u8; 1024]);
+        let start = std::time::Instant::now();
+        router.sender().send(data.clone()).await.unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("first data frame must pass within the burst")
+        .unwrap();
+        assert_eq!(first.kind(), FrameKind::Data);
+
+        // Second 1 KiB frame: burst budget spent, ~1 s token deficit.
+        router.sender().send(data).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("second data frame must still arrive")
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "paced frame arrived too early: {elapsed:?}"
+        );
+
+        // A control acknowledgement must not wait behind bulk data: send it
+        // immediately after and expect it to arrive well before the next
+        // token refill.
+        let ack = frame(FrameKind::Ack, stream_id, b"ok");
+        router.sender().send(ack).await.unwrap();
+        let control = tokio::time::timeout(
+            Duration::from_millis(250),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("control frames must bypass the payload limiter")
+        .unwrap();
+        assert_eq!(control.kind(), FrameKind::Ack);
     }
 }

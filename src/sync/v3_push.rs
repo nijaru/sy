@@ -31,9 +31,6 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.bwlimit.is_some() {
-        return Some("bandwidth limiting is not yet scheduler-integrated in v3");
-    }
     if config.resume.only {
         return Some("resume-only control flow is not implemented by v3");
     }
@@ -107,11 +104,18 @@ pub(super) async fn run(
 ) -> Result<SyncStats> {
     let started = Instant::now();
     let ssh_config = resolve_v3_ssh_config(host, user)?;
+    let router_config = RouterConfig {
+        // --bwlimit paces outbound file-content bytes in the router writer; all
+        // other frame kinds bypass the limiter so control traffic never waits
+        // behind bulk data.
+        outbound_payload_limit: config.bwlimit,
+        ..RouterConfig::default()
+    };
     let session = SshRemoteSession::connect(
         &ssh_config,
         Operation::Push,
         destination_root,
-        RouterConfig::default(),
+        router_config,
     )
     .await
     .map_err(map_io)?;
@@ -638,6 +642,16 @@ mod tests {
             config.min_size,
             config.max_size
         ));
+    }
+
+    #[test]
+    fn bwlimit_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.bwlimit = Some(1024 * 1024);
+
+        // The router writer paces outbound Data payloads; control frames bypass
+        // the limiter, so no legacy fallback is needed.
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]

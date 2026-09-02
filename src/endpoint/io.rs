@@ -53,12 +53,18 @@ pub struct StreamCopyResult {
 /// Hashing is opt-in. When verification is requested, the source is hashed as
 /// bytes flow through the pipeline and the staged destination is hashed before
 /// commit. A mismatch aborts staging and leaves the old destination intact.
+///
+/// `rate_limiter` optionally paces the copy: each chunk consumes tokens from
+/// the shared `--bwlimit` bucket before it is written, so the pacing point is
+/// exactly the userspace byte stream (native kernel copies bypass this path
+/// entirely when a limit is set).
 pub async fn copy_file_streaming(
     source: &dyn Endpoint,
     source_path: &Path,
     dest: &dyn Endpoint,
     dest_path: &Path,
     verify: bool,
+    rate_limiter: Option<&std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
 ) -> Result<StreamCopyResult> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -84,6 +90,15 @@ pub async fn copy_file_streaming(
 
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&buffer[..read]);
+        }
+        if let Some(limiter) = rate_limiter {
+            let sleep = limiter
+                .lock()
+                .map_err(|_| SyncError::Config("rate limiter poisoned".to_string()))?
+                .consume(u64::try_from(read).unwrap_or(0));
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
         }
         if let Err(error) = writer.write(&buffer[..read]).await {
             let _ = writer.abort().await;
