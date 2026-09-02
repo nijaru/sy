@@ -1502,7 +1502,9 @@ fn test_remove_source_files_moves_committed_and_verified_entries() {
     let (source, dest) = setup_test_dir("remove_source_files");
 
     fs::write(source.path().join("created.txt"), "created").unwrap();
-    fs::write(dest.path().join("updated.txt"), "old").unwrap();
+    // Different lengths force an Update under the quick check even on
+    // filesystems whose mtime granularity would otherwise match the pair.
+    fs::write(dest.path().join("updated.txt"), "stale-bytes").unwrap();
     fs::write(source.path().join("updated.txt"), "new").unwrap();
     fs::create_dir(source.path().join("sub")).unwrap();
     fs::write(source.path().join("sub/inner.txt"), "inner").unwrap();
