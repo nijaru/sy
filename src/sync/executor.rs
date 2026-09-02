@@ -385,6 +385,8 @@ impl<'a> TaskExecutor<'a> {
                 eprintln!("{} {}", item, task.dest_path.display());
             }
 
+            self.remove_source_after_commit(source_entry).await?;
+
             Ok(if task.action == SyncAction::Create {
                 TaskResult::SymlinkCreated
             } else {
@@ -418,6 +420,7 @@ impl<'a> TaskExecutor<'a> {
                         eprintln!("{} {}", item, task.dest_path.display());
                     }
 
+                    self.remove_source_after_commit(source_entry).await?;
                     return Ok(if task.action == SyncAction::Create {
                         TaskResult::Created { bytes: 0 }
                     } else {
@@ -488,10 +491,7 @@ impl<'a> TaskExecutor<'a> {
         // Source removal is intentionally last. Verification or preservation
         // failure leaves the source untouched, and a removal failure is surfaced
         // instead of reporting a successful move that left the source behind.
-        if self.config.remove_source_files {
-            let source_path = self.source.root().join(&*source_entry.relative_path);
-            tokio::fs::remove_file(&source_path).await?;
-        }
+        self.remove_source_after_commit(source_entry).await?;
 
         Ok(if task.action == SyncAction::Create {
             TaskResult::Created {
@@ -502,6 +502,46 @@ impl<'a> TaskExecutor<'a> {
                 bytes: transfer.bytes_written,
             }
         })
+    }
+
+    /// Remove the source entry under --remove-source-files once the
+    /// destination commit (and, for regular files, staged verification and
+    /// preservation) has succeeded. Removal is intentionally the last step so
+    /// any earlier failure leaves the source untouched; a removal failure is
+    /// surfaced instead of reporting a successful move that left data behind.
+    async fn remove_source_after_commit(&self, source_entry: &FileEntry) -> Result<()> {
+        if !self.config.remove_source_files {
+            return Ok(());
+        }
+        let source_path = self.source.root().join(&*source_entry.relative_path);
+        // Race check: a source replaced or modified between scan and commit
+        // must not be removed, because the removed bytes would not be the
+        // verified ones. Size, mtime, and inode identify the scanned file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = tokio::fs::symlink_metadata(&source_path)
+                .await
+                .map_err(|error| {
+                    Error::Io(std::io::Error::other(format!(
+                        "source {} changed between scan and removal; not removing ({error})",
+                        source_entry.relative_path.display()
+                    )))
+                })?;
+            if metadata.len() != source_entry.size
+                || metadata.modified().unwrap_or(std::time::UNIX_EPOCH) != source_entry.modified
+                || source_entry
+                    .inode
+                    .is_some_and(|inode| inode != metadata.ino())
+            {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "source {} changed between scan and removal; not removing",
+                    source_entry.relative_path.display()
+                ))));
+            }
+        }
+        tokio::fs::remove_file(&source_path).await?;
+        Ok(())
     }
 
     fn hardlink_map(&self) -> Result<MutexGuard<'_, HashMap<u64, PathBuf>>> {

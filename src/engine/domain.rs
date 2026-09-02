@@ -244,25 +244,11 @@ pub enum SkipReason {
 /// Semantic result of reconciliation. No byte-transfer strategy appears here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOp {
-    Create {
-        source: Entry,
-    },
-    Update {
-        source: Entry,
-        destination: Entry,
-    },
-    Replace {
-        source: Entry,
-        destination: Entry,
-    },
-    Metadata {
-        source: Entry,
-        destination: Entry,
-    },
-    Skip {
-        path: RelativePath,
-        reason: SkipReason,
-    },
+    Create { source: Entry },
+    Update { source: Entry, destination: Entry },
+    Replace { source: Entry, destination: Entry },
+    Metadata { source: Entry, destination: Entry },
+    Skip { source: Entry, reason: SkipReason },
 }
 
 impl SyncOp {
@@ -271,8 +257,8 @@ impl SyncOp {
             Self::Create { source }
             | Self::Update { source, .. }
             | Self::Replace { source, .. }
-            | Self::Metadata { source, .. } => &source.path,
-            Self::Skip { path, .. } => path,
+            | Self::Metadata { source, .. }
+            | Self::Skip { source, .. } => &source.path,
         }
     }
 }
