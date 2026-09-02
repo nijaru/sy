@@ -51,6 +51,10 @@ pub struct RouterConfig {
     /// acknowledgements, scans, and metadata are never throttled so control
     /// traffic cannot starve behind bulk data.
     pub outbound_payload_limit: Option<u64>,
+    /// Optional idle I/O deadline (`--timeout`): the session aborts when no
+    /// inbound frame arrives within this many seconds. `None` disables the
+    /// deadline, matching rsync's default of no I/O timeout.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for RouterConfig {
@@ -62,6 +66,7 @@ impl Default for RouterConfig {
             max_outbound_frames: 128,
             max_outbound_bytes: 16 * 1024 * 1024,
             outbound_payload_limit: None,
+            idle_timeout: None,
         }
     }
 }
@@ -70,6 +75,9 @@ impl Default for RouterConfig {
 pub enum RouterError {
     #[error("active stream budget must be greater than zero")]
     ZeroStreamBudget,
+
+    #[error("no inbound frame within the configured I/O timeout (--timeout); aborting session")]
+    IdleTimeoutExceeded,
 
     #[error("{direction} frame budget must be greater than zero")]
     ZeroFrameBudget { direction: &'static str },
@@ -462,12 +470,28 @@ where
         // allocation. The router then admits the completed frame into its
         // global queue budget, so resident inbound memory is bounded by the
         // configured budget plus at most one frame currently being read.
+        // The idle deadline (`--timeout`) wraps each read: a session that
+        // receives nothing for the configured window is presumed hung and
+        // torn down, matching rsync's I/O timeout semantics. Any inbound
+        // frame resets the window.
+        let deadline = inner.config.idle_timeout;
         let frame = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
                 continue;
+            }
+            _ = async {
+                match deadline {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if deadline.is_some() => {
+                // Do NOT close streams cleanly here: the reader task's error
+                // path publishes this failure to every stream inbox so
+                // waiters observe the typed timeout, not a silent clean end.
+                return Err(RouterError::IdleTimeoutExceeded);
             }
             result = read_frame_or_eof(&mut reader) => match result? {
                 // A clean EOF is the peer hanging up between frames. It is not
@@ -1139,6 +1163,85 @@ mod tests {
         .unwrap();
         let routed = router.control().recv().await.unwrap().unwrap();
         assert_eq!(routed.frame().kind(), FrameKind::Ping);
+    }
+
+    /// --timeout: a session that receives no inbound frame within the
+    /// configured window aborts with the typed idle error; stream waiters
+    /// observe the failure rather than a silent clean end.
+    #[tokio::test]
+    async fn idle_timeout_aborts_silent_session() {
+        let config = RouterConfig {
+            idle_timeout: Some(Duration::from_millis(150)),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+
+        // The peer never writes; the deadline must fire and the inbox must
+        // surface the typed timeout (not a clean `None`).
+        let error = inbox.recv().await.unwrap_err();
+        assert!(matches!(*error, RouterError::IdleTimeoutExceeded));
+    }
+
+    /// A session that keeps receiving frames resets the idle deadline each
+    /// time and must survive windows far beyond the configured timeout.
+    #[tokio::test]
+    async fn steady_frames_never_trip_idle_deadline() {
+        let config = RouterConfig {
+            idle_timeout: Some(Duration::from_millis(200)),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        // Frames arrive well inside each 200 ms window; five windows pass,
+        // far beyond the timeout, without tripping it.
+        for tick in 0..5 {
+            write_frame(
+                &mut peer_writer,
+                &Frame::new(
+                    FrameKind::Entry,
+                    FrameFlags::empty(),
+                    stream_id,
+                    Bytes::from(format!("tick {tick}")),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let routed = tokio::time::timeout(Duration::from_millis(500), inbox.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                routed.frame().payload(),
+                &Bytes::from(format!("tick {tick}"))
+            );
+        }
+
+        // Session is still healthy: a final frame routes normally.
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"final"),
+        )
+        .await
+        .unwrap();
+        let routed = tokio::time::timeout(Duration::from_millis(500), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(routed.frame().payload(), &Bytes::from_static(b"final"));
     }
 
     /// --bwlimit paces outbound `Data` payload bytes across all streams while

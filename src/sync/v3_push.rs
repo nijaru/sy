@@ -25,7 +25,7 @@ use sy::remote::push_controller::{
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
-use sy::remote::ssh::SshRemoteSession;
+use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
@@ -49,9 +49,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     }
     if config.partial.is_some() || config.partial_dir.is_some() {
         return Some("legacy partial-file semantics are not mapped to transactional v3 writes");
-    }
-    if config.timeout.is_some() || config.contimeout.is_some() {
-        return Some("CLI timeout overrides are not yet mapped to the v3 OpenSSH session");
     }
     if config.compress_level.is_some()
         || !matches!(config.compression_detection, CompressionDetection::Never)
@@ -91,13 +88,21 @@ pub(super) async fn run(
         // other frame kinds bypass the limiter so control traffic never waits
         // behind bulk data.
         outbound_payload_limit: config.bwlimit,
+        // --timeout aborts the session when no inbound frame arrives within
+        // the configured window (rsync I/O timeout semantics).
+        idle_timeout: config.timeout.map(std::time::Duration::from_secs),
         ..RouterConfig::default()
     };
-    let session = SshRemoteSession::connect(
+    let launch = SshLaunchOptions {
+        // --contimeout bounds the OpenSSH connection establishment.
+        connect_timeout: config.contimeout,
+    };
+    let session = SshRemoteSession::connect_with_options(
         &ssh_config,
         Operation::Push,
         destination_root,
         router_config,
+        launch,
     )
     .await
     .map_err(map_io)?;
@@ -632,6 +637,14 @@ mod tests {
         assert!(!source_root.path().join("unchanged").exists());
         assert!(!source_root.path().join("keep-dir/inner").exists());
         assert!(source_root.path().join("keep-dir").is_dir());
+    }
+
+    #[test]
+    fn timeouts_map_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.timeout = Some(60);
+        config.contimeout = Some(5);
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]
