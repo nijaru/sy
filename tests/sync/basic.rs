@@ -1419,3 +1419,61 @@ fn test_backup_preserves_original() {
         "updated content"
     );
 }
+
+/// --diff details every planned operation with byte sizes in dry-run mode.
+#[test]
+fn test_diff_mode_details_planned_changes() {
+    let (source, dest) = setup_test_dir("diff_mode");
+
+    fs::write(source.path().join("small.txt"), "tiny").unwrap();
+    fs::write(source.path().join("large.txt"), "x".repeat(4096)).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--dry-run",
+            "--diff",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join("small.txt").exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Would create: "),
+        "diff mode must detail per-file plans, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(4.00 KB)"),
+        "diff mode must include byte sizes, got:\n{stdout}"
+    );
+}
+
+/// --diff without --dry-run is rejected: it would silently do nothing.
+#[test]
+fn test_diff_without_dry_run_fails() {
+    let (source, dest) = setup_test_dir("diff_reject");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--diff",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--diff requires --dry-run"),
+        "got:\n{stderr}"
+    );
+    // Nothing was mutated: the command must not have synced before failing.
+    assert!(!dest.path().join("file.txt").exists());
+}

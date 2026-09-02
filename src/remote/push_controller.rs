@@ -253,13 +253,27 @@ pub struct RemotePushPreview {
     pub bytes_to_update: u64,
 }
 
+/// One planned deletion surfaced to `--diff` dry-run detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewDelete {
+    pub path: RelativePath,
+    pub is_directory: bool,
+}
+
 /// Consume a completed remote-push plan without executing endpoint mutations.
 ///
 /// Dry-run uses the exact same full-tree preflight as execution, including
 /// deletion protection and threshold checks, then reads only the disk-backed
-/// semantic journal. Dropping the delete/finalize journals performs no remote
+/// semantic journal. Dropping the finalize journals performs no remote
 /// operations.
-pub async fn preview_remote_push(plan: RemotePushPlan) -> Result<RemotePushPreview> {
+///
+/// `diff_detail` optionally receives one line per planned operation and one
+/// per delete candidate, the `--diff` byte-accounting view (`Would create:
+/// path (size)`).
+pub async fn preview_remote_push(
+    plan: RemotePushPlan,
+    mut diff_detail: impl FnMut(PreviewOp),
+) -> Result<RemotePushPreview> {
     let RemotePushPlan {
         mut reader,
         operations,
@@ -273,9 +287,26 @@ pub async fn preview_remote_push(plan: RemotePushPlan) -> Result<RemotePushPrevi
     };
 
     while let Some(operation) = reader.next().await? {
+        diff_detail(PreviewOp::Operation(&operation));
         record_preview_operation(&mut preview, &operation)?;
     }
+    if let Some(delete) = delete {
+        let mut replay = delete.into_replay();
+        while let Some(action) = replay.next_action().await? {
+            diff_detail(PreviewOp::Delete(PreviewDelete {
+                path: action.path,
+                is_directory: action.is_directory,
+            }));
+        }
+    }
     Ok(preview)
+}
+
+/// A `--diff` dry-run detail item: a planned transfer operation or a planned
+/// deletion.
+pub enum PreviewOp<'a> {
+    Operation(&'a SyncOp),
+    Delete(PreviewDelete),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -682,7 +713,7 @@ mod tests {
         .await
         .unwrap();
 
-        let preview = preview_remote_push(plan).await.unwrap();
+        let preview = preview_remote_push(plan, |_| {}).await.unwrap();
         assert_eq!(preview.planned_operations, 3);
         assert_eq!(preview.files_created, 1);
         assert_eq!(preview.files_updated, 1);

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
-use sy::engine::domain::{Entry, RelativePath};
+use sy::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
@@ -21,7 +21,8 @@ use sy::remote::hash::{hash_rooted_file, RemoteHashError};
 use sy::remote::push::RemotePushExecutor;
 use sy::remote::push_controller::{
     preflight_remote_push_scoped, preflight_remote_push_scoped_with_content, preview_remote_push,
-    RemotePushController, RemotePushControllerError, RemotePushPreview, RemotePushSummary,
+    PreviewOp, RemotePushController, RemotePushControllerError, RemotePushPreview,
+    RemotePushSummary,
 };
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
@@ -30,9 +31,6 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.diff_mode {
-        return Some("diff-mode byte accounting is not yet mapped to v3");
-    }
     if config.trash {
         return Some("trash deletion is not yet implemented by v3");
     }
@@ -272,9 +270,14 @@ async fn execute_with_handle(
     };
 
     if config.dry_run {
-        let preview = preview_remote_push(plan)
-            .await
-            .map_err(map_controller_error)?;
+        let diff_mode = config.diff_mode;
+        let preview = preview_remote_push(plan, |item| {
+            if diff_mode {
+                emit_diff_line(item);
+            }
+        })
+        .await
+        .map_err(map_controller_error)?;
         return preview_stats(preview);
     }
 
@@ -397,6 +400,51 @@ fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
             limit: *limit,
             force: *force,
         }),
+    }
+}
+
+/// Emit one `--diff` dry-run detail line for a planned operation or deletion,
+/// mirroring the legacy per-file format (`Would create: path (size)`).
+///
+/// `tracing::info!` keeps the channel consistent with the rest of the sync
+/// log: default verbosity hides it (WARN floor), `-v` shows it, and `--quiet`
+/// or `--json` silences it at the subscriber.
+fn emit_diff_line(item: PreviewOp<'_>) {
+    match item {
+        PreviewOp::Operation(SyncOp::Create { source }) => match source.kind {
+            EntryKind::File => tracing::info!(
+                "Would create: {} ({})",
+                source.path,
+                crate::resource::format_bytes(source.size)
+            ),
+            _ => tracing::info!("Would create: {}", source.path),
+        },
+        PreviewOp::Operation(SyncOp::Update { source, .. }) => match source.kind {
+            EntryKind::File => tracing::info!(
+                "Would update: {} ({}, using delta sync)",
+                source.path,
+                crate::resource::format_bytes(source.size)
+            ),
+            _ => tracing::info!("Would update: {}", source.path),
+        },
+        PreviewOp::Operation(SyncOp::Replace { source, .. }) => {
+            tracing::info!("Would replace: {}", source.path)
+        }
+        PreviewOp::Operation(SyncOp::Metadata { source, .. }) => {
+            tracing::info!("Would update metadata: {}", source.path)
+        }
+        PreviewOp::Operation(SyncOp::Skip { path, .. }) => {
+            tracing::info!("Would skip: {}", path)
+        }
+        PreviewOp::Delete(delete) => tracing::info!(
+            "Would delete: {}{}",
+            delete.path,
+            if delete.is_directory {
+                " (directory)"
+            } else {
+                ""
+            }
+        ),
     }
 }
 
@@ -596,16 +644,13 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_maps_to_v3_while_diff_mode_still_falls_back() {
+    fn dry_run_and_diff_mode_map_to_v3_without_fallback() {
         let mut config = supported_config();
         config.dry_run = true;
         assert_eq!(legacy_fallback_reason(&config), None);
 
         config.diff_mode = true;
-        assert_eq!(
-            legacy_fallback_reason(&config),
-            Some("diff-mode byte accounting is not yet mapped to v3")
-        );
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]
@@ -1588,5 +1633,71 @@ mod tests {
             std::fs::read(destination_root.path().join("new")).unwrap(),
             b"new"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_mode_dry_run_emits_per_operation_detail() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("create"), b"create-me").unwrap();
+        std::fs::write(source_root.path().join("update"), b"new-value").unwrap();
+        std::fs::write(destination_root.path().join("remove"), b"remove-me").unwrap();
+        std::fs::write(destination_root.path().join("update"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            // Diff-mode dry-run performs the scan preflight only.
+            match session.next_request().await.unwrap().unwrap() {
+                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                _ => panic!("diff-mode dry-run must not emit mutation requests"),
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.dry_run = true;
+        config.diff_mode = true;
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Percentage(100),
+            force: false,
+        };
+
+        // Diff detail lines go through tracing::info!; the structured preview
+        // stats are asserted directly, and the emitted lines are covered by
+        // the CLI dry-run diff end-to-end test where a real subscriber is
+        // initialized from CLI flags.
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(stats.bytes_would_add, 9);
+        assert_eq!(stats.bytes_would_change, 9);
+        assert!(!destination_root.path().join("create").exists());
+        assert!(destination_root.path().join("remove").exists());
     }
 }
