@@ -13,7 +13,8 @@ mod transfer;
 
 pub use entry::{WireEntry, WireEntryKind};
 pub use frame::{
-    read_frame, write_frame, Frame, FrameFlags, FrameKind, StreamId, MAX_FRAME_PAYLOAD,
+    read_frame, read_frame_or_eof, write_frame, Frame, FrameFlags, FrameKind, ReadFrame, StreamId,
+    MAX_FRAME_PAYLOAD,
 };
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
@@ -40,6 +41,9 @@ pub use transfer::{
 pub enum ProtocolError {
     #[error("protocol I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("clean end of stream at a frame boundary")]
+    CleanEof,
 
     #[error("frame payload is too large: {len} bytes (maximum {max})")]
     PayloadTooLarge { len: usize, max: usize },

@@ -1,4 +1,6 @@
-use crate::protocol::{read_frame, write_frame, Frame, FrameKind, StreamId, MAX_FRAME_PAYLOAD};
+use crate::protocol::{
+    read_frame_or_eof, write_frame, Frame, FrameKind, ReadFrame, StreamId, MAX_FRAME_PAYLOAD,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -130,6 +132,11 @@ enum StreamMessage {
 enum IncomingMessage {
     Stream(IncomingStream),
     Failed(SharedRouterError),
+    /// Orderly end of the incoming stream after a clean transport EOF.
+    /// Distinguished from `Failed` so `serve_transport` can drain active
+    /// tasks and exit successfully instead of treating a peer hangup
+    /// between frames as a transport failure.
+    Closed,
 }
 
 struct OutboundFrame {
@@ -306,6 +313,7 @@ impl IncomingStreams {
         match self.receiver.recv().await {
             Some(IncomingMessage::Stream(stream)) => Ok(Some(stream)),
             Some(IncomingMessage::Failed(error)) => Err(error),
+            Some(IncomingMessage::Closed) => Ok(None),
             None => Ok(None),
         }
     }
@@ -442,7 +450,7 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        // `read_frame` validates the 1 MiB protocol payload cap before
+        // `read_frame_or_eof` validates the 1 MiB protocol payload cap before
         // allocation. The router then admits the completed frame into its
         // global queue budget, so resident inbound memory is bounded by the
         // configured budget plus at most one frame currently being read.
@@ -453,7 +461,19 @@ where
                 }
                 continue;
             }
-            result = read_frame(&mut reader) => result?,
+            result = read_frame_or_eof(&mut reader) => match result? {
+                // A clean EOF is the peer hanging up between frames. It is not
+                // a transport failure: close stream inboxes orderly (waiters
+                // see stream end and surface typed `UnexpectedStreamEnd`
+                // errors if they still expected data) and let the writer drain
+                // queued acknowledgements before it observes the closed
+                // outbound channel.
+                ReadFrame::CleanEof => {
+                    close_all_streams(inner);
+                    return Ok(());
+                }
+                ReadFrame::Frame(frame) => frame,
+            },
         };
         let (frame_permit, byte_permit) = acquire_capacity(
             Arc::clone(&inner.inbound_frames),
@@ -659,6 +679,19 @@ fn current_failure(
         .lock()
         .map(|failure| failure.clone())
         .map_err(|_| Arc::new(RouterError::StatePoisoned))
+}
+
+/// Close every stream inbox with an orderly stream end (no `Failed` message,
+/// no failure record). Waiters receiving `Ok(None)` from `recv` treat this as
+/// end of stream and report their own typed errors where data was still
+/// expected.
+fn close_all_streams(inner: &Arc<RouterInner>) {
+    if let Ok(mut streams) = inner.streams.lock() {
+        for (_, sender) in streams.drain() {
+            drop(sender);
+        }
+    }
+    let _ = inner.incoming_tx.send(IncomingMessage::Closed);
 }
 
 fn publish_failure(inner: &Arc<RouterInner>, error: SharedRouterError) {
@@ -919,7 +952,7 @@ mod tests {
             .send(frame(FrameKind::Ack, stream_id, b"ok"))
             .await
             .unwrap();
-        let outbound = read_frame(&mut peer_reader).await.unwrap();
+        let outbound = crate::protocol::read_frame(&mut peer_reader).await.unwrap();
         assert_eq!(outbound.kind(), FrameKind::Ack);
         assert_eq!(outbound.stream_id(), stream_id);
     }
