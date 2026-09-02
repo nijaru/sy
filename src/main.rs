@@ -26,7 +26,7 @@ mod transport;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use cli::{Cli, ResumeMode, VerifyMode};
+use cli::{Cli, VerifyMode};
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
@@ -185,12 +185,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 cli.exclude = excludes.clone();
             }
         }
-        if let Some(resume) = profile.resume {
-            // Profile sets resume=false means --no-resume
-            if !resume {
-                cli.resume = ResumeMode::No;
-            }
-        }
     }
 
     // Setup logging
@@ -227,16 +221,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
             .ok()
             .map(|e| e.with_abort_on_failure(cli.abort_on_hook_failure))
     };
-
-    // Clear cache if requested (before creating engine)
-    if cli.clear_cache {
-        use sync::dircache::DirectoryCache;
-        if let Err(e) = DirectoryCache::delete(destination.path()) {
-            tracing::warn!("Failed to clear directory cache: {}", e);
-        } else if !cli.quiet && !cli.json {
-            tracing::info!("Cleared directory cache");
-        }
-    }
 
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
@@ -435,12 +419,6 @@ Or install from local source with: cargo install --path . --features acl"#
         max_size: cli.max_size,
         filter_engine,
         bwlimit: cli.bwlimit,
-        resume: sync::ResumeConfig {
-            enabled: cli.resume(),
-            only: cli.resume == ResumeMode::Only,
-            checkpoint_files: cli.checkpoint_files,
-            checkpoint_bytes: cli.checkpoint_bytes,
-        },
         json: cli.json,
         verification: sync::VerificationConfig {
             mode: checksum_type,
@@ -470,8 +448,6 @@ Or install from local source with: cargo install --path . --features acl"#
             update_only: cli.update,
             ignore_existing: cli.ignore_existing,
         },
-        cache: cli.cache,
-        clear_cache: cli.clear_cache,
         dest_is_remote: destination.is_remote(),
         perf: cli.perf,
         // rsync-compat flags

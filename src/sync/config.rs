@@ -19,14 +19,11 @@ pub struct SyncConfig {
     pub max_size: Option<u64>,
     pub filter_engine: FilterEngine,
     pub bwlimit: Option<u64>,
-    pub resume: ResumeConfig,
     pub json: bool,
     pub verification: VerificationConfig,
     pub preserve: PreserveConfig,
     pub progress: bool,
     pub comparison: ComparisonConfig,
-    pub cache: bool,
-    pub clear_cache: bool,
     pub dest_is_remote: bool,
     pub perf: bool,
     // rsync-compat flags
@@ -61,7 +58,6 @@ impl SyncConfig {
             max_size: None,
             filter_engine: FilterEngine::new(),
             bwlimit: None,
-            resume: ResumeConfig::disabled(),
             json: false,
             verification: VerificationConfig {
                 mode: ChecksumType::Fast,
@@ -73,8 +69,6 @@ impl SyncConfig {
             preserve: PreserveConfig::default(),
             progress: false,
             comparison: ComparisonConfig::default(),
-            cache: false,
-            clear_cache: false,
             dest_is_remote: false,
             perf: false,
             // rsync-compat flags
@@ -201,26 +195,6 @@ impl Default for PreserveConfig {
             owner: false,
             devices: false,
             keep_dirlinks: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ResumeConfig {
-    pub enabled: bool,
-    pub only: bool,
-    pub checkpoint_files: usize,
-    pub checkpoint_bytes: u64,
-}
-
-impl ResumeConfig {
-    #[allow(dead_code)]
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            only: false,
-            checkpoint_files: 0,
-            checkpoint_bytes: 0,
         }
     }
 }

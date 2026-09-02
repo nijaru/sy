@@ -370,169 +370,34 @@ fn test_large_file_update_with_delta_sync() {
 }
 
 #[test]
-fn test_directory_cache_created() {
-    let (source, dest) = setup_test_dir("cache_created");
+fn test_cache_flags_removed() {
+    let (source, dest) = setup_test_dir("cache_removed");
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_not_created_by_default() {
-    let (source, dest) = setup_test_dir("no_cache");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_persists() {
-    let (source, dest) = setup_test_dir("cache_persist");
-
-    fs::write(source.path().join("file1.txt"), "content1").unwrap();
-
-    // First sync with cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    // Add new file
-    fs::write(source.path().join("file2.txt"), "content2").unwrap();
-
-    // Second sync should use cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join("file2.txt").exists());
-}
-
-#[test]
-fn test_directory_cache_clear() {
-    let (source, dest) = setup_test_dir("cache_clear");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    // Create cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join(".sy-dir-cache.json").exists());
-
-    // Clear cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--clear-cache",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_dry_run() {
-    let (source, dest) = setup_test_dir("cache_dry_run");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    // Dry run with cache should not create cache file
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_updates_on_new_directories() {
-    let (source, dest) = setup_test_dir("cache_new_dirs");
-
-    fs::create_dir_all(source.path().join("subdir")).unwrap();
-    fs::write(source.path().join("subdir/file.txt"), "content").unwrap();
-
-    // First sync
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    // Add new directory
-    fs::create_dir_all(source.path().join("newdir")).unwrap();
-    fs::write(source.path().join("newdir/file2.txt"), "content2").unwrap();
-
-    // Second sync should pick up new directory
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join("newdir/file2.txt").exists());
+    // The directory cache never worked on the 0.5 engines and the flags are
+    // removed outright; passing them must fail as unknown arguments.
+    for flag in ["--cache", "--clear-cache"] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
+    // Nothing was synced by the rejected invocations.
+    assert!(!dest.path().join("file.txt").exists());
 }
 
 // Trailing slash behavior tests

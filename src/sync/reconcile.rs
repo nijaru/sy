@@ -39,15 +39,6 @@ pub(crate) async fn run_local_sync(
         tokio::fs::create_dir_all(dest.root()).await?;
     }
 
-    if config.cache {
-        tracing::debug!(
-            "directory cache reuse disabled in v0.5 until invalidation is content-safe"
-        );
-    }
-    if config.clear_cache && !config.dry_run {
-        let _ = crate::sync::dircache::DirectoryCache::delete(dest.root());
-    }
-
     let delete_plan = match config.delete {
         DeleteMode::Disabled => None,
         DeleteMode::Enabled { limit, force } => {
@@ -164,10 +155,6 @@ pub(crate) async fn run_local_sync(
         } else {
             execute_delete_journal(dest, &mut plan.journal, &mut stats).await?;
         }
-    }
-
-    if config.cache && !config.dry_run {
-        crate::sync::dircache::DirectoryCache::new().save(dest.root())?;
     }
 
     stats.duration = started.elapsed();
