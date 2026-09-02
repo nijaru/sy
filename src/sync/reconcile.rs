@@ -210,7 +210,7 @@ async fn queue_operation(
     };
 
     if config.dry_run {
-        record_planned_task(&task, stats);
+        record_planned_task(&task, config, stats);
         return Ok(());
     }
 
@@ -709,12 +709,53 @@ async fn execute_batch(
     Ok(())
 }
 
-fn record_planned_task(task: &SyncTask, stats: &mut SyncStats) {
+fn record_planned_task(task: &SyncTask, config: &SyncConfig, stats: &mut SyncStats) {
     match task.action {
         SyncAction::Skip => stats.files_skipped += 1,
-        SyncAction::Create => stats.files_created += 1,
-        SyncAction::Update => stats.files_updated += 1,
-        SyncAction::Delete => stats.files_deleted += 1,
+        SyncAction::Create => {
+            stats.files_created += 1;
+            if let Some(source) = &task.source {
+                if !source.is_dir {
+                    stats.bytes_would_add += source.size;
+                }
+                if config.diff_mode {
+                    if source.is_dir {
+                        tracing::info!("Would create: {}", task.dest_path.display());
+                    } else {
+                        tracing::info!(
+                            "Would create: {} ({})",
+                            task.dest_path.display(),
+                            crate::resource::format_bytes(source.size)
+                        );
+                    }
+                }
+            }
+        }
+        SyncAction::Update => {
+            stats.files_updated += 1;
+            if let Some(source) = &task.source {
+                if !source.is_dir {
+                    stats.bytes_would_change += source.size;
+                }
+                if config.diff_mode {
+                    if source.is_dir {
+                        tracing::info!("Would update: {}", task.dest_path.display());
+                    } else {
+                        tracing::info!(
+                            "Would update: {} ({}, using delta sync)",
+                            task.dest_path.display(),
+                            crate::resource::format_bytes(source.size)
+                        );
+                    }
+                }
+            }
+        }
+        SyncAction::Delete => {
+            stats.files_deleted += 1;
+            if config.diff_mode {
+                tracing::info!("Would delete: {}", task.dest_path.display());
+            }
+        }
     }
 }
 

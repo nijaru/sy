@@ -536,6 +536,12 @@ pub struct Cli {
 
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
+        // --diff is a dry-run display variant; without --dry-run it silently
+        // showed nothing, which reads as success while doing nothing at all.
+        if self.diff && !self.dry_run {
+            anyhow::bail!("--diff requires --dry-run (it details planned changes only)");
+        }
+
         // Validate size filters first (independent of source path)
         if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
             if min > max {
@@ -1661,6 +1667,18 @@ mod tests {
         let result = cli.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min-size"));
+    }
+
+    #[test]
+    fn test_diff_requires_dry_run() {
+        // --diff without --dry-run previously did nothing silently; validation
+        // must reject it so a mistaken invocation cannot read as success.
+        let cli = Cli::try_parse_from(["sy", "/tmp/source/", "/tmp/dest", "--diff"]).unwrap();
+        assert!(cli
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--diff requires --dry-run"));
     }
 
     #[test]
