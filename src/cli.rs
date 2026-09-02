@@ -78,9 +78,11 @@ impl VerificationMode {
         }
     }
 
-    /// Check if this mode requires block-level verification
+    /// Whether --verify enables post-write verification of committed bytes.
+    /// The local engine hashes staged bytes against the source before the
+    /// rename commit; the v3 protocol always verifies unconditionally.
     pub fn verify_blocks(&self) -> bool {
-        false
+        matches!(self, Self::Verify)
     }
 }
 
@@ -284,19 +286,6 @@ pub struct Cli {
     /// Use streaming mode for massive directories (experimental)
     #[arg(long, hide = true)]
     pub stream: bool,
-
-    /// Use checksum database for faster --checksum re-syncs (default: false)
-    /// The database stores checksums to avoid recomputation for unchanged files
-    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
-    pub checksum_db: bool,
-
-    /// Clear checksum database before starting
-    #[arg(long)]
-    pub clear_checksum_db: bool,
-
-    /// Remove stale entries from checksum database (files no longer in source)
-    #[arg(long)]
-    pub prune_checksum_db: bool,
 
     /// Verify file integrity after write using xxHash3 checksums
     ///
@@ -779,9 +768,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             retry: 0,
             retry_delay: 1,
             recursive: false,
@@ -869,9 +855,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             retry: 0,
             retry_delay: 1,
             recursive: false,
@@ -963,9 +946,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1058,9 +1038,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1148,9 +1125,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1238,9 +1212,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1328,9 +1299,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1418,9 +1386,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1527,9 +1492,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
             retry: 0,
@@ -1632,9 +1594,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1722,9 +1681,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1745,7 +1701,9 @@ mod tests {
     #[test]
     fn test_verification_mode_verify_blocks() {
         assert!(!VerificationMode::None.verify_blocks());
-        assert!(!VerificationMode::Verify.verify_blocks());
+        // --verify enables post-write verification; the 0.4 wiring hard-coded
+        // this to false, silently ignoring the flag on every engine.
+        assert!(VerificationMode::Verify.verify_blocks());
     }
 
     #[test]
@@ -1825,9 +1783,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -1915,9 +1870,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2005,9 +1957,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2095,9 +2044,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2192,9 +2138,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2288,9 +2231,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2385,9 +2325,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2482,9 +2419,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2576,9 +2510,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
@@ -2713,9 +2644,6 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,

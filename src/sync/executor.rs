@@ -79,6 +79,8 @@ pub struct TaskExecutor<'a> {
     backup: BackupConfig,
     config: ExecuteConfig,
     hardlink_map: Mutex<HashMap<u64, PathBuf>>,
+    /// Successful post-write verifications under --verify, for stats.
+    verified_count: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> TaskExecutor<'a> {
@@ -115,6 +117,7 @@ impl<'a> TaskExecutor<'a> {
             },
             config: ExecuteConfig::default(),
             hardlink_map: Mutex::new(HashMap::new()),
+            verified_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -461,6 +464,12 @@ impl<'a> TaskExecutor<'a> {
                 actual: actual.to_hex().to_string(),
             });
         }
+        // `Verified` is only produced when --verify requested post-write
+        // verification; count it so the flag's effect is observable in stats.
+        if matches!(transfer.verification, VerificationStatus::Verified) {
+            self.verified_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         self.apply_preservation(&task.dest_path, preservation)
             .await?;
@@ -579,6 +588,9 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
+        stats.files_verified = self
+            .verified_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         stats.duration = start.elapsed();
         Ok(stats)
     }
@@ -643,9 +655,6 @@ mod tests {
             VerificationConfig {
                 mode: ChecksumType::Fast,
                 verify_on_write: false,
-                checksum_db: false,
-                clear_checksum_db: false,
-                prune_checksum_db: false,
             },
             4,
         )
@@ -708,9 +717,6 @@ mod tests {
             VerificationConfig {
                 mode: ChecksumType::Fast,
                 verify_on_write: false,
-                checksum_db: false,
-                clear_checksum_db: false,
-                prune_checksum_db: false,
             },
             0,
         );
@@ -771,9 +777,6 @@ mod tests {
             VerificationConfig {
                 mode: ChecksumType::Fast,
                 verify_on_write: false,
-                checksum_db: false,
-                clear_checksum_db: false,
-                prune_checksum_db: false,
             },
             4,
         )
@@ -837,9 +840,6 @@ mod tests {
             VerificationConfig {
                 mode: ChecksumType::Fast,
                 verify_on_write: true,
-                checksum_db: false,
-                clear_checksum_db: false,
-                prune_checksum_db: false,
             },
             4,
         )

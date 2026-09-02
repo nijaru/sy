@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-pub mod checksumdb;
 pub mod config;
 pub mod executor;
 pub mod output;
@@ -189,34 +188,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.transport.create_dir_all(destination).await?;
         }
 
-        // Handle checksum database
-        let checksum_db = if self.config.comparison.checksum && self.config.verification.checksum_db
-        {
-            // Open checksum database
-            match checksumdb::ChecksumDatabase::open(destination) {
-                Ok(db) => {
-                    tracing::debug!("Opened checksum database");
-
-                    // Clear if requested
-                    if self.config.verification.clear_checksum_db && !self.config.dry_run {
-                        if let Err(e) = db.clear() {
-                            tracing::warn!("Failed to clear checksum database: {}", e);
-                        } else {
-                            tracing::info!("Cleared checksum database");
-                        }
-                    }
-
-                    Some(db)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to open checksum database: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Start scan timing
         if let Some(ref monitor) = self.perf_monitor {
             monitor.lock().expect("perf monitor poisoned").start_scan();
@@ -228,7 +199,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let total_scanned = all_files.len();
         tracing::info!("Found {} items in source", total_scanned);
 
-        // Prepare transport for the workload (e.g., expand SSH connection pool)
         // Prepare transport for the workload (e.g., expand SSH connection pool)
         self.transport.prepare_for_transfer(total_scanned).await?;
 
@@ -1177,68 +1147,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             }
         }
 
-        // Store checksums in database if enabled
-        if let Some(ref db) = checksum_db {
-            if !self.config.dry_run {
-                let mut stored_count = 0;
-                let verifier = IntegrityVerifier::new(
-                    if self.config.comparison.checksum {
-                        ChecksumType::Fast
-                    } else {
-                        ChecksumType::None
-                    },
-                    false,
-                );
-
-                for file in &source_files {
-                    if file.is_dir {
-                        continue; // Skip directories
-                    }
-
-                    // Compute checksum for source file
-                    if let Ok(checksum) = verifier.compute_file_checksum(&file.path) {
-                        // Store in database
-                        if let Err(e) =
-                            db.store_checksum(&file.path, file.modified, file.size, &checksum)
-                        {
-                            tracing::warn!(
-                                "Failed to store checksum for {}: {}",
-                                file.path.display(),
-                                e
-                            );
-                        } else {
-                            stored_count += 1;
-                        }
-                    }
-                }
-
-                if stored_count > 0 {
-                    tracing::info!("Stored {} checksums in database", stored_count);
-                }
-
-                // Handle prune flag
-                if self.config.verification.prune_checksum_db {
-                    use std::collections::HashSet;
-                    let existing_paths: HashSet<_> =
-                        source_files.iter().map(|f| (*f.path).clone()).collect();
-
-                    match db.prune(&existing_paths) {
-                        Ok(pruned) => {
-                            if pruned > 0 {
-                                tracing::info!(
-                                    "Pruned {} stale entries from checksum database",
-                                    pruned
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to prune checksum database: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
         // Remove source files after successful transfer (--remove-source-files)
         if self.config.remove_source_files && !self.config.dry_run && final_stats.errors.is_empty()
         {
@@ -1428,9 +1336,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     pb.inc(1); // Indeterminate spinner update
 
                     // Plan the file
-                    // Pass None for checksum_db for now (streaming doesn't load it efficiently yet)
                     let task = planner
-                        .plan_file_async(&file, &destination, &transport, None)
+                        .plan_file_async(&file, &destination, &transport)
                         .await?;
 
                     Ok(task)

@@ -62,9 +62,6 @@ impl SyncConfig {
             verification: VerificationConfig {
                 mode: ChecksumType::Fast,
                 verify_on_write: false,
-                checksum_db: false,
-                clear_checksum_db: false,
-                prune_checksum_db: false,
             },
             preserve: PreserveConfig::default(),
             progress: false,
@@ -161,9 +158,6 @@ pub struct ComparisonConfig {
 pub struct VerificationConfig {
     pub mode: ChecksumType,
     pub verify_on_write: bool,
-    pub checksum_db: bool,
-    pub clear_checksum_db: bool,
-    pub prune_checksum_db: bool,
 }
 
 #[derive(Debug, Clone)]
