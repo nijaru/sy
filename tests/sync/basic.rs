@@ -994,15 +994,18 @@ fn test_max_size_flag() {
 fn test_bwlimit_flag() {
     let (source, dest) = setup_test_dir("bwlimit");
 
-    // Create a large file
-    fs::write(source.path().join("large.txt"), "a".repeat(10000)).unwrap();
+    // 30 KiB at a 60 KiB/s limit: the one-second burst covers the first
+    // 60 KiB, so the transfer completes without a measurable pause while
+    // still exercising the paced streaming path (native kernel copies are
+    // bypassed when a limit is set).
+    fs::write(source.path().join("large.txt"), "a".repeat(30 * 1024)).unwrap();
 
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--bwlimit=1",
+            "--bwlimit=60KB",
         ])
         .output()
         .unwrap();
@@ -1502,4 +1505,37 @@ fn test_trash_flag_removed() {
         "got:\n{stderr}"
     );
     assert!(!dest.path().join("keep.txt").exists());
+}
+
+/// --bwlimit actually paces local transfers: bytes above the one-second burst
+/// must take token-deficit time. This pins the regression where the local
+/// engine silently ignored the limit and transferred at full disk speed.
+#[test]
+fn test_bwlimit_paces_local_transfer() {
+    let (source, dest) = setup_test_dir("bwlimit_pace");
+
+    // 40 KiB payload at a 16 KiB/s limit: burst covers 16 KiB, the remaining
+    // 24 KiB need ~1.5 s of token refill.
+    fs::write(source.path().join("paced.bin"), vec![0_u8; 40 * 1024]).unwrap();
+
+    let start = std::time::Instant::now();
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--bwlimit=16KB",
+        ])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(dest.path().join("paced.bin")).unwrap().len(),
+        40 * 1024
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1300),
+        "transfer must be paced: 40 KiB at 16 KiB/s needs ~1.5 s, took {elapsed:?}"
+    );
 }

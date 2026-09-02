@@ -84,6 +84,11 @@ pub(crate) async fn run_local_sync(
         itemize_changes: config.itemize_changes,
         remove_source_files: config.remove_source_files,
         print_stats: config.stats,
+        rate_limiter: config.bwlimit.map(|limit| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::sync::ratelimit::RateLimiter::new(limit),
+            ))
+        }),
     });
 
     let batch_size = config

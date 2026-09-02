@@ -26,10 +26,15 @@ pub enum TransferStrategy {
     Streaming,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TransferOptions {
     pub update: bool,
     pub verify: bool,
+    /// Optional shared bandwidth pacing in bytes per second (`--bwlimit`).
+    /// When set, native kernel fast paths (fs::copy, reflink) are bypassed:
+    /// pacing requires bytes to flow through this process where the token
+    /// bucket can meter them.
+    pub rate_limiter: Option<std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,9 +82,16 @@ pub async fn transfer_file(
         "selecting transfer strategy"
     );
 
-    if let (Some(source_native), Some(dest_native)) =
+    // Kernel fast paths copy inside the kernel; a rate limit requires bytes
+    // to flow through this process, so native strategies are bypassed
+    // entirely when pacing is requested and the streaming loop below meters
+    // the bytes instead.
+    let native_pair = if options.rate_limiter.is_none() {
         (source.native_path(source_path), dest.native_path(dest_path))
-    {
+    } else {
+        (None, None)
+    };
+    if let (Some(source_native), Some(dest_native)) = native_pair {
         if source_caps.sparse
             && dest_caps.sparse
             && native_file_is_sparse(&source_native).unwrap_or(false)
@@ -127,8 +139,7 @@ pub async fn transfer_file(
 
         if dest_caps.atomic_rename {
             let result =
-                native_whole_copy(source_native, dest_native, metadata.clone(), options.verify)
-                    .await?;
+                native_whole_copy(source_native, dest_native, metadata, options.verify).await?;
             return Ok(TransferResult {
                 bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
@@ -145,8 +156,15 @@ pub async fn transfer_file(
             )));
         }
 
-        let result =
-            copy_file_streaming(source, source_path, dest, dest_path, options.verify).await?;
+        let result = copy_file_streaming(
+            source,
+            source_path,
+            dest,
+            dest_path,
+            options.verify,
+            options.rate_limiter.as_ref(),
+        )
+        .await?;
         return Ok(TransferResult {
             bytes_written: result.bytes_written,
             strategy: TransferStrategy::Streaming,

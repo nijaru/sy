@@ -53,6 +53,9 @@ pub struct ExecuteConfig {
     pub itemize_changes: bool,
     pub remove_source_files: bool,
     pub print_stats: bool,
+    /// Shared `--bwlimit` pacing for all local transfers. `None` keeps kernel
+    /// fast paths; `Some` routes bytes through the paced streaming copy.
+    pub rate_limiter: Option<std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
 }
 
 #[derive(Debug, Default)]
@@ -439,6 +442,7 @@ impl<'a> TaskExecutor<'a> {
             TransferOptions {
                 update: task.action == SyncAction::Update,
                 verify: self.verification.verify_on_write,
+                rate_limiter: self.config.rate_limiter.clone(),
             },
         )
         .await?;
@@ -541,6 +545,8 @@ impl<'a> TaskExecutor<'a> {
             TransferOptions {
                 update: false,
                 verify: false,
+                // Backups move bytes too; the same --bwlimit budget applies.
+                rate_limiter: self.config.rate_limiter.clone(),
             },
         )
         .await?;

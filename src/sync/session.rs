@@ -236,6 +236,11 @@ impl SyncSession {
             crate::endpoint::transfer::TransferOptions {
                 update: existed,
                 verify: self.config.verification.verify_on_write,
+                rate_limiter: self.config.bwlimit.map(|limit| {
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::sync::ratelimit::RateLimiter::new(limit),
+                    ))
+                }),
             },
         )
         .await?;
