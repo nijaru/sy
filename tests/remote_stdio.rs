@@ -85,13 +85,61 @@ async fn stdio_scan_completes_over_line_buffered_pipe() {
     );
 
     // Dropping the session drops the router and its writer task, closing the
-    // child's stdin pipe; the agent must observe EOF and terminate promptly.
-    // Its exit status is not asserted: on a clean disconnect the reader
-    // currently reports early-eof as an I/O error and exits 1, a separate
-    // defect from the flush regression under test.
+    // child's stdin pipe; the agent must observe EOF at a frame boundary,
+    // drain remaining acknowledgements, and terminate promptly. Exit status
+    // on clean EOF is pinned by `stdio_agent_exits_zero_on_clean_eof`.
     drop(session);
     tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .expect("agent did not exit after stdin EOF")
         .unwrap();
+}
+
+/// After a completed session, the client drops its transport handles (the
+/// usual way an SSH client ends a push: the `sy` process closes stdin). The
+/// agent must observe clean EOF at a frame boundary, finish remaining
+/// acknowledgements, and exit 0 — EOF is a peer hangup, not an I/O error.
+///
+/// EOF mid-frame remains an error: a header that promises payload bytes and
+/// never delivers them is truncation and must be loud.
+#[tokio::test]
+async fn stdio_agent_exits_zero_on_clean_eof() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("file"), b"content").unwrap();
+
+    let mut child = Command::new(sy_bin())
+        .arg("__serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+
+    let session = ClientRemoteSession::connect(
+        child_stdout,
+        child_stdin,
+        Operation::Push,
+        root.path(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let entries = session.scan(ScanRequest::default()).await.unwrap();
+    let count = Box::pin(entries).count().await;
+    assert_eq!(count, 1, "scan should list the one file");
+
+    drop(session);
+
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("agent did not exit after stdin EOF")
+        .unwrap();
+    assert!(
+        status.success(),
+        "agent must exit 0 on clean EOF at a frame boundary, got {status}"
+    );
 }

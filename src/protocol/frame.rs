@@ -189,21 +189,86 @@ fn validate_payload_len(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Result of reading a frame, distinguishing a clean end of stream at a
+/// frame boundary from truncation in the middle of a frame.
+#[derive(Debug)]
+pub enum ReadFrame {
+    /// A complete frame was read.
+    Frame(Frame),
+    /// The reader reached end of stream exactly between two frames: no
+    /// protocol bytes were lost. A peer closing stdin/stdout after its
+    /// last acknowledgement must not be reported as a transport failure.
+    CleanEof,
+}
+
 pub async fn read_frame<R>(reader: &mut R) -> Result<Frame>
 where
     R: AsyncRead + Unpin,
 {
+    match read_frame_or_eof(reader).await? {
+        ReadFrame::Frame(frame) => Ok(frame),
+        ReadFrame::CleanEof => Err(ProtocolError::CleanEof),
+    }
+}
+
+/// Read one frame, reporting a clean end of stream instead of an I/O error
+/// when the transport closes exactly at a frame boundary. Mid-frame EOF
+/// remains an `Io(UnexpectedEof)` error: bytes were promised by a header and
+/// never delivered.
+pub async fn read_frame_or_eof<R>(reader: &mut R) -> Result<ReadFrame>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0_u8; HEADER_LEN];
-    reader.read_exact(&mut header).await?;
+    match read_exact_or_eof(reader, &mut header).await? {
+        EofAt::Clean => return Ok(ReadFrame::CleanEof),
+        EofAt::Byte(byte) => {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("connection closed mid-header after {byte} of {HEADER_LEN} bytes"),
+            );
+            return Err(ProtocolError::Io(error));
+        }
+        EofAt::Complete => {}
+    }
     let header = FrameHeader::decode(header)?;
     let mut payload = vec![0_u8; header.payload_len];
     reader.read_exact(&mut payload).await?;
-    Frame::new(
+    Ok(ReadFrame::Frame(Frame::new(
         header.kind,
         header.flags,
         header.stream_id,
         Bytes::from(payload),
-    )
+    )?))
+}
+
+/// How much of a fixed-length read completed before the stream ended.
+enum EofAt {
+    Clean,
+    Byte(usize),
+    Complete,
+}
+
+async fn read_exact_or_eof<R>(reader: &mut R, buf: &mut [u8]) -> Result<EofAt>
+where
+    R: AsyncRead + Unpin,
+{
+    // An empty read buffer cannot distinguish clean from truncated EOF;
+    // callers with zero-length headers do not exist in this protocol.
+    debug_assert!(!buf.is_empty());
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            return Ok(if filled == 0 {
+                EofAt::Clean
+            } else {
+                EofAt::Byte(filled)
+            });
+        }
+        filled += n;
+    }
+    Ok(EofAt::Complete)
 }
 
 pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<()>
@@ -300,4 +365,71 @@ mod tests {
         #[test]
         fn arbitrary_headers_never_panic(header in any::<[u8; HEADER_LEN]>()) { let _ = FrameHeader::decode(header); }
     }
+}
+
+#[tokio::test]
+async fn clean_eof_between_frames_is_reported_as_clean_eof() {
+    let (mut writer, mut reader) = tokio::io::duplex(64);
+    let frame = Frame::new(
+        FrameKind::Data,
+        FrameFlags::empty(),
+        StreamId::CONTROL,
+        Bytes::from_static(b"x"),
+    )
+    .unwrap();
+    write_frame(&mut writer, &frame).await.unwrap();
+    drop(writer);
+
+    assert!(matches!(
+        read_frame_or_eof(&mut reader).await.unwrap(),
+        ReadFrame::Frame(_)
+    ));
+    assert!(matches!(
+        read_frame_or_eof(&mut reader).await.unwrap(),
+        ReadFrame::CleanEof
+    ));
+}
+
+#[tokio::test]
+async fn eof_mid_header_is_truncation_not_clean_eof() {
+    let (mut writer, mut reader) = tokio::io::duplex(HEADER_LEN);
+    // Partial header: 5 of HEADER_LEN bytes, then the peer closes.
+    writer.write_all(&[0_u8; 5]).await.unwrap();
+    drop(writer);
+    let error = read_frame_or_eof(&mut reader).await.unwrap_err();
+    assert!(
+        error.to_string().contains("mid-header"),
+        "mid-header EOF must be a loud truncation error, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn eof_mid_payload_is_truncation_not_clean_eof() {
+    let (mut writer, mut reader) = tokio::io::duplex(HEADER_LEN + 8);
+    let frame = Frame::new(
+        FrameKind::Data,
+        FrameFlags::empty(),
+        StreamId::CONTROL,
+        Bytes::from_static(b"eight-bytes-payload!"),
+    )
+    .unwrap();
+    // Write the full header but only part of the promised payload before
+    // closing: the header says 19 payload bytes, only 8 ever arrive.
+    let header = FrameHeader {
+        payload_len: frame.payload.len(),
+        kind: frame.kind,
+        flags: frame.flags,
+        stream_id: frame.stream_id,
+    }
+    .encode()
+    .unwrap();
+    writer.write_all(&header).await.unwrap();
+    writer.write_all(&frame.payload[..8]).await.unwrap();
+    drop(writer);
+    let error = read_frame_or_eof(&mut reader).await.unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("I/O"),
+        "mid-payload EOF must surface as an I/O truncation error, got: {text}"
+    );
 }
