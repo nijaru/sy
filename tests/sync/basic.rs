@@ -1493,3 +1493,84 @@ fn test_checksum_db_flags_removed() {
     }
     assert!(!dest.path().join("file.txt").exists());
 }
+
+/// --remove-source-files locally: transferred and planner-verified unchanged
+/// files move (destination bytes intact); skips without verified destination
+/// parity keep their source; directories are never removed.
+#[test]
+fn test_remove_source_files_moves_committed_and_verified_entries() {
+    let (source, dest) = setup_test_dir("remove_source_files");
+
+    fs::write(source.path().join("created.txt"), "created").unwrap();
+    fs::write(dest.path().join("updated.txt"), "old").unwrap();
+    fs::write(source.path().join("updated.txt"), "new").unwrap();
+    fs::create_dir(source.path().join("sub")).unwrap();
+    fs::write(source.path().join("sub/inner.txt"), "inner").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--remove-source-files",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Moved bytes all present at the destination.
+    assert_eq!(
+        fs::read_to_string(dest.path().join("created.txt")).unwrap(),
+        "created"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("updated.txt")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("sub/inner.txt")).unwrap(),
+        "inner"
+    );
+
+    // Sources removed; empty directory kept.
+    assert!(!source.path().join("created.txt").exists());
+    assert!(!source.path().join("updated.txt").exists());
+    assert!(!source.path().join("sub/inner.txt").exists());
+    assert!(source.path().join("sub").is_dir());
+}
+
+/// Under --remove-source-files, a file that exists only in the source is
+/// never removed when --existing skips its transfer: the destination has no
+/// verified copy, so removal would destroy the only remaining bytes.
+#[test]
+fn test_remove_source_files_keeps_untransferred_source_under_existing() {
+    let (source, dest) = setup_test_dir("remove_source_existing");
+
+    fs::write(source.path().join("only-here.txt"), "precious").unwrap();
+    fs::write(dest.path().join("other.txt"), "else").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--remove-source-files",
+            "--existing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(source.path().join("only-here.txt")).is_ok(),
+        "untransferred source must be kept under --existing"
+    );
+    assert!(!dest.path().join("only-here.txt").exists());
+}

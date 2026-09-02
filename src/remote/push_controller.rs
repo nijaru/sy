@@ -1,5 +1,5 @@
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
-use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, SkipReason, SyncOp};
 use crate::engine::finalize_journal::{
     FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
@@ -365,6 +365,10 @@ impl RemotePushController {
 
         while let Some(operation) = reader.next().await? {
             record_semantic_operation(&mut summary, &operation)?;
+            if let Some(source) = removable_skip_source(&operation) {
+                self.executor.remove_verified_parity_source(source).await?;
+                continue;
+            }
             let Some(main) = lower_sync_op(operation, execution_policy)?.main else {
                 continue;
             };
@@ -572,6 +576,22 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
         .ok_or(RemotePushControllerError::CounterOverflow(counter))
 }
 
+/// Under --remove-source-files, an entry the planner verified as unchanged
+/// (size/mtime parity, or content equality for checksum comparison) may move:
+/// the destination already holds the exact bytes. Skips for other reasons
+/// (--existing with a missing destination, --ignore-existing, --update with a
+/// newer destination, filtered entries) have no verified destination copy and
+/// must keep their source.
+fn removable_skip_source(operation: &SyncOp) -> Option<&Entry> {
+    match operation {
+        SyncOp::Skip {
+            source,
+            reason: SkipReason::Unchanged,
+        } if !source.is_directory() => Some(source),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,7 +642,7 @@ mod tests {
         ));
         assert!(matches!(
             plan.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { path: value, .. }) if value == path("c")
+            Some(SyncOp::Skip { source, .. }) if source.path == path("c")
         ));
         assert!(plan.reader.next().await.unwrap().is_none());
     }
@@ -680,9 +700,9 @@ mod tests {
         assert!(matches!(
             plan.reader.next().await.unwrap(),
             Some(SyncOp::Skip {
-                path: value,
+                source,
                 reason: crate::engine::domain::SkipReason::MissingDestination,
-            }) if value == path("missing")
+            }) if source.path == path("missing")
         ));
         assert!(plan.reader.next().await.unwrap().is_none());
         assert!(plan.finalize.next().await.unwrap().is_none());
@@ -758,7 +778,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             equal.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { path: value, .. }) if value == path("a")
+            Some(SyncOp::Skip { source, .. }) if source.path == path("a")
         ));
 
         let mut changed = preflight_remote_push_scoped_with_content(
@@ -861,7 +881,7 @@ mod tests {
 
         assert!(matches!(
             plan.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { path: value, .. }) if value == path("parent")
+            Some(SyncOp::Skip { source, .. }) if source.path == path("parent")
         ));
         assert_eq!(
             plan.finalize.next().await.unwrap(),

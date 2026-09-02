@@ -42,7 +42,7 @@ pub fn plan_entry(
     let Some(destination) = destination else {
         return PlanDecision::Ready(if policy.existing_only {
             SyncOp::Skip {
-                path: source.path,
+                source,
                 reason: SkipReason::MissingDestination,
             }
         } else {
@@ -52,14 +52,14 @@ pub fn plan_entry(
 
     if policy.ignore_existing {
         return PlanDecision::Ready(SyncOp::Skip {
-            path: source.path,
+            source,
             reason: SkipReason::ExistingOnly,
         });
     }
 
     if policy.update_only && destination.modified > source.modified {
         return PlanDecision::Ready(SyncOp::Skip {
-            path: source.path,
+            source,
             reason: SkipReason::DestinationNewer,
         });
     }
@@ -160,7 +160,7 @@ fn metadata_or_skip(source: Entry, destination: Entry, policy: ComparisonPolicy)
         }
     } else {
         SyncOp::Skip {
-            path: source.path,
+            source,
             reason: SkipReason::Unchanged,
         }
     }

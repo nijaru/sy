@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sy::engine::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
 use sy::engine::delete_plan::{enforce_delete_policy, DeleteLimit, DeletePlanError, DeletePolicy};
-use sy::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use sy::engine::domain::{Entry, EntryKind, SkipReason, SyncOp, Timestamp};
 use sy::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonMode, ComparisonPolicy, PlanDecision,
 };
@@ -196,6 +196,14 @@ async fn queue_operation(
     executor: &TaskExecutor<'_>,
     stats: &mut SyncStats,
 ) -> Result<()> {
+    if let SyncOp::Skip { source, reason } = &operation {
+        if *reason == SkipReason::Unchanged && !source.is_directory() {
+            remove_skipped_source_after_parity(source_endpoint.root(), config, source).await?;
+            stats.files_skipped += 1;
+            return Ok(());
+        }
+    }
+
     let Some(task) = compatibility_task(source_endpoint, config, operation).await? else {
         stats.files_skipped += 1;
         return Ok(());
@@ -210,6 +218,64 @@ async fn queue_operation(
     if batch.len() >= batch_size {
         execute_batch(executor, batch, stats).await?;
     }
+    Ok(())
+}
+
+/// Under --remove-source-files, an entry the planner verified as unchanged
+/// (destination already holds the exact bytes) moves without a transfer:
+/// removal happens right after reconciliation records the skip. Skips for
+/// other reasons (missing destination under --existing, --ignore-existing,
+/// --update with a newer destination, filtered entries) have no verified
+/// destination copy and keep their source. The scan identity is re-checked
+/// before removal so a source replaced after the scan is never deleted.
+#[cfg(unix)]
+async fn remove_skipped_source_after_parity(
+    source_root: &Path,
+    config: &SyncConfig,
+    source: &Entry,
+) -> Result<()> {
+    if !config.remove_source_files || config.dry_run {
+        return Ok(());
+    }
+    if source.is_directory() {
+        return Ok(());
+    }
+    let path = source_root.join(source.path.as_path());
+    let Some(expected) = source.identity else {
+        return Err(SyncError::Config(format!(
+            "source entry {} changed between scan and removal; not removing",
+            source.path
+        )));
+    };
+    let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+        SyncError::Config(format!(
+            "source entry {} changed between scan and removal; not removing ({error})",
+            source.path
+        ))
+    })?;
+    let current = crate::endpoint::local_identity::metadata_identity(&metadata, source.kind)
+        .ok_or_else(|| {
+            SyncError::Config(format!(
+                "source entry {} changed between scan and removal; not removing",
+                source.path
+            ))
+        })?;
+    if current != expected {
+        return Err(SyncError::Config(format!(
+            "source entry {} changed between scan and removal; not removing",
+            source.path
+        )));
+    }
+    tokio::fs::remove_file(&path).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn remove_skipped_source_after_parity(
+    _source_root: &Path,
+    _config: &SyncConfig,
+    _source: &Entry,
+) -> Result<()> {
     Ok(())
 }
 
@@ -297,12 +363,25 @@ async fn hardlink_compatibility_metadata(
 ) -> Result<(Option<u64>, u64)> {
     use std::os::unix::fs::MetadataExt;
 
-    if !config.preserve.hardlinks || kind != EntryKind::File {
+    if kind != EntryKind::File {
+        return Ok((None, 1));
+    }
+
+    // The extra stat is reserved for consumers that need inode facts:
+    // hard-link preservation (link topology) and --remove-source-files
+    // (post-commit source race checks).
+    let needs_inode = config.preserve.hardlinks || config.remove_source_files;
+    if !needs_inode {
         return Ok((None, 1));
     }
 
     let metadata = tokio::fs::symlink_metadata(path).await?;
-    Ok((Some(metadata.ino()), metadata.nlink()))
+    let nlink = if config.preserve.hardlinks {
+        metadata.nlink()
+    } else {
+        1
+    };
+    Ok((Some(metadata.ino()), nlink))
 }
 
 #[cfg(not(unix))]

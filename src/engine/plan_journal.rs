@@ -185,9 +185,9 @@ fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
             encode_entry(&mut payload, source)?;
             encode_entry(&mut payload, destination)?;
         }
-        SyncOp::Skip { path, reason } => {
+        SyncOp::Skip { source, reason } => {
             payload.push(4);
-            encode_relative_path(&mut payload, path)?;
+            encode_entry(&mut payload, source)?;
             payload.push(match reason {
                 SkipReason::Unchanged => 0,
                 SkipReason::Filtered => 1,
@@ -219,7 +219,7 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
             destination: decode_entry(&mut reader)?,
         },
         4 => {
-            let path = decode_relative_path(&mut reader)?;
+            let source = decode_entry(&mut reader)?;
             let reason = match reader.u8()? {
                 0 => SkipReason::Unchanged,
                 1 => SkipReason::Filtered,
@@ -232,7 +232,7 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
                     ))
                 }
             };
-            SyncOp::Skip { path, reason }
+            SyncOp::Skip { source, reason }
         }
         _ => {
             return Err(PlanJournalError::InvalidRecord(
@@ -525,11 +525,11 @@ mod tests {
                 destination,
             },
             SyncOp::Skip {
-                path: path("skip"),
+                source: file("skip", 1, 0xBB),
                 reason: SkipReason::DestinationNewer,
             },
             SyncOp::Skip {
-                path: path("missing"),
+                source: file("missing", 1, 0xCC),
                 reason: SkipReason::MissingDestination,
             },
         ];
@@ -551,8 +551,10 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![b'f', 0x80, b'o']);
         let relative = RelativePath::new(PathBuf::from(raw)).unwrap();
+        let mut source = file("f", 1, 0x80);
+        source.path = relative.clone();
         let operation = SyncOp::Skip {
-            path: relative.clone(),
+            source,
             reason: SkipReason::Filtered,
         };
         let mut journal = PlanJournal::new().await.unwrap();
@@ -584,7 +586,7 @@ mod tests {
         let mut journal = PlanJournal::new().await.unwrap();
         journal
             .append(&SyncOp::Skip {
-                path: path("skip"),
+                source: file("skip", 1, 0xAA),
                 reason: SkipReason::Unchanged,
             })
             .await
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     fn decoder_rejects_trailing_bytes_and_unknown_tags() {
         let operation = SyncOp::Skip {
-            path: path("skip"),
+            source: file("skip", 1, 0xAA),
             reason: SkipReason::Unchanged,
         };
         let mut payload = encode_operation(&operation).unwrap();

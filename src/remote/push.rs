@@ -77,6 +77,12 @@ pub enum RemotePushError {
 
     #[error("symlink action is missing the scanned target for {0}")]
     MissingSymlinkTarget(PathBuf),
+
+    #[error("source entry {0} changed between scan and removal; not removing")]
+    SourceChangedBeforeRemoval(PathBuf),
+
+    #[error("failed to remove committed source {0}: {1}")]
+    SourceRemoval(PathBuf, std::io::Error),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -328,6 +334,9 @@ pub struct RemotePushExecutor {
     scheduler: Scheduler,
     delta_limits: BasisIndexLimits,
     delta_min_size: u64,
+    /// --remove-source-files: delete the source entry after its destination
+    /// commit is acknowledged (v3 commits only after BLAKE3 verification).
+    remove_source_files: bool,
 }
 
 impl RemotePushExecutor {
@@ -343,11 +352,17 @@ impl RemotePushExecutor {
             scheduler,
             delta_limits,
             delta_min_size: DEFAULT_REMOTE_DELTA_MIN_SIZE,
+            remove_source_files: false,
         }
     }
 
     pub const fn with_delta_min_size(mut self, bytes: u64) -> Self {
         self.delta_min_size = bytes;
+        self
+    }
+
+    pub const fn with_remove_source_files(mut self, enabled: bool) -> Self {
+        self.remove_source_files = enabled;
         self
     }
 
@@ -373,11 +388,12 @@ impl RemotePushExecutor {
                     .remote
                     .transfer_file_with_metadata(
                         self.source_root.clone(),
-                        source,
+                        source.clone(),
                         delta_basis,
                         metadata,
                     )
                     .await?;
+                self.remove_committed_source(&source).await?;
                 Ok(Some(summary))
             }
             RemotePushAction::ReplaceSymlink { source, modified } => {
@@ -390,6 +406,7 @@ impl RemotePushExecutor {
                         .apply_metadata(&source.path, EntryKind::Symlink, None, Some(modified))
                         .await?;
                 }
+                self.remove_committed_source(&source).await?;
                 Ok(None)
             }
             RemotePushAction::ApplyMetadata {
@@ -437,6 +454,71 @@ impl RemotePushExecutor {
                 metadata.modified,
             )
             .await?;
+        Ok(())
+    }
+
+    /// --remove-source-files: remove an entry the planner verified as already
+    /// in sync with the destination. Only callable for non-directories whose
+    /// scan identity still matches; a changed source is refused.
+    pub async fn remove_verified_parity_source(&self, source: &Entry) -> Result<()> {
+        if !self.remove_source_files {
+            return Ok(());
+        }
+        self.remove_committed_source(source).await
+    }
+
+    /// Remove the source entry under --remove-source-files after the
+    /// destination commit is acknowledged. The scan identity is re-checked
+    /// first: a source replaced or modified after the scan must not be
+    /// removed, because the moved bytes would not be the verified ones.
+    #[cfg(unix)]
+    async fn remove_committed_source(&self, source: &Entry) -> Result<()> {
+        if !self.remove_source_files {
+            return Ok(());
+        }
+        let path = self.source_root.join(source.path.as_path());
+        let expected = source
+            .identity
+            .ok_or_else(|| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|_| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
+        let kind = if metadata.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
+            .ok_or_else(|| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
+        if current != expected {
+            return Err(RemotePushError::SourceChangedBeforeRemoval(path));
+        }
+        // Only non-directories move. Empty directories stay, matching rsync's
+        // --remove-source-files semantics.
+        if kind == EntryKind::Directory {
+            return Ok(());
+        }
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|error| RemotePushError::SourceRemoval(path, error))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn remove_committed_source(&self, source: &Entry) -> Result<()> {
+        if !self.remove_source_files {
+            return Ok(());
+        }
+        let path = self.source_root.join(source.path.as_path());
+        let metadata = tokio::fs::symlink_metadata(&path).await?;
+        if metadata.is_dir() {
+            return Ok(());
+        }
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|error| RemotePushError::SourceRemoval(path, error))?;
         Ok(())
     }
 

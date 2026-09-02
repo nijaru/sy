@@ -44,9 +44,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode != SymlinkMode::Preserve {
         return Some("non-preserving symlink modes are not yet mapped to v3");
     }
-    if config.remove_source_files {
-        return Some("post-success source removal is not yet implemented by v3");
-    }
     if config.backup.is_some() || config.backup_dir.is_some() {
         return Some("backup semantics are not yet implemented by v3");
     }
@@ -283,7 +280,8 @@ async fn execute_with_handle(
         remote,
         scheduler,
         BasisIndexLimits::default(),
-    );
+    )
+    .with_remove_source_files(config.remove_source_files);
     let summary = RemotePushController::new(executor, max_in_flight)
         .execute(plan)
         .await
@@ -419,8 +417,8 @@ fn emit_diff_line(item: PreviewOp<'_>) {
         PreviewOp::Operation(SyncOp::Metadata { source, .. }) => {
             tracing::info!("Would update metadata: {}", source.path)
         }
-        PreviewOp::Operation(SyncOp::Skip { path, .. }) => {
-            tracing::info!("Would skip: {}", path)
+        PreviewOp::Operation(SyncOp::Skip { source, .. }) => {
+            tracing::info!("Would skip: {}", source.path)
         }
         PreviewOp::Delete(delete) => tracing::info!(
             "Would delete: {}{}",
@@ -537,6 +535,110 @@ mod tests {
 
     fn file_entry(value: &str) -> Entry {
         sized_file_entry(value, 1)
+    }
+
+    /// --remove-source-files over v3: transferred files and planner-verified
+    /// unchanged files move; the destination keeps every byte and directories
+    /// stay. A skip without verified destination parity (missing destination
+    /// under --existing) must keep its source.
+    #[tokio::test]
+    async fn remove_source_files_moves_committed_and_unchanged_entries() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::create_dir(source_root.path().join("keep-dir")).unwrap();
+        std::fs::write(source_root.path().join("keep-dir/inner"), b"inner").unwrap();
+        std::fs::write(source_root.path().join("created"), b"new").unwrap();
+        std::fs::write(source_root.path().join("updated"), b"new-value").unwrap();
+        // Unchanged file: identical size and mtime means quick comparison skips.
+        let unchanged = source_root.path().join("unchanged");
+        std::fs::write(&unchanged, b"same").unwrap();
+        let dest_unchanged = destination_root.path().join("unchanged");
+        std::fs::write(&dest_unchanged, b"same").unwrap();
+        let metadata = std::fs::metadata(&unchanged).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        filetime::set_file_times(&dest_unchanged, mtime, mtime).unwrap();
+        std::fs::write(destination_root.path().join("updated"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            // dest scan, source scan, three file transfers (create + update +
+            // directory descendants), and no more.
+            for _ in 0..5 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        session.mutation_handler().serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected remove-source v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.remove_source_files = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 2, "created + inner");
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_skipped, 1);
+        // Every moved byte is present at the destination.
+        assert_eq!(
+            std::fs::read(destination_root.path().join("created")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("updated")).unwrap(),
+            b"new-value"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("unchanged")).unwrap(),
+            b"same"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("keep-dir/inner")).unwrap(),
+            b"inner"
+        );
+        // Sources moved; the empty directory remains (rsync semantics).
+        assert!(!source_root.path().join("created").exists());
+        assert!(!source_root.path().join("updated").exists());
+        assert!(!source_root.path().join("unchanged").exists());
+        assert!(!source_root.path().join("keep-dir/inner").exists());
+        assert!(source_root.path().join("keep-dir").is_dir());
+    }
+
+    #[test]
+    fn remove_source_files_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.remove_source_files = true;
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]
