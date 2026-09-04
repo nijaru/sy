@@ -204,6 +204,22 @@ impl RootedFs {
         self.create_directory_path_blocking(relative.as_path())
     }
 
+    /// Copy one regular file to another root-relative path (`--backup`). The
+    /// source is opened with the same no-follow, root-confined resolution as
+    /// transfers; the destination is written through staged rename so a
+    /// failed copy never exposes a partial backup. Destination parent
+    /// directories are created root-confined. The copy preserves the source's
+    /// mode and mtime.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn copy_file_blocking(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+    ) -> Result<()> {
+        self.copy_file_path_blocking(source.as_path(), destination.as_path())
+    }
+
     /// Atomically replace a non-directory destination with a symlink while the
     /// resolved parent directory remains pinned. The symlink target is stored as
     /// opaque native path data and is never resolved by this operation.
@@ -316,6 +332,70 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
+    fn copy_file_path_blocking(&self, source: &Path, destination: &Path) -> Result<()> {
+        // Parent directories of the backup location may not exist yet; create
+        // each one root-confined (mkdir -p semantics beneath the pinned root).
+        if let Some(parent) = destination.parent() {
+            self.ensure_directories_blocking(parent)?;
+        }
+
+        let source_file = self.open_regular_path_blocking(source)?;
+        let source_metadata = source_file.metadata()?;
+        if !source_metadata.file_type().is_file() {
+            return Err(RootedFsError::NotRegularFile(source.to_path_buf()));
+        }
+        let source_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(source_metadata.permissions().mode() & 0o7777)
+        };
+        let source_mtime = source_metadata.modified().ok().and_then(|time| {
+            let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Timestamp::new(duration.as_secs() as i64, duration.subsec_nanos()).ok()
+        });
+
+        let mut staged = self.begin_staged_path_blocking(destination)?;
+        std::io::copy(&mut &source_file, staged.file_mut())?;
+        staged.apply_metadata_blocking(source_mode, source_mtime)?;
+        staged.commit()
+    }
+
+    #[cfg(not(unix))]
+    fn copy_file_path_blocking(&self, _source: &Path, _destination: &Path) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Create each missing ancestor directory of `relative` beneath the
+    /// pinned root without following symlink components. Existing real
+    /// directories are accepted; other leaf kinds are errors.
+    #[cfg(unix)]
+    fn ensure_directories_blocking(&self, relative: &Path) -> Result<()> {
+        let mut current_fd = self.root_fd.try_clone()?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(RootedFsError::InvalidRelativePath);
+            };
+            current_fd = match open_dir_at(current_fd.as_raw_fd(), name) {
+                Ok(fd) => fd,
+                Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    let name_c = component_cstring(name)?;
+                    let result = unsafe {
+                        // SAFETY: `current_fd` remains open and `name_c` is a
+                        // live single component. mkdirat creates only beneath
+                        // the already-resolved parent.
+                        libc::mkdirat(current_fd.as_raw_fd(), name_c.as_ptr(), 0o777)
+                    };
+                    if result != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    open_dir_at(current_fd.as_raw_fd(), name)?
+                }
+                Err(error) => return Err(error),
+            };
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn create_directory_path_blocking(&self, relative: &Path) -> Result<()> {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let leaf_c = component_cstring(&leaf)?;
@@ -387,7 +467,18 @@ impl RootedFs {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
             Ok(()) => Ok(()),
+            // A vanished entry is idempotent success.
             Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            // A non-empty directory is kept, not an error: under --backup a
+            // deletion's backup copy may legitimately repopulate the
+            // directory right before its removal (rsync behaves the same).
+            Err(RootedFsError::Io(error))
+                if is_directory
+                    && (error.raw_os_error() == Some(libc::ENOTEMPTY)
+                        || error.raw_os_error() == Some(libc::EEXIST)) =>
+            {
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }
