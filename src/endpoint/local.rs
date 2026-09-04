@@ -1,35 +1,29 @@
-use crate::endpoint::{Capabilities, Endpoint, EndpointType, FileMetadata, ScanOptions};
-use crate::error::Result;
-use crate::sync::scanner::{FileEntry, Scanner};
+use crate::endpoint::{
+    BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, StagedWriter,
+};
+use crate::error::{Result, SyncError};
 use async_trait::async_trait;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-// Dead-code suppressed until Phase 3 (SyncSession) wires these in.
-#[allow(dead_code)]
+/// Local filesystem endpoint.
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
-    scan_options: ScanOptions,
 }
 
-#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 impl LocalEndpoint {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             capabilities: Capabilities::local(),
-            scan_options: ScanOptions::default(),
         }
-    }
-
-    pub fn with_scan_options(mut self, options: ScanOptions) -> Self {
-        self.scan_options = options;
-        self
     }
 
     fn resolve(&self, relative: &Path) -> PathBuf {
@@ -41,7 +35,6 @@ impl LocalEndpoint {
     }
 }
 
-#[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
     FileMetadata {
         size: meta.len(),
@@ -50,12 +43,121 @@ fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
         is_symlink: meta.is_symlink(),
         #[cfg(unix)]
         mode: meta.mode(),
+    }
+}
+
+/// Transactional local regular-file write backed by a same-directory temp file.
+struct LocalStagedWriter {
+    file: Option<tokio::fs::File>,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    guard: Option<crate::temp_file::TempFileGuard>,
+}
+
+impl LocalStagedWriter {
+    async fn new(final_path: PathBuf) -> Result<Self> {
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&final_path);
+        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+
+        Ok(Self {
+            file: Some(file),
+            temp_path,
+            final_path,
+            guard: Some(guard),
+        })
+    }
+
+    fn file_mut(&mut self) -> Result<&mut tokio::fs::File> {
+        self.file.as_mut().ok_or_else(|| {
+            SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "staged writer is already closed",
+            ))
+        })
+    }
+}
+
+#[async_trait]
+impl StagedWriter for LocalStagedWriter {
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.file_mut()?.write_all(data).await?;
+        Ok(())
+    }
+
+    async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()> {
+        self.file_mut()?.flush().await?;
+        filetime::set_file_mtime(
+            &self.temp_path,
+            filetime::FileTime::from_system_time(metadata.modified),
+        )?;
+
         #[cfg(unix)]
-        uid: meta.uid(),
-        #[cfg(unix)]
-        gid: meta.gid(),
-        #[cfg(unix)]
-        nlink: meta.nlink(),
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(
+                &self.temp_path,
+                std::fs::Permissions::from_mode(metadata.mode),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
+        const BUFFER_SIZE: usize = 1024 * 1024;
+        self.file_mut()?.flush().await?;
+
+        let mut file = tokio::fs::File::open(&self.temp_path).await?;
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Some(hasher.finalize()))
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            drop(file);
+        }
+        tokio::fs::rename(&self.temp_path, &self.final_path).await?;
+        if let Some(guard) = self.guard.take() {
+            guard.defuse();
+        }
+        Ok(())
+    }
+
+    async fn abort(mut self: Box<Self>) -> Result<()> {
+        self.file.take();
+        match tokio::fs::remove_file(&self.temp_path).await {
+            Ok(()) => {
+                if let Some(guard) = self.guard.take() {
+                    guard.defuse();
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(guard) = self.guard.take() {
+                    guard.defuse();
+                }
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -73,65 +175,241 @@ impl Endpoint for LocalEndpoint {
         &self.root
     }
 
-    async fn scan(&self, opts: ScanOptions) -> Result<Vec<FileEntry>> {
-        let path = self.root.clone();
-        let options = opts;
-        tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::new(&path).with_options(options);
-            scanner.scan()
-        })
-        .await
-        .map_err(|e| crate::error::SyncError::Io(std::io::Error::other(e.to_string())))?
+    fn native_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(self.resolve(path))
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
-        let full_path = self.resolve(path);
-        Ok(tokio::fs::try_exists(&full_path).await.unwrap_or(false))
+        match tokio::fs::symlink_metadata(self.resolve(path)).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
-        let full_path = self.resolve(path);
-        let meta = tokio::fs::metadata(&full_path).await?;
+        let meta = tokio::fs::symlink_metadata(self.resolve(path)).await?;
         Ok(file_metadata_from_fs(&meta))
     }
 
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
-        let full_path = self.resolve(path);
-        tokio::fs::read(&full_path).await.map_err(|e| {
-            crate::error::SyncError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to read file {}: {}", full_path.display(), e),
-            ))
-        })
-    }
-
-    async fn write_file(&self, path: &Path, data: &[u8], meta: &FileMetadata) -> Result<()> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Atomic write: temp file + rename (same directory = same filesystem)
-        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&full_path);
-        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
-
-        tokio::fs::write(&temp_path, data).await?;
-        filetime::set_file_mtime(
-            &temp_path,
-            filetime::FileTime::from_system_time(meta.modified),
-        )?;
+    async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(meta.mode);
-            tokio::fs::set_permissions(&temp_path, perms).await?;
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Vec<(OsString, Vec<u8>)>> {
+                let mut result = Vec::new();
+                for name in xattr::list(&full_path)? {
+                    if let Some(value) = xattr::get(&full_path, &name)? {
+                        result.push((name, value));
+                    }
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
         }
 
-        // Atomic rename to final path
-        tokio::fs::rename(&temp_path, &full_path).await?;
-        guard.defuse();
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "local extended attributes are unsupported on this platform".to_string(),
+            ))
+        }
+    }
 
-        Ok(())
+    async fn write_xattrs(&self, path: &Path, xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let full_path = self.resolve(path);
+            let xattrs = xattrs.to_vec();
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                let existing: Vec<OsString> = xattr::list(&full_path)?.collect();
+
+                for (name, value) in &xattrs {
+                    xattr::set(&full_path, name, value)?;
+                }
+
+                for name in existing {
+                    if !xattrs.iter().any(|(desired, _)| desired == &name) {
+                        xattr::remove(&full_path, &name)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (path, xattrs);
+            Err(SyncError::Config(
+                "local extended attributes are unsupported on this platform".to_string(),
+            ))
+        }
+    }
+
+    async fn read_acl(&self, path: &Path) -> Result<Option<String>> {
+        #[cfg(all(unix, feature = "acl"))]
+        {
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                let entries = exacl::getfacl(&full_path, None)?;
+                if entries.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        entries
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ))
+                }
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(all(unix, feature = "acl")))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "local ACL preservation requires the acl feature on Unix".to_string(),
+            ))
+        }
+    }
+
+    async fn write_acl(&self, path: &Path, acl: &str) -> Result<()> {
+        #[cfg(all(unix, feature = "acl"))]
+        {
+            let full_path = self.resolve(path);
+            let acl = acl.to_string();
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::str::FromStr;
+
+                let entries = if acl.is_empty() {
+                    #[cfg(target_os = "macos")]
+                    {
+                        Vec::new()
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = std::fs::metadata(&full_path)?.permissions().mode();
+                        exacl::from_mode(mode & 0o777)
+                    }
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "freebsd",
+                        target_os = "macos"
+                    )))]
+                    {
+                        Vec::new()
+                    }
+                } else {
+                    acl.lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| {
+                            exacl::AclEntry::from_str(line).map_err(|error| {
+                                SyncError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    error.to_string(),
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                exacl::setfacl(&[&full_path], &entries, None)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(all(unix, feature = "acl")))]
+        {
+            let _ = (path, acl);
+            Err(SyncError::Config(
+                "local ACL preservation requires the acl feature on Unix".to_string(),
+            ))
+        }
+    }
+
+    async fn read_bsd_flags(&self, path: &Path) -> Result<Option<u32>> {
+        #[cfg(target_os = "macos")]
+        {
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
+                use std::os::macos::fs::MetadataExt;
+                Ok(Some(std::fs::symlink_metadata(full_path)?.st_flags()))
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err(SyncError::Config(
+                "BSD flags are only supported on macOS".to_string(),
+            ))
+        }
+    }
+
+    async fn write_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let full_path = self.resolve(path);
+            return tokio::task::spawn_blocking(move || -> Result<()> {
+                let path =
+                    std::ffi::CString::new(full_path.as_os_str().as_bytes()).map_err(|_| {
+                        SyncError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "NUL in path",
+                        ))
+                    })?;
+
+                // SAFETY: `path` is a live, NUL-terminated CString for the full
+                // local destination path. `chflags` only borrows the pointer for
+                // the duration of this call.
+                let result = unsafe { libc::chflags(path.as_ptr(), flags as _) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(SyncError::Io(std::io::Error::last_os_error()))
+                }
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, flags);
+            Err(SyncError::Config(
+                "BSD flags are only supported on macOS".to_string(),
+            ))
+        }
+    }
+
+    async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
+        let full_path = self.resolve(path);
+        let file = tokio::fs::File::open(&full_path).await.map_err(|error| {
+            SyncError::Io(std::io::Error::new(
+                error.kind(),
+                format!("Failed to open file {}: {}", full_path.display(), error),
+            ))
+        })?;
+        Ok(Box::pin(file))
+    }
+
+    async fn begin_write(&self, path: &Path) -> Result<Box<dyn StagedWriter>> {
+        Ok(Box::new(LocalStagedWriter::new(self.resolve(path)).await?))
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
@@ -150,8 +428,7 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
-        let full_path = self.resolve(path);
-        tokio::fs::create_dir_all(&full_path).await?;
+        tokio::fs::create_dir_all(self.resolve(path)).await?;
         Ok(())
     }
 
@@ -160,8 +437,26 @@ impl Endpoint for LocalEndpoint {
         if let Some(parent) = full_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::symlink(target, &full_dest).await?;
-        Ok(())
+
+        #[cfg(unix)]
+        {
+            // Stage the directory entry and atomically rename it over an existing
+            // file/symlink. Type-changing directory replacements are rejected by
+            // reconciliation before reaching this operation.
+            let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
+            let guard = crate::temp_file::TempFileGuard::new(&temp);
+            tokio::fs::symlink(target, &temp).await?;
+            tokio::fs::rename(&temp, &full_dest).await?;
+            guard.defuse();
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            Err(SyncError::Config(
+                "symlink creation is not implemented for this platform".to_string(),
+            ))
+        }
     }
 
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
@@ -170,27 +465,12 @@ impl Endpoint for LocalEndpoint {
         if let Some(parent) = full_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::hard_link(&full_source, &full_dest).await?;
-        Ok(())
-    }
 
-    async fn set_mtime(&self, path: &Path, mtime: SystemTime) -> Result<()> {
-        let full_path = self.resolve(path);
-        filetime::set_file_mtime(&full_path, filetime::FileTime::from_system_time(mtime))?;
-        Ok(())
-    }
-
-    async fn set_permissions(&self, path: &Path, mode: u32) -> Result<()> {
-        let full_path = self.resolve(path);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&full_path, fs::Permissions::from_mode(mode)).await?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, mode);
-        }
+        let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
+        let guard = crate::temp_file::TempFileGuard::new(&temp);
+        tokio::fs::hard_link(&full_source, &temp).await?;
+        tokio::fs::rename(&temp, &full_dest).await?;
+        guard.defuse();
         Ok(())
     }
 }
@@ -208,160 +488,129 @@ mod tests {
             is_symlink: false,
             #[cfg(unix)]
             mode: 0o644,
-            #[cfg(unix)]
-            uid: 0,
-            #[cfg(unix)]
-            gid: 0,
-            #[cfg(unix)]
-            nlink: 1,
         }
     }
 
     #[tokio::test]
-    async fn test_scan() {
+    async fn staged_abort_preserves_destination() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("file.txt"), "content").unwrap();
-
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-        let entries = ep.scan(ScanOptions::default()).await.unwrap();
-        assert_eq!(entries.len(), 1);
+        fs::write(dir.path().join("file"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        writer.write(b"new").await.unwrap();
+        writer.abort().await.unwrap();
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
     }
 
     #[tokio::test]
-    async fn test_read_write_roundtrip() {
+    async fn staged_hash_reads_uncommitted_bytes() {
         let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        writer.write(b"content").await.unwrap();
+        let hash = writer.staged_hash().await.unwrap().unwrap();
+        assert_eq!(hash, blake3::hash(b"content"));
+        writer.abort().await.unwrap();
+        assert!(!dir.path().join("file").exists());
+    }
 
-        ep.write_file(Path::new("test.txt"), b"content", &make_meta())
+    #[tokio::test]
+    async fn staged_commit_replaces_destination() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        writer.write(b"content").await.unwrap();
+        writer.set_metadata(&make_meta()).await.unwrap();
+        writer.commit().await.unwrap();
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_xattrs_round_trip_and_remove_stale_values() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"content").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+
+        endpoint
+            .write_xattrs(
+                Path::new("file"),
+                &[(OsString::from("user.sy-test"), b"first".to_vec())],
+            )
             .await
             .unwrap();
+        assert_eq!(
+            endpoint.read_xattrs(Path::new("file")).await.unwrap(),
+            vec![(OsString::from("user.sy-test"), b"first".to_vec())]
+        );
 
-        let data = ep.read_file(Path::new("test.txt")).await.unwrap();
-        assert_eq!(data, b"content");
-    }
-
-    #[tokio::test]
-    async fn test_exists() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        assert!(!ep.exists(Path::new("missing.txt")).await.unwrap());
-
-        fs::write(dir.path().join("exists.txt"), "data").unwrap();
-        assert!(ep.exists(Path::new("exists.txt")).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_capabilities() {
-        let ep = LocalEndpoint::new(PathBuf::from("/tmp"));
-        assert_eq!(ep.endpoint_type(), EndpointType::Local);
-        assert!(ep.capabilities().cow_writes);
-        assert!(ep.capabilities().delta_sync);
-    }
-
-    #[tokio::test]
-    async fn test_remove_file() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        fs::write(dir.path().join("file.txt"), "data").unwrap();
-        assert!(ep.exists(Path::new("file.txt")).await.unwrap());
-
-        ep.remove(Path::new("file.txt"), false).await.unwrap();
-        assert!(!ep.exists(Path::new("file.txt")).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_remove_dir_recursive() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        fs::create_dir(dir.path().join("subdir")).unwrap();
-        fs::write(dir.path().join("subdir/file.txt"), "data").unwrap();
-
-        ep.remove(Path::new("subdir"), true).await.unwrap();
-        assert!(!ep.exists(Path::new("subdir")).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_create_dir_all() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        ep.create_dir_all(Path::new("a/b/c")).await.unwrap();
-        assert!(dir.path().join("a/b/c").is_dir());
-    }
-
-    #[tokio::test]
-    async fn test_create_symlink() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        fs::write(dir.path().join("target.txt"), "data").unwrap();
-        ep.create_symlink(Path::new("target.txt"), Path::new("link.txt"))
+        endpoint.write_xattrs(Path::new("file"), &[]).await.unwrap();
+        assert!(endpoint
+            .read_xattrs(Path::new("file"))
             .await
-            .unwrap();
-
-        assert!(dir
-            .path()
-            .join("link.txt")
-            .symlink_metadata()
             .unwrap()
-            .file_type()
-            .is_symlink());
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_update_is_atomic_at_endpoint_boundary() {
+        let dir = TempDir::new().unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        endpoint
+            .create_symlink(Path::new("first"), Path::new("link"))
+            .await
+            .unwrap();
+        endpoint
+            .create_symlink(Path::new("second"), Path::new("link"))
+            .await
+            .unwrap();
         assert_eq!(
-            fs::read_link(dir.path().join("link.txt")).unwrap(),
-            Path::new("target.txt")
+            fs::read_link(dir.path().join("link")).unwrap(),
+            Path::new("second")
         );
     }
 
     #[tokio::test]
-    async fn test_create_hardlink() {
+    async fn hardlink_update_is_atomic_at_endpoint_boundary() {
         let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        fs::write(dir.path().join("original.txt"), "data").unwrap();
-        ep.create_hardlink(Path::new("original.txt"), Path::new("hardlink.txt"))
+        fs::write(dir.path().join("first"), b"one").unwrap();
+        fs::write(dir.path().join("second"), b"two").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        endpoint
+            .create_hardlink(Path::new("first"), Path::new("link"))
             .await
             .unwrap();
-
-        assert!(dir.path().join("hardlink.txt").exists());
-        assert_eq!(fs::read(dir.path().join("hardlink.txt")).unwrap(), b"data");
+        endpoint
+            .create_hardlink(Path::new("second"), Path::new("link"))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(dir.path().join("link")).unwrap(), b"two");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_copy_file() {
+    async fn exists_sees_dangling_symlink() {
         let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        ep.write_file(Path::new("source.txt"), b"content", &make_meta())
-            .await
-            .unwrap();
-
-        let bytes = ep
-            .copy_file(Path::new("source.txt"), Path::new("dest.txt"))
-            .await
-            .unwrap();
-
-        assert_eq!(bytes, 7);
-        assert_eq!(
-            ep.read_file(Path::new("dest.txt")).await.unwrap(),
-            b"content"
+        std::os::unix::fs::symlink("missing", dir.path().join("link")).unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        assert!(endpoint.exists(Path::new("link")).await.unwrap());
+        assert!(
+            endpoint
+                .metadata(Path::new("link"))
+                .await
+                .unwrap()
+                .is_symlink
         );
     }
 
-    #[tokio::test]
-    async fn test_metadata() {
-        let dir = TempDir::new().unwrap();
-        let ep = LocalEndpoint::new(dir.path().to_path_buf());
-
-        ep.write_file(Path::new("file.txt"), b"content", &make_meta())
-            .await
-            .unwrap();
-
-        let meta = ep.metadata(Path::new("file.txt")).await.unwrap();
-        assert_eq!(meta.size, 7);
-        assert!(!meta.is_dir);
-        assert!(!meta.is_symlink);
+    #[test]
+    fn exposes_native_path() {
+        let endpoint = LocalEndpoint::new(PathBuf::from("/tmp/root"));
+        assert_eq!(
+            endpoint.native_path(Path::new("file")),
+            Some(PathBuf::from("/tmp/root/file"))
+        );
     }
 }

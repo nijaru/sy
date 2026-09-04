@@ -26,7 +26,7 @@ mod transport;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use cli::{Cli, ResumeMode, VerifyMode};
+use cli::{Cli, VerifyMode};
 use colored::Colorize;
 use config::Config;
 use filter::FilterEngine;
@@ -68,14 +68,30 @@ fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBu
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI arguments
-    let mut cli = Cli::parse();
-
-    // Set RUST_BACKTRACE=0 unless user explicitly set it
+    // Set RUST_BACKTRACE=0 unless user explicitly set it.
     if std::env::var("RUST_BACKTRACE").is_err() {
         std::env::set_var("RUST_BACKTRACE", "0");
     }
 
+    // The private v3 SSH agent bypasses Clap and all normal CLI setup so stdout
+    // remains protocol-only from the first byte. The remote root is negotiated
+    // in SessionOpen; it is deliberately not accepted as an argv pathname.
+    let mut raw_args = std::env::args_os();
+    let _program = raw_args.next();
+    if raw_args.next().as_deref() == Some(std::ffi::OsStr::new("__serve")) {
+        if raw_args.next().is_some() {
+            eprintln!("Error: __serve does not accept command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = sy::remote::serve::run_stdio().await {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Parse user-facing CLI arguments only after private-agent dispatch.
+    let mut cli = Cli::parse();
     if let Err(e) = run(&mut cli).await {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
@@ -169,12 +185,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 cli.exclude = excludes.clone();
             }
         }
-        if let Some(resume) = profile.resume {
-            // Profile sets resume=false means --no-resume
-            if !resume {
-                cli.resume = ResumeMode::No;
-            }
-        }
     }
 
     // Setup logging
@@ -211,16 +221,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
             .ok()
             .map(|e| e.with_abort_on_failure(cli.abort_on_hook_failure))
     };
-
-    // Clear cache if requested (before creating engine)
-    if cli.clear_cache {
-        use sync::dircache::DirectoryCache;
-        if let Err(e) = DirectoryCache::delete(destination.path()) {
-            tracing::warn!("Failed to clear directory cache: {}", e);
-        } else if !cli.quiet && !cli.json {
-            tracing::info!("Cleared directory cache");
-        }
-    }
 
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
@@ -390,9 +390,6 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Warn about unimplemented flags
-    if cli.partial.is_some() {
-        eprintln!("Warning: --partial is not yet implemented");
-    }
     if cli.stream {
         eprintln!("Warning: --stream is not yet implemented");
     }
@@ -404,28 +401,14 @@ Or install from local source with: cargo install --path . --features acl"#
         dry_run: cli.dry_run,
         diff_mode: cli.diff,
         delete: if cli.delete {
-            let threshold = if cli.max_delete.ends_with('%') {
-                cli.max_delete
-                    .trim_end_matches('%')
-                    .parse::<u8>()
-                    .unwrap_or(50)
-            } else {
-                // For absolute counts, we'll use 100% (no threshold) since the limit is handled elsewhere
-                100
-            };
+            let limit = sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)?;
             sync::DeleteMode::Enabled {
-                threshold,
+                limit,
                 force: cli.force_delete,
             }
         } else {
             sync::DeleteMode::Disabled
         },
-        max_delete: if cli.delete {
-            Some(cli.max_delete.clone())
-        } else {
-            None
-        },
-        trash: cli.trash,
         quiet: cli.quiet || cli.json,
         max_concurrent: cli.parallel,
         max_errors: cli.max_errors,
@@ -433,19 +416,10 @@ Or install from local source with: cargo install --path . --features acl"#
         max_size: cli.max_size,
         filter_engine,
         bwlimit: cli.bwlimit,
-        resume: sync::ResumeConfig {
-            enabled: cli.resume(),
-            only: cli.resume == ResumeMode::Only,
-            checkpoint_files: cli.checkpoint_files,
-            checkpoint_bytes: cli.checkpoint_bytes,
-        },
         json: cli.json,
         verification: sync::VerificationConfig {
             mode: checksum_type,
             verify_on_write,
-            checksum_db: cli.checksum_db,
-            clear_checksum_db: cli.clear_checksum_db,
-            prune_checksum_db: cli.prune_checksum_db,
         },
         preserve: sync::PreserveConfig {
             xattrs: cli.preserve_xattrs,
@@ -454,6 +428,11 @@ Or install from local source with: cargo install --path . --features acl"#
             flags: cli.preserve_flags,
             symlink_mode,
             permissions: cli.should_preserve_permissions(),
+            times: cli.should_preserve_times(),
+            group: cli.should_preserve_group(),
+            owner: cli.should_preserve_owner(),
+            devices: cli.should_preserve_devices(),
+            keep_dirlinks: cli.keep_dirlinks,
         },
         progress: cli.progress,
         comparison: sync::ComparisonConfig {
@@ -463,8 +442,6 @@ Or install from local source with: cargo install --path . --features acl"#
             update_only: cli.update,
             ignore_existing: cli.ignore_existing,
         },
-        cache: cli.cache,
-        clear_cache: cli.clear_cache,
         dest_is_remote: destination.is_remote(),
         perf: cli.perf,
         // rsync-compat flags
@@ -474,8 +451,6 @@ Or install from local source with: cargo install --path . --features acl"#
         backup: cli.backup.clone(),
         backup_dir: cli.backup_dir.clone(),
         suffix: cli.suffix.clone(),
-        partial: cli.partial.clone(),
-        partial_dir: cli.partial_dir.clone(),
         timeout: cli.timeout,
         contimeout: cli.contimeout,
         compress_level: cli.compress_level,
@@ -764,15 +739,14 @@ Or install from local source with: cargo install --path . --features acl"#
         };
 
         let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
-        let max_delete_percent = if cli.max_delete.ends_with('%') {
-            cli.max_delete
-                .trim_end_matches('%')
-                .parse::<u8>()
-                .unwrap_or(50)
-        } else {
-            // For absolute counts, convert to percentage (assuming 100% means no limit)
-            100
-        };
+        let max_delete_percent =
+            match sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)? {
+                sync::DeleteLimit::Unlimited => 100,
+                sync::DeleteLimit::Percentage(value) => value,
+                sync::DeleteLimit::Count(_) => anyhow::bail!(
+        "absolute --max-delete counts are not supported with --bidirectional; use a percentage"
+    ),
+            };
         let bisync_opts = bisync::BisyncOptions {
             conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
                 .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,

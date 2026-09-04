@@ -1,3 +1,5 @@
+extern crate self as sy;
+
 // Public API — these are the stable library exports
 pub mod cli;
 pub mod compress;
@@ -12,17 +14,28 @@ pub mod temp_file;
 #[doc(hidden)]
 pub mod bisync;
 #[doc(hidden)]
+pub mod endpoint;
+#[doc(hidden)]
+pub mod engine;
+#[doc(hidden)]
+pub mod protocol;
+#[doc(hidden)]
+pub mod remote;
+#[doc(hidden)]
+pub mod rooted_fs;
+#[doc(hidden)]
 pub mod server;
 #[cfg(feature = "ssh")]
 #[doc(hidden)]
 pub mod ssh;
+#[doc(hidden)]
+pub mod transfer;
 #[doc(hidden)]
 pub mod transport;
 
 // Private modules
 pub(crate) mod binary;
 pub(crate) mod config;
-pub(crate) mod endpoint;
 pub(crate) mod filter;
 pub(crate) mod fs_util;
 pub(crate) mod hooks;

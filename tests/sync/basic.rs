@@ -27,6 +27,12 @@ fn setup_test_dir(_name: &str) -> (TempDir, TempDir) {
     (source, dest)
 }
 
+fn setup_test_dir_with_backup(_name: &str) -> (TempDir, TempDir, TempDir) {
+    let (source, dest) = setup_test_dir(_name);
+    let backup = TempDir::new().unwrap();
+    (source, dest, backup)
+}
+
 #[test]
 fn test_basic_sync() {
     let (source, dest) = setup_test_dir("basic");
@@ -370,169 +376,34 @@ fn test_large_file_update_with_delta_sync() {
 }
 
 #[test]
-fn test_directory_cache_created() {
-    let (source, dest) = setup_test_dir("cache_created");
+fn test_cache_flags_removed() {
+    let (source, dest) = setup_test_dir("cache_removed");
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_not_created_by_default() {
-    let (source, dest) = setup_test_dir("no_cache");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_persists() {
-    let (source, dest) = setup_test_dir("cache_persist");
-
-    fs::write(source.path().join("file1.txt"), "content1").unwrap();
-
-    // First sync with cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    // Add new file
-    fs::write(source.path().join("file2.txt"), "content2").unwrap();
-
-    // Second sync should use cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join("file2.txt").exists());
-}
-
-#[test]
-fn test_directory_cache_clear() {
-    let (source, dest) = setup_test_dir("cache_clear");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    // Create cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join(".sy-dir-cache.json").exists());
-
-    // Clear cache
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--clear-cache",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_dry_run() {
-    let (source, dest) = setup_test_dir("cache_dry_run");
-
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    // Dry run with cache should not create cache file
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(!dest.path().join(".sy-dir-cache.json").exists());
-}
-
-#[test]
-fn test_directory_cache_updates_on_new_directories() {
-    let (source, dest) = setup_test_dir("cache_new_dirs");
-
-    fs::create_dir_all(source.path().join("subdir")).unwrap();
-    fs::write(source.path().join("subdir/file.txt"), "content").unwrap();
-
-    // First sync
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    // Add new directory
-    fs::create_dir_all(source.path().join("newdir")).unwrap();
-    fs::write(source.path().join("newdir/file2.txt"), "content2").unwrap();
-
-    // Second sync should pick up new directory
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--cache=true",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(dest.path().join("newdir/file2.txt").exists());
+    // The directory cache never worked on the 0.5 engines and the flags are
+    // removed outright; passing them must fail as unknown arguments.
+    for flag in ["--cache", "--clear-cache"] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
+    // Nothing was synced by the rejected invocations.
+    assert!(!dest.path().join("file.txt").exists());
 }
 
 // Trailing slash behavior tests
@@ -716,25 +587,35 @@ fn test_backup_flag() {
     );
 }
 
+/// --partial and --partial-dir never acquired working semantics on the 0.5
+/// engine: transactional staged writes never expose partial files, so there
+/// is nothing to keep. The flags are removed; passing them must fail as
+/// unknown arguments.
 #[test]
-fn test_partial_flag() {
-    let (source, dest) = setup_test_dir("partial");
+fn test_partial_flags_removed() {
+    let (source, dest) = setup_test_dir("partial_removed");
 
-    // Create a file in source
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // Sync without --partial (default behavior)
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(dest.path().join("file.txt").exists());
+    for flag in ["--partial", "--partial-dir"] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -994,15 +875,18 @@ fn test_max_size_flag() {
 fn test_bwlimit_flag() {
     let (source, dest) = setup_test_dir("bwlimit");
 
-    // Create a large file
-    fs::write(source.path().join("large.txt"), "a".repeat(10000)).unwrap();
+    // 30 KiB at a 60 KiB/s limit: the one-second burst covers the first
+    // 60 KiB, so the transfer completes without a measurable pause while
+    // still exercising the paced streaming path (native kernel copies are
+    // bypassed when a limit is set).
+    fs::write(source.path().join("large.txt"), "a".repeat(30 * 1024)).unwrap();
 
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
             dest.path().to_str().unwrap(),
             "--exclude-vcs",
-            "--bwlimit=1",
+            "--bwlimit=60KB",
         ])
         .output()
         .unwrap();
@@ -1417,5 +1301,368 @@ fn test_backup_preserves_original() {
     assert_eq!(
         fs::read_to_string(dest.path().join("file.txt")).unwrap(),
         "updated content"
+    );
+}
+
+/// --diff details every planned operation with byte sizes in dry-run mode.
+#[test]
+fn test_diff_mode_details_planned_changes() {
+    let (source, dest) = setup_test_dir("diff_mode");
+
+    fs::write(source.path().join("small.txt"), "tiny").unwrap();
+    fs::write(source.path().join("large.txt"), "x".repeat(4096)).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--dry-run",
+            "--diff",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!dest.path().join("small.txt").exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Would create: "),
+        "diff mode must detail per-file plans, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(4.00 KB)"),
+        "diff mode must include byte sizes, got:\n{stdout}"
+    );
+}
+
+/// --diff without --dry-run is rejected: it would silently do nothing.
+#[test]
+fn test_diff_without_dry_run_fails() {
+    let (source, dest) = setup_test_dir("diff_reject");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--diff",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--diff requires --dry-run"),
+        "got:\n{stderr}"
+    );
+    // Nothing was mutated: the command must not have synced before failing.
+    assert!(!dest.path().join("file.txt").exists());
+}
+
+/// --trash was never implemented in any engine and was removed; passing it
+/// must fail as an unknown argument rather than silently doing nothing.
+#[test]
+fn test_trash_flag_removed() {
+    let (source, dest) = setup_test_dir("trash_removed");
+
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--trash",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains("--trash"),
+        "got:\n{stderr}"
+    );
+    assert!(!dest.path().join("keep.txt").exists());
+}
+
+/// --bwlimit actually paces local transfers: bytes above the one-second burst
+/// must take token-deficit time. This pins the regression where the local
+/// engine silently ignored the limit and transferred at full disk speed.
+#[test]
+fn test_bwlimit_paces_local_transfer() {
+    let (source, dest) = setup_test_dir("bwlimit_pace");
+
+    // 40 KiB payload at a 16 KiB/s limit: burst covers 16 KiB, the remaining
+    // 24 KiB need ~1.5 s of token refill.
+    fs::write(source.path().join("paced.bin"), vec![0_u8; 40 * 1024]).unwrap();
+
+    let start = std::time::Instant::now();
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--bwlimit=16KB",
+        ])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(dest.path().join("paced.bin")).unwrap().len(),
+        40 * 1024
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1300),
+        "transfer must be paced: 40 KiB at 16 KiB/s needs ~1.5 s, took {elapsed:?}"
+    );
+}
+
+/// --verify enables post-write verification on the local engine: committed
+/// files are hashed against the source and counted. The 0.4 wiring computed
+/// verification from a helper hard-coded to false, silently ignoring the flag.
+#[test]
+fn test_verify_counts_verified_files() {
+    let (source, dest) = setup_test_dir("verify_counts");
+
+    fs::write(source.path().join("a.txt"), "alpha").unwrap();
+    fs::write(source.path().join("b.txt"), "beta").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--verify=after",
+            "--stats",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The source is a fresh git repository, so the exact count includes git
+    // internals; what matters is that every created file was verified.
+    let created = stdout
+        .lines()
+        .find(|line| line.contains("Files created:"))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|v| v.parse::<usize>().ok())
+        .expect("created count");
+    // "Verification:    N files (xxHash3)" - N is the token before "files".
+    let verified = stdout
+        .lines()
+        .find(|line| line.contains("Verification:"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .zip(line.split_whitespace().skip(1))
+                .find(|(_, next)| *next == "files" || next.starts_with("files"))
+                .and_then(|(token, _)| token.parse::<usize>().ok())
+        })
+        .expect("verified count");
+    assert!(
+        stdout.contains("Verification:"),
+        "--verify=after must report verification, got:\n{stdout}"
+    );
+    assert_eq!(
+        created, verified,
+        "every created file must be verified under --verify=after"
+    );
+    assert!(
+        verified >= 2,
+        "the two data files must be among the verified"
+    );
+}
+
+/// The checksum database was consumed only by the unreachable legacy engine
+/// and is removed; passing its flags must fail as unknown arguments.
+#[test]
+fn test_checksum_db_flags_removed() {
+    let (source, dest) = setup_test_dir("checksum_db_removed");
+
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    for flag in [
+        "--checksum-db",
+        "--clear-checksum-db",
+        "--prune-checksum-db",
+    ] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
+    assert!(!dest.path().join("file.txt").exists());
+}
+
+/// --remove-source-files locally: transferred and planner-verified unchanged
+/// files move (destination bytes intact); skips without verified destination
+/// parity keep their source; directories are never removed.
+#[test]
+fn test_remove_source_files_moves_committed_and_verified_entries() {
+    let (source, dest) = setup_test_dir("remove_source_files");
+
+    fs::write(source.path().join("created.txt"), "created").unwrap();
+    // Different lengths force an Update under the quick check even on
+    // filesystems whose mtime granularity would otherwise match the pair.
+    fs::write(dest.path().join("updated.txt"), "stale-bytes").unwrap();
+    fs::write(source.path().join("updated.txt"), "new").unwrap();
+    fs::create_dir(source.path().join("sub")).unwrap();
+    fs::write(source.path().join("sub/inner.txt"), "inner").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--remove-source-files",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Moved bytes all present at the destination.
+    assert_eq!(
+        fs::read_to_string(dest.path().join("created.txt")).unwrap(),
+        "created"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("updated.txt")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("sub/inner.txt")).unwrap(),
+        "inner"
+    );
+
+    // Sources removed; empty directory kept.
+    assert!(!source.path().join("created.txt").exists());
+    assert!(!source.path().join("updated.txt").exists());
+    assert!(!source.path().join("sub/inner.txt").exists());
+    assert!(source.path().join("sub").is_dir());
+}
+
+/// Under --remove-source-files, a file that exists only in the source is
+/// never removed when --existing skips its transfer: the destination has no
+/// verified copy, so removal would destroy the only remaining bytes.
+#[test]
+fn test_remove_source_files_keeps_untransferred_source_under_existing() {
+    let (source, dest) = setup_test_dir("remove_source_existing");
+
+    fs::write(source.path().join("only-here.txt"), "precious").unwrap();
+    fs::write(dest.path().join("other.txt"), "else").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--remove-source-files",
+            "--existing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(source.path().join("only-here.txt")).is_ok(),
+        "untransferred source must be kept under --existing"
+    );
+    assert!(!dest.path().join("only-here.txt").exists());
+}
+
+/// --backup preserves deleted files, not just replaced ones (rsync
+/// semantics): the delete journal copies each doomed file to the backup
+/// location before removal. A directory holding a deletion's backup survives
+/// because it is no longer empty.
+#[test]
+fn test_backup_preserves_deleted_files() {
+    let (source, dest) = setup_test_dir("backup_deletes");
+
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+    fs::write(dest.path().join("doomed.txt"), "precious-old-content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            "--delete",
+            "--max-delete=100%",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dest.path().join("doomed.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("doomed.txt~")).unwrap(),
+        "precious-old-content"
+    );
+}
+
+/// --backup-dir preserves the destination tree structure so same-named files
+/// in different directories cannot collide.
+#[test]
+fn test_backup_dir_preserves_tree_structure() {
+    let (source, dest, backup) = setup_test_dir_with_backup("backup_dir_structure");
+
+    fs::create_dir(source.path().join("sub")).unwrap();
+    fs::create_dir(dest.path().join("sub")).unwrap();
+    fs::write(source.path().join("sub/file.txt"), "new-a").unwrap();
+    fs::write(source.path().join("root.txt"), "new-b").unwrap();
+    fs::write(dest.path().join("sub/file.txt"), "old-a").unwrap();
+    fs::write(dest.path().join("root.txt"), "old-b").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            &format!("--backup-dir={}", backup.path().display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(backup.path().join("sub/file.txt~")).unwrap(),
+        "old-a"
+    );
+    assert_eq!(
+        fs::read_to_string(backup.path().join("root.txt~")).unwrap(),
+        "old-b"
     );
 }

@@ -1,12 +1,9 @@
 #![allow(dead_code)]
-pub mod checksumdb;
 pub mod config;
-pub mod dircache;
 pub mod executor;
 pub mod output;
 pub mod progress;
 pub mod ratelimit;
-pub mod resume;
 pub mod scale;
 pub mod scanner;
 pub mod server_mode;
@@ -14,6 +11,7 @@ pub mod session;
 pub mod stats;
 pub mod strategy;
 pub mod transfer;
+mod v3_push;
 #[cfg(feature = "watch")]
 #[cfg(feature = "watch")]
 pub mod watch;
@@ -21,7 +19,8 @@ pub mod watch;
 pub mod watch_session;
 
 pub use config::{
-    ComparisonConfig, DeleteMode, PreserveConfig, ResumeConfig, SyncConfig, VerificationConfig,
+    parse_delete_limit, ComparisonConfig, DeleteLimit, DeleteMode, PreserveConfig, SyncConfig,
+    VerificationConfig,
 };
 pub use stats::{SyncError, SyncStats, VerificationResult};
 
@@ -30,17 +29,15 @@ use crate::integrity::{ChecksumType, IntegrityVerifier};
 use crate::perf::{PerformanceMetrics, PerformanceMonitor};
 use crate::resource;
 use crate::transport::Transport;
-use dircache::DirectoryCache;
 use futures::{stream::StreamExt, FutureExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use output::SyncEvent;
 use ratelimit::RateLimiter;
-use resume::{ResumeState, SyncFlags};
 use scale::FileSetBloom;
 use scanner::FileEntry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use strategy::{StrategyPlanner, SyncAction};
 use transfer::Transferrer;
 
@@ -72,6 +69,59 @@ pub(crate) fn itemize_string(
         crate::sync::strategy::SyncAction::Skip => '.',
     };
     format!("{}{}..........", file_type, update_type)
+}
+
+fn enforce_configured_delete_limit(
+    delete: &DeleteMode,
+    eligible_destination_entries: usize,
+    delete_candidates: usize,
+) -> Result<()> {
+    let Some(limit) = delete.limit() else {
+        return Ok(());
+    };
+    let eligible_destination_entries =
+        u64::try_from(eligible_destination_entries).map_err(|_| {
+            crate::error::SyncError::Config("eligible delete count exceeds u64 range".to_string())
+        })?;
+    let delete_candidates = u64::try_from(delete_candidates).map_err(|_| {
+        crate::error::SyncError::Config("delete candidate count exceeds u64 range".to_string())
+    })?;
+    let policy = sy::engine::delete_plan::DeletePolicy {
+        limit,
+        force: delete.is_forced(),
+    };
+    match sy::engine::delete_plan::enforce_delete_policy(
+        policy,
+        eligible_destination_entries,
+        delete_candidates,
+    ) {
+        Ok(()) => Ok(()),
+        Err(sy::engine::delete_plan::DeletePlanError::ThresholdExceeded {
+            eligible_destination_entries,
+            delete_candidates,
+            threshold,
+        }) => {
+            let percentage = if eligible_destination_entries == 0 {
+                0.0
+            } else {
+                delete_candidates as f64 * 100.0 / eligible_destination_entries as f64
+            };
+            Err(crate::error::SyncError::DeletionThresholdExceeded {
+                percentage,
+                threshold,
+            })
+        }
+        Err(sy::engine::delete_plan::DeletePlanError::CountExceeded {
+            delete_candidates,
+            limit,
+        }) => Err(crate::error::SyncError::DeletionCountExceeded {
+            delete_candidates,
+            limit,
+        }),
+        Err(other) => Err(crate::error::SyncError::Io(std::io::Error::other(
+            other.to_string(),
+        ))),
+    }
 }
 
 impl<T: Transport + 'static> SyncEngine<T> {
@@ -138,156 +188,19 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.transport.create_dir_all(destination).await?;
         }
 
-        // Handle directory cache
-        if self.config.clear_cache && !self.config.dry_run {
-            if let Err(e) = DirectoryCache::delete(destination) {
-                tracing::warn!("Failed to clear directory cache: {}", e);
-            } else {
-                tracing::debug!("Cleared directory cache");
-            }
-        }
-
-        // Load directory cache (if enabled)
-        let mut dir_cache = if self.config.cache {
-            let cache = DirectoryCache::load(destination);
-            tracing::debug!("Loaded directory cache with {} entries", cache.len());
-            Some(cache)
-        } else {
-            None
-        };
-
-        // Handle checksum database
-        let checksum_db = if self.config.comparison.checksum && self.config.verification.checksum_db
-        {
-            // Open checksum database
-            match checksumdb::ChecksumDatabase::open(destination) {
-                Ok(db) => {
-                    tracing::debug!("Opened checksum database");
-
-                    // Clear if requested
-                    if self.config.verification.clear_checksum_db && !self.config.dry_run {
-                        if let Err(e) = db.clear() {
-                            tracing::warn!("Failed to clear checksum database: {}", e);
-                        } else {
-                            tracing::info!("Cleared checksum database");
-                        }
-                    }
-
-                    Some(db)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to open checksum database: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Check if we can use cached scan results (incremental scanning)
-        let can_cache = if let Some(ref cache) = dir_cache {
-            // Check source directory mtime
-            if let Ok(source_meta) = std::fs::metadata(source) {
-                if let Ok(source_mtime) = source_meta.modified() {
-                    let source_path = PathBuf::from(".");
-                    !cache.needs_rescan(&source_path, source_mtime)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         // Start scan timing
         if let Some(ref monitor) = self.perf_monitor {
             monitor.lock().expect("perf monitor poisoned").start_scan();
         }
 
         // Scan source directory (or use cache)
-        let all_files = if can_cache {
-            // Use cached files for incremental scan
-            if let Some(ref cache) = dir_cache {
-                if let Some(cached_files) = cache.get_cached_files(&PathBuf::from(".")) {
-                    let file_count = cached_files.len();
-                    tracing::info!(
-                        "Using cached scan results ({} files) - source unchanged",
-                        file_count
-                    );
-
-                    // Convert cached files back to FileEntry
-                    cached_files
-                        .iter()
-                        .map(|cf| cf.to_file_entry(source))
-                        .collect()
-                } else {
-                    // Cache exists but no files cached for root directory
-                    tracing::debug!("No cached files found, performing full scan");
-                    self.transport.scan(source).await?
-                }
-            } else {
-                // This shouldn't happen, but fall back to full scan
-                self.transport.scan(source).await?
-            }
-        } else {
-            tracing::debug!("Scanning source directory (cache miss or disabled)...");
-            self.transport.scan(source).await?
-        };
+        let all_files = self.transport.scan(source).await?;
 
         let total_scanned = all_files.len();
-        if can_cache {
-            tracing::info!("Retrieved {} items from cache", total_scanned);
-        } else {
-            tracing::info!("Found {} items in source", total_scanned);
-        }
+        tracing::info!("Found {} items in source", total_scanned);
 
         // Prepare transport for the workload (e.g., expand SSH connection pool)
         self.transport.prepare_for_transfer(total_scanned).await?;
-
-        // Update cache with scanned directory mtimes and file entries (for future incremental scans)
-        if let Some(ref mut cache) = dir_cache {
-            use crate::sync::dircache::CachedFile;
-            use std::collections::HashMap;
-
-            // Group files by their parent directory
-            let mut files_by_dir: HashMap<PathBuf, Vec<CachedFile>> = HashMap::new();
-
-            for file in &all_files {
-                // Update directory mtimes
-                if file.is_dir {
-                    cache.update((*file.relative_path).clone(), file.modified);
-                }
-
-                // Group files by directory for caching
-                let dir_path = if file.is_dir {
-                    (*file.relative_path).clone()
-                } else {
-                    file.relative_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from("."))
-                };
-
-                files_by_dir
-                    .entry(dir_path)
-                    .or_default()
-                    .push(CachedFile::from_file_entry(file));
-            }
-
-            // Cache files for each directory
-            let total_files: usize = files_by_dir.values().map(|v| v.len()).sum();
-            for (dir_path, files) in files_by_dir {
-                cache.cache_files(dir_path, files);
-            }
-
-            tracing::debug!(
-                "Updated directory cache with {} directories, {} files",
-                cache.len(),
-                total_files
-            );
-        }
 
         // Filter files by size and exclude patterns
         // Also track excluded directories to filter their children (rsync behavior)
@@ -362,69 +275,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             resource::check_fd_limits(self.config.max_concurrent)?;
         }
 
-        tracing::debug!("Resource checks completed, loading resume state");
-
-        // Load or create resume state
-        let current_flags = SyncFlags {
-            delete: self.config.delete.is_enabled(),
-            exclude: vec![], // Filter rules handled by FilterEngine
-            min_size: self.config.min_size,
-            max_size: self.config.max_size,
-        };
-
-        let resume_state = if self.config.resume.enabled {
-            match ResumeState::load(destination)? {
-                Some(state) => {
-                    if state.is_compatible_with(&current_flags) {
-                        let (completed, total) = state.progress();
-                        tracing::info!(
-                            "Resuming sync: {} of {} files already completed",
-                            completed,
-                            total
-                        );
-                        if !self.config.quiet {
-                            println!(
-                                "📋 Resuming previous sync ({}/{} files completed)",
-                                completed, total
-                            );
-                        }
-                        Some(state)
-                    } else {
-                        tracing::warn!("Resume state incompatible (flags changed), starting fresh");
-                        if !self.config.quiet {
-                            println!("⚠️  Resume state incompatible, starting fresh sync");
-                        }
-                        ResumeState::delete(destination)?;
-                        Some(ResumeState::new(
-                            source.to_path_buf(),
-                            destination.to_path_buf(),
-                            current_flags,
-                            source_files.len(),
-                        ))
-                    }
-                }
-                None => {
-                    // No existing state, create new one
-                    Some(ResumeState::new(
-                        source.to_path_buf(),
-                        destination.to_path_buf(),
-                        current_flags,
-                        source_files.len(),
-                    ))
-                }
-            }
-        } else {
-            None
-        };
-
-        // Get set of completed files for filtering
-        let completed_paths = resume_state
-            .as_ref()
-            .map(|s| s.completed_paths())
-            .unwrap_or_default();
-
-        tracing::debug!("Resume state loaded, starting plan timing");
-
         // Start plan timing
         if let Some(ref monitor) = self.perf_monitor {
             monitor.lock().expect("perf monitor poisoned").start_plan();
@@ -441,22 +291,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
 
         tracing::debug!("Starting to plan {} tasks", source_files.len());
 
-        // Filter out already-completed files before planning
-        tracing::debug!("Filtering completed files...");
-        let files_to_plan: Vec<_> = source_files
-            .iter()
-            .filter(|file| {
-                if !completed_paths.is_empty() && completed_paths.contains(&**file.relative_path) {
-                    tracing::debug!("Skipping completed file: {}", file.relative_path.display());
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-
+        let files_to_plan: Vec<_> = source_files.iter().collect();
         let total_to_plan = files_to_plan.len();
-        tracing::debug!("Filtered to {} files to plan", total_to_plan);
+        tracing::debug!("Planning {} files", total_to_plan);
 
         // Create planning progress bar (spinner for scanning destination)
         let plan_pb = if self.config.quiet {
@@ -531,37 +368,17 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     .scan()
                     .map(|files| files.len())
                     .unwrap_or(0);
-
-                // Check threshold: prevent mass deletion
-                if dest_file_count > 0 && !self.config.delete.is_forced() {
-                    let delete_percentage =
-                        (deletions.len() as f64 / dest_file_count as f64) * 100.0;
-
-                    if delete_percentage > self.config.delete.threshold() as f64 {
-                        tracing::error!(
-                            "Refusing to delete {:.1}% of destination files ({} files). Threshold: {}%. Use --force-delete to override.",
-                            delete_percentage,
-                            deletions.len(),
-                            self.config.delete.threshold()
-                        );
-
-                        if !self.config.quiet {
-                            eprintln!(
-                                "⚠️  ERROR: Would delete {:.1}% of files ({}/{}), exceeding threshold of {}%",
-                                delete_percentage,
-                                deletions.len(),
-                                dest_file_count,
-                                self.config.delete.threshold()
-                            );
-                            eprintln!("Use --force-delete to skip safety checks (dangerous!)");
-                        }
-
-                        return Err(crate::error::SyncError::Io(std::io::Error::other(format!(
-                            "Deletion threshold exceeded: {:.1}% > {}%",
-                            delete_percentage,
-                            self.config.delete.threshold()
-                        ))));
+                if let Err(error) = enforce_configured_delete_limit(
+                    &self.config.delete,
+                    dest_file_count,
+                    deletions.len(),
+                ) {
+                    tracing::error!(%error, "refusing unsafe deletion plan");
+                    if !self.config.quiet {
+                        eprintln!("ERROR: {error}");
+                        eprintln!("Use --force-delete to skip safety checks (dangerous!)");
                     }
+                    return Err(error);
                 }
 
                 // CRITICAL SAFETY NET: Even with --force-delete, require confirmation for catastrophic deletions
@@ -662,11 +479,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             }
             .emit();
         }
-
-        // Wrap resume state for thread-safe access
-        let resume_state = Arc::new(Mutex::new(resume_state));
-        let _checkpoint_files = self.config.resume.checkpoint_files;
-        let _checkpoint_bytes = self.config.resume.checkpoint_bytes;
 
         // Execute sync operations in parallel
         // Thread-safe stats tracking
@@ -770,10 +582,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 }
             }
         }
-
-        // Create counters for periodic checkpointing
-        let mut files_since_checkpoint = 0;
-        let mut bytes_since_checkpoint = 0;
 
         // Use stream-based execution (buffer_unordered) instead of join_all
         // This allows processing results as they complete and enabling periodic checkpointing
@@ -1215,81 +1023,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     {
                         s.files_verified += 1;
                     }
-
-                    // Resume State Update & Periodic Checkpointing
-                    if self.config.resume.enabled
-                        && !self.config.dry_run
-                        && matches!(task.action, SyncAction::Create | SyncAction::Update)
-                    {
-                        if let Ok(mut state_guard) = resume_state.lock() {
-                            if let Some(state) = state_guard.as_mut() {
-                                // Add to state
-                                let rel_path = task
-                                    .dest_path
-                                    .strip_prefix(destination)
-                                    .unwrap_or(&task.dest_path)
-                                    .to_path_buf();
-                                let checksum = if task.dest_path.exists() {
-                                    let verifier = IntegrityVerifier::new(
-                                        self.config.verification.mode,
-                                        false,
-                                    );
-                                    verifier
-                                        .compute_file_checksum(&task.dest_path)
-                                        .map(|checksum| checksum.to_hex())
-                                        .unwrap_or_else(|e| {
-                                            tracing::debug!(
-                                                "Failed to checksum completed file {}: {}",
-                                                task.dest_path.display(),
-                                                e
-                                            );
-                                            "none".to_string()
-                                        })
-                                } else {
-                                    "none".to_string()
-                                };
-
-                                state.add_completed_file(
-                                    resume::CompletedFile {
-                                        relative_path: rel_path,
-                                        action: match task.action {
-                                            SyncAction::Create => "create".to_string(),
-                                            SyncAction::Update => "update".to_string(),
-                                            _ => "unknown".to_string(),
-                                        },
-                                        size: task.source.as_ref().map(|s| s.size).unwrap_or(0),
-                                        checksum,
-                                        completed_at: resume::format_timestamp(SystemTime::now()),
-                                    },
-                                    res.bytes_written,
-                                );
-
-                                // Update counters
-                                files_since_checkpoint += 1;
-                                bytes_since_checkpoint += res.bytes_written;
-
-                                // Check thresholds
-                                if files_since_checkpoint >= self.config.resume.checkpoint_files
-                                    || bytes_since_checkpoint >= self.config.resume.checkpoint_bytes
-                                {
-                                    tracing::debug!(
-                                        "Checkpointing resume state ({} files, {} bytes)",
-                                        files_since_checkpoint,
-                                        bytes_since_checkpoint
-                                    );
-                                    // Only save checkpoints if destination is local
-                                    // (resume state files must be on local filesystem)
-                                    if !self.config.dest_is_remote {
-                                        if let Err(e) = state.save(destination) {
-                                            tracing::warn!("Failed to save checkpoint: {}", e);
-                                        }
-                                    }
-                                    files_since_checkpoint = 0;
-                                    bytes_since_checkpoint = 0;
-                                }
-                            }
-                        }
-                    }
                 }
                 Err((task, e)) => {
                     // Error handling
@@ -1411,100 +1144,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     bandwidth_utilization: perf_metrics.bandwidth_utilization,
                 }
                 .emit();
-            }
-        }
-
-        // Clean up resume state on successful completion
-        if let Ok(mut state_guard) = resume_state.lock() {
-            if state_guard.is_some() {
-                // Only clean up if this was an actual resume operation
-                // (Don't clean up if we just created a new state that was never saved)
-                if ResumeState::load(destination)?.is_some() {
-                    tracing::debug!("Cleaning up resume state file");
-                    if let Err(e) = ResumeState::delete(destination) {
-                        tracing::warn!("Failed to delete resume state: {}", e);
-                    }
-                }
-            }
-            // Drop the state
-            *state_guard = None;
-        }
-
-        // Save directory cache if enabled
-        if self.config.cache && !self.config.dry_run {
-            if let Some(ref cache) = dir_cache {
-                // Only save cache if destination is local
-                if !self.config.dest_is_remote {
-                    if let Err(e) = cache.save(destination) {
-                        tracing::warn!("Failed to save directory cache: {}", e);
-                    } else {
-                        tracing::debug!("Saved directory cache with {} entries", cache.len());
-                    }
-                } else {
-                    tracing::debug!("Skipping cache save - destination directory doesn't exist");
-                }
-            }
-        }
-
-        // Store checksums in database if enabled
-        if let Some(ref db) = checksum_db {
-            if !self.config.dry_run {
-                let mut stored_count = 0;
-                let verifier = IntegrityVerifier::new(
-                    if self.config.comparison.checksum {
-                        ChecksumType::Fast
-                    } else {
-                        ChecksumType::None
-                    },
-                    false,
-                );
-
-                for file in &source_files {
-                    if file.is_dir {
-                        continue; // Skip directories
-                    }
-
-                    // Compute checksum for source file
-                    if let Ok(checksum) = verifier.compute_file_checksum(&file.path) {
-                        // Store in database
-                        if let Err(e) =
-                            db.store_checksum(&file.path, file.modified, file.size, &checksum)
-                        {
-                            tracing::warn!(
-                                "Failed to store checksum for {}: {}",
-                                file.path.display(),
-                                e
-                            );
-                        } else {
-                            stored_count += 1;
-                        }
-                    }
-                }
-
-                if stored_count > 0 {
-                    tracing::info!("Stored {} checksums in database", stored_count);
-                }
-
-                // Handle prune flag
-                if self.config.verification.prune_checksum_db {
-                    use std::collections::HashSet;
-                    let existing_paths: HashSet<_> =
-                        source_files.iter().map(|f| (*f.path).clone()).collect();
-
-                    match db.prune(&existing_paths) {
-                        Ok(pruned) => {
-                            if pruned > 0 {
-                                tracing::info!(
-                                    "Pruned {} stale entries from checksum database",
-                                    pruned
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to prune checksum database: {}", e);
-                        }
-                    }
-                }
             }
         }
 
@@ -1697,9 +1336,8 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     pb.inc(1); // Indeterminate spinner update
 
                     // Plan the file
-                    // Pass None for checksum_db for now (streaming doesn't load it efficiently yet)
                     let task = planner
-                        .plan_file_async(&file, &destination, &transport, None)
+                        .plan_file_async(&file, &destination, &transport)
                         .await?;
 
                     Ok(task)
@@ -1996,8 +1634,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let pb = pb.clone();
                 let dry_run = self.config.dry_run;
                 let json = self.config.json;
-                let _force_delete = self.config.delete.is_forced();
-                let _delete_threshold = self.config.delete.threshold();
 
                 // We need to count deletions to check threshold (which requires buffering or estimation)
                 // In streaming mode, strict threshold enforcement is hard before starting.

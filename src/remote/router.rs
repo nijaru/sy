@@ -1,0 +1,1306 @@
+use crate::protocol::{
+    read_frame_or_eof, write_frame, Frame, FrameKind, ReadFrame, StreamId, MAX_FRAME_PAYLOAD,
+};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
+
+const BYTE_QUANTUM: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterRole {
+    Client,
+    Server,
+}
+
+impl RouterRole {
+    const fn first_local_stream(self) -> u32 {
+        match self {
+            Self::Client => 1,
+            Self::Server => 2,
+        }
+    }
+
+    const fn local_owns(self, stream_id: StreamId) -> bool {
+        !stream_id.is_control()
+            && match self {
+                Self::Client => !stream_id.get().is_multiple_of(2),
+                Self::Server => stream_id.get().is_multiple_of(2),
+            }
+    }
+
+    const fn peer_owns(self, stream_id: StreamId) -> bool {
+        !stream_id.is_control() && !self.local_owns(stream_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterConfig {
+    pub max_active_streams: u32,
+    pub max_inbound_frames: u32,
+    pub max_inbound_bytes: u64,
+    pub max_outbound_frames: u32,
+    pub max_outbound_bytes: u64,
+    /// Optional outbound `Data` payload pacing in bytes per second across all
+    /// multiplexed streams (`--bwlimit`). Token-bucket with a one-second
+    /// burst, matching the legacy limiter. Applies to file-content bytes only;
+    /// acknowledgements, scans, and metadata are never throttled so control
+    /// traffic cannot starve behind bulk data.
+    pub outbound_payload_limit: Option<u64>,
+    /// Optional idle I/O deadline (`--timeout`): the session aborts when no
+    /// inbound frame arrives within this many seconds. `None` disables the
+    /// deadline, matching rsync's default of no I/O timeout.
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            max_active_streams: 256,
+            max_inbound_frames: 128,
+            max_inbound_bytes: 16 * 1024 * 1024,
+            max_outbound_frames: 128,
+            max_outbound_bytes: 16 * 1024 * 1024,
+            outbound_payload_limit: None,
+            idle_timeout: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RouterError {
+    #[error("active stream budget must be greater than zero")]
+    ZeroStreamBudget,
+
+    #[error("no inbound frame within the configured I/O timeout (--timeout); aborting session")]
+    IdleTimeoutExceeded,
+
+    #[error("{direction} frame budget must be greater than zero")]
+    ZeroFrameBudget { direction: &'static str },
+
+    #[error(
+        "{direction} byte budget must be at least one maximum protocol frame ({minimum} bytes), got {budget}"
+    )]
+    ByteBudgetTooSmall {
+        direction: &'static str,
+        budget: u64,
+        minimum: u64,
+    },
+
+    #[error(
+        "{direction} byte budget is too large to represent: {bytes} bytes with {quantum}-byte permits"
+    )]
+    ByteBudgetTooLarge {
+        direction: &'static str,
+        bytes: u64,
+        quantum: u64,
+    },
+
+    #[error("frame router state lock was poisoned")]
+    StatePoisoned,
+
+    #[error("frame router is shutting down")]
+    ShuttingDown,
+
+    #[error("local stream id space exhausted")]
+    StreamIdExhausted,
+
+    #[error("stream {0} is already registered")]
+    StreamAlreadyRegistered(u32),
+
+    #[error("active stream limit reached ({0})")]
+    TooManyStreams(u32),
+
+    #[error("stream {0} was closed while the peer was still sending frames")]
+    StreamClosed(u32),
+
+    #[error("peer attempted to open stream {stream_id} from the local {role:?} id namespace")]
+    InvalidPeerStreamId { role: RouterRole, stream_id: u32 },
+
+    #[error("peer attempted to open stream {stream_id} with non-opening frame {kind:?}")]
+    InvalidStreamOpen { stream_id: u32, kind: FrameKind },
+
+    #[error("incoming stream acceptor is closed")]
+    IncomingClosed,
+
+    #[error("frame router writer is closed")]
+    WriterClosed,
+
+    #[error("frame router {direction} budget semaphore was closed")]
+    BudgetClosed { direction: &'static str },
+
+    #[error(transparent)]
+    Protocol(#[from] crate::protocol::ProtocolError),
+}
+
+pub type SharedRouterError = Arc<RouterError>;
+
+enum StreamMessage {
+    Frame(RoutedFrame),
+    Failed(SharedRouterError),
+}
+
+enum IncomingMessage {
+    Stream(IncomingStream),
+    Failed(SharedRouterError),
+    /// Orderly end of the incoming stream after a clean transport EOF.
+    /// Distinguished from `Failed` so `serve_transport` can drain active
+    /// tasks and exit successfully instead of treating a peer hangup
+    /// between frames as a transport failure.
+    Closed,
+}
+
+struct OutboundFrame {
+    frame: Frame,
+    written: Option<oneshot::Sender<()>>,
+    _frame_permit: OwnedSemaphorePermit,
+    _byte_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// A received frame that retains its global router capacity until dropped.
+///
+/// Keeping the permits attached to the frame means queue memory remains bounded
+/// even though individual stream inboxes use unbounded channels internally.
+pub struct RoutedFrame {
+    frame: Frame,
+    _frame_permit: OwnedSemaphorePermit,
+    _byte_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RoutedFrame {
+    pub const fn frame(&self) -> &Frame {
+        &self.frame
+    }
+}
+
+impl fmt::Debug for RoutedFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.frame.fmt(formatter)
+    }
+}
+
+struct RouterInner {
+    streams: Mutex<HashMap<StreamId, mpsc::UnboundedSender<StreamMessage>>>,
+    failure: Mutex<Option<SharedRouterError>>,
+    incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
+    inbound_frames: Arc<Semaphore>,
+    inbound_bytes: Arc<Semaphore>,
+    outbound_frames: Arc<Semaphore>,
+    outbound_bytes: Arc<Semaphore>,
+    shutdown: watch::Sender<bool>,
+    config: RouterConfig,
+    role: RouterRole,
+    next_stream_id: AtomicU32,
+}
+
+#[derive(Clone)]
+pub struct RouterSender {
+    inner: Arc<RouterInner>,
+    outbound_tx: mpsc::UnboundedSender<OutboundFrame>,
+}
+
+impl RouterSender {
+    /// Allocate and register a locally initiated non-zero stream.
+    ///
+    /// Client-initiated streams are odd and server-initiated streams are even.
+    /// Registration happens before the caller can send the opening frame, so a
+    /// fast peer response cannot race ahead of the inbox.
+    pub fn open_stream(&self) -> Result<StreamInbox, SharedRouterError> {
+        let raw = self
+            .inner
+            .next_stream_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current == 0 {
+                    None
+                } else {
+                    Some(current.checked_add(2).unwrap_or(0))
+                }
+            })
+            .map_err(|_| Arc::new(RouterError::StreamIdExhausted))?;
+        register_stream(&self.inner, StreamId::new(raw))
+    }
+
+    /// Queue a frame for the single serialized transport writer.
+    ///
+    /// Frame-count and byte permits are acquired before enqueueing and remain
+    /// held until the writer finishes the frame, providing backpressure without
+    /// a second hidden buffering policy. Acknowledgements additionally wait for
+    /// the writer to flush them so a completed operation cannot lose its final
+    /// success signal when the router is dropped immediately afterward.
+    pub async fn send(&self, frame: Frame) -> Result<(), SharedRouterError> {
+        if let Some(failure) = current_failure(&self.inner)? {
+            return Err(failure);
+        }
+
+        let (frame_permit, byte_permit) = acquire_capacity(
+            Arc::clone(&self.inner.outbound_frames),
+            Arc::clone(&self.inner.outbound_bytes),
+            frame.payload().len(),
+            self.inner.config.max_outbound_bytes,
+            "outbound",
+        )
+        .await
+        .map_err(Arc::new)?;
+        let (written, completion) = if frame.kind() == FrameKind::Ack {
+            let (written, completion) = oneshot::channel();
+            (Some(written), Some(completion))
+        } else {
+            (None, None)
+        };
+        let queued = OutboundFrame {
+            frame,
+            written,
+            _frame_permit: frame_permit,
+            _byte_permit: byte_permit,
+        };
+        self.outbound_tx
+            .send(queued)
+            .map_err(|_| Arc::new(RouterError::WriterClosed))?;
+        if let Some(completion) = completion {
+            completion
+                .await
+                .map_err(|_| Arc::new(RouterError::WriterClosed))?;
+        }
+        Ok(())
+    }
+}
+
+/// Inbox for one protocol stream.
+pub struct StreamInbox {
+    stream_id: StreamId,
+    receiver: mpsc::UnboundedReceiver<StreamMessage>,
+    inner: Weak<RouterInner>,
+}
+
+impl StreamInbox {
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub async fn recv(&mut self) -> Result<Option<RoutedFrame>, SharedRouterError> {
+        match self.receiver.recv().await {
+            Some(StreamMessage::Frame(frame)) => Ok(Some(frame)),
+            Some(StreamMessage::Failed(error)) => Err(error),
+            None => match self.inner.upgrade() {
+                Some(inner) => match current_failure(&inner)? {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                },
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+impl Drop for StreamInbox {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if let Ok(mut streams) = inner.streams.lock() {
+            streams.remove(&self.stream_id);
+        };
+    }
+}
+
+/// First frame and inbox for a stream initiated by the peer.
+pub struct IncomingStream {
+    pub first: RoutedFrame,
+    pub inbox: StreamInbox,
+}
+
+impl IncomingStream {
+    pub const fn stream_id(&self) -> StreamId {
+        self.inbox.stream_id()
+    }
+}
+
+pub struct IncomingStreams {
+    receiver: mpsc::UnboundedReceiver<IncomingMessage>,
+}
+
+impl IncomingStreams {
+    pub async fn recv(&mut self) -> Result<Option<IncomingStream>, SharedRouterError> {
+        match self.receiver.recv().await {
+            Some(IncomingMessage::Stream(stream)) => Ok(Some(stream)),
+            Some(IncomingMessage::Failed(error)) => Err(error),
+            Some(IncomingMessage::Closed) => Ok(None),
+            None => Ok(None),
+        }
+    }
+}
+
+pub struct RouterTasks {
+    reader: JoinHandle<Result<(), SharedRouterError>>,
+    writer: JoinHandle<Result<(), SharedRouterError>>,
+}
+
+impl RouterTasks {
+    pub fn abort(&self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+impl Drop for RouterTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// Owns the central reader/writer actors for one already-negotiated transport.
+///
+/// The router starts after the v3 control-plane handshake. Control stream 0 is
+/// registered immediately for later Error/Ping/Pong traffic; locally opened
+/// streams are registered before use, while unknown peer-owned streams are
+/// delivered through `IncomingStreams` with their first frame attached.
+pub struct FrameRouter {
+    sender: RouterSender,
+    control: StreamInbox,
+    incoming: IncomingStreams,
+    tasks: RouterTasks,
+}
+
+impl FrameRouter {
+    pub fn start<R, W>(
+        reader: R,
+        writer: W,
+        role: RouterRole,
+        config: RouterConfig,
+    ) -> Result<Self, RouterError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let inbound_byte_units = validate_config(config)?;
+        let outbound_byte_units = byte_units(config.max_outbound_bytes, "outbound")?;
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outbound_payload_limit = config.outbound_payload_limit;
+        let inner = Arc::new(RouterInner {
+            streams: Mutex::new(HashMap::new()),
+            failure: Mutex::new(None),
+            incoming_tx,
+            inbound_frames: Arc::new(Semaphore::new(config.max_inbound_frames as usize)),
+            inbound_bytes: Arc::new(Semaphore::new(inbound_byte_units as usize)),
+            outbound_frames: Arc::new(Semaphore::new(config.max_outbound_frames as usize)),
+            outbound_bytes: Arc::new(Semaphore::new(outbound_byte_units as usize)),
+            shutdown: shutdown_tx,
+            config,
+            role,
+            next_stream_id: AtomicU32::new(role.first_local_stream()),
+        });
+
+        let control = register_stream_plain(&inner, StreamId::CONTROL)?;
+        let sender = RouterSender {
+            inner: Arc::clone(&inner),
+            outbound_tx,
+        };
+
+        let reader_inner = Arc::clone(&inner);
+        let reader_shutdown = shutdown_rx.clone();
+        let reader_task = tokio::spawn(async move {
+            match reader_loop(reader, &reader_inner, reader_shutdown).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let error = Arc::new(error);
+                    publish_failure(&reader_inner, Arc::clone(&error));
+                    Err(error)
+                }
+            }
+        });
+
+        let writer_inner = Arc::clone(&inner);
+        let writer_task = tokio::spawn(async move {
+            match writer_loop(writer, outbound_rx, shutdown_rx, outbound_payload_limit).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let error = Arc::new(error);
+                    publish_failure(&writer_inner, Arc::clone(&error));
+                    Err(error)
+                }
+            }
+        });
+
+        Ok(Self {
+            sender,
+            control,
+            incoming: IncomingStreams {
+                receiver: incoming_rx,
+            },
+            tasks: RouterTasks {
+                reader: reader_task,
+                writer: writer_task,
+            },
+        })
+    }
+
+    pub fn sender(&self) -> RouterSender {
+        self.sender.clone()
+    }
+
+    pub fn control(&mut self) -> &mut StreamInbox {
+        &mut self.control
+    }
+
+    pub fn incoming(&mut self) -> &mut IncomingStreams {
+        &mut self.incoming
+    }
+
+    pub fn tasks(&self) -> &RouterTasks {
+        &self.tasks
+    }
+}
+
+async fn reader_loop<R>(
+    mut reader: R,
+    inner: &Arc<RouterInner>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), RouterError>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        // `read_frame_or_eof` validates the 1 MiB protocol payload cap before
+        // allocation. The router then admits the completed frame into its
+        // global queue budget, so resident inbound memory is bounded by the
+        // configured budget plus at most one frame currently being read.
+        // The idle deadline (`--timeout`) wraps each read: a session that
+        // receives nothing for the configured window is presumed hung and
+        // torn down, matching rsync's I/O timeout semantics. Any inbound
+        // frame resets the window.
+        let deadline = inner.config.idle_timeout;
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            _ = async {
+                match deadline {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if deadline.is_some() => {
+                // Do NOT close streams cleanly here: the reader task's error
+                // path publishes this failure to every stream inbox so
+                // waiters observe the typed timeout, not a silent clean end.
+                return Err(RouterError::IdleTimeoutExceeded);
+            }
+            result = read_frame_or_eof(&mut reader) => match result? {
+                // A clean EOF is the peer hanging up between frames. It is not
+                // a transport failure: close stream inboxes orderly (waiters
+                // see stream end and surface typed `UnexpectedStreamEnd`
+                // errors if they still expected data) and let the writer drain
+                // queued acknowledgements before it observes the closed
+                // outbound channel.
+                ReadFrame::CleanEof => {
+                    close_all_streams(inner);
+                    return Ok(());
+                }
+                ReadFrame::Frame(frame) => frame,
+            },
+        };
+        let (frame_permit, byte_permit) = acquire_capacity(
+            Arc::clone(&inner.inbound_frames),
+            Arc::clone(&inner.inbound_bytes),
+            frame.payload().len(),
+            inner.config.max_inbound_bytes,
+            "inbound",
+        )
+        .await?;
+        route_inbound(
+            inner,
+            RoutedFrame {
+                frame,
+                _frame_permit: frame_permit,
+                _byte_permit: byte_permit,
+            },
+        )?;
+    }
+}
+
+async fn writer_loop<W>(
+    mut writer: W,
+    mut receiver: mpsc::UnboundedReceiver<OutboundFrame>,
+    mut shutdown: watch::Receiver<bool>,
+    payload_limit: Option<u64>,
+) -> Result<(), RouterError>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Sole consumer of the limiter: the writer is the single point where all
+    // multiplexed streams converge, so no synchronization is needed.
+    let mut limiter = payload_limit.map(crate::sync::ratelimit::RateLimiter::new);
+    loop {
+        let queued = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            queued = receiver.recv() => queued,
+        };
+        let Some(mut queued) = queued else {
+            writer
+                .flush()
+                .await
+                .map_err(crate::protocol::ProtocolError::from)?;
+            return Ok(());
+        };
+        // --bwlimit pacing: bulk `Data` frames sleep for their token deficit
+        // before the write; control frames (Ack/Scan/Metadata) skip the
+        // limiter entirely so they cannot starve behind a large transfer.
+        if let (Some(limiter), FrameKind::Data) = (limiter.as_mut(), queued.frame.kind()) {
+            let sleep = limiter.consume(u64::try_from(queued.frame.payload().len()).unwrap_or(0));
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
+        }
+        write_frame(&mut writer, &queued.frame).await?;
+        // Every frame is flushed, not only acknowledgements: the contract of a
+        // completed frame is that its bytes reached the transport, but process
+        // stdio implementations buffer binary payloads (std::io::Stdout is a
+        // LineWriter under tokio::io::stdout()) and would otherwise hold
+        // newlineless frames — including EntryEnd — until an unrelated Ack
+        // forces a flush, deadlocking the session.
+        writer
+            .flush()
+            .await
+            .map_err(crate::protocol::ProtocolError::from)?;
+        if let Some(written) = queued.written.take() {
+            let _ = written.send(());
+        }
+        // `queued` drops here, releasing frame and byte capacity only after the
+        // bytes have been accepted by the underlying AsyncWrite.
+    }
+}
+
+fn route_inbound(inner: &Arc<RouterInner>, routed: RoutedFrame) -> Result<(), RouterError> {
+    {
+        let failure = inner
+            .failure
+            .lock()
+            .map_err(|_| RouterError::StatePoisoned)?;
+        if failure.is_some() {
+            return Err(RouterError::ShuttingDown);
+        }
+    }
+
+    let stream_id = routed.frame.stream_id();
+    let sender = {
+        let mut streams = inner
+            .streams
+            .lock()
+            .map_err(|_| RouterError::StatePoisoned)?;
+        if let Some(sender) = streams.get(&stream_id) {
+            sender.clone()
+        } else if !inner.role.peer_owns(stream_id) {
+            return Err(RouterError::InvalidPeerStreamId {
+                role: inner.role,
+                stream_id: stream_id.get(),
+            });
+        } else if !is_stream_opening_kind(routed.frame.kind()) {
+            return Err(RouterError::InvalidStreamOpen {
+                stream_id: stream_id.get(),
+                kind: routed.frame.kind(),
+            });
+        } else {
+            ensure_stream_capacity(inner, &streams)?;
+            let (sender, receiver) = mpsc::unbounded_channel();
+            streams.insert(stream_id, sender);
+            let inbox = StreamInbox {
+                stream_id,
+                receiver,
+                inner: Arc::downgrade(inner),
+            };
+            drop(streams);
+            inner
+                .incoming_tx
+                .send(IncomingMessage::Stream(IncomingStream {
+                    first: routed,
+                    inbox,
+                }))
+                .map_err(|_| RouterError::IncomingClosed)?;
+            return Ok(());
+        }
+    };
+
+    sender
+        .send(StreamMessage::Frame(routed))
+        .map_err(|_| RouterError::StreamClosed(stream_id.get()))
+}
+
+fn is_stream_opening_kind(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::ScanRequest
+            | FrameKind::HashRequest
+            | FrameKind::SignatureRequest
+            | FrameKind::FileBegin
+            | FrameKind::Metadata
+            | FrameKind::Mutation
+    )
+}
+
+fn register_stream(
+    inner: &Arc<RouterInner>,
+    stream_id: StreamId,
+) -> Result<StreamInbox, SharedRouterError> {
+    // Match `publish_failure`'s lock order. Holding the failure guard through
+    // registration prevents a stream from being inserted just after failure
+    // broadcast drained the registry.
+    let failure = inner
+        .failure
+        .lock()
+        .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
+    if let Some(error) = failure.as_ref() {
+        return Err(Arc::clone(error));
+    }
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let mut streams = inner
+        .streams
+        .lock()
+        .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
+    if streams.contains_key(&stream_id) {
+        return Err(Arc::new(RouterError::StreamAlreadyRegistered(
+            stream_id.get(),
+        )));
+    }
+    ensure_stream_capacity(inner, &streams).map_err(Arc::new)?;
+    streams.insert(stream_id, sender);
+    Ok(StreamInbox {
+        stream_id,
+        receiver,
+        inner: Arc::downgrade(inner),
+    })
+}
+
+fn register_stream_plain(
+    inner: &Arc<RouterInner>,
+    stream_id: StreamId,
+) -> Result<StreamInbox, RouterError> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let mut streams = inner
+        .streams
+        .lock()
+        .map_err(|_| RouterError::StatePoisoned)?;
+    if streams.contains_key(&stream_id) {
+        return Err(RouterError::StreamAlreadyRegistered(stream_id.get()));
+    }
+    streams.insert(stream_id, sender);
+    Ok(StreamInbox {
+        stream_id,
+        receiver,
+        inner: Arc::downgrade(inner),
+    })
+}
+
+fn ensure_stream_capacity(
+    inner: &RouterInner,
+    streams: &HashMap<StreamId, mpsc::UnboundedSender<StreamMessage>>,
+) -> Result<(), RouterError> {
+    let active = streams
+        .len()
+        .saturating_sub(usize::from(streams.contains_key(&StreamId::CONTROL)));
+    if active >= inner.config.max_active_streams as usize {
+        return Err(RouterError::TooManyStreams(inner.config.max_active_streams));
+    }
+    Ok(())
+}
+
+fn current_failure(
+    inner: &Arc<RouterInner>,
+) -> Result<Option<SharedRouterError>, SharedRouterError> {
+    inner
+        .failure
+        .lock()
+        .map(|failure| failure.clone())
+        .map_err(|_| Arc::new(RouterError::StatePoisoned))
+}
+
+/// Close every stream inbox with an orderly stream end (no `Failed` message,
+/// no failure record). Waiters receiving `Ok(None)` from `recv` treat this as
+/// end of stream and report their own typed errors where data was still
+/// expected.
+fn close_all_streams(inner: &Arc<RouterInner>) {
+    if let Ok(mut streams) = inner.streams.lock() {
+        for (_, sender) in streams.drain() {
+            drop(sender);
+        }
+    }
+    let _ = inner.incoming_tx.send(IncomingMessage::Closed);
+}
+
+fn publish_failure(inner: &Arc<RouterInner>, error: SharedRouterError) {
+    let first_failure = match inner.failure.lock() {
+        Ok(mut failure) => {
+            if failure.is_some() {
+                false
+            } else {
+                *failure = Some(Arc::clone(&error));
+                true
+            }
+        }
+        Err(_) => false,
+    };
+    if !first_failure {
+        return;
+    }
+
+    let _ = inner.shutdown.send(true);
+    inner.inbound_frames.close();
+    inner.inbound_bytes.close();
+    inner.outbound_frames.close();
+    inner.outbound_bytes.close();
+
+    if let Ok(mut streams) = inner.streams.lock() {
+        for (_, sender) in streams.drain() {
+            let _ = sender.send(StreamMessage::Failed(Arc::clone(&error)));
+        }
+    }
+    let _ = inner
+        .incoming_tx
+        .send(IncomingMessage::Failed(Arc::clone(&error)));
+}
+
+fn validate_config(config: RouterConfig) -> Result<u32, RouterError> {
+    if config.max_active_streams == 0 {
+        return Err(RouterError::ZeroStreamBudget);
+    }
+    if config.max_inbound_frames == 0 {
+        return Err(RouterError::ZeroFrameBudget {
+            direction: "inbound",
+        });
+    }
+    if config.max_outbound_frames == 0 {
+        return Err(RouterError::ZeroFrameBudget {
+            direction: "outbound",
+        });
+    }
+    validate_byte_budget(config.max_inbound_bytes, "inbound")?;
+    validate_byte_budget(config.max_outbound_bytes, "outbound")?;
+    byte_units(config.max_inbound_bytes, "inbound")
+}
+
+fn validate_byte_budget(bytes: u64, direction: &'static str) -> Result<(), RouterError> {
+    let minimum = MAX_FRAME_PAYLOAD as u64;
+    if bytes < minimum {
+        return Err(RouterError::ByteBudgetTooSmall {
+            direction,
+            budget: bytes,
+            minimum,
+        });
+    }
+    byte_units(bytes, direction).map(|_| ())
+}
+
+fn byte_units(bytes: u64, direction: &'static str) -> Result<u32, RouterError> {
+    let units = bytes.div_ceil(BYTE_QUANTUM);
+    u32::try_from(units).map_err(|_| RouterError::ByteBudgetTooLarge {
+        direction,
+        bytes,
+        quantum: BYTE_QUANTUM,
+    })
+}
+
+fn frame_byte_units(bytes: usize) -> u32 {
+    if bytes == 0 {
+        0
+    } else {
+        // A protocol frame is capped at 1 MiB, so this conversion cannot exceed
+        // u32 on any supported target.
+        (bytes as u64).div_ceil(BYTE_QUANTUM) as u32
+    }
+}
+
+async fn acquire_capacity(
+    frames: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    payload_len: usize,
+    byte_budget: u64,
+    direction: &'static str,
+) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), RouterError> {
+    if payload_len as u64 > byte_budget {
+        return Err(RouterError::ByteBudgetTooSmall {
+            direction,
+            budget: byte_budget,
+            minimum: payload_len as u64,
+        });
+    }
+
+    let frame_permit = frames
+        .acquire_owned()
+        .await
+        .map_err(|_| RouterError::BudgetClosed { direction })?;
+    let units = frame_byte_units(payload_len);
+    let byte_permit = if units == 0 {
+        None
+    } else {
+        Some(
+            bytes
+                .acquire_many_owned(units)
+                .await
+                .map_err(|_| RouterError::BudgetClosed { direction })?,
+        )
+    };
+    Ok((frame_permit, byte_permit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::FrameFlags;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    fn frame(kind: FrameKind, stream_id: StreamId, payload: &'static [u8]) -> Frame {
+        Frame::new(
+            kind,
+            FrameFlags::empty(),
+            stream_id,
+            Bytes::from_static(payload),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_unbounded_or_impossibly_small_configs() {
+        let zero_streams = RouterConfig {
+            max_active_streams: 0,
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            FrameRouter::start(
+                tokio::io::empty(),
+                tokio::io::sink(),
+                RouterRole::Client,
+                zero_streams
+            ),
+            Err(RouterError::ZeroStreamBudget)
+        ));
+
+        let zero_frames = RouterConfig {
+            max_inbound_frames: 0,
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            FrameRouter::start(
+                tokio::io::empty(),
+                tokio::io::sink(),
+                RouterRole::Client,
+                zero_frames
+            ),
+            Err(RouterError::ZeroFrameBudget {
+                direction: "inbound"
+            })
+        ));
+
+        let small = RouterConfig {
+            max_inbound_bytes: (MAX_FRAME_PAYLOAD - 1) as u64,
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            FrameRouter::start(
+                tokio::io::empty(),
+                tokio::io::sink(),
+                RouterRole::Client,
+                small
+            ),
+            Err(RouterError::ByteBudgetTooSmall {
+                direction: "inbound",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn allocates_disjoint_client_and_server_stream_namespaces() {
+        let (client_io, _peer) = tokio::io::duplex(4096);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let client = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(client.sender().open_stream().unwrap().stream_id().get(), 1);
+        assert_eq!(client.sender().open_stream().unwrap().stream_id().get(), 3);
+
+        let (server_io, _peer) = tokio::io::duplex(4096);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = FrameRouter::start(
+            server_reader,
+            server_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(server.sender().open_stream().unwrap().stream_id().get(), 2);
+        assert_eq!(server.sender().open_stream().unwrap().stream_id().get(), 4);
+    }
+
+    #[tokio::test]
+    async fn active_stream_limit_is_enforced() {
+        let config = RouterConfig {
+            max_active_streams: 1,
+            ..RouterConfig::default()
+        };
+        let (router_io, _peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let router = FrameRouter::start(reader, writer, RouterRole::Client, config).unwrap();
+        let first = router.sender().open_stream().unwrap();
+        let error = match router.sender().open_stream() {
+            Err(error) => error,
+            Ok(_) => panic!("expected active stream limit error"),
+        };
+        assert!(matches!(error.as_ref(), RouterError::TooManyStreams(1)));
+        drop(first);
+        assert!(router.sender().open_stream().is_ok());
+    }
+
+    #[tokio::test]
+    async fn routes_registered_streams() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (mut peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let router = FrameRouter::start(
+            router_reader,
+            router_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"metadata"),
+        )
+        .await
+        .unwrap();
+        let routed = inbox.recv().await.unwrap().unwrap();
+        assert_eq!(routed.frame().kind(), FrameKind::Entry);
+        assert_eq!(routed.frame().payload(), &Bytes::from_static(b"metadata"));
+
+        router
+            .sender()
+            .send(frame(FrameKind::Ack, stream_id, b"ok"))
+            .await
+            .unwrap();
+        let outbound = crate::protocol::read_frame(&mut peer_reader).await.unwrap();
+        assert_eq!(outbound.kind(), FrameKind::Ack);
+        assert_eq!(outbound.stream_id(), stream_id);
+    }
+
+    #[tokio::test]
+    async fn accepts_peer_opened_stream_and_routes_followups() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let mut router = FrameRouter::start(
+            router_reader,
+            router_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let stream_id = StreamId::new(77);
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::ScanRequest, stream_id, b"request"),
+        )
+        .await
+        .unwrap();
+        let mut incoming = router.incoming().recv().await.unwrap().unwrap();
+        assert_eq!(incoming.stream_id(), stream_id);
+        assert_eq!(incoming.first.frame().kind(), FrameKind::ScanRequest);
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"entry"),
+        )
+        .await
+        .unwrap();
+        let followup = incoming.inbox.recv().await.unwrap().unwrap();
+        assert_eq!(followup.frame().kind(), FrameKind::Entry);
+    }
+
+    #[tokio::test]
+    async fn rejects_peer_streams_from_local_namespace() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let mut router = FrameRouter::start(
+            router_reader,
+            router_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::ScanRequest, StreamId::new(3), b"bad"),
+        )
+        .await
+        .unwrap();
+        let error = match router.incoming().recv().await {
+            Err(error) => error,
+            Ok(_) => panic!("expected peer namespace error"),
+        };
+        assert!(matches!(
+            error.as_ref(),
+            RouterError::InvalidPeerStreamId {
+                role: RouterRole::Client,
+                stream_id: 3
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_opening_frame_for_unknown_peer_stream() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let mut router = FrameRouter::start(
+            router_reader,
+            router_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, StreamId::new(77), b"bad"),
+        )
+        .await
+        .unwrap();
+        let error = match router.incoming().recv().await {
+            Err(error) => error,
+            Ok(_) => panic!("expected stream opener error"),
+        };
+        assert!(matches!(
+            error.as_ref(),
+            RouterError::InvalidStreamOpen {
+                stream_id: 77,
+                kind: FrameKind::Entry
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbound_frame_budget_applies_backpressure_until_frame_drop() {
+        let config = RouterConfig {
+            max_inbound_frames: 1,
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"first"),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"second"),
+        )
+        .await
+        .unwrap();
+
+        let first = inbox.recv().await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err()
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.frame().payload(), &Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test]
+    async fn control_stream_is_pre_registered() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let mut router = FrameRouter::start(
+            router_reader,
+            router_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Ping, StreamId::CONTROL, b"ping"),
+        )
+        .await
+        .unwrap();
+        let routed = router.control().recv().await.unwrap().unwrap();
+        assert_eq!(routed.frame().kind(), FrameKind::Ping);
+    }
+
+    /// --timeout: a session that receives no inbound frame within the
+    /// configured window aborts with the typed idle error; stream waiters
+    /// observe the failure rather than a silent clean end.
+    #[tokio::test]
+    async fn idle_timeout_aborts_silent_session() {
+        let config = RouterConfig {
+            idle_timeout: Some(Duration::from_millis(150)),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+
+        // The peer never writes; the deadline must fire and the inbox must
+        // surface the typed timeout (not a clean `None`).
+        let error = inbox.recv().await.unwrap_err();
+        assert!(matches!(*error, RouterError::IdleTimeoutExceeded));
+    }
+
+    /// A session that keeps receiving frames resets the idle deadline each
+    /// time and must survive windows far beyond the configured timeout.
+    #[tokio::test]
+    async fn steady_frames_never_trip_idle_deadline() {
+        let config = RouterConfig {
+            idle_timeout: Some(Duration::from_millis(200)),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        // Frames arrive well inside each 200 ms window; five windows pass,
+        // far beyond the timeout, without tripping it.
+        for tick in 0..5 {
+            write_frame(
+                &mut peer_writer,
+                &Frame::new(
+                    FrameKind::Entry,
+                    FrameFlags::empty(),
+                    stream_id,
+                    Bytes::from(format!("tick {tick}")),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let routed = tokio::time::timeout(Duration::from_millis(500), inbox.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                routed.frame().payload(),
+                &Bytes::from(format!("tick {tick}"))
+            );
+        }
+
+        // Session is still healthy: a final frame routes normally.
+        write_frame(
+            &mut peer_writer,
+            &frame(FrameKind::Entry, stream_id, b"final"),
+        )
+        .await
+        .unwrap();
+        let routed = tokio::time::timeout(Duration::from_millis(500), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(routed.frame().payload(), &Bytes::from_static(b"final"));
+    }
+
+    /// --bwlimit paces outbound `Data` payload bytes across all streams while
+    /// control frames bypass the limiter entirely.
+    #[tokio::test]
+    async fn data_frames_are_paced_by_payload_limit() {
+        let config = RouterConfig {
+            // 1 KiB/s with a 1 KiB burst: the first frame is free, the second
+            // identical frame must wait a full second.
+            outbound_payload_limit: Some(1024),
+            ..RouterConfig::default()
+        };
+        let (router_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (router_reader, router_writer) = tokio::io::split(router_io);
+        let (mut peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let router =
+            FrameRouter::start(router_reader, router_writer, RouterRole::Client, config).unwrap();
+        let inbox = router.sender().open_stream().unwrap();
+        let stream_id = inbox.stream_id();
+
+        let data = frame(FrameKind::Data, stream_id, &[0_u8; 1024]);
+        let start = std::time::Instant::now();
+        router.sender().send(data.clone()).await.unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("first data frame must pass within the burst")
+        .unwrap();
+        assert_eq!(first.kind(), FrameKind::Data);
+
+        // Second 1 KiB frame: burst budget spent, ~1 s token deficit.
+        router.sender().send(data).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("second data frame must still arrive")
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "paced frame arrived too early: {elapsed:?}"
+        );
+
+        // A control acknowledgement must not wait behind bulk data: send it
+        // immediately after and expect it to arrive well before the next
+        // token refill.
+        let ack = frame(FrameKind::Ack, stream_id, b"ok");
+        router.sender().send(ack).await.unwrap();
+        let control = tokio::time::timeout(
+            Duration::from_millis(250),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .expect("control frames must bypass the payload limiter")
+        .unwrap();
+        assert_eq!(control.kind(), FrameKind::Ack);
+    }
+}

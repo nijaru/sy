@@ -22,18 +22,6 @@ pub enum VerifyMode {
     Only,
 }
 
-/// Resume mode for interrupted transfers
-#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
-pub enum ResumeMode {
-    /// Resume interrupted transfers if state found (default)
-    #[default]
-    Auto,
-    /// Only resume interrupted transfers, don't start new ones
-    Only,
-    /// Disable resume support
-    No,
-}
-
 fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
     Ok(SyncPath::parse(s))
 }
@@ -90,9 +78,11 @@ impl VerificationMode {
         }
     }
 
-    /// Check if this mode requires block-level verification
+    /// Whether --verify enables post-write verification of committed bytes.
+    /// The local engine hashes staged bytes against the source before the
+    /// rename commit; the v3 protocol always verifies unconditionally.
     pub fn verify_blocks(&self) -> bool {
-        false
+        matches!(self, Self::Verify)
     }
 }
 
@@ -140,11 +130,6 @@ pub enum SymlinkMode {
     # Verify file integrity after write
     sy /source /destination --verify            # xxHash3 verification
 
-    # Resume interrupted transfers
-    sy /source user@host:/dest --resume         # Auto-resume interrupted large files
-    sy /source user@host:/dest --resume=only    # Only resume, don't start new transfers
-    sy /source user@host:/dest --clear-resume-state  # Clear all resume state
-
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
@@ -173,10 +158,6 @@ pub struct Cli {
     /// Force deletion even if it exceeds safety threshold (use with --delete)
     #[arg(long)]
     pub force_delete: bool,
-
-    /// Move deleted files to trash instead of permanent deletion
-    #[arg(long)]
-    pub trash: bool,
 
     /// Verbosity level (can be repeated: -v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -215,15 +196,6 @@ pub struct Cli {
     /// Backup file suffix (default: ~)
     #[arg(long, default_value = "~")]
     pub suffix: String,
-
-    /// Keep partially transferred files
-    /// Optional DIR to store partial files in a separate directory
-    #[arg(long, num_args = 0..=1, default_missing_value = "", hide = true)]
-    pub partial: Option<String>,
-
-    /// Directory to store partial files (alias for --partial=DIR)
-    #[arg(long)]
-    pub partial_dir: Option<PathBuf>,
 
     /// Remove source files after successful transfer (like mv)
     #[arg(long)]
@@ -302,50 +274,9 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
-    /// Resume mode (auto|only|no)
-    /// - auto: Resume interrupted transfers if state found (default)
-    /// - only: Only resume interrupted transfers, don't start new ones
-    /// - no: Disable resume support
-    #[arg(long, value_enum, default_value = "auto")]
-    pub resume: ResumeMode,
-
-    /// Clear all resume state before starting
-    #[arg(long)]
-    pub clear_resume_state: bool,
-
     /// Use streaming mode for massive directories (experimental)
     #[arg(long, hide = true)]
     pub stream: bool,
-
-    /// Checkpoint every N files (default: 100)
-    #[arg(long, default_value = "100")]
-    pub checkpoint_files: usize,
-
-    /// Checkpoint every N bytes transferred (e.g., "100MB", default: 100MB)
-    #[arg(long, value_parser = parse_size, default_value = "104857600")]
-    pub checkpoint_bytes: u64,
-
-    /// Use directory cache for faster re-syncs (default: false)
-    /// The cache stores directory mtimes to skip unchanged directories
-    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
-    pub cache: bool,
-
-    /// Delete any existing cache files before starting
-    #[arg(long)]
-    pub clear_cache: bool,
-
-    /// Use checksum database for faster --checksum re-syncs (default: false)
-    /// The database stores checksums to avoid recomputation for unchanged files
-    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
-    pub checksum_db: bool,
-
-    /// Clear checksum database before starting
-    #[arg(long)]
-    pub clear_checksum_db: bool,
-
-    /// Remove stale entries from checksum database (files no longer in source)
-    #[arg(long)]
-    pub prune_checksum_db: bool,
 
     /// Verify file integrity after write using xxHash3 checksums
     ///
@@ -536,6 +467,12 @@ pub struct Cli {
 
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
+        // --diff is a dry-run display variant; without --dry-run it silently
+        // showed nothing, which reads as success while doing nothing at all.
+        if self.diff && !self.dry_run {
+            anyhow::bail!("--diff requires --dry-run (it details planned changes only)");
+        }
+
         // Validate size filters first (independent of source path)
         if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
             if min > max {
@@ -673,20 +610,6 @@ impl Cli {
         }
     }
 
-    /// Get effective resume setting (default: true)
-    ///
-    /// Priority:
-    /// 1. --resume=no: disables resume (returns false)
-    /// 2. --resume or --resume=auto: enables resume (returns true)
-    /// 3. --resume=only: only resume, don't start new (returns true)
-    /// 4. Default: enabled (returns true)
-    pub fn resume(&self) -> bool {
-        match self.resume {
-            ResumeMode::No => false,
-            ResumeMode::Auto | ResumeMode::Only => true,
-        }
-    }
-
     /// Check if source is a file (not a directory)
     pub fn is_single_file(&self) -> bool {
         self.source
@@ -772,7 +695,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -782,8 +704,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -804,9 +724,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -840,14 +757,8 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -869,7 +780,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -879,8 +789,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -901,9 +809,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -937,14 +842,8 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -972,7 +871,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -982,8 +880,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1002,9 +898,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1038,16 +931,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1074,7 +961,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1084,8 +970,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1104,9 +988,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1140,16 +1021,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1171,7 +1046,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: true,
             perf: false,
@@ -1181,8 +1055,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1201,9 +1073,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1237,16 +1106,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1268,7 +1131,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1278,8 +1140,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1298,9 +1158,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1334,16 +1191,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1365,7 +1216,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 1,
             quiet: false,
             perf: false,
@@ -1375,8 +1225,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1395,9 +1243,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1431,16 +1276,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1462,7 +1301,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 2,
             quiet: false,
             perf: false,
@@ -1472,8 +1310,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1492,9 +1328,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1528,16 +1361,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1578,7 +1405,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1588,8 +1414,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1608,9 +1432,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1644,16 +1465,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1661,6 +1476,18 @@ mod tests {
         let result = cli.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min-size"));
+    }
+
+    #[test]
+    fn test_diff_requires_dry_run() {
+        // --diff without --dry-run previously did nothing silently; validation
+        // must reject it so a mistaken invocation cannot read as success.
+        let cli = Cli::try_parse_from(["sy", "/tmp/source/", "/tmp/dest", "--diff"]).unwrap();
+        assert!(cli
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--diff requires --dry-run"));
     }
 
     #[test]
@@ -1678,7 +1505,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1688,8 +1514,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1708,9 +1532,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1744,16 +1565,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1775,7 +1590,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1785,8 +1599,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1805,9 +1617,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::After, // But --verify flag should override
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1841,16 +1650,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1867,7 +1670,9 @@ mod tests {
     #[test]
     fn test_verification_mode_verify_blocks() {
         assert!(!VerificationMode::None.verify_blocks());
-        assert!(!VerificationMode::Verify.verify_blocks());
+        // --verify enables post-write verification; the 0.4 wiring hard-coded
+        // this to false, silently ignoring the flag on every engine.
+        assert!(VerificationMode::Verify.verify_blocks());
     }
 
     #[test]
@@ -1885,7 +1690,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1895,8 +1699,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -1915,9 +1717,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -1951,16 +1750,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -1982,7 +1775,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -1992,8 +1784,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2012,9 +1802,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Skip, // Should be overridden
             copy_links: true,         // Override to Follow
             keep_dirlinks: false,
@@ -2048,16 +1835,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2079,7 +1860,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2089,8 +1869,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2109,9 +1887,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Skip,
             copy_links: false,
             keep_dirlinks: false,
@@ -2145,16 +1920,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2176,7 +1945,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2186,8 +1954,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2206,9 +1972,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2242,16 +2005,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2280,7 +2037,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2290,8 +2046,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2310,9 +2064,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2346,16 +2097,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2383,7 +2128,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2393,8 +2137,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2413,9 +2155,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2449,16 +2188,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2487,7 +2220,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2497,8 +2229,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2517,9 +2247,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2553,16 +2280,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2591,7 +2312,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2601,8 +2321,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2621,9 +2339,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2657,16 +2372,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2692,7 +2401,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2702,8 +2410,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2722,9 +2428,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2758,16 +2461,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         };
@@ -2836,7 +2533,6 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
@@ -2846,8 +2542,6 @@ mod tests {
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
@@ -2866,9 +2560,6 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
             keep_dirlinks: false,
@@ -2902,16 +2593,10 @@ mod tests {
             max_delete: "50%".to_string(),
             clear_bisync_state: false,
             force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
             retry: 0,
             retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
             server: false,
         }
