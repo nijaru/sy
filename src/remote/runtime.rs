@@ -34,7 +34,7 @@ use crate::transfer::delta::{
 use futures::StreamExt;
 use metadata::{request_metadata, serve_incoming_metadata_rooted, RemoteMetadataError};
 use mutation::{
-    request_create_directory, request_remove, request_replace_symlink,
+    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
     serve_incoming_mutation_rooted, RemoteMutationError,
 };
 use std::path::{Path, PathBuf};
@@ -308,6 +308,21 @@ impl ClientRemoteSession {
             &self.router.sender(),
             path,
             is_directory,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side copy beneath the pinned root. `--backup` uses this to
+    /// preserve soon-to-be-replaced or deleted destination files; the same
+    /// request is the seed of the object-native copy transfer strategy.
+    pub async fn copy_file(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_copy_file(
+            &self.router.sender(),
+            source,
+            destination,
             self.server.platform.os,
         )
         .await

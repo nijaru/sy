@@ -17,7 +17,7 @@ use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::hash::{hash_rooted_file, RemoteHashError};
-use sy::remote::push::RemotePushExecutor;
+use sy::remote::push::{RemoteBackupPlan, RemotePushExecutor};
 use sy::remote::push_controller::{
     preflight_remote_push_scoped, preflight_remote_push_scoped_with_content, preview_remote_push,
     PreviewOp, RemotePushController, RemotePushControllerError, RemotePushPreview,
@@ -43,12 +43,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     }
     if config.preserve.symlink_mode != SymlinkMode::Preserve {
         return Some("non-preserving symlink modes are not yet mapped to v3");
-    }
-    if config.backup.is_some() || config.backup_dir.is_some() {
-        return Some("backup semantics are not yet implemented by v3");
-    }
-    if config.partial.is_some() || config.partial_dir.is_some() {
-        return Some("legacy partial-file semantics are not mapped to transactional v3 writes");
     }
     if config.compress_level.is_some()
         || !matches!(config.compression_detection, CompressionDetection::Never)
@@ -280,13 +274,38 @@ async fn execute_with_handle(
         ..ResourceBudget::default()
     };
     let scheduler = Scheduler::new(budget).map_err(map_io)?;
+    // --backup on v3: all backup locations must stay beneath the pinned
+    // destination root. An absolute --backup-dir cannot be honored without
+    // breaking root confinement, so it is rejected instead of silently
+    // relocated.
+    let backup_plan = if config.backup.is_some() {
+        let dir = match &config.backup_dir {
+            Some(dir) => {
+                if dir.is_absolute() {
+                    return Err(SyncError::Config(format!(
+                        "--backup-dir must be relative to the remote destination root for v3 push, got {}",
+                        dir.display()
+                    )));
+                }
+                Some(sy::engine::domain::RelativePath::new(dir.clone()).map_err(map_io)?)
+            }
+            None => None,
+        };
+        Some(RemoteBackupPlan {
+            suffix: config.suffix.clone(),
+            dir,
+        })
+    } else {
+        None
+    };
     let executor = RemotePushExecutor::new(
         source_root.to_path_buf(),
         remote,
         scheduler,
         BasisIndexLimits::default(),
     )
-    .with_remove_source_files(config.remove_source_files);
+    .with_remove_source_files(config.remove_source_files)
+    .with_backup(backup_plan);
     let summary = RemotePushController::new(executor, max_in_flight)
         .execute(plan)
         .await
@@ -637,6 +656,101 @@ mod tests {
         assert!(!source_root.path().join("unchanged").exists());
         assert!(!source_root.path().join("keep-dir/inner").exists());
         assert!(source_root.path().join("keep-dir").is_dir());
+    }
+
+    /// --backup over v3: replaced and deleted destination files are preserved
+    /// through server-side copies beneath the destination root; the suffixed
+    /// backup replaces nothing (an existing backup is overwritten) and
+    /// directory structure is preserved under --backup-dir.
+    #[tokio::test]
+    async fn backup_preserves_replaced_and_deleted_files_over_v3() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("updated"), b"new-value").unwrap();
+        std::fs::write(destination_root.path().join("updated"), b"old-value").unwrap();
+        std::fs::create_dir(destination_root.path().join("sub")).unwrap();
+        std::fs::write(destination_root.path().join("sub/gone"), b"gone-content").unwrap();
+        std::fs::write(source_root.path().join("fresh"), b"fresh").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let mutation = session.mutation_handler();
+            // destination scan, backup copy (updated), two file transfers,
+            // delete-backup copy, file remove, directory remove. The source
+            // scan is local and produces no request.
+            for _ in 0..7 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected backup v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.backup = Some("simple".to_string());
+        config.delete = DeleteMode::Enabled {
+            limit: DeleteLimit::Percentage(100),
+            force: false,
+        };
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert_eq!(stats.files_updated, 1);
+        // sub/gone plus the sub directory (its removal request is issued;
+        // the server tolerates the non-empty survivor case).
+        assert_eq!(stats.files_deleted, 2);
+        // New destination contents.
+        assert_eq!(
+            std::fs::read(destination_root.path().join("updated")).unwrap(),
+            b"new-value"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("fresh")).unwrap(),
+            b"fresh"
+        );
+        assert!(!destination_root.path().join("sub/gone").exists());
+        // Backups preserved the old bytes with the suffix. The directory
+        // holding a deletion's backup survives (it is no longer empty).
+        assert_eq!(
+            std::fs::read(destination_root.path().join("updated~")).unwrap(),
+            b"old-value"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("sub/gone~")).unwrap(),
+            b"gone-content"
+        );
+        assert!(destination_root.path().join("sub").is_dir());
     }
 
     #[test]
@@ -1381,6 +1495,7 @@ mod tests {
         .unwrap();
 
         server.await.unwrap();
+        eprintln!("STATS: {stats:?}");
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(

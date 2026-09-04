@@ -390,9 +390,6 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Warn about unimplemented flags
-    if cli.partial.is_some() {
-        eprintln!("Warning: --partial is not yet implemented");
-    }
     if cli.stream {
         eprintln!("Warning: --stream is not yet implemented");
     }
@@ -454,8 +451,6 @@ Or install from local source with: cargo install --path . --features acl"#
         backup: cli.backup.clone(),
         backup_dir: cli.backup_dir.clone(),
         suffix: cli.suffix.clone(),
-        partial: cli.partial.clone(),
-        partial_dir: cli.partial_dir.clone(),
         timeout: cli.timeout,
         contimeout: cli.contimeout,
         compress_level: cli.compress_level,

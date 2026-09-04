@@ -5,6 +5,7 @@
 //! executor while that executor is being replaced.
 
 use crate::endpoint::io::hash_file_streaming;
+use crate::endpoint::transfer::{transfer_file, TransferOptions};
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
 use crate::sync::config::{DeleteMode, SyncConfig};
@@ -71,7 +72,6 @@ pub(crate) async fn run_local_sync(
         preserve_hardlinks: config.preserve.hardlinks,
         preserve_xattrs: config.preserve.xattrs,
         preserve_dir_permissions: config.preserve.permissions,
-        keep_partial: config.partial.is_some(),
         itemize_changes: config.itemize_changes,
         remove_source_files: config.remove_source_files,
         print_stats: config.stats,
@@ -153,7 +153,18 @@ pub(crate) async fn run_local_sync(
         if config.dry_run {
             stats.files_deleted = plan.delete_candidates;
         } else {
-            execute_delete_journal(dest, &mut plan.journal, &mut stats).await?;
+            // The same backup policy that protects replaced files protects
+            // deleted ones: --backup covers deletions too (rsync semantics).
+            let backup = if config.backup.is_some() {
+                Some(BackupConfig {
+                    enabled: true,
+                    suffix: config.suffix.clone(),
+                    dir: config.backup_dir.clone(),
+                })
+            } else {
+                None
+            };
+            execute_delete_journal(dest, &mut plan.journal, backup.as_ref(), &mut stats).await?;
         }
     }
 
@@ -732,6 +743,7 @@ fn map_delete_plan_error(error: DeletePlanError) -> SyncError {
 async fn execute_delete_journal(
     dest: &dyn Endpoint,
     journal: &mut DeleteJournalReader,
+    backup: Option<&BackupConfig>,
     stats: &mut SyncStats,
 ) -> Result<()> {
     let mut protected_dirs = Vec::<PathBuf>::new();
@@ -749,12 +761,60 @@ async fn execute_delete_journal(
                     continue;
                 }
                 if dest.exists(&record.path).await? {
-                    dest.remove(&record.path, false).await?;
-                    stats.files_deleted += 1;
+                    // A non-empty directory is kept, not an error: its
+                    // surviving content is legitimate (under --backup a
+                    // deletion's backup file may repopulate the directory,
+                    // like rsync). Only a genuinely empty directory is
+                    // removed.
+                    match dest.remove(&record.path, false).await {
+                        Ok(()) => {
+                            stats.files_deleted += 1;
+                        }
+                        Err(SyncError::Io(ref io))
+                            if io.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                                || io.raw_os_error() == Some(66)
+                                || io.raw_os_error() == Some(39) =>
+                        {
+                            tracing::debug!(
+                                path = %record.path.display(),
+                                "kept non-empty destination directory"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             DeleteKind::FileLike => {
                 if dest.exists(&record.path).await? {
+                    // Under --backup a deleted file is moved to the backup
+                    // location first (rsync backs up deletions, not just
+                    // replacements). A backup failure aborts the delete: the
+                    // user asked for a copy before those bytes go away.
+                    // Symlinks are removed without a backup: a backup copies
+                    // regular-file bytes, and a dangling or escaped target
+                    // must not be resolved.
+                    if let Some(backup) = backup {
+                        let metadata = dest.metadata(&record.path).await?;
+                        if !metadata.is_symlink {
+                            let backup_path = backup.destination_path(&record.path)?;
+                            let backup_parent = backup_path
+                                .parent()
+                                .ok_or_else(|| std::io::Error::other("Invalid backup path"))?;
+                            tokio::fs::create_dir_all(backup_parent).await?;
+                            transfer_file(
+                                dest,
+                                &record.path,
+                                dest,
+                                &backup_path,
+                                TransferOptions {
+                                    update: false,
+                                    verify: false,
+                                    rate_limiter: None,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
                     dest.remove(&record.path, false).await?;
                     stats.files_deleted += 1;
                 }

@@ -83,6 +83,9 @@ pub enum RemotePushError {
 
     #[error("failed to remove committed source {0}: {1}")]
     SourceRemoval(PathBuf, std::io::Error),
+
+    #[error("--backup location for {0} is not representable beneath the destination root")]
+    InvalidBackupPath(PathBuf),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -328,6 +331,53 @@ fn metadata_work(
 /// Executes already-lowered v3 push work. The caller owns tree ordering,
 /// deletion commit, and finalize replay; this type owns per-item admission and
 /// transfer-strategy selection.
+/// `--backup` plan for the v3 push executor. All paths stay relative to the
+/// destination root: the server resolves them beneath its pinned root, so an
+/// absolute backup directory is rejected at session setup, not silently
+/// relocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBackupPlan {
+    pub suffix: String,
+    /// Optional `--backup-dir` relative to the destination root.
+    pub dir: Option<crate::engine::domain::RelativePath>,
+}
+
+impl RemoteBackupPlan {
+    /// Backup location for one destination path (root-relative).
+    fn destination(
+        &self,
+        path: &crate::engine::domain::RelativePath,
+    ) -> Option<crate::engine::domain::RelativePath> {
+        let mut components: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(dir) = &self.dir {
+            components.extend(dir.as_path().components().filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_os_string()),
+                _ => None,
+            }));
+        } else {
+            // Beside the file: parent components, then the suffixed name.
+            components.extend(
+                path.as_path()
+                    .parent()?
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(name) => Some(name.to_os_string()),
+                        _ => None,
+                    }),
+            );
+        }
+        let name = path.as_path().file_name()?.to_string_lossy().into_owned();
+        components.push(format!("{name}{}", self.suffix).into());
+        crate::engine::domain::RelativePath::new(
+            components
+                .iter()
+                .map(|c| c.as_os_str())
+                .collect::<std::path::PathBuf>(),
+        )
+        .ok()
+    }
+}
+
 pub struct RemotePushExecutor {
     source_root: PathBuf,
     remote: ClientRemoteHandle,
@@ -337,6 +387,9 @@ pub struct RemotePushExecutor {
     /// --remove-source-files: delete the source entry after its destination
     /// commit is acknowledged (v3 commits only after BLAKE3 verification).
     remove_source_files: bool,
+    /// --backup: preserve replaced and deleted destination files via
+    /// server-side copies before the mutation.
+    backup: Option<RemoteBackupPlan>,
 }
 
 impl RemotePushExecutor {
@@ -353,6 +406,7 @@ impl RemotePushExecutor {
             delta_limits,
             delta_min_size: DEFAULT_REMOTE_DELTA_MIN_SIZE,
             remove_source_files: false,
+            backup: None,
         }
     }
 
@@ -363,6 +417,11 @@ impl RemotePushExecutor {
 
     pub const fn with_remove_source_files(mut self, enabled: bool) -> Self {
         self.remove_source_files = enabled;
+        self
+    }
+
+    pub fn with_backup(mut self, plan: Option<RemoteBackupPlan>) -> Self {
+        self.backup = plan;
         self
     }
 
@@ -383,6 +442,20 @@ impl RemotePushExecutor {
                 destination,
                 metadata,
             } => {
+                // --backup preserves the replaced destination file first. The
+                // server copies it beneath the pinned root before the staged
+                // replacement commits; a backup failure aborts the transfer
+                // so the user's copy cannot be silently skipped.
+                if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
+                    if existing.is_file() {
+                        let backup_path = plan.destination(&existing.path).ok_or_else(|| {
+                            RemotePushError::InvalidBackupPath(
+                                existing.path.as_path().to_path_buf(),
+                            )
+                        })?;
+                        self.remote.copy_file(&existing.path, &backup_path).await?;
+                    }
+                }
                 let delta_basis = self.prepare_delta_basis(destination).await?;
                 let summary = self
                     .remote
@@ -431,6 +504,30 @@ impl RemotePushExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
+        // --backup preserves a deleted file first (rsync backs up deletions,
+        // not just replacements). The server copies regular-file bytes
+        // beneath the pinned root; symlinks are removed without a backup so a
+        // dangling or escaped target is never resolved.
+        if let Some(plan) = &self.backup {
+            if !action.is_directory {
+                let backup_path = plan.destination(&action.path).ok_or_else(|| {
+                    RemotePushError::InvalidBackupPath(action.path.as_path().to_path_buf())
+                })?;
+                let copied = self.remote.copy_file(&action.path, &backup_path).await;
+                match copied {
+                    Ok(()) => {}
+                    // The entry may be a symlink (or otherwise not a regular
+                    // file): remove proceeds without a backup.
+                    Err(error) => {
+                        tracing::debug!(
+                            path = %action.path.as_path().display(),
+                            error = %error,
+                            "delete backup copy unavailable; removing without backup"
+                        );
+                    }
+                }
+            }
+        }
         self.remote
             .remove(&action.path, action.is_directory)
             .await?;

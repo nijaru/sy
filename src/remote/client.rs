@@ -1,5 +1,7 @@
 use super::metadata::request_metadata;
-use super::mutation::{request_create_directory, request_remove, request_replace_symlink};
+use super::mutation::{
+    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
+};
 use super::{ClientRemoteSession, RemoteSessionError, Result};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
@@ -222,6 +224,16 @@ impl ClientRemoteHandle {
     pub async fn remove(&self, path: &RelativePath, is_directory: bool) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_remove(&self.sender, path, is_directory, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Server-side copy beneath the pinned root. `--backup` uses this to
+    /// preserve soon-to-be-replaced or deleted destination files; the same
+    /// request is the seed of the object-native copy transfer strategy.
+    pub async fn copy_file(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_copy_file(&self.sender, source, destination, self.peer)
             .await
             .map_err(Into::into)
     }

@@ -50,6 +50,9 @@ pub enum RemoteMutationError {
     #[error("replace-symlink mutation is missing its target")]
     MissingSymlinkTarget,
 
+    #[error("copy-file mutation is missing its source path")]
+    MissingCopySource,
+
     #[error("native symlink target encoding is unsupported for peer platform {0:?}")]
     UnsupportedTargetEncoding(PlatformOs),
 
@@ -111,6 +114,20 @@ pub async fn request_remove(
     request_mutation(sender, mutation).await
 }
 
+/// Request a server-side copy beneath the pinned root (`--backup`: copy the
+/// soon-to-be-replaced or deleted destination file before the mutation).
+pub async fn request_copy_file(
+    sender: &RouterSender,
+    source: &RelativePath,
+    destination: &RelativePath,
+    peer: PlatformOs,
+) -> Result<()> {
+    ensure_compatible_path_encoding(peer)?;
+    let source = encode_relative_path(source.as_path())?;
+    let destination = encode_relative_path(destination.as_path())?;
+    request_mutation(sender, WireMutation::copy_file(source, destination)).await
+}
+
 async fn request_mutation(sender: &RouterSender, mutation: WireMutation) -> Result<()> {
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
@@ -152,11 +169,25 @@ pub async fn serve_incoming_mutation_rooted(
         .cloned()
         .map(|target| decode_native_target(target, peer))
         .transpose()?;
+    let copy_source = if kind == WireMutationKind::CopyFile {
+        let source = mutation
+            .copy_source()
+            .cloned()
+            .ok_or(RemoteMutationError::Protocol(ProtocolError::InvalidField {
+                field: "copy_source",
+                reason: "copy-file mutation requires a source path",
+            }))?;
+        Some(decode_relative_path(source, peer)?)
+    } else {
+        None
+    };
     drop(first);
 
-    tokio::task::spawn_blocking(move || apply_mutation(&rooted, relative, kind, target))
-        .await
-        .map_err(|error| RemoteMutationError::Worker(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        apply_mutation(&rooted, relative, kind, target, copy_source)
+    })
+    .await
+    .map_err(|error| RemoteMutationError::Worker(error.to_string()))??;
 
     sender
         .send(Frame::new(
@@ -174,6 +205,7 @@ fn apply_mutation(
     path: RelativePath,
     kind: WireMutationKind,
     target: Option<PathBuf>,
+    copy_source: Option<RelativePath>,
 ) -> Result<()> {
     match kind {
         WireMutationKind::CreateDirectory => rooted.create_directory_blocking(&path)?,
@@ -183,6 +215,10 @@ fn apply_mutation(
         }
         WireMutationKind::RemoveFileLike => rooted.remove_blocking(&path, false)?,
         WireMutationKind::RemoveDirectory => rooted.remove_blocking(&path, true)?,
+        WireMutationKind::CopyFile => {
+            let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
+            rooted.copy_file_blocking(&source, &path)?;
+        }
     }
     Ok(())
 }

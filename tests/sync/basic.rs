@@ -27,6 +27,12 @@ fn setup_test_dir(_name: &str) -> (TempDir, TempDir) {
     (source, dest)
 }
 
+fn setup_test_dir_with_backup(_name: &str) -> (TempDir, TempDir, TempDir) {
+    let (source, dest) = setup_test_dir(_name);
+    let backup = TempDir::new().unwrap();
+    (source, dest, backup)
+}
+
 #[test]
 fn test_basic_sync() {
     let (source, dest) = setup_test_dir("basic");
@@ -581,25 +587,35 @@ fn test_backup_flag() {
     );
 }
 
+/// --partial and --partial-dir never acquired working semantics on the 0.5
+/// engine: transactional staged writes never expose partial files, so there
+/// is nothing to keep. The flags are removed; passing them must fail as
+/// unknown arguments.
 #[test]
-fn test_partial_flag() {
-    let (source, dest) = setup_test_dir("partial");
+fn test_partial_flags_removed() {
+    let (source, dest) = setup_test_dir("partial_removed");
 
-    // Create a file in source
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // Sync without --partial (default behavior)
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(dest.path().join("file.txt").exists());
+    for flag in ["--partial", "--partial-dir"] {
+        let output = Command::new(sy_bin())
+            .args([
+                &format!("{}/", source.path().display()),
+                dest.path().to_str().unwrap(),
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{flag} must be rejected as unknown"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{flag} not rejected:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1575,4 +1591,78 @@ fn test_remove_source_files_keeps_untransferred_source_under_existing() {
         "untransferred source must be kept under --existing"
     );
     assert!(!dest.path().join("only-here.txt").exists());
+}
+
+/// --backup preserves deleted files, not just replaced ones (rsync
+/// semantics): the delete journal copies each doomed file to the backup
+/// location before removal. A directory holding a deletion's backup survives
+/// because it is no longer empty.
+#[test]
+fn test_backup_preserves_deleted_files() {
+    let (source, dest) = setup_test_dir("backup_deletes");
+
+    fs::write(source.path().join("keep.txt"), "keep").unwrap();
+    fs::write(dest.path().join("doomed.txt"), "precious-old-content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            "--delete",
+            "--max-delete=100%",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dest.path().join("doomed.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("doomed.txt~")).unwrap(),
+        "precious-old-content"
+    );
+}
+
+/// --backup-dir preserves the destination tree structure so same-named files
+/// in different directories cannot collide.
+#[test]
+fn test_backup_dir_preserves_tree_structure() {
+    let (source, dest, backup) = setup_test_dir_with_backup("backup_dir_structure");
+
+    fs::create_dir(source.path().join("sub")).unwrap();
+    fs::create_dir(dest.path().join("sub")).unwrap();
+    fs::write(source.path().join("sub/file.txt"), "new-a").unwrap();
+    fs::write(source.path().join("root.txt"), "new-b").unwrap();
+    fs::write(dest.path().join("sub/file.txt"), "old-a").unwrap();
+    fs::write(dest.path().join("root.txt"), "old-b").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--backup",
+            &format!("--backup-dir={}", backup.path().display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(backup.path().join("sub/file.txt~")).unwrap(),
+        "old-a"
+    );
+    assert_eq!(
+        fs::read_to_string(backup.path().join("root.txt~")).unwrap(),
+        "old-b"
+    );
 }

@@ -41,15 +41,47 @@ pub struct BackupConfig {
     pub dir: Option<PathBuf>,
 }
 
+impl BackupConfig {
+    /// Resolve the backup location for one destination path.
+    ///
+    /// `dest_path` is the file's path relative to the destination root.
+    /// Without `--backup-dir` the backup sits beside the destination file
+    /// (name + suffix). With `--backup-dir` backups land under that
+    /// directory preserving their path relative to the destination root:
+    /// two same-named files in different directories must not collide, and
+    /// users expect the tree shape (GNU rsync semantics). A relative
+    /// `--backup-dir` is anchored to the process working directory.
+    pub fn destination_path(&self, dest_path: &Path) -> std::io::Result<PathBuf> {
+        let file_name = dest_path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("Invalid file path"))?
+            .to_string_lossy()
+            .into_owned();
+        match &self.dir {
+            Some(dir) => {
+                let dir = if dir.is_absolute() {
+                    dir.clone()
+                } else {
+                    std::env::current_dir()?.join(dir)
+                };
+                let mut backup = dir.join(dest_path);
+                backup.set_file_name(format!("{file_name}{}", self.suffix));
+                Ok(backup)
+            }
+            None => Ok(dest_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("{file_name}{}", self.suffix))),
+        }
+    }
+}
+
 /// Configuration for task execution behavior.
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteConfig {
     pub preserve_hardlinks: bool,
     pub preserve_xattrs: bool,
     pub preserve_dir_permissions: bool,
-    /// Retained for CLI compatibility. Transactional staged writes do not expose
-    /// incomplete destination files; resumable staging will own this later.
-    pub keep_partial: bool,
     pub itemize_changes: bool,
     pub remove_source_files: bool,
     pub print_stats: bool,
@@ -565,26 +597,13 @@ impl<'a> TaskExecutor<'a> {
             return Ok(());
         }
 
-        let abs_dest = self.abs_dest_path(path);
-        let backup_path = if let Some(ref dir) = self.backup.dir {
-            let file_name = abs_dest
-                .file_name()
-                .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
-            dir.join(format!(
-                "{}{}",
-                file_name.to_string_lossy(),
-                self.backup.suffix
-            ))
-        } else {
-            let file_name = abs_dest
-                .file_name()
-                .ok_or_else(|| std::io::Error::other("Invalid file path"))?;
-            abs_dest.parent().unwrap_or(Path::new(".")).join(format!(
-                "{}{}",
-                file_name.to_string_lossy(),
-                self.backup.suffix
-            ))
-        };
+        // Backup location is computed from the root-relative path so that
+        // --backup-dir joins the tree structure under the backup root.
+        let backup_path = self.backup.destination_path(path)?;
+        let backup_parent = backup_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("Invalid backup path"))?;
+        tokio::fs::create_dir_all(backup_parent).await?;
 
         transfer_file(
             self.dest,
