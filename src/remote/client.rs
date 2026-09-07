@@ -16,7 +16,8 @@ use crate::remote::signature::{
     SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, request_file_transfer_with_policy, RemoteDeltaBasis, TransferMetadata, TransferSummary,
+    request_file_transfer, request_file_transfer_with_policy, RemoteDeltaBasis, TransferMetadata,
+    TransferSummary,
 };
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
