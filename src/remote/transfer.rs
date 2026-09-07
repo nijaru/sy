@@ -63,6 +63,9 @@ pub enum RemoteTransferError {
     #[error("file transfer requires a regular-file source entry")]
     InvalidSource,
 
+    #[error("compressed Data payload failed to decompress: {0}")]
+    Decompression(String),
+
     #[error("file transfer requires a scanned source identity")]
     MissingSourceIdentity,
 
@@ -163,6 +166,9 @@ pub type Result<T> = std::result::Result<T, RemoteTransferError>;
 
 enum ProducerItem {
     Data(Bytes),
+    /// Compressed with zstd level `ZSTD_FAST_LEVEL`; the frame loop must set
+    /// `FrameFlags::COMPRESSED` so the receiver knows to decompress.
+    CompressedData(Bytes),
     Copy(WireDeltaCopy),
 }
 
@@ -202,6 +208,27 @@ pub async fn request_file_transfer_with_metadata(
     delta_basis: Option<RemoteDeltaBasis>,
     metadata: TransferMetadata,
     peer: PlatformOs,
+) -> Result<TransferSummary> {
+    request_file_transfer_with_policy(
+        sender,
+        source_root,
+        source,
+        delta_basis,
+        metadata,
+        peer,
+        None,
+    )
+    .await
+}
+
+pub async fn request_file_transfer_with_policy(
+    sender: &RouterSender,
+    source_root: PathBuf,
+    source: Entry,
+    delta_basis: Option<RemoteDeltaBasis>,
+    metadata: TransferMetadata,
+    peer: PlatformOs,
+    compression: Option<crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
     ensure_compatible_path_encoding(peer)?;
     if !source.is_file() {
@@ -266,6 +293,7 @@ pub async fn request_file_transfer_with_metadata(
             expected_size,
             basis_index,
             producer_tx,
+            compression,
         )
     });
 
@@ -274,6 +302,14 @@ pub async fn request_file_transfer_with_metadata(
             ProducerItem::Data(bytes) => Frame::new(
                 FrameKind::Data,
                 FrameFlags::empty(),
+                stream_id,
+                WireData::new(bytes)?.into_bytes(),
+            )?,
+            // The COMPRESSED flag appears only on frames whose payload is
+            // actually zstd-compressed, per the protocol contract.
+            ProducerItem::CompressedData(bytes) => Frame::new(
+                FrameKind::Data,
+                FrameFlags::COMPRESSED,
                 stream_id,
                 WireData::new(bytes)?.into_bytes(),
             )?,
@@ -350,8 +386,19 @@ pub async fn serve_incoming_file_rooted(
 
         let op = match frame.kind() {
             FrameKind::Data => {
-                require_empty_flags(frame)?;
-                ReconstructionOp::Data(WireData::decode(frame.payload())?.into_bytes())
+                // A compressed payload is only accepted because this session
+                // advertised the ZSTD capability in its handshake. The flag
+                // must reflect the actual payload, so an uncompressed Data
+                // frame must not carry it and vice versa.
+                if frame.flags() == FrameFlags::COMPRESSED {
+                    let compressed = WireData::decode(frame.payload())?.into_bytes();
+                    let decompressed = zstd::stream::decode_all(compressed.as_ref())
+                        .map_err(|error| RemoteTransferError::Decompression(error.to_string()))?;
+                    ReconstructionOp::Data(Bytes::from(decompressed))
+                } else {
+                    require_empty_flags(frame)?;
+                    ReconstructionOp::Data(WireData::decode(frame.payload())?.into_bytes())
+                }
             }
             FrameKind::DeltaCopy => {
                 require_empty_flags(frame)?;
@@ -419,6 +466,7 @@ fn produce_source(
     expected_size: u64,
     basis: Option<BasisIndex>,
     sender: mpsc::Sender<ProducerItem>,
+    compression: Option<crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
     let summary = if let Some(basis) = basis {
         let delta = match_delta(&mut file, &basis, |op| {
@@ -443,7 +491,7 @@ fn produce_source(
             reused_bytes: delta.reused_bytes,
         }
     } else {
-        produce_whole(&mut file, sender)?
+        produce_whole(&mut file, sender, compression.as_ref())?
     };
 
     validate_source(&file, expected_identity, expected_size)?;
@@ -456,10 +504,43 @@ fn produce_source(
     Ok(summary)
 }
 
-fn produce_whole(file: &mut File, sender: mpsc::Sender<ProducerItem>) -> Result<TransferSummary> {
+/// Compress one chunk with the profile from the v3 chunk benchmark. The
+/// compressed size stays under the wire cap because chunk reads are bounded
+/// by `MAX_TRANSFER_DATA_SIZE` and zstd never expands past a small header
+/// overhead on incompressible input; the caller still validates via
+/// `WireData::new` before send.
+fn compress_chunk(bytes: &[u8]) -> Result<Bytes> {
+    let compressed = zstd::bulk::compress(bytes, crate::engine::compression::ZSTD_FAST_LEVEL)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(Bytes::from(compressed))
+}
+
+fn produce_whole(
+    file: &mut File,
+    sender: mpsc::Sender<ProducerItem>,
+    compression: Option<&crate::engine::compression::CompressionPolicy>,
+) -> Result<TransferSummary> {
+    use crate::engine::compression::{
+        choose_for_min_elapsed, ByteRate, CompressionChoice, CompressionPolicy, CompressionSample,
+        CompressionTiming, DEFAULT_LINK_RATE_BYTES_PER_SEC,
+    };
+
     let mut buffer = vec![0_u8; MAX_TRANSFER_DATA_SIZE];
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
+
+    // Auto mode samples the first chunk and lets the wall-clock model decide
+    // whether compression wins for the remaining bulk; Always compresses every
+    // chunk. The first chunk of Auto is always sent compressed because the
+    // sample measurement requires a compressed observation anyway and a single
+    // chunk of wrong choice cannot dominate a transfer.
+    let mut decision = match compression {
+        Some(CompressionPolicy::Always) | Some(CompressionPolicy::Auto) => {
+            CompressionChoice::ZstdFast
+        }
+        None => CompressionChoice::None,
+    };
+    let mut first_chunk = compression == Some(&CompressionPolicy::Auto);
 
     loop {
         let read = loop {
@@ -477,11 +558,57 @@ fn produce_whole(file: &mut File, sender: mpsc::Sender<ProducerItem>) -> Result<
         file_size = file_size
             .checked_add(u64::try_from(read).map_err(|_| RemoteTransferError::ByteCountOverflow)?)
             .ok_or(RemoteTransferError::ByteCountOverflow)?;
-        sender
-            .blocking_send(ProducerItem::Data(Bytes::copy_from_slice(bytes)))
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
-            })?;
+
+        if first_chunk {
+            first_chunk = false;
+            let compressed = compress_chunk(bytes)?;
+            let sample = CompressionSample::new(read as u64, compressed.len() as u64)
+                .expect("chunk read is non-zero");
+            let timing = CompressionTiming::new(
+                ByteRate::new(DEFAULT_LINK_RATE_BYTES_PER_SEC).expect("constant is non-zero"),
+                // Encode/decode rates from the v3 chunk benchmark: zstd -5
+                // encodes at ~800 MB/s and decodes at ~1.6 GB/s on the
+                // reference hardware; slower CPUs only make compression
+                // *less* attractive, so the defaults are the optimistic end.
+                ByteRate::new(800 * 1024 * 1024).unwrap(),
+                ByteRate::new(1600 * 1024 * 1024).unwrap(),
+                std::num::NonZeroU32::new(MAX_TRANSFER_DATA_SIZE as u32)
+                    .expect("chunk size is non-zero"),
+            );
+            decision = choose_for_min_elapsed(file_size.max(read as u64), sample, timing);
+            if decision == CompressionChoice::ZstdFast {
+                sender
+                    .blocking_send(ProducerItem::CompressedData(compressed))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
+                    })?;
+            } else {
+                sender
+                    .blocking_send(ProducerItem::Data(Bytes::copy_from_slice(bytes)))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
+                    })?;
+            }
+            continue;
+        }
+
+        match decision {
+            CompressionChoice::ZstdFast => {
+                let compressed = compress_chunk(bytes)?;
+                sender
+                    .blocking_send(ProducerItem::CompressedData(compressed))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
+                    })?;
+            }
+            CompressionChoice::None => {
+                sender
+                    .blocking_send(ProducerItem::Data(Bytes::copy_from_slice(bytes)))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
+                    })?;
+            }
+        }
     }
 
     Ok(TransferSummary {

@@ -60,6 +60,9 @@ pub enum RemoteSessionError {
         kind: FrameKind,
     },
 
+    #[error("compression requested but the peer did not negotiate the ZSTD capability")]
+    PeerLacksZstd,
+
     #[error(transparent)]
     Hash(#[from] RemoteHashError),
 

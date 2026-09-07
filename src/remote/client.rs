@@ -3,6 +3,7 @@ use super::mutation::{
     request_copy_file, request_create_directory, request_remove, request_replace_symlink,
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
+use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
@@ -15,8 +16,7 @@ use crate::remote::signature::{
     SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, request_file_transfer_with_metadata, RemoteDeltaBasis, TransferMetadata,
-    TransferSummary,
+    request_file_transfer, request_file_transfer_with_policy, RemoteDeltaBasis, TransferMetadata, TransferSummary,
 };
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
@@ -182,13 +182,33 @@ impl ClientRemoteHandle {
         metadata: TransferMetadata,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer_with_metadata(
+        self.transfer_file_with_policy(source_root, source, delta_basis, metadata, None)
+            .await
+    }
+
+    /// `compression` selects per-file chunk compression for the transfer
+    /// (`-z`/`--compress`); `None` disables it. The peer must have negotiated
+    /// the ZSTD capability.
+    pub async fn transfer_file_with_policy(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        delta_basis: Option<RemoteDeltaBasis>,
+        metadata: TransferMetadata,
+        compression: Option<CompressionPolicy>,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        if compression.is_some() && !self.ready.capabilities.contains(CapabilitySet::ZSTD) {
+            return Err(RemoteSessionError::PeerLacksZstd);
+        }
+        request_file_transfer_with_policy(
             &self.sender,
             source_root,
             source,
             delta_basis,
             metadata,
             self.peer,
+            compression,
         )
         .await
         .map_err(Into::into)
