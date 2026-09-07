@@ -572,7 +572,9 @@ mod tests {
         std::fs::create_dir(source_root.path().join("keep-dir")).unwrap();
         std::fs::write(source_root.path().join("keep-dir/inner"), b"inner").unwrap();
         std::fs::write(source_root.path().join("created"), b"new").unwrap();
-        std::fs::write(source_root.path().join("updated"), b"new-value").unwrap();
+        // Different lengths force an Update under the quick check on any
+        // filesystem mtime granularity.
+        std::fs::write(source_root.path().join("updated"), b"updated-new-value").unwrap();
         // Unchanged file: identical size and mtime means quick comparison skips.
         let unchanged = source_root.path().join("unchanged");
         std::fs::write(&unchanged, b"same").unwrap();
@@ -640,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(destination_root.path().join("updated")).unwrap(),
-            b"new-value"
+            b"updated-new-value"
         );
         assert_eq!(
             std::fs::read(destination_root.path().join("unchanged")).unwrap(),
@@ -666,7 +668,9 @@ mod tests {
     async fn backup_preserves_replaced_and_deleted_files_over_v3() {
         let source_root = TempDir::new().unwrap();
         let destination_root = TempDir::new().unwrap();
-        std::fs::write(source_root.path().join("updated"), b"new-value").unwrap();
+        // Different lengths force an Update under the quick check even on
+        // filesystems whose mtime granularity could match the pair.
+        std::fs::write(source_root.path().join("updated"), b"new-value-longer").unwrap();
         std::fs::write(destination_root.path().join("updated"), b"old-value").unwrap();
         std::fs::create_dir(destination_root.path().join("sub")).unwrap();
         std::fs::write(destination_root.path().join("sub/gone"), b"gone-content").unwrap();
@@ -733,7 +737,7 @@ mod tests {
         // New destination contents.
         assert_eq!(
             std::fs::read(destination_root.path().join("updated")).unwrap(),
-            b"new-value"
+            b"new-value-longer"
         );
         assert_eq!(
             std::fs::read(destination_root.path().join("fresh")).unwrap(),
