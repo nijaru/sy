@@ -453,7 +453,6 @@ Or install from local source with: cargo install --path . --features acl"#
         suffix: cli.suffix.clone(),
         timeout: cli.timeout,
         contimeout: cli.contimeout,
-        compress_level: cli.compress_level,
         compression_detection: cli.compress,
         itemize_changes: cli.itemize_changes,
         human_readable: cli.human_readable,

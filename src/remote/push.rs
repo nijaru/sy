@@ -1,3 +1,4 @@
+use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
@@ -390,6 +391,8 @@ pub struct RemotePushExecutor {
     /// --backup: preserve replaced and deleted destination files via
     /// server-side copies before the mutation.
     backup: Option<RemoteBackupPlan>,
+    /// -z/--compress: chunk compression policy for file transfers.
+    compression: Option<CompressionPolicy>,
 }
 
 impl RemotePushExecutor {
@@ -407,6 +410,7 @@ impl RemotePushExecutor {
             delta_min_size: DEFAULT_REMOTE_DELTA_MIN_SIZE,
             remove_source_files: false,
             backup: None,
+            compression: None,
         }
     }
 
@@ -417,6 +421,11 @@ impl RemotePushExecutor {
 
     pub const fn with_remove_source_files(mut self, enabled: bool) -> Self {
         self.remove_source_files = enabled;
+        self
+    }
+
+    pub const fn with_compression(mut self, policy: Option<CompressionPolicy>) -> Self {
+        self.compression = policy;
         self
     }
 
@@ -459,11 +468,12 @@ impl RemotePushExecutor {
                 let delta_basis = self.prepare_delta_basis(destination).await?;
                 let summary = self
                     .remote
-                    .transfer_file_with_metadata(
+                    .transfer_file_with_policy(
                         self.source_root.clone(),
                         source.clone(),
                         delta_basis,
                         metadata,
+                        self.compression,
                     )
                     .await?;
                 self.remove_committed_source(&source).await?;

@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
+use sy::engine::compression::CompressionPolicy;
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
@@ -43,11 +44,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     }
     if config.preserve.symlink_mode != SymlinkMode::Preserve {
         return Some("non-preserving symlink modes are not yet mapped to v3");
-    }
-    if config.compress_level.is_some()
-        || !matches!(config.compression_detection, CompressionDetection::Never)
-    {
-        return Some("compression policy is not yet integrated with the v3 transfer path");
     }
     if config.itemize_changes {
         return Some("itemized change output is not yet emitted from v3 plans");
@@ -305,7 +301,8 @@ async fn execute_with_handle(
         BasisIndexLimits::default(),
     )
     .with_remove_source_files(config.remove_source_files)
-    .with_backup(backup_plan);
+    .with_backup(backup_plan)
+    .with_compression(compression_policy(config));
     let summary = RemotePushController::new(executor, max_in_flight)
         .execute(plan)
         .await
@@ -379,6 +376,20 @@ fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u6
     }
 
     min_size.is_none_or(|min| entry.size >= min) && max_size.is_none_or(|max| entry.size <= max)
+}
+
+/// Map the CLI compression flags onto the v3 per-transfer policy. The
+/// default (`never`) disables compression; `always` compresses every chunk;
+/// `auto`/extension sample the first chunk and let the wall-clock model
+/// decide (extension-only detection has no separate 0.5 meaning).
+fn compression_policy(config: &SyncConfig) -> Option<CompressionPolicy> {
+    match config.compression_detection {
+        CompressionDetection::Never => None,
+        CompressionDetection::Auto | CompressionDetection::Extension => {
+            Some(CompressionPolicy::Auto)
+        }
+        CompressionDetection::Always => Some(CompressionPolicy::Always),
+    }
 }
 
 fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
@@ -755,6 +766,84 @@ mod tests {
             b"gone-content"
         );
         assert!(destination_root.path().join("sub").is_dir());
+    }
+
+    #[test]
+    fn compression_maps_to_v3_without_fallback() {
+        let mut config = supported_config();
+        config.compression_detection = CompressionDetection::Always;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.compression_detection = CompressionDetection::Auto;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.compression_detection = CompressionDetection::Extension;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        // The default stays compression-free.
+        config.compression_detection = CompressionDetection::Never;
+        assert_eq!(legacy_fallback_reason(&config), None);
+    }
+
+    /// -z/--compress transfers compressible file bytes as zstd-compressed
+    /// Data chunks; the server decompresses, reconstructs, BLAKE3-verifies,
+    /// and commits identical bytes.
+    #[tokio::test]
+    async fn compressed_transfer_round_trips_over_v3() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        // Highly compressible content spanning several chunks.
+        let mut payload = Vec::new();
+        for i in 0..4 {
+            payload.extend_from_slice(format!("chunk {i}: ").repeat(20_000).as_bytes());
+        }
+        std::fs::write(source_root.path().join("compressible"), &payload).unwrap();
+
+        // Destination scan, source scan (local), one file transfer.
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected compression v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.compression_detection = CompressionDetection::Always;
+        let stats = execute_with_handle(
+            source_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("compressible")).unwrap(),
+            payload
+        );
     }
 
     #[test]

@@ -7,6 +7,24 @@ use std::time::Duration;
 /// `auto` may still choose no compression when that is faster end to end.
 pub const ZSTD_FAST_LEVEL: i32 = -5;
 
+/// Per-transfer compression decision policy, mapped from the CLI flags.
+///
+/// `Auto` samples the first chunk and compresses only when the wall-clock
+/// model (`choose_for_min_elapsed`) predicts a win at the current link rate.
+/// `Always` compresses every chunk unconditionally. The legacy extension-
+/// only detection mode has no 0.5 meaning (the model is sample-based) and maps
+/// to `Auto` at the v3 boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionPolicy {
+    Auto,
+    Always,
+}
+
+/// Link rate used by the `Auto` timing model when no rate is known. Chosen
+/// from the v3 chunk benchmark: below ~125 MB/s the zstd-fast pipeline wins
+/// on compressible data, and slower links only widen that win.
+pub const DEFAULT_LINK_RATE_BYTES_PER_SEC: u64 = 125 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionChoice {
     None,

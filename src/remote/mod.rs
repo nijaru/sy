@@ -203,6 +203,9 @@ fn process_capabilities() -> CapabilitySet {
     if supports_staged_files(os) {
         capabilities.insert(CapabilitySet::STAGED_WRITE | CapabilitySet::ATOMIC_REPLACE);
     }
+    // Compressed Data frames are decodable wherever zstd is linked, which is
+    // everywhere this crate builds.
+    capabilities.insert(CapabilitySet::ZSTD);
     capabilities
 }
 

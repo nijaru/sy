@@ -64,6 +64,10 @@ bitflags! {
         const ROLLING_SIGNATURES = 1 << 11;
         const MULTIPLEXING = 1 << 12;
         const RAW_PATHS = 1 << 13;
+        /// Peer can receive zstd-compressed `Data` frame payloads (flag
+        /// COMPRESSED). Bounded by the same frame payload cap; the flag must
+        /// appear only on frames whose payload is actually compressed.
+        const ZSTD = 1 << 14;
     }
 }
 
