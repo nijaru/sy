@@ -1636,8 +1636,10 @@ fn test_backup_dir_preserves_tree_structure() {
 
     fs::create_dir(source.path().join("sub")).unwrap();
     fs::create_dir(dest.path().join("sub")).unwrap();
-    fs::write(source.path().join("sub/file.txt"), "new-a").unwrap();
-    fs::write(source.path().join("root.txt"), "new-b").unwrap();
+    // Different lengths force updates under the quick check on any filesystem
+    // mtime granularity, so backups are deterministic.
+    fs::write(source.path().join("sub/file.txt"), "replacement-a").unwrap();
+    fs::write(source.path().join("root.txt"), "replacement-b").unwrap();
     fs::write(dest.path().join("sub/file.txt"), "old-a").unwrap();
     fs::write(dest.path().join("root.txt"), "old-b").unwrap();
 
