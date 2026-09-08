@@ -192,6 +192,12 @@ impl Endpoint for LocalEndpoint {
         Ok(file_metadata_from_fs(&meta))
     }
 
+    async fn metadata_following(&self, path: &Path) -> Result<FileMetadata> {
+        // std::fs::metadata follows links; a dangling target errors loudly.
+        let meta = tokio::fs::metadata(self.resolve(path)).await?;
+        Ok(file_metadata_from_fs(&meta))
+    }
+
     async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
         #[cfg(unix)]
         {

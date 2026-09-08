@@ -633,6 +633,7 @@ mod tests {
         let request = ScanRequest {
             respect_gitignore: false,
             include_git_dir: false,
+            follow_symlinks: false,
             max_depth: None,
             metadata: EntryMetadataRequest {
                 unix_mode: cfg!(unix),
@@ -737,6 +738,7 @@ mod tests {
         let scan_request = ScanRequest {
             respect_gitignore: false,
             include_git_dir: false,
+            follow_symlinks: false,
             max_depth: None,
             metadata: EntryMetadataRequest {
                 unix_mode: cfg!(unix),

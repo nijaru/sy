@@ -982,6 +982,7 @@ mod tests {
         let scan_request = ScanRequest {
             respect_gitignore: false,
             include_git_dir: true,
+            follow_symlinks: false,
             max_depth: None,
             metadata: EntryMetadataRequest {
                 unix_mode: true,

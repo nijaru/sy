@@ -9,6 +9,9 @@ bitflags! {
         const RESPECT_GITIGNORE = 1 << 0;
         const INCLUDE_GIT_DIR = 1 << 1;
         const HAS_MAX_DEPTH = 1 << 2;
+        /// --copy-links: the walk follows symlinks and reports their targets
+        /// instead of the links themselves.
+        const FOLLOW_SYMLINKS = 1 << 3;
     }
 }
 
@@ -30,6 +33,7 @@ bitflags! {
 pub struct WireScanRequest {
     pub respect_gitignore: bool,
     pub include_git_dir: bool,
+    pub follow_symlinks: bool,
     pub max_depth: Option<u32>,
     pub unix_mode: bool,
     pub symlink_target: bool,
@@ -43,6 +47,7 @@ impl WireScanRequest {
         scan.set(ScanFlags::RESPECT_GITIGNORE, self.respect_gitignore);
         scan.set(ScanFlags::INCLUDE_GIT_DIR, self.include_git_dir);
         scan.set(ScanFlags::HAS_MAX_DEPTH, self.max_depth.is_some());
+        scan.set(ScanFlags::FOLLOW_SYMLINKS, self.follow_symlinks);
 
         let mut metadata = MetadataFlags::empty();
         metadata.set(MetadataFlags::UNIX_MODE, self.unix_mode);
@@ -83,6 +88,7 @@ impl WireScanRequest {
         Ok(Self {
             respect_gitignore: scan.contains(ScanFlags::RESPECT_GITIGNORE),
             include_git_dir: scan.contains(ScanFlags::INCLUDE_GIT_DIR),
+            follow_symlinks: scan.contains(ScanFlags::FOLLOW_SYMLINKS),
             max_depth: scan.contains(ScanFlags::HAS_MAX_DEPTH).then_some(raw_depth),
             unix_mode: metadata.contains(MetadataFlags::UNIX_MODE),
             symlink_target: metadata.contains(MetadataFlags::SYMLINK_TARGET),
@@ -101,6 +107,7 @@ mod tests {
         let request = WireScanRequest {
             respect_gitignore: true,
             include_git_dir: false,
+            follow_symlinks: false,
             max_depth: Some(0),
             unix_mode: true,
             symlink_target: true,
@@ -118,6 +125,7 @@ mod tests {
         let request = WireScanRequest {
             respect_gitignore: false,
             include_git_dir: false,
+            follow_symlinks: false,
             max_depth: None,
             unix_mode: false,
             symlink_target: false,

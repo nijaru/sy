@@ -232,6 +232,8 @@ impl SyncSession {
             crate::endpoint::transfer::TransferOptions {
                 update: existed,
                 verify: self.config.verification.verify_on_write,
+                follow_symlinks: self.config.preserve.symlink_mode
+                    == crate::cli::SymlinkMode::Follow,
                 rate_limiter: self.config.bwlimit.map(|limit| {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         crate::sync::ratelimit::RateLimiter::new(limit),
@@ -366,6 +368,7 @@ fn verification_scan_request(options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: options.respect_gitignore,
         include_git_dir: options.include_git_dir,
+        follow_symlinks: false,
         max_depth: options.dirs_only.then_some(1),
         metadata: EntryMetadataRequest {
             unix_mode: false,

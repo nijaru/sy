@@ -92,7 +92,10 @@ fn scan_worker(
         .git_ignore(request.respect_gitignore)
         .git_global(request.respect_gitignore)
         .git_exclude(request.respect_gitignore)
-        .follow_links(false)
+        // --copy-links: follow symlinks in the walk. `engine_entry` then
+        // classifies each link by its target's kind (a dangling link is a
+        // scan error, never a silently skipped entry).
+        .follow_links(request.follow_symlinks)
         // The engine validates strict ordering again at the trust boundary. The
         // local walker supplies that order without whole-tree materialization.
         .sort_by_file_path(|left, right| left.cmp(right));
@@ -141,10 +144,21 @@ fn send_error(sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>, error
 }
 
 fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry, LocalScanError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| LocalScanError::Metadata {
+    let lstat = std::fs::symlink_metadata(path).map_err(|source| LocalScanError::Metadata {
         path: path.to_path_buf(),
         source,
     })?;
+    // Under --copy-links the entry is its target, not the link: stat through
+    // the link so kind/size/mtime describe what a transfer would copy. A
+    // dangling link is a loud scan error.
+    let metadata = if request.follow_symlinks && lstat.file_type().is_symlink() {
+        std::fs::metadata(path).map_err(|source| LocalScanError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?
+    } else {
+        lstat
+    };
     let relative = path
         .strip_prefix(root)
         .map_err(|_| LocalScanError::OutsideRoot {
