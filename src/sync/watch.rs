@@ -145,7 +145,6 @@ mod tests {
             transport,
             SyncConfig {
                 max_concurrent: 4,
-                max_errors: 100,
                 ..SyncConfig::test_default()
             },
         );
@@ -177,7 +176,6 @@ mod tests {
             transport,
             SyncConfig {
                 max_concurrent: 4,
-                max_errors: 100,
                 ..SyncConfig::test_default()
             },
         );

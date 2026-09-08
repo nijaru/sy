@@ -45,9 +45,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode != SymlinkMode::Preserve {
         return Some("non-preserving symlink modes are not yet mapped to v3");
     }
-    if config.max_errors != 100 {
-        return Some("custom max-error policy is not yet mapped to v3 fail-fast execution");
-    }
     None
 }
 
@@ -573,7 +570,6 @@ mod tests {
     fn supported_config() -> SyncConfig {
         let mut config = SyncConfig::test_default();
         config.max_concurrent = 2;
-        config.max_errors = 100;
         config.verification.mode = crate::integrity::ChecksumType::None;
         config
     }

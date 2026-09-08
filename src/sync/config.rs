@@ -14,7 +14,6 @@ pub struct SyncConfig {
     #[allow(dead_code)]
     pub quiet: bool,
     pub max_concurrent: usize,
-    pub max_errors: usize,
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
     pub filter_engine: FilterEngine,
@@ -49,7 +48,6 @@ impl SyncConfig {
             delete: DeleteMode::Disabled,
             quiet: true,
             max_concurrent: 4,
-            max_errors: 100,
             min_size: None,
             max_size: None,
             filter_engine: FilterEngine::new(),
