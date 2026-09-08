@@ -27,7 +27,6 @@ pub struct Transferrer<'a, T: Transport> {
     preserve_acls: bool,
     #[allow(dead_code)] // Only used on macOS, suppress warning on other platforms
     preserve_flags: bool,
-    per_file_progress: bool, // Show progress bar for large files
     hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>, // inode -> state
 }
 
@@ -42,7 +41,6 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         preserve_hardlinks: bool,
         preserve_acls: bool,
         preserve_flags: bool, // macOS only, no-op on other platforms
-        per_file_progress: bool,
         hardlink_map: Arc<Mutex<HashMap<u64, InodeState>>>,
     ) -> Self {
         Self {
@@ -54,7 +52,6 @@ impl<'a, T: Transport> Transferrer<'a, T> {
             preserve_hardlinks,
             preserve_acls,
             preserve_flags,
-            per_file_progress,
             hardlink_map,
         }
     }
@@ -266,24 +263,14 @@ impl<'a, T: Transport> Transferrer<'a, T> {
         &self,
         source: &Path,
         dest: &Path,
-        file_size: u64,
+        _file_size: u64,
     ) -> Result<TransferResult> {
-        use crate::sync::progress::{create_progress_callback, MIN_SIZE_FOR_PROGRESS};
-
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
             self.transport.create_dir_all(parent).await?;
         }
 
-        // Use streaming copy with progress for large files
-        let result = if self.per_file_progress && file_size >= MIN_SIZE_FOR_PROGRESS {
-            let progress_callback = create_progress_callback(source, file_size);
-            self.transport
-                .copy_file_streaming(source, dest, Some(progress_callback))
-                .await?
-        } else {
-            self.transport.copy_file(source, dest).await?
-        };
+        let result = self.transport.copy_file(source, dest).await?;
 
         tracing::debug!("Copied: {} -> {}", source.display(), dest.display());
         Ok(result)
@@ -520,7 +507,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
         let dest_path = dest_dir.path().join("test.txt");
@@ -567,7 +553,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         ); // dry_run = true
         let dest_path = dest_dir.path().join("test.txt");
@@ -606,7 +591,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -662,7 +646,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -724,7 +707,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
         let dest_path = dest_dir.path().join("link.txt");
@@ -778,7 +760,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Skip,
-            false,
             false,
             false,
             false,
@@ -843,7 +824,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         ); // preserve_xattrs = true
         let dest_path = dest_dir.path().join("test.txt");
@@ -901,7 +881,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -990,7 +969,6 @@ mod tests {
             true,
             false,
             false,
-            false, // per_file_progress
             Arc::clone(&hardlink_map),
         );
 
@@ -1097,7 +1075,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -1222,7 +1199,6 @@ mod tests {
             true,
             false,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1291,7 +1267,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1349,7 +1324,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1378,7 +1352,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -1435,7 +1408,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1488,7 +1460,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1533,7 +1504,6 @@ mod tests {
             true,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -1586,7 +1556,6 @@ mod tests {
             false,
             true,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1631,7 +1600,6 @@ mod tests {
             false,
             false,
             SymlinkMode::Preserve,
-            false,
             false,
             false,
             false,
@@ -1682,7 +1650,6 @@ mod tests {
             false,
             false,
             true,
-            false,
             false,
             hardlink_map,
         );
@@ -1747,7 +1714,6 @@ mod tests {
             false,
             true,
             false,
-            false,
             hardlink_map,
         );
 
@@ -1805,7 +1771,6 @@ mod tests {
             false,
             false,
             true,
-            false,
             false,
             hardlink_map,
         );
@@ -1872,7 +1837,6 @@ mod tests {
             false,
             false,
             true, // preserve_flags = true
-            false,
             hardlink_map,
         );
         let dest_path = dest_dir.path().join("test.txt");
@@ -1939,7 +1903,6 @@ mod tests {
             false,
             false,
             false, // preserve_flags = false
-            false,
             hardlink_map,
         );
         let dest_path = dest_dir.path().join("test.txt");

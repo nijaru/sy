@@ -393,6 +393,8 @@ pub struct RemotePushExecutor {
     backup: Option<RemoteBackupPlan>,
     /// -z/--compress: chunk compression policy for file transfers.
     compression: Option<CompressionPolicy>,
+    /// Per-operation output (`-i`/`--json`). `None` prints nothing.
+    reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
 
 impl RemotePushExecutor {
@@ -411,6 +413,7 @@ impl RemotePushExecutor {
             remove_source_files: false,
             backup: None,
             compression: None,
+            reporter: None,
         }
     }
 
@@ -429,6 +432,25 @@ impl RemotePushExecutor {
         self
     }
 
+    pub fn with_reporter(
+        mut self,
+        reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
+    ) -> Self {
+        self.reporter = reporter;
+        self
+    }
+
+    fn report(
+        &self,
+        op: crate::sync::output::ItemizeOp,
+        kind: crate::sync::output::ItemizeKind,
+        path: &crate::engine::domain::RelativePath,
+    ) {
+        if let Some(reporter) = &self.reporter {
+            reporter.operation(op, kind, path.as_path());
+        }
+    }
+
     pub fn with_backup(mut self, plan: Option<RemoteBackupPlan>) -> Self {
         self.backup = plan;
         self
@@ -444,6 +466,11 @@ impl RemotePushExecutor {
         match action {
             RemotePushAction::CreateDirectory { source } => {
                 self.remote.create_directory(&source.path).await?;
+                self.report(
+                    crate::sync::output::ItemizeOp::Create,
+                    crate::sync::output::ItemizeKind::Directory,
+                    &source.path,
+                );
                 Ok(None)
             }
             RemotePushAction::TransferFile {
@@ -451,6 +478,7 @@ impl RemotePushExecutor {
                 destination,
                 metadata,
             } => {
+                let is_update = destination.is_some();
                 // --backup preserves the replaced destination file first. The
                 // server copies it beneath the pinned root before the staged
                 // replacement commits; a backup failure aborts the transfer
@@ -477,6 +505,12 @@ impl RemotePushExecutor {
                     )
                     .await?;
                 self.remove_committed_source(&source).await?;
+                let op = if is_update {
+                    crate::sync::output::ItemizeOp::Update
+                } else {
+                    crate::sync::output::ItemizeOp::Create
+                };
+                self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
                 Ok(Some(summary))
             }
             RemotePushAction::ReplaceSymlink { source, modified } => {
@@ -490,6 +524,11 @@ impl RemotePushExecutor {
                         .await?;
                 }
                 self.remove_committed_source(&source).await?;
+                self.report(
+                    crate::sync::output::ItemizeOp::Create,
+                    crate::sync::output::ItemizeKind::Symlink,
+                    &source.path,
+                );
                 Ok(None)
             }
             RemotePushAction::ApplyMetadata {
@@ -541,6 +580,15 @@ impl RemotePushExecutor {
         self.remote
             .remove(&action.path, action.is_directory)
             .await?;
+        self.report(
+            crate::sync::output::ItemizeOp::Delete,
+            if action.is_directory {
+                crate::sync::output::ItemizeKind::Directory
+            } else {
+                crate::sync::output::ItemizeKind::File
+            },
+            &action.path,
+        );
         Ok(())
     }
 
