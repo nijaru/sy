@@ -30,6 +30,10 @@ pub enum TransferStrategy {
 pub struct TransferOptions {
     pub update: bool,
     pub verify: bool,
+    /// --copy-links: the source entry is the TARGET of a symlink; the scan
+    /// classified it by target kind. The transfer guard and size decisions
+    /// must therefore stat through the link, and plain opens follow it.
+    pub follow_symlinks: bool,
     /// Optional shared bandwidth pacing in bytes per second (`--bwlimit`).
     /// When set, native kernel fast paths (fs::copy, reflink) are bypassed:
     /// pacing requires bytes to flow through this process where the token
@@ -59,7 +63,12 @@ pub async fn transfer_file(
     dest_path: &Path,
     options: TransferOptions,
 ) -> Result<TransferResult> {
-    let metadata = source.metadata(source_path).await?;
+    let mut metadata = source.metadata(source_path).await?;
+    if options.follow_symlinks && metadata.is_symlink {
+        // The scan reported the target; resolve the link so the transfer
+        // guards and size decisions describe the bytes that will be copied.
+        metadata = source.metadata_following(source_path).await?;
+    }
     if metadata.is_dir || metadata.is_symlink {
         return Err(SyncError::Config(format!(
             "file transfer requested for non-regular source {}",

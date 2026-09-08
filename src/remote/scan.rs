@@ -73,6 +73,9 @@ pub enum RemoteScanError {
 
     #[error("local metadata scan failed")]
     LocalScan(#[source] BoxError),
+
+    #[error("the remote scan handler does not support follow-symlinks scans yet")]
+    RemoteFollowUnsupported,
 }
 
 impl From<SharedRouterError> for RemoteScanError {
@@ -125,6 +128,13 @@ pub async fn serve_incoming_scan_rooted(
     let first_frame = first.frame();
     require_stream(first_frame, stream_id)?;
     let request = decode_scan_request(first_frame)?;
+    // RootedFs scans resolve through held root descriptors without following
+    // symlinks (root confinement); a follow-scan is not yet offered remotely.
+    // The bit is rejected loudly rather than silently ignored so a client
+    // never receives a different namespace than it asked for.
+    if request.follow_symlinks {
+        return Err(RemoteScanError::RemoteFollowUnsupported);
+    }
     drop(first);
 
     serve_scan(rooted, request, sender, stream_id).await?;
@@ -275,6 +285,7 @@ fn scan_request_to_wire(request: ScanRequest) -> Result<WireScanRequest> {
     Ok(WireScanRequest {
         respect_gitignore: request.respect_gitignore,
         include_git_dir: request.include_git_dir,
+        follow_symlinks: request.follow_symlinks,
         max_depth,
         unix_mode: request.metadata.unix_mode,
         symlink_target: request.metadata.symlink_target,
@@ -291,6 +302,7 @@ fn wire_to_scan_request(request: WireScanRequest) -> Result<ScanRequest> {
     Ok(ScanRequest {
         respect_gitignore: request.respect_gitignore,
         include_git_dir: request.include_git_dir,
+        follow_symlinks: request.follow_symlinks,
         max_depth,
         metadata: EntryMetadataRequest {
             unix_mode: request.unix_mode,
@@ -582,6 +594,7 @@ mod tests {
         let request = ScanRequest {
             respect_gitignore: true,
             include_git_dir: true,
+            follow_symlinks: false,
             max_depth: Some(7),
             metadata: EntryMetadataRequest {
                 unix_mode: true,
@@ -654,6 +667,8 @@ mod tests {
 
         let request = ScanRequest {
             respect_gitignore: false,
+
+            follow_symlinks: false,
             include_git_dir: false,
             max_depth: None,
             metadata: EntryMetadataRequest {

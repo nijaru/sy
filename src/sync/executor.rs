@@ -4,6 +4,7 @@
 //! transfer layer chooses endpoint-native fast paths when available and falls
 //! back to bounded staged streaming. Verification is explicit BLAKE3 I/O.
 
+use crate::cli::SymlinkMode;
 use crate::endpoint::io::{hash_file_streaming, VerificationStatus};
 use crate::endpoint::transfer::{transfer_file, TransferOptions, FILE_TRANSFER_BUFFER_BUDGET};
 use crate::endpoint::Endpoint;
@@ -508,6 +509,7 @@ impl<'a> TaskExecutor<'a> {
             TransferOptions {
                 update: task.action == SyncAction::Update,
                 verify: self.verification.verify_on_write,
+                follow_symlinks: self.preserve.symlink_mode == SymlinkMode::Follow,
                 rate_limiter: self.config.rate_limiter.clone(),
             },
         )
@@ -642,6 +644,9 @@ impl<'a> TaskExecutor<'a> {
             TransferOptions {
                 update: false,
                 verify: false,
+                // Backups copy destination files as themselves; a backup must
+                // never resolve a symlink.
+                follow_symlinks: false,
                 // Backups move bytes too; the same --bwlimit budget applies.
                 rate_limiter: self.config.rate_limiter.clone(),
             },

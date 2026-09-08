@@ -42,9 +42,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     {
         return Some("requested preservation semantics exceed current v3 mode/mtime support");
     }
-    if config.preserve.symlink_mode != SymlinkMode::Preserve {
-        return Some("non-preserving symlink modes are not yet mapped to v3");
-    }
     None
 }
 
@@ -174,6 +171,7 @@ async fn execute_with_handle(
     );
     let min_size = config.min_size;
     let max_size = config.max_size;
+    let skip_symlinks = config.preserve.symlink_mode == SymlinkMode::Skip;
     let delete_filter = config.filter_engine.clone();
     let max_depth = selection_max_depth(config, scan_options);
     let include_git_dir = scan_options.include_git_dir;
@@ -196,7 +194,10 @@ async fn execute_with_handle(
             destination,
             comparison_policy(config),
             delete_policy(&config.delete),
-            move |entry| entry_in_size_scope(entry, min_size, max_size),
+            move |entry| {
+                entry_in_size_scope(entry, min_size, max_size)
+                    && entry_selected_by_symlink_mode(entry, skip_symlinks)
+            },
             move |entry| {
                 delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
@@ -231,7 +232,10 @@ async fn execute_with_handle(
             destination,
             comparison_policy(config),
             delete_policy(&config.delete),
-            move |entry| entry_in_size_scope(entry, min_size, max_size),
+            move |entry| {
+                entry_in_size_scope(entry, min_size, max_size)
+                    && entry_selected_by_symlink_mode(entry, skip_symlinks)
+            },
             move |entry| {
                 delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
@@ -331,6 +335,9 @@ fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRe
     ScanRequest {
         respect_gitignore: scan_options.respect_gitignore,
         include_git_dir: scan_options.include_git_dir,
+        // --copy-links: the remote walk yields target kinds (the source scan
+        // is local in a push, so this reaches the local walker directly).
+        follow_symlinks: config.preserve.symlink_mode == SymlinkMode::Follow,
         max_depth: selection_max_depth(config, scan_options),
         metadata: metadata_request(config),
     }
@@ -340,6 +347,7 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
     ScanRequest {
         respect_gitignore: false,
         include_git_dir: true,
+        follow_symlinks: false,
         max_depth: None,
         metadata: metadata_request(config),
     }
@@ -375,6 +383,16 @@ fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
 /// out of deletion scope. The lock is uncontended: one preflight task owns
 /// the scope; the mutex exists because scope state is cached across calls
 /// while the closure is `FnMut`.
+/// --links=skip: symlinks are excluded from transfer selection but remain
+/// in the reconciliation stream, so their destination counterparts keep
+/// delete protection (selection must never narrow deletion scope).
+fn entry_selected_by_symlink_mode(entry: &Entry, skip_symlinks: bool) -> bool {
+    if skip_symlinks && entry.kind == sy::engine::domain::EntryKind::Symlink {
+        return false;
+    }
+    true
+}
+
 fn entry_not_source_ignored(
     scope: &std::sync::Arc<std::sync::Mutex<sy::engine::ignore_scope::SourceIgnoreScope>>,
     entry: &Entry,
@@ -784,6 +802,20 @@ mod tests {
             b"gone-content"
         );
         assert!(destination_root.path().join("sub").is_dir());
+    }
+
+    #[test]
+    fn symlink_modes_map_to_v3_without_fallback() {
+        // --copy-links and --links=skip are scan/selection semantics on the
+        // v3 engine: follow makes the local source walk report targets, skip
+        // filters symlinks from transfer while keeping delete protection.
+        let mut config = supported_config();
+        config.preserve.symlink_mode = crate::cli::SymlinkMode::Follow;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.preserve.symlink_mode = crate::cli::SymlinkMode::Skip;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.preserve.symlink_mode = crate::cli::SymlinkMode::Preserve;
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]

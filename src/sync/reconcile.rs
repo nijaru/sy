@@ -4,6 +4,7 @@
 //! `engine/`. This module only adapts the resulting `SyncOp`s to the legacy task
 //! executor while that executor is being replaced.
 
+use crate::cli::SymlinkMode;
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::transfer::{transfer_file, TransferOptions};
 use crate::endpoint::Endpoint;
@@ -490,6 +491,10 @@ fn scan_request(config: &SyncConfig, options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: options.respect_gitignore,
         include_git_dir: options.include_git_dir,
+        // --copy-links: the source walk reports symlink targets; the
+        // executor then transfers the target bytes through the normal
+        // file paths.
+        follow_symlinks: config.preserve.symlink_mode == SymlinkMode::Follow,
         max_depth: options.dirs_only.then_some(1),
         metadata: EntryMetadataRequest {
             unix_mode: config.preserve.permissions,
@@ -504,6 +509,7 @@ fn delete_scan_request(options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: options.respect_gitignore,
         include_git_dir: options.include_git_dir,
+        follow_symlinks: false,
         max_depth: options.dirs_only.then_some(1),
         metadata: EntryMetadataRequest {
             unix_mode: false,
@@ -519,8 +525,11 @@ fn delete_scan_request(options: ScanOptions) -> ScanRequest {
 /// `dest_delete_eligible` through the source-derived scope.
 fn complete_delete_scan_request() -> ScanRequest {
     ScanRequest {
+        // Delete-scope scans are never link-following: a destination
+        // symlink must be judged as itself, never by what it points at.
         respect_gitignore: false,
         include_git_dir: true,
+        follow_symlinks: false,
         max_depth: None,
         metadata: EntryMetadataRequest {
             unix_mode: false,
@@ -542,6 +551,12 @@ async fn destination_stream(root: &Path, request: ScanRequest) -> Result<EntrySt
 }
 
 fn source_entry_selected(config: &SyncConfig, entry: &Entry) -> bool {
+    // --links=skip: symlinks are selected OUT of transfer but stay in the
+    // reconciliation stream — their dest counterparts remain protected from
+    // --delete exactly like excluded entries that still anchor protection.
+    if config.preserve.symlink_mode == SymlinkMode::Skip && entry.kind == EntryKind::Symlink {
+        return false;
+    }
     if !entry.is_directory() {
         if let Some(min) = config.min_size {
             if entry.size < min {
@@ -851,6 +866,10 @@ async fn execute_delete_journal(
                                 TransferOptions {
                                     update: false,
                                     verify: false,
+                                    // Deleting a symlink backs it up as a
+                                    // regular-file copy of nothing: never
+                                    // follow the link (see backup comments).
+                                    follow_symlinks: false,
                                     rate_limiter: None,
                                 },
                             )

@@ -30,6 +30,10 @@ impl Default for EntryMetadataRequest {
 pub struct ScanRequest {
     pub respect_gitignore: bool,
     pub include_git_dir: bool,
+    /// --copy-links: follow symlinks during the walk, reporting their targets
+    /// instead of the links. A dangling link surfaces as a scan error rather
+    /// than a silently skipped entry.
+    pub follow_symlinks: bool,
     /// Maximum walk depth relative to the endpoint root. `None` means recursive.
     pub max_depth: Option<usize>,
     pub metadata: EntryMetadataRequest,
@@ -40,6 +44,7 @@ impl Default for ScanRequest {
         Self {
             respect_gitignore: false,
             include_git_dir: true,
+            follow_symlinks: false,
             max_depth: None,
             metadata: EntryMetadataRequest::default(),
         }

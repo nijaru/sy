@@ -135,6 +135,17 @@ pub trait Endpoint: Send + Sync {
     async fn exists(&self, path: &Path) -> Result<bool>;
     async fn metadata(&self, path: &Path) -> Result<FileMetadata>;
 
+    /// Stat through symlinks (--copy-links: the entry is the link's target).
+    /// Endpoints without follow-capable resolution must refuse rather than
+    /// return link metadata that would misdescribe the transfer.
+    async fn metadata_following(&self, path: &Path) -> Result<FileMetadata> {
+        Err(SyncError::Config(format!(
+            "{:?} endpoint cannot resolve symlink targets for {}",
+            self.endpoint_type(),
+            path.display()
+        )))
+    }
+
     /// Read extended attributes only when preservation policy requests them.
     async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
         Err(SyncError::Config(format!(
