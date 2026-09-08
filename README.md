@@ -1,7 +1,7 @@
 # sy
 
 > [!WARNING]
-> **Under active development.** `sy` is in the middle of a ground-up v0.5 rewrite (see the `v0.5-architecture` branch, PR #27) — expect breaking changes and CI churn until the stable release lands.
+> 🚧 Under active development.
 
 [![CI](https://github.com/nijaru/sy/actions/workflows/ci.yml/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
