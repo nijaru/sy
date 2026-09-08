@@ -434,7 +434,6 @@ Or install from local source with: cargo install --path . --features acl"#
             devices: cli.should_preserve_devices(),
             keep_dirlinks: cli.keep_dirlinks,
         },
-        progress: cli.progress,
         comparison: sync::ComparisonConfig {
             ignore_times: cli.ignore_times,
             size_only: cli.size_only,
@@ -1036,13 +1035,6 @@ Or install from local source with: cargo install --path . --features acl"#
                     "Verification:".green(),
                     stats.files_verified.to_string().green(),
                 );
-            }
-        }
-
-        // Print performance summary if --perf is enabled
-        if cli.perf {
-            if let Some(metrics) = session.get_performance_metrics() {
-                metrics.print_summary();
             }
         }
     }

@@ -173,10 +173,6 @@ name = "sync_performance"
 path = "tests/sync/performance.rs"
 
 [[test]]
-name = "sync_progress"
-path = "tests/sync/progress.rs"
-
-[[test]]
 name = "sync_advanced"
 path = "tests/sync/advanced.rs"
 

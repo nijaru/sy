@@ -45,18 +45,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode != SymlinkMode::Preserve {
         return Some("non-preserving symlink modes are not yet mapped to v3");
     }
-    if config.itemize_changes {
-        return Some("itemized change output is not yet emitted from v3 plans");
-    }
-    if config.progress {
-        return Some("legacy progress reporting is not yet mapped to v3 streams");
-    }
-    if config.json {
-        return Some("legacy JSON event output is not yet emitted by the v3 adapter");
-    }
-    if config.perf {
-        return Some("legacy performance metrics are not yet mapped to the v3 adapter");
-    }
     if config.max_errors != 100 {
         return Some("custom max-error policy is not yet mapped to v3 fail-fast execution");
     }
@@ -97,7 +85,9 @@ pub(super) async fn run(
     .await
     .map_err(map_io)?;
     let remote = session.remote().request_handle();
-    let mut stats = execute_with_handle(source_root, remote, config, scan_options).await?;
+    let destination_root = destination_root.to_path_buf();
+    let mut stats =
+        execute_with_handle(source_root, &destination_root, remote, config, scan_options).await?;
     stats.duration = started.elapsed();
     Ok(stats)
 }
@@ -163,15 +153,24 @@ fn filtered_source_stream(source: EntryStream, filter: FilterEngine) -> EntryStr
 
 async fn execute_with_handle(
     source_root: &Path,
+    destination_root: &Path,
     remote: ClientRemoteHandle,
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
+        config.itemize_changes,
+        config.json,
+        config.quiet,
+        config.perf,
+    ));
+    let scan_started = std::time::Instant::now();
     let source_request = source_scan_request(config, scan_options);
     let destination = remote
         .scan(destination_scan_request(config))
         .await
         .map_err(map_io)?;
+    reporter.start(source_root, destination_root);
     let source = filtered_source_stream(
         local_entry_stream(source_root.to_path_buf(), source_request),
         config.filter_engine.clone(),
@@ -302,12 +301,33 @@ async fn execute_with_handle(
     )
     .with_remove_source_files(config.remove_source_files)
     .with_backup(backup_plan)
-    .with_compression(compression_policy(config));
+    .with_compression(compression_policy(config))
+    .with_reporter(Some(reporter.clone()));
+    let scan_elapsed = scan_started.elapsed();
+    let transfer_started = std::time::Instant::now();
     let summary = RemotePushController::new(executor, max_in_flight)
         .execute(plan)
         .await
         .map_err(map_controller_error)?;
-    summary_stats(summary)
+    let mut stats = summary_stats(summary)?;
+    stats.duration = scan_elapsed + transfer_started.elapsed();
+    reporter.finish(
+        &sy::sync::output::SummaryCounts {
+            files_created: stats.files_created,
+            files_updated: stats.files_updated,
+            files_skipped: stats.files_skipped,
+            files_deleted: stats.files_deleted,
+            bytes_transferred: stats.bytes_transferred,
+            duration_secs: stats.duration.as_secs_f64(),
+            files_verified: stats.files_verified as u64,
+            verification_failures: stats.verification_failures,
+        },
+        sy::sync::output::SyncTimings {
+            scan: scan_elapsed,
+            transfer: transfer_started.elapsed(),
+        },
+    );
+    Ok(stats)
 }
 
 fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
@@ -635,6 +655,7 @@ mod tests {
         config.remove_source_files = true;
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -732,6 +753,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -831,6 +853,7 @@ mod tests {
         config.compression_detection = CompressionDetection::Always;
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1065,6 +1088,7 @@ mod tests {
         };
         let error = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1132,6 +1156,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1213,6 +1238,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             scan_options,
@@ -1323,6 +1349,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             scan_options,
@@ -1386,6 +1413,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1451,6 +1479,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             scan_options,
@@ -1515,6 +1544,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             scan_options,
@@ -1580,6 +1610,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1645,6 +1676,7 @@ mod tests {
         config.existing = true;
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1705,6 +1737,7 @@ mod tests {
         };
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1801,6 +1834,7 @@ mod tests {
         config.comparison.checksum = true;
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1880,6 +1914,7 @@ mod tests {
         config.dry_run = true;
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -1936,6 +1971,7 @@ mod tests {
         let config = supported_config();
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),
@@ -2003,6 +2039,7 @@ mod tests {
         // initialized from CLI flags.
         let stats = execute_with_handle(
             source_root.path(),
+            destination_root.path(),
             session.request_handle(),
             &config,
             ScanOptions::default(),

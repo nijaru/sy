@@ -2,7 +2,6 @@
 pub mod config;
 pub mod executor;
 pub mod output;
-pub mod progress;
 pub mod ratelimit;
 pub mod scale;
 pub mod scanner;
@@ -31,7 +30,6 @@ use crate::resource;
 use crate::transport::Transport;
 use futures::{stream::StreamExt, FutureExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use output::SyncEvent;
 use ratelimit::RateLimiter;
 use scale::FileSetBloom;
 use scanner::FileEntry;
@@ -470,16 +468,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             monitor.lock().expect("perf monitor poisoned").end_plan();
         }
 
-        // Emit start event if JSON mode
-        if self.config.json {
-            SyncEvent::Start {
-                source: source.to_path_buf(),
-                destination: destination.to_path_buf(),
-                total_files: tasks.len(),
-            }
-            .emit();
-        }
-
         // Execute sync operations in parallel
         // Thread-safe stats tracking
         let stats = Arc::new(Mutex::new(SyncStats {
@@ -599,7 +587,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             let preserve_hardlinks = self.config.preserve.hardlinks;
             let preserve_acls = self.config.preserve.acls;
             let preserve_flags = self.config.preserve.flags;
-            let progress = self.config.progress && !self.config.quiet;
             let hardlink_map = Arc::clone(&hardlink_map);
             let _perf_monitor = self.perf_monitor.clone();
 
@@ -616,7 +603,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                     preserve_hardlinks,
                     preserve_acls,
                     preserve_flags,
-                    progress,
                     hardlink_map,
                 );
                 let verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -892,16 +878,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     }
                                 }
                             }
-
-                            // Emit JSON
-                            if self.config.json {
-                                SyncEvent::Create {
-                                    path: task.dest_path.clone(),
-                                    size: task.source.as_ref().map(|s| s.size).unwrap_or(0),
-                                    bytes_transferred: res.bytes_written,
-                                }
-                                .emit();
-                            }
                         }
                         SyncAction::Update => {
                             s.files_updated += 1;
@@ -951,31 +927,9 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     }
                                 }
                             }
-
-                            if self.config.json {
-                                let delta_used = res
-                                    .transfer_result
-                                    .as_ref()
-                                    .map(|r| r.used_delta())
-                                    .unwrap_or(false);
-                                SyncEvent::Update {
-                                    path: task.dest_path.clone(),
-                                    size: task.source.as_ref().map(|s| s.size).unwrap_or(0),
-                                    bytes_transferred: res.bytes_written,
-                                    delta_used,
-                                }
-                                .emit();
-                            }
                         }
                         SyncAction::Skip => {
                             s.files_skipped += 1;
-                            if self.config.json {
-                                SyncEvent::Skip {
-                                    path: task.dest_path.clone(),
-                                    reason: "up_to_date".to_string(),
-                                }
-                                .emit();
-                            }
                         }
                         SyncAction::Delete => {
                             s.files_deleted += 1;
@@ -1001,13 +955,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     .lock()
                                     .expect("perf monitor poisoned")
                                     .add_file_deleted();
-                            }
-
-                            if self.config.json {
-                                SyncEvent::Delete {
-                                    path: task.dest_path.clone(),
-                                }
-                                .emit();
                             }
                         }
                     }
@@ -1109,43 +1056,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             final_stats.files_deleted,
             final_stats.duration.as_secs_f64()
         );
-
-        // Emit summary event if JSON mode
-        if self.config.json {
-            SyncEvent::Summary {
-                files_created: final_stats.files_created as usize,
-                files_updated: final_stats.files_updated as usize,
-                files_skipped: final_stats.files_skipped,
-                files_deleted: final_stats.files_deleted,
-                bytes_transferred: final_stats.bytes_transferred,
-                duration_secs: final_stats.duration.as_secs_f64(),
-                files_verified: final_stats.files_verified,
-                verification_failures: final_stats.verification_failures,
-            }
-            .emit();
-
-            // Emit performance metrics if performance monitoring is enabled
-            if let Some(perf_metrics) = self.get_performance_metrics() {
-                SyncEvent::Performance {
-                    total_duration_secs: perf_metrics.total_duration.as_secs_f64(),
-                    scan_duration_secs: perf_metrics.scan_duration.as_secs_f64(),
-                    plan_duration_secs: perf_metrics.plan_duration.as_secs_f64(),
-                    transfer_duration_secs: perf_metrics.transfer_duration.as_secs_f64(),
-                    bytes_transferred: perf_metrics.bytes_transferred,
-                    bytes_read: perf_metrics.bytes_read,
-                    files_processed: perf_metrics.files_processed,
-                    files_created: perf_metrics.files_created,
-                    files_updated: perf_metrics.files_updated,
-                    files_deleted: perf_metrics.files_deleted,
-                    directories_created: perf_metrics.directories_created,
-                    avg_transfer_speed: perf_metrics.avg_transfer_speed,
-                    peak_transfer_speed: perf_metrics.peak_transfer_speed,
-                    files_per_second: perf_metrics.files_per_second,
-                    bandwidth_utilization: perf_metrics.bandwidth_utilization,
-                }
-                .emit();
-            }
-        }
 
         // Remove source files after successful transfer (--remove-source-files)
         if self.config.remove_source_files && !self.config.dry_run && final_stats.errors.is_empty()
@@ -1351,7 +1261,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let pb = pb.clone();
                 let dry_run = self.config.dry_run;
                 let diff_mode = self.config.diff_mode;
-                let json = self.config.json;
                 // Clone other config fields...
                 let verification_mode = self.config.verification.mode;
                 let verify_on_write = self.config.verification.verify_on_write;
@@ -1360,7 +1269,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let preserve_hardlinks = self.config.preserve.hardlinks;
                 let preserve_acls = self.config.preserve.acls;
                 let preserve_flags = self.config.preserve.flags;
-                let progress = self.config.progress && !self.config.quiet;
                 let hardlink_map = hardlink_map.clone();
                 let rate_limiter = rate_limiter.clone();
                 let perf_monitor = self.perf_monitor.clone();
@@ -1376,13 +1284,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         let mut s = stats.lock().expect("stats counter poisoned");
                         s.files_skipped += 1;
                     }
-                    if json {
-                        SyncEvent::Skip {
-                            path: task.dest_path.clone(),
-                            reason: "up_to_date".to_string(),
-                        }
-                        .emit();
-                    }
                     return futures::future::ready(Ok(())).boxed();
                 }
 
@@ -1396,7 +1297,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                         preserve_hardlinks,
                         preserve_acls,
                         preserve_flags,
-                        progress,
                         hardlink_map,
                     );
                     let _verifier = IntegrityVerifier::new(verification_mode, verify_on_write);
@@ -1483,14 +1383,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
                                         }
 
-                                        if json {
-                                            SyncEvent::Create {
-                                                path: task.dest_path.clone(),
-                                                size: source.size,
-                                                bytes_transferred: bytes_written,
-                                            }
-                                            .emit();
-                                        }
                                         Ok(())
                                     }
                                     Err(e) => {
@@ -1579,19 +1471,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                             }
                                         }
 
-                                        if json {
-                                            let delta_used = transfer_result
-                                                .as_ref()
-                                                .map(|r| r.used_delta())
-                                                .unwrap_or(false);
-                                            SyncEvent::Update {
-                                                path: task.dest_path.clone(),
-                                                size: source.size,
-                                                bytes_transferred: bytes_written,
-                                                delta_used,
-                                            }
-                                            .emit();
-                                        }
                                         Ok(())
                                     }
                                     Err(e) => {
@@ -1633,7 +1512,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                 let stats = stats.clone();
                 let pb = pb.clone();
                 let dry_run = self.config.dry_run;
-                let json = self.config.json;
 
                 // We need to count deletions to check threshold (which requires buffering or estimation)
                 // In streaming mode, strict threshold enforcement is hard before starting.
@@ -1669,12 +1547,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     s.bytes_would_delete += dest_file.size;
                                     s.files_deleted += 1;
                                 }
-                                if json {
-                                    SyncEvent::Delete {
-                                        path: (*path).clone(),
-                                    }
-                                    .emit();
-                                }
                                 return Ok(());
                             }
 
@@ -1684,13 +1556,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
                                     {
                                         let mut s = stats.lock().expect("stats counter poisoned");
                                         s.files_deleted += 1;
-                                    }
-                                    // Track perf (omitted for brevity)
-                                    if json {
-                                        SyncEvent::Delete {
-                                            path: (*path).clone(),
-                                        }
-                                        .emit();
                                     }
                                     Ok(())
                                 }
@@ -1934,7 +1799,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
         let hardlink_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         // Per-file progress should respect quiet mode
-        let progress = self.config.progress && !self.config.quiet;
 
         let transferrer = Transferrer::new(
             self.transport.as_ref(),
@@ -1945,7 +1809,6 @@ impl<T: Transport + 'static> SyncEngine<T> {
             self.config.preserve.hardlinks,
             self.config.preserve.acls,
             self.config.preserve.flags,
-            progress,
             hardlink_map,
         );
 

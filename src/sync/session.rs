@@ -198,10 +198,6 @@ impl SyncSession {
         Ok(result)
     }
 
-    pub fn get_performance_metrics(&self) -> Option<&crate::perf::PerformanceMetrics> {
-        None
-    }
-
     /// Sync one local regular file through the same capability-driven transfer
     /// layer as tree sync.
     pub async fn sync_single_file(&self, source: &Path, dest: &Path) -> Result<SyncStats> {

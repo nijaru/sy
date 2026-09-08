@@ -9,7 +9,7 @@ use crate::endpoint::transfer::{transfer_file, TransferOptions, FILE_TRANSFER_BU
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError as Error};
 use crate::sync::config::{PreserveConfig, VerificationConfig};
-use crate::sync::itemize_string;
+use crate::sync::output::{ItemizeKind, ItemizeOp};
 use crate::sync::scanner::FileEntry;
 use crate::sync::stats::{SyncError, SyncStats};
 use crate::sync::strategy::{SyncAction, SyncTask};
@@ -77,17 +77,30 @@ impl BackupConfig {
 }
 
 /// Configuration for task execution behavior.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ExecuteConfig {
     pub preserve_hardlinks: bool,
     pub preserve_xattrs: bool,
     pub preserve_dir_permissions: bool,
-    pub itemize_changes: bool,
     pub remove_source_files: bool,
-    pub print_stats: bool,
     /// Shared `--bwlimit` pacing for all local transfers. `None` keeps kernel
     /// fast paths; `Some` routes bytes through the paced streaming copy.
     pub rate_limiter: Option<std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
+    /// Itemize/JSON output for completed operations. `None` prints nothing.
+    pub reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
+}
+
+impl std::fmt::Debug for ExecuteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecuteConfig")
+            .field("preserve_hardlinks", &self.preserve_hardlinks)
+            .field("preserve_xattrs", &self.preserve_xattrs)
+            .field("preserve_dir_permissions", &self.preserve_dir_permissions)
+            .field("remove_source_files", &self.remove_source_files)
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .field("reporter", &self.reporter.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +129,14 @@ pub struct TaskExecutor<'a> {
 }
 
 impl<'a> TaskExecutor<'a> {
+    /// Report one completed destination operation through the shared
+    /// reporter when one is configured; a `None` reporter prints nothing.
+    fn report(&self, op: ItemizeOp, kind: ItemizeKind, path: &Path) {
+        if let Some(reporter) = &self.config.reporter {
+            reporter.operation(op, kind, path);
+        }
+    }
+
     pub fn new(
         source: &'a dyn Endpoint,
         dest: &'a dyn Endpoint,
@@ -382,6 +403,11 @@ impl<'a> TaskExecutor<'a> {
     ) -> Result<TaskResult> {
         let preservation = self.read_preservation(source_entry).await?;
         self.dest.create_dir_all(&task.dest_path).await?;
+        self.report(
+            ItemizeOp::for_action(&task.action),
+            ItemizeKind::Directory,
+            &task.dest_path,
+        );
 
         #[cfg(unix)]
         if self.config.preserve_dir_permissions {
@@ -412,10 +438,11 @@ impl<'a> TaskExecutor<'a> {
             let target = tokio::fs::read_link(&source_path).await?;
             self.dest.create_symlink(&target, &task.dest_path).await?;
 
-            if self.config.itemize_changes {
-                let item = itemize_string(&task.action, false, true);
-                eprintln!("{} {}", item, task.dest_path.display());
-            }
+            self.report(
+                ItemizeOp::for_action(&task.action),
+                ItemizeKind::Symlink,
+                &task.dest_path,
+            );
 
             self.remove_source_after_commit(source_entry).await?;
 
@@ -447,10 +474,11 @@ impl<'a> TaskExecutor<'a> {
                         .create_hardlink(&first_path, &task.dest_path)
                         .await?;
 
-                    if self.config.itemize_changes {
-                        let item = itemize_string(&task.action, false, false);
-                        eprintln!("{} {}", item, task.dest_path.display());
-                    }
+                    self.report(
+                        ItemizeOp::for_action(&task.action),
+                        ItemizeKind::File,
+                        &task.dest_path,
+                    );
 
                     self.remove_source_after_commit(source_entry).await?;
                     return Ok(if task.action == SyncAction::Create {
@@ -515,10 +543,11 @@ impl<'a> TaskExecutor<'a> {
             }
         }
 
-        if self.config.itemize_changes {
-            let item = itemize_string(&task.action, false, false);
-            eprintln!("{} {}", item, task.dest_path.display());
-        }
+        self.report(
+            ItemizeOp::for_action(&task.action),
+            ItemizeKind::File,
+            &task.dest_path,
+        );
 
         // Source removal is intentionally last. Verification or preservation
         // failure leaves the source untouched, and a removal failure is surfaced

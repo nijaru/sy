@@ -10,6 +10,7 @@ use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
 use crate::sync::config::{DeleteMode, SyncConfig};
 use crate::sync::executor::{BackupConfig, ExecuteConfig, TaskExecutor};
+use crate::sync::output::{ItemizeKind, SyncReporter};
 use crate::sync::scanner::{FileEntry, ScanOptions};
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{SyncAction, SyncTask};
@@ -55,6 +56,14 @@ pub(crate) async fn run_local_sync(
         }
     };
 
+    let reporter = std::sync::Arc::new(SyncReporter::new(
+        config.itemize_changes,
+        config.json,
+        config.quiet,
+        config.perf,
+    ));
+    reporter.start(source.root(), dest.root());
+    let run_started = std::time::Instant::now();
     let executor = TaskExecutor::new(
         source,
         dest,
@@ -72,9 +81,8 @@ pub(crate) async fn run_local_sync(
         preserve_hardlinks: config.preserve.hardlinks,
         preserve_xattrs: config.preserve.xattrs,
         preserve_dir_permissions: config.preserve.permissions,
-        itemize_changes: config.itemize_changes,
         remove_source_files: config.remove_source_files,
-        print_stats: config.stats,
+        reporter: Some(reporter.clone()),
         rate_limiter: config.bwlimit.map(|limit| {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::sync::ratelimit::RateLimiter::new(limit),
@@ -124,6 +132,7 @@ pub(crate) async fn run_local_sync(
                     plan_matched(source, dest, comparison, source_entry, destination).await?;
                 queue_operation(
                     source, config, operation, &mut batch, batch_size, &executor, &mut stats,
+                    &reporter,
                 )
                 .await?;
                 continue;
@@ -140,7 +149,7 @@ pub(crate) async fn run_local_sync(
             }
         };
         queue_operation(
-            source, config, operation, &mut batch, batch_size, &executor, &mut stats,
+            source, config, operation, &mut batch, batch_size, &executor, &mut stats, &reporter,
         )
         .await?;
     }
@@ -164,11 +173,34 @@ pub(crate) async fn run_local_sync(
             } else {
                 None
             };
-            execute_delete_journal(dest, &mut plan.journal, backup.as_ref(), &mut stats).await?;
+            execute_delete_journal(
+                dest,
+                &mut plan.journal,
+                backup.as_ref(),
+                &mut stats,
+                &reporter,
+            )
+            .await?;
         }
     }
 
     stats.duration = started.elapsed();
+    reporter.finish(
+        &crate::sync::output::SummaryCounts {
+            files_created: stats.files_created,
+            files_updated: stats.files_updated,
+            files_skipped: stats.files_skipped,
+            files_deleted: stats.files_deleted,
+            bytes_transferred: stats.bytes_transferred,
+            duration_secs: stats.duration.as_secs_f64(),
+            files_verified: stats.files_verified as u64,
+            verification_failures: stats.verification_failures,
+        },
+        crate::sync::output::SyncTimings {
+            scan: Duration::ZERO,
+            transfer: run_started.elapsed(),
+        },
+    );
     Ok(stats)
 }
 
@@ -198,6 +230,7 @@ async fn plan_matched(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn queue_operation(
     source_endpoint: &dyn Endpoint,
     config: &SyncConfig,
@@ -206,9 +239,11 @@ async fn queue_operation(
     batch_size: usize,
     executor: &TaskExecutor<'_>,
     stats: &mut SyncStats,
+    reporter: &SyncReporter,
 ) -> Result<()> {
     if let SyncOp::Skip { source, reason } = &operation {
         if *reason == SkipReason::Unchanged && !source.is_directory() {
+            reporter.skipped(source.path.as_path(), "up_to_date");
             remove_skipped_source_after_parity(source_endpoint.root(), config, source).await?;
             stats.files_skipped += 1;
             return Ok(());
@@ -745,6 +780,7 @@ async fn execute_delete_journal(
     journal: &mut DeleteJournalReader,
     backup: Option<&BackupConfig>,
     stats: &mut SyncStats,
+    reporter: &SyncReporter,
 ) -> Result<()> {
     let mut protected_dirs = Vec::<PathBuf>::new();
 
@@ -768,6 +804,7 @@ async fn execute_delete_journal(
                     // removed.
                     match dest.remove(&record.path, false).await {
                         Ok(()) => {
+                            reporter.deleted(ItemizeKind::Directory, &record.path);
                             stats.files_deleted += 1;
                         }
                         Err(SyncError::Io(ref io))
@@ -793,8 +830,13 @@ async fn execute_delete_journal(
                     // Symlinks are removed without a backup: a backup copies
                     // regular-file bytes, and a dangling or escaped target
                     // must not be resolved.
+                    let metadata = dest.metadata(&record.path).await?;
+                    let kind = if metadata.is_symlink {
+                        ItemizeKind::Symlink
+                    } else {
+                        ItemizeKind::File
+                    };
                     if let Some(backup) = backup {
-                        let metadata = dest.metadata(&record.path).await?;
                         if !metadata.is_symlink {
                             let backup_path = backup.destination_path(&record.path)?;
                             let backup_parent = backup_path
@@ -816,6 +858,7 @@ async fn execute_delete_journal(
                         }
                     }
                     dest.remove(&record.path, false).await?;
+                    reporter.deleted(kind, &record.path);
                     stats.files_deleted += 1;
                 }
             }
