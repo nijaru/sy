@@ -1,7 +1,7 @@
 # sy
 
 > [!WARNING]
-> Under active development. Expect breaking changes.
+> Under active development.
 
 [![CI](https://github.com/nijaru/sy/actions/workflows/ci.yml/badge.svg)](https://github.com/nijaru/sy/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
