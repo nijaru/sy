@@ -432,6 +432,22 @@ fn configure_streaming(
 }
 
 fn streaming_stats(stats: crate::streaming::SyncStats, duration: std::time::Duration) -> SyncStats {
+    // v2's wire stats cannot distinguish create from update (files_ok covers
+    // both), so they are reported under created rather than fabricated
+    // update counts. Failed transfers (files_err) are surfaced as errors —
+    // the v2 stack is fail-fast per file, so >0 means the run aborted early
+    // or the counter was left non-zero by a partial batch.
+    let mut errors = Vec::new();
+    if stats.files_err > 0 {
+        errors.push(crate::sync::stats::SyncError {
+            path: PathBuf::new(),
+            error: format!(
+                "legacy streaming stack reported {} failed transfer(s)",
+                stats.files_err
+            ),
+            action: "transfer".to_string(),
+        });
+    }
     SyncStats {
         files_scanned: stats.files_scanned,
         files_created: stats.files_ok,
@@ -440,6 +456,7 @@ fn streaming_stats(stats: crate::streaming::SyncStats, duration: std::time::Dura
         delta_bytes_saved: stats.delta_bytes_saved,
         dirs_created: stats.dirs_created,
         symlinks_created: stats.symlinks_created,
+        errors,
         duration,
         ..Default::default()
     }

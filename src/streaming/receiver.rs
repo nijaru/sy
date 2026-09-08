@@ -526,10 +526,24 @@ impl Receiver {
     async fn handle_delete(&mut self, delete: Delete) -> Result<()> {
         let full_path = validate_path(&self.config.root, &delete.path)?;
 
+        // A failed removal is surfaced, not swallowed: counting a failed
+        // delete as deleted makes the summary lie about destination state.
+        // NotFound is tolerated (a prior delete of a parent may have removed
+        // it already); everything else aborts the sync.
         if delete.is_dir {
-            let _ = fs::remove_dir_all(&full_path).await;
-        } else {
-            let _ = fs::remove_file(&full_path).await;
+            if let Err(error) = fs::remove_dir_all(&full_path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "failed to delete directory {}",
+                        full_path.display()
+                    )));
+                }
+            }
+        } else if let Err(error) = fs::remove_file(&full_path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to delete file {}", full_path.display())));
+            }
         }
 
         self.stats.deleted += 1;
