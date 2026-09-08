@@ -460,6 +460,41 @@ impl Cli {
             anyhow::bail!("--diff requires --dry-run (it details planned changes only)");
         }
 
+        // Pull (remote source -> local destination) still runs the legacy v2
+        // stack, which cannot honor several mutating/output flags. Reject them
+        // up front rather than silently ignoring them mid-sync. The v3 pull
+        // path (in development) lifts these restrictions.
+        if let (Some(source), Some(dest)) = (&self.source, &self.destination) {
+            if source.is_remote() && dest.is_local() {
+                if self.delete {
+                    anyhow::bail!(
+                        "--delete is not yet supported for remote->local pulls: the legacy \
+                         transport interleaves deletions with a partial source scan instead of \
+                         gating them on a complete scan. This will be supported once the v3 \
+                         engine handles pulls; refusing beats risking destination data."
+                    );
+                }
+                let unsupported = [
+                    (self.backup.is_some(), "--backup"),
+                    (self.backup_dir.is_some(), "--backup-dir"),
+                    (self.remove_source_files, "--remove-source-files"),
+                    (self.itemize_changes, "--itemize-changes"),
+                    (self.json, "--json"),
+                    (self.perf, "--perf"),
+                    (self.timeout.is_some(), "--timeout"),
+                ];
+                for (enabled, flag) in unsupported {
+                    if enabled {
+                        anyhow::bail!(
+                            "{flag} is not yet supported for remote->local pulls (legacy \
+                             transport path); it is silently ignored there today, so it is \
+                             rejected instead. The v3 engine will lift this."
+                        );
+                    }
+                }
+            }
+        }
+
         // Validate size filters first (independent of source path)
         if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
             if min > max {
@@ -919,6 +954,38 @@ mod tests {
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
         assert!(cli.is_single_file());
+    }
+
+    #[test]
+    fn test_validate_pull_rejects_delete() {
+        // remote source -> local destination with --delete must be refused
+        // before any connection: the legacy pull transport authorizes
+        // deletions from a partial source scan.
+        let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", "--delete"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_pull_rejects_unsupported_output_and_safety_flags() {
+        for flag in [
+            "--backup",
+            "--backup-dir=/tmp/b",
+            "--remove-source-files",
+            "--itemize-changes",
+            "--json",
+            "--perf",
+            "--timeout=30",
+        ] {
+            let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", flag]);
+            assert!(cli.validate().is_err(), "pull must reject {flag}");
+        }
+    }
+
+    #[test]
+    fn test_validate_pull_accepts_supported_flags() {
+        // The same flags stay valid on local->local syncs and plain pulls.
+        let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst"]);
+        assert!(cli.validate().is_ok());
     }
 
     #[test]
