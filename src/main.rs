@@ -411,7 +411,6 @@ Or install from local source with: cargo install --path . --features acl"#
         },
         quiet: cli.quiet || cli.json,
         max_concurrent: cli.parallel,
-        max_errors: cli.max_errors,
         min_size: cli.min_size,
         max_size: cli.max_size,
         filter_engine,
