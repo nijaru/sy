@@ -10,6 +10,7 @@ pub mod session;
 pub mod stats;
 pub mod strategy;
 pub mod transfer;
+mod v3_local;
 #[cfg(feature = "ssh")]
 mod v3_pull;
 mod v3_push;

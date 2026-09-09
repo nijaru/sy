@@ -133,7 +133,7 @@ impl SourceFilterSelection {
     }
 }
 
-fn filtered_source_stream(source: EntryStream, filter: FilterEngine) -> EntryStream {
+pub(super) fn filtered_source_stream(source: EntryStream, filter: FilterEngine) -> EntryStream {
     if filter.is_empty() {
         return source;
     }
