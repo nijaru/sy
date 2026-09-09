@@ -460,35 +460,39 @@ impl Cli {
             anyhow::bail!("--diff requires --dry-run (it details planned changes only)");
         }
 
-        // Pull (remote source -> local destination) still runs the legacy v2
-        // stack, which cannot honor several mutating/output flags. Reject them
-        // up front rather than silently ignoring them mid-sync. The v3 pull
-        // path (in development) lifts these restrictions.
+        // Pull (remote source -> local destination) runs on the v3 engine.
+        // Flags the v3 pull path does not implement yet are rejected up
+        // front rather than silently ignored mid-sync. Each of these has a
+        // concrete remaining design, not a legacy-transport excuse:
+        // - --delete needs remote ignore-scope evaluation so destination
+        //   counterparts of source-ignored files stay protected;
+        // - --remove-source-files needs confined server-side source removal;
+        // - --copy-links needs a confined remote follow-walk.
         if let (Some(source), Some(dest)) = (&self.source, &self.destination) {
             if source.is_remote() && dest.is_local() {
                 if self.delete {
                     anyhow::bail!(
-                        "--delete is not yet supported for remote->local pulls: the legacy \
-                         transport interleaves deletions with a partial source scan instead of \
-                         gating them on a complete scan. This will be supported once the v3 \
-                         engine handles pulls; refusing beats risking destination data."
+                        "--delete is not yet supported for remote->local pulls: the v3 \
+                         engine must evaluate the remote source's ignore rules for delete \
+                         protection before deletions can be authorized. Refusing beats \
+                         risking destination data."
                     );
                 }
                 let unsupported = [
-                    (self.backup.is_some(), "--backup"),
-                    (self.backup_dir.is_some(), "--backup-dir"),
                     (self.remove_source_files, "--remove-source-files"),
-                    (self.itemize_changes, "--itemize-changes"),
-                    (self.json, "--json"),
-                    (self.perf, "--perf"),
-                    (self.timeout.is_some(), "--timeout"),
+                    // Both routes into Follow mode need the confined remote
+                    // follow-walk design.
+                    (
+                        self.copy_links || self.links == SymlinkMode::Follow,
+                        "--copy-links/--links=follow",
+                    ),
                 ];
                 for (enabled, flag) in unsupported {
                     if enabled {
                         anyhow::bail!(
-                            "{flag} is not yet supported for remote->local pulls (legacy \
-                             transport path); it is silently ignored there today, so it is \
-                             rejected instead. The v3 engine will lift this."
+                            "{flag} is not yet supported for remote->local pulls on the v3 \
+                             engine; it would be silently ignored, so it is rejected \
+                             instead."
                         );
                     }
                 }
@@ -959,25 +963,35 @@ mod tests {
     #[test]
     fn test_validate_pull_rejects_delete() {
         // remote source -> local destination with --delete must be refused
-        // before any connection: the legacy pull transport authorizes
-        // deletions from a partial source scan.
+        // before any connection: v3 pull must evaluate the remote source's
+        // ignore rules for delete protection before deletions are authorized.
         let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", "--delete"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
-    fn test_validate_pull_rejects_unsupported_output_and_safety_flags() {
+    fn test_validate_pull_rejects_unimplemented_v3_flags() {
+        for flag in ["--remove-source-files", "--copy-links"] {
+            let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", flag]);
+            assert!(cli.validate().is_err(), "pull must reject {flag}");
+        }
+    }
+
+    #[test]
+    fn test_validate_pull_accepts_v3_supported_flags() {
+        // The v3 engine honors these on pulls now: backup, output options,
+        // and timeouts are real (not silent no-ops) on the pull path.
         for flag in [
             "--backup",
             "--backup-dir=/tmp/b",
-            "--remove-source-files",
             "--itemize-changes",
             "--json",
             "--perf",
             "--timeout=30",
+            "--compress",
         ] {
             let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", flag]);
-            assert!(cli.validate().is_err(), "pull must reject {flag}");
+            assert!(cli.validate().is_ok(), "pull must accept {flag}");
         }
     }
 

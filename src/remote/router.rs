@@ -643,6 +643,7 @@ fn is_stream_opening_kind(kind: FrameKind) -> bool {
         kind,
         FrameKind::ScanRequest
             | FrameKind::HashRequest
+            | FrameKind::FileFetchRequest
             | FrameKind::SignatureRequest
             | FrameKind::FileBegin
             | FrameKind::Metadata

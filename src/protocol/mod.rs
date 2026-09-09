@@ -1,5 +1,6 @@
 mod codec;
 mod entry;
+mod fetch;
 mod frame;
 mod handshake;
 mod hash;
@@ -12,6 +13,7 @@ mod signature;
 mod transfer;
 
 pub use entry::{WireEntry, WireEntryKind};
+pub use fetch::WireFileFetchRequest;
 pub use frame::{
     read_frame, read_frame_or_eof, write_frame, Frame, FrameFlags, FrameKind, ReadFrame, StreamId,
     MAX_FRAME_PAYLOAD,

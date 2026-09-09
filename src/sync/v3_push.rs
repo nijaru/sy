@@ -86,7 +86,10 @@ pub(super) async fn run(
     Ok(stats)
 }
 
-fn resolve_v3_ssh_config(host: &str, user: &Option<String>) -> Result<sy::ssh::config::SshConfig> {
+pub(super) fn resolve_v3_ssh_config(
+    host: &str,
+    user: &Option<String>,
+) -> Result<sy::ssh::config::SshConfig> {
     if let Some(user) = user {
         Ok(sy::ssh::config::SshConfig {
             hostname: host.to_string(),
@@ -331,7 +334,7 @@ async fn execute_with_handle(
     Ok(stats)
 }
 
-fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
+pub(super) fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: scan_options.respect_gitignore,
         include_git_dir: scan_options.include_git_dir,
@@ -343,7 +346,7 @@ fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRe
     }
 }
 
-fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
+pub(super) fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
     ScanRequest {
         respect_gitignore: false,
         include_git_dir: true,
@@ -353,7 +356,7 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
     }
 }
 
-fn metadata_request(config: &SyncConfig) -> EntryMetadataRequest {
+pub(super) fn metadata_request(config: &SyncConfig) -> EntryMetadataRequest {
     EntryMetadataRequest {
         unix_mode: true,
         symlink_target: true,
@@ -362,15 +365,15 @@ fn metadata_request(config: &SyncConfig) -> EntryMetadataRequest {
     }
 }
 
-fn selection_max_depth(config: &SyncConfig, scan_options: ScanOptions) -> Option<usize> {
+pub(super) fn selection_max_depth(config: &SyncConfig, scan_options: ScanOptions) -> Option<usize> {
     (config.dirs || scan_options.dirs_only).then_some(1)
 }
 
-fn entry_in_depth_scope(entry: &Entry, max_depth: Option<usize>) -> bool {
+pub(super) fn entry_in_depth_scope(entry: &Entry, max_depth: Option<usize>) -> bool {
     max_depth.is_none_or(|depth| entry.path.as_path().components().count() <= depth)
 }
 
-fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
+pub(super) fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
     include_git_dir
         || !entry
             .path
@@ -386,14 +389,14 @@ fn entry_in_vcs_scope(entry: &Entry, include_git_dir: bool) -> bool {
 /// --links=skip: symlinks are excluded from transfer selection but remain
 /// in the reconciliation stream, so their destination counterparts keep
 /// delete protection (selection must never narrow deletion scope).
-fn entry_selected_by_symlink_mode(entry: &Entry, skip_symlinks: bool) -> bool {
+pub(super) fn entry_selected_by_symlink_mode(entry: &Entry, skip_symlinks: bool) -> bool {
     if skip_symlinks && entry.kind == sy::engine::domain::EntryKind::Symlink {
         return false;
     }
     true
 }
 
-fn entry_not_source_ignored(
+pub(super) fn entry_not_source_ignored(
     scope: &std::sync::Arc<std::sync::Mutex<sy::engine::ignore_scope::SourceIgnoreScope>>,
     entry: &Entry,
 ) -> bool {
@@ -405,7 +408,11 @@ fn entry_not_source_ignored(
     !scope.protects(entry)
 }
 
-fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u64>) -> bool {
+pub(super) fn entry_in_size_scope(
+    entry: &Entry,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+) -> bool {
     if entry.is_directory() {
         return true;
     }
@@ -417,7 +424,7 @@ fn entry_in_size_scope(entry: &Entry, min_size: Option<u64>, max_size: Option<u6
 /// default (`never`) disables compression; `always` compresses every chunk;
 /// `auto`/extension sample the first chunk and let the wall-clock model
 /// decide (extension-only detection has no separate 0.5 meaning).
-fn compression_policy(config: &SyncConfig) -> Option<CompressionPolicy> {
+pub(super) fn compression_policy(config: &SyncConfig) -> Option<CompressionPolicy> {
     match config.compression_detection {
         CompressionDetection::Never => None,
         CompressionDetection::Auto | CompressionDetection::Extension => {
@@ -427,7 +434,7 @@ fn compression_policy(config: &SyncConfig) -> Option<CompressionPolicy> {
     }
 }
 
-fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
+pub(super) fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
     let mode = if config.comparison.checksum {
         ComparisonMode::Checksum
     } else if config.comparison.ignore_times {
@@ -447,7 +454,7 @@ fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
     }
 }
 
-fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
+pub(super) fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
     match mode {
         DeleteMode::Disabled => None,
         DeleteMode::Enabled { limit, force } => Some(DeletePolicy {
@@ -463,7 +470,7 @@ fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
 /// `tracing::info!` keeps the channel consistent with the rest of the sync
 /// log: default verbosity hides it (WARN floor), `-v` shows it, and `--quiet`
 /// or `--json` silences it at the subscriber.
-fn emit_diff_line(item: PreviewOp<'_>) {
+pub(super) fn emit_diff_line(item: PreviewOp<'_>) {
     match item {
         PreviewOp::Operation(SyncOp::Create { source }) => match source.kind {
             EntryKind::File => tracing::info!(
@@ -502,7 +509,7 @@ fn emit_diff_line(item: PreviewOp<'_>) {
     }
 }
 
-fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
+pub(super) fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
     Ok(SyncStats {
         files_scanned: preview.planned_operations,
         files_created: preview.files_created,
@@ -517,7 +524,7 @@ fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
     })
 }
 
-fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
+pub(super) fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
     Ok(SyncStats {
         files_scanned: summary.planned_operations,
         files_created: summary.files_created,
@@ -533,13 +540,13 @@ fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
     })
 }
 
-fn to_usize(value: u64, counter: &'static str) -> Result<usize> {
+pub(super) fn to_usize(value: u64, counter: &'static str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         SyncError::Config(format!("v3 {counter} counter exceeds platform usize range"))
     })
 }
 
-fn map_controller_error(error: RemotePushControllerError) -> SyncError {
+pub(super) fn map_controller_error(error: RemotePushControllerError) -> SyncError {
     if let RemotePushControllerError::DeletePlan(DeletePlanError::ThresholdExceeded {
         eligible_destination_entries,
         delete_candidates,
@@ -569,7 +576,7 @@ fn map_controller_error(error: RemotePushControllerError) -> SyncError {
     map_io(error)
 }
 
-fn map_io(error: impl std::fmt::Display) -> SyncError {
+pub(super) fn map_io(error: impl std::fmt::Display) -> SyncError {
     SyncError::Io(std::io::Error::other(error.to_string()))
 }
 

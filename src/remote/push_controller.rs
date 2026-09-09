@@ -1,3 +1,4 @@
+use crate::engine::delete_plan::DeleteAction;
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, SkipReason, SyncOp};
 use crate::engine::finalize_journal::{
@@ -8,10 +9,9 @@ use crate::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonPolicy, PlanDecision,
 };
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
-use crate::remote::push::{
-    lower_sync_op, RemotePushAction, RemotePushError, RemotePushExecutor, RemotePushLowerError,
-    RemotePushPolicy,
-};
+use crate::engine::scheduler::ResourceRequest;
+use crate::engine::work::WorkItem;
+use crate::remote::push::{RemotePushError, RemotePushLowerError, RemotePushPolicy};
 use crate::remote::transfer::TransferSummary;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -327,20 +327,67 @@ pub struct RemotePushSummary {
     pub reused_bytes: u64,
 }
 
-/// Executes one preflighted v3 push with bounded task fan-out.
+/// Executor interface shared by every v3 direction. The controller owns the
+/// safety ordering — preorder directories, bounded concurrent leaves,
+/// reverse-order deletes, reverse-order finalize — and executors own
+/// per-item admission and the concrete mutation/fetch. `remove_verified_-
+/// parity_source` is push-only (`--remove-source-files` removes the local
+/// source after commit); pulls have no local source to remove, so the
+/// default is a no-op.
+pub trait SyncPlanExecutor: Send + Sync + 'static {
+    type Action: Send + 'static;
+    type Error: std::fmt::Display + Send + 'static;
+
+    fn lower(
+        &self,
+        op: SyncOp,
+        policy: RemotePushPolicy,
+    ) -> std::result::Result<LoweredSyncWork<Self::Action>, Self::Error>;
+    fn is_directory_action(&self, action: &Self::Action) -> bool;
+    fn is_leaf_action(&self, action: &Self::Action) -> bool;
+    fn leaf_resources(&self, action: &Self::Action) -> ResourceRequest;
+    fn execute(
+        &self,
+        item: WorkItem<Self::Action>,
+    ) -> impl Future<Output = std::result::Result<Option<TransferSummary>, Self::Error>> + Send;
+    fn execute_delete(
+        &self,
+        action: DeleteAction,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+    fn execute_finalize(
+        &self,
+        metadata: FinalizeMetadata,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+    fn remove_verified_parity_source(
+        &self,
+        source: &Entry,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+
+    fn on_execute_error(&self, error: &Self::Error) -> RemotePushControllerError;
+}
+
+/// The lowered work shape shared by every direction: an optional main
+/// action and an optional finalize action.
+#[derive(Debug, Default)]
+pub struct LoweredSyncWork<A> {
+    pub main: Option<WorkItem<A>>,
+    pub finalize: Option<WorkItem<A>>,
+}
+
+/// Executes one preflighted v3 sync with bounded task fan-out.
 ///
 /// Directory creation is awaited in preorder before reconciliation advances to
 /// descendants. Independent leaf work may run concurrently, but at most
 /// `max_in_flight` worker futures exist even before scheduler admission. All
 /// directory metadata is preflighted into a reverse journal and replayed
 /// child-before-parent only after main work and reverse deletes complete.
-pub struct RemotePushController {
-    executor: Arc<RemotePushExecutor>,
+pub struct RemotePushController<E: SyncPlanExecutor> {
+    executor: Arc<E>,
     max_in_flight: NonZeroUsize,
 }
 
-impl RemotePushController {
-    pub fn new(executor: RemotePushExecutor, max_in_flight: NonZeroUsize) -> Self {
+impl<E: SyncPlanExecutor> RemotePushController<E> {
+    pub fn new(executor: E, max_in_flight: NonZeroUsize) -> Self {
         Self {
             executor: Arc::new(executor),
             max_in_flight,
@@ -361,46 +408,70 @@ impl RemotePushController {
             delete_candidates,
             ..RemotePushSummary::default()
         };
-        let mut workers = JoinSet::new();
+        let mut workers = JoinSet::<std::result::Result<Option<TransferSummary>, E::Error>>::new();
 
         while let Some(operation) = reader.next().await? {
             record_semantic_operation(&mut summary, &operation)?;
             if let Some(source) = removable_skip_source(&operation) {
-                self.executor.remove_verified_parity_source(source).await?;
+                self.executor
+                    .remove_verified_parity_source(source)
+                    .await
+                    .map_err(|error| self.executor.on_execute_error(&error))?;
                 continue;
             }
-            let Some(main) = lower_sync_op(operation, execution_policy)?.main else {
+            let lowered = self
+                .executor
+                .lower(operation, execution_policy)
+                .map_err(|error| self.executor.on_execute_error(&error))?;
+            // Finalize metadata is journal-owned: preflight appends every
+            // directory's mode/mtime to the finalize journal and the replay
+            // below applies it child-before-parent AFTER deletes. The
+            // lowered finalize field documents the shape but is not
+            // executed here — running it inline would race the delete
+            // phase (a parent's restored mode must not precede child
+            // deletions) and double the requests.
+            let Some(main) = lowered.main else {
                 continue;
             };
             summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
 
-            if matches!(main.action(), RemotePushAction::CreateDirectory { .. }) {
-                let result = self.executor.execute(main).await?;
+            if self.executor.is_directory_action(main.action()) {
+                let result = self
+                    .executor
+                    .execute(main)
+                    .await
+                    .map_err(|error| self.executor.on_execute_error(&error))?;
                 record_transfer(&mut summary, result)?;
                 continue;
             }
 
             while workers.len() >= self.max_in_flight.get() {
-                collect_one(&mut workers, &mut summary).await?;
+                collect_one::<E>(&mut workers, &mut summary).await?;
             }
             let executor = Arc::clone(&self.executor);
             workers.spawn(async move { executor.execute(main).await });
         }
 
         while !workers.is_empty() {
-            collect_one(&mut workers, &mut summary).await?;
+            collect_one::<E>(&mut workers, &mut summary).await?;
         }
 
         if let Some(delete) = delete {
             let mut replay = delete.into_replay();
             while let Some(action) = replay.next_action().await? {
-                self.executor.execute_delete(action).await?;
+                self.executor
+                    .execute_delete(action)
+                    .await
+                    .map_err(|error| self.executor.on_execute_error(&error))?;
                 summary.deleted_entries = checked_add(summary.deleted_entries, 1, "deleted entry")?;
             }
         }
 
         while let Some(metadata) = finalize.next().await? {
-            self.executor.execute_finalize(metadata).await?;
+            self.executor
+                .execute_finalize(metadata)
+                .await
+                .map_err(|error| self.executor.on_execute_error(&error))?;
             summary.finalized_metadata =
                 checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
         }
@@ -458,16 +529,19 @@ fn directory_finalize_metadata(
         modified,
     }))
 }
-async fn collect_one(
-    workers: &mut JoinSet<std::result::Result<Option<TransferSummary>, RemotePushError>>,
+async fn collect_one<E: SyncPlanExecutor>(
+    workers: &mut JoinSet<std::result::Result<Option<TransferSummary>, E::Error>>,
     summary: &mut RemotePushSummary,
 ) -> Result<()> {
     let result = workers
         .join_next()
         .await
         .ok_or_else(|| RemotePushControllerError::Worker("worker set ended early".to_string()))?
-        .map_err(|error| RemotePushControllerError::Worker(error.to_string()))??;
-    record_transfer(summary, result)
+        .map_err(|error| RemotePushControllerError::Worker(error.to_string()))?;
+    match result {
+        Ok(summary_item) => record_transfer(summary, summary_item),
+        Err(error) => Err(RemotePushControllerError::Worker(error.to_string())),
+    }
 }
 
 fn record_transfer(
@@ -594,6 +668,8 @@ fn removable_skip_source(operation: &SyncOp) -> Option<&Entry> {
 
 #[cfg(test)]
 mod tests {
+    use crate::remote::push::RemotePushExecutor;
+
     use super::*;
     use crate::engine::delete_plan::DeleteLimit;
     use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
@@ -963,6 +1039,7 @@ mod tests {
                         metadata_handler.serve(incoming).await.unwrap();
                     }
                     IncomingRequest::Hash(_) => panic!("unexpected hash request"),
+                    IncomingRequest::FileFetch(_) => panic!("unexpected fetch request"),
                     IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
                 }
             }
