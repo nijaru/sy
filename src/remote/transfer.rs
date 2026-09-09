@@ -16,7 +16,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-const PRODUCER_QUEUE_DEPTH: usize = 8;
+pub(crate) const PRODUCER_QUEUE_DEPTH: usize = 8;
 const RECONSTRUCTION_QUEUE_DEPTH: usize = 8;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -154,6 +154,12 @@ pub enum RemoteTransferError {
 
     #[error("file-transfer byte count overflow")]
     ByteCountOverflow,
+
+    #[error("pulled source digest mismatch: server reported {expected:02x?}, staged bytes hash to {actual:02x?}")]
+    FetchDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl From<SharedRouterError> for RemoteTransferError {
@@ -164,7 +170,7 @@ impl From<SharedRouterError> for RemoteTransferError {
 
 pub type Result<T> = std::result::Result<T, RemoteTransferError>;
 
-enum ProducerItem {
+pub(crate) enum ProducerItem {
     Data(Bytes),
     /// Compressed with zstd level `ZSTD_FAST_LEVEL`; the frame loop must set
     /// `FrameFlags::COMPRESSED` so the receiver knows to decompress.
@@ -515,7 +521,7 @@ fn compress_chunk(bytes: &[u8]) -> Result<Bytes> {
     Ok(Bytes::from(compressed))
 }
 
-fn produce_whole(
+pub(crate) fn produce_whole(
     file: &mut File,
     sender: mpsc::Sender<ProducerItem>,
     compression: Option<&crate::engine::compression::CompressionPolicy>,
@@ -761,7 +767,11 @@ fn checked_output_size(current: u64, added: usize, expected_size: u64) -> Result
     Ok(next)
 }
 
-fn validate_source(file: &File, expected: EntryIdentity, expected_size: u64) -> Result<()> {
+pub(crate) fn validate_source(
+    file: &File,
+    expected: EntryIdentity,
+    expected_size: u64,
+) -> Result<()> {
     let metadata = file.metadata()?;
     let identity = opened_identity(&metadata)?;
     if metadata.len() != expected_size || identity != expected {
@@ -790,7 +800,7 @@ fn opened_identity(metadata: &std::fs::Metadata) -> Result<EntryIdentity> {
         .ok_or(RemoteTransferError::MissingOpenedIdentity)
 }
 
-async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
+pub(crate) async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
     let routed = inbox
         .recv()
         .await?

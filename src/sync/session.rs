@@ -316,28 +316,51 @@ impl SyncSession {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
             _ => return Err(SyncError::Config("source must be SSH for pull".to_string())),
         };
-        let started = Instant::now();
-        let ssh_config = resolve_ssh_config(host, user)?;
-        let server_session =
-            crate::transport::server::ServerSession::connect_ssh(&ssh_config, source_root)
+        // The v3 engine serves every pull; CLI validation rejects flags the
+        // v3 pull path does not implement. The session check is the second
+        // gate: a programmatically-built config that skips validation gets
+        // a loud error, never a silent v2 fallback (the v2 stack is
+        // condemned and unreachable here once item 7 removes it).
+        #[cfg(feature = "ssh")]
+        {
+            if let Some(reason) = super::v3_pull::legacy_fallback_reason(&self.config) {
+                return Err(SyncError::Config(reason.to_string()));
+            }
+            super::v3_pull::run(
+                &source_root.to_string_lossy(),
+                self.dest.root(),
+                host,
+                user,
+                &self.config,
+                self.scan_options,
+            )
+            .await
+        }
+        #[cfg(not(feature = "ssh"))]
+        {
+            let started = Instant::now();
+            let ssh_config = resolve_ssh_config(host, user)?;
+            let server_session =
+                crate::transport::server::ServerSession::connect_ssh(&ssh_config, source_root)
+                    .await
+                    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            let (mut stdin, mut stdout) = server_session.split();
+            let mut streaming = crate::streaming::StreamingSync::new(
+                self.dest.root().to_path_buf(),
+                source_root.clone(),
+                self.config.delete.is_enabled(),
+                self.config.compression_detection,
+            )
+            .with_filter(self.config.filter_engine.clone())
+            .with_dry_run(self.config.dry_run)
+            .with_scan_options(self.scan_options);
+            streaming = configure_streaming(streaming, &self.config);
+            let stats = streaming
+                .pull(&mut stdout, &mut stdin)
                 .await
                 .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        let (mut stdin, mut stdout) = server_session.split();
-        let mut streaming = crate::streaming::StreamingSync::new(
-            self.dest.root().to_path_buf(),
-            source_root.clone(),
-            self.config.delete.is_enabled(),
-            self.config.compression_detection,
-        )
-        .with_filter(self.config.filter_engine.clone())
-        .with_dry_run(self.config.dry_run)
-        .with_scan_options(self.scan_options);
-        streaming = configure_streaming(streaming, &self.config);
-        let stats = streaming
-            .pull(&mut stdout, &mut stdin)
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(streaming_stats(stats, started.elapsed()))
+            Ok(streaming_stats(stats, started.elapsed()))
+        }
     }
 }
 

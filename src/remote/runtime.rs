@@ -349,6 +349,7 @@ pub enum IncomingRequest {
     Hash(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
+    FileFetch(IncomingStream),
     Metadata(IncomingStream),
     Mutation(IncomingStream),
 }
@@ -487,6 +488,11 @@ impl ServerRemoteSession {
         }
     }
 
+    /// The pinned session root for pull-side source handlers (file fetch).
+    pub fn scan_handler_rooted(&self) -> crate::rooted_fs::RootedFs {
+        self.opened.rooted.clone()
+    }
+
     pub fn hash_handler(&self) -> ServerHashHandler {
         ServerHashHandler {
             rooted: self.opened.rooted.clone(),
@@ -536,6 +542,9 @@ impl ServerRemoteSession {
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
+            FrameKind::FileFetchRequest if self.opened.operation == Operation::Pull => {
+                Ok(Some(IncomingRequest::FileFetch(incoming)))
+            }
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
             }
@@ -551,6 +560,10 @@ impl ServerRemoteSession {
                     kind: incoming.first.frame().kind(),
                 })
             }
+            FrameKind::FileFetchRequest => Err(RemoteSessionError::OperationMismatch {
+                operation: self.opened.operation,
+                kind: incoming.first.frame().kind(),
+            }),
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
         }
     }
@@ -714,6 +727,7 @@ mod tests {
                     }
                     IncomingRequest::Hash(_)
                     | IncomingRequest::File(_)
+                    | IncomingRequest::FileFetch(_)
                     | IncomingRequest::Metadata(_)
                     | IncomingRequest::Mutation(_) => {
                         panic!("unexpected mutation request")

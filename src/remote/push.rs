@@ -87,6 +87,9 @@ pub enum RemotePushError {
 
     #[error("--backup location for {0} is not representable beneath the destination root")]
     InvalidBackupPath(PathBuf),
+
+    #[error(transparent)]
+    Lower(#[from] RemotePushLowerError),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -345,7 +348,7 @@ pub struct RemoteBackupPlan {
 
 impl RemoteBackupPlan {
     /// Backup location for one destination path (root-relative).
-    fn destination(
+    pub(crate) fn destination(
         &self,
         path: &crate::engine::domain::RelativePath,
     ) -> Option<crate::engine::domain::RelativePath> {
@@ -395,6 +398,96 @@ pub struct RemotePushExecutor {
     compression: Option<CompressionPolicy>,
     /// Per-operation output (`-i`/`--json`). `None` prints nothing.
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
+}
+
+impl crate::remote::push_controller::SyncPlanExecutor for RemotePushExecutor {
+    type Action = RemotePushAction;
+    type Error = RemotePushError;
+
+    fn lower(
+        &self,
+        op: crate::engine::domain::SyncOp,
+        policy: RemotePushPolicy,
+    ) -> std::result::Result<
+        crate::remote::push_controller::LoweredSyncWork<RemotePushAction>,
+        RemotePushError,
+    > {
+        let lowered = lower_sync_op(op, policy)?;
+        Ok(crate::remote::push_controller::LoweredSyncWork {
+            main: lowered.main,
+            finalize: lowered.finalize,
+        })
+    }
+
+    fn is_directory_action(&self, action: &RemotePushAction) -> bool {
+        matches!(action, RemotePushAction::CreateDirectory { .. })
+    }
+
+    fn is_leaf_action(&self, _action: &RemotePushAction) -> bool {
+        true
+    }
+
+    fn leaf_resources(
+        &self,
+        action: &RemotePushAction,
+    ) -> crate::engine::scheduler::ResourceRequest {
+        match action {
+            RemotePushAction::CreateDirectory { .. }
+            | RemotePushAction::ApplyMetadata { .. }
+            | RemotePushAction::ReplaceSymlink { .. } => {
+                crate::engine::scheduler::ResourceRequest {
+                    active_files: 0,
+                    buffered_bytes: 0,
+                    metadata_ops: 1,
+                    cpu_tasks: 0,
+                    network_writes: 1,
+                }
+            }
+            RemotePushAction::TransferFile { .. } => crate::engine::scheduler::ResourceRequest {
+                active_files: 1,
+                buffered_bytes: crate::remote::push::REMOTE_FILE_WORKING_SET,
+                metadata_ops: 0,
+                cpu_tasks: 1,
+                network_writes: 1,
+            },
+        }
+    }
+
+    async fn execute(
+        &self,
+        item: crate::engine::work::WorkItem<RemotePushAction>,
+    ) -> std::result::Result<Option<crate::remote::transfer::TransferSummary>, RemotePushError>
+    {
+        RemotePushExecutor::execute(self, item).await
+    }
+
+    async fn execute_delete(
+        &self,
+        action: crate::engine::delete_plan::DeleteAction,
+    ) -> std::result::Result<(), RemotePushError> {
+        RemotePushExecutor::execute_delete(self, action).await
+    }
+
+    async fn execute_finalize(
+        &self,
+        metadata: crate::engine::finalize_journal::FinalizeMetadata,
+    ) -> std::result::Result<(), RemotePushError> {
+        RemotePushExecutor::execute_finalize(self, metadata).await
+    }
+
+    async fn remove_verified_parity_source(
+        &self,
+        source: &crate::engine::domain::Entry,
+    ) -> std::result::Result<(), RemotePushError> {
+        RemotePushExecutor::remove_verified_parity_source(self, source).await
+    }
+
+    fn on_execute_error(
+        &self,
+        error: &RemotePushError,
+    ) -> crate::remote::push_controller::RemotePushControllerError {
+        crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
+    }
 }
 
 impl RemotePushExecutor {

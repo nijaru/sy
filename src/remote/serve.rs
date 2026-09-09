@@ -1,3 +1,4 @@
+use crate::remote::fetch::serve_incoming_file_fetch;
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
     IncomingRequest, RemoteSessionError, ServerFileHandler, ServerHashHandler,
@@ -31,6 +32,17 @@ struct RequestHandlers {
     file: ServerFileHandler,
     metadata: ServerMetadataHandler,
     mutation: ServerMutationHandler,
+    fetch: ServerFetchHandler,
+}
+
+/// Pull-session whole-file source producer. The compression policy mirrors
+/// the push direction: the client sets `-z`/`--compress`, and per-chunk
+/// zstd applies only when both sides negotiated the ZSTD capability.
+#[derive(Clone)]
+pub struct ServerFetchHandler {
+    rooted: crate::rooted_fs::RootedFs,
+    sender: crate::remote::router::RouterSender,
+    peer: crate::protocol::PlatformOs,
 }
 
 /// Serve one negotiated v3 transport with bounded request-task ownership.
@@ -53,6 +65,7 @@ where
         file: session.file_handler(),
         metadata: session.metadata_handler(),
         mutation: session.mutation_handler(),
+        fetch: fetch_handler(&session),
     };
     let mut tasks = JoinSet::<RequestResult>::new();
     let mut accepting = true;
@@ -96,6 +109,18 @@ pub async fn run_stdio() -> Result<()> {
         RouterConfig::default(),
     )
     .await
+}
+
+/// The per-request compression bit (from the fetch request) selects zstd; the
+/// ZSTD capability was negotiated at handshake, so a client requesting
+/// compression with a peer lacking it is rejected loudly on the client side
+/// before any request is sent.
+fn fetch_handler(session: &ServerRemoteSession) -> ServerFetchHandler {
+    ServerFetchHandler {
+        rooted: session.scan_handler_rooted(),
+        sender: session.sender(),
+        peer: session.client().platform.os,
+    }
 }
 
 fn spawn_request(
@@ -148,6 +173,20 @@ fn spawn_request(
                     .serve(incoming)
                     .await
                     .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::FileFetch(incoming) => {
+            let handler = handlers.fetch.clone();
+            tasks.spawn(async move {
+                serve_incoming_file_fetch(
+                    handler.rooted.clone(),
+                    incoming,
+                    &handler.sender,
+                    handler.peer,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
             });
         }
         IncomingRequest::Mutation(incoming) => {

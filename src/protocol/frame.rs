@@ -48,6 +48,7 @@ pub enum FrameKind {
     Mutation = 21,
     HashRequest = 22,
     HashResult = 23,
+    FileFetchRequest = 24,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -77,6 +78,7 @@ impl TryFrom<u8> for FrameKind {
             21 => Ok(Self::Mutation),
             22 => Ok(Self::HashRequest),
             23 => Ok(Self::HashResult),
+            24 => Ok(Self::FileFetchRequest),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }

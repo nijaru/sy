@@ -63,6 +63,12 @@ impl ClientRemoteHandle {
         self.ready
     }
 
+    /// The session's frame router sender. Executors open fetch streams
+    /// directly; request helpers wrap it for standard RPCs.
+    pub fn sender(&self) -> crate::remote::router::RouterSender {
+        self.sender.clone()
+    }
+
     pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
         request_scan(&self.sender, request, self.peer).await
     }

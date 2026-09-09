@@ -10,6 +10,8 @@ pub mod session;
 pub mod stats;
 pub mod strategy;
 pub mod transfer;
+#[cfg(feature = "ssh")]
+mod v3_pull;
 mod v3_push;
 #[cfg(feature = "watch")]
 #[cfg(feature = "watch")]
