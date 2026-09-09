@@ -121,14 +121,26 @@ impl SyncSession {
     }
 
     async fn direct_local(&self) -> Result<SyncStats> {
-        let source = self
-            .source
-            .as_endpoint()
-            .ok_or_else(|| SyncError::Config("source must be local for direct sync".to_string()))?;
-        let dest = self.dest.as_endpoint().ok_or_else(|| {
-            SyncError::Config("destination must be local for direct sync".to_string())
-        })?;
-        reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await
+        // The v3 controller pipeline is the default local path (item 6);
+        // the legacy batch executor remains only for the preservation
+        // cluster until preservation lands once on the unified executor.
+        if let Some(reason) = super::v3_local::legacy_fallback_reason(&self.config) {
+            tracing::debug!(reason, "using legacy local compatibility path");
+            let source = self.source.as_endpoint().ok_or_else(|| {
+                SyncError::Config("source must be local for direct sync".to_string())
+            })?;
+            let dest = self.dest.as_endpoint().ok_or_else(|| {
+                SyncError::Config("destination must be local for direct sync".to_string())
+            })?;
+            return reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await;
+        }
+        super::v3_local::run(
+            self.source.root(),
+            self.dest.root(),
+            &self.config,
+            self.scan_options,
+        )
+        .await
     }
 
     /// Verify local source and destination trees through the same strict,

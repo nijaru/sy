@@ -1,5 +1,6 @@
 pub mod fetch;
 pub mod hash;
+pub mod local_executor;
 pub mod path;
 pub mod pull;
 pub mod pull_lower;
