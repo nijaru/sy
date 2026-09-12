@@ -10,8 +10,7 @@ Read, in order:
 
 1. `docs/architecture-0.5.md` — canonical target architecture and invariants.
 2. `agent-context/ai/0.5-rewrite.md` — current rewrite state, known debt, and implementation order.
-3. `nijaru/dotfiles/dot_agents/skills/rust-expert/SKILL.md` — required Rust/systems guidance.
-4. `nijaru/dotfiles/dot_agents/skills/rust-cli/SKILL.md` when changing the CLI.
+3. `~/.agents/skills/rust-cli/SKILL.md` — usage-rs and CLI conventions when changing the CLI.
 
 If old code disagrees with the 0.5 architecture docs, the docs define the intended direction unless a new finding demonstrates a better design.
 
