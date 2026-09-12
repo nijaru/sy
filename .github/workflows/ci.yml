@@ -35,7 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+        # The runner image ships a third-party Chrome apt source whose mirror
+        # intermittently fails hash verification; it is irrelevant to this
+        # build, so it is removed before update to keep apt deterministic.
+        run: |
+          # glob without extension: the runner ships both .list and
+          # deb822 .sources forms depending on image generation
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update && sudo apt-get install -y libacl1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -80,7 +87,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+        # The runner image ships a third-party Chrome apt source whose mirror
+        # intermittently fails hash verification; it is irrelevant to this
+        # build, so it is removed before update to keep apt deterministic.
+        run: |
+          # glob without extension: the runner ships both .list and
+          # deb822 .sources forms depending on image generation
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update && sudo apt-get install -y libacl1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests

@@ -1,6 +1,6 @@
-//! Server mode — runs when invoked as `sy --server <path>`
+//! Server mode — runs when invoked as `sy --server <path>`.
 //!
-//! Uses streaming protocol (v2) for all operations.
+//! Uses the streaming protocol for all operations.
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
@@ -9,13 +9,12 @@ use tokio::sync::mpsc;
 
 use crate::compress::CompressionDetection;
 use crate::streaming::{
-    channel::file_job_channel,
+    channel::{file_job_channel, SENDER_CHANNEL_SIZE},
     protocol::{self as v2, HelloFlags, MessageType},
     Generator, GeneratorConfig, Receiver, ReceiverConfig, Sender, SenderConfig,
 };
 use crate::sync::scanner::ScanOptions;
 
-/// Expand tilde (~) in paths to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
 
@@ -32,14 +31,12 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 }
 
-/// Main server entry point
 pub async fn run_server() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let raw_path = args
         .last()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-
     let root_path = expand_tilde(&raw_path);
 
     if !root_path.exists() {
@@ -48,7 +45,6 @@ pub async fn run_server() -> Result<()> {
 
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
-
     let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
 
     if msg_type != MessageType::Hello {
@@ -62,9 +58,8 @@ pub async fn run_server() -> Result<()> {
     }
 
     let hello = v2::Hello::decode(payload)?;
-
-    let resp = v2::Hello::new(HelloFlags::empty(), "");
-    v2::write_frame(&mut stdout, &resp.encode()?).await?;
+    let response = v2::Hello::new(HelloFlags::empty(), "");
+    v2::write_frame(&mut stdout, &response.encode()?).await?;
     stdout.flush().await?;
 
     if hello.flags.contains(HelloFlags::PULL) {
@@ -74,7 +69,6 @@ pub async fn run_server() -> Result<()> {
     }
 }
 
-/// Handle PULL mode: client pulls files from server (we are source)
 async fn run_server_pull(
     hello: v2::Hello,
     root_path: PathBuf,
@@ -97,7 +91,6 @@ async fn run_server_pull(
 
     let (checksum, update_only, ignore_existing, ignore_times, size_only) =
         hello.comparison_flags_tuple();
-
     let mut generator = Generator::new(GeneratorConfig {
         root: root_path.clone(),
         include_hidden: true,
@@ -120,8 +113,7 @@ async fn run_server_pull(
         let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
         match msg_type {
             MessageType::DestFileEntry => {
-                let entry = v2::DestFileEntry::decode(payload)?;
-                generator.add_dest_entry(entry);
+                generator.add_dest_entry(v2::DestFileEntry::decode(payload)?);
             }
             MessageType::DestFileEnd => break,
             _ => anyhow::bail!("Unexpected message during Initial Exchange: {:?}", msg_type),
@@ -129,8 +121,7 @@ async fn run_server_pull(
     }
 
     let (tx, rx) = file_job_channel();
-    let gen_handle = tokio::spawn(async move { generator.run(tx).await });
-
+    let generator_handle = tokio::spawn(async move { generator.run(tx).await });
     let sender = Sender::new(SenderConfig {
         root: root_path,
         compress: if hello.flags.contains(HelloFlags::COMPRESSION) {
@@ -140,25 +131,15 @@ async fn run_server_pull(
         },
         bwlimit: None,
     });
-
-    // Unbounded channel: blocking_send panics inside tokio::spawn
-    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
-    let sender_handle = tokio::spawn(async move {
-        sender
-            .run(rx, |bytes| {
-                data_tx
-                    .send(bytes)
-                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
-            })
-            .await
-    });
+    let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(SENDER_CHANNEL_SIZE);
+    let sender_handle = tokio::spawn(async move { sender.run(rx, data_tx).await });
 
     while let Some(bytes) = data_rx.recv().await {
         v2::write_frame(&mut stdout, &bytes).await?;
     }
     stdout.flush().await?;
 
-    let (total_files, total_bytes, files_scanned) = gen_handle.await??;
+    let (total_files, total_bytes, files_scanned) = generator_handle.await??;
     sender_handle.await??;
 
     let done = v2::Done {
@@ -174,7 +155,6 @@ async fn run_server_pull(
     Ok(())
 }
 
-/// Handle PUSH mode: client pushes files to server (we are destination)
 async fn run_server_push(
     hello: v2::Hello,
     root_path: PathBuf,
@@ -188,8 +168,7 @@ async fn run_server_push(
         verify,
     });
 
-    // Unbounded channel: blocking_send panics inside tokio::spawn
-    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(SENDER_CHANNEL_SIZE);
     let receiver_root = root_path.clone();
     let scan_handle = tokio::spawn(async move {
         let receiver = Receiver::new(ReceiverConfig {
@@ -197,13 +176,7 @@ async fn run_server_push(
             block_size: 4096,
             verify,
         });
-        receiver
-            .scan_dest(|bytes| {
-                data_tx
-                    .send(bytes)
-                    .map_err(|_| anyhow::anyhow!("Data channel closed"))
-            })
-            .await
+        receiver.scan_dest(&data_tx).await
     });
 
     while let Some(bytes) = data_rx.recv().await {
@@ -214,11 +187,9 @@ async fn run_server_push(
 
     loop {
         let (msg_type, payload) = v2::read_frame(&mut stdin).await?;
-
         if msg_type == MessageType::Done {
             break;
         }
-
         receiver.handle_message(msg_type, payload).await?;
     }
 
@@ -227,7 +198,7 @@ async fn run_server_push(
         files_err: receiver.stats().files_err,
         bytes: receiver.stats().bytes_transferred,
         duration_ms: 0,
-        files_scanned: 0, // Client knows its own source count in push mode
+        files_scanned: 0,
     };
     v2::write_frame(&mut stdout, &done.encode()?).await?;
     stdout.flush().await?;

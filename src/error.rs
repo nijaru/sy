@@ -24,6 +24,11 @@ pub enum SyncError {
     #[error("Deletion threshold exceeded: {percentage:.1}% > {threshold}% (use --force-delete to override)")]
     DeletionThresholdExceeded { percentage: f64, threshold: u8 },
 
+    #[error(
+        "Deletion count limit exceeded: {delete_candidates} > {limit} (use --force-delete to override)"
+    )]
+    DeletionCountExceeded { delete_candidates: u64, limit: u64 },
+
     #[error("Failed to read directory: {path}\nCause: {source}\nCheck that the directory exists and you have read permissions.")]
     ReadDirError {
         path: PathBuf,

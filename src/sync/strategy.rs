@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-use super::checksumdb::ChecksumDatabase;
 use super::scanner::FileEntry;
-use crate::error::{Result, SyncError};
+use crate::error::Result;
 use crate::integrity::{Checksum, ChecksumType, IntegrityVerifier};
 use crate::transport::{FileInfo, Transport};
 use std::path::Path;
@@ -193,7 +192,6 @@ impl StrategyPlanner {
         source: &FileEntry,
         dest_root: &Path,
         transport: &T,
-        checksum_db: Option<&ChecksumDatabase>,
     ) -> Result<SyncTask> {
         let dest_path = dest_root.join(&*source.relative_path);
 
@@ -242,7 +240,7 @@ impl StrategyPlanner {
 
                     // Compute checksums if verifier is present and files are local
                     let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
-                        self.compute_checksums_local(source, &dest_path, verifier, checksum_db)?
+                        self.compute_checksums_local(source, &dest_path, verifier)?
                     } else {
                         (None, None)
                     };
@@ -297,106 +295,36 @@ impl StrategyPlanner {
         source: &FileEntry,
         dest_path: &Path,
         verifier: &IntegrityVerifier,
-        checksum_db: Option<&ChecksumDatabase>,
     ) -> Result<(Option<Checksum>, Option<Checksum>)> {
-        let checksum_type = match verifier.checksum_type() {
-            ChecksumType::None => "none",
-            ChecksumType::Fast => "fast",
-            ChecksumType::Cryptographic => "cryptographic",
-        };
-
-        // Try to get source checksum (check database first, then compute)
         let source_checksum = if source.path.exists() {
-            // Try database first
-            if let Some(db) = checksum_db {
-                if let Ok(Some(cached)) =
-                    db.get_checksum(&source.path, source.modified, source.size, checksum_type)
-                {
-                    tracing::debug!("Database hit for source: {}", source.path.display());
-                    Some(cached)
-                } else {
-                    // Cache miss, compute
-                    tracing::debug!(
-                        "Database miss for source: {}, computing",
-                        source.path.display()
+            match verifier.compute_file_checksum(&source.path) {
+                Ok(cksum) => Some(cksum),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to compute source checksum for {}: {} (file may have been deleted after scan)",
+                        source.path.display(),
+                        e
                     );
-                    match verifier.compute_file_checksum(&source.path) {
-                        Ok(cksum) => Some(cksum),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to compute source checksum for {}: {} (file may have been deleted after scan)",
-                                source.path.display(),
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-            } else {
-                // No database, compute directly
-                match verifier.compute_file_checksum(&source.path) {
-                    Ok(cksum) => Some(cksum),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to compute source checksum for {}: {} (file may have been deleted after scan)",
-                            source.path.display(),
-                            e
-                        );
-                        None
-                    }
+                    None
                 }
             }
         } else {
             None
         };
 
-        // Try to get dest checksum (check database first, then compute)
         // IMPORTANT: Only compute checksums for paths that exist locally.
         // For remote SSH destinations, dest_path won't exist on the local filesystem.
         // Attempting to access it would cause "No such file or directory" errors.
         let dest_checksum = if dest_path.exists() {
-            // Get dest metadata for database query
-            let dest_metadata = std::fs::metadata(dest_path).map_err(|e| {
-                SyncError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to read metadata for destination file {}: {}. This may indicate a remote path being accessed locally.", dest_path.display(), e),
-                ))
-            })?;
-            let dest_mtime = dest_metadata.modified().ok();
-            let dest_size = Some(dest_metadata.len());
-
-            // Try database first
-            if let (Some(db), Some(mtime), Some(size)) = (checksum_db, dest_mtime, dest_size) {
-                if let Ok(Some(cached)) = db.get_checksum(dest_path, mtime, size, checksum_type) {
-                    tracing::debug!("Database hit for dest: {}", dest_path.display());
-                    Some(cached)
-                } else {
-                    // Cache miss, compute
-                    tracing::debug!("Database miss for dest: {}, computing", dest_path.display());
-                    match verifier.compute_file_checksum(dest_path) {
-                        Ok(cksum) => Some(cksum),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to compute dest checksum for {}: {} (if this is a remote destination, this is a bug - checksum computation should not access remote paths locally)",
-                                dest_path.display(),
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-            } else {
-                // No database or metadata, compute directly
-                match verifier.compute_file_checksum(dest_path) {
-                    Ok(cksum) => Some(cksum),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to compute dest checksum for {}: {} (if this is a remote destination, this is a bug - checksum computation should not access remote paths locally)",
-                            dest_path.display(),
-                            e
-                        );
-                        None
-                    }
+            match verifier.compute_file_checksum(dest_path) {
+                Ok(cksum) => Some(cksum),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to compute dest checksum for {}: {} (if this is a remote destination, this is a bug - checksum computation should not access remote paths locally)",
+                        dest_path.display(),
+                        e
+                    );
+                    None
                 }
             }
         } else {
@@ -429,7 +357,7 @@ impl StrategyPlanner {
                 Ok(dest_meta) => {
                     // Compute checksums if verifier is present
                     let (source_cksum, dest_cksum) = if let Some(ref verifier) = self.verifier {
-                        self.compute_checksums_local(source, &dest_path, verifier, None)
+                        self.compute_checksums_local(source, &dest_path, verifier)
                             .unwrap_or((None, None))
                     } else {
                         (None, None)
