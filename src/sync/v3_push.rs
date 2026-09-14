@@ -35,10 +35,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
         || config.preserve.hardlinks
         || config.preserve.acls
         || config.preserve.flags
-        || config.preserve.group
-        || config.preserve.owner
-        || config.preserve.devices
-        || config.preserve.keep_dirlinks
     {
         return Some("requested preservation semantics exceed current v3 mode/mtime support");
     }

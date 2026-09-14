@@ -293,11 +293,6 @@ pub struct Cli {
     #[arg(short = 'L', long)]
     pub copy_links: bool,
 
-    /// Treat symlinked directories on receiver as directories
-    /// If dest has a symlink to a dir, sync into that dir rather than replacing it
-    #[arg(short = 'K', long)]
-    pub keep_dirlinks: bool,
-
     /// Preserve extended attributes (xattrs)
     #[arg(short = 'X', long)]
     pub preserve_xattrs: bool,
@@ -322,22 +317,12 @@ pub struct Cli {
     #[arg(short = 't', long)]
     pub preserve_times: bool,
 
-    /// Preserve group (requires appropriate permissions)
-    #[arg(short = 'g', long)]
-    pub preserve_group: bool,
-
-    /// Preserve owner (requires root)
-    #[arg(short = 'o', long)]
-    pub preserve_owner: bool,
-
-    /// Preserve device files and special files (requires root)
-    #[arg(short = 'D', long)]
-    pub preserve_devices: bool,
-
-    /// Archive mode: preserve all metadata (-rlptgoD) and copy everything
+    /// Archive mode: preserve permissions, times, and symlinks (-rlpt) and copy everything
     ///
-    /// Equivalent to rsync's -rlptgoD (recursive, links, perms, times, group, owner, devices).
-    /// All files are copied by default (no .gitignore filtering, .git directories included).
+    /// Deliberate divergence from rsync -a (-rlptgoD): owner, group, and
+    /// device preservation were unimplemented stubs and are removed rather
+    /// than silently ignored. All files are copied by default (no .gitignore
+    /// filtering, .git directories included).
     ///
     /// Does NOT include: -X (xattrs), -A (ACLs), -H (hardlinks) - add those flags separately.
     #[arg(short = 'a', long)]
@@ -667,24 +652,6 @@ impl Cli {
         self.archive || self.preserve_times
     }
 
-    /// Check if group should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for group preservation (planned feature)
-    pub fn should_preserve_group(&self) -> bool {
-        self.archive || self.preserve_group
-    }
-
-    /// Check if owner should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for owner preservation (planned feature)
-    pub fn should_preserve_owner(&self) -> bool {
-        self.archive || self.preserve_owner
-    }
-
-    /// Check if device files should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for device preservation (planned feature)
-    pub fn should_preserve_devices(&self) -> bool {
-        self.archive || self.preserve_devices
-    }
-
     /// Check if symlinks should be preserved (archive mode enables by default)
     #[allow(dead_code)] // Public API for symlink preservation (planned feature)
     pub fn should_preserve_symlinks(&self) -> bool {
@@ -749,16 +716,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -831,16 +794,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -917,16 +876,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1046,16 +1001,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1128,16 +1079,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1210,16 +1157,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1292,16 +1235,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1374,16 +1313,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1475,16 +1410,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1572,16 +1503,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1654,16 +1581,12 @@ mod tests {
             verify: VerifyMode::After, // But --verify flag should override
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1751,16 +1674,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1833,16 +1752,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Skip, // Should be overridden
             copy_links: true,         // Override to Follow
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1915,16 +1830,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Skip,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1997,16 +1908,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: true, // Archive mode enabled
             gitignore: false,
             exclude_vcs: false,
@@ -2039,9 +1946,6 @@ mod tests {
         // Archive mode should enable all these flags
         assert!(cli.should_preserve_permissions());
         assert!(cli.should_preserve_times());
-        assert!(cli.should_preserve_group());
-        assert!(cli.should_preserve_owner());
-        assert!(cli.should_preserve_devices());
         assert!(cli.should_preserve_symlinks());
     }
 
@@ -2086,16 +1990,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: true, // Only permissions enabled
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2128,9 +2028,6 @@ mod tests {
         // Only permissions should be enabled
         assert!(cli.should_preserve_permissions());
         assert!(!cli.should_preserve_times());
-        assert!(!cli.should_preserve_group());
-        assert!(!cli.should_preserve_owner());
-        assert!(!cli.should_preserve_devices());
     }
 
     #[test]
@@ -2174,16 +2071,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: true, // Explicit flag also enabled
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: true, // Archive mode also enabled
             gitignore: false,
             exclude_vcs: false,
@@ -2216,9 +2109,6 @@ mod tests {
         // All should be enabled (archive mode OR individual flags)
         assert!(cli.should_preserve_permissions());
         assert!(cli.should_preserve_times());
-        assert!(cli.should_preserve_group());
-        assert!(cli.should_preserve_owner());
-        assert!(cli.should_preserve_devices());
     }
 
     #[test]
@@ -2263,16 +2153,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2352,16 +2238,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2438,16 +2320,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2567,16 +2445,12 @@ mod tests {
             verify: VerifyMode::No,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,

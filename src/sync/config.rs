@@ -159,10 +159,6 @@ pub struct PreserveConfig {
     pub symlink_mode: SymlinkMode,
     pub permissions: bool,
     pub times: bool,
-    pub group: bool,
-    pub owner: bool,
-    pub devices: bool,
-    pub keep_dirlinks: bool,
 }
 
 impl Default for PreserveConfig {
@@ -175,10 +171,6 @@ impl Default for PreserveConfig {
             symlink_mode: SymlinkMode::Preserve,
             permissions: false,
             times: false,
-            group: false,
-            owner: false,
-            devices: false,
-            keep_dirlinks: false,
         }
     }
 }
