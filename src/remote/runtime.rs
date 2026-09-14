@@ -34,8 +34,8 @@ use crate::transfer::delta::{
 use futures::StreamExt;
 use metadata::{request_metadata, serve_incoming_metadata_rooted, RemoteMetadataError};
 use mutation::{
-    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
-    serve_incoming_mutation_rooted, RemoteMutationError,
+    request_copy_file, request_create_directory, request_hardlink, request_remove,
+    request_replace_symlink, serve_incoming_mutation_rooted, RemoteMutationError,
 };
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -323,6 +323,20 @@ impl ClientRemoteSession {
     pub async fn copy_file(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_copy_file(
+            &self.router.sender(),
+            source,
+            destination,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side hardlink beneath the pinned root (`-H`). Links
+    /// `destination` to the existing `source` inode without moving bytes.
+    pub async fn hardlink(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_hardlink(
             &self.router.sender(),
             source,
             destination,

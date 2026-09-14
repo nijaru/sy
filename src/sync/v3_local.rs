@@ -8,8 +8,8 @@
 //! untouched.
 //!
 //! The legacy reconcile/TaskExecutor path remains for the preservation
-//! cluster (xattrs/hardlinks/ACLs/flags) until preservation lands once on
-//! this executor; every other CLI-accepted local sync routes here.
+//! cluster (xattrs/ACLs/flags) until preservation lands once on this
+//! executor; every other CLI-accepted local sync routes here.
 
 use crate::cli::SymlinkMode;
 use crate::error::{Result, SyncError};
@@ -36,11 +36,7 @@ use sy::remote::push_controller::{
 /// Only the preservation cluster remains there; it is deliberately deferred
 /// so preservation lands once on this executor rather than twice.
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.xattrs
-        || config.preserve.hardlinks
-        || config.preserve.acls
-        || config.preserve.flags
-    {
+    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
         return Some("requested preservation semantics exceed current v3 mode/mtime support");
     }
     None
@@ -209,6 +205,7 @@ pub(super) async fn run(
     .with_rate_limiter(rate_limiter)
     .with_remove_source_files(config.remove_source_files)
     .with_verify_on_write(config.verification.verify_on_write)
+    .with_hardlinks(config.preserve.hardlinks)
     .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
@@ -253,5 +250,53 @@ fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option<PathBuf> {
         Some(dir.clone())
     } else {
         Some(destination_root.join(dir))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::sync::scanner::ScanOptions;
+    use tempfile::TempDir;
+
+    /// -H/--preserve-hardlinks locally: one transfer moves the
+    /// representative's bytes; the other member links to it. Both
+    /// destination paths share one inode.
+    #[tokio::test]
+    async fn hardlink_group_shares_one_transfer_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("first"), b"shared-bytes").unwrap();
+        std::fs::hard_link(
+            source_root.path().join("first"),
+            source_root.path().join("second"),
+        )
+        .unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.hardlinks = true;
+        let stats = run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_created, 2);
+        assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("first")).unwrap(),
+            b"shared-bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("second")).unwrap(),
+            b"shared-bytes"
+        );
+        use std::os::unix::fs::MetadataExt;
+        let first = std::fs::metadata(destination_root.path().join("first")).unwrap();
+        let second = std::fs::metadata(destination_root.path().join("second")).unwrap();
+        assert_eq!(first.ino(), second.ino());
     }
 }

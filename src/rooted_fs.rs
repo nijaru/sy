@@ -204,6 +204,24 @@ impl RootedFs {
         self.create_directory_path_blocking(relative.as_path())
     }
 
+    /// Link one root-relative path to an existing root-relative regular file
+    /// (`-H/--preserve-hardlinks`). The source is verified as a regular file
+    /// through its no-follow parent before linking; a symlink source is
+    /// refused. The link is staged under a temporary name in the held
+    /// destination parent and renamed over the destination, so replacing a
+    /// file/symlink is atomic and a directory destination fails loudly
+    /// instead of being recursed into. Destination parents are created
+    /// root-confined, matching copy semantics.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn create_hardlink_blocking(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+    ) -> Result<()> {
+        self.create_hardlink_path_blocking(source.as_path(), destination.as_path())
+    }
+
     /// Copy one regular file to another root-relative path (`--backup`). The
     /// source is opened with the same no-follow, root-confined resolution as
     /// transfers; the destination is written through staged rename so a
@@ -328,6 +346,54 @@ impl RootedFs {
 
     #[cfg(not(unix))]
     fn begin_staged_path_blocking(&self, _relative: &Path) -> Result<RootedStagedFile> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn create_hardlink_path_blocking(&self, source: &Path, destination: &Path) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.ensure_directories_blocking(parent)?;
+            }
+        }
+        // Resolve both parents without following peer-controlled symlinks.
+        // The source leaf is opened O_NOFOLLOW and required to be a regular
+        // file so a symlink source can never be linked through.
+        let (source_parent, source_leaf) = self.open_parent_blocking(source)?;
+        let source_file = open_file_at(source_parent.as_raw_fd(), &source_leaf)?;
+        if !source_file.metadata()?.file_type().is_file() {
+            return Err(RootedFsError::NotRegularFile(source.to_path_buf()));
+        }
+        let (destination_parent, destination_leaf) = self.open_parent_blocking(destination)?;
+        let destination_parent_fd = destination_parent.as_raw_fd();
+        for _ in 0..TEMP_CREATE_ATTEMPTS {
+            let temp_name = next_temp_name();
+            match link_at(
+                source_parent.as_raw_fd(),
+                &source_leaf,
+                destination_parent_fd,
+                &temp_name,
+            ) {
+                Ok(()) => {
+                    return match rename_at(destination_parent_fd, &temp_name, &destination_leaf) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            let _ = unlink_at(destination_parent_fd, &temp_name, false);
+                            Err(error)
+                        }
+                    };
+                }
+                Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
+    }
+
+    #[cfg(not(unix))]
+    fn create_hardlink_path_blocking(&self, _source: &Path, _destination: &Path) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -735,6 +801,33 @@ fn modified_timespecs(modified: Timestamp) -> Result<[libc::timespec; 2]> {
 }
 
 #[cfg(unix)]
+fn link_at(
+    source_parent: RawFd,
+    source_leaf: &OsStr,
+    dest_parent: RawFd,
+    dest_leaf: &OsStr,
+) -> Result<()> {
+    let source = component_cstring(source_leaf)?;
+    let dest = component_cstring(dest_leaf)?;
+    let result = unsafe {
+        // SAFETY: both descriptors remain open and both names are live
+        // NUL-terminated single components. Flags are zero so a symlink
+        // source is refused rather than followed.
+        libc::linkat(
+            source_parent,
+            source.as_ptr(),
+            dest_parent,
+            dest.as_ptr(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rename_at(parent: RawFd, from: &OsStr, to: &OsStr) -> Result<()> {
     let from = component_cstring(from)?;
     let to = component_cstring(to)?;
@@ -850,6 +943,59 @@ mod tests {
         assert_eq!(metadata.mode() & 0o7777, 0o640);
         assert_eq!(metadata.mtime(), modified.seconds());
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+    }
+
+    #[tokio::test]
+    async fn hardlink_shares_inode_and_replaces_atomically() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("first"), b"shared").unwrap();
+        std::fs::write(root.path().join("second"), b"replaced").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        rooted
+            .create_hardlink_blocking(&relative("first"), &relative("linked"))
+            .unwrap();
+        let first = std::fs::metadata(root.path().join("first")).unwrap();
+        let linked = std::fs::metadata(root.path().join("linked")).unwrap();
+        assert_eq!(first.ino(), linked.ino());
+        assert_eq!(
+            std::fs::read(root.path().join("linked")).unwrap(),
+            b"shared"
+        );
+
+        rooted
+            .create_hardlink_blocking(&relative("first"), &relative("second"))
+            .unwrap();
+        let second = std::fs::metadata(root.path().join("second")).unwrap();
+        assert_eq!(first.ino(), second.ino());
+        assert_eq!(
+            std::fs::read(root.path().join("second")).unwrap(),
+            b"shared"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardlink_refuses_symlink_source_and_parent_escape() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        std::fs::write(root.path().join("real"), b"real").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("leaf"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        assert!(rooted
+            .create_hardlink_blocking(&relative("leaf"), &relative("linked"))
+            .is_err());
+        assert!(rooted
+            .create_hardlink_blocking(&relative("escape/secret"), &relative("linked"))
+            .is_err());
+        assert!(!root.path().join("linked").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"outside"
+        );
     }
 
     #[tokio::test]

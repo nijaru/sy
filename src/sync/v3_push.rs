@@ -31,11 +31,7 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.xattrs
-        || config.preserve.hardlinks
-        || config.preserve.acls
-        || config.preserve.flags
-    {
+    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
         return Some("requested preservation semantics exceed current v3 mode/mtime support");
     }
     None
@@ -302,6 +298,7 @@ async fn execute_with_handle(
     .with_remove_source_files(config.remove_source_files)
     .with_backup(backup_plan)
     .with_compression(compression_policy(config))
+    .with_hardlinks(config.preserve.hardlinks)
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
@@ -805,6 +802,89 @@ mod tests {
             b"gone-content"
         );
         assert!(destination_root.path().join("sub").is_dir());
+    }
+
+    /// -H/--preserve-hardlinks over v3: members of one scanned group share
+    /// a single transferred representative; the rest become server-side
+    /// links to it. One file's bytes move; both destination paths share one
+    /// inode. The server sees exactly scan + transfer + hardlink mutation.
+    #[tokio::test]
+    async fn hardlink_group_shares_one_transfer_over_v3() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("first"), b"shared-bytes").unwrap();
+        std::fs::hard_link(
+            source_root.path().join("first"),
+            source_root.path().join("second"),
+        )
+        .unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let mutation = session.mutation_handler();
+            // Destination scan, one file transfer (the representative),
+            // one hardlink mutation. The source scan is local.
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        mutation.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected hardlink v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.hardlinks = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 2);
+        assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("first")).unwrap(),
+            b"shared-bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("second")).unwrap(),
+            b"shared-bytes"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let first = std::fs::metadata(destination_root.path().join("first")).unwrap();
+            let second = std::fs::metadata(destination_root.path().join("second")).unwrap();
+            assert_eq!(first.ino(), second.ino());
+        }
     }
 
     #[test]
