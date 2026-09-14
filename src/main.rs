@@ -428,10 +428,6 @@ Or install from local source with: cargo install --path . --features acl"#
             symlink_mode,
             permissions: cli.should_preserve_permissions(),
             times: cli.should_preserve_times(),
-            group: cli.should_preserve_group(),
-            owner: cli.should_preserve_owner(),
-            devices: cli.should_preserve_devices(),
-            keep_dirlinks: cli.keep_dirlinks,
         },
         comparison: sync::ComparisonConfig {
             ignore_times: cli.ignore_times,

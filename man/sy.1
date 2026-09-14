@@ -4,7 +4,7 @@
 .SH NAME
 sy \- Modern file synchronization tool
 .SH SYNOPSIS
-\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-K\fR|\fB\-\-keep\-dirlinks\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-g\fR|\fB\-\-preserve\-group\fR] [\fB\-o\fR|\fB\-\-preserve\-owner\fR] [\fB\-D\fR|\fB\-\-preserve\-devices\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
+\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
 .SH DESCRIPTION
 Modern file synchronization tool
 .SH OPTIONS
@@ -147,9 +147,6 @@ skip: Skip all symlinks
 \fB\-L\fR, \fB\-\-copy\-links\fR
 Follow symlinks and copy targets (shortcut for \-\-links follow)
 .TP
-\fB\-K\fR, \fB\-\-keep\-dirlinks\fR
-Treat symlinked directories on receiver as directories If dest has a symlink to a dir, sync into that dir rather than replacing it
-.TP
 \fB\-X\fR, \fB\-\-preserve\-xattrs\fR
 Preserve extended attributes (xattrs)
 .TP
@@ -168,19 +165,10 @@ Preserve permissions
 \fB\-t\fR, \fB\-\-preserve\-times\fR
 Preserve modification times
 .TP
-\fB\-g\fR, \fB\-\-preserve\-group\fR
-Preserve group (requires appropriate permissions)
-.TP
-\fB\-o\fR, \fB\-\-preserve\-owner\fR
-Preserve owner (requires root)
-.TP
-\fB\-D\fR, \fB\-\-preserve\-devices\fR
-Preserve device files and special files (requires root)
-.TP
 \fB\-a\fR, \fB\-\-archive\fR
-Archive mode: preserve all metadata (\-rlptgoD) and copy everything
+Archive mode: preserve permissions, times, and symlinks (\-rlpt) and copy everything
 
-Equivalent to rsync\*(Aqs \-rlptgoD (recursive, links, perms, times, group, owner, devices). All files are copied by default (no .gitignore filtering, .git directories included).
+Deliberate divergence from rsync \-a (\-rlptgoD): owner, group, and device preservation were unimplemented stubs and are removed rather than silently ignored. All files are copied by default (no .gitignore filtering, .git directories included).
 
 Does NOT include: \-X (xattrs), \-A (ACLs), \-H (hardlinks) \- add those flags separately.
 .TP
