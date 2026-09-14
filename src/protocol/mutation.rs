@@ -12,6 +12,10 @@ pub enum WireMutationKind {
     /// Server-side copy beneath the pinned root. Seeds the object-native
     /// copy strategy and backs up replaced/deleted files for `--backup`.
     CopyFile = 5,
+    /// Server-side hardlink beneath the pinned root (`-H/--preserve-hardlinks`:
+    /// link `path` to the existing `copy_source` inode). Both stay beneath
+    /// the pinned root; the source must be a regular file.
+    Hardlink = 6,
 }
 
 impl TryFrom<u8> for WireMutationKind {
@@ -24,6 +28,7 @@ impl TryFrom<u8> for WireMutationKind {
             3 => Ok(Self::RemoveFileLike),
             4 => Ok(Self::RemoveDirectory),
             5 => Ok(Self::CopyFile),
+            6 => Ok(Self::Hardlink),
             _ => Err(ProtocolError::InvalidField {
                 field: "mutation_kind",
                 reason: "unknown mutation kind",
@@ -93,6 +98,20 @@ impl WireMutation {
         Self {
             path: destination,
             kind: WireMutationKind::CopyFile,
+            symlink_target: None,
+            copy_source: Some(source),
+        }
+    }
+
+    /// Link `destination` to the existing root-relative `source` inode.
+    /// Used for `-H/--preserve-hardlinks`: members of one scanned hardlink
+    /// group share a single transferred representative; the rest become
+    /// links to it. The `copy_source` field carries the link source so the
+    /// wire shape stays bounded like `CopyFile`.
+    pub fn hardlink(source: RelativeWirePath, destination: RelativeWirePath) -> Self {
+        Self {
+            path: destination,
+            kind: WireMutationKind::Hardlink,
             symlink_target: None,
             copy_source: Some(source),
         }
@@ -199,20 +218,21 @@ impl WireMutation {
         } else {
             None
         };
-        let copy_source = if kind == WireMutationKind::CopyFile {
-            let source_len = reader.u32()? as usize;
-            if source_len > MAX_WIRE_PATH_BYTES {
-                return Err(ProtocolError::PathTooLong {
-                    len: source_len,
-                    max: MAX_WIRE_PATH_BYTES,
-                });
-            }
-            Some(RelativeWirePath::decode(Bytes::copy_from_slice(
-                reader.take(source_len)?,
-            ))?)
-        } else {
-            None
-        };
+        let copy_source =
+            if kind == WireMutationKind::CopyFile || kind == WireMutationKind::Hardlink {
+                let source_len = reader.u32()? as usize;
+                if source_len > MAX_WIRE_PATH_BYTES {
+                    return Err(ProtocolError::PathTooLong {
+                        len: source_len,
+                        max: MAX_WIRE_PATH_BYTES,
+                    });
+                }
+                Some(RelativeWirePath::decode(Bytes::copy_from_slice(
+                    reader.take(source_len)?,
+                ))?)
+            } else {
+                None
+            };
         reader.finish()?;
         let mutation = Self {
             path,
@@ -232,6 +252,7 @@ impl WireMutation {
         ) {
             (WireMutationKind::ReplaceSymlink, true, false)
             | (WireMutationKind::CopyFile, false, true)
+            | (WireMutationKind::Hardlink, false, true)
             | (
                 WireMutationKind::CreateDirectory
                 | WireMutationKind::RemoveFileLike
@@ -246,6 +267,10 @@ impl WireMutation {
             (WireMutationKind::CopyFile, _, _) => Err(ProtocolError::InvalidField {
                 field: "copy_source",
                 reason: "copy-file mutation requires a source path",
+            }),
+            (WireMutationKind::Hardlink, _, _) => Err(ProtocolError::InvalidField {
+                field: "copy_source",
+                reason: "hardlink mutation requires a source path",
             }),
             (_, true, _) => Err(ProtocolError::InvalidField {
                 field: "symlink_target",
@@ -277,7 +302,8 @@ mod tests {
             WireMutation::replace_symlink(path(), target),
             WireMutation::remove_file_like(path()),
             WireMutation::remove_directory(path()),
-            WireMutation::copy_file(path(), backup_dir),
+            WireMutation::copy_file(path(), backup_dir.clone()),
+            WireMutation::hardlink(path(), backup_dir),
         ];
         for mutation in mutations {
             assert_eq!(

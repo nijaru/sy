@@ -1,6 +1,7 @@
 use super::metadata::request_metadata;
 use super::mutation::{
-    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
+    request_copy_file, request_create_directory, request_hardlink, request_remove,
+    request_replace_symlink,
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
 use crate::engine::compression::CompressionPolicy;
@@ -261,6 +262,15 @@ impl ClientRemoteHandle {
     pub async fn copy_file(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_copy_file(&self.sender, source, destination, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Server-side hardlink beneath the pinned root (`-H`). Links
+    /// `destination` to the existing `source` inode without moving bytes.
+    pub async fn hardlink(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_hardlink(&self.sender, source, destination, self.peer)
             .await
             .map_err(Into::into)
     }

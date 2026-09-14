@@ -1,6 +1,6 @@
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
-use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::WorkItem;
@@ -396,6 +396,14 @@ pub struct RemotePushExecutor {
     backup: Option<RemoteBackupPlan>,
     /// -z/--compress: chunk compression policy for file transfers.
     compression: Option<CompressionPolicy>,
+    /// -H/--preserve-hardlinks: deduplicate scanned hardlink groups. The
+    /// map holds group -> first committed destination path; the mutex is
+    /// held across a grouped transfer so members of one group serialize
+    /// (ungrouped files stay concurrent). Skipped groups never populate the
+    /// map, matching the legacy executor: a lone transferred member still
+    /// moves bytes correctly, just without link sharing.
+    hardlinks: bool,
+    hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
     /// Per-operation output (`-i`/`--json`). `None` prints nothing.
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
@@ -506,6 +514,8 @@ impl RemotePushExecutor {
             remove_source_files: false,
             backup: None,
             compression: None,
+            hardlinks: false,
+            hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             reporter: None,
         }
     }
@@ -522,6 +532,11 @@ impl RemotePushExecutor {
 
     pub const fn with_compression(mut self, policy: Option<CompressionPolicy>) -> Self {
         self.compression = policy;
+        self
+    }
+
+    pub const fn with_hardlinks(mut self, enabled: bool) -> Self {
+        self.hardlinks = enabled;
         self
     }
 
@@ -571,6 +586,20 @@ impl RemotePushExecutor {
                 destination,
                 metadata,
             } => {
+                // -H/--preserve-hardlinks: members of one scanned group
+                // share a single transferred representative; the rest become
+                // server-side links to it. The group mutex is held across a
+                // grouped transfer so members serialize (ungrouped files
+                // stay concurrent); the legacy executor was fully serial
+                // here, so this is strictly more concurrent.
+                if self.hardlinks {
+                    if let Some(identity) = source.hardlink_group {
+                        let group = *identity.as_bytes();
+                        return self
+                            .execute_grouped_file(source, destination, metadata, group)
+                            .await;
+                    }
+                }
                 let is_update = destination.is_some();
                 // --backup preserves the replaced destination file first. The
                 // server copies it beneath the pinned root before the staged
@@ -635,6 +664,106 @@ impl RemotePushExecutor {
                 Ok(None)
             }
         }
+    }
+
+    /// One grouped regular file under `-H`: transfer the representative or
+    /// link subsequent members to it. The caller holds no locks; this method
+    /// owns group serialization. A linking member revalidates its scan
+    /// identity first so a source replaced after the scan fails loudly
+    /// instead of linking stale bytes.
+    async fn execute_grouped_file(
+        &self,
+        source: Entry,
+        destination: Option<Entry>,
+        metadata: TransferMetadata,
+        group: [u8; 32],
+    ) -> Result<Option<TransferSummary>> {
+        let mut groups = self.hardlink_groups.lock().await;
+        if let Some(first) = groups.get(&group).cloned() {
+            self.check_source_identity(&source).await?;
+            if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
+                if existing.is_file() {
+                    let backup_path = plan.destination(&existing.path).ok_or_else(|| {
+                        RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
+                    })?;
+                    self.remote.copy_file(&existing.path, &backup_path).await?;
+                }
+            }
+            self.remote.hardlink(&first, &source.path).await?;
+            self.remove_committed_source(&source).await?;
+            let op = if destination.is_some() {
+                crate::sync::output::ItemizeOp::Update
+            } else {
+                crate::sync::output::ItemizeOp::Create
+            };
+            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            return Ok(Some(TransferSummary {
+                file_size: source.size,
+                digest: [0_u8; 32],
+                literal_bytes: 0,
+                reused_bytes: source.size,
+            }));
+        }
+        let is_update = destination.is_some();
+        if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
+            if existing.is_file() {
+                let backup_path = plan.destination(&existing.path).ok_or_else(|| {
+                    RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
+                })?;
+                self.remote.copy_file(&existing.path, &backup_path).await?;
+            }
+        }
+        let delta_basis = self.prepare_delta_basis(destination).await?;
+        let summary = self
+            .remote
+            .transfer_file_with_policy(
+                self.source_root.clone(),
+                source.clone(),
+                delta_basis,
+                metadata,
+                self.compression,
+            )
+            .await?;
+        groups.insert(group, source.path.clone());
+        drop(groups);
+        self.remove_committed_source(&source).await?;
+        let op = if is_update {
+            crate::sync::output::ItemizeOp::Update
+        } else {
+            crate::sync::output::ItemizeOp::Create
+        };
+        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        Ok(Some(summary))
+    }
+
+    /// Revalidate a linking member's scan identity (cheap stat, no bytes).
+    async fn check_source_identity(&self, source: &Entry) -> Result<()> {
+        let Some(expected) = source.identity else {
+            return Err(RemotePushError::SourceChangedBeforeRemoval(
+                source.path.as_path().to_path_buf(),
+            ));
+        };
+        let path = self.source_root.join(source.path.as_path());
+        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|_| {
+            RemotePushError::SourceChangedBeforeRemoval(source.path.as_path().to_path_buf())
+        })?;
+        let kind = if metadata.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
+            .ok_or_else(|| {
+                RemotePushError::SourceChangedBeforeRemoval(source.path.as_path().to_path_buf())
+            })?;
+        if current != expected {
+            return Err(RemotePushError::SourceChangedBeforeRemoval(
+                source.path.as_path().to_path_buf(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn execute_delete(&self, action: DeleteAction) -> Result<()> {

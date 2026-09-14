@@ -105,6 +105,11 @@ pub struct RemotePullExecutor {
     /// capability is checked before the first request, mirroring the push
     /// side's transfer_file_with_policy contract.
     compression: Option<CompressionPolicy>,
+    /// -H/--preserve-hardlinks: group -> first committed destination path.
+    /// The mutex is held across a grouped fetch so members serialize
+    /// (ungrouped files stay concurrent), mirroring the push executor.
+    hardlinks: bool,
+    hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
 }
 
 impl RemotePullExecutor {
@@ -125,6 +130,8 @@ impl RemotePullExecutor {
             reporter: None,
             rate_limiter: None,
             compression: None,
+            hardlinks: false,
+            hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -156,6 +163,11 @@ impl RemotePullExecutor {
 
     pub fn with_compression(mut self, policy: Option<CompressionPolicy>) -> Self {
         self.compression = policy;
+        self
+    }
+
+    pub const fn with_hardlinks(mut self, enabled: bool) -> Self {
+        self.hardlinks = enabled;
         self
     }
 
@@ -207,6 +219,16 @@ impl RemotePullExecutor {
                 destination,
                 metadata,
             } => {
+                // -H: members after the first link to the representative
+                // instead of fetching the same bytes again.
+                if self.hardlinks {
+                    if let Some(identity) = source.hardlink_group {
+                        let group = *identity.as_bytes();
+                        return self
+                            .execute_grouped_fetch(source, destination, metadata, group)
+                            .await;
+                    }
+                }
                 let is_update = destination.is_some();
                 // --backup preserves the replaced destination file first, as a
                 // local copy (the destination is local in a pull). A backup
@@ -269,6 +291,85 @@ impl RemotePullExecutor {
                 Ok(None)
             }
         }
+    }
+
+    /// One grouped fetch under `-H`: fetch the representative or link
+    /// subsequent members to it locally. Group membership is scan-time: a
+    /// linking member inherits the representative's bytes, so a remote
+    /// replacement of a linking member after the scan can leave that path
+    /// one scan behind (the transferred representative itself is always
+    /// identity-validated by the fetch). The group mutex serializes members.
+    async fn execute_grouped_fetch(
+        &self,
+        source: Entry,
+        destination: Option<Entry>,
+        metadata: PullTransferMetadata,
+        group: [u8; 32],
+    ) -> Result<Option<crate::remote::transfer::TransferSummary>> {
+        let mut groups = self.hardlink_groups.lock().await;
+        if let Some(first) = groups.get(&group).cloned() {
+            let is_update = destination.is_some();
+            if let Some(existing) = &destination {
+                if existing.is_file() && self.backup_enabled() {
+                    let backup_abs = self.backup_destination_for(&existing.path)?;
+                    if let Some(parent) = backup_abs.parent() {
+                        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                            RemotePullError::LocalMutation(backup_abs.clone(), error)
+                        })?;
+                    }
+                    copy_local_backup(&self.destination_root, &existing.path, &backup_abs)
+                        .await
+                        .map_err(|error| {
+                            RemotePullError::LocalMutation(backup_abs.clone(), error)
+                        })?;
+                }
+            }
+            let first_abs = self.dest_path(&first);
+            let dest_abs = self.dest_path(&source.path);
+            link_local_file(&first_abs, &dest_abs).await?;
+            if let Some(mode) = metadata.unix_mode {
+                set_local_mode(&dest_abs, mode).await?;
+            }
+            if let Some(modified) = metadata.modified {
+                set_local_mtime(&dest_abs, modified).await?;
+            }
+            let op = if is_update {
+                crate::sync::output::ItemizeOp::Update
+            } else {
+                crate::sync::output::ItemizeOp::Create
+            };
+            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            return Ok(Some(crate::remote::transfer::TransferSummary {
+                file_size: source.size,
+                digest: [0_u8; 32],
+                literal_bytes: 0,
+                reused_bytes: source.size,
+            }));
+        }
+        let is_update = destination.is_some();
+        if let Some(existing) = &destination {
+            if existing.is_file() && self.backup_enabled() {
+                let backup_abs = self.backup_destination_for(&existing.path)?;
+                if let Some(parent) = backup_abs.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                        RemotePullError::LocalMutation(backup_abs.clone(), error)
+                    })?;
+                }
+                copy_local_backup(&self.destination_root, &existing.path, &backup_abs)
+                    .await
+                    .map_err(|error| RemotePullError::LocalMutation(backup_abs.clone(), error))?;
+            }
+        }
+        let summary = self.fetch_into_staging(&source, &metadata).await?;
+        groups.insert(group, source.path.clone());
+        drop(groups);
+        let op = if is_update {
+            crate::sync::output::ItemizeOp::Update
+        } else {
+            crate::sync::output::ItemizeOp::Create
+        };
+        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        Ok(Some(summary))
     }
 
     /// Fetch one source file into endpoint staging and commit atomically.
@@ -482,6 +583,39 @@ async fn copy_local_backup(
 
 /// Stage a symlink beside the destination and rename it into place so a
 /// link-over-file (or link-over-link) replacement is atomic.
+/// Atomically link `dest` to the existing `first` inode (`-H`): stage the
+/// link under a temporary name in the held destination parent, then rename
+/// over the destination. Replacing a directory fails loudly; a file or
+/// symlink is replaced atomically.
+async fn link_local_file(first: &Path, dest: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| RemotePullError::LocalMutation(parent.to_path_buf(), error))?;
+        }
+        let temp = crate::temp_file::TempFileGuard::temp_path_for(dest);
+        let guard = crate::temp_file::TempFileGuard::new(&temp);
+        tokio::fs::hard_link(first, &temp)
+            .await
+            .map_err(|error| RemotePullError::LocalMutation(temp.clone(), error))?;
+        tokio::fs::rename(&temp, dest)
+            .await
+            .map_err(|error| RemotePullError::LocalMutation(dest.to_path_buf(), error))?;
+        drop(guard);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, dest);
+        Err(RemotePullError::LocalMutation(
+            dest.to_path_buf(),
+            std::io::Error::other("hardlink preservation is not supported on this platform"),
+        ))
+    }
+}
+
 async fn replace_local_symlink(target: &Path, dest: &Path) -> Result<()> {
     #[cfg(unix)]
     {

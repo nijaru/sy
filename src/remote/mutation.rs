@@ -128,6 +128,20 @@ pub async fn request_copy_file(
     request_mutation(sender, WireMutation::copy_file(source, destination)).await
 }
 
+/// Request a server-side hardlink beneath the pinned root
+/// (`-H/--preserve-hardlinks`: link `destination` to existing `source`).
+pub async fn request_hardlink(
+    sender: &RouterSender,
+    source: &RelativePath,
+    destination: &RelativePath,
+    peer: PlatformOs,
+) -> Result<()> {
+    ensure_compatible_path_encoding(peer)?;
+    let source = encode_relative_path(source.as_path())?;
+    let destination = encode_relative_path(destination.as_path())?;
+    request_mutation(sender, WireMutation::hardlink(source, destination)).await
+}
+
 async fn request_mutation(sender: &RouterSender, mutation: WireMutation) -> Result<()> {
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
@@ -169,7 +183,7 @@ pub async fn serve_incoming_mutation_rooted(
         .cloned()
         .map(|target| decode_native_target(target, peer))
         .transpose()?;
-    let copy_source = if kind == WireMutationKind::CopyFile {
+    let copy_source = if kind == WireMutationKind::CopyFile || kind == WireMutationKind::Hardlink {
         let source = mutation
             .copy_source()
             .cloned()
@@ -218,6 +232,10 @@ fn apply_mutation(
         WireMutationKind::CopyFile => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
             rooted.copy_file_blocking(&source, &path)?;
+        }
+        WireMutationKind::Hardlink => {
+            let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
+            rooted.create_hardlink_blocking(&source, &path)?;
         }
     }
     Ok(())
@@ -373,7 +391,7 @@ mod tests {
         let peer = Platform::current().os;
 
         let server_task = tokio::spawn(async move {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
                 serve_incoming_mutation_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
@@ -393,6 +411,14 @@ mod tests {
         request_remove(&client.sender(), &old, false, peer)
             .await
             .unwrap();
+        // -H: the server links through held descriptors; the linked path
+        // shares the source inode.
+        std::fs::write(root.path().join("basis"), b"basis").unwrap();
+        let basis = RelativePath::new("basis").unwrap();
+        let linked = RelativePath::new("linked").unwrap();
+        request_hardlink(&client.sender(), &basis, &linked, peer)
+            .await
+            .unwrap();
         request_remove(&client.sender(), &dir, true, peer)
             .await
             .unwrap();
@@ -400,6 +426,13 @@ mod tests {
 
         assert!(!root.path().join("old").exists());
         assert!(!root.path().join("dir").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let basis = std::fs::metadata(root.path().join("basis")).unwrap();
+            let linked = std::fs::metadata(root.path().join("linked")).unwrap();
+            assert_eq!(basis.ino(), linked.ino());
+        }
         assert_eq!(
             std::fs::read_link(root.path().join("link")).unwrap(),
             Path::new("../target")

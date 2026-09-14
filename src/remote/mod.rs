@@ -207,6 +207,12 @@ fn process_capabilities() -> CapabilitySet {
     if supports_staged_files(os) {
         capabilities.insert(CapabilitySet::STAGED_WRITE | CapabilitySet::ATOMIC_REPLACE);
     }
+    // Hardlink creation is owned end to end: the `Hardlink` mutation links
+    // through held parent descriptors (no-follow, regular-file verified),
+    // and the push/pull/local executors deduplicate scanned hardlink groups.
+    if supports_hardlinks(os) {
+        capabilities.insert(CapabilitySet::HARDLINK);
+    }
     // Compressed Data frames are decodable wherever zstd is linked, which is
     // everywhere this crate builds.
     capabilities.insert(CapabilitySet::ZSTD);
@@ -222,6 +228,10 @@ const fn supports_rolling_signatures(os: PlatformOs) -> bool {
 }
 
 const fn supports_staged_files(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+const fn supports_hardlinks(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
 }
 
@@ -431,7 +441,10 @@ mod tests {
         assert!(!client.ready.capabilities.contains(CapabilitySet::SPARSE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::XATTR));
         assert!(!client.ready.capabilities.contains(CapabilitySet::ACL));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::HARDLINK));
+        assert_eq!(
+            client.ready.capabilities.contains(CapabilitySet::HARDLINK),
+            supports_hardlinks(Platform::current().os)
+        );
         assert!(!client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS));
     }
 
@@ -449,6 +462,10 @@ mod tests {
             local.contains(CapabilitySet::STAGED_WRITE),
             supports_staged_files(Platform::current().os)
         );
+        assert_eq!(
+            local.contains(CapabilitySet::HARDLINK),
+            supports_hardlinks(Platform::current().os)
+        );
         assert!(!local.intersects(
             CapabilitySet::RANDOM_READ
                 | CapabilitySet::RANDOM_WRITE
@@ -456,7 +473,6 @@ mod tests {
                 | CapabilitySet::SPARSE
                 | CapabilitySet::XATTR
                 | CapabilitySet::ACL
-                | CapabilitySet::HARDLINK
                 | CapabilitySet::BSD_FLAGS
         ));
 
@@ -478,6 +494,14 @@ mod tests {
         assert!(supports_staged_files(PlatformOs::Macos));
         assert!(!supports_staged_files(PlatformOs::Windows));
         assert!(!supports_staged_files(PlatformOs::Other(4)));
+    }
+
+    #[test]
+    fn hardlinks_are_scoped_to_tested_os_family() {
+        assert!(supports_hardlinks(PlatformOs::Linux));
+        assert!(supports_hardlinks(PlatformOs::Macos));
+        assert!(!supports_hardlinks(PlatformOs::Windows));
+        assert!(!supports_hardlinks(PlatformOs::Other(4)));
     }
 
     #[tokio::test]

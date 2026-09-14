@@ -48,11 +48,7 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode == SymlinkMode::Follow {
         return Some("v3 pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
     }
-    if config.preserve.xattrs
-        || config.preserve.hardlinks
-        || config.preserve.acls
-        || config.preserve.flags
-    {
+    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
         return Some("requested preservation semantics exceed current v3 mode/mtime support");
     }
     None
@@ -195,6 +191,7 @@ async fn execute_with_handle(
             .with_backup_suffix(config.suffix.clone())
             .with_reporter(Some(reporter.clone()))
             .with_compression(compression_policy(config))
+            .with_hardlinks(config.preserve.hardlinks)
             .with_rate_limiter(rate_limiter);
 
     let scan_elapsed = scan_started.elapsed();
@@ -419,6 +416,96 @@ mod tests {
             std::fs::read(destination_root.path().join("bulk.txt")).unwrap(),
             content.as_bytes()
         );
+    }
+
+    /// -H/--preserve-hardlinks on pull: one fetch moves the representative's
+    /// bytes; the other member links to it locally. The server sees exactly
+    /// scan + one fetch — no second fetch, no mutation (the destination is
+    /// local, so linking never crosses the wire).
+    #[tokio::test]
+    async fn hardlink_group_fetches_once_and_links_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("first"), b"shared-bytes").unwrap();
+        std::fs::hard_link(
+            source_root.path().join("first"),
+            source_root.path().join("second"),
+        )
+        .unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            // One scan + one fetch: the second group member links locally.
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        scan.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::FileFetch(incoming) => {
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _other => panic!("unexpected v3 pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.hardlinks = true;
+        let stats = execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 2);
+        assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("first")).unwrap(),
+            b"shared-bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("second")).unwrap(),
+            b"shared-bytes"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let first = std::fs::metadata(destination_root.path().join("first")).unwrap();
+            let second = std::fs::metadata(destination_root.path().join("second")).unwrap();
+            assert_eq!(first.ino(), second.ino());
+        }
     }
 
     /// Every CLI-accepted pull maps onto v3 without legacy fallback; the

@@ -96,6 +96,11 @@ pub struct LocalSyncExecutor {
     /// --remove-source-files: remove a committed or parity-verified source
     /// entry after the destination commit is acknowledged.
     remove_source_files: bool,
+    /// -H/--preserve-hardlinks: group -> first committed destination path.
+    /// The mutex is held across a grouped transfer so members serialize
+    /// (ungrouped files stay concurrent), mirroring the remote executors.
+    hardlinks: bool,
+    hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
     /// Post-write BLAKE3 verification (--verify).
     verify_on_write: bool,
     reporter: Option<Arc<crate::sync::output::SyncReporter>>,
@@ -114,6 +119,8 @@ impl LocalSyncExecutor {
             rate_limiter: None,
             remove_source_files: false,
             verify_on_write: false,
+            hardlinks: false,
+            hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             reporter: None,
         }
     }
@@ -145,6 +152,11 @@ impl LocalSyncExecutor {
 
     pub fn with_verify_on_write(mut self, enabled: bool) -> Self {
         self.verify_on_write = enabled;
+        self
+    }
+
+    pub const fn with_hardlinks(mut self, enabled: bool) -> Self {
+        self.hardlinks = enabled;
         self
     }
 
@@ -308,6 +320,16 @@ impl LocalSyncExecutor {
                 destination,
                 metadata,
             } => {
+                // -H: members after the first link to the representative.
+                if self.hardlinks {
+                    if let Some(identity) = source.hardlink_group {
+                        let group = *identity.as_bytes();
+                        return self
+                            .execute_grouped_file(source, destination, metadata, group)
+                            .await
+                            .map(Some);
+                    }
+                }
                 let is_update = destination.is_some();
                 if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
                     self.backup_replacement_file(&source.path).await?;
@@ -358,6 +380,106 @@ impl LocalSyncExecutor {
                 Ok(None)
             }
         }
+    }
+
+    /// One grouped file under `-H`: transfer the representative or link
+    /// subsequent members to it. The linking member revalidates its scan
+    /// identity first so a source replaced after the scan fails loudly
+    /// instead of linking stale bytes. The group mutex serializes members.
+    async fn execute_grouped_file(
+        &self,
+        source: Entry,
+        destination: Option<Entry>,
+        metadata: LocalTransferMetadata,
+        group: [u8; 32],
+    ) -> Result<crate::remote::transfer::TransferSummary> {
+        let mut groups = self.hardlink_groups.lock().await;
+        if let Some(first) = groups.get(&group).cloned() {
+            self.check_source_identity(&source).await?;
+            let is_update = destination.is_some();
+            if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
+                self.backup_replacement_file(&source.path).await?;
+            }
+            let first_abs = self.destination_path(&first);
+            let dest_abs = self.destination_path(&source.path);
+            link_local_file(&first_abs, &dest_abs)
+                .await
+                .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
+            if let Some(mode) = metadata.unix_mode {
+                self.set_mode(&dest_abs, mode).await?;
+            }
+            if let Some(modified) = metadata.modified {
+                self.set_mtime(&dest_abs, modified).await?;
+            }
+            self.remove_committed_source(&source).await?;
+            let op = if is_update {
+                crate::sync::output::ItemizeOp::Update
+            } else {
+                crate::sync::output::ItemizeOp::Create
+            };
+            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            return Ok(crate::remote::transfer::TransferSummary {
+                file_size: source.size,
+                digest: [0_u8; 32],
+                literal_bytes: 0,
+                reused_bytes: source.size,
+            });
+        }
+        let is_update = destination.is_some();
+        if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
+            self.backup_replacement_file(&source.path).await?;
+        }
+        let transfer = self
+            .transfer_source_file(&source, &destination, &metadata)
+            .await?;
+        groups.insert(group, source.path.clone());
+        drop(groups);
+        self.remove_committed_source(&source).await?;
+        let op = if is_update {
+            crate::sync::output::ItemizeOp::Update
+        } else {
+            crate::sync::output::ItemizeOp::Create
+        };
+        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        Ok(transfer)
+    }
+
+    /// Revalidate a linking member's scan identity (cheap stat, no bytes).
+    async fn check_source_identity(&self, source: &Entry) -> Result<()> {
+        let Some(expected) = source.identity else {
+            return Err(LocalSyncError::Source(
+                self.source_path(&source.path),
+                std::io::Error::other("source entry changed between scan and link"),
+            ));
+        };
+        let path = self.source_path(&source.path);
+        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|_| {
+            LocalSyncError::Source(
+                path.clone(),
+                std::io::Error::other("source entry changed between scan and link"),
+            )
+        })?;
+        let kind = if metadata.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
+            .ok_or_else(|| {
+                LocalSyncError::Source(
+                    path.clone(),
+                    std::io::Error::other("source entry changed between scan and link"),
+                )
+            })?;
+        if current != expected {
+            return Err(LocalSyncError::Source(
+                path,
+                std::io::Error::other("source entry changed between scan and link"),
+            ));
+        }
+        Ok(())
     }
 
     /// One file through the transfer layer's staging, strategy selection,
@@ -719,6 +841,30 @@ impl crate::remote::push_controller::SyncPlanExecutor for LocalSyncExecutor {
         error: &LocalSyncError,
     ) -> crate::remote::push_controller::RemotePushControllerError {
         crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
+    }
+}
+
+/// Atomically link `dest` to the existing `first` inode (`-H`): stage the
+/// link under a temporary name, then rename over the destination.
+async fn link_local_file(first: &Path, dest: &Path) -> std::result::Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let temp = crate::temp_file::TempFileGuard::temp_path_for(dest);
+        let guard = crate::temp_file::TempFileGuard::new(&temp);
+        tokio::fs::hard_link(first, &temp).await?;
+        tokio::fs::rename(&temp, dest).await?;
+        guard.defuse();
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, dest);
+        Err(std::io::Error::other(
+            "hardlink preservation is not supported on this platform",
+        ))
     }
 }
 
