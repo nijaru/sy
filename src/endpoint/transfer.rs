@@ -237,7 +237,7 @@ async fn reflink_patch(
 
         // Reflink patching trades an extra destination read for fewer physical
         // writes. Keep it conservative until the benchmark suite tunes this.
-        let ratio = match crate::delta::estimate_change_ratio(
+        let ratio = match sy::transfer::ratio::estimate_change_ratio(
             &source,
             &dest,
             TRANSFER_BUFFER_SIZE,
