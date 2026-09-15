@@ -9,10 +9,9 @@ The `v0.5-architecture` branch is a ground-up rewrite. Do not infer the target d
 Read, in order:
 
 1. `docs/architecture-0.5.md` — canonical target architecture and invariants.
-2. `agent-context/ai/0.5-rewrite.md` — current rewrite state, known debt, and implementation order.
-3. `agent-context/ai/0.5-design-audit.md` — accepted design decisions (rooted filesystem, bisync, compression, delta, object stores). Do not re-open these without new evidence.
-4. `agent-context/ai/0.5-alignment-audit.md` — current conformance findings (F1–F8) with evidence and the prioritized alignment roadmap.
-5. `~/.agents/skills/rust-cli/SKILL.md` — usage-rs and CLI conventions when changing the CLI.
+2. `~/.agents/skills/rust-cli/SKILL.md` — usage-rs and CLI conventions when changing the CLI.
+
+Accepted designs and prior research are retained in private knowledge; search there before re-opening decisions.
 
 If old code disagrees with the 0.5 architecture docs, the docs define the intended direction unless a new finding demonstrates a better design.
 
@@ -229,4 +228,4 @@ Do not add without benchmark/evidence:
 
 ## Current Focus
 
-Build the new 0.5 architecture under clean `engine/`, `protocol/`, and `remote/` boundaries, then physically remove the old stacks. See `agent-context/ai/0.5-rewrite.md` for the exact current sequence.
+Build the new 0.5 architecture under clean `engine/`, `protocol/`, and `remote/` boundaries, then physically remove the old stacks.

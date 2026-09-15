@@ -4,10 +4,7 @@
 
 The target is one bounded synchronization engine that works across local filesystems, SSH hosts, and eventually object stores.
 
-This document describes the **target**. Current conformance to it, the remaining
-live legacy paths, and the prioritized alignment roadmap are recorded in
-`agent-context/ai/0.5-alignment-audit.md`; accepted design decisions are in
-`agent-context/ai/0.5-design-audit.md`.
+This document describes the **target**.
 
 ## Design principles
 
