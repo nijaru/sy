@@ -10,7 +10,9 @@ Read, in order:
 
 1. `docs/architecture-0.5.md` — canonical target architecture and invariants.
 2. `agent-context/ai/0.5-rewrite.md` — current rewrite state, known debt, and implementation order.
-3. `~/.agents/skills/rust-cli/SKILL.md` — usage-rs and CLI conventions when changing the CLI.
+3. `agent-context/ai/0.5-design-audit.md` — accepted design decisions (rooted filesystem, bisync, compression, delta, object stores). Do not re-open these without new evidence.
+4. `agent-context/ai/0.5-alignment-audit.md` — current conformance findings (F1–F8) with evidence and the prioritized alignment roadmap.
+5. `~/.agents/skills/rust-cli/SKILL.md` — usage-rs and CLI conventions when changing the CLI.
 
 If old code disagrees with the 0.5 architecture docs, the docs define the intended direction unless a new finding demonstrates a better design.
 
