@@ -4,7 +4,7 @@
 .SH NAME
 sy \- Modern file synchronization tool
 .SH SYNOPSIS
-\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
+\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-max\-delete\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
 .SH DESCRIPTION
 Modern file synchronization tool
 .SH OPTIONS
@@ -218,20 +218,8 @@ List all available profiles
 \fB\-\-show\-profile\fR \fI<SHOW_PROFILE>\fR
 Show details of a specific profile
 .TP
-\fB\-\-bidirectional\fR
-Bidirectional sync mode \- sync changes in both directions Detects and resolves conflicts automatically based on \-\-conflict\-resolve strategy
-.TP
-\fB\-\-conflict\-resolve\fR \fI<CONFLICT_RESOLVE>\fR [default: newer]
-Conflict resolution strategy for bidirectional sync Options: newer (default), larger, smaller, source, dest, rename
-.TP
 \fB\-\-max\-delete\fR \fI<MAX_DELETE>\fR [default: 50%]
 Maximum deletions allowed \- Absolute count: \-\-max\-delete=1000 \- Percentage: \-\-max\-delete=50% \- 0 = unlimited (default: 50%)
-.TP
-\fB\-\-clear\-bisync\-state\fR
-Clear bidirectional sync state before syncing Forces full comparison instead of using cached state
-.TP
-\fB\-\-force\-resync\fR
-Force resync by ignoring corrupt state (recovery mode) Use this when bisync state file is corrupted All differences will be treated as new changes on first sync
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -12,8 +12,6 @@ pub mod temp_file;
 
 // Internal modules — public for binary/test access, not part of stable API
 #[doc(hidden)]
-pub mod bisync;
-#[doc(hidden)]
 pub mod endpoint;
 #[doc(hidden)]
 pub mod engine;
