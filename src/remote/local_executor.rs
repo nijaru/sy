@@ -15,6 +15,7 @@ use crate::endpoint::transfer::{transfer_file, TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
+use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::xattr::{
     apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
 };
@@ -55,6 +56,9 @@ pub enum LocalSyncError {
 
     #[error(transparent)]
     Xattr(#[from] RemoteXattrError),
+
+    #[error(transparent)]
+    Acl(#[from] RemoteAclError),
 }
 
 pub type Result<T> = std::result::Result<T, LocalSyncError>;
@@ -112,6 +116,10 @@ pub struct LocalSyncExecutor {
     /// destination for every entry this executor creates or updates. Symlinks
     /// are skipped (their attributes are not portable).
     xattrs: bool,
+    /// -A/--preserve-acls: mirror the source's access-control list onto the
+    /// destination for every entry this executor creates or updates.
+    /// Symlinks are skipped, like xattrs.
+    acls: bool,
     /// Post-write BLAKE3 verification (--verify).
     verify_on_write: bool,
     reporter: Option<Arc<crate::sync::output::SyncReporter>>,
@@ -133,6 +141,7 @@ impl LocalSyncExecutor {
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             xattrs: false,
+            acls: false,
             reporter: None,
         }
     }
@@ -174,6 +183,11 @@ impl LocalSyncExecutor {
 
     pub const fn with_xattrs(mut self, enabled: bool) -> Self {
         self.xattrs = enabled;
+        self
+    }
+
+    pub const fn with_acls(mut self, enabled: bool) -> Self {
+        self.acls = enabled;
         self
     }
 
@@ -221,6 +235,30 @@ impl LocalSyncExecutor {
     ) -> Result<()> {
         let location = XattrLocation::Local(self.destination_root.as_path());
         apply_preserved_xattrs(&location, path, kind, xattrs).await?;
+        Ok(())
+    }
+
+    /// Read the source's access-control list for one entry when `-A`
+    /// requested it. Symlinks are skipped, like xattrs.
+    async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
+        if !self.acls || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = AclLocation::Local(self.source_root.as_path());
+        let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
+        Ok(Some(acl.unwrap_or_default()))
+    }
+
+    /// Mirror an already-read access-control list onto the local
+    /// destination.
+    async fn write_destination_acls(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        acl: &str,
+    ) -> Result<()> {
+        let location = AclLocation::Local(self.destination_root.as_path());
+        apply_preserved_acls(&location, path, kind, acl).await?;
         Ok(())
     }
 
@@ -349,11 +387,16 @@ impl LocalSyncExecutor {
                 // Read the source's attributes before creating anything so a
                 // source metadata failure cannot leave a partial entry.
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|error| LocalSyncError::Destination(path.clone(), error))?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 self.report(
@@ -381,6 +424,7 @@ impl LocalSyncExecutor {
                 let is_update = destination.is_some();
                 // Read the source attributes before any destination mutation.
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
                     self.backup_replacement_file(&source.path).await?;
                 }
@@ -389,6 +433,10 @@ impl LocalSyncExecutor {
                     .await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 self.remove_committed_source(&source).await?;
@@ -423,6 +471,7 @@ impl LocalSyncExecutor {
                 modified,
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 let path = self.destination_path(&source.path);
                 if let Some(mode) = unix_mode {
                     self.set_mode(&path, mode).await?;
@@ -434,6 +483,10 @@ impl LocalSyncExecutor {
                 }
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 Ok(None)
@@ -487,6 +540,7 @@ impl LocalSyncExecutor {
         let is_update = destination.is_some();
         // Read the source attributes before any destination mutation.
         let xattrs = self.read_source_xattrs(&source).await?;
+        let acls = self.read_source_acls(&source).await?;
         if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
             self.backup_replacement_file(&source.path).await?;
         }
@@ -495,6 +549,10 @@ impl LocalSyncExecutor {
             .await?;
         if let Some(xattrs) = xattrs.as_deref() {
             self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                .await?;
+        }
+        if let Some(acls) = acls.as_deref() {
+            self.write_destination_acls(&source.path, source.kind, acls)
                 .await?;
         }
         groups.insert(group, source.path.clone());

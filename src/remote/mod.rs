@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod fetch;
 pub mod hash;
 pub mod local_executor;
@@ -220,6 +221,14 @@ fn process_capabilities() -> CapabilitySet {
     if supports_xattrs(os) {
         capabilities.insert(CapabilitySet::XATTR);
     }
+    // Access-control lists are owned the same way: Linux reuses exacl on a
+    // `/proc/self/fd` alias of the held no-follow leaf, macOS drives fd
+    // syscalls directly, and every executor mirrors the source list after a
+    // mutation. Advertised only where the implementation exists, i.e. with
+    // the `acl` feature on the Unix data-plane family.
+    if acl_advertised_for(os) {
+        capabilities.insert(CapabilitySet::ACL);
+    }
     // Compressed Data frames are decodable wherever zstd is linked, which is
     // everywhere this crate builds.
     capabilities.insert(CapabilitySet::ZSTD);
@@ -246,6 +255,29 @@ const fn supports_hardlinks(os: PlatformOs) -> bool {
 /// both supported 0.5 data-plane platforms advertise it.
 const fn supports_xattrs(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+/// Access-control confinement matches xattrs (held no-follow leaf on both
+/// data-plane platforms), but the implementation additionally requires the
+/// `acl` feature that links exacl/libacl. The capability is inserted under
+/// that feature gate at the call site.
+const fn supports_acls(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+/// Whether this build advertises the ACL capability for `os`: the
+/// implementation exists only with the `acl` feature on the Unix data-plane
+/// family.
+const fn acl_advertised_for(os: PlatformOs) -> bool {
+    #[cfg(all(unix, feature = "acl"))]
+    {
+        supports_acls(os)
+    }
+    #[cfg(not(all(unix, feature = "acl")))]
+    {
+        let _ = os;
+        false
+    }
 }
 
 async fn prepare_root(operation: Operation, root: &Path) -> Result<()> {
@@ -456,7 +488,10 @@ mod tests {
             client.ready.capabilities.contains(CapabilitySet::XATTR),
             supports_xattrs(Platform::current().os)
         );
-        assert!(!client.ready.capabilities.contains(CapabilitySet::ACL));
+        assert_eq!(
+            client.ready.capabilities.contains(CapabilitySet::ACL),
+            acl_advertised_for(Platform::current().os),
+        );
         assert_eq!(
             client.ready.capabilities.contains(CapabilitySet::HARDLINK),
             supports_hardlinks(Platform::current().os)
@@ -487,9 +522,12 @@ mod tests {
                 | CapabilitySet::RANDOM_WRITE
                 | CapabilitySet::REFLINK
                 | CapabilitySet::SPARSE
-                | CapabilitySet::ACL
                 | CapabilitySet::BSD_FLAGS
         ));
+        assert_eq!(
+            local.contains(CapabilitySet::ACL),
+            acl_advertised_for(Platform::current().os)
+        );
 
         let peer = CapabilitySet::BLAKE3 | CapabilitySet::MULTIPLEXING;
         assert_eq!(negotiated_capabilities(peer), peer);
@@ -525,6 +563,14 @@ mod tests {
         assert!(supports_xattrs(PlatformOs::Macos));
         assert!(!supports_xattrs(PlatformOs::Windows));
         assert!(!supports_xattrs(PlatformOs::Other(4)));
+    }
+
+    #[test]
+    fn acls_are_scoped_to_tested_os_family() {
+        assert!(supports_acls(PlatformOs::Linux));
+        assert!(supports_acls(PlatformOs::Macos));
+        assert!(!supports_acls(PlatformOs::Windows));
+        assert!(!supports_acls(PlatformOs::Other(4)));
     }
 
     #[tokio::test]

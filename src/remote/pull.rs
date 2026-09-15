@@ -19,6 +19,7 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
+use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::fetch::fetch_file;
 use crate::remote::router::RouterSender;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
@@ -61,6 +62,9 @@ pub enum RemotePullError {
 
     #[error(transparent)]
     Xattr(#[from] RemoteXattrError),
+
+    #[error(transparent)]
+    Acl(#[from] RemoteAclError),
 }
 
 pub type Result<T> = std::result::Result<T, RemotePullError>;
@@ -121,6 +125,10 @@ pub struct RemotePullExecutor {
     /// onto the local destination for every entry this executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
     xattrs: bool,
+    /// -A/--preserve-acls: mirror the remote source's access-control list
+    /// onto the local destination for every entry this executor creates or
+    /// updates. Symlinks are skipped, like xattrs.
+    acls: bool,
 }
 
 impl RemotePullExecutor {
@@ -144,6 +152,7 @@ impl RemotePullExecutor {
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             xattrs: false,
+            acls: false,
         }
     }
 
@@ -188,6 +197,11 @@ impl RemotePullExecutor {
         self
     }
 
+    pub const fn with_acls(mut self, enabled: bool) -> Self {
+        self.acls = enabled;
+        self
+    }
+
     pub fn with_rate_limiter(
         mut self,
         limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
@@ -224,11 +238,16 @@ impl RemotePullExecutor {
                 // Read the source's attributes before creating anything so a
                 // source metadata failure cannot leave a partial entry.
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 self.report(
@@ -258,6 +277,7 @@ impl RemotePullExecutor {
                 // (backup or fetch) so a source metadata failure cannot leave
                 // a half-mutated destination.
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 // --backup preserves the replaced destination file first, as a
                 // local copy (the destination is local in a pull). A backup
                 // failure aborts the fetch so the user's copy cannot be
@@ -280,6 +300,10 @@ impl RemotePullExecutor {
                 let summary = self.fetch_into_staging(&source, &metadata).await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 let op = if is_update {
@@ -312,6 +336,7 @@ impl RemotePullExecutor {
                 modified,
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 let dest = self.dest_path(&source.path);
                 if let Some(mode) = unix_mode {
                     set_local_mode(&dest, mode).await?;
@@ -323,6 +348,10 @@ impl RemotePullExecutor {
                 }
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 Ok(None)
@@ -386,6 +415,7 @@ impl RemotePullExecutor {
         let is_update = destination.is_some();
         // Read the remote source attributes before any local mutation.
         let xattrs = self.read_source_xattrs(&source).await?;
+        let acls = self.read_source_acls(&source).await?;
         if let Some(existing) = &destination {
             if existing.is_file() && self.backup_enabled() {
                 let backup_abs = self.backup_destination_for(&existing.path)?;
@@ -402,6 +432,10 @@ impl RemotePullExecutor {
         let summary = self.fetch_into_staging(&source, &metadata).await?;
         if let Some(xattrs) = xattrs.as_deref() {
             self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                .await?;
+        }
+        if let Some(acls) = acls.as_deref() {
+            self.write_destination_acls(&source.path, source.kind, acls)
                 .await?;
         }
         groups.insert(group, source.path.clone());
@@ -497,6 +531,30 @@ impl RemotePullExecutor {
     ) -> Result<()> {
         let location = XattrLocation::Local(self.destination_root.as_path());
         apply_preserved_xattrs(&location, path, kind, xattrs).await?;
+        Ok(())
+    }
+
+    /// Read the remote source's access-control list for one entry when `-A`
+    /// requested it. Symlinks are skipped, like xattrs.
+    async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
+        if !self.acls || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = AclLocation::Remote(&self.remote);
+        let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
+        Ok(Some(acl.unwrap_or_default()))
+    }
+
+    /// Mirror an already-read access-control list onto the local
+    /// destination.
+    async fn write_destination_acls(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        acl: &str,
+    ) -> Result<()> {
+        let location = AclLocation::Local(self.destination_root.as_path());
+        apply_preserved_acls(&location, path, kind, acl).await?;
         Ok(())
     }
 

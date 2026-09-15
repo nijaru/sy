@@ -12,6 +12,7 @@ use crate::engine::scan::ScanRequest;
 use crate::protocol::{
     CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
 };
+use crate::remote::acl::serve_incoming_acl_rooted;
 use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
 use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
@@ -405,6 +406,7 @@ pub enum IncomingRequest {
     Metadata(IncomingStream),
     Mutation(IncomingStream),
     Xattr(IncomingStream),
+    Acl(IncomingStream),
 }
 
 #[derive(Clone)]
@@ -522,6 +524,30 @@ impl ServerXattrHandler {
     }
 }
 
+/// Access-control read/write requests use the same session-pinned root
+/// descriptor, with the same Pull-session write refusal as xattrs: the
+/// remote root is the read-only source there.
+#[derive(Clone)]
+pub struct ServerAclHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+    operation: Operation,
+}
+
+impl ServerAclHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::acl::Result<()> {
+        serve_incoming_acl_rooted(
+            self.rooted.clone(),
+            incoming,
+            &self.sender,
+            self.peer,
+            self.operation,
+        )
+        .await
+    }
+}
+
 pub struct ServerRemoteSession {
     opened: OpenedServerSession,
     router: FrameRouter,
@@ -619,6 +645,15 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn acl_handler(&self) -> ServerAclHandler {
+        ServerAclHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+            operation: self.opened.operation,
+        }
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
@@ -644,6 +679,9 @@ impl ServerRemoteSession {
             // write in a Pull session because the remote root is then the
             // read-only source.
             FrameKind::XattrRequest => Ok(Some(IncomingRequest::Xattr(incoming))),
+            // ACL reads are valid in both directions, with the same
+            // Pull-session write refusal as xattrs.
+            FrameKind::AclRequest => Ok(Some(IncomingRequest::Acl(incoming))),
             FrameKind::FileBegin | FrameKind::Metadata | FrameKind::Mutation => {
                 Err(RemoteSessionError::OperationMismatch {
                     operation: self.opened.operation,
@@ -820,7 +858,8 @@ mod tests {
                     | IncomingRequest::FileFetch(_)
                     | IncomingRequest::Metadata(_)
                     | IncomingRequest::Mutation(_)
-                    | IncomingRequest::Xattr(_) => {
+                    | IncomingRequest::Xattr(_)
+                    | IncomingRequest::Acl(_) => {
                         panic!("unexpected mutation request")
                     }
                 }

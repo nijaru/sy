@@ -1,7 +1,7 @@
 use crate::remote::fetch::serve_incoming_file_fetch;
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
-    IncomingRequest, RemoteSessionError, ServerFileHandler, ServerHashHandler,
+    IncomingRequest, RemoteSessionError, ServerAclHandler, ServerFileHandler, ServerHashHandler,
     ServerMetadataHandler, ServerMutationHandler, ServerRemoteSession, ServerScanHandler,
     ServerSignatureHandler, ServerXattrHandler,
 };
@@ -33,6 +33,7 @@ struct RequestHandlers {
     metadata: ServerMetadataHandler,
     mutation: ServerMutationHandler,
     xattr: ServerXattrHandler,
+    acl: ServerAclHandler,
     fetch: ServerFetchHandler,
 }
 
@@ -67,6 +68,7 @@ where
         metadata: session.metadata_handler(),
         mutation: session.mutation_handler(),
         xattr: session.xattr_handler(),
+        acl: session.acl_handler(),
         fetch: fetch_handler(&session),
     };
     let mut tasks = JoinSet::<RequestResult>::new();
@@ -202,6 +204,15 @@ fn spawn_request(
         }
         IncomingRequest::Xattr(incoming) => {
             let handler = handlers.xattr.clone();
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::Acl(incoming) => {
+            let handler = handlers.acl.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)

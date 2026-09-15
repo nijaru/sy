@@ -1,3 +1,4 @@
+mod acl;
 mod codec;
 mod entry;
 mod fetch;
@@ -13,6 +14,7 @@ mod signature;
 mod transfer;
 mod xattr;
 
+pub use acl::{AclMode, WireAcl, WireAclRequest, WireAclResult, MAX_ACL_TEXT_BYTES};
 pub use entry::{WireEntry, WireEntryKind};
 pub use fetch::WireFileFetchRequest;
 pub use frame::{
@@ -99,6 +101,9 @@ pub enum ProtocolError {
 
     #[error("too many xattr entries: {count} (maximum {max})")]
     TooManyXattrs { count: usize, max: usize },
+
+    #[error("acl text exceeds maximum size: {len} bytes (maximum {max})")]
+    AclTextTooLarge { len: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
