@@ -11,6 +11,7 @@ mod scan;
 mod session;
 mod signature;
 mod transfer;
+mod xattr;
 
 pub use entry::{WireEntry, WireEntryKind};
 pub use fetch::WireFileFetchRequest;
@@ -37,6 +38,10 @@ pub use signature::{
 pub use transfer::{
     WireData, WireDeltaCopy, WireFileBasis, WireFileBegin, WireFileEnd, MAX_DELTA_COPY_SIZE,
     MAX_TRANSFER_DATA_SIZE, TRANSFER_BASIS_IDENTITY_LEN, TRANSFER_DIGEST_LEN,
+};
+pub use xattr::{
+    WireXattr, WireXattrRequest, WireXattrResult, XattrMode, MAX_XATTR_ENTRIES,
+    MAX_XATTR_NAME_BYTES, MAX_XATTR_TOTAL_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +90,15 @@ pub enum ProtocolError {
         client: VersionRange,
         server: VersionRange,
     },
+
+    #[error("xattr name exceeds maximum length: {len} bytes (maximum {max})")]
+    XattrNameTooLong { len: usize, max: usize },
+
+    #[error("xattr set exceeds maximum size: {len} bytes (maximum {max})")]
+    XattrPayloadTooLarge { len: usize, max: usize },
+
+    #[error("too many xattr entries: {count} (maximum {max})")]
+    TooManyXattrs { count: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;

@@ -3,7 +3,7 @@ use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
     IncomingRequest, RemoteSessionError, ServerFileHandler, ServerHashHandler,
     ServerMetadataHandler, ServerMutationHandler, ServerRemoteSession, ServerScanHandler,
-    ServerSignatureHandler,
+    ServerSignatureHandler, ServerXattrHandler,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
@@ -32,6 +32,7 @@ struct RequestHandlers {
     file: ServerFileHandler,
     metadata: ServerMetadataHandler,
     mutation: ServerMutationHandler,
+    xattr: ServerXattrHandler,
     fetch: ServerFetchHandler,
 }
 
@@ -65,6 +66,7 @@ where
         file: session.file_handler(),
         metadata: session.metadata_handler(),
         mutation: session.mutation_handler(),
+        xattr: session.xattr_handler(),
         fetch: fetch_handler(&session),
     };
     let mut tasks = JoinSet::<RequestResult>::new();
@@ -191,6 +193,15 @@ fn spawn_request(
         }
         IncomingRequest::Mutation(incoming) => {
             let handler = handlers.mutation.clone();
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::Xattr(incoming) => {
+            let handler = handlers.xattr.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)

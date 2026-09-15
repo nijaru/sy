@@ -20,6 +20,7 @@ use crate::remote::transfer::{
     request_file_transfer, request_file_transfer_with_policy, RemoteDeltaBasis, TransferMetadata,
     TransferSummary,
 };
+use crate::remote::xattr::{request_read_xattrs, request_write_xattrs};
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
@@ -271,6 +272,32 @@ impl ClientRemoteHandle {
     pub async fn hardlink(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_hardlink(&self.sender, source, destination, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Read the remote peer's extended attributes for one entry (`-X`). Used
+    /// when the remote root is the source (a pull).
+    pub async fn read_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+    ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+        request_read_xattrs(&self.sender, path, kind, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mirror an extended-attribute set onto the remote destination for one
+    /// entry (`-X`). Push-only: a Pull session's remote root is source-only.
+    pub async fn write_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        xattrs: &[(std::ffi::OsString, Vec<u8>)],
+    ) -> Result<()> {
+        self.require_push(FrameKind::XattrRequest)?;
+        request_write_xattrs(&self.sender, path, kind, xattrs, self.peer)
             .await
             .map_err(Into::into)
     }

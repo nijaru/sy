@@ -7,7 +7,11 @@ use crate::engine::work::WorkItem;
 use crate::protocol::CapabilitySet;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{RemoteDeltaBasis, TransferMetadata, TransferSummary};
+use crate::remote::xattr::{
+    apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
+};
 use crate::transfer::delta::BasisIndexLimits;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Existing v2 uses 10 MiB as the point where rolling-delta setup starts to
@@ -90,6 +94,9 @@ pub enum RemotePushError {
 
     #[error(transparent)]
     Lower(#[from] RemotePushLowerError),
+
+    #[error(transparent)]
+    Xattr(#[from] RemoteXattrError),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -404,6 +411,10 @@ pub struct RemotePushExecutor {
     /// moves bytes correctly, just without link sharing.
     hardlinks: bool,
     hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
+    /// -X/--preserve-xattrs: mirror the local source's extended attributes
+    /// onto the remote destination for every entry the executor creates or
+    /// updates. Symlinks are skipped (their attributes are not portable).
+    xattrs: bool,
     /// Per-operation output (`-i`/`--json`). `None` prints nothing.
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
@@ -516,6 +527,7 @@ impl RemotePushExecutor {
             compression: None,
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            xattrs: false,
             reporter: None,
         }
     }
@@ -537,6 +549,11 @@ impl RemotePushExecutor {
 
     pub const fn with_hardlinks(mut self, enabled: bool) -> Self {
         self.hardlinks = enabled;
+        self
+    }
+
+    pub const fn with_xattrs(mut self, enabled: bool) -> Self {
+        self.xattrs = enabled;
         self
     }
 
@@ -573,7 +590,15 @@ impl RemotePushExecutor {
 
         match action {
             RemotePushAction::CreateDirectory { source } => {
+                // Read the source's attributes before the first mutation so a
+                // source metadata failure cannot leave a half-created
+                // destination entry behind.
+                let xattrs = self.read_source_xattrs(&source).await?;
                 self.remote.create_directory(&source.path).await?;
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
@@ -616,6 +641,7 @@ impl RemotePushExecutor {
                     }
                 }
                 let delta_basis = self.prepare_delta_basis(destination).await?;
+                let xattrs = self.read_source_xattrs(&source).await?;
                 let summary = self
                     .remote
                     .transfer_file_with_policy(
@@ -626,6 +652,10 @@ impl RemotePushExecutor {
                         self.compression,
                     )
                     .await?;
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
                 self.remove_committed_source(&source).await?;
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
@@ -658,9 +688,14 @@ impl RemotePushExecutor {
                 unix_mode,
                 modified,
             } => {
+                let xattrs = self.read_source_xattrs(&source).await?;
                 self.remote
                     .apply_metadata(&source.path, source.kind, unix_mode, modified)
                     .await?;
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
                 Ok(None)
             }
         }
@@ -714,6 +749,7 @@ impl RemotePushExecutor {
             }
         }
         let delta_basis = self.prepare_delta_basis(destination).await?;
+        let xattrs = self.read_source_xattrs(&source).await?;
         let summary = self
             .remote
             .transfer_file_with_policy(
@@ -724,6 +760,10 @@ impl RemotePushExecutor {
                 self.compression,
             )
             .await?;
+        if let Some(xattrs) = xattrs.as_deref() {
+            self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                .await?;
+        }
         groups.insert(group, source.path.clone());
         drop(groups);
         self.remove_committed_source(&source).await?;
@@ -924,6 +964,30 @@ impl RemotePushExecutor {
             entry: destination,
             index,
         }))
+    }
+
+    /// Read the local source's extended attributes for one entry when `-X`
+    /// requested them. Symlinks carry no portable mutable attributes, so they
+    /// are skipped rather than having their targets resolved.
+    async fn read_source_xattrs(&self, source: &Entry) -> Result<Option<Vec<(OsString, Vec<u8>)>>> {
+        if !self.xattrs || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = XattrLocation::Local(self.source_root.as_path());
+        let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
+        Ok(Some(xattrs))
+    }
+
+    /// Mirror an already-read attribute set onto the remote destination.
+    async fn write_destination_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        xattrs: &[(OsString, Vec<u8>)],
+    ) -> Result<()> {
+        let location = XattrLocation::Remote(&self.remote);
+        apply_preserved_xattrs(&location, path, kind, xattrs).await?;
+        Ok(())
     }
 }
 

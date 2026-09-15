@@ -46,6 +46,12 @@ pub enum RootedFsError {
     #[error("timestamp seconds are not representable by this platform")]
     TimestampOutOfRange,
 
+    #[error("extended attributes exceed the bounded set size: {len} bytes (maximum {max})")]
+    XattrSetTooLarge { len: usize, max: usize },
+
+    #[error("extended attributes are not preserved for symlinks")]
+    UnsupportedSymlinkXattrs,
+
     #[error("could not allocate a unique staging file after {0} attempts")]
     StagingNameExhausted(usize),
 
@@ -254,6 +260,38 @@ impl RootedFs {
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn remove_blocking(&self, relative: &RelativePath, is_directory: bool) -> Result<()> {
         self.remove_path_blocking(relative.as_path(), is_directory)
+    }
+
+    /// Read every extended attribute of one file or directory beneath the
+    /// pinned root. The leaf is opened without following a symlink and the
+    /// attributes are read through that held descriptor, so a raced path swap
+    /// cannot redirect the read. The total set is bounded; an oversized set is
+    /// refused loudly rather than truncated. Symlinks are refused (their
+    /// attributes are not portable and reading them would resolve the target).
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn read_xattrs_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
+        self.read_xattrs_path_blocking(relative.as_path(), kind)
+    }
+
+    /// Mirror an extended-attribute set onto one file or directory beneath the
+    /// pinned root: every requested attribute is set and every existing
+    /// attribute absent from the request is removed. The leaf is opened without
+    /// following a symlink and every mutation goes through that held
+    /// descriptor. Symlinks are refused.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn write_xattrs_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        xattrs: &[(OsString, Vec<u8>)],
+    ) -> Result<()> {
+        self.write_xattrs_path_blocking(relative.as_path(), kind, xattrs)
     }
 
     /// Apply requested metadata to an existing entry beneath the pinned root.
@@ -603,6 +641,121 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
+    fn read_xattrs_path_blocking(
+        &self,
+        relative: &Path,
+        kind: EntryKind,
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
+        use xattr::FileExt;
+
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        let mut xattrs = Vec::new();
+        let mut total = 0_usize;
+        for name in file.list_xattr()? {
+            // A value may be large on filesystems that store it out of line
+            // (macOS resource forks). The running total is checked before the
+            // value is retained so an oversized set fails loudly.
+            let Some(value) = file.get_xattr(&name)? else {
+                continue;
+            };
+            total = total
+                .checked_add(name.as_bytes().len())
+                .and_then(|value_total| value_total.checked_add(value.len()))
+                .ok_or(RootedFsError::XattrSetTooLarge {
+                    len: usize::MAX,
+                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+                })?;
+            if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
+                return Err(RootedFsError::XattrSetTooLarge {
+                    len: total,
+                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+                });
+            }
+            xattrs.push((name, value));
+        }
+        Ok(xattrs)
+    }
+
+    #[cfg(not(unix))]
+    fn read_xattrs_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn write_xattrs_path_blocking(
+        &self,
+        relative: &Path,
+        kind: EntryKind,
+        xattrs: &[(OsString, Vec<u8>)],
+    ) -> Result<()> {
+        use xattr::FileExt;
+
+        let total = xattrs.iter().try_fold(0_usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_bytes().len())
+                .and_then(|value_total| value_total.checked_add(value.len()))
+                .ok_or(RootedFsError::XattrSetTooLarge {
+                    len: usize::MAX,
+                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+                })
+        })?;
+        if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
+            return Err(RootedFsError::XattrSetTooLarge {
+                len: total,
+                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+            });
+        }
+
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        for (name, value) in xattrs {
+            file.set_xattr(name, value)?;
+        }
+        // Mirror semantics: attributes that exist only on the destination are
+        // removed so stale values cannot survive a sync.
+        for existing in file.list_xattr()? {
+            if !xattrs.iter().any(|(name, _)| name == &existing) {
+                file.remove_xattr(&existing)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn write_xattrs_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _xattrs: &[(OsString, Vec<u8>)],
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Open one file or directory leaf for descriptor-based attribute access.
+    /// The parent is resolved without following peer-controlled symlinks and
+    /// the leaf is opened without following a symlink, so both reading and
+    /// writing attributes stay confined to the held root.
+    #[cfg(unix)]
+    fn open_xattr_entry_blocking(&self, relative: &Path, kind: EntryKind) -> Result<File> {
+        let (parent, leaf) = self.open_parent_blocking(relative)?;
+        let file = match kind {
+            EntryKind::File => {
+                let file = open_file_at(parent.as_raw_fd(), &leaf)?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(RootedFsError::NotRegularFile(relative.to_path_buf()));
+                }
+                file
+            }
+            EntryKind::Directory => File::from(open_dir_at(parent.as_raw_fd(), &leaf)?),
+            EntryKind::Symlink => return Err(RootedFsError::UnsupportedSymlinkXattrs),
+        };
+        Ok(file)
+    }
+
+    #[cfg(unix)]
     fn open_parent_blocking(&self, relative: &Path) -> Result<(OwnedFd, OsString)> {
         let mut components = relative.components().peekable();
         if components.peek().is_none() {
@@ -869,6 +1022,16 @@ mod tests {
         RelativePath::new(PathBuf::from(path)).unwrap()
     }
 
+    /// Keep only the caller's attribute namespace. macOS attaches
+    /// `com.apple.provenance` to freshly written files, so tests must not
+    /// assume the file has exactly the attributes they set.
+    fn user_xattrs(xattrs: Vec<(OsString, Vec<u8>)>) -> Vec<(OsString, Vec<u8>)> {
+        xattrs
+            .into_iter()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("user."))
+            .collect()
+    }
+
     #[tokio::test]
     async fn opens_nested_regular_file_beneath_held_root() {
         let root = tempfile::TempDir::new().unwrap();
@@ -1073,6 +1236,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rooted_xattrs_round_trip_and_mirror_removes_stale_values() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let name = OsString::from("user.sy-test");
+
+        rooted
+            .write_xattrs_blocking(
+                &relative("file"),
+                EntryKind::File,
+                &[(name.clone(), b"one".to_vec())],
+            )
+            .unwrap();
+        assert_eq!(
+            user_xattrs(
+                rooted
+                    .read_xattrs_blocking(&relative("file"), EntryKind::File)
+                    .unwrap()
+            ),
+            vec![(name.clone(), b"one".to_vec())]
+        );
+
+        // Mirroring an empty set clears stale destination attributes.
+        rooted
+            .write_xattrs_blocking(&relative("file"), EntryKind::File, &[])
+            .unwrap();
+        assert!(user_xattrs(
+            rooted
+                .read_xattrs_blocking(&relative("file"), EntryKind::File)
+                .unwrap()
+        )
+        .is_empty());
+
+        rooted
+            .write_xattrs_blocking(
+                &relative("dir"),
+                EntryKind::Directory,
+                &[(name.clone(), b"dir".to_vec())],
+            )
+            .unwrap();
+        assert_eq!(
+            user_xattrs(
+                rooted
+                    .read_xattrs_blocking(&relative("dir"), EntryKind::Directory)
+                    .unwrap()
+            ),
+            vec![(name, b"dir".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_xattrs_refuse_parent_escape_and_symlink_leaf() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("file"), b"outside").unwrap();
+        std::fs::write(root.path().join("real"), b"real").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file"), root.path().join("leaf")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let name = OsString::from("user.sy-test");
+
+        assert!(rooted
+            .read_xattrs_blocking(&relative("escape/file"), EntryKind::File)
+            .is_err());
+        assert!(rooted
+            .read_xattrs_blocking(&relative("leaf"), EntryKind::File)
+            .is_err());
+        assert!(rooted
+            .write_xattrs_blocking(
+                &relative("escape/file"),
+                EntryKind::File,
+                &[(name.clone(), b"escape".to_vec())],
+            )
+            .is_err());
+        assert!(rooted
+            .write_xattrs_blocking(
+                &relative("leaf"),
+                EntryKind::File,
+                &[(name, b"escape".to_vec())],
+            )
+            .is_err());
+        assert!(xattr::get(outside.path().join("file"), "user.sy-test")
+            .unwrap()
+            .is_none());
+    }
     #[tokio::test]
     async fn dropped_stage_preserves_destination_and_removes_temp() {
         let root = tempfile::TempDir::new().unwrap();

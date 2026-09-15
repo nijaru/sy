@@ -648,6 +648,7 @@ fn is_stream_opening_kind(kind: FrameKind) -> bool {
             | FrameKind::FileBegin
             | FrameKind::Metadata
             | FrameKind::Mutation
+            | FrameKind::XattrRequest
     )
 }
 
