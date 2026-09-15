@@ -33,14 +33,10 @@ use sy::remote::push_controller::{
 
 /// Whether a local sync must use the legacy TaskExecutor path.
 ///
-/// Only BSD flags remain there; everything else landed on this executor so
-/// preservation lands once rather than twice.
-pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.flags {
-        return Some(
-            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
-        );
-    }
+/// The preservation cluster is complete on v3, so nothing routes to legacy
+/// anymore. The function stays until item 7 deletes the condemned stacks
+/// (P2); it exists so the call sites keep their loud second gate.
+pub(super) fn legacy_fallback_reason(_config: &SyncConfig) -> Option<&'static str> {
     None
 }
 
@@ -210,6 +206,7 @@ pub(super) async fn run(
     .with_hardlinks(config.preserve.hardlinks)
     .with_xattrs(config.preserve.xattrs)
     .with_acls(config.preserve.acls)
+    .with_bsd_flags(config.preserve.flags)
     .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
@@ -410,5 +407,60 @@ mod tests {
 
         let cleared = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
         assert_eq!(cleared, base_text);
+    }
+
+    /// -F/--preserve-flags locally: the source flag word is mirrored onto
+    /// the destination after the transfer, and a later pass clears flags
+    /// the source dropped (macOS only).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bsd_flags_are_mirrored_and_cleared_locally() {
+        use std::ffi::CString;
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+
+        fn set_flags(path: &std::path::Path, flags: u32) {
+            let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `cpath` is a live NUL-terminated pathname borrowed for
+            // the duration of the call.
+            let ret = unsafe { libc::chflags(cpath.as_ptr(), flags) };
+            assert_eq!(ret, 0);
+        }
+
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        set_flags(&source_file, 0x1);
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.flags = true;
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        assert_eq!(
+            std::fs::metadata(&destination_file).unwrap().st_flags(),
+            0x1
+        );
+
+        std::fs::write(&source_file, b"one-two").unwrap();
+        set_flags(&source_file, 0);
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::metadata(&destination_file).unwrap().st_flags(), 0);
     }
 }

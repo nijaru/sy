@@ -38,6 +38,11 @@ use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 /// so it lands once, not twice. Pull-specific refusals (delete,
 /// remove-source-files, copy-links) are handled by CLI validation before a
 /// connection is opened; this returns None for every pull the CLI accepts.
+/// Whether a pull must fall back to the legacy v2 stack.
+///
+/// The preservation cluster is complete on v3 (pull-specific refusals for
+/// delete, remove-source-files, and copy-links stay, handled below). The
+/// function stays until item 7 deletes the condemned stacks (P2).
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
     if config.delete.is_enabled() {
         return Some("v3 pull --delete is not yet implemented (remote ignore-scope delete protection is the remaining design)");
@@ -47,11 +52,6 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     }
     if config.preserve.symlink_mode == SymlinkMode::Follow {
         return Some("v3 pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
-    }
-    if config.preserve.flags {
-        return Some(
-            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
-        );
     }
     None
 }
@@ -196,6 +196,7 @@ async fn execute_with_handle(
             .with_hardlinks(config.preserve.hardlinks)
             .with_xattrs(config.preserve.xattrs)
             .with_acls(config.preserve.acls)
+            .with_bsd_flags(config.preserve.flags)
             .with_rate_limiter(rate_limiter);
 
     let scan_elapsed = scan_started.elapsed();
@@ -515,6 +516,93 @@ mod tests {
         assert_eq!(mirrored, source_text);
     }
 
+    /// -F/--preserve-flags over v3 pull: the remote source's flag word is
+    /// read through the pinned root and mirrored onto the local destination
+    /// after the staged commit (macOS only).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bsd_flags_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+        use std::ffi::CString;
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"pull-bytes").unwrap();
+        let cpath = CString::new(source_file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `cpath` is a live NUL-terminated pathname borrowed for
+        // the duration of the call. UF_NODUMP is inert for the test itself.
+        assert_eq!(unsafe { libc::chflags(cpath.as_ptr(), 0x1) }, 0);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            let flags_handler = session.bsd_flags_handler();
+            // Remote scan, then the flags read and the whole-file fetch:
+            // exactly three requests, so an extra round-trip regression
+            // cannot hide.
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::BsdFlags(incoming) => {
+                        flags_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::FileFetch(incoming) => {
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _other => panic!("unexpected v3 pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.flags = true;
+        execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            std::fs::metadata(destination_root.path().join("file"))
+                .unwrap()
+                .st_flags(),
+            0x1
+        );
+    }
+
     /// --compress pulls compressed chunks end-to-end: the fetch request sets
     /// the compression bit, the server streams zstd frames, and the staged
     /// bytes still verify against the server-reported digest.
@@ -692,14 +780,14 @@ mod tests {
         config.timeout = Some(30);
         assert_eq!(legacy_fallback_reason(&config), None);
 
-        // -X/-A route to v3; BSD flags still refuse.
+        // -X/-A/-F route to v3; only pull-specific refusals remain.
         config.preserve.xattrs = true;
         assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = true;
         assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = false;
         config.preserve.flags = true;
-        assert!(legacy_fallback_reason(&config).is_some());
+        assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.flags = false;
 
         // The refused cluster keeps its reasons for defense-in-depth: if

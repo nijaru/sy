@@ -20,6 +20,9 @@ use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
+use crate::remote::bsdflags::{
+    apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
+};
 use crate::remote::fetch::fetch_file;
 use crate::remote::router::RouterSender;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
@@ -65,6 +68,9 @@ pub enum RemotePullError {
 
     #[error(transparent)]
     Acl(#[from] RemoteAclError),
+
+    #[error(transparent)]
+    BsdFlags(#[from] RemoteBsdFlagsError),
 }
 
 pub type Result<T> = std::result::Result<T, RemotePullError>;
@@ -129,6 +135,10 @@ pub struct RemotePullExecutor {
     /// onto the local destination for every entry this executor creates or
     /// updates. Symlinks are skipped, like xattrs.
     acls: bool,
+    /// -F/--preserve-flags (macOS only): mirror the remote source's BSD
+    /// file flags onto the local destination for every entry this executor
+    /// creates or updates. Symlinks are skipped, like xattrs.
+    bsd_flags: bool,
 }
 
 impl RemotePullExecutor {
@@ -153,6 +163,7 @@ impl RemotePullExecutor {
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             xattrs: false,
             acls: false,
+            bsd_flags: false,
         }
     }
 
@@ -202,6 +213,11 @@ impl RemotePullExecutor {
         self
     }
 
+    pub const fn with_bsd_flags(mut self, enabled: bool) -> Self {
+        self.bsd_flags = enabled;
+        self
+    }
+
     pub fn with_rate_limiter(
         mut self,
         limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
@@ -239,6 +255,7 @@ impl RemotePullExecutor {
                 // source metadata failure cannot leave a partial entry.
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
@@ -248,6 +265,10 @@ impl RemotePullExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 self.report(
@@ -278,6 +299,7 @@ impl RemotePullExecutor {
                 // a half-mutated destination.
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 // --backup preserves the replaced destination file first, as a
                 // local copy (the destination is local in a pull). A backup
                 // failure aborts the fetch so the user's copy cannot be
@@ -304,6 +326,10 @@ impl RemotePullExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 let op = if is_update {
@@ -337,6 +363,7 @@ impl RemotePullExecutor {
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 let dest = self.dest_path(&source.path);
                 if let Some(mode) = unix_mode {
                     set_local_mode(&dest, mode).await?;
@@ -352,6 +379,10 @@ impl RemotePullExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 Ok(None)
@@ -416,6 +447,7 @@ impl RemotePullExecutor {
         // Read the remote source attributes before any local mutation.
         let xattrs = self.read_source_xattrs(&source).await?;
         let acls = self.read_source_acls(&source).await?;
+        let bsd_flags = self.read_source_bsd_flags(&source).await?;
         if let Some(existing) = &destination {
             if existing.is_file() && self.backup_enabled() {
                 let backup_abs = self.backup_destination_for(&existing.path)?;
@@ -436,6 +468,10 @@ impl RemotePullExecutor {
         }
         if let Some(acls) = acls.as_deref() {
             self.write_destination_acls(&source.path, source.kind, acls)
+                .await?;
+        }
+        if let Some(flags) = bsd_flags {
+            self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
         }
         groups.insert(group, source.path.clone());
@@ -555,6 +591,30 @@ impl RemotePullExecutor {
     ) -> Result<()> {
         let location = AclLocation::Local(self.destination_root.as_path());
         apply_preserved_acls(&location, path, kind, acl).await?;
+        Ok(())
+    }
+
+    /// Read the remote source's BSD file flags for one entry when `-F`
+    /// requested them (macOS only; elsewhere `-F` is refused up front).
+    /// Symlinks are skipped, like xattrs.
+    async fn read_source_bsd_flags(&self, source: &Entry) -> Result<Option<u32>> {
+        if !self.bsd_flags || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = BsdFlagsLocation::Remote(&self.remote);
+        let flags = read_preserved_bsd_flags(&location, &source.path, source.kind).await?;
+        Ok(Some(flags))
+    }
+
+    /// Mirror already-read BSD file flags onto the local destination.
+    async fn write_destination_bsd_flags(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        flags: u32,
+    ) -> Result<()> {
+        let location = BsdFlagsLocation::Local(self.destination_root.as_path());
+        apply_preserved_bsd_flags(&location, path, kind, flags).await?;
         Ok(())
     }
 

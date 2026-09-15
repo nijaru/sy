@@ -650,6 +650,7 @@ fn is_stream_opening_kind(kind: FrameKind) -> bool {
             | FrameKind::Mutation
             | FrameKind::XattrRequest
             | FrameKind::AclRequest
+            | FrameKind::BsdFlagsRequest
     )
 }
 

@@ -1,9 +1,9 @@
 use crate::remote::fetch::serve_incoming_file_fetch;
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
-    IncomingRequest, RemoteSessionError, ServerAclHandler, ServerFileHandler, ServerHashHandler,
-    ServerMetadataHandler, ServerMutationHandler, ServerRemoteSession, ServerScanHandler,
-    ServerSignatureHandler, ServerXattrHandler,
+    IncomingRequest, RemoteSessionError, ServerAclHandler, ServerBsdFlagsHandler,
+    ServerFileHandler, ServerHashHandler, ServerMetadataHandler, ServerMutationHandler,
+    ServerRemoteSession, ServerScanHandler, ServerSignatureHandler, ServerXattrHandler,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
@@ -34,6 +34,7 @@ struct RequestHandlers {
     mutation: ServerMutationHandler,
     xattr: ServerXattrHandler,
     acl: ServerAclHandler,
+    bsd_flags: ServerBsdFlagsHandler,
     fetch: ServerFetchHandler,
 }
 
@@ -69,6 +70,7 @@ where
         mutation: session.mutation_handler(),
         xattr: session.xattr_handler(),
         acl: session.acl_handler(),
+        bsd_flags: session.bsd_flags_handler(),
         fetch: fetch_handler(&session),
     };
     let mut tasks = JoinSet::<RequestResult>::new();
@@ -213,6 +215,15 @@ fn spawn_request(
         }
         IncomingRequest::Acl(incoming) => {
             let handler = handlers.acl.clone();
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::BsdFlags(incoming) => {
+            let handler = handlers.bsd_flags.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)

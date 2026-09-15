@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod bsdflags;
 pub mod fetch;
 pub mod hash;
 pub mod local_executor;
@@ -229,6 +230,12 @@ fn process_capabilities() -> CapabilitySet {
     if acl_advertised_for(os) {
         capabilities.insert(CapabilitySet::ACL);
     }
+    // BSD file flags are a single confined word (fchflags through the held
+    // no-follow leaf) mirrored by every executor after a mutation. Only
+    // macOS implements them; elsewhere `-F` is refused up front.
+    if supports_bsd_flags(os) {
+        capabilities.insert(CapabilitySet::BSD_FLAGS);
+    }
     // Compressed Data frames are decodable wherever zstd is linked, which is
     // everywhere this crate builds.
     capabilities.insert(CapabilitySet::ZSTD);
@@ -263,6 +270,12 @@ const fn supports_xattrs(os: PlatformOs) -> bool {
 /// that feature gate at the call site.
 const fn supports_acls(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+/// BSD-flags access is a single confined word available only on macOS
+/// (`fchflags`/`st_flags`); no feature gate is involved.
+const fn supports_bsd_flags(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Macos)
 }
 
 /// Whether this build advertises the ACL capability for `os`: the
@@ -496,7 +509,10 @@ mod tests {
             client.ready.capabilities.contains(CapabilitySet::HARDLINK),
             supports_hardlinks(Platform::current().os)
         );
-        assert!(!client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS));
+        assert_eq!(
+            client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS),
+            supports_bsd_flags(Platform::current().os),
+        );
     }
 
     #[test]
@@ -522,8 +538,11 @@ mod tests {
                 | CapabilitySet::RANDOM_WRITE
                 | CapabilitySet::REFLINK
                 | CapabilitySet::SPARSE
-                | CapabilitySet::BSD_FLAGS
         ));
+        assert_eq!(
+            local.contains(CapabilitySet::BSD_FLAGS),
+            supports_bsd_flags(Platform::current().os),
+        );
         assert_eq!(
             local.contains(CapabilitySet::ACL),
             acl_advertised_for(Platform::current().os)
@@ -563,6 +582,14 @@ mod tests {
         assert!(supports_xattrs(PlatformOs::Macos));
         assert!(!supports_xattrs(PlatformOs::Windows));
         assert!(!supports_xattrs(PlatformOs::Other(4)));
+    }
+
+    #[test]
+    fn bsd_flags_are_macos_only() {
+        assert!(!supports_bsd_flags(PlatformOs::Linux));
+        assert!(supports_bsd_flags(PlatformOs::Macos));
+        assert!(!supports_bsd_flags(PlatformOs::Windows));
+        assert!(!supports_bsd_flags(PlatformOs::Other(4)));
     }
 
     #[test]
