@@ -21,7 +21,7 @@ pub mod watch;
 pub mod watch_session;
 
 pub use config::{
-    parse_delete_limit, ComparisonConfig, DeleteLimit, DeleteMode, PreserveConfig, SyncConfig,
+    parse_delete_limit, ComparisonConfig, DeleteMode, PreserveConfig, SyncConfig,
     VerificationConfig,
 };
 pub use stats::{SyncError, SyncStats, VerificationResult};

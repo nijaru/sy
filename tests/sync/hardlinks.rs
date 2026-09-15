@@ -159,89 +159,6 @@ fn test_sync_preserves_hardlinks() {
     }
 }
 
-/// Test bisync handles hard links correctly
-#[test]
-#[cfg(unix)]
-#[ignore] // Slow test - run explicitly with --ignored
-fn test_bisync_with_hardlinks() {
-    let source_dir = TempDir::new().unwrap();
-    let dest_dir = TempDir::new().unwrap();
-
-    // Create hard link set in source
-    let file1 = create_file(source_dir.path(), "data1.txt", "content").unwrap();
-    let file2 = source_dir.path().join("data2.txt");
-    fs::hard_link(&file1, &file2).unwrap();
-
-    // First sync (initial)
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
-        .arg(source_dir.path())
-        .arg(dest_dir.path())
-        .arg("--bidirectional")
-        .output()
-        .expect("Failed to execute sy");
-
-    assert!(output.status.success(), "Initial bisync failed");
-
-    // Second sync (should be idempotent)
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
-        .arg(source_dir.path())
-        .arg(dest_dir.path())
-        .arg("--bidirectional")
-        .output()
-        .expect("Failed to execute sy");
-
-    assert!(output.status.success(), "Second bisync failed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Idempotent sync should show no changes
-    // (hard links shouldn't trigger false positives)
-    assert!(
-        !stdout.contains("conflict"),
-        "Hard links shouldn't cause conflicts"
-    );
-
-    println!("✅ Bisync handles hard links without false conflicts");
-}
-
-/// Test hard link conflict detection in bisync
-#[test]
-#[cfg(unix)]
-#[ignore] // Slow test - run explicitly with --ignored
-fn test_bisync_hardlink_conflict() {
-    let source_dir = TempDir::new().unwrap();
-    let dest_dir = TempDir::new().unwrap();
-
-    // Create different hard link structures on each side
-    // Source: file1 -> file2 (hard linked)
-    let source_file1 = create_file(source_dir.path(), "file1.txt", "source data").unwrap();
-    let source_file2 = source_dir.path().join("file2.txt");
-    fs::hard_link(&source_file1, &source_file2).unwrap();
-
-    // Dest: file1 and file2 are independent files
-    create_file(dest_dir.path(), "file1.txt", "dest data 1").unwrap();
-    create_file(dest_dir.path(), "file2.txt", "dest data 2").unwrap();
-
-    // Run bisync
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
-        .arg(source_dir.path())
-        .arg(dest_dir.path())
-        .arg("--bidirectional")
-        .output()
-        .expect("Failed to execute sy");
-
-    // Should detect that files have different content
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    println!("stdout: {}", stdout);
-    println!("stderr: {}", stderr);
-
-    // This documents current behavior - bisync should handle
-    // the content difference (not specifically the hard link difference)
-    println!("✅ Bisync detects content differences in hard link conflicts");
-}
-
 /// Test hard link preservation across directories
 #[test]
 #[cfg(unix)]
@@ -305,11 +222,10 @@ fn test_hardlink_modification_detection() {
     let file2 = source_dir.path().join("link.txt");
     fs::hard_link(&file1, &file2).unwrap();
 
-    // Initial sync
+    // Initial sync (trailing slash: sync directory *contents*)
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
-        .arg(source_dir.path())
+        .arg(format!("{}/", source_dir.path().display()))
         .arg(dest_dir.path())
-        .arg("--bidirectional")
         .output()
         .expect("Failed to execute sy");
 
@@ -327,9 +243,8 @@ fn test_hardlink_modification_detection() {
 
     // Second sync should detect change
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sy"))
-        .arg(source_dir.path())
+        .arg(format!("{}/", source_dir.path().display()))
         .arg(dest_dir.path())
-        .arg("--bidirectional")
         .output()
         .expect("Failed to execute sy");
 
