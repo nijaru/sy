@@ -1,6 +1,9 @@
 #[cfg(unix)]
 mod scan;
 
+#[cfg(all(target_os = "macos", feature = "acl"))]
+mod acl_macos;
+
 use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
 use std::ffi::OsString;
 use std::fs::File;
@@ -51,6 +54,15 @@ pub enum RootedFsError {
 
     #[error("extended attributes are not preserved for symlinks")]
     UnsupportedSymlinkXattrs,
+
+    #[error("access control lists exceed the bounded text size: {len} bytes (maximum {max})")]
+    AclSetTooLarge { len: usize, max: usize },
+
+    #[error("access control lists are not preserved for symlinks")]
+    UnsupportedSymlinkAcls,
+
+    #[error("access control lists are unsupported: {0}")]
+    AclUnsupported(&'static str),
 
     #[error("could not allocate a unique staging file after {0} attempts")]
     StagingNameExhausted(usize),
@@ -292,6 +304,52 @@ impl RootedFs {
         xattrs: &[(OsString, Vec<u8>)],
     ) -> Result<()> {
         self.write_xattrs_path_blocking(relative.as_path(), kind, xattrs)
+    }
+
+    /// Read the access-control list of one file or directory beneath the
+    /// pinned root, as exacl unified-entries text (`None` when the entry
+    /// carries no ACL). The leaf is opened without following a symlink and
+    /// every read goes through that held descriptor, so a raced path swap
+    /// cannot redirect the read. The text is bounded; an oversized list is
+    /// refused loudly rather than truncated. Symlinks are refused (their
+    /// ACLs are not portable and reading them would resolve the target).
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn read_acl_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+    ) -> Result<Option<String>> {
+        if kind == EntryKind::Symlink {
+            return Err(RootedFsError::UnsupportedSymlinkAcls);
+        }
+        self.read_acl_path_blocking(relative.as_path(), kind)
+    }
+
+    /// Mirror an access-control list, as exacl unified-entries text, onto one
+    /// file or directory beneath the pinned root. An empty string clears the
+    /// list (on Linux the mode-derived base entries are restored, matching
+    /// `LocalEndpoint::write_acl`). The leaf is opened without following a
+    /// symlink and every mutation goes through that held descriptor.
+    /// Symlinks are refused.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn write_acl_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        acl: &str,
+    ) -> Result<()> {
+        if kind == EntryKind::Symlink {
+            return Err(RootedFsError::UnsupportedSymlinkAcls);
+        }
+        if acl.len() > crate::protocol::MAX_ACL_TEXT_BYTES {
+            return Err(RootedFsError::AclSetTooLarge {
+                len: acl.len(),
+                max: crate::protocol::MAX_ACL_TEXT_BYTES,
+            });
+        }
+        self.write_acl_path_blocking(relative.as_path(), kind, acl)
     }
 
     /// Apply requested metadata to an existing entry beneath the pinned root.
@@ -734,6 +792,126 @@ impl RootedFs {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
+    /// Linux: exacl is path-based, but `/proc/self/fd/N` resolves to the
+    /// already-open inode for `acl_get_file` (verified on Fedora: access
+    /// reads, default-entry reads, and writes through read-only descriptors
+    /// all follow the magic link). The fd comes from
+    /// `open_xattr_entry_blocking`, so confinement is unchanged and no
+    /// acl_t conversion is needed: the text is exacl's own unified format.
+    /// If `/proc` is unavailable the lookup fails loudly instead of
+    /// silently reading the wrong file.
+    #[cfg(all(target_os = "linux", feature = "acl"))]
+    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        let entries = exacl::getfacl(&fd_alias_path(&file), None)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(exacl::to_string(&entries)?))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "acl"))]
+    fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        // Mirror `LocalEndpoint::write_acl`: empty text restores the
+        // mode-derived base entries instead of leaving a bare ACL.
+        let entries = if acl.is_empty() {
+            let mode = file.metadata()?.permissions().mode();
+            exacl::from_mode(mode & 0o777)
+        } else {
+            exacl::from_str(acl)?
+        };
+        exacl::setfacl(&[fd_alias_path(&file)], &entries, None)?;
+        Ok(())
+    }
+
+    /// macOS: `/dev/fd/N` does NOT resolve to the open inode for
+    /// `acl_get_file` (verified: it returns an empty list), so the fd-based
+    /// syscalls in `acl_macos` carry the conversion instead. Same
+    /// no-follow held descriptor, same exacl text format.
+    #[cfg(all(target_os = "macos", feature = "acl"))]
+    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        let entries = acl_macos::read_fd_entries(file.as_raw_fd())?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(exacl::to_string(&entries)?))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "acl"))]
+    fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        let entries = exacl::from_str(acl)?;
+        acl_macos::write_fd_entries(file.as_raw_fd(), &entries)?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(feature = "acl")))]
+    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
+        Err(RootedFsError::AclUnsupported(
+            "ACL preservation requires the acl feature; rebuild with --features acl",
+        ))
+    }
+
+    #[cfg(all(unix, not(feature = "acl")))]
+    fn write_acl_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _acl: &str,
+    ) -> Result<()> {
+        Err(RootedFsError::AclUnsupported(
+            "ACL preservation requires the acl feature; rebuild with --features acl",
+        ))
+    }
+
+    #[cfg(all(
+        unix,
+        feature = "acl",
+        not(target_os = "linux"),
+        not(target_os = "macos")
+    ))]
+    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
+        Err(RootedFsError::AclUnsupported(
+            "access control lists are only supported on Linux and macOS",
+        ))
+    }
+
+    #[cfg(all(
+        unix,
+        feature = "acl",
+        not(target_os = "linux"),
+        not(target_os = "macos")
+    ))]
+    fn write_acl_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _acl: &str,
+    ) -> Result<()> {
+        Err(RootedFsError::AclUnsupported(
+            "access control lists are only supported on Linux and macOS",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    fn write_acl_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _acl: &str,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     /// Open one file or directory leaf for descriptor-based attribute access.
     /// The parent is resolved without following peer-controlled symlinks and
     /// the leaf is opened without following a symlink, so both reading and
@@ -811,6 +989,17 @@ fn open_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
         // SAFETY: successful `openat` returned a fresh owned descriptor.
         OwnedFd::from_raw_fd(fd)
     })
+}
+
+/// Alias an already-open leaf as a `/proc/self/fd/N` path.
+///
+/// Linux resolves this magic link to the open file description for
+/// `acl_get_file`/`acl_set_file`, which lets exacl operate on the held
+/// no-follow descriptor without any path-based lookup. The caller must keep
+/// `file` alive for the whole exacl call.
+#[cfg(all(target_os = "linux", feature = "acl"))]
+fn fd_alias_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 #[cfg(unix)]

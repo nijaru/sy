@@ -5,6 +5,7 @@ use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::WorkItem;
 use crate::protocol::CapabilitySet;
+use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{RemoteDeltaBasis, TransferMetadata, TransferSummary};
 use crate::remote::xattr::{
@@ -97,6 +98,9 @@ pub enum RemotePushError {
 
     #[error(transparent)]
     Xattr(#[from] RemoteXattrError),
+
+    #[error(transparent)]
+    Acl(#[from] RemoteAclError),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -415,6 +419,10 @@ pub struct RemotePushExecutor {
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
     xattrs: bool,
+    /// -A/--preserve-acls: mirror the local source's access-control list
+    /// onto the remote destination for every entry the executor creates or
+    /// updates. Symlinks are skipped, like xattrs.
+    acls: bool,
     /// Per-operation output (`-i`/`--json`). `None` prints nothing.
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
@@ -528,6 +536,7 @@ impl RemotePushExecutor {
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             xattrs: false,
+            acls: false,
             reporter: None,
         }
     }
@@ -554,6 +563,11 @@ impl RemotePushExecutor {
 
     pub const fn with_xattrs(mut self, enabled: bool) -> Self {
         self.xattrs = enabled;
+        self
+    }
+
+    pub const fn with_acls(mut self, enabled: bool) -> Self {
+        self.acls = enabled;
         self
     }
 
@@ -594,9 +608,14 @@ impl RemotePushExecutor {
                 // source metadata failure cannot leave a half-created
                 // destination entry behind.
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 self.remote.create_directory(&source.path).await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 self.report(
@@ -642,6 +661,7 @@ impl RemotePushExecutor {
                 }
                 let delta_basis = self.prepare_delta_basis(destination).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 let summary = self
                     .remote
                     .transfer_file_with_policy(
@@ -654,6 +674,10 @@ impl RemotePushExecutor {
                     .await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 self.remove_committed_source(&source).await?;
@@ -689,11 +713,16 @@ impl RemotePushExecutor {
                 modified,
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
+                let acls = self.read_source_acls(&source).await?;
                 self.remote
                     .apply_metadata(&source.path, source.kind, unix_mode, modified)
                     .await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
+                if let Some(acls) = acls.as_deref() {
+                    self.write_destination_acls(&source.path, source.kind, acls)
                         .await?;
                 }
                 Ok(None)
@@ -750,6 +779,7 @@ impl RemotePushExecutor {
         }
         let delta_basis = self.prepare_delta_basis(destination).await?;
         let xattrs = self.read_source_xattrs(&source).await?;
+        let acls = self.read_source_acls(&source).await?;
         let summary = self
             .remote
             .transfer_file_with_policy(
@@ -762,6 +792,10 @@ impl RemotePushExecutor {
             .await?;
         if let Some(xattrs) = xattrs.as_deref() {
             self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                .await?;
+        }
+        if let Some(acls) = acls.as_deref() {
+            self.write_destination_acls(&source.path, source.kind, acls)
                 .await?;
         }
         groups.insert(group, source.path.clone());
@@ -987,6 +1021,31 @@ impl RemotePushExecutor {
     ) -> Result<()> {
         let location = XattrLocation::Remote(&self.remote);
         apply_preserved_xattrs(&location, path, kind, xattrs).await?;
+        Ok(())
+    }
+
+    /// Read the local source's access-control list for one entry when `-A`
+    /// requested it. Symlinks are skipped, like xattrs.
+    async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
+        if !self.acls || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = AclLocation::Local(self.source_root.as_path());
+        let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
+        Ok(Some(acl.unwrap_or_default()))
+    }
+
+    /// Mirror an already-read access-control list onto the remote
+    /// destination. Preservation ordering matches xattrs (read before the
+    /// first mutation, applied after commit).
+    async fn write_destination_acls(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        acl: &str,
+    ) -> Result<()> {
+        let location = AclLocation::Remote(&self.remote);
+        apply_preserved_acls(&location, path, kind, acl).await?;
         Ok(())
     }
 }

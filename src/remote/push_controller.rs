@@ -1042,6 +1042,7 @@ mod tests {
                     IncomingRequest::FileFetch(_) => panic!("unexpected fetch request"),
                     IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
                     IncomingRequest::Xattr(_) => panic!("unexpected xattr request"),
+                    IncomingRequest::Acl(_) => panic!("unexpected acl request"),
                 }
             }
             order

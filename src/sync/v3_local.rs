@@ -33,12 +33,13 @@ use sy::remote::push_controller::{
 
 /// Whether a local sync must use the legacy TaskExecutor path.
 ///
-/// Only the deferred preservation cluster (ACLs, BSD flags) remains there; it
-/// is deliberately deferred so preservation lands once on this executor rather
-/// than twice.
+/// Only BSD flags remain there; everything else landed on this executor so
+/// preservation lands once rather than twice.
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
+    if config.preserve.flags {
+        return Some(
+            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
+        );
     }
     None
 }
@@ -208,6 +209,7 @@ pub(super) async fn run(
     .with_verify_on_write(config.verification.verify_on_write)
     .with_hardlinks(config.preserve.hardlinks)
     .with_xattrs(config.preserve.xattrs)
+    .with_acls(config.preserve.acls)
     .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
@@ -355,5 +357,58 @@ mod tests {
             Some(b"second".to_vec())
         );
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+    }
+
+    /// -A/--preserve-acls locally: the source list is mirrored onto the
+    /// destination after the transfer, and a later pass clears entries the
+    /// source dropped.
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn acls_are_mirrored_and_cleared_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        let base_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let mut planted = exacl::getfacl(&source_file, None).unwrap();
+        planted.push(exacl::AclEntry::allow_user(
+            &uid.to_string(),
+            exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        exacl::setfacl(&[&source_file], &planted, None).unwrap();
+        let first_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        assert_ne!(first_text, base_text);
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.acls = true;
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        let mirrored = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
+        assert_eq!(mirrored, first_text);
+
+        std::fs::write(&source_file, b"one-two").unwrap();
+        let base = exacl::from_str(&base_text).unwrap();
+        exacl::setfacl(&[&source_file], &base, None).unwrap();
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let cleared = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
+        assert_eq!(cleared, base_text);
     }
 }

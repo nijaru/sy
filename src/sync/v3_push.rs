@@ -31,8 +31,10 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
+    if config.preserve.flags {
+        return Some(
+            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
+        );
     }
     None
 }
@@ -300,6 +302,7 @@ async fn execute_with_handle(
     .with_compression(compression_policy(config))
     .with_hardlinks(config.preserve.hardlinks)
     .with_xattrs(config.preserve.xattrs)
+    .with_acls(config.preserve.acls)
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
@@ -902,16 +905,16 @@ mod tests {
         assert_eq!(legacy_fallback_reason(&config), None);
     }
 
-    /// -X/--preserve-xattrs routes to v3 on every direction; the remaining
-    /// preservation cluster (ACLs, BSD flags) still refuses so an unimplemented
-    /// flag can never look like a successful sync.
+    /// -X/--preserve-xattrs routes to v3 on every direction; ACLs now route
+    /// there too. The remaining preservation item (BSD flags) still refuses
+    /// so an unimplemented flag can never look like a successful sync.
     #[test]
     fn xattrs_route_to_v3_and_deferred_preservation_still_refuses() {
         let mut config = supported_config();
         config.preserve.xattrs = true;
         assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = true;
-        assert!(legacy_fallback_reason(&config).is_some());
+        assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = false;
         config.preserve.flags = true;
         assert!(legacy_fallback_reason(&config).is_some());
@@ -1010,6 +1013,107 @@ mod tests {
             Some(b"second".to_vec())
         );
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+    }
+
+    /// -A/--preserve-acls over v3: the local source's list is mirrored onto
+    /// the remote destination after each committed mutation, and dropping the
+    /// source list clears the destination.
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn acls_are_mirrored_and_cleared_over_v3_push() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        // Capture the untouched base list first so the second pass can
+        // restore it exactly (empty on macOS, mode entries on Linux).
+        let base_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        // Plant one named entry on top of the file's current list (on Linux
+        // that keeps the required base entries, so one shape works on both
+        // data-plane platforms).
+        let uid = unsafe { libc::getuid() };
+        let mut planted = exacl::getfacl(&source_file, None).unwrap();
+        planted.push(exacl::AclEntry::allow_user(
+            &uid.to_string(),
+            exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        exacl::setfacl(&[&source_file], &planted, None).unwrap();
+        let first_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        assert!(!first_text.is_empty());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let acl_handler = session.acl_handler();
+            // Two passes: destination scan + file transfer + acl mirror each.
+            for _ in 0..6 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Acl(incoming) => {
+                        acl_handler.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected acl v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.acls = true;
+
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+        let destination_file = destination_root.path().join("file");
+        let mirrored = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
+        assert_eq!(mirrored, first_text);
+
+        // Second pass: the source drops the named entry and changes content,
+        // so the mirror must clear the destination back to the base list.
+        std::fs::write(&source_file, b"one-two").unwrap();
+        let base = exacl::from_str(&base_text).unwrap();
+        exacl::setfacl(&[&source_file], &base, None).unwrap();
+        let second_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        assert_eq!(second_text, base_text);
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        let cleared = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
+        assert_eq!(cleared, second_text);
+        assert_ne!(cleared, first_text);
     }
     #[test]
     fn compression_maps_to_v3_without_fallback() {

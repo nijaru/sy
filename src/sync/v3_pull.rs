@@ -48,8 +48,10 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode == SymlinkMode::Follow {
         return Some("v3 pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
     }
-    if config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
+    if config.preserve.flags {
+        return Some(
+            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
+        );
     }
     None
 }
@@ -193,6 +195,7 @@ async fn execute_with_handle(
             .with_compression(compression_policy(config))
             .with_hardlinks(config.preserve.hardlinks)
             .with_xattrs(config.preserve.xattrs)
+            .with_acls(config.preserve.acls)
             .with_rate_limiter(rate_limiter);
 
     let scan_elapsed = scan_started.elapsed();
@@ -425,6 +428,93 @@ mod tests {
         );
     }
 
+    /// -A/--preserve-acls over v3 pull: the remote source's list is read
+    /// through the pinned root and mirrored onto the local destination after
+    /// the staged commit.
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn acls_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"pull-bytes").unwrap();
+        let uid = unsafe { libc::getuid() };
+        let mut planted = exacl::getfacl(&source_file, None).unwrap();
+        planted.push(exacl::AclEntry::allow_user(
+            &uid.to_string(),
+            exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        exacl::setfacl(&[&source_file], &planted, None).unwrap();
+        let source_text = exacl::to_string(&exacl::getfacl(&source_file, None).unwrap()).unwrap();
+        assert!(!source_text.is_empty());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            let acl_handler = session.acl_handler();
+            // Remote scan, then the acl read and the whole-file fetch:
+            // exactly three requests, so an extra round-trip regression
+            // cannot hide.
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Acl(incoming) => {
+                        acl_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::FileFetch(incoming) => {
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _other => panic!("unexpected v3 pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.acls = true;
+        execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        let mirrored =
+            exacl::to_string(&exacl::getfacl(destination_root.path().join("file"), None).unwrap())
+                .unwrap();
+        assert_eq!(mirrored, source_text);
+    }
+
     /// --compress pulls compressed chunks end-to-end: the fetch request sets
     /// the compression bit, the server streams zstd frames, and the staged
     /// bytes still verify against the server-reported digest.
@@ -602,11 +692,11 @@ mod tests {
         config.timeout = Some(30);
         assert_eq!(legacy_fallback_reason(&config), None);
 
-        // -X routes to v3; the deferred preservation cluster still refuses.
+        // -X/-A route to v3; BSD flags still refuse.
         config.preserve.xattrs = true;
         assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = true;
-        assert!(legacy_fallback_reason(&config).is_some());
+        assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = false;
         config.preserve.flags = true;
         assert!(legacy_fallback_reason(&config).is_some());
