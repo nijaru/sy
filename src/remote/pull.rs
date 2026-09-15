@@ -22,6 +22,10 @@ use crate::engine::work::WorkItem;
 use crate::remote::fetch::fetch_file;
 use crate::remote::router::RouterSender;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
+use crate::remote::xattr::{
+    apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
+};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -54,6 +58,9 @@ pub enum RemotePullError {
 
     #[error("transactional type replacement is not implemented for directory transition at {0}")]
     TransactionalDirectoryReplace(PathBuf),
+
+    #[error(transparent)]
+    Xattr(#[from] RemoteXattrError),
 }
 
 pub type Result<T> = std::result::Result<T, RemotePullError>;
@@ -110,6 +117,10 @@ pub struct RemotePullExecutor {
     /// (ungrouped files stay concurrent), mirroring the push executor.
     hardlinks: bool,
     hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
+    /// -X/--preserve-xattrs: mirror the remote source's extended attributes
+    /// onto the local destination for every entry this executor creates or
+    /// updates. Symlinks are skipped (their attributes are not portable).
+    xattrs: bool,
 }
 
 impl RemotePullExecutor {
@@ -132,6 +143,7 @@ impl RemotePullExecutor {
             compression: None,
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            xattrs: false,
         }
     }
 
@@ -171,6 +183,11 @@ impl RemotePullExecutor {
         self
     }
 
+    pub const fn with_xattrs(mut self, enabled: bool) -> Self {
+        self.xattrs = enabled;
+        self
+    }
+
     pub fn with_rate_limiter(
         mut self,
         limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
@@ -204,9 +221,16 @@ impl RemotePullExecutor {
         match action {
             RemotePullAction::CreateDirectory { source } => {
                 let path = self.dest_path(&source.path);
+                // Read the source's attributes before creating anything so a
+                // source metadata failure cannot leave a partial entry.
+                let xattrs = self.read_source_xattrs(&source).await?;
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
@@ -230,6 +254,10 @@ impl RemotePullExecutor {
                     }
                 }
                 let is_update = destination.is_some();
+                // Read the remote source attributes before any local mutation
+                // (backup or fetch) so a source metadata failure cannot leave
+                // a half-mutated destination.
+                let xattrs = self.read_source_xattrs(&source).await?;
                 // --backup preserves the replaced destination file first, as a
                 // local copy (the destination is local in a pull). A backup
                 // failure aborts the fetch so the user's copy cannot be
@@ -250,6 +278,10 @@ impl RemotePullExecutor {
                     }
                 }
                 let summary = self.fetch_into_staging(&source, &metadata).await?;
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
+                }
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -279,6 +311,7 @@ impl RemotePullExecutor {
                 unix_mode,
                 modified,
             } => {
+                let xattrs = self.read_source_xattrs(&source).await?;
                 let dest = self.dest_path(&source.path);
                 if let Some(mode) = unix_mode {
                     set_local_mode(&dest, mode).await?;
@@ -287,6 +320,10 @@ impl RemotePullExecutor {
                     if source.kind != EntryKind::Symlink {
                         set_local_mtime(&dest, modified).await?;
                     }
+                }
+                if let Some(xattrs) = xattrs.as_deref() {
+                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                        .await?;
                 }
                 Ok(None)
             }
@@ -347,6 +384,8 @@ impl RemotePullExecutor {
             }));
         }
         let is_update = destination.is_some();
+        // Read the remote source attributes before any local mutation.
+        let xattrs = self.read_source_xattrs(&source).await?;
         if let Some(existing) = &destination {
             if existing.is_file() && self.backup_enabled() {
                 let backup_abs = self.backup_destination_for(&existing.path)?;
@@ -361,6 +400,10 @@ impl RemotePullExecutor {
             }
         }
         let summary = self.fetch_into_staging(&source, &metadata).await?;
+        if let Some(xattrs) = xattrs.as_deref() {
+            self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                .await?;
+        }
         groups.insert(group, source.path.clone());
         drop(groups);
         let op = if is_update {
@@ -431,6 +474,30 @@ impl RemotePullExecutor {
     /// only when --backup was passed).
     fn backup_enabled(&self) -> bool {
         self.backup
+    }
+
+    /// Read the remote source's extended attributes for one entry when `-X`
+    /// requested them. Symlinks cannot be read without resolving their target,
+    /// so they are skipped.
+    async fn read_source_xattrs(&self, source: &Entry) -> Result<Option<Vec<(OsString, Vec<u8>)>>> {
+        if !self.xattrs || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = XattrLocation::Remote(&self.remote);
+        let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
+        Ok(Some(xattrs))
+    }
+
+    /// Mirror an already-read attribute set onto the local destination.
+    async fn write_destination_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        xattrs: &[(OsString, Vec<u8>)],
+    ) -> Result<()> {
+        let location = XattrLocation::Local(self.destination_root.as_path());
+        apply_preserved_xattrs(&location, path, kind, xattrs).await?;
+        Ok(())
     }
 
     /// Backup location for one root-relative destination path, mirroring the

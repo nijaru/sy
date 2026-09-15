@@ -7,9 +7,9 @@
 //! reflink+patch, sparse copy) live in the transfer layer and are preserved
 //! untouched.
 //!
-//! The legacy reconcile/TaskExecutor path remains for the preservation
-//! cluster (xattrs/ACLs/flags) until preservation lands once on this
-//! executor; every other CLI-accepted local sync routes here.
+//! The legacy reconcile/TaskExecutor path remains for the deferred
+//! preservation cluster (ACLs/BSD flags) until that preservation lands once on
+//! this executor; every other CLI-accepted local sync routes here.
 
 use crate::cli::SymlinkMode;
 use crate::error::{Result, SyncError};
@@ -33,11 +33,12 @@ use sy::remote::push_controller::{
 
 /// Whether a local sync must use the legacy TaskExecutor path.
 ///
-/// Only the preservation cluster remains there; it is deliberately deferred
-/// so preservation lands once on this executor rather than twice.
+/// Only the deferred preservation cluster (ACLs, BSD flags) remains there; it
+/// is deliberately deferred so preservation lands once on this executor rather
+/// than twice.
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime support");
+    if config.preserve.acls || config.preserve.flags {
+        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
     }
     None
 }
@@ -206,6 +207,7 @@ pub(super) async fn run(
     .with_remove_source_files(config.remove_source_files)
     .with_verify_on_write(config.verification.verify_on_write)
     .with_hardlinks(config.preserve.hardlinks)
+    .with_xattrs(config.preserve.xattrs)
     .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
@@ -298,5 +300,60 @@ mod tests {
         let first = std::fs::metadata(destination_root.path().join("first")).unwrap();
         let second = std::fs::metadata(destination_root.path().join("second")).unwrap();
         assert_eq!(first.ino(), second.ino());
+    }
+
+    /// -X/--preserve-xattrs locally: source attributes are mirrored onto the
+    /// destination after the transfer, and a later pass clears values the
+    /// source dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xattrs_are_mirrored_and_stale_values_removed_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-e2e";
+        let stale = "user.sy-stale";
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        xattr::set(&source_file, name, b"first").unwrap();
+        xattr::set(&source_file, stale, b"gone").unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.xattrs = true;
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            xattr::get(&destination_file, stale).unwrap(),
+            Some(b"gone".to_vec())
+        );
+
+        std::fs::write(&source_file, b"one-two").unwrap();
+        xattr::remove(&source_file, stale).unwrap();
+        xattr::set(&source_file, name, b"second").unwrap();
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert!(xattr::get(&destination_file, stale).unwrap().is_none());
     }
 }

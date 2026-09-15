@@ -26,6 +26,9 @@ use crate::remote::transfer::{
     request_file_transfer, serve_incoming_file_rooted, RemoteDeltaBasis, RemoteTransferError,
     TransferSummary,
 };
+use crate::remote::xattr::{
+    request_read_xattrs, request_write_xattrs, serve_incoming_xattr_rooted, RemoteXattrError,
+};
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use crate::rooted_fs::RootedFs;
 use crate::transfer::delta::{
@@ -77,6 +80,9 @@ pub enum RemoteSessionError {
 
     #[error(transparent)]
     Mutation(#[from] RemoteMutationError),
+
+    #[error(transparent)]
+    Xattr(#[from] RemoteXattrError),
 
     #[error(transparent)]
     BasisIndex(#[from] BasisIndexError),
@@ -346,6 +352,38 @@ impl ClientRemoteSession {
         .map_err(Into::into)
     }
 
+    /// Read the remote destination's extended attributes for one entry
+    /// (`-X`). Used by the pull executor, whose remote root is the source.
+    pub async fn read_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+    ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+        request_read_xattrs(&self.router.sender(), path, kind, self.server.platform.os)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mirror an extended-attribute set onto the remote destination for one
+    /// entry (`-X`). Push-only: a Pull session's remote root is source-only.
+    pub async fn write_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        xattrs: &[(std::ffi::OsString, Vec<u8>)],
+    ) -> Result<()> {
+        self.require_push(FrameKind::XattrRequest)?;
+        request_write_xattrs(
+            &self.router.sender(),
+            path,
+            kind,
+            xattrs,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     fn require_push(&self, kind: FrameKind) -> Result<()> {
         if self.operation == Operation::Push {
             Ok(())
@@ -366,6 +404,7 @@ pub enum IncomingRequest {
     FileFetch(IncomingStream),
     Metadata(IncomingStream),
     Mutation(IncomingStream),
+    Xattr(IncomingStream),
 }
 
 #[derive(Clone)]
@@ -459,6 +498,30 @@ impl ServerMutationHandler {
     }
 }
 
+/// Extended-attribute read/write requests use the same session-pinned root
+/// descriptor. The session direction is carried so a write request in a Pull
+/// session is refused: the remote root is the read-only source there.
+#[derive(Clone)]
+pub struct ServerXattrHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+    operation: Operation,
+}
+
+impl ServerXattrHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::xattr::Result<()> {
+        serve_incoming_xattr_rooted(
+            self.rooted.clone(),
+            incoming,
+            &self.sender,
+            self.peer,
+            self.operation,
+        )
+        .await
+    }
+}
+
 pub struct ServerRemoteSession {
     opened: OpenedServerSession,
     router: FrameRouter,
@@ -547,6 +610,15 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn xattr_handler(&self) -> ServerXattrHandler {
+        ServerXattrHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+            operation: self.opened.operation,
+        }
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
@@ -568,6 +640,10 @@ impl ServerRemoteSession {
             FrameKind::Mutation if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::Mutation(incoming)))
             }
+            // Xattr reads are valid in both directions; the handler refuses a
+            // write in a Pull session because the remote root is then the
+            // read-only source.
+            FrameKind::XattrRequest => Ok(Some(IncomingRequest::Xattr(incoming))),
             FrameKind::FileBegin | FrameKind::Metadata | FrameKind::Mutation => {
                 Err(RemoteSessionError::OperationMismatch {
                     operation: self.opened.operation,
@@ -743,7 +819,8 @@ mod tests {
                     | IncomingRequest::File(_)
                     | IncomingRequest::FileFetch(_)
                     | IncomingRequest::Metadata(_)
-                    | IncomingRequest::Mutation(_) => {
+                    | IncomingRequest::Mutation(_)
+                    | IncomingRequest::Xattr(_) => {
                         panic!("unexpected mutation request")
                     }
                 }

@@ -14,6 +14,7 @@ pub mod signature;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod transfer;
+pub mod xattr;
 
 use crate::endpoint::Endpoint;
 use crate::protocol::{
@@ -213,6 +214,12 @@ fn process_capabilities() -> CapabilitySet {
     if supports_hardlinks(os) {
         capabilities.insert(CapabilitySet::HARDLINK);
     }
+    // Extended attributes are read and written through held descriptors with
+    // the same no-follow leaf discipline, and every executor mirrors the
+    // source set onto the destination after a content or metadata mutation.
+    if supports_xattrs(os) {
+        capabilities.insert(CapabilitySet::XATTR);
+    }
     // Compressed Data frames are decodable wherever zstd is linked, which is
     // everywhere this crate builds.
     capabilities.insert(CapabilitySet::ZSTD);
@@ -232,6 +239,12 @@ const fn supports_staged_files(os: PlatformOs) -> bool {
 }
 
 const fn supports_hardlinks(os: PlatformOs) -> bool {
+    matches!(os, PlatformOs::Linux | PlatformOs::Macos)
+}
+
+/// Extended-attribute access is descriptor-based and only compiled on Unix;
+/// both supported 0.5 data-plane platforms advertise it.
+const fn supports_xattrs(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
 }
 
@@ -439,7 +452,10 @@ mod tests {
             .contains(CapabilitySet::RANDOM_WRITE));
         assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
         assert!(!client.ready.capabilities.contains(CapabilitySet::SPARSE));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::XATTR));
+        assert_eq!(
+            client.ready.capabilities.contains(CapabilitySet::XATTR),
+            supports_xattrs(Platform::current().os)
+        );
         assert!(!client.ready.capabilities.contains(CapabilitySet::ACL));
         assert_eq!(
             client.ready.capabilities.contains(CapabilitySet::HARDLINK),
@@ -471,7 +487,6 @@ mod tests {
                 | CapabilitySet::RANDOM_WRITE
                 | CapabilitySet::REFLINK
                 | CapabilitySet::SPARSE
-                | CapabilitySet::XATTR
                 | CapabilitySet::ACL
                 | CapabilitySet::BSD_FLAGS
         ));
@@ -502,6 +517,14 @@ mod tests {
         assert!(supports_hardlinks(PlatformOs::Macos));
         assert!(!supports_hardlinks(PlatformOs::Windows));
         assert!(!supports_hardlinks(PlatformOs::Other(4)));
+    }
+
+    #[test]
+    fn xattrs_are_scoped_to_tested_os_family() {
+        assert!(supports_xattrs(PlatformOs::Linux));
+        assert!(supports_xattrs(PlatformOs::Macos));
+        assert!(!supports_xattrs(PlatformOs::Windows));
+        assert!(!supports_xattrs(PlatformOs::Other(4)));
     }
 
     #[tokio::test]

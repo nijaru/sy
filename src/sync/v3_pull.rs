@@ -48,8 +48,8 @@ pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str
     if config.preserve.symlink_mode == SymlinkMode::Follow {
         return Some("v3 pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
     }
-    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime support");
+    if config.preserve.acls || config.preserve.flags {
+        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
     }
     None
 }
@@ -192,6 +192,7 @@ async fn execute_with_handle(
             .with_reporter(Some(reporter.clone()))
             .with_compression(compression_policy(config))
             .with_hardlinks(config.preserve.hardlinks)
+            .with_xattrs(config.preserve.xattrs)
             .with_rate_limiter(rate_limiter);
 
     let scan_elapsed = scan_started.elapsed();
@@ -343,6 +344,84 @@ mod tests {
         assert_eq!(
             std::fs::read(destination_root.path().join("sub/deep.txt")).unwrap(),
             b"deep"
+        );
+    }
+
+    /// -X/--preserve-xattrs over v3 pull: the remote source's attributes are
+    /// read through the pinned root and mirrored onto the local destination
+    /// after the staged commit.
+    #[tokio::test]
+    async fn xattrs_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-e2e";
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"pull-bytes").unwrap();
+        xattr::set(&source_file, name, b"from-remote").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            let xattr_handler = session.xattr_handler();
+            // Remote scan, then per file the xattr read and the whole-file
+            // fetch: exactly three requests, so an extra round-trip regression
+            // cannot hide.
+            for _ in 0..3 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::Xattr(incoming) => {
+                        xattr_handler.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::FileFetch(incoming) => {
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _other => panic!("unexpected v3 pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.xattrs = true;
+        execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            xattr::get(destination_root.path().join("file"), name).unwrap(),
+            Some(b"from-remote".to_vec())
         );
     }
 
@@ -522,6 +601,16 @@ mod tests {
         config.backup = Some(String::new());
         config.timeout = Some(30);
         assert_eq!(legacy_fallback_reason(&config), None);
+
+        // -X routes to v3; the deferred preservation cluster still refuses.
+        config.preserve.xattrs = true;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.preserve.acls = true;
+        assert!(legacy_fallback_reason(&config).is_some());
+        config.preserve.acls = false;
+        config.preserve.flags = true;
+        assert!(legacy_fallback_reason(&config).is_some());
+        config.preserve.flags = false;
 
         // The refused cluster keeps its reasons for defense-in-depth: if
         // validation ever leaks one through, the session still refuses.

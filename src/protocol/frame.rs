@@ -49,6 +49,8 @@ pub enum FrameKind {
     HashRequest = 22,
     HashResult = 23,
     FileFetchRequest = 24,
+    XattrRequest = 25,
+    XattrResult = 26,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -79,6 +81,8 @@ impl TryFrom<u8> for FrameKind {
             22 => Ok(Self::HashRequest),
             23 => Ok(Self::HashResult),
             24 => Ok(Self::FileFetchRequest),
+            25 => Ok(Self::XattrRequest),
+            26 => Ok(Self::XattrResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -361,6 +365,8 @@ mod tests {
         assert_eq!(FrameKind::Mutation as u8, 21);
         assert_eq!(FrameKind::HashRequest as u8, 22);
         assert_eq!(FrameKind::HashResult as u8, 23);
+        assert_eq!(FrameKind::XattrRequest as u8, 25);
+        assert_eq!(FrameKind::XattrResult as u8, 26);
     }
 
     proptest! {

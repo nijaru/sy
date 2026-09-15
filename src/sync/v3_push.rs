@@ -31,8 +31,8 @@ use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.xattrs || config.preserve.acls || config.preserve.flags {
-        return Some("requested preservation semantics exceed current v3 mode/mtime support");
+    if config.preserve.acls || config.preserve.flags {
+        return Some("requested preservation semantics exceed current v3 mode/mtime/xattr support");
     }
     None
 }
@@ -299,6 +299,7 @@ async fn execute_with_handle(
     .with_backup(backup_plan)
     .with_compression(compression_policy(config))
     .with_hardlinks(config.preserve.hardlinks)
+    .with_xattrs(config.preserve.xattrs)
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
@@ -901,6 +902,115 @@ mod tests {
         assert_eq!(legacy_fallback_reason(&config), None);
     }
 
+    /// -X/--preserve-xattrs routes to v3 on every direction; the remaining
+    /// preservation cluster (ACLs, BSD flags) still refuses so an unimplemented
+    /// flag can never look like a successful sync.
+    #[test]
+    fn xattrs_route_to_v3_and_deferred_preservation_still_refuses() {
+        let mut config = supported_config();
+        config.preserve.xattrs = true;
+        assert_eq!(legacy_fallback_reason(&config), None);
+        config.preserve.acls = true;
+        assert!(legacy_fallback_reason(&config).is_some());
+        config.preserve.acls = false;
+        config.preserve.flags = true;
+        assert!(legacy_fallback_reason(&config).is_some());
+    }
+
+    /// -X/--preserve-xattrs over v3: the local source's attributes are mirrored
+    /// onto the remote destination after each committed mutation, and a second
+    /// pass removes destination attributes the source no longer carries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xattrs_are_mirrored_and_stale_values_removed_over_v3_push() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-e2e";
+        let stale = "user.sy-stale";
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        xattr::set(&source_file, name, b"first").unwrap();
+        xattr::set(&source_file, stale, b"gone").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let xattr_handler = session.xattr_handler();
+            // Two passes: destination scan + file transfer + xattr mirror each.
+            for _ in 0..6 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Xattr(incoming) => {
+                        xattr_handler.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected xattr v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.xattrs = true;
+
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+        let destination_file = destination_root.path().join("file");
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            xattr::get(&destination_file, stale).unwrap(),
+            Some(b"gone".to_vec())
+        );
+
+        // Second pass: the source drops the stale attribute and changes
+        // content, so the mirror must clear the destination's stale value.
+        std::fs::write(&source_file, b"one-two").unwrap();
+        xattr::remove(&source_file, stale).unwrap();
+        xattr::set(&source_file, name, b"second").unwrap();
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+    }
     #[test]
     fn compression_maps_to_v3_without_fallback() {
         let mut config = supported_config();

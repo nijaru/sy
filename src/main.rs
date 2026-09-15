@@ -389,6 +389,14 @@ Or install from local source with: cargo install --path . --features acl"#
         );
     }
 
+    // Extended attributes are descriptor-based and only compiled on Unix. The
+    // flag is rejected up front rather than failing mid-sync on a platform
+    // where no endpoint can preserve them.
+    #[cfg(not(unix))]
+    if cli.preserve_xattrs {
+        anyhow::bail!("extended attribute preservation is only supported on Unix platforms");
+    }
+
     // Warn about unimplemented flags
     if cli.stream {
         eprintln!("Warning: --stream is not yet implemented");
