@@ -6,6 +6,9 @@ use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::WorkItem;
 use crate::protocol::CapabilitySet;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
+use crate::remote::bsdflags::{
+    apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
+};
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{RemoteDeltaBasis, TransferMetadata, TransferSummary};
 use crate::remote::xattr::{
@@ -101,6 +104,9 @@ pub enum RemotePushError {
 
     #[error(transparent)]
     Acl(#[from] RemoteAclError),
+
+    #[error(transparent)]
+    BsdFlags(#[from] RemoteBsdFlagsError),
 }
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
@@ -423,6 +429,10 @@ pub struct RemotePushExecutor {
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped, like xattrs.
     acls: bool,
+    /// -F/--preserve-flags (macOS only): mirror the source's BSD file flags
+    /// onto the remote destination for every entry the executor creates or
+    /// updates. Symlinks are skipped, like xattrs.
+    bsd_flags: bool,
     /// Per-operation output (`-i`/`--json`). `None` prints nothing.
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
@@ -537,6 +547,7 @@ impl RemotePushExecutor {
             hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             xattrs: false,
             acls: false,
+            bsd_flags: false,
             reporter: None,
         }
     }
@@ -568,6 +579,11 @@ impl RemotePushExecutor {
 
     pub const fn with_acls(mut self, enabled: bool) -> Self {
         self.acls = enabled;
+        self
+    }
+
+    pub const fn with_bsd_flags(mut self, enabled: bool) -> Self {
+        self.bsd_flags = enabled;
         self
     }
 
@@ -609,6 +625,7 @@ impl RemotePushExecutor {
                 // destination entry behind.
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 self.remote.create_directory(&source.path).await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
@@ -616,6 +633,10 @@ impl RemotePushExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 self.report(
@@ -662,6 +683,7 @@ impl RemotePushExecutor {
                 let delta_basis = self.prepare_delta_basis(destination).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 let summary = self
                     .remote
                     .transfer_file_with_policy(
@@ -678,6 +700,10 @@ impl RemotePushExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 self.remove_committed_source(&source).await?;
@@ -714,6 +740,7 @@ impl RemotePushExecutor {
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
+                let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 self.remote
                     .apply_metadata(&source.path, source.kind, unix_mode, modified)
                     .await?;
@@ -723,6 +750,10 @@ impl RemotePushExecutor {
                 }
                 if let Some(acls) = acls.as_deref() {
                     self.write_destination_acls(&source.path, source.kind, acls)
+                        .await?;
+                }
+                if let Some(flags) = bsd_flags {
+                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
                 Ok(None)
@@ -780,6 +811,7 @@ impl RemotePushExecutor {
         let delta_basis = self.prepare_delta_basis(destination).await?;
         let xattrs = self.read_source_xattrs(&source).await?;
         let acls = self.read_source_acls(&source).await?;
+        let bsd_flags = self.read_source_bsd_flags(&source).await?;
         let summary = self
             .remote
             .transfer_file_with_policy(
@@ -796,6 +828,10 @@ impl RemotePushExecutor {
         }
         if let Some(acls) = acls.as_deref() {
             self.write_destination_acls(&source.path, source.kind, acls)
+                .await?;
+        }
+        if let Some(flags) = bsd_flags {
+            self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
         }
         groups.insert(group, source.path.clone());
@@ -1046,6 +1082,32 @@ impl RemotePushExecutor {
     ) -> Result<()> {
         let location = AclLocation::Remote(&self.remote);
         apply_preserved_acls(&location, path, kind, acl).await?;
+        Ok(())
+    }
+
+    /// Read the source's BSD file flags for one entry when `-F` requested
+    /// them (macOS only; elsewhere `-F` is refused up front). Symlinks are
+    /// skipped, like xattrs.
+    async fn read_source_bsd_flags(&self, source: &Entry) -> Result<Option<u32>> {
+        if !self.bsd_flags || source.is_symlink() {
+            return Ok(None);
+        }
+        let location = BsdFlagsLocation::Local(self.source_root.as_path());
+        let flags = read_preserved_bsd_flags(&location, &source.path, source.kind).await?;
+        Ok(Some(flags))
+    }
+
+    /// Mirror already-read BSD file flags onto the remote destination.
+    /// Preservation ordering matches xattrs (read before the first
+    /// mutation, applied after commit).
+    async fn write_destination_bsd_flags(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        flags: u32,
+    ) -> Result<()> {
+        let location = BsdFlagsLocation::Remote(&self.remote);
+        apply_preserved_bsd_flags(&location, path, kind, flags).await?;
         Ok(())
     }
 }

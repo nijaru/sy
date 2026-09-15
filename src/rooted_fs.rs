@@ -61,6 +61,9 @@ pub enum RootedFsError {
     #[error("access control lists are not preserved for symlinks")]
     UnsupportedSymlinkAcls,
 
+    #[error("bsd flags are not preserved for symlinks")]
+    UnsupportedSymlinkBsdFlags,
+
     #[error("access control lists are unsupported: {0}")]
     AclUnsupported(&'static str),
 
@@ -350,6 +353,37 @@ impl RootedFs {
             });
         }
         self.write_acl_path_blocking(relative.as_path(), kind, acl)
+    }
+
+    /// Read the BSD file flags of one file or directory beneath the pinned
+    /// root (macOS only). The leaf is opened without following a symlink and
+    /// the flags are read through that held descriptor. Symlinks are refused,
+    /// like xattrs and ACLs.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn read_bsd_flags_blocking(&self, relative: &RelativePath, kind: EntryKind) -> Result<u32> {
+        if kind == EntryKind::Symlink {
+            return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
+        }
+        self.read_bsd_flags_path_blocking(relative.as_path(), kind)
+    }
+
+    /// Mirror BSD file flags onto one file or directory beneath the pinned
+    /// root (macOS only): 0 clears every flag. The leaf is opened without
+    /// following a symlink and the mutation goes through that held
+    /// descriptor. Symlinks are refused.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    pub fn write_bsd_flags_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        flags: u32,
+    ) -> Result<()> {
+        if kind == EntryKind::Symlink {
+            return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
+        }
+        self.write_bsd_flags_path_blocking(relative.as_path(), kind, flags)
     }
 
     /// Apply requested metadata to an existing entry beneath the pinned root.
@@ -908,6 +942,52 @@ impl RootedFs {
         _relative: &Path,
         _kind: EntryKind,
         _acl: &str,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// macOS: read `st_flags` through the held no-follow leaf descriptor.
+    /// `fstat` on an `O_NOFOLLOW` open reports the leaf itself, so neither
+    /// parent nor leaf symlinks can redirect the read.
+    #[cfg(target_os = "macos")]
+    fn read_bsd_flags_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<u32> {
+        use std::os::macos::fs::MetadataExt;
+
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        Ok(file.metadata()?.st_flags())
+    }
+
+    /// macOS: `fchflags` on the held no-follow leaf descriptor replaces the
+    /// whole flag word (0 clears), so the mirror is a single confined
+    /// syscall with no path lookup at all.
+    #[cfg(target_os = "macos")]
+    fn write_bsd_flags_path_blocking(
+        &self,
+        relative: &Path,
+        kind: EntryKind,
+        flags: u32,
+    ) -> Result<()> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        // SAFETY: `file` is a live held descriptor; `fchflags` only mutates
+        // flags on the open file description.
+        let ret = unsafe { libc::fchflags(file.as_raw_fd(), flags) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn read_bsd_flags_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<u32> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn write_bsd_flags_path_blocking(
+        &self,
+        _relative: &Path,
+        _kind: EntryKind,
+        _flags: u32,
     ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }

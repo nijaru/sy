@@ -397,6 +397,14 @@ Or install from local source with: cargo install --path . --features acl"#
         anyhow::bail!("extended attribute preservation is only supported on Unix platforms");
     }
 
+    // BSD file flags exist only on macOS (fchflags/st_flags). Reject up
+    // front elsewhere rather than failing mid-sync or silently ignoring the
+    // flag (the old help text called it a no-op; loud beats silent).
+    #[cfg(not(target_os = "macos"))]
+    if cli.preserve_flags {
+        anyhow::bail!("BSD flag preservation is only supported on macOS");
+    }
+
     // Warn about unimplemented flags
     if cli.stream {
         eprintln!("Warning: --stream is not yet implemented");

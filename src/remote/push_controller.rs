@@ -1043,6 +1043,7 @@ mod tests {
                     IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
                     IncomingRequest::Xattr(_) => panic!("unexpected xattr request"),
                     IncomingRequest::Acl(_) => panic!("unexpected acl request"),
+                    IncomingRequest::BsdFlags(_) => panic!("unexpected bsd flags request"),
                 }
             }
             order

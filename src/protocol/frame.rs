@@ -53,6 +53,8 @@ pub enum FrameKind {
     XattrResult = 26,
     AclRequest = 27,
     AclResult = 28,
+    BsdFlagsRequest = 29,
+    BsdFlagsResult = 30,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -87,6 +89,8 @@ impl TryFrom<u8> for FrameKind {
             26 => Ok(Self::XattrResult),
             27 => Ok(Self::AclRequest),
             28 => Ok(Self::AclResult),
+            29 => Ok(Self::BsdFlagsRequest),
+            30 => Ok(Self::BsdFlagsResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -373,6 +377,8 @@ mod tests {
         assert_eq!(FrameKind::XattrResult as u8, 26);
         assert_eq!(FrameKind::AclRequest as u8, 27);
         assert_eq!(FrameKind::AclResult as u8, 28);
+        assert_eq!(FrameKind::BsdFlagsRequest as u8, 29);
+        assert_eq!(FrameKind::BsdFlagsResult as u8, 30);
     }
 
     proptest! {

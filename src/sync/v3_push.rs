@@ -30,12 +30,12 @@ use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
-pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.preserve.flags {
-        return Some(
-            "requested preservation semantics exceed current v3 mode/mtime/xattr/acl support",
-        );
-    }
+/// Whether a push must fall back to the legacy v2 stack.
+///
+/// The preservation cluster is complete on v3, so nothing routes to legacy
+/// anymore. The function stays until item 7 deletes the condemned stacks
+/// (P2); it exists so the call sites keep their loud second gate.
+pub(super) fn legacy_fallback_reason(_config: &SyncConfig) -> Option<&'static str> {
     None
 }
 
@@ -303,6 +303,7 @@ async fn execute_with_handle(
     .with_hardlinks(config.preserve.hardlinks)
     .with_xattrs(config.preserve.xattrs)
     .with_acls(config.preserve.acls)
+    .with_bsd_flags(config.preserve.flags)
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
@@ -905,19 +906,16 @@ mod tests {
         assert_eq!(legacy_fallback_reason(&config), None);
     }
 
-    /// -X/--preserve-xattrs routes to v3 on every direction; ACLs now route
-    /// there too. The remaining preservation item (BSD flags) still refuses
-    /// so an unimplemented flag can never look like a successful sync.
+    /// -X/-A/-F route to v3 on every direction: the preservation cluster is
+    /// complete, so no accepted flag selects the legacy path anymore. (The
+    /// fallback function itself is deleted by item 7.)
     #[test]
-    fn xattrs_route_to_v3_and_deferred_preservation_still_refuses() {
+    fn preservation_routes_to_v3_without_fallback() {
         let mut config = supported_config();
         config.preserve.xattrs = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
         config.preserve.acls = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        config.preserve.acls = false;
         config.preserve.flags = true;
-        assert!(legacy_fallback_reason(&config).is_some());
+        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     /// -X/--preserve-xattrs over v3: the local source's attributes are mirrored
@@ -1114,6 +1112,104 @@ mod tests {
         let cleared = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
         assert_eq!(cleared, second_text);
         assert_ne!(cleared, first_text);
+    }
+
+    /// -F/--preserve-flags over v3: the local source's flag word is mirrored
+    /// onto the remote destination after each committed mutation, and
+    /// clearing the source word clears the destination (macOS only; other
+    /// platforms refuse `-F` up front).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bsd_flags_are_mirrored_and_cleared_over_v3_push() {
+        use std::ffi::CString;
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+
+        fn set_flags(path: &std::path::Path, flags: u32) {
+            let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `cpath` is a live NUL-terminated pathname borrowed for
+            // the duration of the call.
+            let ret = unsafe { libc::chflags(cpath.as_ptr(), flags) };
+            assert_eq!(ret, 0);
+        }
+
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        std::fs::write(&source_file, b"one").unwrap();
+        // UF_NODUMP is visible in st_flags and inert for the test itself.
+        set_flags(&source_file, 0x1);
+        assert_eq!(std::fs::metadata(&source_file).unwrap().st_flags(), 0x1);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let flags_handler = session.bsd_flags_handler();
+            // Two passes: destination scan + file transfer + flags mirror.
+            for _ in 0..6 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::BsdFlags(incoming) => {
+                        flags_handler.serve(incoming).await.unwrap();
+                    }
+                    _ => panic!("unexpected bsd flags v3 adapter request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.flags = true;
+
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+        let destination_file = destination_root.path().join("file");
+        assert_eq!(
+            std::fs::metadata(&destination_file).unwrap().st_flags(),
+            0x1
+        );
+
+        // Second pass: content change plus cleared flags must clear the
+        // destination word.
+        std::fs::write(&source_file, b"one-two").unwrap();
+        set_flags(&source_file, 0);
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(std::fs::metadata(&destination_file).unwrap().st_flags(), 0);
     }
     #[test]
     fn compression_maps_to_v3_without_fallback() {

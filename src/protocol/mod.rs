@@ -1,4 +1,5 @@
 mod acl;
+mod bsdflags;
 mod codec;
 mod entry;
 mod fetch;
@@ -15,6 +16,7 @@ mod transfer;
 mod xattr;
 
 pub use acl::{AclMode, WireAcl, WireAclRequest, WireAclResult, MAX_ACL_TEXT_BYTES};
+pub use bsdflags::{BsdFlagsMode, WireBsdFlagsRequest, WireBsdFlagsResult};
 pub use entry::{WireEntry, WireEntryKind};
 pub use fetch::WireFileFetchRequest;
 pub use frame::{

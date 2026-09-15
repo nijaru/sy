@@ -13,6 +13,7 @@ use crate::protocol::{
     CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
 };
 use crate::remote::acl::serve_incoming_acl_rooted;
+use crate::remote::bsdflags::serve_incoming_bsd_flags_rooted;
 use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
 use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
@@ -407,6 +408,7 @@ pub enum IncomingRequest {
     Mutation(IncomingStream),
     Xattr(IncomingStream),
     Acl(IncomingStream),
+    BsdFlags(IncomingStream),
 }
 
 #[derive(Clone)]
@@ -548,6 +550,30 @@ impl ServerAclHandler {
     }
 }
 
+/// BSD-flags read/write requests use the same session-pinned root
+/// descriptor, with the same Pull-session write refusal as xattrs and ACLs:
+/// the remote root is the read-only source there.
+#[derive(Clone)]
+pub struct ServerBsdFlagsHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+    operation: Operation,
+}
+
+impl ServerBsdFlagsHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::bsdflags::Result<()> {
+        serve_incoming_bsd_flags_rooted(
+            self.rooted.clone(),
+            incoming,
+            &self.sender,
+            self.peer,
+            self.operation,
+        )
+        .await
+    }
+}
+
 pub struct ServerRemoteSession {
     opened: OpenedServerSession,
     router: FrameRouter,
@@ -654,6 +680,15 @@ impl ServerRemoteSession {
         }
     }
 
+    pub fn bsd_flags_handler(&self) -> ServerBsdFlagsHandler {
+        ServerBsdFlagsHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+            operation: self.opened.operation,
+        }
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
@@ -682,6 +717,9 @@ impl ServerRemoteSession {
             // ACL reads are valid in both directions, with the same
             // Pull-session write refusal as xattrs.
             FrameKind::AclRequest => Ok(Some(IncomingRequest::Acl(incoming))),
+            // BSD-flags reads are valid in both directions, with the same
+            // Pull-session write refusal.
+            FrameKind::BsdFlagsRequest => Ok(Some(IncomingRequest::BsdFlags(incoming))),
             FrameKind::FileBegin | FrameKind::Metadata | FrameKind::Mutation => {
                 Err(RemoteSessionError::OperationMismatch {
                     operation: self.opened.operation,
@@ -859,7 +897,8 @@ mod tests {
                     | IncomingRequest::Metadata(_)
                     | IncomingRequest::Mutation(_)
                     | IncomingRequest::Xattr(_)
-                    | IncomingRequest::Acl(_) => {
+                    | IncomingRequest::Acl(_)
+                    | IncomingRequest::BsdFlags(_) => {
                         panic!("unexpected mutation request")
                     }
                 }
