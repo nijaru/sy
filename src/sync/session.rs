@@ -4,9 +4,6 @@
 //! synchronization keeps the existing SSH streaming protocol until its v0.5
 //! protocol migration is ready.
 
-#[path = "reconcile.rs"]
-mod reconcile;
-
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
@@ -121,19 +118,6 @@ impl SyncSession {
     }
 
     async fn direct_local(&self) -> Result<SyncStats> {
-        // The v3 controller pipeline is the default local path (item 6);
-        // the legacy batch executor remains only for the preservation
-        // cluster until preservation lands once on the unified executor.
-        if let Some(reason) = super::v3_local::legacy_fallback_reason(&self.config) {
-            tracing::debug!(reason, "using legacy local compatibility path");
-            let source = self.source.as_endpoint().ok_or_else(|| {
-                SyncError::Config("source must be local for direct sync".to_string())
-            })?;
-            let dest = self.dest.as_endpoint().ok_or_else(|| {
-                SyncError::Config("destination must be local for direct sync".to_string())
-            })?;
-            return reconcile::run_local_sync(source, dest, &self.config, self.scan_options).await;
-        }
         super::v3_local::run(
             self.source.root(),
             self.dest.root(),
@@ -266,11 +250,6 @@ impl SyncSession {
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
-        if let Some(reason) = super::v3_push::legacy_fallback_reason(&self.config) {
-            tracing::debug!(reason, "using legacy remote push compatibility path");
-            return self.streaming_push_legacy().await;
-        }
-
         let (host, user, dest_root) = match &self.dest {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
             _ => {
@@ -290,49 +269,11 @@ impl SyncSession {
         .await
     }
 
-    async fn streaming_push_legacy(&self) -> Result<SyncStats> {
-        let (host, user, dest_root) = match &self.dest {
-            EndpointPair::Ssh { host, user, root } => (host, user, root),
-            _ => {
-                return Err(SyncError::Config(
-                    "destination must be SSH for push".to_string(),
-                ))
-            }
-        };
-        let started = Instant::now();
-        let ssh_config = resolve_ssh_config(host, user)?;
-        let server_session =
-            crate::transport::server::ServerSession::connect_ssh(&ssh_config, dest_root)
-                .await
-                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        let (mut stdin, mut stdout) = server_session.split();
-        let mut streaming = crate::streaming::StreamingSync::new(
-            self.source.root().to_path_buf(),
-            dest_root.clone(),
-            self.config.delete.is_enabled(),
-            self.config.compression_detection,
-        )
-        .with_filter(self.config.filter_engine.clone())
-        .with_dry_run(self.config.dry_run)
-        .with_scan_options(self.scan_options);
-        streaming = configure_streaming(streaming, &self.config);
-        let stats = streaming
-            .push(&mut stdout, &mut stdin)
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(streaming_stats(stats, started.elapsed()))
-    }
-
     async fn streaming_pull(&self) -> Result<SyncStats> {
         let (host, user, source_root) = match &self.source {
             EndpointPair::Ssh { host, user, root } => (host, user, root),
             _ => return Err(SyncError::Config("source must be SSH for pull".to_string())),
         };
-        // The v3 engine serves every pull; CLI validation rejects flags the
-        // v3 pull path does not implement. The session check is the second
-        // gate: a programmatically-built config that skips validation gets
-        // a loud error, never a silent v2 fallback (the v2 stack is
-        // condemned and unreachable here once item 7 removes it).
         #[cfg(feature = "ssh")]
         {
             if let Some(reason) = super::v3_pull::legacy_fallback_reason(&self.config) {
@@ -350,28 +291,8 @@ impl SyncSession {
         }
         #[cfg(not(feature = "ssh"))]
         {
-            let started = Instant::now();
-            let ssh_config = resolve_ssh_config(host, user)?;
-            let server_session =
-                crate::transport::server::ServerSession::connect_ssh(&ssh_config, source_root)
-                    .await
-                    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-            let (mut stdin, mut stdout) = server_session.split();
-            let mut streaming = crate::streaming::StreamingSync::new(
-                self.dest.root().to_path_buf(),
-                source_root.clone(),
-                self.config.delete.is_enabled(),
-                self.config.compression_detection,
-            )
-            .with_filter(self.config.filter_engine.clone())
-            .with_dry_run(self.config.dry_run)
-            .with_scan_options(self.scan_options);
-            streaming = configure_streaming(streaming, &self.config);
-            let stats = streaming
-                .pull(&mut stdout, &mut stdin)
-                .await
-                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-            Ok(streaming_stats(stats, started.elapsed()))
+            let _ = (host, user, source_root);
+            Err(SyncError::Config("SSH support is disabled".to_string()))
         }
     }
 }
@@ -416,88 +337,6 @@ fn verification_scan_request(options: ScanOptions) -> ScanRequest {
 
 fn map_engine_error(error: EngineError) -> SyncError {
     SyncError::Io(std::io::Error::other(error))
-}
-
-fn resolve_ssh_config(host: &str, user: &Option<String>) -> Result<crate::ssh::config::SshConfig> {
-    if let Some(user) = user {
-        Ok(crate::ssh::config::SshConfig {
-            hostname: host.to_string(),
-            user: user.clone(),
-            ..Default::default()
-        })
-    } else {
-        crate::ssh::config::parse_ssh_config(host)
-    }
-}
-
-fn configure_streaming(
-    mut streaming: crate::streaming::StreamingSync,
-    config: &SyncConfig,
-) -> crate::streaming::StreamingSync {
-    let comparison = &config.comparison;
-    let mut flags = 0_u8;
-    if comparison.checksum {
-        flags |= 0x01;
-    }
-    if comparison.update_only {
-        flags |= 0x02;
-    }
-    if comparison.ignore_existing {
-        flags |= 0x04;
-    }
-    if comparison.ignore_times {
-        flags |= 0x08;
-    }
-    if comparison.size_only {
-        flags |= 0x10;
-    }
-    if flags != 0 {
-        streaming = streaming.with_comparison_flags(flags);
-    }
-    if config.verification.verify_on_write {
-        streaming = streaming.with_verify(true);
-    }
-    if let Some(limit) = config.bwlimit {
-        streaming = streaming.with_bwlimit(limit);
-    }
-    if let Some(limit) = config.delete.limit() {
-        streaming = streaming.with_max_delete(crate::sync::config::format_delete_limit(limit));
-    }
-    if config.delete.is_forced() {
-        streaming = streaming.with_force_delete(true);
-    }
-    streaming
-}
-
-fn streaming_stats(stats: crate::streaming::SyncStats, duration: std::time::Duration) -> SyncStats {
-    // v2's wire stats cannot distinguish create from update (files_ok covers
-    // both), so they are reported under created rather than fabricated
-    // update counts. Failed transfers (files_err) are surfaced as errors —
-    // the v2 stack is fail-fast per file, so >0 means the run aborted early
-    // or the counter was left non-zero by a partial batch.
-    let mut errors = Vec::new();
-    if stats.files_err > 0 {
-        errors.push(crate::sync::stats::SyncError {
-            path: PathBuf::new(),
-            error: format!(
-                "legacy streaming stack reported {} failed transfer(s)",
-                stats.files_err
-            ),
-            action: "transfer".to_string(),
-        });
-    }
-    SyncStats {
-        files_scanned: stats.files_scanned,
-        files_created: stats.files_ok,
-        bytes_transferred: stats.bytes_transferred,
-        files_delta_synced: stats.delta_files as usize,
-        delta_bytes_saved: stats.delta_bytes_saved,
-        dirs_created: stats.dirs_created,
-        symlinks_created: stats.symlinks_created,
-        errors,
-        duration,
-        ..Default::default()
-    }
 }
 
 #[cfg(test)]

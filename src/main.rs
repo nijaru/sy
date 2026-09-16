@@ -1,8 +1,6 @@
-mod binary;
 mod cli;
 mod compress;
 mod config;
-mod delta;
 mod endpoint;
 mod error;
 mod filter;
@@ -12,16 +10,11 @@ mod integrity;
 mod path;
 mod perf;
 mod resource;
-mod resume;
 mod retry;
-#[allow(dead_code)] // Server is only invoked at runtime via `sy --server`
-mod server;
 mod sparse;
 mod ssh;
-mod streaming;
 mod sync;
 mod temp_file;
-mod transport;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -126,11 +119,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 anyhow::bail!("Profile '{}' not found", profile_name);
             }
         }
-    }
-
-    // Server mode (internal use)
-    if cli.server {
-        return sy::server::run_server().await;
     }
 
     // Merge profile with CLI args if --profile is set

@@ -152,6 +152,7 @@ pub fn supports_cow_reflinks(_path: &Path) -> bool {
 /// }
 /// ```
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn same_filesystem(path1: &Path, path2: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 

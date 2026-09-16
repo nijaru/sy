@@ -106,21 +106,3 @@ fn test_compression_skip_local() {
 fn test_s3_sync_basic() {
     // Placeholder - S3 tests require real credentials
 }
-
-// Server mode tests
-
-#[test]
-fn test_server_mode_help() {
-    let output = Command::new(sy_bin())
-        .args(["--server", "--help"])
-        .output()
-        .unwrap();
-
-    // Server mode should show help or error gracefully
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stderr.contains("server") || stdout.contains("server") || output.status.success(),
-        "Server mode should respond to --help"
-    );
-}

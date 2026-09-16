@@ -406,10 +406,6 @@ pub struct Cli {
     #[arg(long, default_value = "1", hide = true)]
     pub retry_delay: u64,
 
-    /// Internal: Run in server mode (used over SSH)
-    #[arg(long, hide = true)]
-    pub server: bool,
-
     // === rsync compatibility flags (hidden, no-op) ===
     /// Recursive (no-op: sy is always recursive, for rsync compatibility)
     #[arg(short = 'r', hide = true)]
@@ -497,7 +493,7 @@ impl Cli {
         }
 
         // --list-profiles and --show-profile don't need source/destination
-        if self.list_profiles || self.show_profile.is_some() || self.server {
+        if self.list_profiles || self.show_profile.is_some() {
             return Ok(());
         }
 
@@ -678,7 +674,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -752,7 +747,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -832,7 +826,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
@@ -953,7 +946,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -1027,7 +1019,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1101,7 +1092,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::WARN);
     }
@@ -1175,7 +1165,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1249,7 +1238,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1342,7 +1330,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         let result = cli.validate();
@@ -1431,7 +1418,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::None);
     }
@@ -1505,7 +1491,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
@@ -1594,7 +1579,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1668,7 +1652,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -1742,7 +1725,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -1816,7 +1798,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         // Archive mode should enable all these flags
@@ -1894,7 +1875,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         // Only permissions should be enabled
@@ -1971,7 +1951,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         // All should be enabled (archive mode OR individual flags)
@@ -2049,7 +2028,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         let result = cli.validate();
@@ -2130,7 +2108,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2208,7 +2185,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2329,7 +2305,6 @@ mod tests {
             retry: 0,
             retry_delay: 1,
             recursive: false,
-            server: false,
         }
     }
 }
