@@ -160,7 +160,21 @@ impl Endpoint for LocalEndpoint {
         if let Some(parent) = full_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        #[cfg(unix)]
         tokio::fs::symlink(target, &full_dest).await?;
+        #[cfg(windows)]
+        {
+            // tokio::fs::symlink is unix-only; Windows distinguishes file/dir links
+            let is_dir = tokio::fs::metadata(target)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                tokio::fs::symlink_dir(target, &full_dest).await?;
+            } else {
+                tokio::fs::symlink_file(target, &full_dest).await?;
+            }
+        }
         Ok(())
     }
 
