@@ -538,7 +538,14 @@ fn strip_xattrs(path: &Path) -> std::io::Result<()> {
     };
 
     for attribute in attributes {
-        xattr::remove(path, &attribute)?;
+        match xattr::remove(path, &attribute) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(libc::EPERM)
+                    || error.raw_os_error() == Some(libc::EACCES) => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
