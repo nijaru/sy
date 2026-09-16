@@ -31,15 +31,6 @@ use sy::remote::push_controller::{
     RemotePushController, RemotePushControllerError, RemotePushSummary,
 };
 
-/// Whether a local sync must use the legacy TaskExecutor path.
-///
-/// The preservation cluster is complete on v3, so nothing routes to legacy
-/// anymore. The function stays until item 7 deletes the condemned stacks
-/// (P2); it exists so the call sites keep their loud second gate.
-pub(super) fn legacy_fallback_reason(_config: &SyncConfig) -> Option<&'static str> {
-    None
-}
-
 pub(super) async fn run(
     source_root: &Path,
     destination_root: &Path,

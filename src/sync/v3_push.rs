@@ -30,15 +30,6 @@ use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
-/// Whether a push must fall back to the legacy v2 stack.
-///
-/// The preservation cluster is complete on v3, so nothing routes to legacy
-/// anymore. The function stays until item 7 deletes the condemned stacks
-/// (P2); it exists so the call sites keep their loud second gate.
-pub(super) fn legacy_fallback_reason(_config: &SyncConfig) -> Option<&'static str> {
-    None
-}
-
 pub(super) async fn run(
     source_root: &Path,
     destination_root: &Path,
@@ -892,32 +883,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn symlink_modes_map_to_v3_without_fallback() {
-        // --copy-links and --links=skip are scan/selection semantics on the
-        // v3 engine: follow makes the local source walk report targets, skip
-        // filters symlinks from transfer while keeping delete protection.
-        let mut config = supported_config();
-        config.preserve.symlink_mode = crate::cli::SymlinkMode::Follow;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        config.preserve.symlink_mode = crate::cli::SymlinkMode::Skip;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        config.preserve.symlink_mode = crate::cli::SymlinkMode::Preserve;
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
-    /// -X/-A/-F route to v3 on every direction: the preservation cluster is
-    /// complete, so no accepted flag selects the legacy path anymore. (The
-    /// fallback function itself is deleted by item 7.)
-    #[test]
-    fn preservation_routes_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.preserve.xattrs = true;
-        config.preserve.acls = true;
-        config.preserve.flags = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
     /// -X/--preserve-xattrs over v3: the local source's attributes are mirrored
     /// onto the remote destination after each committed mutation, and a second
     /// pass removes destination attributes the source no longer carries.
@@ -1211,19 +1176,6 @@ mod tests {
         server.await.unwrap();
         assert_eq!(std::fs::metadata(&destination_file).unwrap().st_flags(), 0);
     }
-    #[test]
-    fn compression_maps_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.compression_detection = CompressionDetection::Always;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        config.compression_detection = CompressionDetection::Auto;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        config.compression_detection = CompressionDetection::Extension;
-        assert_eq!(legacy_fallback_reason(&config), None);
-        // The default stays compression-free.
-        config.compression_detection = CompressionDetection::Never;
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
 
     /// -z/--compress transfers compressible file bytes as zstd-compressed
     /// Data chunks; the server decompresses, reconstructs, BLAKE3-verifies,
@@ -1291,28 +1243,12 @@ mod tests {
     }
 
     #[test]
-    fn timeouts_map_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.timeout = Some(60);
-        config.contimeout = Some(5);
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
-    #[test]
-    fn remove_source_files_maps_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.remove_source_files = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
-    #[test]
-    fn supported_policy_maps_to_v3_without_fallback() {
+    fn supported_policy_maps_to_v3() {
         let mut config = supported_config();
         config.comparison.size_only = true;
         config.comparison.update_only = true;
         config.preserve.permissions = true;
         config.preserve.times = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
 
         let policy = comparison_policy(&config);
         assert_eq!(policy.mode, ComparisonMode::SizeOnly);
@@ -1322,13 +1258,12 @@ mod tests {
     }
 
     #[test]
-    fn absolute_delete_limit_maps_to_v3_without_fallback() {
+    fn absolute_delete_limit_maps_to_v3() {
         let mut config = supported_config();
         config.delete = DeleteMode::Enabled {
             limit: DeleteLimit::Count(1),
             force: false,
         };
-        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(
             delete_policy(&config.delete),
             Some(DeletePolicy {
@@ -1336,13 +1271,6 @@ mod tests {
                 force: false,
             })
         );
-    }
-
-    #[test]
-    fn filter_selection_maps_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.filter_engine.add_exclude("*.tmp").unwrap();
-        assert_eq!(legacy_fallback_reason(&config), None);
     }
 
     #[test]
@@ -1354,7 +1282,6 @@ mod tests {
             ..ScanOptions::default()
         };
 
-        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(
             source_scan_request(&config, scan_options).max_depth,
             Some(1)
@@ -1363,21 +1290,17 @@ mod tests {
     }
 
     #[test]
-    fn exclude_vcs_selection_maps_to_v3_without_fallback() {
-        let config = supported_config();
-
-        assert_eq!(legacy_fallback_reason(&config), None);
+    fn exclude_vcs_selection_maps_to_v3() {
         assert!(!entry_in_vcs_scope(&file_entry(".git/config"), false));
         assert!(entry_in_vcs_scope(&file_entry("src/.gitkeep"), false));
     }
 
     #[test]
-    fn size_selection_maps_to_v3_without_fallback() {
+    fn size_selection_maps_to_v3() {
         let mut config = supported_config();
         config.min_size = Some(3);
         config.max_size = Some(10);
 
-        assert_eq!(legacy_fallback_reason(&config), None);
         assert!(!entry_in_size_scope(
             &sized_file_entry("small", 2),
             config.min_size,
@@ -1396,40 +1319,18 @@ mod tests {
     }
 
     #[test]
-    fn bwlimit_maps_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.bwlimit = Some(1024 * 1024);
-
-        // The router writer paces outbound Data payloads; control frames bypass
-        // the limiter, so no legacy fallback is needed.
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
-    #[test]
-    fn dry_run_and_diff_mode_map_to_v3_without_fallback() {
-        let mut config = supported_config();
-        config.dry_run = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
-
-        config.diff_mode = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
-    }
-
-    #[test]
-    fn checksum_comparison_maps_to_v3_without_fallback() {
+    fn checksum_comparison_maps_to_v3() {
         let mut config = supported_config();
         config.comparison.checksum = true;
 
-        assert_eq!(legacy_fallback_reason(&config), None);
         assert_eq!(comparison_policy(&config).mode, ComparisonMode::Checksum);
     }
 
     #[test]
-    fn existing_only_selection_maps_to_v3_without_fallback() {
+    fn existing_only_selection_maps_to_v3() {
         let mut config = supported_config();
         config.existing = true;
 
-        assert_eq!(legacy_fallback_reason(&config), None);
         assert!(comparison_policy(&config).existing_only);
     }
 

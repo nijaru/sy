@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod io;

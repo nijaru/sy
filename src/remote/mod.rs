@@ -268,6 +268,7 @@ const fn supports_xattrs(os: PlatformOs) -> bool {
 /// data-plane platforms), but the implementation additionally requires the
 /// `acl` feature that links exacl/libacl. The capability is inserted under
 /// that feature gate at the call site.
+#[cfg(all(unix, feature = "acl"))]
 const fn supports_acls(os: PlatformOs) -> bool {
     matches!(os, PlatformOs::Linux | PlatformOs::Macos)
 }

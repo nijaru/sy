@@ -19,20 +19,6 @@ pub enum ItemizeOp {
     Delete,
 }
 
-impl ItemizeOp {
-    /// Map the legacy `SyncAction` onto a reporter op for the live local
-    /// executor. `Skip` is reported by the reconcile layer, not here.
-    pub fn for_action(action: &crate::sync::strategy::SyncAction) -> Self {
-        use crate::sync::strategy::SyncAction;
-        match action {
-            SyncAction::Create => ItemizeOp::Create,
-            SyncAction::Update => ItemizeOp::Update,
-            SyncAction::Delete => ItemizeOp::Delete,
-            SyncAction::Skip => ItemizeOp::Create,
-        }
-    }
-}
-
 /// Entry kind as the itemize type column reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemizeKind {

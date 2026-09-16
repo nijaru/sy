@@ -13,11 +13,6 @@ use std::path::{Path, PathBuf};
 
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Conservative maximum explicit heap buffering used by one local regular-file
-/// transfer. Reflink patching compares source and destination with two buffers;
-/// the other transfer paths use at most one at a time.
-pub(crate) const FILE_TRANSFER_BUFFER_BUDGET: u64 = (TRANSFER_BUFFER_SIZE as u64) * 2;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStrategy {
     NativeSparseCopy,

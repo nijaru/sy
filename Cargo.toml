@@ -78,9 +78,6 @@ lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
 rayon = "1.10"
 num_cpus = "1.16"  # CPU count detection for parallel scanning
 
-# Scale
-fastbloom = "0.7"  # Bloom filters for efficient deletion checks
-
 # SSH - Optional feature
 ssh2 = { version = "0.9", optional = true }
 whoami = { version = "1", optional = true }
@@ -128,17 +125,6 @@ harness = false
 name = "compress_bench"
 harness = false
 
-[[bench]]
-name = "scale_bench"
-harness = false
-
-[[bench]]
-name = "scanner_bench"
-harness = false
-
-[[bin]]
-name = "sy-remote"
-path = "src/bin/sy-remote.rs"
 
 [[bin]]
 name = "sy-bench-gen"

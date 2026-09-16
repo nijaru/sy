@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum SyncError {
     #[allow(dead_code)] // Used in future phases (network sync)
     #[error(
@@ -126,6 +127,7 @@ impl SyncError {
     }
 
     /// Classify an IO error from SSH operations into appropriate network error types
+    #[allow(dead_code)]
     pub fn from_ssh_io_error(err: std::io::Error, context: &str) -> Self {
         use std::io::ErrorKind;
 
