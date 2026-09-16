@@ -385,20 +385,22 @@ mod tests {
         })
     }
 
-    fn planted_text() -> String {
+    fn planted_text(file: &std::path::Path) -> String {
         let uid = unsafe { libc::getuid() };
-        exacl::to_string(&[exacl::AclEntry::allow_user(
+        let mut entries = exacl::getfacl(file, None).unwrap();
+        entries.push(exacl::AclEntry::allow_user(
             &uid.to_string(),
             exacl::Perm::READ,
             exacl::Flag::empty(),
-        )])
-        .unwrap()
+        ));
+        exacl::to_string(&entries).unwrap()
     }
 
     #[tokio::test]
     async fn acl_round_trip_reads_and_mirrors_write() {
         let root = tempfile::TempDir::new().unwrap();
-        std::fs::write(root.path().join("file"), b"data").unwrap();
+        let file_path = root.path().join("file");
+        std::fs::write(&file_path, b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
@@ -421,7 +423,7 @@ mod tests {
         let server_task = serve(server, rooted, peer, Operation::Push, 2);
 
         let path = RelativePath::new("file").unwrap();
-        let text = planted_text();
+        let text = planted_text(&file_path);
         request_write_acls(&client.sender(), &path, EntryKind::File, &text, peer)
             .await
             .unwrap();
@@ -493,14 +495,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let initial_acl = exacl::getfacl(root.path().join("file"), None).unwrap();
         let error = server_task.await.unwrap().unwrap_err();
         assert!(matches!(
             error,
             RemoteAclError::WriteInSourceSession(Operation::Pull)
         ));
         // The source file keeps whatever list it had (the write never ran).
-        assert!(exacl::getfacl(root.path().join("file"), None)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            exacl::getfacl(root.path().join("file"), None).unwrap(),
+            initial_acl
+        );
     }
 }

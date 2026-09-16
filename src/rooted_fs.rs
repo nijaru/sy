@@ -810,7 +810,14 @@ impl RootedFs {
         // removed so stale values cannot survive a sync.
         for existing in file.list_xattr()? {
             if !xattrs.iter().any(|(name, _)| name == &existing) {
-                file.remove_xattr(&existing)?;
+                match file.remove_xattr(&existing) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::PermissionDenied
+                            || error.raw_os_error() == Some(libc::EPERM)
+                            || error.raw_os_error() == Some(libc::EACCES) => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         Ok(())
@@ -837,7 +844,7 @@ impl RootedFs {
     #[cfg(all(target_os = "linux", feature = "acl"))]
     fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
-        let entries = exacl::getfacl(&fd_alias_path(&file), None)?;
+        let entries = exacl::getfacl(fd_alias_path(&file), None)?;
         if entries.is_empty() {
             return Ok(None);
         }

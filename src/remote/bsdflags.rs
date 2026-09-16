@@ -347,6 +347,7 @@ mod tests {
     use super::*;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
 
+    #[cfg(target_os = "macos")]
     fn serve(
         mut server: FrameRouter,
         rooted: RootedFs,

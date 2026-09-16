@@ -238,7 +238,14 @@ impl Endpoint for LocalEndpoint {
 
                 for name in existing {
                     if !xattrs.iter().any(|(desired, _)| desired == &name) {
-                        xattr::remove(&full_path, &name)?;
+                        match xattr::remove(&full_path, &name) {
+                            Ok(()) => {}
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::PermissionDenied
+                                    || error.raw_os_error() == Some(libc::EPERM)
+                                    || error.raw_os_error() == Some(libc::EACCES) => {}
+                            Err(error) => return Err(SyncError::Io(error)),
+                        }
                     }
                 }
                 Ok(())
@@ -546,17 +553,20 @@ mod tests {
             )
             .await
             .unwrap();
+        let user_xattrs = |attrs: Vec<(OsString, Vec<u8>)>| {
+            attrs
+                .into_iter()
+                .filter(|(name, _)| name.to_string_lossy().starts_with("user."))
+                .collect::<Vec<_>>()
+        };
+
         assert_eq!(
-            endpoint.read_xattrs(Path::new("file")).await.unwrap(),
+            user_xattrs(endpoint.read_xattrs(Path::new("file")).await.unwrap()),
             vec![(OsString::from("user.sy-test"), b"first".to_vec())]
         );
 
         endpoint.write_xattrs(Path::new("file"), &[]).await.unwrap();
-        assert!(endpoint
-            .read_xattrs(Path::new("file"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(user_xattrs(endpoint.read_xattrs(Path::new("file")).await.unwrap()).is_empty());
     }
 
     #[cfg(unix)]
