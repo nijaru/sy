@@ -1027,7 +1027,7 @@ impl SshTransport {
                 #[cfg(not(unix))]
                 {
                     // Windows fallback
-                    let mut file = std::fs::OpenOptions::new().write(true).open(&dest_path)?;
+                    let mut file = std::fs::OpenOptions::new().write(true).open(&temp_path)?;
                     file.seek(SeekFrom::Start(offset))?;
 
                     let mut buffer = vec![0u8; 1024 * 1024];
