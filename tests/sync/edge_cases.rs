@@ -623,3 +623,31 @@ fn test_symlink_to_file_delta() {
         "updated target"
     );
 }
+
+#[test]
+fn test_case_collision_preflight_on_case_insensitive_target() {
+    let (source, dest) = setup_test_dir();
+    fs::write(source.path().join("case_test.txt"), "source content").unwrap();
+    fs::write(dest.path().join("CASE_TEST.TXT"), "dest content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("collision") || stderr.contains("collides"),
+            "expected collision error in stderr, got: {}",
+            stderr
+        );
+        // Ensure destination was NOT modified
+        assert_eq!(
+            fs::read_to_string(dest.path().join("CASE_TEST.TXT")).unwrap(),
+            "dest content"
+        );
+    }
+}

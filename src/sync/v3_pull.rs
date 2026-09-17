@@ -150,7 +150,7 @@ async fn execute_with_handle(
     let plan = preflight_remote_push_scoped(
         source,
         destination,
-        comparison_policy(config),
+        comparison_policy(config, sy::protocol::Platform::current().os),
         delete_policy(&config.delete),
         |_entry| true,
         |_entry| false,

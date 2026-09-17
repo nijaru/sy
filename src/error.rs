@@ -30,6 +30,14 @@ pub enum SyncError {
     )]
     DeletionCountExceeded { delete_candidates: u64, limit: u64 },
 
+    #[error(
+        "Destination namespace collision: '{colliding}' collides with '{existing}' under case-insensitive/normalizing semantics"
+    )]
+    NamespaceCollision {
+        existing: PathBuf,
+        colliding: PathBuf,
+    },
+
     #[error("Failed to read directory: {path}\nCause: {source}\nCheck that the directory exists and you have read permissions.")]
     ReadDirError {
         path: PathBuf,
