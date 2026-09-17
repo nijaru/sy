@@ -4,7 +4,7 @@ mod scan;
 #[cfg(all(target_os = "macos", feature = "acl"))]
 mod acl_macos;
 
-use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +30,9 @@ const TEMP_CREATE_ATTEMPTS: usize = 128;
 pub enum RootedFsError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error("destination entry changed between scan and removal for {0}")]
+    DestinationChanged(PathBuf),
 
     #[error("rooted filesystem path must contain only normal relative components")]
     InvalidRelativePath,
@@ -272,9 +275,18 @@ impl RootedFs {
     /// components are opened with no-follow semantics and `unlinkat` never
     /// follows the destination leaf.
     ///
+    /// If `expected_identity` is provided, the existing entry is inspected
+    /// through the held descriptor with no-follow semantics before removal,
+    /// and `RootedFsError::DestinationChanged` is returned on identity or type mismatch.
+    ///
     /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn remove_blocking(&self, relative: &RelativePath, is_directory: bool) -> Result<()> {
-        self.remove_path_blocking(relative.as_path(), is_directory)
+    pub fn remove_blocking(
+        &self,
+        relative: &RelativePath,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
+        self.remove_path_blocking(relative.as_path(), is_directory, expected_identity)
     }
 
     /// Read every extended attribute of one file or directory beneath the
@@ -659,8 +671,59 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn remove_path_blocking(&self, relative: &Path, is_directory: bool) -> Result<()> {
+    fn remove_path_blocking(
+        &self,
+        relative: &Path,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
+        let leaf_c = component_cstring(&leaf)?;
+        let mut stat = MaybeUninit::<libc::stat>::zeroed();
+        let stat_res = unsafe {
+            // SAFETY: `parent` is live, `leaf_c` is a live single component, and
+            // `stat` points to writable storage for one libc::stat value.
+            libc::fstatat(
+                parent.as_raw_fd(),
+                leaf_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_res < 0 {
+            let error = std::io::Error::last_os_error();
+            // A vanished entry is idempotent success.
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let stat = unsafe {
+            // SAFETY: successful fstatat initialized the stat structure.
+            stat.assume_init()
+        };
+
+        let file_type = stat.st_mode & libc::S_IFMT;
+        let actual_is_dir = file_type == libc::S_IFDIR;
+        if is_directory != actual_is_dir {
+            return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
+        }
+
+        if let Some(expected) = expected_identity {
+            let kind = if actual_is_dir {
+                EntryKind::Directory
+            } else if file_type == libc::S_IFLNK {
+                EntryKind::Symlink
+            } else {
+                EntryKind::File
+            };
+            let actual_identity = crate::endpoint::local_identity::stat_identity(&stat, kind)
+                .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
+            if actual_identity != expected {
+                return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
+            }
+        }
+
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
             Ok(()) => Ok(()),
             // A vanished entry is idempotent success.
@@ -680,7 +743,12 @@ impl RootedFs {
     }
 
     #[cfg(not(unix))]
-    fn remove_path_blocking(&self, _relative: &Path, _is_directory: bool) -> Result<()> {
+    fn remove_path_blocking(
+        &self,
+        _relative: &Path,
+        _is_directory: bool,
+        _expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1668,7 +1736,7 @@ mod tests {
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
 
         assert!(rooted
-            .remove_blocking(&relative("escape/keep"), false)
+            .remove_blocking(&relative("escape/keep"), false, None)
             .is_err());
         assert_eq!(
             std::fs::read(outside.path().join("keep")).unwrap(),
@@ -1683,10 +1751,74 @@ mod tests {
         std::fs::create_dir(root.path().join("dir")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
 
-        rooted.remove_blocking(&relative("file"), false).unwrap();
-        rooted.remove_blocking(&relative("dir"), true).unwrap();
+        rooted
+            .remove_blocking(&relative("file"), false, None)
+            .unwrap();
+        rooted
+            .remove_blocking(&relative("dir"), true, None)
+            .unwrap();
         assert!(!root.path().join("file").exists());
         assert!(!root.path().join("dir").exists());
+    }
+
+    #[tokio::test]
+    async fn confined_remove_validates_destination_identity() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file_path = root.path().join("file");
+        let dir_path = root.path().join("dir");
+        std::fs::write(&file_path, b"initial content").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let file_meta = std::fs::symlink_metadata(&file_path).unwrap();
+        let file_id =
+            crate::endpoint::local_identity::metadata_identity(&file_meta, EntryKind::File)
+                .unwrap();
+
+        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        let dir_id =
+            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
+                .unwrap();
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+
+        // Vanished entry is idempotent success.
+        rooted
+            .remove_blocking(&relative("nonexistent"), false, Some(file_id))
+            .unwrap();
+
+        // Mismatched file identity fails and preserves the file.
+        let wrong_id = EntryIdentity::from_bytes([99; 32]);
+        let err = rooted
+            .remove_blocking(&relative("file"), false, Some(wrong_id))
+            .unwrap_err();
+        assert!(matches!(err, RootedFsError::DestinationChanged(_)));
+        assert!(file_path.exists());
+
+        // Type mismatch (file requested as directory) fails.
+        let err = rooted
+            .remove_blocking(&relative("file"), true, None)
+            .unwrap_err();
+        assert!(matches!(err, RootedFsError::DestinationChanged(_)));
+        assert!(file_path.exists());
+
+        // Matching file identity succeeds.
+        rooted
+            .remove_blocking(&relative("file"), false, Some(file_id))
+            .unwrap();
+        assert!(!file_path.exists());
+
+        // Mismatched directory identity fails and preserves the dir.
+        let err = rooted
+            .remove_blocking(&relative("dir"), true, Some(wrong_id))
+            .unwrap_err();
+        assert!(matches!(err, RootedFsError::DestinationChanged(_)));
+        assert!(dir_path.exists());
+
+        // Matching directory identity succeeds.
+        rooted
+            .remove_blocking(&relative("dir"), true, Some(dir_id))
+            .unwrap();
+        assert!(!dir_path.exists());
     }
 
     #[tokio::test]

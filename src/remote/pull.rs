@@ -16,7 +16,7 @@ use crate::endpoint::io::StagedWriter;
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::engine::compression::CompressionPolicy;
-use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
@@ -684,7 +684,7 @@ impl RemotePullExecutor {
                 }
             }
         }
-        remove_local_entry(&path, action.is_directory)
+        remove_local_entry(&path, action.is_directory, action.identity)
             .await
             .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
         self.report(
@@ -833,23 +833,62 @@ async fn replace_local_symlink(target: &Path, dest: &Path) -> Result<()> {
 async fn remove_local_entry(
     path: &Path,
     is_directory: bool,
+    expected_identity: Option<EntryIdentity>,
 ) -> std::result::Result<(), std::io::Error> {
-    let meta = tokio::fs::symlink_metadata(path).await?;
-    if meta.file_type().is_symlink() {
-        tokio::fs::remove_file(path).await
+    let meta = match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let kind = if meta.file_type().is_symlink() {
+        EntryKind::Symlink
     } else if meta.is_dir() {
-        if is_directory {
-            tokio::fs::remove_dir_all(path).await
-        } else {
-            // The journal says file but the tree grew a directory beneath
-            // the scan: refuse rather than recursively delete un-planned
-            // entries.
-            Err(std::io::Error::other(
-                "destination entry changed to a directory since the scan",
-            ))
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    if is_directory != (kind == EntryKind::Directory) {
+        return Err(std::io::Error::other(
+            "destination entry type changed since the scan",
+        ));
+    }
+    if let Some(expected) = expected_identity {
+        let current =
+            crate::endpoint::local_identity::metadata_identity(&meta, kind).ok_or_else(|| {
+                std::io::Error::other("destination entry changed between scan and removal")
+            })?;
+        if current != expected {
+            return Err(std::io::Error::other(
+                "destination entry changed between scan and removal",
+            ));
+        }
+    }
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else if is_directory {
+        match tokio::fs::remove_dir(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || error.raw_os_error() == Some(66)
+                    || error.raw_os_error() == Some(39) =>
+            {
+                // Kept non-empty directory (e.g. holds protected descendant or --backup file)
+                tracing::debug!(
+                    path = %path.display(),
+                    "kept non-empty destination directory"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     } else {
-        tokio::fs::remove_file(path).await
+        unreachable!()
     }
 }
 
@@ -1015,5 +1054,97 @@ impl crate::remote::push_controller::SyncPlanExecutor for RemotePullExecutor {
         error: &RemotePullError,
     ) -> crate::remote::push_controller::RemotePushControllerError {
         crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pull_remove_local_entry_validates_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file_path = temp.path().join("file");
+        let dir_path = temp.path().join("dir");
+        std::fs::write(&file_path, b"delete target").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let file_meta = std::fs::symlink_metadata(&file_path).unwrap();
+        let file_id =
+            crate::endpoint::local_identity::metadata_identity(&file_meta, EntryKind::File)
+                .unwrap();
+
+        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        let dir_id =
+            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
+                .unwrap();
+
+        // Vanished entry is idempotent.
+        remove_local_entry(&temp.path().join("missing"), false, Some(file_id))
+            .await
+            .unwrap();
+
+        // Mismatched file identity fails.
+        let wrong_id = EntryIdentity::from_bytes([77; 32]);
+        let err = remove_local_entry(&file_path, false, Some(wrong_id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "destination entry changed between scan and removal"
+        );
+        assert!(file_path.exists());
+
+        // Type mismatch fails.
+        let err = remove_local_entry(&file_path, true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "destination entry type changed since the scan"
+        );
+        assert!(file_path.exists());
+
+        // Matching file identity succeeds.
+        remove_local_entry(&file_path, false, Some(file_id))
+            .await
+            .unwrap();
+        assert!(!file_path.exists());
+
+        // Mismatched directory identity fails.
+        let err = remove_local_entry(&dir_path, true, Some(wrong_id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "destination entry changed between scan and removal"
+        );
+        assert!(dir_path.exists());
+
+        // Matching directory identity succeeds.
+        remove_local_entry(&dir_path, true, Some(dir_id))
+            .await
+            .unwrap();
+        assert!(!dir_path.exists());
+    }
+
+    #[tokio::test]
+    async fn pull_remove_local_entry_does_not_recursively_delete_non_empty_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir_path = temp.path().join("dir");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("surviving"), b"keep me").unwrap();
+
+        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        let dir_id =
+            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
+                .unwrap();
+
+        // Kept without an error when non-empty.
+        remove_local_entry(&dir_path, true, Some(dir_id))
+            .await
+            .unwrap();
+        assert!(dir_path.exists());
+        assert!(dir_path.join("surviving").exists());
     }
 }

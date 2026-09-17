@@ -5,7 +5,7 @@ use super::mutation::{
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
 use crate::engine::compression::CompressionPolicy;
-use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{CapabilitySet, FrameKind, Operation, PlatformOs, SessionReady};
@@ -250,11 +250,22 @@ impl ClientRemoteHandle {
             .map_err(Into::into)
     }
 
-    pub async fn remove(&self, path: &RelativePath, is_directory: bool) -> Result<()> {
+    pub async fn remove(
+        &self,
+        path: &RelativePath,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
-        request_remove(&self.sender, path, is_directory, self.peer)
-            .await
-            .map_err(Into::into)
+        request_remove(
+            &self.sender,
+            path,
+            is_directory,
+            expected_identity,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Server-side copy beneath the pinned root. `--backup` uses this to

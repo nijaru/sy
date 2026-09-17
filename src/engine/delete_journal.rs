@@ -1,10 +1,11 @@
+use super::domain::EntryIdentity;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const TRAILER_LEN: u64 = 4;
-const RECORD_HEADER_LEN: usize = 5;
+const MIN_RECORD_PAYLOAD: usize = 6;
 const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 
 pub type Result<T> = std::result::Result<T, io::Error>;
@@ -22,6 +23,7 @@ pub enum DeleteKind {
 pub struct DeleteRecord {
     pub path: PathBuf,
     pub kind: DeleteKind,
+    pub identity: Option<EntryIdentity>,
 }
 
 /// Exact, bounded-memory spool for destination-only paths.
@@ -45,9 +47,15 @@ impl DeleteJournal {
         })
     }
 
-    pub async fn append(&mut self, path: &Path, kind: DeleteKind) -> Result<()> {
+    pub async fn append(
+        &mut self,
+        path: &Path,
+        kind: DeleteKind,
+        identity: Option<EntryIdentity>,
+    ) -> Result<()> {
         let path = encode_path(path.as_os_str());
-        let payload_len = RECORD_HEADER_LEN
+        let header_len: usize = if identity.is_some() { 38 } else { 6 };
+        let payload_len = header_len
             .checked_add(path.len())
             .ok_or_else(|| invalid_data("delete journal record length overflow"))?;
 
@@ -60,7 +68,7 @@ impl DeleteJournal {
 
         let path_len = u32::try_from(path.len())
             .map_err(|_| invalid_data("delete journal path length exceeds u32"))?;
-        let payload_len = u32::try_from(payload_len)
+        let payload_len_u32 = u32::try_from(payload_len)
             .map_err(|_| invalid_data("delete journal record length exceeds u32"))?;
 
         self.file
@@ -70,9 +78,15 @@ impl DeleteJournal {
                 DeleteKind::ProtectDirectory => 2,
             })
             .await?;
+        if let Some(id) = identity {
+            self.file.write_u8(1).await?;
+            self.file.write_all(id.as_bytes()).await?;
+        } else {
+            self.file.write_u8(0).await?;
+        }
         self.file.write_u32(path_len).await?;
         self.file.write_all(&path).await?;
-        self.file.write_u32(payload_len).await?;
+        self.file.write_u32(payload_len_u32).await?;
         self.records = self
             .records
             .checked_add(1)
@@ -116,7 +130,7 @@ impl DeleteJournalReader {
             .seek(SeekFrom::Start(self.cursor - TRAILER_LEN))
             .await?;
         let payload_len = self.file.read_u32().await? as usize;
-        if !(RECORD_HEADER_LEN..=MAX_RECORD_PAYLOAD).contains(&payload_len) {
+        if !(MIN_RECORD_PAYLOAD..=MAX_RECORD_PAYLOAD).contains(&payload_len) {
             return Err(invalid_data(format!(
                 "invalid delete journal record length: {payload_len}"
             )));
@@ -142,8 +156,22 @@ impl DeleteJournalReader {
                 )))
             }
         };
+        let identity = match self.file.read_u8().await? {
+            0 => None,
+            1 => {
+                let mut bytes = [0u8; 32];
+                self.file.read_exact(&mut bytes).await?;
+                Some(EntryIdentity::from_bytes(bytes))
+            }
+            value => {
+                return Err(invalid_data(format!(
+                    "invalid delete journal identity flag: {value}"
+                )))
+            }
+        };
+        let header_len = if identity.is_some() { 38 } else { 6 };
         let path_len = self.file.read_u32().await? as usize;
-        if path_len != payload_len - RECORD_HEADER_LEN {
+        if payload_len < header_len || path_len != payload_len - header_len {
             return Err(invalid_data(format!(
                 "delete journal path length {path_len} does not match record length {payload_len}"
             )));
@@ -159,7 +187,11 @@ impl DeleteJournalReader {
             .checked_sub(1)
             .ok_or_else(|| invalid_data("delete journal contains more records than expected"))?;
 
-        Ok(Some(DeleteRecord { path, kind }))
+        Ok(Some(DeleteRecord {
+            path,
+            kind,
+            identity,
+        }))
     }
 }
 
@@ -229,16 +261,21 @@ mod tests {
     #[tokio::test]
     async fn replays_records_in_reverse_order() {
         let mut journal = DeleteJournal::new().await.unwrap();
+        let file_id = EntryIdentity::from_bytes([42; 32]);
         journal
-            .append(Path::new("parent"), DeleteKind::Directory)
+            .append(Path::new("parent"), DeleteKind::Directory, None)
             .await
             .unwrap();
         journal
-            .append(Path::new("parent"), DeleteKind::ProtectDirectory)
+            .append(Path::new("parent"), DeleteKind::ProtectDirectory, None)
             .await
             .unwrap();
         journal
-            .append(Path::new("parent/file"), DeleteKind::FileLike)
+            .append(
+                Path::new("parent/file"),
+                DeleteKind::FileLike,
+                Some(file_id),
+            )
             .await
             .unwrap();
 
@@ -251,6 +288,7 @@ mod tests {
             Some(DeleteRecord {
                 path: PathBuf::from("parent/file"),
                 kind: DeleteKind::FileLike,
+                identity: Some(file_id),
             })
         );
         assert_eq!(
@@ -258,6 +296,7 @@ mod tests {
             Some(DeleteRecord {
                 path: PathBuf::from("parent"),
                 kind: DeleteKind::ProtectDirectory,
+                identity: None,
             })
         );
         assert_eq!(
@@ -265,6 +304,7 @@ mod tests {
             Some(DeleteRecord {
                 path: PathBuf::from("parent"),
                 kind: DeleteKind::Directory,
+                identity: None,
             })
         );
         assert_eq!(reader.next().await.unwrap(), None);
@@ -286,7 +326,10 @@ mod tests {
 
         let path = PathBuf::from(OsString::from_vec(vec![b'f', 0x80, b'o']));
         let mut journal = DeleteJournal::new().await.unwrap();
-        journal.append(&path, DeleteKind::FileLike).await.unwrap();
+        journal
+            .append(&path, DeleteKind::FileLike, None)
+            .await
+            .unwrap();
         let mut reader = journal.seal().await.unwrap();
         assert_eq!(reader.next().await.unwrap().unwrap().path, path);
     }
@@ -295,7 +338,7 @@ mod tests {
     async fn rejects_corrupt_trailing_record_length() {
         let mut journal = DeleteJournal::new().await.unwrap();
         journal
-            .append(Path::new("file"), DeleteKind::FileLike)
+            .append(Path::new("file"), DeleteKind::FileLike, None)
             .await
             .unwrap();
         let mut reader = journal.seal().await.unwrap();

@@ -910,7 +910,7 @@ impl RemotePushExecutor {
             }
         }
         self.remote
-            .remove(&action.path, action.is_directory)
+            .remove(&action.path, action.is_directory, action.identity)
             .await?;
         self.report(
             crate::sync::output::ItemizeOp::Delete,

@@ -752,6 +752,7 @@ mod tests {
             Some(crate::engine::delete_plan::DeleteAction {
                 path: path("remove"),
                 is_directory: false,
+                identity: None,
             })
         );
         assert_eq!(replay.next_action().await.unwrap(), None);
@@ -904,6 +905,7 @@ mod tests {
             Some(crate::engine::delete_plan::DeleteAction {
                 path: path("remove"),
                 is_directory: false,
+                identity: None,
             })
         );
         assert_eq!(replay.next_action().await.unwrap(), None);

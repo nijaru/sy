@@ -874,16 +874,49 @@ impl LocalSyncExecutor {
             return Ok(());
         }
         let path = self.destination_path(&action.path);
-        let metadata = tokio::fs::symlink_metadata(&path)
-            .await
-            .map_err(|error| LocalSyncError::Destination(path.clone(), error))?;
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        if action.is_directory != (kind == EntryKind::Directory) {
+            return Err(LocalSyncError::Destination(
+                path,
+                std::io::Error::other("destination entry type changed since the scan"),
+            ));
+        }
+        if let Some(expected) = action.identity {
+            let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
+                .ok_or_else(|| {
+                    LocalSyncError::Destination(
+                        path.clone(),
+                        std::io::Error::other("destination entry changed between scan and removal"),
+                    )
+                })?;
+            if current != expected {
+                return Err(LocalSyncError::Destination(
+                    path,
+                    std::io::Error::other("destination entry changed between scan and removal"),
+                ));
+            }
+        }
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|error| LocalSyncError::Destination(path.clone(), error))?;
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
+            }
         } else if action.is_directory {
             match tokio::fs::remove_dir(&path).await {
                 Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
                         || error.raw_os_error() == Some(66)
@@ -900,13 +933,7 @@ impl LocalSyncExecutor {
                 Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
             }
         } else {
-            // The plan says file-like, but the destination grew a directory
-            // beneath the scan: refuse rather than recursively delete
-            // un-planned entries.
-            return Err(LocalSyncError::Destination(
-                path,
-                std::io::Error::other("destination entry changed to a directory since the scan"),
-            ));
+            unreachable!()
         }
         self.report(
             crate::sync::output::ItemizeOp::Delete,
@@ -1304,4 +1331,112 @@ fn metadata_work(
         unix_mode,
         modified,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::delete_plan::DeleteAction;
+    use crate::engine::domain::EntryIdentity;
+    use crate::engine::scheduler::ResourceBudget;
+
+    fn rel(path: &str) -> RelativePath {
+        RelativePath::new(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_execute_delete_validates_identity() {
+        let temp_src = tempfile::TempDir::new().unwrap();
+        let temp_dst = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dst.path().join("file");
+        let dir_path = temp_dst.path().join("dir");
+        std::fs::write(&file_path, b"delete target").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let file_meta = std::fs::symlink_metadata(&file_path).unwrap();
+        let file_id =
+            crate::endpoint::local_identity::metadata_identity(&file_meta, EntryKind::File)
+                .unwrap();
+
+        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        let dir_id =
+            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
+                .unwrap();
+
+        let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
+        let executor = LocalSyncExecutor::new(
+            temp_src.path().to_path_buf(),
+            temp_dst.path().to_path_buf(),
+            scheduler,
+        );
+
+        // Vanished entry succeeds idempotently.
+        executor
+            .execute_delete(DeleteAction {
+                path: rel("missing"),
+                is_directory: false,
+                identity: Some(file_id),
+            })
+            .await
+            .unwrap();
+
+        // Mismatched file identity fails and preserves the file.
+        let wrong_id = EntryIdentity::from_bytes([123; 32]);
+        let err = executor
+            .execute_delete(DeleteAction {
+                path: rel("file"),
+                is_directory: false,
+                identity: Some(wrong_id),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(file_path.exists());
+
+        // Type mismatch fails.
+        let err = executor
+            .execute_delete(DeleteAction {
+                path: rel("file"),
+                is_directory: true,
+                identity: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(file_path.exists());
+
+        // Matching file identity deletes successfully.
+        executor
+            .execute_delete(DeleteAction {
+                path: rel("file"),
+                is_directory: false,
+                identity: Some(file_id),
+            })
+            .await
+            .unwrap();
+        assert!(!file_path.exists());
+
+        // Mismatched directory identity fails and preserves the directory.
+        let err = executor
+            .execute_delete(DeleteAction {
+                path: rel("dir"),
+                is_directory: true,
+                identity: Some(wrong_id),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(dir_path.exists());
+
+        // Matching directory identity deletes successfully.
+        executor
+            .execute_delete(DeleteAction {
+                path: rel("dir"),
+                is_directory: true,
+                identity: Some(dir_id),
+            })
+            .await
+            .unwrap();
+        assert!(!dir_path.exists());
+    }
 }

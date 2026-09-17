@@ -6,7 +6,7 @@ mod metadata;
 mod mutation;
 pub use client::ClientRemoteHandle;
 
-use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
 use crate::protocol::{
@@ -313,12 +313,18 @@ impl ClientRemoteSession {
             .map_err(Into::into)
     }
 
-    pub async fn remove(&self, path: &RelativePath, is_directory: bool) -> Result<()> {
+    pub async fn remove(
+        &self,
+        path: &RelativePath,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_remove(
             &self.router.sender(),
             path,
             is_directory,
+            expected_identity,
             self.server.platform.os,
         )
         .await
@@ -1091,10 +1097,10 @@ mod tests {
             .await
             .unwrap();
         session
-            .remove(&RelativePath::new("old").unwrap(), false)
+            .remove(&RelativePath::new("old").unwrap(), false, None)
             .await
             .unwrap();
-        session.remove(&dir, true).await.unwrap();
+        session.remove(&dir, true, None).await.unwrap();
         server.await.unwrap();
 
         assert!(!destination_root.path().join("old").exists());
