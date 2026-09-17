@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum SyncError {
     #[allow(dead_code)] // Used in future phases (network sync)
     #[error(
@@ -23,6 +24,19 @@ pub enum SyncError {
 
     #[error("Deletion threshold exceeded: {percentage:.1}% > {threshold}% (use --force-delete to override)")]
     DeletionThresholdExceeded { percentage: f64, threshold: u8 },
+
+    #[error(
+        "Deletion count limit exceeded: {delete_candidates} > {limit} (use --force-delete to override)"
+    )]
+    DeletionCountExceeded { delete_candidates: u64, limit: u64 },
+
+    #[error(
+        "Destination namespace collision: '{colliding}' collides with '{existing}' under case-insensitive/normalizing semantics"
+    )]
+    NamespaceCollision {
+        existing: PathBuf,
+        colliding: PathBuf,
+    },
 
     #[error("Failed to read directory: {path}\nCause: {source}\nCheck that the directory exists and you have read permissions.")]
     ReadDirError {
@@ -79,16 +93,6 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("Bisync state file corrupted: {path}\nReason: {reason}\n\nTo recover:\n  1. Backup the corrupt file (optional): cp {path} {path}.backup\n  2. Rebuild state from scratch: sy --force-resync <source> <dest>\n\nNote: First sync after recovery will treat all differences as new changes.")]
-    StateCorruption { path: PathBuf, reason: String },
-
-    #[error("Sync already in progress for this directory pair:\n  Source: {source_path}\n  Dest: {dest_path}\n  Lock file: {lock_file}\n\nAnother sy process is currently syncing these directories.\nWait for it to complete or check if the process is still running.\n\nIf no sync is running and the lock is stale:\n  rm {lock_file}")]
-    SyncLocked {
-        source_path: String,
-        dest_path: String,
-        lock_file: String,
-    },
-
     #[error("Database error: {0}\nCheck that the destination directory is writable.")]
     Database(String),
 
@@ -131,6 +135,7 @@ impl SyncError {
     }
 
     /// Classify an IO error from SSH operations into appropriate network error types
+    #[allow(dead_code)]
     pub fn from_ssh_io_error(err: std::io::Error, context: &str) -> Self {
         use std::io::ErrorKind;
 

@@ -78,9 +78,6 @@ lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
 rayon = "1.10"
 num_cpus = "1.16"  # CPU count detection for parallel scanning
 
-# Scale
-fastbloom = "0.7"  # Bloom filters for efficient deletion checks
-
 # SSH - Optional feature
 ssh2 = { version = "0.9", optional = true }
 whoami = { version = "1", optional = true }
@@ -92,11 +89,12 @@ futures = "0.3.31"
 fjall = "2.11.2"
 
 # S3 / Cloud Storage - Optional feature
-object_store = { version = "0.12.4", features = ["aws", "gcp"], optional = true }
+object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
 memmap2 = "0.9.9"
 bitflags = "2.10.0"
+unicode-normalization = "0.1"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
@@ -128,21 +126,6 @@ harness = false
 name = "compress_bench"
 harness = false
 
-[[bench]]
-name = "scale_bench"
-harness = false
-
-[[bench]]
-name = "checksumdb_bench"
-harness = false
-
-[[bench]]
-name = "scanner_bench"
-harness = false
-
-[[bin]]
-name = "sy-remote"
-path = "src/bin/sy-remote.rs"
 
 [[bin]]
 name = "sy-bench-gen"
@@ -177,10 +160,6 @@ name = "sync_performance"
 path = "tests/sync/performance.rs"
 
 [[test]]
-name = "sync_progress"
-path = "tests/sync/progress.rs"
-
-[[test]]
 name = "sync_advanced"
 path = "tests/sync/advanced.rs"
 
@@ -199,10 +178,6 @@ path = "tests/sync/change_ratio.rs"
 [[test]]
 name = "sync_compression"
 path = "tests/sync/compression.rs"
-
-[[test]]
-name = "sync_delta"
-path = "tests/sync/delta.rs"
 
 [[test]]
 name = "sync_hardlinks"
