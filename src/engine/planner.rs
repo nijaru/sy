@@ -13,6 +13,8 @@ pub enum ComparisonMode {
     Always,
 }
 
+use super::namespace::CaseSensitivity;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComparisonPolicy {
     pub mode: ComparisonMode,
@@ -21,6 +23,7 @@ pub struct ComparisonPolicy {
     pub update_only: bool,
     pub preserve_permissions: bool,
     pub preserve_times: bool,
+    pub case_sensitivity: CaseSensitivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
