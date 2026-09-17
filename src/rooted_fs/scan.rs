@@ -301,43 +301,20 @@ const fn stat_mode_u32(stat: &libc::stat) -> u32 {
     stat.st_mode as u32
 }
 
-#[cfg(target_os = "linux")]
-const fn stat_device_u64(stat: &libc::stat) -> u64 {
-    stat.st_dev
-}
-
-#[cfg(target_os = "macos")]
-const fn stat_device_u64(stat: &libc::stat) -> u64 {
-    stat.st_dev as u64
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const fn stat_device_u64(stat: &libc::stat) -> u64 {
-    stat.st_dev as u64
-}
-
 fn symlink_snapshot(stat: &libc::stat, path: &Path) -> Result<SymlinkSnapshot, RootedScanError> {
-    let (mtime, mtime_nsec, ctime, ctime_nsec) = stat_times(stat)?;
+    if stat.st_size < 0 {
+        return Err(RootedScanError::NegativeSize(path.to_path_buf()));
+    }
+    let (mtime, mtime_nsec, _ctime, _ctime_nsec) = stat_times(stat)?;
     let modified = Timestamp::new(mtime, mtime_nsec)
         .map_err(|_| RootedScanError::InvalidTimestamp(path.to_path_buf()))?;
-    let size = u64::try_from(stat.st_size)
-        .map_err(|_| RootedScanError::NegativeSize(path.to_path_buf()))?;
     let mode = stat_mode_u32(stat);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sy-entry-identity-v1\0");
-    hasher.update(&stat_device_u64(stat).to_le_bytes());
-    hasher.update(&stat.st_ino.to_le_bytes());
-    hasher.update(&size.to_le_bytes());
-    hasher.update(&mode.to_le_bytes());
-    hasher.update(&mtime.to_le_bytes());
-    hasher.update(&(i64::from(mtime_nsec)).to_le_bytes());
-    hasher.update(&ctime.to_le_bytes());
-    hasher.update(&(i64::from(ctime_nsec)).to_le_bytes());
-    hasher.update(&[3]);
+    let identity = crate::endpoint::local_identity::stat_identity(stat, EntryKind::Symlink)
+        .ok_or_else(|| RootedScanError::InvalidTimestamp(path.to_path_buf()))?;
     Ok(SymlinkSnapshot {
         mode,
         modified,
-        identity: EntryIdentity::from_bytes(*hasher.finalize().as_bytes()),
+        identity,
     })
 }
 

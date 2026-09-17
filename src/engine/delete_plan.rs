@@ -1,5 +1,5 @@
 use super::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
-use super::domain::{Entry, InvalidRelativePath, RelativePath};
+use super::domain::{Entry, EntryIdentity, InvalidRelativePath, RelativePath};
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,7 @@ pub struct DeletePolicy {
 pub struct DeleteAction {
     pub path: RelativePath,
     pub is_directory: bool,
+    pub identity: Option<EntryIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -203,7 +204,7 @@ impl DeleteTracker {
     async fn append_candidate(&mut self, entry: &Entry) -> Result<()> {
         if entry.is_directory() {
             self.journal
-                .append(entry.path.as_path(), DeleteKind::Directory)
+                .append(entry.path.as_path(), DeleteKind::Directory, entry.identity)
                 .await?;
             self.candidate_directories.push(CandidateDirectory {
                 path: entry.path.clone(),
@@ -211,7 +212,7 @@ impl DeleteTracker {
             });
         } else {
             self.journal
-                .append(entry.path.as_path(), DeleteKind::FileLike)
+                .append(entry.path.as_path(), DeleteKind::FileLike, entry.identity)
                 .await?;
         }
         Ok(())
@@ -223,7 +224,7 @@ impl DeleteTracker {
                 continue;
             }
             self.journal
-                .append(candidate.path.as_path(), DeleteKind::ProtectDirectory)
+                .append(candidate.path.as_path(), DeleteKind::ProtectDirectory, None)
                 .await?;
             candidate.protected = true;
             self.delete_candidates = checked_sub(self.delete_candidates, 1, "delete candidate")?;
@@ -288,12 +289,14 @@ impl DeleteReplay {
                     return Ok(Some(DeleteAction {
                         path,
                         is_directory: true,
+                        identity: record.identity,
                     }));
                 }
                 DeleteKind::FileLike => {
                     return Ok(Some(DeleteAction {
                         path,
                         is_directory: false,
+                        identity: record.identity,
                     }));
                 }
             }
@@ -360,6 +363,7 @@ mod tests {
             Some(DeleteAction {
                 path: path("parent/file"),
                 is_directory: false,
+                identity: None,
             })
         );
         assert_eq!(
@@ -367,9 +371,32 @@ mod tests {
             Some(DeleteAction {
                 path: path("parent"),
                 is_directory: true,
+                identity: None,
             })
         );
         assert_eq!(replay.next_action().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn preserves_entry_identity_into_delete_action() {
+        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+        let mut test_file = file("target");
+        let id = EntryIdentity::from_bytes([99; 32]);
+        test_file.identity = Some(id);
+        tracker
+            .observe_destination_only(&test_file, true)
+            .await
+            .unwrap();
+        let plan = tracker.finish().await.unwrap();
+        let mut replay = plan.into_replay();
+        assert_eq!(
+            replay.next_action().await.unwrap(),
+            Some(DeleteAction {
+                path: path("target"),
+                is_directory: false,
+                identity: Some(id),
+            })
+        );
     }
 
     #[tokio::test]

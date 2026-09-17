@@ -1,4 +1,4 @@
-use crate::engine::domain::RelativePath;
+use crate::engine::domain::{EntryIdentity, RelativePath};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireMutation,
     WireMutationKind, WirePath,
@@ -102,14 +102,16 @@ pub async fn request_remove(
     sender: &RouterSender,
     path: &RelativePath,
     is_directory: bool,
+    expected_identity: Option<EntryIdentity>,
     peer: PlatformOs,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     let path = encode_relative_path(path.as_path())?;
+    let expected_identity = expected_identity.map(|id| *id.as_bytes());
     let mutation = if is_directory {
-        WireMutation::remove_directory(path)
+        WireMutation::remove_directory(path, expected_identity)
     } else {
-        WireMutation::remove_file_like(path)
+        WireMutation::remove_file_like(path, expected_identity)
     };
     request_mutation(sender, mutation).await
 }
@@ -195,10 +197,21 @@ pub async fn serve_incoming_mutation_rooted(
     } else {
         None
     };
+    let expected_identity = mutation
+        .expected_identity()
+        .copied()
+        .map(EntryIdentity::from_bytes);
     drop(first);
 
     tokio::task::spawn_blocking(move || {
-        apply_mutation(&rooted, relative, kind, target, copy_source)
+        apply_mutation(
+            &rooted,
+            relative,
+            kind,
+            target,
+            copy_source,
+            expected_identity,
+        )
     })
     .await
     .map_err(|error| RemoteMutationError::Worker(error.to_string()))??;
@@ -220,6 +233,7 @@ fn apply_mutation(
     kind: WireMutationKind,
     target: Option<PathBuf>,
     copy_source: Option<RelativePath>,
+    expected_identity: Option<EntryIdentity>,
 ) -> Result<()> {
     match kind {
         WireMutationKind::CreateDirectory => rooted.create_directory_blocking(&path)?,
@@ -227,8 +241,12 @@ fn apply_mutation(
             let target = target.ok_or(RemoteMutationError::MissingSymlinkTarget)?;
             rooted.replace_symlink_blocking(&path, &target)?;
         }
-        WireMutationKind::RemoveFileLike => rooted.remove_blocking(&path, false)?,
-        WireMutationKind::RemoveDirectory => rooted.remove_blocking(&path, true)?,
+        WireMutationKind::RemoveFileLike => {
+            rooted.remove_blocking(&path, false, expected_identity)?
+        }
+        WireMutationKind::RemoveDirectory => {
+            rooted.remove_blocking(&path, true, expected_identity)?
+        }
         WireMutationKind::CopyFile => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
             rooted.copy_file_blocking(&source, &path)?;
@@ -408,7 +426,12 @@ mod tests {
             .await
             .unwrap();
         let old = RelativePath::new("old").unwrap();
-        request_remove(&client.sender(), &old, false, peer)
+        let old_meta = std::fs::symlink_metadata(root.path().join("old")).unwrap();
+        let old_id = crate::endpoint::local_identity::metadata_identity(
+            &old_meta,
+            crate::engine::domain::EntryKind::File,
+        );
+        request_remove(&client.sender(), &old, false, old_id, peer)
             .await
             .unwrap();
         // -H: the server links through held descriptors; the linked path
@@ -419,7 +442,12 @@ mod tests {
         request_hardlink(&client.sender(), &basis, &linked, peer)
             .await
             .unwrap();
-        request_remove(&client.sender(), &dir, true, peer)
+        let dir_meta = std::fs::symlink_metadata(root.path().join("dir")).unwrap();
+        let dir_id = crate::endpoint::local_identity::metadata_identity(
+            &dir_meta,
+            crate::engine::domain::EntryKind::Directory,
+        );
+        request_remove(&client.sender(), &dir, true, dir_id, peer)
             .await
             .unwrap();
         server_task.await.unwrap();
@@ -437,5 +465,55 @@ mod tests {
             std::fs::read_link(root.path().join("link")).unwrap(),
             Path::new("../target")
         );
+    }
+
+    #[tokio::test]
+    async fn remote_remove_validates_destination_identity() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file_path = root.path().join("target");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let client = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let mut server = FrameRouter::start(
+            server_reader,
+            server_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let sender = server.sender();
+        let peer = Platform::current().os;
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.incoming().recv().await.unwrap().unwrap();
+            let result = serve_incoming_mutation_rooted(rooted, incoming, &sender, peer).await;
+            drop(server);
+            drop(sender);
+            result
+        });
+
+        let target = RelativePath::new("target").unwrap();
+
+        // Mismatched identity fails and leaves file in place.
+        let wrong_id = EntryIdentity::from_bytes([99; 32]);
+        let err = request_remove(&client.sender(), &target, false, Some(wrong_id), peer).await;
+        assert!(err.is_err());
+        assert!(file_path.exists());
+
+        let server_err = server_task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            server_err,
+            RemoteMutationError::RootedFs(RootedFsError::DestinationChanged(_))
+        ));
     }
 }
