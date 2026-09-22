@@ -25,7 +25,7 @@ pub use frame::{
 };
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
-    ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3,
+    ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::WireMetadata;
@@ -34,7 +34,7 @@ pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
 };
 pub use scan::WireScanRequest;
-pub use session::{Operation, SessionOpen, SessionReady};
+pub use session::{NameFolding, Operation, SessionOpen, SessionReady, WireNamespaceSemantics};
 pub use signature::{
     SignatureBlockSize, WireSignature, WireSignatureEnd, WireSignatureRequest,
     MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,

@@ -22,7 +22,7 @@ use crate::endpoint::Endpoint;
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
-    VersionRange, WirePath, PROTOCOL_V3,
+    VersionRange, WirePath, PROTOCOL_V3, PROTOCOL_V3_1,
 };
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::ffi::OsString;
@@ -90,7 +90,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let versions = VersionRange::exact(PROTOCOL_V3);
+    let versions = VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_1)?;
     let hello = ClientHello::new(
         versions,
         process_capabilities(),
@@ -114,7 +114,7 @@ where
 
     let frame = read_frame(reader).await?;
     expect_control(&frame, FrameKind::SessionReady)?;
-    let ready = SessionReady::decode(frame.payload())?;
+    let ready = SessionReady::decode(frame.payload(), server.version)?;
 
     Ok(ClientSession { server, ready })
 }
@@ -130,7 +130,10 @@ where
     expect_control(&frame, FrameKind::ClientHello)?;
     let client = ClientHello::decode(frame.payload())?;
 
-    let version = negotiate_version(client.versions, VersionRange::exact(PROTOCOL_V3))?;
+    let version = negotiate_version(
+        client.versions,
+        VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_1)?,
+    )?;
     let server = ServerHello::new(
         version,
         process_capabilities(),
@@ -155,8 +158,11 @@ where
     let capabilities = negotiated_capabilities(client.capabilities);
     let precision = endpoint.capabilities().modtime_precision.as_nanos();
     let modtime_precision_ns = u64::try_from(precision).unwrap_or(u64::MAX);
-    let ready = SessionReady::new(capabilities, modtime_precision_ns);
-    let frame = Frame::control(FrameKind::SessionReady, ready.encode())?;
+    // Root-scoped name semantics: the client's alias preflight must follow the
+    // opened filesystem, not the peer OS name.
+    let namespace_semantics = crate::fs_util::namespace_semantics(&root).into();
+    let ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
+    let frame = Frame::control(FrameKind::SessionReady, ready.encode(version))?;
     write_frame(writer, &frame).await?;
     writer.flush().await?;
 
@@ -457,7 +463,12 @@ mod tests {
         .unwrap();
         let opened = server.await.unwrap().unwrap();
 
-        assert_eq!(client.server.version, PROTOCOL_V3);
+        assert_eq!(client.server.version, PROTOCOL_V3_1);
+        // The client receives the probed root semantics, not an OS guess.
+        assert_eq!(
+            client.ready.namespace_semantics,
+            Some(crate::fs_util::namespace_semantics(root.path()).into())
+        );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
         assert_eq!(opened.rooted.root_path(), root.path());

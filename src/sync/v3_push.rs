@@ -173,6 +173,11 @@ async fn execute_with_handle(
             scan_options.respect_gitignore,
         ),
     ));
+    // Preflight follows the destination root's negotiated name semantics; a
+    // 3.0 peer (no root-scoped answer) falls back to the OS approximation.
+    let namespace_semantics = remote
+        .namespace_semantics()
+        .unwrap_or_else(|| NamespaceSemantics::for_platform(remote.peer_platform()));
     let plan = if config.comparison.checksum {
         let source_rooted = RootedFs::open(source_root.to_path_buf())
             .await
@@ -181,10 +186,7 @@ async fn execute_with_handle(
         preflight_remote_push_scoped_with_content(
             source,
             destination,
-            comparison_policy(
-                config,
-                NamespaceSemantics::for_platform(remote.peer_platform()),
-            ),
+            comparison_policy(config, namespace_semantics),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
@@ -222,10 +224,7 @@ async fn execute_with_handle(
         preflight_remote_push_scoped(
             source,
             destination,
-            comparison_policy(
-                config,
-                NamespaceSemantics::for_platform(remote.peer_platform()),
-            ),
+            comparison_policy(config, namespace_semantics),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
