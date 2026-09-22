@@ -10,6 +10,7 @@ use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
 use std::path::{Path, PathBuf};
+use sy::engine::domain::EntryIdentity;
 
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -34,6 +35,8 @@ pub struct TransferOptions {
     /// pacing requires bytes to flow through this process where the token
     /// bucket can meter them.
     pub rate_limiter: Option<std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
+    /// Scan-time identity expectations validated at transfer start and commit.
+    pub identity: TransferIdentity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +52,234 @@ struct NativeTransferResult {
     verification: VerificationStatus,
 }
 
+/// What the transfer must prove about the source before committing bytes.
+#[derive(Debug, Clone, Copy)]
+pub enum SourceExpectation {
+    /// Scan-time identity: validated at transfer start and again at commit.
+    Scanned(EntryIdentity),
+    /// No scan observation exists (single-file copy): capture an identity at
+    /// transfer start and validate it at commit to detect mid-transfer edits.
+    SnapshotAtOpen,
+    /// No observation is available; source race checks are skipped and the
+    /// weaker guarantee is the caller's documented limitation.
+    Unverified,
+}
+
+/// Destination state the commit must still observe.
+#[derive(Debug, Clone, Copy)]
+pub enum ExpectedDestination {
+    /// A create: the destination path must remain absent through commit.
+    Absent,
+    /// An update: the destination must still carry the scanned identity, so a
+    /// concurrent edit is never silently overwritten.
+    Unchanged(EntryIdentity),
+    /// No scan observation exists (single-file copy): capture the identity at
+    /// transfer start and require it unchanged at commit.
+    SnapshotAtOpen,
+    /// No observation is available; destination race checks are skipped.
+    Unverified,
+}
+
+/// Scan-time identity expectations for one transfer.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferIdentity {
+    pub source: SourceExpectation,
+    pub destination: ExpectedDestination,
+}
+
+impl TransferIdentity {
+    /// No race observations at all. Only for callers that genuinely cannot
+    /// observe identity on their platform.
+    pub const fn unverified() -> Self {
+        Self {
+            source: SourceExpectation::Unverified,
+            destination: ExpectedDestination::Unverified,
+        }
+    }
+}
+
+/// One observed identity state of a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    Identified(EntryIdentity),
+    /// The platform cannot produce identity tokens (weaker guarantee).
+    Unidentified,
+    Missing,
+}
+
+fn observe(path: &Path, follow_symlinks: bool) -> Result<Observation> {
+    let metadata = if follow_symlinks {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    };
+    match metadata {
+        Ok(metadata) => Ok(
+            match crate::endpoint::local_identity::identity_for_metadata(&metadata) {
+                Some(identity) => Observation::Identified(identity),
+                None => Observation::Unidentified,
+            },
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Observation::Missing),
+        Err(error) => Err(SyncError::Io(error)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceCheck {
+    path: PathBuf,
+    follow_symlinks: bool,
+    identity: EntryIdentity,
+}
+
+#[derive(Debug, Clone)]
+enum DestinationCheck {
+    Absent(PathBuf),
+    Unchanged {
+        path: PathBuf,
+        identity: EntryIdentity,
+    },
+    Unverified,
+}
+
+/// Deterministic race-injection point: runs immediately before the commit
+/// checks, inside the scan/commit race window. Production callers pass `None`;
+/// unit tests inject filesystem mutations here to exercise abort paths.
+type RaceHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Which validation point is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckPoint {
+    /// Right after expectation resolution, before any staging work.
+    Open,
+    /// Immediately before the visible commit.
+    Commit,
+}
+
+/// Commit-time race expectations for one transfer.
+///
+/// Portable filesystem race detection observes source and destination with
+/// separate stat/rename syscalls. Ordinary concurrent edits, replacements,
+/// truncations, and growth change the identity token and abort staging before
+/// commit; an adversarial ABA replacement that restores every observed field
+/// (including ctime) is outside what portable stat can prove.
+#[derive(Clone)]
+struct CommitChecks {
+    source: Option<SourceCheck>,
+    destination: DestinationCheck,
+    test_hook: Option<RaceHook>,
+}
+
+fn require_native(path: Option<&Path>, role: &str) -> Result<PathBuf> {
+    path.map(Path::to_path_buf).ok_or_else(|| {
+        SyncError::Config(format!(
+            "endpoint cannot re-observe {role} identity for transfer race checks"
+        ))
+    })
+}
+
+impl CommitChecks {
+    fn resolve(
+        identity: TransferIdentity,
+        source_native: Option<&Path>,
+        dest_native: Option<&Path>,
+        follow_symlinks: bool,
+        test_hook: Option<RaceHook>,
+    ) -> Result<Self> {
+        let source = match identity.source {
+            SourceExpectation::Scanned(expected) => {
+                let path = require_native(source_native, "source")?;
+                Some(SourceCheck {
+                    path,
+                    follow_symlinks,
+                    identity: expected,
+                })
+            }
+            SourceExpectation::SnapshotAtOpen => {
+                let path = require_native(source_native, "source")?;
+                match observe(&path, follow_symlinks)? {
+                    Observation::Identified(identity) => Some(SourceCheck {
+                        path,
+                        follow_symlinks,
+                        identity,
+                    }),
+                    Observation::Missing => {
+                        return Err(SyncError::SourceChanged { path });
+                    }
+                    Observation::Unidentified => None,
+                }
+            }
+            SourceExpectation::Unverified => None,
+        };
+        let destination = match identity.destination {
+            ExpectedDestination::Absent => {
+                let path = require_native(dest_native, "destination")?;
+                DestinationCheck::Absent(path)
+            }
+            ExpectedDestination::Unchanged(expected) => {
+                let path = require_native(dest_native, "destination")?;
+                DestinationCheck::Unchanged {
+                    path,
+                    identity: expected,
+                }
+            }
+            ExpectedDestination::SnapshotAtOpen => {
+                let path = require_native(dest_native, "destination")?;
+                match observe(&path, false)? {
+                    Observation::Identified(identity) => {
+                        DestinationCheck::Unchanged { path, identity }
+                    }
+                    Observation::Missing => {
+                        return Err(SyncError::DestinationChanged { path });
+                    }
+                    Observation::Unidentified => DestinationCheck::Unverified,
+                }
+            }
+            ExpectedDestination::Unverified => DestinationCheck::Unverified,
+        };
+        Ok(Self {
+            source,
+            destination,
+            test_hook,
+        })
+    }
+
+    /// Prove the scanned (or snapshot) state still holds.
+    ///
+    /// Runs at transfer start (closing the scan-to-open window) and again
+    /// immediately before the visible commit (closing the read window).
+    fn verify(&self, checkpoint: CheckPoint) -> Result<()> {
+        if checkpoint == CheckPoint::Commit {
+            if let Some(hook) = &self.test_hook {
+                hook();
+            }
+        }
+        if let Some(expected) = &self.source {
+            if observe(&expected.path, expected.follow_symlinks)?
+                != Observation::Identified(expected.identity)
+            {
+                return Err(SyncError::SourceChanged {
+                    path: expected.path.clone(),
+                });
+            }
+        }
+        match &self.destination {
+            DestinationCheck::Absent(path) => {
+                if observe(path, false)? != Observation::Missing {
+                    return Err(SyncError::DestinationChanged { path: path.clone() });
+                }
+            }
+            DestinationCheck::Unchanged { path, identity } => {
+                if observe(path, false)? != Observation::Identified(*identity) {
+                    return Err(SyncError::DestinationChanged { path: path.clone() });
+                }
+            }
+            DestinationCheck::Unverified => {}
+        }
+        Ok(())
+    }
+}
+
 /// Transfer a file using endpoint capabilities rather than endpoint-specific
 /// policy in the caller.
 pub async fn transfer_file(
@@ -57,6 +288,38 @@ pub async fn transfer_file(
     dest: &dyn Endpoint,
     dest_path: &Path,
     options: TransferOptions,
+) -> Result<TransferResult> {
+    transfer_file_inner(source, source_path, dest, dest_path, options, None).await
+}
+
+/// Transfer with a deterministic race hook for unit tests.
+#[cfg(test)]
+pub(crate) async fn transfer_file_with_hook(
+    source: &dyn Endpoint,
+    source_path: &Path,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    options: TransferOptions,
+    test_hook: RaceHook,
+) -> Result<TransferResult> {
+    transfer_file_inner(
+        source,
+        source_path,
+        dest,
+        dest_path,
+        options,
+        Some(test_hook),
+    )
+    .await
+}
+
+async fn transfer_file_inner(
+    source: &dyn Endpoint,
+    source_path: &Path,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    options: TransferOptions,
+    test_hook: Option<RaceHook>,
 ) -> Result<TransferResult> {
     let mut metadata = source.metadata(source_path).await?;
     if options.follow_symlinks && metadata.is_symlink {
@@ -86,12 +349,23 @@ pub async fn transfer_file(
         "selecting transfer strategy"
     );
 
-    // Kernel fast paths copy inside the kernel; a rate limit requires bytes
-    // to flow through this process, so native strategies are bypassed
-    // entirely when pacing is requested and the streaming loop below meters
-    // the bytes instead.
+    // Race checks need re-observable native paths; strategies below may still
+    // prefer streaming. Native strategy selection additionally requires the
+    // bytes to flow through this process when pacing is requested.
+    let source_native = source.native_path(source_path);
+    let dest_native = dest.native_path(dest_path);
+    let checks = CommitChecks::resolve(
+        options.identity,
+        source_native.as_deref(),
+        dest_native.as_deref(),
+        options.follow_symlinks,
+        test_hook,
+    )?;
+    // Close the scan-to-open window before any staging work begins.
+    checks.verify(CheckPoint::Open)?;
+
     let native_pair = if options.rate_limiter.is_none() {
-        (source.native_path(source_path), dest.native_path(dest_path))
+        (source_native, dest_native)
     } else {
         (None, None)
     };
@@ -105,6 +379,7 @@ pub async fn transfer_file(
                 dest_native.clone(),
                 metadata.clone(),
                 options.verify,
+                checks.clone(),
             )
             .await?
             {
@@ -130,6 +405,7 @@ pub async fn transfer_file(
                 dest_native.clone(),
                 metadata.clone(),
                 options.verify,
+                checks.clone(),
             )
             .await?
             {
@@ -143,7 +419,8 @@ pub async fn transfer_file(
 
         if dest_caps.atomic_rename {
             let result =
-                native_whole_copy(source_native, dest_native, metadata, options.verify).await?;
+                native_whole_copy(source_native, dest_native, metadata, options.verify, checks)
+                    .await?;
             return Ok(TransferResult {
                 bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
@@ -167,6 +444,7 @@ pub async fn transfer_file(
             dest_path,
             options.verify,
             options.rate_limiter.as_ref(),
+            Some(&|| checks.verify(CheckPoint::Commit)),
         )
         .await?;
         return Ok(TransferResult {
@@ -188,6 +466,7 @@ async fn native_whole_copy(
     dest: PathBuf,
     metadata: FileMetadata,
     verify: bool,
+    checks: CommitChecks,
 ) -> Result<NativeTransferResult> {
     tokio::task::spawn_blocking(move || {
         if let Some(parent) = dest.parent() {
@@ -207,6 +486,7 @@ async fn native_whole_copy(
             });
         }
 
+        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -224,6 +504,7 @@ async fn reflink_patch(
     dest: PathBuf,
     metadata: FileMetadata,
     verify: bool,
+    checks: CommitChecks,
 ) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         if !dest.exists() {
@@ -270,6 +551,7 @@ async fn reflink_patch(
             }));
         }
 
+        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -404,6 +686,7 @@ async fn native_sparse_copy(
     dest: PathBuf,
     metadata: FileMetadata,
     verify: bool,
+    checks: CommitChecks,
 ) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         use std::fs::File;
@@ -455,6 +738,7 @@ async fn native_sparse_copy(
             }));
         }
 
+        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -473,6 +757,7 @@ async fn native_sparse_copy(
     _dest: PathBuf,
     _metadata: FileMetadata,
     _verify: bool,
+    _checks: CommitChecks,
 ) -> Result<Option<NativeTransferResult>> {
     Ok(None)
 }
@@ -553,4 +838,545 @@ fn strip_xattrs(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn strip_xattrs(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::endpoint::local::LocalEndpoint;
+    use crate::endpoint::local_identity::metadata_identity;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use sy::engine::domain::EntryKind;
+
+    const NAME: &str = "file";
+
+    fn identity_of(path: &Path) -> EntryIdentity {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        metadata_identity(&metadata, EntryKind::File).unwrap()
+    }
+
+    struct Fixture {
+        source_root: tempfile::TempDir,
+        dest_root: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                source_root: tempfile::tempdir().unwrap(),
+                dest_root: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn source_file(&self) -> PathBuf {
+            self.source_root.path().join(NAME)
+        }
+
+        fn dest_file(&self) -> PathBuf {
+            self.dest_root.path().join(NAME)
+        }
+
+        fn source_endpoint(&self) -> LocalEndpoint {
+            LocalEndpoint::new(self.source_root.path().to_path_buf())
+        }
+
+        fn dest_endpoint(&self) -> LocalEndpoint {
+            LocalEndpoint::new(self.dest_root.path().to_path_buf())
+        }
+
+        /// Visible entries in the destination root; staging must be gone after
+        /// every abort.
+        fn dest_entries(&self) -> usize {
+            std::fs::read_dir(self.dest_root.path()).unwrap().count()
+        }
+    }
+
+    fn update_identity(fixture: &Fixture) -> TransferIdentity {
+        TransferIdentity {
+            source: SourceExpectation::Scanned(identity_of(&fixture.source_file())),
+            destination: ExpectedDestination::Unchanged(identity_of(&fixture.dest_file())),
+        }
+    }
+
+    fn create_identity(fixture: &Fixture) -> TransferIdentity {
+        TransferIdentity {
+            source: SourceExpectation::Scanned(identity_of(&fixture.source_file())),
+            destination: ExpectedDestination::Absent,
+        }
+    }
+
+    fn options(identity: TransferIdentity, update: bool) -> TransferOptions {
+        TransferOptions {
+            update,
+            verify: false,
+            follow_symlinks: false,
+            rate_limiter: None,
+            identity,
+        }
+    }
+
+    fn streaming_options(identity: TransferIdentity, update: bool) -> TransferOptions {
+        TransferOptions {
+            rate_limiter: Some(Arc::new(std::sync::Mutex::new(
+                crate::sync::ratelimit::RateLimiter::new(1_u64 << 40),
+            ))),
+            ..options(identity, update)
+        }
+    }
+
+    fn hook(mutate: impl Fn() + Send + Sync + 'static) -> RaceHook {
+        Arc::new(mutate)
+    }
+
+    #[tokio::test]
+    async fn matching_expectations_commit() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+
+        transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn streaming_matching_expectations_commit() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+
+        let result = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            streaming_options(identity, true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy, TransferStrategy::Streaming);
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn scan_to_open_race_detected_without_hook() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let decoy = fixture.source_root.path().join("decoy");
+        std::fs::write(&decoy, b"decoy content").unwrap();
+
+        // The scanned identity belongs to another entry: the source changed
+        // between scan and transfer start.
+        let identity = TransferIdentity {
+            source: SourceExpectation::Scanned(identity_of(&decoy)),
+            destination: ExpectedDestination::Unchanged(identity_of(&fixture.dest_file())),
+        };
+
+        let error = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn source_size_change_before_commit_aborts_and_preserves_destination() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        let racing = hook(move || std::fs::write(&source_file, b"RACED").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn source_same_size_rewrite_detected() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        // Same length, different content and mode: only identity fields catch
+        // this, not size comparison.
+        let racing = hook(move || {
+            std::fs::write(&source_file, b"XXXX").unwrap();
+            std::fs::set_permissions(&source_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        });
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn source_replacement_before_commit_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        let replacement = fixture.source_root.path().join("replacement");
+        let racing = hook(move || {
+            std::fs::write(&replacement, b"ZZZZ").unwrap();
+            std::fs::rename(&replacement, &source_file).unwrap();
+        });
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn source_removed_before_commit_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        let racing = hook(move || std::fs::remove_file(&source_file).unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn source_root_rename_before_commit_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let old_root = fixture.source_root.path().to_path_buf();
+        let moved_root = old_root.with_extension("moved");
+        let racing = hook(move || std::fs::rename(&old_root, &moved_root).unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn destination_appearing_during_create_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        let identity = create_identity(&fixture);
+        let dest_file = fixture.dest_file();
+        let racing = hook(move || std::fs::write(&dest_file, b"KEEP").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, false),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"KEEP");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn destination_appearing_before_transfer_start_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        let identity = create_identity(&fixture);
+        // The raced-in destination exists before the transfer even begins.
+        std::fs::write(fixture.dest_file(), b"KEEP").unwrap();
+
+        let error = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"KEEP");
+    }
+
+    #[tokio::test]
+    async fn destination_edit_during_update_aborts_and_preserves_edit() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let dest_file = fixture.dest_file();
+        let racing = hook(move || std::fs::write(&dest_file, b"OLD!XX").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!XX");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_path_enforces_commit_checks() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        let racing = hook(move || std::fs::write(&source_file, b"RACED").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            streaming_options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn sparse_path_enforces_commit_checks() {
+        let fixture = Fixture::new();
+        // Sparse source: preallocated length with a small tail write.
+        let source_file = fixture.source_file();
+        let file = std::fs::File::create(&source_file).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        drop(file);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_file)
+            .unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(1024 * 1024 - 4)).unwrap();
+        file.write_all(b"tail").unwrap();
+        drop(file);
+
+        let identity = create_identity(&fixture);
+        let dest_file = fixture.dest_file();
+        let racing = hook(move || std::fs::write(&dest_file, b"KEEP").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, false),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"KEEP");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    fn cow_fixture() -> Option<Fixture> {
+        let fixture = Fixture::new();
+        // Reflink needs a COW destination; skip where the filesystem lacks it.
+        if crate::fs_util::supports_cow_reflinks(fixture.dest_root.path()) {
+            Some(fixture)
+        } else {
+            None
+        }
+    }
+
+    /// A large, mostly-unchanged update is eligible for reflink patching on COW
+    /// filesystems; the strategy must still honor the commit checks.
+    #[tokio::test]
+    async fn reflink_patch_enforces_commit_checks() {
+        let Some(fixture) = cow_fixture() else {
+            return;
+        };
+        let size = 16 * 1024 * 1024 + 1;
+        let mut content = vec![b'A'; size];
+        content[0] = b'B';
+        std::fs::write(fixture.source_file(), &content).unwrap();
+        content[0] = b'A';
+        std::fs::write(fixture.dest_file(), &content).unwrap();
+        let identity = update_identity(&fixture);
+        let source_file = fixture.source_file();
+        let racing = hook(move || std::fs::write(&source_file, b"raced").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap().len(), size);
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    /// Pins that the reflink branch is actually exercised where COW exists.
+    #[tokio::test]
+    async fn reflink_patch_selected_on_cow_filesystems() {
+        let Some(fixture) = cow_fixture() else {
+            return;
+        };
+        let size = 16 * 1024 * 1024 + 1;
+        let mut content = vec![b'A'; size];
+        content[0] = b'B';
+        std::fs::write(fixture.source_file(), &content).unwrap();
+        content[0] = b'A';
+        std::fs::write(fixture.dest_file(), &content).unwrap();
+        let identity = update_identity(&fixture);
+
+        let result = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy, TransferStrategy::ReflinkPatch);
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap()[0], b'B');
+    }
+
+    #[tokio::test]
+    async fn snapshot_expectations_detect_mid_transfer_edits() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = TransferIdentity {
+            source: SourceExpectation::SnapshotAtOpen,
+            destination: ExpectedDestination::SnapshotAtOpen,
+        };
+        let source_file = fixture.source_file();
+        let racing = hook(move || std::fs::write(&source_file, b"RACED").unwrap());
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    #[tokio::test]
+    async fn unverified_expectations_still_transfer() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+
+        transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(TransferIdentity::unverified(), true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
 }

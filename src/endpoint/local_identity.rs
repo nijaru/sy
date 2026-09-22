@@ -80,6 +80,22 @@ pub(crate) fn metadata_identity(
     None
 }
 
+/// Identity of an observed entry, deriving the kind from the metadata itself.
+///
+/// Race checks compare whole tokens, so the kind tag must describe what was
+/// actually observed (a replaced symlink vs file must not compare equal).
+pub(crate) fn identity_for_metadata(metadata: &std::fs::Metadata) -> Option<EntryIdentity> {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        EntryKind::Symlink
+    } else if file_type.is_dir() {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    metadata_identity(metadata, kind)
+}
+
 #[cfg(not(unix))]
 pub(crate) fn stat_identity(_stat: &(), _kind: EntryKind) -> Option<EntryIdentity> {
     None

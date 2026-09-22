@@ -689,6 +689,19 @@ impl LocalSyncExecutor {
                 verify: self.verify_on_write,
                 follow_symlinks: self.follow_symlinks,
                 rate_limiter: self.rate_limiter.clone(),
+                identity: crate::endpoint::transfer::TransferIdentity {
+                    source: source
+                        .identity
+                        .map(crate::endpoint::transfer::SourceExpectation::Scanned)
+                        .unwrap_or(crate::endpoint::transfer::SourceExpectation::Unverified),
+                    destination: match destination {
+                        Some(destination) => destination
+                            .identity
+                            .map(crate::endpoint::transfer::ExpectedDestination::Unchanged)
+                            .unwrap_or(crate::endpoint::transfer::ExpectedDestination::Unverified),
+                        None => crate::endpoint::transfer::ExpectedDestination::Absent,
+                    },
+                },
             },
         )
         .await
