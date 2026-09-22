@@ -219,6 +219,60 @@ impl RootedFs {
         self.begin_staged_path_blocking(relative.as_path())
     }
 
+    /// Observe the identity of one root-relative entry without following a
+    /// peer-controlled leaf symlink. `None` means the path is absent.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    #[cfg(unix)]
+    pub fn path_identity_blocking(
+        &self,
+        relative: &RelativePath,
+    ) -> Result<Option<(EntryKind, EntryIdentity)>> {
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        let leaf_c = component_cstring(&leaf)?;
+        let mut stat = MaybeUninit::<libc::stat>::zeroed();
+        let stat_res = unsafe {
+            // SAFETY: `parent` is live, `leaf_c` is a live single component, and
+            // `stat` points to writable storage for one libc::stat value.
+            libc::fstatat(
+                parent.as_raw_fd(),
+                leaf_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_res < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let stat = unsafe {
+            // SAFETY: successful fstatat initialized the stat structure.
+            stat.assume_init()
+        };
+        let file_type = stat.st_mode & libc::S_IFMT;
+        let kind = if file_type == libc::S_IFDIR {
+            EntryKind::Directory
+        } else if file_type == libc::S_IFLNK {
+            EntryKind::Symlink
+        } else {
+            EntryKind::File
+        };
+        let identity = crate::endpoint::local_identity::stat_identity(&stat, kind)
+            .ok_or_else(|| RootedFsError::DestinationChanged(relative.as_path().to_path_buf()))?;
+        Ok(Some((kind, identity)))
+    }
+
+    #[cfg(not(unix))]
+    pub fn path_identity_blocking(
+        &self,
+        _relative: &RelativePath,
+    ) -> Result<Option<(EntryKind, EntryIdentity)>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     /// Create one directory beneath the pinned root without following any
     /// peer-controlled parent symlink. Existing real directories are accepted
     /// so repeated create requests are idempotent; files and symlinks are not.
