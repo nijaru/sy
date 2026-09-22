@@ -17,8 +17,8 @@ use crate::remote::signature::{
     SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, request_file_transfer_with_policy, RemoteDeltaBasis, TransferMetadata,
-    TransferSummary,
+    request_file_transfer, request_file_transfer_with_policy, TransferDestination,
+    TransferMetadata, TransferSummary,
 };
 use crate::remote::xattr::{request_read_xattrs, request_write_xattrs};
 use crate::transfer::delta::{
@@ -181,10 +181,10 @@ impl ClientRemoteHandle {
         &self,
         source_root: PathBuf,
         source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
+        destination: Option<TransferDestination>,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        request_file_transfer(&self.sender, source_root, source, delta_basis, self.peer)
+        request_file_transfer(&self.sender, source_root, source, destination, self.peer)
             .await
             .map_err(Into::into)
     }
@@ -193,11 +193,11 @@ impl ClientRemoteHandle {
         &self,
         source_root: PathBuf,
         source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
+        destination: Option<TransferDestination>,
         metadata: TransferMetadata,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        self.transfer_file_with_policy(source_root, source, delta_basis, metadata, None)
+        self.transfer_file_with_policy(source_root, source, destination, metadata, None)
             .await
     }
 
@@ -208,7 +208,7 @@ impl ClientRemoteHandle {
         &self,
         source_root: PathBuf,
         source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
+        destination: Option<TransferDestination>,
         metadata: TransferMetadata,
         compression: Option<CompressionPolicy>,
     ) -> Result<TransferSummary> {
@@ -220,7 +220,7 @@ impl ClientRemoteHandle {
             &self.sender,
             source_root,
             source,
-            delta_basis,
+            destination,
             metadata,
             self.peer,
             compression,

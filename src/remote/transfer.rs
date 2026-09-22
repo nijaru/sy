@@ -20,12 +20,6 @@ pub(crate) const PRODUCER_QUEUE_DEPTH: usize = 8;
 const RECONSTRUCTION_QUEUE_DEPTH: usize = 8;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-#[derive(Debug)]
-pub struct RemoteDeltaBasis {
-    pub entry: Entry,
-    pub index: BasisIndex,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransferMetadata {
     pub unix_mode: Option<u32>,
@@ -72,9 +66,6 @@ pub enum RemoteTransferError {
     #[error("delta transfer requires a regular-file basis at the source path")]
     InvalidBasis,
 
-    #[error("delta transfer requires a scanned destination basis identity")]
-    MissingBasisIdentity,
-
     #[error(
         "opened source changed since scan (expected {expected_size} bytes, observed {actual_size} bytes)"
     )]
@@ -90,6 +81,12 @@ pub enum RemoteTransferError {
         expected_size: u64,
         actual_size: u64,
     },
+
+    #[error("destination entry appeared during transfer: {path} must remain absent until commit")]
+    UnexpectedDestination { path: PathBuf },
+
+    #[error("destination changed since scan: {path} was replaced or modified before commit")]
+    DestinationChanged { path: PathBuf },
 
     #[error("opened file did not provide a stable endpoint identity")]
     MissingOpenedIdentity,
@@ -186,21 +183,75 @@ enum ReconstructionOp {
 
 struct PreparedReconstruction {
     staged: RootedStagedFile,
+    /// Copy-op basis: only present when the destination is a regular file.
     basis: Option<(File, WireFileBasis)>,
+    rooted: RootedFs,
+    relative: RelativePath,
+    expectation: Option<WireFileBasis>,
+}
+
+/// Prove the destination still carries the state the client scanned.
+///
+/// `None` expectation is a create: the destination must remain absent. This is
+/// stat-based race detection over separate syscalls, with the same documented
+/// limits as local transfers (see `endpoint::transfer`).
+fn validate_destination_state(
+    rooted: &RootedFs,
+    relative: &RelativePath,
+    expectation: Option<WireFileBasis>,
+) -> Result<()> {
+    let observed = rooted.path_identity_blocking(relative)?;
+    let path = relative.as_path().to_path_buf();
+    match expectation {
+        Some(expected) => match observed {
+            Some((_, identity)) if identity.as_bytes() == &expected.identity() => Ok(()),
+            _ => Err(RemoteTransferError::DestinationChanged { path }),
+        },
+        None if observed.is_some() => Err(RemoteTransferError::UnexpectedDestination { path }),
+        None => Ok(()),
+    }
+}
+
+/// The scanned destination state one transfer commits against.
+///
+/// `None` at the call site is a create: the receiver requires the destination
+/// path to remain absent. Updates carry the scanned identity expectation so a
+/// racing replacement aborts staging before commit; delta transfers add the
+/// signature index produced from that same destination entry.
+#[derive(Debug)]
+pub struct TransferDestination {
+    pub expectation: WireFileBasis,
+    pub delta_index: Option<BasisIndex>,
+}
+
+impl TransferDestination {
+    pub const fn whole(expectation: WireFileBasis) -> Self {
+        Self {
+            expectation,
+            delta_index: None,
+        }
+    }
+
+    pub const fn delta(expectation: WireFileBasis, delta_index: BasisIndex) -> Self {
+        Self {
+            expectation,
+            delta_index: Some(delta_index),
+        }
+    }
 }
 
 pub async fn request_file_transfer(
     sender: &RouterSender,
     source_root: PathBuf,
     source: Entry,
-    delta_basis: Option<RemoteDeltaBasis>,
+    destination: Option<TransferDestination>,
     peer: PlatformOs,
 ) -> Result<TransferSummary> {
     request_file_transfer_with_metadata(
         sender,
         source_root,
         source,
-        delta_basis,
+        destination,
         TransferMetadata::default(),
         peer,
     )
@@ -211,7 +262,7 @@ pub async fn request_file_transfer_with_metadata(
     sender: &RouterSender,
     source_root: PathBuf,
     source: Entry,
-    delta_basis: Option<RemoteDeltaBasis>,
+    destination: Option<TransferDestination>,
     metadata: TransferMetadata,
     peer: PlatformOs,
 ) -> Result<TransferSummary> {
@@ -219,7 +270,7 @@ pub async fn request_file_transfer_with_metadata(
         sender,
         source_root,
         source,
-        delta_basis,
+        destination,
         metadata,
         peer,
         None,
@@ -231,7 +282,7 @@ pub async fn request_file_transfer_with_policy(
     sender: &RouterSender,
     source_root: PathBuf,
     source: Entry,
-    delta_basis: Option<RemoteDeltaBasis>,
+    destination: Option<TransferDestination>,
     metadata: TransferMetadata,
     peer: PlatformOs,
     compression: Option<crate::engine::compression::CompressionPolicy>,
@@ -256,21 +307,15 @@ pub async fn request_file_transfer_with_policy(
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
 
     let encoded_path = encode_relative_path(source.path.as_path())?;
-    let (begin, basis_index) = match delta_basis {
-        Some(delta) => {
-            if !delta.entry.is_file() || delta.entry.path != source.path {
-                return Err(RemoteTransferError::InvalidBasis);
-            }
-            let identity = delta
-                .entry
-                .identity
-                .ok_or(RemoteTransferError::MissingBasisIdentity)?;
-            let basis = WireFileBasis::new(delta.entry.size, *identity.as_bytes());
-            (
-                WireFileBegin::delta(encoded_path, source.size, basis),
-                Some(delta.index),
-            )
-        }
+    let (begin, basis_index) = match destination {
+        // The expectation is the scanned destination identity; delta
+        // transfers reuse it as their copy-op basis. The receiver refuses
+        // racing replacements before commit in both cases.
+        Some(destination) => (
+            WireFileBegin::delta(encoded_path, source.size, destination.expectation),
+            destination.delta_index,
+        ),
+        // A create: the receiver requires the path to remain absent.
         None => (WireFileBegin::whole(encoded_path, source.size), None),
     };
     let begin = begin.with_metadata(
@@ -628,18 +673,42 @@ pub(crate) fn produce_whole(
 fn prepare_reconstruction(
     rooted: RootedFs,
     relative: &RelativePath,
-    basis: Option<WireFileBasis>,
+    expectation: Option<WireFileBasis>,
 ) -> Result<PreparedReconstruction> {
-    let basis = match basis {
-        Some(expected) => {
-            let file = rooted.open_regular_blocking(relative)?;
-            validate_basis(&file, expected)?;
-            Some((file, expected))
+    let observed = rooted.path_identity_blocking(relative)?;
+    let path = relative.as_path().to_path_buf();
+    let basis = match expectation {
+        Some(expected) => match observed {
+            Some((kind, identity)) if identity.as_bytes() == &expected.identity() => {
+                if kind == EntryKind::File {
+                    // The copy-op basis is the old destination itself; the
+                    // opened handle is revalidated at completion.
+                    let file = rooted.open_regular_blocking(relative)?;
+                    validate_basis(&file, expected)?;
+                    Some((file, expected))
+                } else {
+                    // Non-regular destination (type transition): whole bytes
+                    // only, with the identity expectation still enforced.
+                    None
+                }
+            }
+            _ => return Err(RemoteTransferError::DestinationChanged { path }),
+        },
+        None => {
+            if observed.is_some() {
+                return Err(RemoteTransferError::UnexpectedDestination { path });
+            }
+            None
         }
-        None => None,
     };
     let staged = rooted.begin_staged_file_blocking(relative)?;
-    Ok(PreparedReconstruction { staged, basis })
+    Ok(PreparedReconstruction {
+        staged,
+        basis,
+        rooted,
+        relative: relative.clone(),
+        expectation,
+    })
 }
 
 fn reconstruct_file(
@@ -698,6 +767,12 @@ fn reconstruct_file(
                 if digest != end.digest() {
                     return Err(RemoteTransferError::DigestMismatch);
                 }
+                // The scanned destination state must still hold at commit.
+                validate_destination_state(
+                    &prepared.rooted,
+                    &prepared.relative,
+                    prepared.expectation,
+                )?;
                 if let Some((basis, expected)) = prepared.basis.as_ref() {
                     validate_basis(basis, *expected)?;
                 }
@@ -954,11 +1029,14 @@ mod tests {
         )
         .unwrap();
         let modified = Timestamp::new(1_600_000_030, 0).unwrap();
+        let destination = file_entry(destination_root.path(), "file.bin");
+        let destination_expectation =
+            WireFileBasis::new(destination.size, *destination.identity.unwrap().as_bytes());
         let summary = request_file_transfer_with_metadata(
             &router.sender(),
             source_root.path().to_path_buf(),
             source,
-            None,
+            Some(TransferDestination::whole(destination_expectation)),
             TransferMetadata {
                 unix_mode: Some(0o640),
                 modified: Some(modified),
@@ -992,10 +1070,9 @@ mod tests {
         std::fs::write(destination_root.path().join("file.bin"), destination).unwrap();
         let source = file_entry(source_root.path(), "file.bin");
         let basis_entry = file_entry(destination_root.path(), "file.bin");
-        let delta = RemoteDeltaBasis {
-            entry: basis_entry,
-            index: basis_index(destination, 4),
-        };
+        let expectation =
+            WireFileBasis::new(basis_entry.size, *basis_entry.identity.unwrap().as_bytes());
+        let delta_index = basis_index(destination, 4);
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
@@ -1037,7 +1114,7 @@ mod tests {
             &router.sender(),
             source_root.path().to_path_buf(),
             source,
-            Some(delta),
+            Some(TransferDestination::delta(expectation, delta_index)),
             session.server.platform.os,
         )
         .await
@@ -1062,9 +1139,12 @@ mod tests {
         let original_mtime = original.mtime();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let destination_identity =
+            crate::endpoint::local_identity::metadata_identity(&original, EntryKind::File).unwrap();
+        let expectation = WireFileBasis::new(original.len(), *destination_identity.as_bytes());
         let prepared = tokio::task::spawn_blocking({
             let relative = relative.clone();
-            move || prepare_reconstruction(rooted, &relative, None)
+            move || prepare_reconstruction(rooted, &relative, Some(expectation))
         })
         .await
         .unwrap()
@@ -1092,5 +1172,149 @@ mod tests {
         assert_eq!(preserved.mode(), original_mode);
         assert_eq!(preserved.mtime(), original_mtime);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// A create declares no destination expectation: the server must refuse a
+    /// destination that appeared instead of silently replacing it.
+    #[tokio::test]
+    async fn whole_create_refuses_existing_destination() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"keep").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, None)
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            prepared,
+            Err(RemoteTransferError::UnexpectedDestination { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"keep");
+    }
+
+    /// The expectation must describe the scanned destination exactly.
+    #[tokio::test]
+    async fn update_with_wrong_destination_expectation_refuses() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let decoy = root.path().join("decoy");
+        std::fs::write(&decoy, b"decoy content").unwrap();
+        let decoy_meta = std::fs::metadata(&decoy).unwrap();
+        let decoy_identity =
+            crate::endpoint::local_identity::metadata_identity(&decoy_meta, EntryKind::File)
+                .unwrap();
+        let wrong = WireFileBasis::new(decoy_meta.len(), *decoy_identity.as_bytes());
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, Some(wrong))
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            prepared,
+            Err(RemoteTransferError::DestinationChanged { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    }
+
+    /// A destination replaced after staging but before FileEnd aborts the
+    /// commit; the concurrent replacement survives untouched.
+    #[tokio::test]
+    async fn destination_replaced_before_commit_refuses() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let original = std::fs::metadata(root.path().join("file")).unwrap();
+        let identity =
+            crate::endpoint::local_identity::metadata_identity(&original, EntryKind::File).unwrap();
+        let expectation = WireFileBasis::new(original.len(), *identity.as_bytes());
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, Some(expectation))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let wire_path = encode_relative_path(relative.as_path()).unwrap();
+        let begin = WireFileBegin::whole(wire_path, 3);
+        let (tx, rx) = mpsc::channel(2);
+        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
+            .await
+            .unwrap();
+
+        // A concurrent writer replaces the destination while bytes are staged.
+        std::fs::write(root.path().join("file"), b"RACED").unwrap();
+
+        let digest = blake3::hash(b"new");
+        tx.send(ReconstructionOp::End(WireFileEnd::new(
+            3,
+            *digest.as_bytes(),
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(RemoteTransferError::DestinationChanged { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"RACED");
+        // Only the preserved destination remains: staging is gone.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// Whole-file replacement of a scanned symlink is a legal type transition:
+    /// the identity expectation is kind-tagged, and non-regular destinations
+    /// receive whole bytes without a copy basis.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn type_transition_with_matching_expectation_commits() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.path().join("file")).unwrap();
+        let link_meta = std::fs::symlink_metadata(root.path().join("file")).unwrap();
+        let identity =
+            crate::endpoint::local_identity::metadata_identity(&link_meta, EntryKind::Symlink)
+                .unwrap();
+        let expectation = WireFileBasis::new(link_meta.len(), *identity.as_bytes());
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, Some(expectation))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let wire_path = encode_relative_path(relative.as_path()).unwrap();
+        let begin = WireFileBegin::whole(wire_path, 3);
+        let (tx, rx) = mpsc::channel(2);
+        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
+            .await
+            .unwrap();
+        let digest = blake3::hash(b"new");
+        tx.send(ReconstructionOp::End(WireFileEnd::new(
+            3,
+            *digest.as_bytes(),
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        worker.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
     }
 }

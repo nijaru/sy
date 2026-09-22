@@ -25,8 +25,7 @@ use crate::remote::signature::{
     RemoteSignatureError, SignatureEvent, SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, serve_incoming_file_rooted, RemoteDeltaBasis, RemoteTransferError,
-    TransferSummary,
+    request_file_transfer, serve_incoming_file_rooted, RemoteTransferError, TransferSummary,
 };
 use crate::remote::xattr::{
     request_read_xattrs, request_write_xattrs, serve_incoming_xattr_rooted, RemoteXattrError,
@@ -265,14 +264,14 @@ impl ClientRemoteSession {
         &self,
         source_root: PathBuf,
         source: Entry,
-        delta_basis: Option<RemoteDeltaBasis>,
+        destination: Option<crate::remote::transfer::TransferDestination>,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
         request_file_transfer(
             &self.router.sender(),
             source_root,
             source,
-            delta_basis,
+            destination,
             self.server.platform.os,
         )
         .await
@@ -967,6 +966,11 @@ mod tests {
         std::fs::write(source_root.path().join("file.bin"), data).unwrap();
         std::fs::write(destination_root.path().join("file.bin"), b"old").unwrap();
         let source = file_entry(source_root.path(), "file.bin");
+        let destination = file_entry(destination_root.path(), "file.bin");
+        let expectation = crate::protocol::WireFileBasis::new(
+            destination.size,
+            *destination.identity.unwrap().as_bytes(),
+        );
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
@@ -994,7 +998,13 @@ mod tests {
         .await
         .unwrap();
         let sent = session
-            .transfer_file(source_root.path().to_path_buf(), source, None)
+            .transfer_file(
+                source_root.path().to_path_buf(),
+                source,
+                Some(crate::remote::transfer::TransferDestination::whole(
+                    expectation,
+                )),
+            )
             .await
             .unwrap();
         let received = server.await.unwrap();
@@ -1126,6 +1136,11 @@ mod tests {
         std::fs::write(outside.path().join("file.bin"), b"outside").unwrap();
         std::fs::write(source_root.path().join("file.bin"), b"new").unwrap();
         let source = file_entry(source_root.path(), "file.bin");
+        let destination = file_entry(&root_path, "file.bin");
+        let expectation = crate::protocol::WireFileBasis::new(
+            destination.size,
+            *destination.identity.unwrap().as_bytes(),
+        );
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
@@ -1160,7 +1175,13 @@ mod tests {
         symlink(outside.path(), &root_path).unwrap();
 
         session
-            .transfer_file(source_root.path().to_path_buf(), source, None)
+            .transfer_file(
+                source_root.path().to_path_buf(),
+                source,
+                Some(crate::remote::transfer::TransferDestination::whole(
+                    expectation,
+                )),
+            )
             .await
             .unwrap();
         server.await.unwrap();

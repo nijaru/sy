@@ -10,7 +10,7 @@ use crate::remote::bsdflags::{
     apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
 };
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
-use crate::remote::transfer::{RemoteDeltaBasis, TransferMetadata, TransferSummary};
+use crate::remote::transfer::{TransferDestination, TransferMetadata, TransferSummary};
 use crate::remote::xattr::{
     apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
 };
@@ -89,6 +89,9 @@ pub enum RemotePushError {
 
     #[error("source entry {0} changed between scan and removal; not removing")]
     SourceChangedBeforeRemoval(PathBuf),
+
+    #[error("scanned destination identity is required to commit a remote update: {0}")]
+    MissingDestinationIdentity(PathBuf),
 
     #[error("failed to remove committed source {0}: {1}")]
     SourceRemoval(PathBuf, std::io::Error),
@@ -680,7 +683,7 @@ impl RemotePushExecutor {
                         self.remote.copy_file(&existing.path, &backup_path).await?;
                     }
                 }
-                let delta_basis = self.prepare_delta_basis(destination).await?;
+                let destination_transfer = self.prepare_destination(destination).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
@@ -689,7 +692,7 @@ impl RemotePushExecutor {
                     .transfer_file_with_policy(
                         self.source_root.clone(),
                         source.clone(),
-                        delta_basis,
+                        destination_transfer,
                         metadata,
                         self.compression,
                     )
@@ -808,7 +811,7 @@ impl RemotePushExecutor {
                 self.remote.copy_file(&existing.path, &backup_path).await?;
             }
         }
-        let delta_basis = self.prepare_delta_basis(destination).await?;
+        let destination_transfer = self.prepare_destination(destination).await?;
         let xattrs = self.read_source_xattrs(&source).await?;
         let acls = self.read_source_acls(&source).await?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
@@ -817,7 +820,7 @@ impl RemotePushExecutor {
             .transfer_file_with_policy(
                 self.source_root.clone(),
                 source.clone(),
-                delta_basis,
+                destination_transfer,
                 metadata,
                 self.compression,
             )
@@ -1009,30 +1012,36 @@ impl RemotePushExecutor {
         Ok(())
     }
 
-    async fn prepare_delta_basis(
+    /// The scanned destination state the remote commit must observe, plus a
+    /// delta index when signature collection selected one for that entry.
+    ///
+    /// `None` is a create: the receiver requires the path to remain absent.
+    async fn prepare_destination(
         &self,
         destination: Option<Entry>,
-    ) -> Result<Option<RemoteDeltaBasis>> {
+    ) -> Result<Option<TransferDestination>> {
         let Some(destination) = destination else {
             return Ok(None);
         };
-        if !delta_candidate(
+        let identity = destination.identity.ok_or_else(|| {
+            RemotePushError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
+        })?;
+        let expectation =
+            crate::protocol::WireFileBasis::new(destination.size, *identity.as_bytes());
+        let delta_index = if delta_candidate(
             &destination,
             self.delta_min_size,
             self.remote.ready().capabilities,
         ) {
-            return Ok(None);
-        }
-        let Some(index) = self
-            .remote
-            .delta_basis(&destination, self.delta_limits)
-            .await?
-        else {
-            return Ok(None);
+            self.remote
+                .delta_basis(&destination, self.delta_limits)
+                .await?
+        } else {
+            None
         };
-        Ok(Some(RemoteDeltaBasis {
-            entry: destination,
-            index,
+        Ok(Some(TransferDestination {
+            expectation,
+            delta_index,
         }))
     }
 
