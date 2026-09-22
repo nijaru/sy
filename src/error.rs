@@ -39,6 +39,15 @@ pub enum SyncError {
     },
 
     #[error(
+        "Preservation conflict: {path} ended with mode {actual:#o} after applying its ACL (expected {expected:#o})"
+    )]
+    PreservationConflict {
+        path: PathBuf,
+        expected: u32,
+        actual: u32,
+    },
+
+    #[error(
         "Source changed during transfer: {path}\nThe source was modified or replaced after it was scanned; the destination was left unchanged."
     )]
     SourceChanged { path: PathBuf },

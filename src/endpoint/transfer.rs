@@ -5,7 +5,9 @@
 //! staged streaming. Local updates may use a reflink clone + patch when that
 //! reduces physical writes; non-COW local files use a normal whole-file copy.
 
-use crate::endpoint::io::{copy_file_streaming, VerificationStatus};
+use crate::endpoint::io::{
+    copy_file_streaming, Preservation, StreamCopyPolicy, VerificationStatus,
+};
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
@@ -37,6 +39,9 @@ pub struct TransferOptions {
     pub rate_limiter: Option<std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
     /// Scan-time identity expectations validated at transfer start and commit.
     pub identity: TransferIdentity,
+    /// Preservation payload read from the validated source; applied to staging
+    /// before commit so a failure aborts instead of committing bare content.
+    pub preservation: Preservation,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,6 +385,7 @@ async fn transfer_file_inner(
                 metadata.clone(),
                 options.verify,
                 checks.clone(),
+                options.preservation.clone(),
             )
             .await?
             {
@@ -406,6 +412,7 @@ async fn transfer_file_inner(
                 metadata.clone(),
                 options.verify,
                 checks.clone(),
+                options.preservation.clone(),
             )
             .await?
             {
@@ -418,9 +425,15 @@ async fn transfer_file_inner(
         }
 
         if dest_caps.atomic_rename {
-            let result =
-                native_whole_copy(source_native, dest_native, metadata, options.verify, checks)
-                    .await?;
+            let result = native_whole_copy(
+                source_native,
+                dest_native,
+                metadata,
+                options.verify,
+                checks,
+                options.preservation,
+            )
+            .await?;
             return Ok(TransferResult {
                 bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
@@ -442,9 +455,12 @@ async fn transfer_file_inner(
             source_path,
             dest,
             dest_path,
-            options.verify,
-            options.rate_limiter.as_ref(),
-            Some(&|| checks.verify(CheckPoint::Commit)),
+            &StreamCopyPolicy {
+                verify: options.verify,
+                rate_limiter: options.rate_limiter.as_ref(),
+                preservation: &options.preservation,
+                pre_commit: Some(&|| checks.verify(CheckPoint::Commit)),
+            },
         )
         .await?;
         return Ok(TransferResult {
@@ -467,6 +483,7 @@ async fn native_whole_copy(
     metadata: FileMetadata,
     verify: bool,
     checks: CommitChecks,
+    preservation: Preservation,
 ) -> Result<NativeTransferResult> {
     tokio::task::spawn_blocking(move || {
         if let Some(parent) = dest.parent() {
@@ -486,8 +503,10 @@ async fn native_whole_copy(
             });
         }
 
-        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
         Ok(NativeTransferResult {
@@ -505,6 +524,7 @@ async fn reflink_patch(
     metadata: FileMetadata,
     verify: bool,
     checks: CommitChecks,
+    preservation: Preservation,
 ) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         if !dest.exists() {
@@ -551,8 +571,10 @@ async fn reflink_patch(
             }));
         }
 
-        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
         Ok(Some(NativeTransferResult {
@@ -687,6 +709,7 @@ async fn native_sparse_copy(
     metadata: FileMetadata,
     verify: bool,
     checks: CommitChecks,
+    preservation: Preservation,
 ) -> Result<Option<NativeTransferResult>> {
     tokio::task::spawn_blocking(move || {
         use std::fs::File;
@@ -738,8 +761,10 @@ async fn native_sparse_copy(
             }));
         }
 
-        checks.verify(CheckPoint::Commit)?;
         apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
         Ok(Some(NativeTransferResult {
@@ -758,6 +783,7 @@ async fn native_sparse_copy(
     _metadata: FileMetadata,
     _verify: bool,
     _checks: CommitChecks,
+    _preservation: Preservation,
 ) -> Result<Option<NativeTransferResult>> {
     Ok(None)
 }
@@ -912,6 +938,7 @@ mod tests {
             verify: false,
             follow_symlinks: false,
             rate_limiter: None,
+            preservation: Preservation::default(),
             identity,
         }
     }
@@ -1359,6 +1386,98 @@ mod tests {
 
         assert!(matches!(error, SyncError::SourceChanged { .. }));
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+    }
+
+    /// A preservation payload that cannot be applied aborts staging: the old
+    /// destination survives and no temp file is left behind.
+    #[tokio::test]
+    async fn preservation_failure_aborts_and_preserves_destination() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        // Oversized attribute names fail in every setxattr implementation.
+        let oversized = format!("user.{}", "x".repeat(300));
+        let mut opts = options(identity, true);
+        opts.preservation = Preservation {
+            xattrs: Some(vec![(std::ffi::OsString::from(oversized), vec![1_u8])]),
+            acl: None,
+        };
+
+        let error = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            opts,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::Io(_)));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    /// Preservation is applied to staging before commit, so the committed
+    /// destination already carries the source's attributes.
+    #[tokio::test]
+    async fn preservation_is_applied_before_commit() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        let identity = create_identity(&fixture);
+        let mut opts = options(identity, false);
+        opts.preservation = Preservation {
+            xattrs: Some(vec![(
+                std::ffi::OsString::from("user.sy_test"),
+                b"v".to_vec(),
+            )]),
+            acl: None,
+        };
+
+        transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+        let value = xattr::get(fixture.dest_file(), "user.sy_test").unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    }
+
+    /// Unparseable ACL text aborts staging rather than committing bare
+    /// content with broken protection.
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn invalid_acl_preservation_aborts() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let identity = update_identity(&fixture);
+        let mut opts = options(identity, true);
+        opts.preservation = Preservation {
+            xattrs: None,
+            acl: Some("not an acl entry".to_string()),
+        };
+
+        let error = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            opts,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::Io(_)));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
     }
 
     #[tokio::test]

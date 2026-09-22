@@ -475,16 +475,16 @@ impl LocalSyncExecutor {
                     self.backup_replacement_file(&source.path).await?;
                 }
                 let transfer = self
-                    .transfer_source_file(&source, &destination, &metadata)
+                    .transfer_source_file(
+                        &source,
+                        &destination,
+                        &metadata,
+                        crate::endpoint::io::Preservation { xattrs, acl: acls },
+                    )
                     .await?;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
+                // Only rename-incompatible flags remain post-commit
+                // finalization; xattrs/ACLs ride into staging and a failure
+                // there aborts the replacement.
                 if let Some(flags) = bsd_flags {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
@@ -601,16 +601,14 @@ impl LocalSyncExecutor {
             self.backup_replacement_file(&source.path).await?;
         }
         let transfer = self
-            .transfer_source_file(&source, &destination, &metadata)
+            .transfer_source_file(
+                &source,
+                &destination,
+                &metadata,
+                crate::endpoint::io::Preservation { xattrs, acl: acls },
+            )
             .await?;
-        if let Some(xattrs) = xattrs.as_deref() {
-            self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                .await?;
-        }
-        if let Some(acls) = acls.as_deref() {
-            self.write_destination_acls(&source.path, source.kind, acls)
-                .await?;
-        }
+        // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
@@ -672,6 +670,7 @@ impl LocalSyncExecutor {
         source: &Entry,
         destination: &Option<Entry>,
         metadata: &LocalTransferMetadata,
+        preservation: crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let source_endpoint = crate::endpoint::local::LocalEndpoint::new(self.source_root.clone());
         let destination_endpoint =
@@ -702,6 +701,7 @@ impl LocalSyncExecutor {
                         None => crate::endpoint::transfer::ExpectedDestination::Absent,
                     },
                 },
+                preservation,
             },
         )
         .await

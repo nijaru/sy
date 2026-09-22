@@ -245,6 +245,7 @@ impl SyncSession {
                         crate::endpoint::transfer::ExpectedDestination::Absent
                     },
                 },
+                preservation: crate::endpoint::io::Preservation::default(),
             },
         )
         .await?;
