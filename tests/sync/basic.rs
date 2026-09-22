@@ -1037,15 +1037,31 @@ fn test_concurrent_sync_safety() {
     let output1 = handle1.join().unwrap();
     let output2 = handle2.join().unwrap();
 
-    // At least one should succeed
-    assert!(
-        output1.status.success() || output2.status.success(),
-        "At least one sync should succeed"
-    );
+    // Concurrent writers to one destination race by design: each sync either
+    // commits its entries or aborts cleanly when the other writer changed the
+    // destination after its scan (destination-race protection). Both may
+    // abort when they split the entries between them; none may corrupt.
+    for (name, output) in [("first", &output1), ("second", &output2)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() || stderr.contains("changed during transfer"),
+            "concurrent {name} sync should succeed or race-abort cleanly, got: {stderr}"
+        );
+    }
 
-    // Check files exist
+    // Check files exist with the source's content
     assert!(dest.path().join("file1.txt").exists(), "File1 should exist");
     assert!(dest.path().join("file2.txt").exists(), "File2 should exist");
+    assert_eq!(
+        fs::read(dest.path().join("file1.txt")).unwrap(),
+        b"content1"
+    );
+    assert_eq!(
+        fs::read(dest.path().join("file2.txt")).unwrap(),
+        b"content2"
+    );
+    // Aborted transfers leave no staging leftovers.
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 2);
 }
 
 #[test]
