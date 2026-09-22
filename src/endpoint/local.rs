@@ -86,6 +86,106 @@ impl LocalStagedWriter {
     }
 }
 
+/// Mirror a preservation set onto a local path, removing stale values.
+///
+/// Blocking syscall API shared by the endpoint methods, staged-writer
+/// preservation, and the native transfer strategies so every commit path
+/// applies identical semantics.
+#[cfg(unix)]
+pub(crate) fn write_xattrs_blocking(
+    full_path: &Path,
+    xattrs: &[(OsString, Vec<u8>)],
+) -> Result<()> {
+    let existing: Vec<OsString> = xattr::list(full_path)?.collect();
+
+    for (name, value) in xattrs {
+        xattr::set(full_path, name, value)?;
+    }
+
+    for name in existing {
+        if !xattrs.iter().any(|(desired, _)| desired == &name) {
+            match xattr::remove(full_path, &name) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(libc::EPERM)
+                        || error.raw_os_error() == Some(libc::EACCES) => {}
+                Err(error) => return Err(SyncError::Io(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace a local path's ACL with `acl`'s exacl-unified text. Empty text
+/// restores the mode-derived base entries.
+#[cfg(all(unix, feature = "acl"))]
+pub(crate) fn write_acl_blocking(full_path: &Path, acl: &str) -> Result<()> {
+    use std::str::FromStr;
+
+    let entries = if acl.is_empty() {
+        #[cfg(target_os = "macos")]
+        {
+            Vec::new()
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(full_path)?.permissions().mode();
+            exacl::from_mode(mode & 0o777)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+        {
+            Vec::new()
+        }
+    } else {
+        acl.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                exacl::AclEntry::from_str(line).map_err(|error| {
+                    SyncError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    exacl::setfacl(&[&full_path], &entries, None)?;
+    Ok(())
+}
+
+/// Apply a preservation payload to one local staging path before commit.
+pub(crate) fn apply_preservation_blocking(
+    full_path: &Path,
+    preservation: &crate::endpoint::io::Preservation,
+) -> Result<()> {
+    if let Some(xattrs) = &preservation.xattrs {
+        #[cfg(unix)]
+        write_xattrs_blocking(full_path, xattrs)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (full_path, xattrs);
+            return Err(SyncError::Config(
+                "local extended attributes are unsupported on this platform".to_string(),
+            ));
+        }
+    }
+    if let Some(acl) = &preservation.acl {
+        #[cfg(all(unix, feature = "acl"))]
+        write_acl_blocking(full_path, acl)?;
+        #[cfg(not(all(unix, feature = "acl")))]
+        {
+            let _ = (full_path, acl);
+            return Err(SyncError::Config(
+                "local ACL preservation requires the acl feature on Unix".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl StagedWriter for LocalStagedWriter {
     async fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -127,6 +227,24 @@ impl StagedWriter for LocalStagedWriter {
             hasher.update(&buffer[..read]);
         }
         Ok(Some(hasher.finalize()))
+    }
+
+    async fn apply_preservation(
+        &mut self,
+        preservation: &crate::endpoint::io::Preservation,
+        expected_mode: Option<u32>,
+    ) -> Result<()> {
+        self.file_mut()?.flush().await?;
+        if !preservation.is_empty() {
+            let temp_path = self.temp_path.clone();
+            let preservation = preservation.clone();
+            tokio::task::spawn_blocking(move || {
+                apply_preservation_blocking(&temp_path, &preservation)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
+        }
+        crate::endpoint::io::verify_staged_mode(&self.temp_path, expected_mode)
     }
 
     async fn commit(mut self: Box<Self>) -> Result<()> {
@@ -229,29 +347,9 @@ impl Endpoint for LocalEndpoint {
         {
             let full_path = self.resolve(path);
             let xattrs = xattrs.to_vec();
-            return tokio::task::spawn_blocking(move || -> Result<()> {
-                let existing: Vec<OsString> = xattr::list(&full_path)?.collect();
-
-                for (name, value) in &xattrs {
-                    xattr::set(&full_path, name, value)?;
-                }
-
-                for name in existing {
-                    if !xattrs.iter().any(|(desired, _)| desired == &name) {
-                        match xattr::remove(&full_path, &name) {
-                            Ok(()) => {}
-                            Err(error)
-                                if error.kind() == std::io::ErrorKind::PermissionDenied
-                                    || error.raw_os_error() == Some(libc::EPERM)
-                                    || error.raw_os_error() == Some(libc::EACCES) => {}
-                            Err(error) => return Err(SyncError::Io(error)),
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return tokio::task::spawn_blocking(move || write_xattrs_blocking(&full_path, &xattrs))
+                .await
+                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
         }
 
         #[cfg(not(unix))]
@@ -299,47 +397,9 @@ impl Endpoint for LocalEndpoint {
         {
             let full_path = self.resolve(path);
             let acl = acl.to_string();
-            return tokio::task::spawn_blocking(move || -> Result<()> {
-                use std::str::FromStr;
-
-                let entries = if acl.is_empty() {
-                    #[cfg(target_os = "macos")]
-                    {
-                        Vec::new()
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = std::fs::metadata(&full_path)?.permissions().mode();
-                        exacl::from_mode(mode & 0o777)
-                    }
-                    #[cfg(not(any(
-                        target_os = "linux",
-                        target_os = "freebsd",
-                        target_os = "macos"
-                    )))]
-                    {
-                        Vec::new()
-                    }
-                } else {
-                    acl.lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .map(|line| {
-                            exacl::AclEntry::from_str(line).map_err(|error| {
-                                SyncError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    error.to_string(),
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                };
-
-                exacl::setfacl(&[&full_path], &entries, None)?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return tokio::task::spawn_blocking(move || write_acl_blocking(&full_path, &acl))
+                .await
+                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
         }
 
         #[cfg(not(all(unix, feature = "acl")))]

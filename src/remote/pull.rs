@@ -319,15 +319,16 @@ impl RemotePullExecutor {
                             })?;
                     }
                 }
-                let summary = self.fetch_into_staging(&source, &metadata).await?;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
+                let summary = self
+                    .fetch_into_staging(
+                        &source,
+                        &metadata,
+                        &crate::endpoint::io::Preservation { xattrs, acl: acls },
+                    )
+                    .await?;
+                // Only rename-incompatible flags remain post-commit
+                // finalization; xattrs/ACLs ride into staging and a failure
+                // there aborts the replacement.
                 if let Some(flags) = bsd_flags {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
@@ -461,15 +462,14 @@ impl RemotePullExecutor {
                     .map_err(|error| RemotePullError::LocalMutation(backup_abs.clone(), error))?;
             }
         }
-        let summary = self.fetch_into_staging(&source, &metadata).await?;
-        if let Some(xattrs) = xattrs.as_deref() {
-            self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                .await?;
-        }
-        if let Some(acls) = acls.as_deref() {
-            self.write_destination_acls(&source.path, source.kind, acls)
-                .await?;
-        }
+        let summary = self
+            .fetch_into_staging(
+                &source,
+                &metadata,
+                &crate::endpoint::io::Preservation { xattrs, acl: acls },
+            )
+            .await?;
+        // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
@@ -494,6 +494,7 @@ impl RemotePullExecutor {
         &self,
         source: &Entry,
         metadata: &PullTransferMetadata,
+        preservation: &crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let endpoint = LocalEndpoint::new(self.destination_root.clone());
@@ -532,6 +533,13 @@ impl RemotePullExecutor {
             )
         })?;
         set_staged_metadata(staged.as_mut(), mode, metadata.modified).await?;
+        staged
+            .apply_preservation(preservation, Some(mode))
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                RemotePullError::LocalMutation(dest.clone(), std::io::Error::other(message))
+            })?;
         staged.commit().await.map_err(|error| {
             let message = error.to_string();
             RemotePullError::LocalMutation(dest, std::io::Error::other(message))

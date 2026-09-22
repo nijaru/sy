@@ -19,6 +19,70 @@ pub enum VerificationStatus {
     },
 }
 
+/// Preservation payload read from a validated source before any destination
+/// mutation and applied to private staging before commit.
+///
+/// Applying preservation before commit means a failure aborts staging and the
+/// previous destination survives; no entry commits without its requested
+/// xattrs/ACLs. BSD/platform flags that can block rename stay post-commit
+/// finalization (see the transfer layer).
+#[derive(Debug, Clone, Default)]
+pub struct Preservation {
+    pub xattrs: Option<Vec<(std::ffi::OsString, Vec<u8>)>>,
+    pub acl: Option<String>,
+}
+
+impl Preservation {
+    pub const fn is_empty(&self) -> bool {
+        self.xattrs.is_none() && self.acl.is_none()
+    }
+}
+
+/// Verify the staged file's effective mode after preservation application.
+///
+/// ACL application can rewrite the mode bits it shares (the POSIX mask), so
+/// the transfer layer proves the interaction held instead of assuming the
+/// order was harmless.
+#[cfg(unix)]
+pub(crate) fn verify_staged_mode(path: &Path, expected_mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(expected_mode) = expected_mode else {
+        return Ok(());
+    };
+    // `FileMetadata.mode` may carry the full st_mode; permission bits are the
+    // contract here.
+    let expected = expected_mode & 0o7777;
+    let observed = std::fs::symlink_metadata(path)?.permissions().mode() & 0o7777;
+    if observed != expected {
+        return Err(SyncError::PreservationConflict {
+            path: path.to_path_buf(),
+            expected,
+            actual: observed,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn verify_staged_mode(_path: &Path, _expected_mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
+impl FileMetadata {
+    /// The mode this platform preserves, when it records one.
+    pub const fn preserved_mode(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(self.mode)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
 /// Transactional destination write.
 ///
 /// Implementations write into endpoint-private staging state. `commit` makes
@@ -29,6 +93,22 @@ pub enum VerificationStatus {
 pub trait StagedWriter: Send {
     async fn write(&mut self, data: &[u8]) -> Result<()>;
     async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()>;
+
+    /// Apply the preservation payload (xattrs/ACLs) to private staging state
+    /// before commit, then prove the effective mode still matches `metadata`.
+    ///
+    /// An error aborts staging: preservation failures never commit content
+    /// without its requested attributes.
+    async fn apply_preservation(
+        &mut self,
+        preservation: &Preservation,
+        expected_mode: Option<u32>,
+    ) -> Result<()> {
+        let _ = (preservation, expected_mode);
+        Err(SyncError::Config(
+            "endpoint cannot apply staged preservation".to_string(),
+        ))
+    }
 
     /// Hash the bytes currently in staging without making them visible.
     ///
@@ -48,28 +128,39 @@ pub struct StreamCopyResult {
     pub verification: VerificationStatus,
 }
 
+/// Inputs for one bounded streaming copy.
+pub struct StreamCopyPolicy<'a> {
+    /// Hash bytes as they flow and verify the staged result before commit.
+    pub verify: bool,
+    /// Shared `--bwlimit` pacing applied at the userspace byte stream.
+    pub rate_limiter:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
+    /// Preservation payload applied to staging before commit.
+    pub preservation: &'a Preservation,
+    /// Last-moment validation (source/destination race checks) before commit.
+    pub pre_commit: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
+}
+
 /// Copy one file between endpoints without whole-file buffering.
 ///
 /// Hashing is opt-in. When verification is requested, the source is hashed as
 /// bytes flow through the pipeline and the staged destination is hashed before
 /// commit. A mismatch aborts staging and leaves the old destination intact.
 ///
-/// `rate_limiter` optionally paces the copy: each chunk consumes tokens from
-/// the shared `--bwlimit` bucket before it is written, so the pacing point is
-/// exactly the userspace byte stream (native kernel copies bypass this path
+/// `policy.rate_limiter` optionally paces the copy: each chunk consumes tokens
+/// from the shared `--bwlimit` bucket before it is written, so the pacing point
+/// is exactly the userspace byte stream (native kernel copies bypass this path
 /// entirely when a limit is set).
 ///
-/// `pre_commit` runs after all bytes and metadata are staged and immediately
-/// before the endpoint commit — the transfer layer's last chance to validate
-/// source/destination race expectations. An error aborts staging.
+/// `policy.pre_commit` runs after all bytes and preservation are staged and
+/// immediately before the endpoint commit — the transfer layer's last chance
+/// to validate source/destination race expectations. An error aborts staging.
 pub async fn copy_file_streaming(
     source: &dyn Endpoint,
     source_path: &Path,
     dest: &dyn Endpoint,
     dest_path: &Path,
-    verify: bool,
-    rate_limiter: Option<&std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
-    pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
+    policy: &StreamCopyPolicy<'_>,
 ) -> Result<StreamCopyResult> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -77,7 +168,7 @@ pub async fn copy_file_streaming(
     let mut reader = source.open_reader(source_path).await?;
     let mut writer = dest.begin_write(dest_path).await?;
     let mut buffer = vec![0_u8; BUFFER_SIZE];
-    let mut hasher = verify.then(blake3::Hasher::new);
+    let mut hasher = policy.verify.then(blake3::Hasher::new);
     let mut bytes_written = 0_u64;
 
     loop {
@@ -96,7 +187,7 @@ pub async fn copy_file_streaming(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&buffer[..read]);
         }
-        if let Some(limiter) = rate_limiter {
+        if let Some(limiter) = policy.rate_limiter {
             let sleep = limiter
                 .lock()
                 .map_err(|_| SyncError::Config("rate limiter poisoned".to_string()))?
@@ -146,7 +237,15 @@ pub async fn copy_file_streaming(
         return Err(error);
     }
 
-    if let Some(pre_commit) = pre_commit {
+    if let Err(error) = writer
+        .apply_preservation(policy.preservation, metadata.preserved_mode())
+        .await
+    {
+        let _ = writer.abort().await;
+        return Err(error);
+    }
+
+    if let Some(pre_commit) = policy.pre_commit {
         if let Err(error) = pre_commit() {
             let _ = writer.abort().await;
             return Err(error);
