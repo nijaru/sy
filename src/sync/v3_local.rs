@@ -90,7 +90,10 @@ pub(super) async fn run(
         preflight_remote_push_scoped_with_content(
             source,
             destination,
-            comparison_policy(config, sy::protocol::Platform::current().os),
+            comparison_policy(
+                config,
+                crate::fs_util::namespace_semantics(destination_root),
+            ),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
@@ -135,7 +138,10 @@ pub(super) async fn run(
         preflight_remote_push_scoped(
             source,
             destination,
-            comparison_policy(config, sy::protocol::Platform::current().os),
+            comparison_policy(
+                config,
+                crate::fs_util::namespace_semantics(destination_root),
+            ),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)

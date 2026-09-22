@@ -13,7 +13,7 @@ pub enum ComparisonMode {
     Always,
 }
 
-use super::namespace::CaseSensitivity;
+use super::namespace::NamespaceSemantics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComparisonPolicy {
@@ -23,7 +23,9 @@ pub struct ComparisonPolicy {
     pub update_only: bool,
     pub preserve_permissions: bool,
     pub preserve_times: bool,
-    pub case_sensitivity: CaseSensitivity,
+    /// Name-comparison rules of the destination root, used by namespace
+    /// alias preflight before any mutation.
+    pub namespace_semantics: NamespaceSemantics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

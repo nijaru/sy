@@ -12,12 +12,12 @@ use sy::endpoint::local_entry_scan::local_entry_stream;
 use sy::engine::compression::CompressionPolicy;
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
-use sy::engine::namespace::CaseSensitivity;
+use sy::engine::namespace::{NamespacePreflightError, NamespaceSemantics};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
-use sy::protocol::{Operation, PlatformOs};
+use sy::protocol::Operation;
 use sy::remote::hash::{hash_rooted_file, RemoteHashError};
 use sy::remote::push::{RemoteBackupPlan, RemotePushExecutor};
 use sy::remote::push_controller::{
@@ -181,7 +181,10 @@ async fn execute_with_handle(
         preflight_remote_push_scoped_with_content(
             source,
             destination,
-            comparison_policy(config, remote.peer_platform()),
+            comparison_policy(
+                config,
+                NamespaceSemantics::for_platform(remote.peer_platform()),
+            ),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
@@ -219,7 +222,10 @@ async fn execute_with_handle(
         preflight_remote_push_scoped(
             source,
             destination,
-            comparison_policy(config, remote.peer_platform()),
+            comparison_policy(
+                config,
+                NamespaceSemantics::for_platform(remote.peer_platform()),
+            ),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
@@ -424,7 +430,10 @@ pub(super) fn compression_policy(config: &SyncConfig) -> Option<CompressionPolic
     }
 }
 
-pub(super) fn comparison_policy(config: &SyncConfig, target_os: PlatformOs) -> ComparisonPolicy {
+pub(super) fn comparison_policy(
+    config: &SyncConfig,
+    namespace_semantics: NamespaceSemantics,
+) -> ComparisonPolicy {
     let mode = if config.comparison.checksum {
         ComparisonMode::Checksum
     } else if config.comparison.ignore_times {
@@ -441,7 +450,7 @@ pub(super) fn comparison_policy(config: &SyncConfig, target_os: PlatformOs) -> C
         update_only: config.comparison.update_only,
         preserve_permissions: config.preserve.permissions,
         preserve_times: config.preserve.times,
-        case_sensitivity: CaseSensitivity::for_platform(target_os),
+        namespace_semantics,
     }
 }
 
@@ -564,11 +573,23 @@ pub(super) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             limit: *limit,
         };
     }
-    if let RemotePushControllerError::Namespace(collision) = &error {
-        return SyncError::NamespaceCollision {
-            existing: collision.existing.as_path().to_path_buf(),
-            colliding: collision.colliding.as_path().to_path_buf(),
-        };
+    if let RemotePushControllerError::Namespace(error) = &error {
+        match error {
+            NamespacePreflightError::Collision(collision) => {
+                return SyncError::NamespaceCollision {
+                    existing: collision.existing.as_path().to_path_buf(),
+                    colliding: collision.colliding.as_path().to_path_buf(),
+                };
+            }
+            NamespacePreflightError::Ambiguity(ambiguity) => {
+                return SyncError::NamespaceAmbiguity {
+                    existing: ambiguity.existing.as_path().to_path_buf(),
+                    colliding: ambiguity.colliding.as_path().to_path_buf(),
+                };
+            }
+            // Scratch I/O and corrupt records stay contextual I/O errors.
+            _ => {}
+        }
     }
     map_io(error)
 }
@@ -1258,7 +1279,10 @@ mod tests {
         config.preserve.permissions = true;
         config.preserve.times = true;
 
-        let policy = comparison_policy(&config, sy::protocol::Platform::current().os);
+        let policy = comparison_policy(
+            &config,
+            sy::engine::namespace::NamespaceSemantics::BYTE_EXACT,
+        );
         assert_eq!(policy.mode, ComparisonMode::SizeOnly);
         assert!(policy.update_only);
         assert!(policy.preserve_permissions);
@@ -1332,7 +1356,11 @@ mod tests {
         config.comparison.checksum = true;
 
         assert_eq!(
-            comparison_policy(&config, sy::protocol::Platform::current().os).mode,
+            comparison_policy(
+                &config,
+                sy::engine::namespace::NamespaceSemantics::BYTE_EXACT
+            )
+            .mode,
             ComparisonMode::Checksum
         );
     }
@@ -1342,7 +1370,13 @@ mod tests {
         let mut config = supported_config();
         config.existing = true;
 
-        assert!(comparison_policy(&config, sy::protocol::Platform::current().os).existing_only);
+        assert!(
+            comparison_policy(
+                &config,
+                sy::engine::namespace::NamespaceSemantics::BYTE_EXACT
+            )
+            .existing_only
+        );
     }
 
     #[tokio::test]
