@@ -4,7 +4,7 @@
 
 The target is one bounded synchronization engine that works across local filesystems, SSH hosts, and eventually object stores.
 
-This document describes the **target**.
+This document describes the **target**, not a claim that every contract is implemented. Replacement transactions, identity validation, bounded namespace preflight, and endpoint conformance are release requirements; a passing happy-path transfer is not evidence that these contracts hold.
 
 ## Design principles
 
@@ -77,7 +77,9 @@ source EntryStream ─┐
                                                                  └─ metadata only
 ```
 
-The reconciler decides **what semantic change is required**. The planner decides **how to perform it**. The scheduler decides **when work is allowed to run**.
+Reconciliation and semantic planning decide **what change is required**. Transfer planning decides **how to produce the bytes**. The scheduler decides **when work is allowed to run**. Endpoints own **whether and how a prepared change commits**; byte strategies never publish a replacement themselves.
+
+One engine controller owns completed preflight, preorder directory preparation, bounded concurrent leaf work, draining workers, reverse deletion, and journal-owned directory finalization. Direction-specific adapters must not duplicate preservation, commit, or failure policy. The current direction-neutral controller belongs under `engine` once its dependencies are neutral; its location is not a reason to introduce a second controller.
 
 Local/local, local/remote, and remote/local differ in endpoint implementation, not in reconciliation semantics:
 
@@ -110,7 +112,9 @@ An endpoint owns a rooted namespace and semantic operations. The minimum core co
 
 The final core must not contain a whole-tree `scan() -> Vec<Entry>` fallback.
 
-Capability assertions are contracts and require conformance tests. A backend must not advertise a capability that its implementation silently ignores.
+Capability assertions are contracts and require conformance tests. A backend must not advertise a capability that its implementation silently ignores. Root/filesystem properties must not be inferred solely from an endpoint's OS or transport type.
+
+The endpoint contract has one semantic capability vocabulary. Wire capability bits map into it at negotiation; protocol and direction adapters must not independently decide preservation or transaction semantics. Local and SSH implementations use the same transaction lifecycle, while retaining backend-native byte strategies. Extend the existing endpoint/staged-writer boundary rather than adding a parallel transaction framework.
 
 Capabilities include, as applicable:
 
@@ -171,21 +175,29 @@ Delete
 Skip
 ```
 
-Type transitions must eventually be transactional rather than rejected or performed as remove-then-create. The local replacement sequence is:
+Type transitions must be transactional rather than remove-then-create. Until a backend implements the required guarantee, reject unsupported transitions during complete preflight, before any destination mutation.
 
-```text
-prepare staged replacement
-rename old destination -> same-directory tombstone
-rename staged replacement -> destination
-rollback old destination if second rename fails
-remove tombstone after commit
-```
+For a nondirectory-to-directory transition, stage the replacement subtree completely, including child work and final metadata, before switching visibility. Child completion inside that private subtree is not destination publication: no child receipt authorizes source removal until the enclosing transaction commits and required finalization succeeds.
 
-Backend-specific implementations may provide a stronger single-step primitive.
+For directory-to-nondirectory replacement, protect excluded descendants and include all discarded descendants in completed preflight's exact deletion accounting. The replacement entry itself is counted as a replacement, not a duplicate delete candidate. Discarding nonempty directory contents requires explicit deletion authorization (`--delete`); an empty entry-kind replacement does not. Apply the threshold before any destination mutation, and assign discarded descendants to the transition transaction so ordinary delete replay cannot remove/count them a second time. Recursive removal is not a shortcut around deletion safety.
+
+Prefer a backend atomic exchange/replacement primitive where supported. A fallback that renames the old destination to a tombstone and then installs staging has a missing-name window: it is **recoverable multi-step replacement**, not atomic visibility. Enabling that fallback requires an owned on-disk recovery record, identity-checked rollback, process-crash recovery, and safe tombstone cleanup. Recovery must preserve the last valid copy. Automatic destructive recovery requires ownership protected by backend primitives or an explicit exclusive-access assumption; if ownership cannot be established safely, retain recovery artifacts and stop for intervention rather than risk deleting an unrelated replacement. Identity checks alone do not establish atomic ownership under concurrent namespace mutation. Refuse transitions where the supported guarantee cannot be met.
+
+State separately whether an operation provides namespace atomicity, recoverability, or power-loss durability. Any durability claim requires appropriate persistence ordering and tests; successful rename alone is not such a guarantee. Synchronization does not promise whole-run rollback.
 
 ### Source mutation / TOCTOU
 
-A scan describes a candidate snapshot, not a guarantee that the source remains unchanged. Regular-file transfer should validate source identity when opening and again at completion using stable metadata available on the platform (for example device/inode/size/mtime/ctime). If the source changes during transfer, retry or fail that entry rather than commit an inconsistent snapshot.
+A scan describes a candidate snapshot, not a guarantee that the source remains unchanged. Regular-file transfer must carry the scanned identity into an opened source handle and validate it before reading and at completion using stable metadata available on the platform (for example device/inode/size/mtime/ctime). Requested preservation metadata must belong to that same validated observation. If the source changes, abort staging with a typed error; retries, if offered, must be bounded.
+
+Native copy, reflink, sparse, hashing and streaming paths must preserve this source binding. A path-based optimization that cannot do so must fall back to a safe bounded strategy. Identity checks detect supported races; they do not create snapshot isolation against arbitrary concurrent in-place writers.
+
+Destination operations carry the expected state (absent or observed identity), revalidated before destructive commit/delete. Portable stat followed by rename/unlink is not atomic compare-and-swap. Use stronger backend preconditions where available and document residual concurrency limits rather than claiming separate syscalls close every race.
+
+### Namespace preflight
+
+Detect destination case/normalization aliases across planned source paths, existing destination paths, and ancestor prefixes before mutation. Comparison semantics belong to the destination root. Where exact semantics are unavailable, use a documented conservative check or reject ambiguous operations; generic Unicode normalization is not proof of filesystem equivalence.
+
+Collision detection must remain bounded even for one extremely wide directory. Use disk-backed records and bounded external sorting/merge (or an equivalently bounded exact algorithm), not a whole-tree or unbounded per-directory map. Bound record sizes, run buffers, merge fan-in and descriptors; propagate scratch I/O failures before mutation. Identical path spellings may deduplicate; distinct names must never silently overwrite one another.
 
 ## Exact bounded deletion
 
@@ -225,20 +237,29 @@ Blocking filesystem/syscall work that is not genuinely asynchronous must stay of
 
 ## Transaction model
 
-Visible destination state changes only at commit:
+For replacement entries, the destination endpoint owns this lifecycle:
 
 ```text
-prepare staging
+validate source observation and expected destination
+  -> prepare private staging
   -> transfer / reconstruct / patch
-  -> apply metadata that belongs on staging
-  -> verify staged contents
-  -> atomically commit
-  -> apply only metadata that must be post-commit
+  -> apply staging-compatible preservation
+  -> verify staged contents and source identity
+  -> revalidate expected destination
+  -> commit using the declared backend guarantee
+  -> required post-commit finalization, if any
+  -> completion receipt / owned cleanup
 ```
 
-Failure before commit leaves the previous destination visible. Temporary files use same-directory staging when atomic rename semantics require it.
+Failure before commit leaves the previous destination intact under the backend's declared guarantee. Staging must be on the required filesystem and remain private even while applying permissive modes/ACLs; use a protected staging namespace or an equivalent proven mechanism.
 
-For remote transfers, a disconnect or protocol failure must abort staging, not leave a partially updated destination.
+Xattrs, ACLs and other staging-compatible preservation belong before commit, not in a second visible-path RPC. Remote preservation for a replacement addresses a session-bound transaction/stream identity with bounded payloads and validated phase transitions. Validate effective mode/ACL interactions rather than assuming metadata application order is harmless.
+
+Only metadata inherently incompatible with commit belongs afterward, such as selected immutable flags. Distinguish pre-commit abort, committed-but-required-finalization-failed, and cleanup-pending outcomes. A post-commit failure cannot be reported as a rollback. Source removal requires a published-destination receipt covering successful required preservation and verification plus source identity revalidation; deletion must not proceed after failed required main-work finalization. An unchanged file may instead receive a verified-existing-destination receipt with strong content/policy-selected preservation proof and revalidated identities. Quick-check equality alone never authorizes source removal. A private staged-subtree child receipt is neither kind of publication receipt.
+
+Directory metadata finalization remains journal-owned after descendant work and deletion. Metadata-only changes on existing inodes have explicit backend semantics, not a fictitious atomic replacement. Hardlink group metadata has one inode-level owner; group bookkeeping must also be bounded.
+
+Disconnect/cancellation before commit aborts owned staging. Lost acknowledgement after commit is an uncertain completion, not proof of abort: preserve the source and reconcile safely on retry. Strategies never commit independently of the endpoint transaction owner.
 
 ## Local transfer strategies
 
@@ -281,6 +302,8 @@ Benefits:
 - ProxyJump/ControlMaster and other OpenSSH features work naturally
 - removes the embedded `ssh2`/libssh2/OpenSSL stack
 - simplifies static musl distribution
+
+Pass the original host alias to OpenSSH and only explicit user overrides. Do not parse and reconstruct SSH configuration: `Include`, `Match`, wildcard precedence, identities, and jump-host behavior belong to OpenSSH. Remove unused embedded SSH dependencies as well as their callers. The session owns subprocess shutdown, exit status and error propagation.
 
 The user-provided remote root is never a shell argument. It is part of the binary protocol handshake.
 
@@ -489,7 +512,12 @@ Do not add these unless measurement demonstrates a need:
 - cargo audit/deny are green;
 - protocol decoding has adversarial/property coverage and bounded allocations;
 - remote path confinement has dedicated escape/symlink tests;
-- interrupted transfers prove old destinations survive;
+- interrupted transfers and injected preservation/commit failures prove old destinations survive pre-commit aborts, with explicit post-commit failure outcomes;
+- one endpoint conformance suite exercises local and SSH transaction/capability semantics;
+- source/destination race tests cover native whole copy, reflink, sparse and streaming paths;
+- namespace preflight proves bounded RAM/descriptors on wide/deep trees and refuses collisions before mutation;
+- supported directory transitions have failure/process-crash recovery coverage;
+- Linux/macOS tests exercise supported optional features semantically, not only through compilation;
 - remote files are BLAKE3-verified before commit;
 - deletion tests prove incomplete scans cannot delete data;
 - Miri is run over relevant unsafe/path/reflink components where practical;
