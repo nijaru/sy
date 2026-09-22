@@ -635,6 +635,10 @@ fn test_case_collision_preflight_on_case_insensitive_target() {
         .output()
         .unwrap();
 
+    // Preflight follows destination-filesystem name semantics. The macOS test
+    // volume folds case, so the two spellings would alias and one source entry
+    // would silently replace the other; Linux CI is byte-exact, where both
+    // spellings legitimately coexist.
     #[cfg(target_os = "macos")]
     {
         assert!(!output.status.success());
@@ -645,6 +649,23 @@ fn test_case_collision_preflight_on_case_insensitive_target() {
             stderr
         );
         // Ensure destination was NOT modified
+        assert_eq!(
+            fs::read_to_string(dest.path().join("CASE_TEST.TXT")).unwrap(),
+            "dest content"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(
+            output.status.success(),
+            "byte-exact destination must accept both spellings, got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(dest.path().join("case_test.txt")).unwrap(),
+            "source content"
+        );
         assert_eq!(
             fs::read_to_string(dest.path().join("CASE_TEST.TXT")).unwrap(),
             "dest content"
