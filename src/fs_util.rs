@@ -1,8 +1,9 @@
+use std::path::Path;
 /// Filesystem utility functions for detecting COW support, hard links, and cross-filesystem operations.
 ///
 /// This module provides platform-specific filesystem detection to enable intelligent
 /// strategy selection in delta sync operations.
-use std::path::Path;
+use sy::engine::namespace::NamespaceSemantics;
 
 /// Check if a filesystem supports copy-on-write (COW) reflinks
 ///
@@ -222,11 +223,263 @@ pub fn has_hard_links(_path: &Path) -> bool {
     false
 }
 
+/// Probe the name-comparison semantics of the filesystem hosting `root`.
+///
+/// Destination namespace preflight needs the *filesystem's* rules, not the
+/// OS's: APFS volumes can be case-sensitive, ext4 directories can opt into
+/// case folding, and removable FAT/exFAT volumes fold case on every OS.
+/// The probe is read-only and may return `Unspecified` axes; callers stay
+/// conservative for those (see `engine::namespace`).
+#[cfg(target_os = "macos")]
+pub fn namespace_semantics(root: &Path) -> NamespaceSemantics {
+    use sy::engine::namespace::Folding;
+
+    let case = macos_case_folding(root);
+    // HFS+ and APFS fold Unicode canonical decomposition by format design;
+    // no API exposes this property, so foreign volumes (smbfs, msdos, ntfs
+    // mounts) stay Unspecified rather than borrowing APFS behavior.
+    let normalization = match macos_fs_type_name(root).as_deref() {
+        Some("apfs") | Some("hfs") | Some("hfsx") => Folding::Folded,
+        _ => Folding::Unspecified,
+    };
+    NamespaceSemantics {
+        case,
+        normalization,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_case_folding(root: &Path) -> sy::engine::namespace::Folding {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use sy::engine::namespace::Folding;
+
+    // `vol_capabilities_attr_t` layout: `<sys/attr.h>` VOL_CAPABILITIES_FORMAT
+    // index holds the VOL_CAP_FMT_* bits. Verified against a live APFS root:
+    // the fixed buffer is `length: u32` followed by the 32-byte capabilities
+    // struct (total 36 bytes).
+    #[repr(C)]
+    struct VolCapabilitiesBuffer {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+
+    const VOL_CAPABILITIES_FORMAT: usize = 0;
+
+    let Ok(path) = CString::new(root.as_os_str().as_bytes()) else {
+        return Folding::Unspecified;
+    };
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = VolCapabilitiesBuffer {
+        length: 0,
+        capabilities: libc::vol_capabilities_attr_t {
+            capabilities: [0; 4],
+            valid: [0; 4],
+        },
+    };
+    // SAFETY: `path` is a valid NUL-terminated string, `attributes` is fully
+    // initialized, and `buffer`/its size match the fixed `attrlist` request
+    // (ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES returns exactly the capabilities
+    // struct after the returned length word). getattrlist only writes within
+    // `attrbufsize` bytes of `buffer`.
+    let status = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast::<libc::c_void>(),
+            (&mut buffer as *mut VolCapabilitiesBuffer).cast::<libc::c_void>(),
+            std::mem::size_of::<VolCapabilitiesBuffer>(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Folding::Unspecified;
+    }
+    let capabilities = buffer.capabilities.capabilities[VOL_CAPABILITIES_FORMAT];
+    let valid = buffer.capabilities.valid[VOL_CAPABILITIES_FORMAT];
+    if (valid & libc::VOL_CAP_FMT_CASE_SENSITIVE) == 0 {
+        return Folding::Unspecified;
+    }
+    if (capabilities & libc::VOL_CAP_FMT_CASE_SENSITIVE) != 0 {
+        Folding::Exact
+    } else {
+        Folding::Folded
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fs_type_name(root: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    let mut stat: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a valid
+    // output pointer of the struct type the callee fills on success.
+    let status = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: success guarantees the callee initialized the whole struct.
+    let stat = unsafe { stat.assume_init() };
+    let name = stat
+        .f_fstypename
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8 as char)
+        .collect::<String>();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn namespace_semantics(root: &Path) -> NamespaceSemantics {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use sy::engine::namespace::Folding;
+
+    let Ok(path) = CString::new(root.as_os_str().as_bytes()) else {
+        return NamespaceSemantics::UNSPECIFIED;
+    };
+    let mut stat: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a valid
+    // output pointer of the struct type the callee fills on success.
+    let status = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return NamespaceSemantics::UNSPECIFIED;
+    }
+    // SAFETY: success guarantees the callee initialized the whole struct.
+    let stat = unsafe { stat.assume_init() };
+
+    match stat.f_type {
+        // Byte-exact name comparison: ext2/3/4 (unless a directory enables
+        // casefold), XFS, Btrfs, tmpfs, ramfs, F2FS (same caveat), EROFS,
+        // NILFS2, squashfs.
+        0xEF53 | 0x584_65342 | 0x9123_683E | 0x0102_1994 | 0x8584_58f6 | 0xF2F5_2010
+        | 0xE0F5_E1E2 | 0x3434 | 0x7371_7368 => {
+            if linux_root_casefolded(root) {
+                // ext4/f2fs casefold directories fold case and Unicode
+                // normalization together (encoding-based folding).
+                NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED
+            } else {
+                NamespaceSemantics::BYTE_EXACT
+            }
+        }
+        // FAT/exFAT/NTFS family: case folding is certain; their normalization
+        // models differ per driver, so the second axis stays Unspecified.
+        0x4D44 | 0x2011_BAB0 | 0x5346_544E => NamespaceSemantics {
+            case: Folding::Folded,
+            normalization: Folding::Unspecified,
+        },
+        // FUSE, NFS, ZFS, CIFS, overlayfs and unknowns can implement any
+        // policy (ZFS datasets and overlayfs upper layers vary per mount).
+        _ => NamespaceSemantics::UNSPECIFIED,
+    }
+}
+
+/// True when `root` is an ext4/f2fs directory with `FS_CASEFOLD_FL` enabled.
+///
+/// The flag is inherited by subdirectories, so the root's setting covers the
+/// whole synchronized subtree.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn linux_root_casefolded(root: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    /// `_IOR('f', 1, long)` from `<linux/fs.h>` on LP64.
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    /// `FS_CASEFOLD_FL` from `<linux/fs.h>`.
+    const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
+
+    let Ok(file) = std::fs::File::open(root) else {
+        return false;
+    };
+    let mut flags: libc::c_long = 0;
+    // SAFETY: `file` holds an open descriptor and `flags` is a valid `long`
+    // output pointer for the FS_IOC_GETFLAGS request. The ioctl only writes
+    // the requested value and reports failure through its return code.
+    let status = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            FS_IOC_GETFLAGS,
+            (&mut flags as *mut libc::c_long).cast::<libc::c_void>(),
+        )
+    };
+    status == 0 && (flags & FS_CASEFOLD_FL) != 0
+}
+
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+fn linux_root_casefolded(_root: &Path) -> bool {
+    // FS_IOC_GETFLAGS request encoding is pointer-width dependent; without a
+    // verified LP64 constant the casefold refinement is simply not applied.
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn namespace_semantics(_root: &Path) -> NamespaceSemantics {
+    // No verified probe on this platform; unknown semantics stay conservative.
+    NamespaceSemantics::UNSPECIFIED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use sy::engine::namespace::Folding;
     use tempfile::TempDir;
+
+    /// Behavioral oracle: create a case-variant name beside an existing one and
+    /// compare the filesystem's real aliasing with the probed claim.
+    #[test]
+    fn namespace_semantics_match_case_alias_behavior() {
+        let temp = TempDir::new().unwrap();
+        let semantics = namespace_semantics(temp.path());
+
+        fs::create_dir(temp.path().join("Probe")).unwrap();
+        let aliases = fs::create_dir(temp.path().join("probe")).is_err();
+
+        match semantics.case {
+            Folding::Exact => assert!(!aliases, "probe claims byte-exact but names alias"),
+            Folding::Folded => assert!(aliases, "probe claims case folding but names do not alias"),
+            Folding::Unspecified => {}
+        }
+    }
+
+    /// Behavioral oracle for Unicode normalization aliasing (NFC vs NFD).
+    #[test]
+    fn namespace_semantics_match_normalization_alias_behavior() {
+        use std::ffi::OsString;
+
+        let temp = TempDir::new().unwrap();
+        let semantics = namespace_semantics(temp.path());
+
+        let nfc = OsString::from("caf\u{e9}");
+        let nfd = OsString::from("cafe\u{301}");
+        assert_ne!(nfc, nfd);
+        fs::create_dir(temp.path().join(&nfc)).unwrap();
+        let aliases = fs::create_dir(temp.path().join(&nfd)).is_err();
+
+        match semantics.normalization {
+            Folding::Exact => assert!(
+                !aliases,
+                "probe claims byte-exact normalization but NFC/NFD alias"
+            ),
+            Folding::Folded => assert!(
+                aliases,
+                "probe claims normalization folding but NFC/NFD do not alias"
+            ),
+            Folding::Unspecified => {}
+        }
+    }
 
     #[test]
     fn test_cow_detection() {

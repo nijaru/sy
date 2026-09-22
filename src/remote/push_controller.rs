@@ -33,7 +33,7 @@ pub enum RemotePushControllerError {
     FinalizeJournal(#[from] FinalizeJournalError),
 
     #[error(transparent)]
-    Namespace(#[from] crate::engine::namespace::NamespaceCollision),
+    Namespace(#[from] crate::engine::namespace::NamespacePreflightError),
 
     #[error(transparent)]
     Lower(#[from] RemotePushLowerError),
@@ -189,7 +189,7 @@ where
         None => None,
     };
     let mut collision_detector =
-        crate::engine::namespace::NamespaceCollisionDetector::new(policy.case_sensitivity);
+        crate::engine::namespace::NamespaceCollisionDetector::new(policy.namespace_semantics);
     let mut operations = 0_u64;
 
     while let Some(item) = reconciler.next().await? {
@@ -201,7 +201,7 @@ where
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.check_and_record(&source.path)?;
+                collision_detector.record(&source.path).await?;
                 if !policy.existing_only {
                     append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 }
@@ -218,7 +218,7 @@ where
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.check_and_record(&source.path)?;
+                collision_detector.record(&source.path).await?;
                 append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
                     .await?;
                 plan_entry(source, Some(destination), policy)
@@ -230,7 +230,7 @@ where
                         .observe_destination_only(&destination, in_scope)
                         .await?;
                 }
-                collision_detector.check_and_record(&destination.path)?;
+                collision_detector.record(&destination.path).await?;
                 continue;
             }
         };
@@ -248,6 +248,9 @@ where
         operations = checked_add(operations, 1, "operation")?;
     }
 
+    // Alias proof completes with the rest of preflight: no mutation may run
+    // before both the collision check and the delete threshold have passed.
+    collision_detector.finish().await?;
     let delete = match delete {
         Some(delete) => Some(delete.finish().await?),
         None => None,
@@ -694,6 +697,7 @@ mod tests {
     use super::*;
     use crate::engine::delete_plan::DeleteLimit;
     use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+    use crate::engine::namespace::NamespacePreflightError;
     use crate::engine::reconcile::BoxError;
     use futures::stream;
     use std::path::PathBuf;
@@ -1155,7 +1159,8 @@ mod tests {
         ]);
         let destination = entries(vec![]);
         let policy = ComparisonPolicy {
-            case_sensitivity: crate::engine::namespace::CaseSensitivity::Insensitive,
+            namespace_semantics:
+                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
             ..ComparisonPolicy::default()
         };
 
@@ -1164,7 +1169,7 @@ mod tests {
             .unwrap_err();
 
         match err {
-            RemotePushControllerError::Namespace(collision) => {
+            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
                 assert_eq!(collision.existing, path("dir/File.txt"));
                 assert_eq!(collision.colliding, path("dir/file.txt"));
             }
@@ -1177,7 +1182,8 @@ mod tests {
         let source = entries(vec![file("foo.txt", 10, 1)]);
         let destination = entries(vec![file("FOO.txt", 10, 1)]);
         let policy = ComparisonPolicy {
-            case_sensitivity: crate::engine::namespace::CaseSensitivity::Insensitive,
+            namespace_semantics:
+                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
             ..ComparisonPolicy::default()
         };
 
@@ -1186,7 +1192,7 @@ mod tests {
             .unwrap_err();
 
         match err {
-            RemotePushControllerError::Namespace(collision) => {
+            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
                 assert_eq!(collision.existing, path("FOO.txt"));
                 assert_eq!(collision.colliding, path("foo.txt"));
             }
@@ -1201,7 +1207,8 @@ mod tests {
         let source = entries(vec![file(nfd, 10, 1), file(nfc, 10, 1)]);
         let destination = entries(vec![]);
         let policy = ComparisonPolicy {
-            case_sensitivity: crate::engine::namespace::CaseSensitivity::Insensitive,
+            namespace_semantics:
+                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
             ..ComparisonPolicy::default()
         };
 
@@ -1209,7 +1216,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, RemotePushControllerError::Namespace(_)));
+        assert!(matches!(
+            err,
+            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(_))
+        ));
     }
 
     #[tokio::test]
@@ -1217,7 +1227,7 @@ mod tests {
         let source = entries(vec![file("FILE.txt", 10, 1), file("file.txt", 10, 1)]);
         let destination = entries(vec![]);
         let policy = ComparisonPolicy {
-            case_sensitivity: crate::engine::namespace::CaseSensitivity::Sensitive,
+            namespace_semantics: crate::engine::namespace::NamespaceSemantics::BYTE_EXACT,
             ..ComparisonPolicy::default()
         };
 
@@ -1226,5 +1236,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.operations, 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_ambiguity_when_semantics_are_unknown() {
+        let source = entries(vec![file("FILE.txt", 10, 1), file("file.txt", 10, 1)]);
+        let destination = entries(vec![]);
+        let policy = ComparisonPolicy {
+            namespace_semantics: crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+            ..ComparisonPolicy::default()
+        };
+
+        let err = preflight_remote_push(source, destination, policy, None, |_| true)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RemotePushControllerError::Namespace(NamespacePreflightError::Ambiguity(_))
+        ));
     }
 }

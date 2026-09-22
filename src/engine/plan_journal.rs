@@ -2,7 +2,7 @@ use super::domain::{
     Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath,
     SkipReason, SyncOp, Timestamp,
 };
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -356,7 +356,7 @@ fn decode_relative_path(reader: &mut SliceReader<'_>) -> Result<RelativePath> {
 }
 
 fn encode_path(payload: &mut Vec<u8>, path: &OsStr) -> Result<()> {
-    let bytes = encode_native_path(path);
+    let bytes = super::native_path::encode(path);
     let len = u32::try_from(bytes.len()).map_err(|_| PlanJournalError::RecordTooLarge {
         actual: bytes.len(),
         maximum: MAX_RECORD_PAYLOAD,
@@ -368,57 +368,7 @@ fn encode_path(payload: &mut Vec<u8>, path: &OsStr) -> Result<()> {
 
 fn decode_path(reader: &mut SliceReader<'_>) -> Result<PathBuf> {
     let len = reader.u32()? as usize;
-    decode_native_path(reader.take(len)?)
-}
-
-#[cfg(unix)]
-fn encode_native_path(path: &OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_bytes().to_vec()
-}
-
-#[cfg(unix)]
-fn decode_native_path(path: &[u8]) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Ok(PathBuf::from(OsString::from_vec(path.to_vec())))
-}
-
-#[cfg(windows)]
-fn encode_native_path(path: &OsStr) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut bytes = Vec::new();
-    for unit in path.encode_wide() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    bytes
-}
-
-#[cfg(windows)]
-fn decode_native_path(path: &[u8]) -> Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    if path.len() % 2 != 0 {
-        return Err(PlanJournalError::InvalidRecord(
-            "odd byte length in Windows plan journal path",
-        ));
-    }
-    let wide = path
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect::<Vec<_>>();
-    Ok(PathBuf::from(OsString::from_wide(&wide)))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn encode_native_path(path: &OsStr) -> Vec<u8> {
-    path.to_string_lossy().into_owned().into_bytes()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn decode_native_path(path: &[u8]) -> Result<PathBuf> {
-    let value = String::from_utf8(path.to_vec()).map_err(|_| {
-        PlanJournalError::InvalidRecord("non-Unicode path in plan journal on unsupported platform")
-    })?;
-    Ok(PathBuf::from(value))
+    Ok(super::native_path::decode(reader.take(len)?)?)
 }
 
 struct SliceReader<'a> {
@@ -548,6 +498,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn journal_preserves_non_utf8_relative_paths() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![b'f', 0x80, b'o']);
         let relative = RelativePath::new(PathBuf::from(raw)).unwrap();

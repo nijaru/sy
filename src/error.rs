@@ -38,6 +38,14 @@ pub enum SyncError {
         colliding: PathBuf,
     },
 
+    #[error(
+        "Destination namespace ambiguity: '{colliding}' may collide with '{existing}'; destination name semantics could not be determined"
+    )]
+    NamespaceAmbiguity {
+        existing: PathBuf,
+        colliding: PathBuf,
+    },
+
     #[error("Failed to read directory: {path}\nCause: {source}\nCheck that the directory exists and you have read permissions.")]
     ReadDirError {
         path: PathBuf,
