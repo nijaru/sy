@@ -39,6 +39,16 @@ pub enum SyncError {
     },
 
     #[error(
+        "Source changed during transfer: {path}\nThe source was modified or replaced after it was scanned; the destination was left unchanged."
+    )]
+    SourceChanged { path: PathBuf },
+
+    #[error(
+        "Destination changed during transfer: {path}\nThe destination was modified or replaced after it was scanned; the transfer was aborted to avoid overwriting it."
+    )]
+    DestinationChanged { path: PathBuf },
+
+    #[error(
         "Destination namespace ambiguity: '{colliding}' may collide with '{existing}'; destination name semantics could not be determined"
     )]
     NamespaceAmbiguity {

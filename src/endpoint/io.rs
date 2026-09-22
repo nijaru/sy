@@ -58,6 +58,10 @@ pub struct StreamCopyResult {
 /// the shared `--bwlimit` bucket before it is written, so the pacing point is
 /// exactly the userspace byte stream (native kernel copies bypass this path
 /// entirely when a limit is set).
+///
+/// `pre_commit` runs after all bytes and metadata are staged and immediately
+/// before the endpoint commit — the transfer layer's last chance to validate
+/// source/destination race expectations. An error aborts staging.
 pub async fn copy_file_streaming(
     source: &dyn Endpoint,
     source_path: &Path,
@@ -65,6 +69,7 @@ pub async fn copy_file_streaming(
     dest_path: &Path,
     verify: bool,
     rate_limiter: Option<&std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
+    pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
 ) -> Result<StreamCopyResult> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -139,6 +144,13 @@ pub async fn copy_file_streaming(
     if let Err(error) = writer.set_metadata(&metadata).await {
         let _ = writer.abort().await;
         return Err(error);
+    }
+
+    if let Some(pre_commit) = pre_commit {
+        if let Err(error) = pre_commit() {
+            let _ = writer.abort().await;
+            return Err(error);
+        }
     }
 
     writer.commit().await?;

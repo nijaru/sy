@@ -235,6 +235,16 @@ impl SyncSession {
                         crate::sync::ratelimit::RateLimiter::new(limit),
                     ))
                 }),
+                identity: crate::endpoint::transfer::TransferIdentity {
+                    // Single-file copy has no scan: capture observations at
+                    // transfer start so mid-transfer edits still abort.
+                    source: crate::endpoint::transfer::SourceExpectation::SnapshotAtOpen,
+                    destination: if existed {
+                        crate::endpoint::transfer::ExpectedDestination::SnapshotAtOpen
+                    } else {
+                        crate::endpoint::transfer::ExpectedDestination::Absent
+                    },
+                },
             },
         )
         .await?;
