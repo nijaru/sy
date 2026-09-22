@@ -936,16 +936,13 @@ mod tests {
                     .unwrap();
             let scan = session.scan_handler();
             let file = session.file_handler();
-            let xattr_handler = session.xattr_handler();
-            // Two passes: destination scan + file transfer + xattr mirror each.
-            for _ in 0..6 {
+            // Two passes of destination scan + file transfer each; xattr
+            // preservation rides the transfer stream into staging.
+            for _ in 0..4 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {
                         file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Xattr(incoming) => {
-                        xattr_handler.serve(incoming).await.unwrap();
                     }
                     _ => panic!("unexpected xattr v3 adapter request"),
                 }
@@ -1043,16 +1040,13 @@ mod tests {
                     .unwrap();
             let scan = session.scan_handler();
             let file = session.file_handler();
-            let acl_handler = session.acl_handler();
-            // Two passes: destination scan + file transfer + acl mirror each.
-            for _ in 0..6 {
+            // Two passes of destination scan + file transfer each; ACL
+            // preservation rides the transfer stream into staging.
+            for _ in 0..4 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {
                         file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Acl(incoming) => {
-                        acl_handler.serve(incoming).await.unwrap();
                     }
                     _ => panic!("unexpected acl v3 adapter request"),
                 }
