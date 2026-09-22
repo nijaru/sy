@@ -13,6 +13,12 @@ pub struct ProtocolVersion {
 
 pub const PROTOCOL_V3: ProtocolVersion = ProtocolVersion { major: 3, minor: 0 };
 
+/// Adds root-scoped destination namespace semantics to `SessionReady`.
+///
+/// Peers negotiate 3.0..=3.1; a 3.0 `SessionReady` omits the field and the
+/// client falls back to its platform approximation.
+pub const PROTOCOL_V3_1: ProtocolVersion = ProtocolVersion { major: 3, minor: 1 };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {
     pub min: ProtocolVersion,

@@ -65,6 +65,12 @@ impl ClientRemoteHandle {
         self.ready
     }
 
+    /// Destination name-comparison semantics probed by the server for the
+    /// negotiated root. `None` only when the negotiated protocol is 3.0.
+    pub fn namespace_semantics(&self) -> Option<crate::engine::namespace::NamespaceSemantics> {
+        self.ready.namespace_semantics.map(Into::into)
+    }
+
     /// The session's frame router sender. Executors open fetch streams
     /// directly; request helpers wrap it for standard RPCs.
     pub fn sender(&self) -> crate::remote::router::RouterSender {

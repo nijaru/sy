@@ -176,6 +176,44 @@ fn fold_component(
     }
 }
 
+impl From<crate::protocol::WireNamespaceSemantics> for NamespaceSemantics {
+    fn from(wire: crate::protocol::WireNamespaceSemantics) -> Self {
+        use crate::protocol::NameFolding as WireFolding;
+
+        fn folding(value: WireFolding) -> Folding {
+            match value {
+                WireFolding::Exact => Folding::Exact,
+                WireFolding::Folded => Folding::Folded,
+                WireFolding::Unspecified => Folding::Unspecified,
+            }
+        }
+
+        Self {
+            case: folding(wire.case),
+            normalization: folding(wire.normalization),
+        }
+    }
+}
+
+impl From<NamespaceSemantics> for crate::protocol::WireNamespaceSemantics {
+    fn from(semantics: NamespaceSemantics) -> Self {
+        use crate::protocol::NameFolding as WireFolding;
+
+        fn folding(value: Folding) -> WireFolding {
+            match value {
+                Folding::Exact => WireFolding::Exact,
+                Folding::Folded => WireFolding::Folded,
+                Folding::Unspecified => WireFolding::Unspecified,
+            }
+        }
+
+        Self {
+            case: folding(semantics.case),
+            normalization: folding(semantics.normalization),
+        }
+    }
+}
+
 /// Destination names alias: one entry would silently replace the other.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -861,6 +899,22 @@ mod tests {
         };
         assert_eq!(collision.existing, rel("A-1"));
         assert_eq!(collision.colliding, rel("a-1"));
+    }
+
+    #[test]
+    fn wire_mapping_round_trips_all_folding_combinations() {
+        use crate::protocol::WireNamespaceSemantics;
+
+        for case in [Folding::Exact, Folding::Folded, Folding::Unspecified] {
+            for normalization in [Folding::Exact, Folding::Folded, Folding::Unspecified] {
+                let semantics = NamespaceSemantics {
+                    case,
+                    normalization,
+                };
+                let wire = WireNamespaceSemantics::from(semantics);
+                assert_eq!(NamespaceSemantics::from(wire), semantics);
+            }
+        }
     }
 
     #[tokio::test]
