@@ -11,6 +11,7 @@ use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, Str
 use crate::rooted_fs::{RootedFs, RootedFsError, RootedStagedFile};
 use crate::transfer::delta::{match_delta, BasisIndex, DeltaMatchError, DeltaOp};
 use bytes::Bytes;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -20,10 +21,15 @@ pub(crate) const PRODUCER_QUEUE_DEPTH: usize = 8;
 const RECONSTRUCTION_QUEUE_DEPTH: usize = 8;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransferMetadata {
     pub unix_mode: Option<u32>,
     pub modified: Option<Timestamp>,
+    /// Complete xattr set applied to staging before commit when `-X` is on.
+    pub xattrs: Option<Vec<(OsString, Vec<u8>)>>,
+    /// Complete exacl-unified ACL text applied to staging before commit when
+    /// `-A` is on (empty text clears).
+    pub acls: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +184,8 @@ pub(crate) enum ProducerItem {
 enum ReconstructionOp {
     Data(Bytes),
     Copy(WireDeltaCopy),
+    Xattrs(Vec<(OsString, Vec<u8>)>),
+    Acls(String),
     End(WireFileEnd),
 }
 
@@ -377,6 +385,39 @@ pub async fn request_file_transfer_with_policy(
     let summary = producer
         .await
         .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    // Preservation rides the transfer stream so the server can apply it to
+    // private staging before commit; a failure there aborts the replacement.
+    if let Some(xattrs) = &metadata.xattrs {
+        let entries = xattrs
+            .iter()
+            .map(|(name, value)| {
+                crate::protocol::WireXattr::new(
+                    crate::remote::xattr::name_bytes(name),
+                    value.clone(),
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let payload = crate::protocol::WireXattrResult::new(entries)?;
+        sender
+            .send(Frame::new(
+                FrameKind::FileXattrs,
+                FrameFlags::empty(),
+                stream_id,
+                payload.encode()?,
+            )?)
+            .await?;
+    }
+    if let Some(acls) = &metadata.acls {
+        let payload = crate::protocol::WireAcl::new(acls.clone())?;
+        sender
+            .send(Frame::new(
+                FrameKind::FileAcls,
+                FrameFlags::empty(),
+                stream_id,
+                payload.encode(),
+            )?)
+            .await?;
+    }
     sender
         .send(Frame::new(
             FrameKind::FileEnd,
@@ -424,6 +465,8 @@ pub async fn serve_incoming_file_rooted(
     let mut worker = Some(tokio::task::spawn_blocking(move || {
         reconstruct_file(prepared, begin_for_worker, reconstruction_rx)
     }));
+    let mut seen_xattrs = false;
+    let mut seen_acls = false;
 
     loop {
         let routed = inbox
@@ -457,6 +500,43 @@ pub async fn serve_incoming_file_rooted(
                     return Err(RemoteTransferError::CopyWithoutBasis);
                 }
                 ReconstructionOp::Copy(WireDeltaCopy::decode(frame.payload())?)
+            }
+            FrameKind::FileXattrs => {
+                require_empty_flags(frame)?;
+                if seen_xattrs {
+                    return Err(RemoteTransferError::UnexpectedFrame {
+                        expected: FrameKind::FileEnd,
+                        actual: FrameKind::FileXattrs,
+                    });
+                }
+                seen_xattrs = true;
+                let entries = crate::protocol::WireXattrResult::decode(frame.payload())?;
+                let xattrs = entries
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        Ok((
+                            crate::engine::native_path::decode(entry.name())?.into_os_string(),
+                            entry.value().to_vec(),
+                        ))
+                    })
+                    .collect::<std::result::Result<Vec<(OsString, Vec<u8>)>, std::io::Error>>()?;
+                ReconstructionOp::Xattrs(xattrs)
+            }
+            FrameKind::FileAcls => {
+                require_empty_flags(frame)?;
+                if seen_acls {
+                    return Err(RemoteTransferError::UnexpectedFrame {
+                        expected: FrameKind::FileEnd,
+                        actual: FrameKind::FileAcls,
+                    });
+                }
+                seen_acls = true;
+                ReconstructionOp::Acls(
+                    crate::protocol::WireAcl::decode(frame.payload())?
+                        .text()
+                        .to_string(),
+                )
             }
             FrameKind::FileEnd => {
                 require_file_end_flags(frame)?;
@@ -720,6 +800,10 @@ fn reconstruct_file(
     let mut file_size = 0_u64;
     let mut literal_bytes = 0_u64;
     let mut reused_bytes = 0_u64;
+    // Preservation frames buffer as bounded sets and are applied to staging
+    // between metadata and commit, matching the local transaction lifecycle.
+    let mut xattrs: Option<Vec<(OsString, Vec<u8>)>> = None;
+    let mut acls: Option<String> = None;
 
     while let Some(op) = receiver.blocking_recv() {
         match op {
@@ -755,6 +839,8 @@ fn reconstruct_file(
                     .checked_add(u64::from(copy.copy_len()))
                     .ok_or(RemoteTransferError::ByteCountOverflow)?;
             }
+            ReconstructionOp::Xattrs(values) => xattrs = Some(values),
+            ReconstructionOp::Acls(text) => acls = Some(text),
             ReconstructionOp::End(end) => {
                 if end.file_size() != begin.file_size() || file_size != begin.file_size() {
                     return Err(RemoteTransferError::SizeMismatch {
@@ -767,15 +853,6 @@ fn reconstruct_file(
                 if digest != end.digest() {
                     return Err(RemoteTransferError::DigestMismatch);
                 }
-                // The scanned destination state must still hold at commit.
-                validate_destination_state(
-                    &prepared.rooted,
-                    &prepared.relative,
-                    prepared.expectation,
-                )?;
-                if let Some((basis, expected)) = prepared.basis.as_ref() {
-                    validate_basis(basis, *expected)?;
-                }
                 let modified = begin
                     .modified()
                     .map(|(seconds, nanoseconds)| Timestamp::new(seconds, nanoseconds))
@@ -787,6 +864,20 @@ fn reconstruct_file(
                 prepared
                     .staged
                     .apply_metadata_blocking(begin.unix_mode(), modified)?;
+                prepared.staged.apply_preservation_blocking(
+                    xattrs.as_deref(),
+                    acls.as_deref(),
+                    begin.unix_mode(),
+                )?;
+                // The scanned destination state must still hold at commit.
+                validate_destination_state(
+                    &prepared.rooted,
+                    &prepared.relative,
+                    prepared.expectation,
+                )?;
+                if let Some((basis, expected)) = prepared.basis.as_ref() {
+                    validate_basis(basis, *expected)?;
+                }
                 prepared.staged.commit()?;
                 return Ok(TransferSummary {
                     file_size,
@@ -1040,6 +1131,8 @@ mod tests {
             TransferMetadata {
                 unix_mode: Some(0o640),
                 modified: Some(modified),
+                xattrs: None,
+                acls: None,
             },
             session.server.platform.os,
         )
@@ -1273,6 +1366,90 @@ mod tests {
         assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"RACED");
         // Only the preserved destination remains: staging is gone.
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// Preservation frames land on the staged inode before commit, so the
+    /// committed file already carries the source's attributes.
+    #[tokio::test]
+    async fn staged_preservation_applies_before_commit() {
+        let root = tempfile::TempDir::new().unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, None)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let wire_path = encode_relative_path(relative.as_path()).unwrap();
+        let begin = WireFileBegin::whole(wire_path, 3)
+            .with_metadata(Some(0o640), None)
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
+            .await
+            .unwrap();
+        tx.send(ReconstructionOp::Xattrs(vec![(
+            OsString::from("user.sy_test"),
+            b"v".to_vec(),
+        )]))
+        .await
+        .unwrap();
+        let digest = blake3::hash(b"new");
+        tx.send(ReconstructionOp::End(WireFileEnd::new(
+            3,
+            *digest.as_bytes(),
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        worker.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
+        let value = xattr::get(root.path().join("file"), "user.sy_test").unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    }
+
+    /// A preservation payload that cannot be applied aborts the
+    /// reconstruction before commit.
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn preservation_failure_aborts_reconstruction() {
+        let root = tempfile::TempDir::new().unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+        let prepared = tokio::task::spawn_blocking({
+            let relative = relative.clone();
+            move || prepare_reconstruction(rooted, &relative, None)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let wire_path = encode_relative_path(relative.as_path()).unwrap();
+        let begin = WireFileBegin::whole(wire_path, 3);
+        let (tx, rx) = mpsc::channel(4);
+        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
+            .await
+            .unwrap();
+        tx.send(ReconstructionOp::Acls("not an acl entry".to_string()))
+            .await
+            .unwrap();
+        let digest = blake3::hash(b"new");
+        tx.send(ReconstructionOp::End(WireFileEnd::new(
+            3,
+            *digest.as_bytes(),
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     /// Whole-file replacement of a scanned symlink is a legal type transition:

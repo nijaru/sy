@@ -55,6 +55,13 @@ pub enum FrameKind {
     AclResult = 28,
     BsdFlagsRequest = 29,
     BsdFlagsResult = 30,
+    /// Staged preservation on a file-transfer stream: the complete xattr set
+    /// to apply before commit. Present frames replace; absent frames leave
+    /// staging untouched.
+    FileXattrs = 31,
+    /// Staged preservation on a file-transfer stream: the complete exacl-unified
+    /// ACL text to apply before commit (empty text clears).
+    FileAcls = 32,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -91,6 +98,8 @@ impl TryFrom<u8> for FrameKind {
             28 => Ok(Self::AclResult),
             29 => Ok(Self::BsdFlagsRequest),
             30 => Ok(Self::BsdFlagsResult),
+            31 => Ok(Self::FileXattrs),
+            32 => Ok(Self::FileAcls),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }

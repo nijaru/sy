@@ -160,6 +160,8 @@ fn lower_create(source: Entry, policy: RemotePushPolicy) -> LowerResult<LoweredP
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
+                xattrs: None,
+                acls: None,
             };
             Ok(LoweredPush {
                 main: Some(file_work(RemotePushAction::TransferFile {
@@ -198,6 +200,8 @@ fn lower_update(
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
+                xattrs: None,
+                acls: None,
             };
             Ok(LoweredPush {
                 main: Some(file_work(RemotePushAction::TransferFile {
@@ -238,6 +242,8 @@ fn lower_replace(
             let metadata = TransferMetadata {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
+                xattrs: None,
+                acls: None,
             };
             Ok(LoweredPush {
                 main: Some(file_work(RemotePushAction::TransferFile {
@@ -687,6 +693,13 @@ impl RemotePushExecutor {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
+                // Preservation rides the transfer stream into server staging;
+                // a failure there aborts the replacement before commit.
+                let metadata = TransferMetadata {
+                    xattrs,
+                    acls,
+                    ..metadata
+                };
                 let summary = self
                     .remote
                     .transfer_file_with_policy(
@@ -697,14 +710,7 @@ impl RemotePushExecutor {
                         self.compression,
                     )
                     .await?;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
+                // Only rename-incompatible flags remain post-commit finalization.
                 if let Some(flags) = bsd_flags {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
@@ -815,6 +821,13 @@ impl RemotePushExecutor {
         let xattrs = self.read_source_xattrs(&source).await?;
         let acls = self.read_source_acls(&source).await?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
+        // Preservation rides the transfer stream into server staging; a
+        // failure there aborts the replacement before commit.
+        let metadata = TransferMetadata {
+            xattrs,
+            acls,
+            ..metadata
+        };
         let summary = self
             .remote
             .transfer_file_with_policy(
@@ -825,14 +838,7 @@ impl RemotePushExecutor {
                 self.compression,
             )
             .await?;
-        if let Some(xattrs) = xattrs.as_deref() {
-            self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                .await?;
-        }
-        if let Some(acls) = acls.as_deref() {
-            self.write_destination_acls(&source.path, source.kind, acls)
-                .await?;
-        }
+        // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;

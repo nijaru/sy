@@ -38,6 +38,25 @@ impl WireAcl {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(4 + self.text.len());
+        out.put_u32(u32::try_from(self.text.len()).unwrap_or(u32::MAX));
+        out.extend_from_slice(self.text.as_bytes());
+        out.freeze()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = SliceReader::new(payload);
+        let len = reader.u32()? as usize;
+        let text =
+            std::str::from_utf8(reader.take(len)?).map_err(|_| ProtocolError::InvalidField {
+                field: "acl_text",
+                reason: "ACL text is not valid UTF-8",
+            })?;
+        reader.finish()?;
+        Self::new(text.to_string())
+    }
 }
 
 /// Whether an ACL request reads the entry's current list or replaces it with

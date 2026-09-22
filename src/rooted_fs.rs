@@ -55,6 +55,9 @@ pub enum RootedFsError {
     #[error("extended attributes exceed the bounded set size: {len} bytes (maximum {max})")]
     XattrSetTooLarge { len: usize, max: usize },
 
+    #[error("preservation changed the staged mode: expected {expected:#o}, observed {actual:#o}")]
+    PreservationModeConflict { expected: u32, actual: u32 },
+
     #[error("extended attributes are not preserved for symlinks")]
     UnsupportedSymlinkXattrs,
 
@@ -151,6 +154,55 @@ impl RootedStagedFile {
         #[cfg(not(unix))]
         {
             let _ = (unix_mode, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+
+    /// Mirror a preservation set onto the staging inode before commit, then
+    /// prove the effective mode still matches `unix_mode` (ACL application can
+    /// rewrite the shared mode bits). Staging is a fresh inode, so mirroring
+    /// means setting exactly this set.
+    pub fn apply_preservation_blocking(
+        &mut self,
+        xattrs: Option<&[(OsString, Vec<u8>)]>,
+        acl: Option<&str>,
+        unix_mode: Option<u32>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use xattr::FileExt;
+
+            if let Some(xattrs) = xattrs {
+                for (name, value) in xattrs {
+                    self.file.set_xattr(name, value)?;
+                }
+            }
+            if let Some(acl) = acl {
+                #[cfg(feature = "acl")]
+                apply_acl_fd(&self.file, acl)?;
+                #[cfg(not(feature = "acl"))]
+                {
+                    let _ = acl;
+                    return Err(RootedFsError::AclUnsupported(
+                        "ACL preservation requires the acl feature; rebuild with --features acl",
+                    ));
+                }
+            }
+            if let Some(expected) = unix_mode.map(|mode| mode & 0o7777) {
+                use std::os::unix::fs::PermissionsExt;
+                let observed = self.file.metadata()?.permissions().mode() & 0o7777;
+                if observed != expected {
+                    return Err(RootedFsError::PreservationModeConflict {
+                        expected,
+                        actual: observed,
+                    });
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (xattrs, acl, unix_mode);
             Err(RootedFsError::UnsupportedPlatform)
         }
     }
@@ -975,19 +1027,8 @@ impl RootedFs {
 
     #[cfg(all(target_os = "linux", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let file = self.open_xattr_entry_blocking(relative, kind)?;
-        // Mirror `LocalEndpoint::write_acl`: empty text restores the
-        // mode-derived base entries instead of leaving a bare ACL.
-        let entries = if acl.is_empty() {
-            let mode = file.metadata()?.permissions().mode();
-            exacl::from_mode(mode & 0o777)
-        } else {
-            exacl::from_str(acl)?
-        };
-        exacl::setfacl(&[fd_alias_path(&file)], &entries, None)?;
-        Ok(())
+        apply_acl_fd(&file, acl)
     }
 
     /// macOS: `/dev/fd/N` does NOT resolve to the open inode for
@@ -1007,9 +1048,7 @@ impl RootedFs {
     #[cfg(all(target_os = "macos", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
-        let entries = exacl::from_str(acl)?;
-        acl_macos::write_fd_entries(file.as_raw_fd(), &entries)?;
-        Ok(())
+        apply_acl_fd(&file, acl)
     }
 
     #[cfg(all(unix, not(feature = "acl")))]
@@ -1209,6 +1248,50 @@ fn open_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
 #[cfg(all(target_os = "linux", feature = "acl"))]
 fn fd_alias_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Replace one held descriptor's ACL from exacl-unified text.
+///
+/// Both the rooted entry writers and the staged-writer preservation path
+/// apply through this fd-based core: no path-based lookup can race the
+/// descriptor. Empty text restores the mode-derived base entries on Linux.
+#[cfg(all(target_os = "linux", feature = "acl"))]
+fn apply_acl_fd(file: &File, acl: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mirror `LocalEndpoint::write_acl`: empty text restores the
+    // mode-derived base entries instead of leaving a bare ACL.
+    let entries = if acl.is_empty() {
+        let mode = file.metadata()?.permissions().mode();
+        exacl::from_mode(mode & 0o777)
+    } else {
+        exacl::from_str(acl)?
+    };
+    exacl::setfacl(&[fd_alias_path(file)], &entries, None)?;
+    Ok(())
+}
+
+/// macOS: `/dev/fd/N` does NOT resolve to the open inode for exacl's path
+/// API (verified: it returns an empty list), so the fd-based syscalls in
+/// `acl_macos` carry the conversion instead. Same held descriptor, same
+/// exacl text format.
+#[cfg(all(target_os = "macos", feature = "acl"))]
+fn apply_acl_fd(file: &File, acl: &str) -> Result<()> {
+    let entries = exacl::from_str(acl)?;
+    acl_macos::write_fd_entries(file.as_raw_fd(), &entries)?;
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    feature = "acl",
+    not(target_os = "linux"),
+    not(target_os = "macos")
+))]
+fn apply_acl_fd(_file: &File, _acl: &str) -> Result<()> {
+    Err(RootedFsError::AclUnsupported(
+        "access control lists are only supported on Linux and macOS",
+    ))
 }
 
 #[cfg(unix)]

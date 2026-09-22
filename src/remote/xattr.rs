@@ -322,13 +322,13 @@ fn check_xattr_set_bounded(xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn name_bytes(name: &OsString) -> Bytes {
+pub(crate) fn name_bytes(name: &OsString) -> Bytes {
     use std::os::unix::ffi::OsStrExt;
     Bytes::copy_from_slice(name.as_os_str().as_bytes())
 }
 
 #[cfg(not(unix))]
-fn name_bytes(name: &OsString) -> Bytes {
+pub(crate) fn name_bytes(name: &OsString) -> Bytes {
     Bytes::copy_from_slice(name.to_string_lossy().as_bytes())
 }
 
