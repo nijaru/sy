@@ -155,7 +155,7 @@ jobs:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/setup-cross-toolchain-action@v2
+      - uses: taiki-e/setup-cross-toolchain-action@v1.42.0
         with:
           target: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
