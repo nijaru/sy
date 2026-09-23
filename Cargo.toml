@@ -38,7 +38,6 @@ clap_mangen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-chrono = "0.4"
 
 # Async runtime (Phase 2: used for transport abstraction)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "process", "time", "sync", "signal"] }
@@ -51,11 +50,8 @@ tempfile = "3"
 glob = "0.3"
 notify = { version = "6.0", optional = true }
 libc = "0.2"
-bincode = "1.3"
-fs2 = "0.4"  # Cross-platform file locking
 
 # Progress & Logging
-indicatif = "0.17"
 colored = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -83,14 +79,10 @@ num_cpus = "1.16"  # CPU count detection for parallel scanning
 dirs = "5"
 futures = "0.3.31"
 
-# Database
-fjall = "2.11.2"
-
-# S3 / Cloud Storage - Optional feature
+# Object storage (optional): object_store is a pure-Rust stack.
 object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
-memmap2 = "0.9.9"
 bitflags = "2.10.0"
 unicode-normalization = "0.1"
 
