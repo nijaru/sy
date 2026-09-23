@@ -47,6 +47,15 @@ pub enum RemotePushControllerError {
     #[error("v3 remote checksum comparison is not implemented for {0}")]
     UnsupportedContentComparison(RelativePath),
 
+    #[error(
+        "unsupported type transition at '{path}': a {source_kind:?} cannot transactionally replace a {destination_kind:?}"
+    )]
+    UnsupportedTypeTransition {
+        path: RelativePath,
+        source_kind: crate::engine::domain::EntryKind,
+        destination_kind: crate::engine::domain::EntryKind,
+    },
+
     #[error("remote push worker failed: {0}")]
     Worker(String),
 
@@ -244,6 +253,22 @@ where
                 finish_content_comparison(source, destination, contents_equal, policy)
             }
         };
+        // Type transitions involving directories need a tree transaction that
+        // does not exist yet. The whole preflight rejects them before any
+        // destination mutation instead of failing mid-execution.
+        if let SyncOp::Replace {
+            source,
+            destination,
+        } = &operation
+        {
+            if source.is_directory() || destination.is_directory() {
+                return Err(RemotePushControllerError::UnsupportedTypeTransition {
+                    path: source.path.clone(),
+                    source_kind: source.kind,
+                    destination_kind: destination.kind,
+                });
+            }
+        }
         journal.append(&operation).await?;
         operations = checked_add(operations, 1, "operation")?;
     }
@@ -1236,6 +1261,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.operations, 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_directory_transitions_before_mutation() {
+        // A directory on either side of a replacement needs a tree
+        // transaction; the whole preflight refuses before any mutation.
+        let source = entries(vec![directory("swap", 0o755)]);
+        let destination = entries(vec![file("swap", 3, 1)]);
+        let err = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RemotePushControllerError::UnsupportedTypeTransition { .. }
+        ));
+
+        let source = entries(vec![file("swap", 3, 1)]);
+        let destination = entries(vec![directory("swap", 0o755)]);
+        let err = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RemotePushControllerError::UnsupportedTypeTransition { .. }
+        ));
     }
 
     #[tokio::test]
