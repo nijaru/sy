@@ -629,7 +629,10 @@ fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
     use std::fs::{File, OpenOptions};
     use std::os::fd::AsRawFd;
 
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    // FICLONE is a fixed 32-bit request code; `libc::Ioctl` differs between
+    // glibc (c_ulong) and musl (c_int), and the kernel only compares the low
+    // 32 bits of the request word.
+    const FICLONE: libc::Ioctl = 0x4004_9409_u32 as libc::Ioctl;
 
     let source_file = File::open(source)?;
     let dest_file = OpenOptions::new()
