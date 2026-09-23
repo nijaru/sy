@@ -395,8 +395,10 @@ pub fn namespace_semantics(root: &Path) -> NamespaceSemantics {
 fn linux_root_casefolded(root: &Path) -> bool {
     use std::os::unix::io::AsRawFd;
 
-    /// `_IOR('f', 1, long)` from `<linux/fs.h>` on LP64.
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    /// `_IOR('f', 1, long)` from `<linux/fs.h>` on LP64. `libc::Ioctl` differs
+    /// between glibc (c_ulong) and musl (c_int); the kernel compares only the
+    /// low 32 bits of the request word.
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601_u32 as libc::Ioctl;
     /// `FS_CASEFOLD_FL` from `<linux/fs.h>`.
     const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
 
