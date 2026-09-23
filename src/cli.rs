@@ -65,7 +65,7 @@ pub enum VerificationMode {
     #[default]
     None,
 
-    /// xxHash3 verification after write (catches corruption)
+    /// Staged verification of written content (catches corruption)
     Verify,
 }
 
@@ -128,7 +128,7 @@ pub enum SymlinkMode {
     sy /source /destination --quiet
 
     # Verify file integrity after write
-    sy /source /destination --verify            # xxHash3 verification
+    sy /source /destination --verify            # staged verification
 
 For more information: https://github.com/nijaru/sy")]
 pub struct Cli {
@@ -261,11 +261,7 @@ pub struct Cli {
     #[arg(long, value_parser = parse_size)]
     pub bwlimit: Option<u64>,
 
-    /// Use streaming mode for massive directories (experimental)
-    #[arg(long, hide = true)]
-    pub stream: bool,
-
-    /// Verify file integrity after write using xxHash3 checksums
+    /// Verify file integrity against staged BLAKE3 verification
     ///
     /// Modes:
     /// - after: Verify each file after writing (default)
@@ -396,15 +392,6 @@ pub struct Cli {
     /// - 0 = unlimited (default: 50%)
     #[arg(long, default_value = "50%")]
     pub max_delete: String,
-
-    /// Maximum retry attempts for network operations (default: 0 = no retries)
-    #[arg(long, default_value = "0", hide = true)]
-    pub retry: u32,
-
-    /// Initial delay between retries in seconds (default: 1)
-    /// Delay increases exponentially with each retry (1s, 2s, 4s, ...)
-    #[arg(long, default_value = "1", hide = true)]
-    pub retry_delay: u64,
 
     // === rsync compatibility flags (hidden, no-op) ===
     /// Recursive (no-op: sy is always recursive, for rsync compatibility)
@@ -663,7 +650,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -671,8 +657,6 @@ mod tests {
             list_profiles: false,
             show_profile: None,
             max_delete: "50%".to_string(),
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert!(cli.validate().is_ok());
@@ -736,7 +720,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -744,8 +727,6 @@ mod tests {
             list_profiles: false,
             show_profile: None,
             max_delete: "50%".to_string(),
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         let result = cli.validate();
@@ -813,7 +794,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -823,8 +803,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         // Single file sync is now supported
@@ -933,7 +911,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -943,8 +920,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert!(cli.validate().is_ok());
@@ -1006,7 +981,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1016,8 +990,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
@@ -1079,7 +1051,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1089,8 +1060,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::WARN);
@@ -1152,7 +1121,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1162,8 +1130,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
@@ -1225,7 +1191,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1235,8 +1200,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
@@ -1317,7 +1280,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1327,8 +1289,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -1405,7 +1365,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1415,8 +1374,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::None);
@@ -1478,7 +1435,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1488,8 +1444,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         // verify flag should override mode to Verify
@@ -1566,7 +1520,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1576,8 +1529,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
@@ -1639,7 +1590,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1649,8 +1599,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
@@ -1712,7 +1660,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1722,8 +1669,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
@@ -1785,7 +1730,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1795,8 +1739,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -1862,7 +1804,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1872,8 +1813,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -1938,7 +1877,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -1948,8 +1886,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -2015,7 +1951,6 @@ mod tests {
             size_only: true,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -2025,8 +1960,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -2095,7 +2028,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -2105,8 +2037,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -2172,7 +2102,6 @@ mod tests {
             size_only: false,
             checksum: true, // Only this flag enabled
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -2182,8 +2111,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         };
 
@@ -2292,7 +2219,6 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
@@ -2302,8 +2228,6 @@ mod tests {
             max_delete: "50%".to_string(),
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
             recursive: false,
         }
     }

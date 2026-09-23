@@ -49,6 +49,48 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  static-musl:
+    name: Static musl build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/setup-cross-toolchain-action@v2
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build static release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Verify the artifact is fully static
+        run: |
+          BIN=target/${{ matrix.target }}/release/sy
+          file "$BIN"
+          # Standalone musl artifacts must run on any Linux regardless of its
+          # libc: no dynamic interpreter and no shared-library dependencies.
+          if readelf -l "$BIN" | grep -q "Requesting program interpreter"; then
+            echo "::error::musl artifact has a dynamic interpreter"
+            readelf -l "$BIN"
+            exit 1
+          fi
+          if readelf -d "$BIN" | grep -q "(NEEDED)"; then
+            echo "::error::musl artifact has shared-library dependencies"
+            readelf -d "$BIN"
+            exit 1
+          fi
+      - name: Smoke test the static binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          BIN=target/${{ matrix.target }}/release/sy
+          work=$(mktemp -d)
+          printf 'static smoke' > "$work/source"
+          "$BIN" "$work/source" "$work/copy"
+          test "$(cat "$work/copy")" = "static smoke"
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest

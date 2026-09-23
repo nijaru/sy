@@ -34,4 +34,3 @@ pub(crate) mod hooks;
 pub mod path;
 pub(crate) mod perf;
 pub(crate) mod resource;
-pub mod retry;

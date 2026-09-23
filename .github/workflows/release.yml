@@ -145,13 +145,72 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}.tar.gz*
 
+  build-musl:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/setup-cross-toolchain-action@v2
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build static release binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/sy dist/
+
+      - name: Verify the artifact is fully static
+        run: |
+          BIN=dist/sy
+          file "$BIN"
+          # Standalone musl artifacts are the remote-agent distribution story
+          # (#26/#28): they must run on any Linux regardless of its libc.
+          if readelf -l "$BIN" | grep -q "Requesting program interpreter"; then
+            echo "::error::musl artifact has a dynamic interpreter"
+            readelf -l "$BIN"
+            exit 1
+          fi
+          if readelf -d "$BIN" | grep -q "(NEEDED)"; then
+            echo "::error::musl artifact has shared-library dependencies"
+            readelf -d "$BIN"
+            exit 1
+          fi
+
+      - name: Smoke test the static binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          work=$(mktemp -d)
+          printf 'static smoke' > "$work/source"
+          ./dist/sy "$work/source" "$work/copy"
+          test "$(cat "$work/copy")" = "static smoke"
+
+      - name: Create tarball
+        run: |
+          cd dist
+          tar czf sy-${{ matrix.target }}.tar.gz sy
+          sha256sum sy-${{ matrix.target }}.tar.gz > sy-${{ matrix.target }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sy-${{ matrix.target }}
+          path: dist/sy-${{ matrix.target }}.tar.gz*
+
   # ============================================================================
   # STAGE 3: Create GitHub Release (stays draft until manually published)
   # ============================================================================
 
   create-release:
     name: Create GitHub Release
-    needs: [verify, build-binaries]
+    needs: [verify, build-binaries, build-musl]
     if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
     runs-on: ubuntu-latest
     steps:

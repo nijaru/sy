@@ -94,7 +94,7 @@ Apply exclude template from ~/.config/sy/templates/ (can be repeated) Examples: 
 Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
 .TP
 \fB\-\-verify\fR \fI<VERIFY>\fR [default: no]
-Verify file integrity after write using xxHash3 checksums
+Verify file integrity against staged BLAKE3 verification
 
 Modes: \- after: Verify each file after writing (default) \- only: Audit file integrity without modifying anything \- no: Disable verification (default)
 .br
@@ -257,7 +257,7 @@ EXAMPLES:
     sy /source /destination \-\-quiet
 
     # Verify file integrity after write
-    sy /source /destination \-\-verify            # xxHash3 verification
+    sy /source /destination \-\-verify            # staged verification
 
 For more information: https://github.com/nijaru/sy
 .SH VERSION
