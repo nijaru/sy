@@ -202,6 +202,7 @@ impl FilterEngine {
 
     /// Serialize rules to rsync-style strings for protocol transmission.
     /// Returns `Vec` of `"+ pattern"` or `"- pattern"` strings.
+    #[allow(dead_code)]
     pub fn to_rule_strings(&self) -> Vec<String> {
         self.rules
             .iter()
@@ -216,6 +217,7 @@ impl FilterEngine {
     }
 
     /// Reconstruct a `FilterEngine` from rsync-style rule strings.
+    #[allow(dead_code)]
     pub fn from_rule_strings(rules: &[String]) -> Result<Self> {
         let mut engine = Self::new();
         for rule in rules {
@@ -311,6 +313,7 @@ impl FilterEngine {
     }
 
     /// Check if a path should be excluded
+    #[allow(dead_code)]
     pub fn should_exclude(&self, path: &Path, is_dir: bool) -> bool {
         !self.should_include(path, is_dir)
     }

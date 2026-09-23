@@ -1,137 +1,172 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use std::io::Write;
-use sy::compress::{compress, decompress, Compression};
+use std::time::Duration;
 
-fn generate_test_data(size: usize, pattern: &str) -> Vec<u8> {
-    match pattern {
-        "text" => {
-            // Realistic text data (log files, source code)
-            "The quick brown fox jumps over the lazy dog. "
-                .repeat(size / 46)
-                .as_bytes()
-                .to_vec()
+#[derive(Debug, Clone, Copy)]
+enum Candidate {
+    Zstd(i32),
+    Lz4,
+}
+
+impl Candidate {
+    fn name(self) -> String {
+        match self {
+            Self::Zstd(level) => format!("zstd-{level}"),
+            Self::Lz4 => "lz4".to_string(),
         }
-        "repetitive" => {
-            // Highly compressible data
-            vec![b'A'; size]
+    }
+
+    fn compress(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Zstd(level) => zstd::bulk::compress(data, level).unwrap(),
+            Self::Lz4 => lz4_flex::compress_prepend_size(data),
         }
-        "random" => {
-            // Incompressible data (simulates already-compressed files)
-            (0..size).map(|i| (i % 256) as u8).collect()
-        }
-        _ => vec![0u8; size],
     }
 }
 
-fn compress_zstd_level(data: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
-    let mut encoder = zstd::Encoder::new(Vec::new(), level)?;
-    encoder.write_all(data)?;
-    encoder.finish()
+#[derive(Debug, Clone, Copy)]
+enum Corpus {
+    SourceText,
+    Repetitive,
+    Mixed,
+    HighEntropy,
 }
 
-fn bench_compression_speed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("compression_speed");
-    group.sample_size(20); // Fewer samples for speed
+impl Corpus {
+    const ALL: [Self; 4] = [
+        Self::SourceText,
+        Self::Repetitive,
+        Self::Mixed,
+        Self::HighEntropy,
+    ];
 
-    // Test only 10MB size for quick results
-    let size = 10 * 1024 * 1024;
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SourceText => "source-text",
+            Self::Repetitive => "repetitive",
+            Self::Mixed => "mixed",
+            Self::HighEntropy => "high-entropy",
+        }
+    }
 
-    // Test different data types
-    for pattern in ["text", "random"].iter() {
-        let data = generate_test_data(size, pattern);
+    fn generate(self, size: usize) -> Vec<u8> {
+        match self {
+            Self::SourceText => repeat_to_size(
+                b"fn reconcile(path: &RelativePath) -> Result<SyncOp> {\n    planner.plan(path)?;\n}\n",
+                size,
+            ),
+            Self::Repetitive => vec![b'A'; size],
+            Self::Mixed => {
+                let mut data = repeat_to_size(
+                    b"2026-08-28T13:00:00Z INFO sync path=/srv/data status=changed bytes=65536\n",
+                    size,
+                );
+                let entropy = high_entropy(size / 4, 0x4d59_5df4_d0f3_3173);
+                let start = size.saturating_sub(entropy.len()) / 2;
+                data[start..start + entropy.len()].copy_from_slice(&entropy);
+                data
+            }
+            Self::HighEntropy => high_entropy(size, 0x9e37_79b9_7f4a_7c15),
+        }
+    }
+}
+
+fn repeat_to_size(pattern: &[u8], size: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(size);
+    while result.len() < size {
+        let remaining = size - result.len();
+        result.extend_from_slice(&pattern[..pattern.len().min(remaining)]);
+    }
+    result
+}
+
+/// Deterministic xorshift64* output. Unlike the previous `i % 256` corpus,
+/// this produces high-entropy bytes that are a useful proxy for encrypted or
+/// already-compressed payloads without adding a benchmark-only RNG dependency.
+fn high_entropy(size: usize, mut state: u64) -> Vec<u8> {
+    let mut result = Vec::with_capacity(size);
+    while result.len() < size {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let word = state.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes();
+        let remaining = size - result.len();
+        result.extend_from_slice(&word[..word.len().min(remaining)]);
+    }
+    result
+}
+
+fn compression_candidates() -> [Candidate; 6] {
+    [
+        Candidate::Zstd(-5),
+        Candidate::Zstd(-3),
+        Candidate::Zstd(-1),
+        Candidate::Zstd(1),
+        Candidate::Zstd(3),
+        Candidate::Lz4,
+    ]
+}
+
+fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(150));
+    group.measurement_time(Duration::from_millis(500));
+}
+
+fn bench_v3_chunk_compression(c: &mut Criterion) {
+    // Protocol v3 compresses bounded literal/data payloads, not whole files.
+    // Measure representative frame/chunk sizes rather than a single 10 MiB
+    // whole-file allocation from the legacy protocol.
+    for size in [64 * 1024, 256 * 1024, 1024 * 1024] {
+        for corpus in Corpus::ALL {
+            let data = corpus.generate(size);
+            let mut group = c.benchmark_group(format!("compress/{}/{}", corpus.name(), size));
+            configure_group(&mut group);
+            group.throughput(Throughput::Bytes(size as u64));
+
+            for candidate in compression_candidates() {
+                let compressed = candidate.compress(&data);
+                let ratio = compressed.len() as f64 / data.len() as f64;
+                let id = BenchmarkId::new(candidate.name(), format!("ratio={ratio:.3}"));
+                group.bench_function(id, |b| {
+                    b.iter(|| candidate.compress(black_box(&data)));
+                });
+            }
+            group.finish();
+        }
+    }
+}
+
+fn bench_v3_chunk_decompression(c: &mut Criterion) {
+    let size = 1024 * 1024;
+    for corpus in [Corpus::SourceText, Corpus::Mixed, Corpus::HighEntropy] {
+        let data = corpus.generate(size);
+        let mut group = c.benchmark_group(format!("decompress/{}", corpus.name()));
+        configure_group(&mut group);
         group.throughput(Throughput::Bytes(size as u64));
 
-        // Benchmark Zstd compression (level 3)
-        group.bench_with_input(
-            BenchmarkId::new(format!("zstd_{}", pattern), size),
-            &data,
-            |b, data| {
-                b.iter(|| compress(black_box(data), Compression::Zstd));
-            },
-        );
-    }
+        for level in [-5, -3, -1, 1, 3] {
+            let encoded = zstd::bulk::compress(&data, level).unwrap();
+            let ratio = encoded.len() as f64 / data.len() as f64;
+            group.bench_function(
+                BenchmarkId::new(format!("zstd-{level}"), format!("ratio={ratio:.3}")),
+                |b| {
+                    b.iter(|| zstd::bulk::decompress(black_box(&encoded), size).unwrap());
+                },
+            );
+        }
 
-    group.finish();
-}
-
-fn bench_decompression_speed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("decompression_speed");
-
-    let size = 10 * 1024 * 1024; // 10 MB
-    let text_data = generate_test_data(size, "text");
-
-    // Pre-compress data
-    let zstd_compressed = compress(&text_data, Compression::Zstd).unwrap();
-
-    group.throughput(Throughput::Bytes(size as u64));
-
-    group.bench_function("zstd_decompress", |b| {
-        b.iter(|| decompress(black_box(&zstd_compressed), Compression::Zstd));
-    });
-
-    group.finish();
-}
-
-fn bench_compression_ratio(c: &mut Criterion) {
-    let mut group = c.benchmark_group("compression_ratio");
-    group.sample_size(10); // Fewer samples since we're measuring ratio, not speed
-
-    let size = 10 * 1024 * 1024; // 10 MB
-
-    for pattern in ["text", "repetitive", "random"].iter() {
-        let data = generate_test_data(size, pattern);
-
-        group.bench_with_input(
-            BenchmarkId::new(format!("zstd_ratio_{}", pattern), pattern),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let compressed = compress(black_box(data), Compression::Zstd).unwrap();
-                    let ratio = compressed.len() as f64 / data.len() as f64;
-                    black_box(ratio)
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_zstd_levels(c: &mut Criterion) {
-    let mut group = c.benchmark_group("zstd_levels");
-    group.sample_size(15); // Moderate sample size
-
-    let size = 10 * 1024 * 1024; // 10 MB
-    let text_data = generate_test_data(size, "text");
-    group.throughput(Throughput::Bytes(size as u64));
-
-    // Test various Zstd compression levels
-    // Level 1: Fastest
-    // Level 3: Default (balanced)
-    // Level 6: Better compression
-    // Level 9: High compression
-    // Level 11: Very high compression
-    // Level 15: Maximum practical
-    // Level 19: Maximum (slow)
-    for level in [1, 3, 6, 9, 11, 15, 19] {
-        group.bench_with_input(BenchmarkId::new("zstd", level), &level, |b, &level| {
-            b.iter(|| {
-                let compressed = compress_zstd_level(black_box(&text_data), level).unwrap();
-                // Also return ratio for comparison
-                let ratio = compressed.len() as f64 / text_data.len() as f64;
-                black_box((compressed, ratio))
-            });
+        let encoded = lz4_flex::compress_prepend_size(&data);
+        let ratio = encoded.len() as f64 / data.len() as f64;
+        group.bench_function(BenchmarkId::new("lz4", format!("ratio={ratio:.3}")), |b| {
+            b.iter(|| lz4_flex::decompress_size_prepended(black_box(&encoded)).unwrap());
         });
+        group.finish();
     }
-
-    group.finish();
 }
 
 criterion_group!(
     benches,
-    bench_compression_speed,
-    bench_decompression_speed,
-    bench_compression_ratio,
-    bench_zstd_levels
+    bench_v3_chunk_compression,
+    bench_v3_chunk_decompression
 );
 criterion_main!(benches);
