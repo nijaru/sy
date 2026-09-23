@@ -28,7 +28,7 @@ default = ["ssh"]
 acl = ["exacl"]
 s3 = ["object_store"]
 gcs = ["object_store"]
-ssh = ["dep:ssh2", "dep:whoami", "dep:regex"]
+ssh = []
 watch = ["dep:notify"]
 
 [dependencies]
@@ -78,11 +78,9 @@ lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
 rayon = "1.10"
 num_cpus = "1.16"  # CPU count detection for parallel scanning
 
-# SSH - Optional feature
-ssh2 = { version = "0.9", optional = true }
-whoami = { version = "1", optional = true }
+# SSH - Optional feature (OpenSSH is invoked as an external process; no
+# embedded SSH stack is linked)
 dirs = "5"
-regex = { version = "1", optional = true }
 futures = "0.3.31"
 
 # Database

@@ -12,7 +12,6 @@ mod perf;
 mod resource;
 mod retry;
 mod sparse;
-mod ssh;
 mod sync;
 mod temp_file;
 
