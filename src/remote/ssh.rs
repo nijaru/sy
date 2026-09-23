@@ -1,7 +1,7 @@
 use crate::protocol::Operation;
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::ClientRemoteSession;
-use crate::ssh::config::SshConfig;
+use crate::ssh::SshTarget;
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::path::Path;
@@ -28,13 +28,13 @@ pub struct SshLaunchOptions {
 
 impl SshRemoteSession {
     pub async fn connect(
-        config: &SshConfig,
+        target: &SshTarget,
         operation: Operation,
         remote_root: &Path,
         router_config: RouterConfig,
     ) -> Result<Self> {
         Self::connect_with_options(
-            config,
+            target,
             operation,
             remote_root,
             router_config,
@@ -44,14 +44,14 @@ impl SshRemoteSession {
     }
 
     pub async fn connect_with_options(
-        config: &SshConfig,
+        target: &SshTarget,
         operation: Operation,
         remote_root: &Path,
         router_config: RouterConfig,
         launch: SshLaunchOptions,
     ) -> Result<Self> {
         let mut command = Command::new("ssh");
-        command.args(ssh_arguments(config, &launch));
+        command.args(ssh_arguments(target, &launch));
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::inherit());
@@ -81,52 +81,24 @@ impl SshRemoteSession {
     }
 }
 
-fn ssh_arguments(config: &SshConfig, launch: &SshLaunchOptions) -> Vec<OsString> {
+fn ssh_arguments(target: &SshTarget, launch: &SshLaunchOptions) -> Vec<OsString> {
     let mut args = Vec::new();
 
-    if !config.user.is_empty() {
+    // Only explicit command-line overrides are passed; everything else is
+    // resolved by OpenSSH from the user's own ssh_config against the alias.
+    if let Some(user) = &target.user {
         args.push(OsString::from("-l"));
-        args.push(OsString::from(&config.user));
-    }
-    if config.port != 22 {
-        args.push(OsString::from("-p"));
-        args.push(OsString::from(config.port.to_string()));
-    }
-    for identity in &config.identity_file {
-        args.push(OsString::from("-i"));
-        args.push(identity.as_os_str().to_os_string());
-    }
-    if let Some(proxy_jump) = &config.proxy_jump {
-        args.push(OsString::from("-J"));
-        args.push(OsString::from(proxy_jump));
-    }
-    if config.control_master {
-        args.push(OsString::from("-o"));
-        args.push(OsString::from("ControlMaster=auto"));
-    }
-    if let Some(control_path) = &config.control_path {
-        args.push(OsString::from("-o"));
-        args.push(OsString::from(format!(
-            "ControlPath={}",
-            control_path.display()
-        )));
-    }
-    if let Some(control_persist) = config.control_persist {
-        args.push(OsString::from("-o"));
-        args.push(OsString::from(format!(
-            "ControlPersist={}",
-            control_persist.as_secs()
-        )));
+        args.push(OsString::from(user));
     }
     if let Some(connect_timeout) = launch.connect_timeout {
         args.push(OsString::from("-o"));
         args.push(OsString::from(format!("ConnectTimeout={connect_timeout}")));
     }
-    if config.compression {
-        args.push(OsString::from("-C"));
-    }
 
-    args.push(OsString::from(&config.hostname));
+    // The alias is one argv word and goes through untouched: Host matching,
+    // Include, Match, HostName, ProxyJump, IdentityFile, ControlMaster and
+    // Compression all belong to OpenSSH. No shell is involved.
+    args.push(target.alias.clone());
     args.push(OsString::from("sy"));
     args.push(OsString::from("__serve"));
     args
@@ -135,57 +107,62 @@ fn ssh_arguments(config: &SshConfig, launch: &SshLaunchOptions) -> Vec<OsString>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::time::Duration;
 
     #[test]
-    fn launcher_uses_private_agent_without_remote_root_argv() {
-        let config = SshConfig {
-            hostname: "host.example".to_string(),
-            port: 2202,
-            user: "alice".to_string(),
-            identity_file: vec![PathBuf::from("/tmp/key")],
-            proxy_jump: Some("jump.example".to_string()),
-            control_master: true,
-            control_path: Some(PathBuf::from("/tmp/sy-control")),
-            control_persist: Some(Duration::from_secs(30)),
-            compression: true,
-        };
+    fn launcher_passes_alias_untouched_with_private_agent() {
+        // The alias is one argv word: no shell, no parsing, no reconstruction.
+        // Even hostile-looking aliases belong to OpenSSH's own resolution.
+        let target = SshTarget::new("host alias;$(touch /tmp/pwn)", Some("alice".to_string()));
+        let args = ssh_arguments(&target, &SshLaunchOptions::default());
 
-        let args = ssh_arguments(&config, &SshLaunchOptions::default());
         assert_eq!(
             &args[args.len() - 3..],
             [
-                OsString::from("host.example"),
+                OsString::from("host alias;$(touch /tmp/pwn)"),
                 OsString::from("sy"),
                 OsString::from("__serve"),
             ]
         );
-        assert!(!args.iter().any(|arg| arg == "/remote/root"));
-        assert!(args.iter().any(|arg| arg == "-J"));
-        assert!(args.iter().any(|arg| arg == "-C"));
-        // No --contimeout: OpenSSH's own default connect timeout applies.
-        assert!(!args.iter().any(|arg| arg == "ConnectTimeout=10"));
+        assert_eq!(&args[..2], [OsString::from("-l"), OsString::from("alice")]);
+    }
+
+    #[test]
+    fn launcher_defers_configuration_to_openssh() {
+        let target = SshTarget::new("gh", None);
+        let args = ssh_arguments(&target, &SshLaunchOptions::default());
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        // Port, identities, jump hosts, control masters, and compression all
+        // come from the user's ssh_config; sy must not reconstruct them.
+        for reconstructed in ["-p", "-i", "-J", "-C", "-o", "-l"] {
+            assert!(
+                !rendered.iter().any(|arg| arg == reconstructed),
+                "{reconstructed} must not be synthesized from ssh_config"
+            );
+        }
+        // No remote root on argv: roots are protocol data.
+        assert!(!rendered.iter().any(|arg| arg.contains("/remote/root")));
+        // No user: OpenSSH applies the alias's own User= (or the local user).
+        assert_eq!(rendered, vec!["gh", "sy", "__serve"]);
     }
 
     #[test]
     fn contimeout_maps_to_openssh_connect_timeout() {
-        let config = SshConfig {
-            hostname: "host.example".to_string(),
-            ..Default::default()
-        };
+        let target = SshTarget::new("host.example", None);
         let launch = SshLaunchOptions {
             connect_timeout: Some(10),
         };
-        let args = ssh_arguments(&config, &launch);
+        let args = ssh_arguments(&target, &launch);
         let options: Vec<String> = args
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let index = options
-            .iter()
-            .position(|arg| arg == "-o")
-            .expect("ConnectTimeout must be passed as an -o option");
-        assert_eq!(options[index + 1], "ConnectTimeout=10");
+        assert_eq!(
+            options,
+            vec!["-o", "ConnectTimeout=10", "host.example", "sy", "__serve"]
+        );
     }
 }

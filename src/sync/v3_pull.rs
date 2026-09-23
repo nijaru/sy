@@ -65,7 +65,9 @@ pub(super) async fn run(
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
     let started = Instant::now();
-    let ssh_config = crate::sync::v3_push::resolve_v3_ssh_config(host, user)?;
+    // OpenSSH resolves this alias with the user's own ssh_config; only an
+    // explicit `user@` from the command line overrides it.
+    let target = sy::ssh::SshTarget::new(host, user.clone());
     let router_config = RouterConfig {
         // --bwlimit paces the pull at the client's staging write (see
         // fetch_file); the router's outbound limiter stays off so control
@@ -84,7 +86,7 @@ pub(super) async fn run(
     // source path fails loudly instead of scanning an empty new tree.
     let source_root_path = std::path::PathBuf::from(source_root);
     let session = SshRemoteSession::connect_with_options(
-        &ssh_config,
+        &target,
         Operation::Pull,
         &source_root_path,
         router_config,

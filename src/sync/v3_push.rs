@@ -40,7 +40,9 @@ pub(super) async fn run(
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
     let started = Instant::now();
-    let ssh_config = resolve_v3_ssh_config(host, user)?;
+    // OpenSSH resolves this alias with the user's own ssh_config; only an
+    // explicit `user@` from the command line overrides it.
+    let target = sy::ssh::SshTarget::new(host, user.clone());
     let router_config = RouterConfig {
         // --bwlimit paces outbound file-content bytes in the router writer; all
         // other frame kinds bypass the limiter so control traffic never waits
@@ -56,7 +58,7 @@ pub(super) async fn run(
         connect_timeout: config.contimeout,
     };
     let session = SshRemoteSession::connect_with_options(
-        &ssh_config,
+        &target,
         Operation::Push,
         destination_root,
         router_config,
@@ -70,22 +72,6 @@ pub(super) async fn run(
         execute_with_handle(source_root, &destination_root, remote, config, scan_options).await?;
     stats.duration = started.elapsed();
     Ok(stats)
-}
-
-pub(super) fn resolve_v3_ssh_config(
-    host: &str,
-    user: &Option<String>,
-) -> Result<sy::ssh::config::SshConfig> {
-    if let Some(user) = user {
-        Ok(sy::ssh::config::SshConfig {
-            hostname: host.to_string(),
-            user: user.clone(),
-            ..Default::default()
-        })
-    } else {
-        sy::ssh::config::parse_ssh_config(host)
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))
-    }
 }
 
 struct SourceFilterSelection {
