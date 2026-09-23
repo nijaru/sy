@@ -604,8 +604,7 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     // Run sync (single file or directory)
-    // Bidirectional sync was removed before 0.5 (see the engine::bisync core
-    // for its future foundation). Unidirectional sync only.
+    // Bidirectional sync was removed before 0.5; unidirectional sync only.
     let stats = if source.is_local() && destination.is_remote() {
         // Use SyncSession for local → remote SSH push
         if !cli.quiet && !cli.json {

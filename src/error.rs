@@ -129,9 +129,6 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("Database error: {0}\nCheck that the destination directory is writable.")]
-    Database(String),
-
     #[error("Data corruption detected: {path}\nBlock {block_number} checksum mismatch after write.\nExpected: {expected_checksum}\nActual: {actual_checksum}\nThis indicates storage or memory corruption. The transfer has been aborted.")]
     BlockCorruption {
         path: PathBuf,
@@ -139,18 +136,6 @@ pub enum SyncError {
         expected_checksum: String,
         actual_checksum: String,
     },
-}
-
-impl From<bincode::Error> for SyncError {
-    fn from(err: bincode::Error) -> Self {
-        SyncError::Database(err.to_string())
-    }
-}
-
-impl From<fjall::Error> for SyncError {
-    fn from(err: fjall::Error) -> Self {
-        SyncError::Database(err.to_string())
-    }
 }
 
 impl SyncError {

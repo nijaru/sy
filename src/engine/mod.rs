@@ -1,6 +1,3 @@
-pub mod bisync;
-pub mod bisync_state;
-pub mod bisync_store;
 pub mod compression;
 #[doc(hidden)]
 pub mod delete_journal;
