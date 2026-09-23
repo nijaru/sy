@@ -10,7 +10,6 @@ mod integrity;
 mod path;
 mod perf;
 mod resource;
-mod retry;
 mod sparse;
 mod sync;
 mod temp_file;
@@ -389,14 +388,6 @@ Or install from local source with: cargo install --path . --features acl"#
     #[cfg(not(target_os = "macos"))]
     if cli.preserve_flags {
         anyhow::bail!("BSD flag preservation is only supported on macOS");
-    }
-
-    // Warn about unimplemented flags
-    if cli.stream {
-        eprintln!("Warning: --stream is not yet implemented");
-    }
-    if cli.retry > 0 {
-        eprintln!("Warning: --retry is not yet wired (SSH has internal retry only)");
     }
 
     let config = sync::SyncConfig {
