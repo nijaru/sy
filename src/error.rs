@@ -39,6 +39,15 @@ pub enum SyncError {
     },
 
     #[error(
+        "Unsupported type transition: '{path}' changes entry kind ({source_kind:?} over {destination_kind:?})\nTransactional directory replacement is not implemented; the destination was left unchanged."
+    )]
+    UnsupportedTypeTransition {
+        path: PathBuf,
+        source_kind: String,
+        destination_kind: String,
+    },
+
+    #[error(
         "Preservation conflict: {path} ended with mode {actual:#o} after applying its ACL (expected {expected:#o})"
     )]
     PreservationConflict {

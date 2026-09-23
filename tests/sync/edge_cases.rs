@@ -625,6 +625,33 @@ fn test_symlink_to_file_delta() {
 }
 
 #[test]
+fn test_type_transition_with_directory_is_refused_before_mutation() {
+    let (source, dest) = setup_test_dir();
+    // Source has `swap` as a directory; the destination has it as a file.
+    fs::create_dir(source.path().join("swap")).unwrap();
+    fs::write(source.path().join("swap/child"), b"child").unwrap();
+    fs::write(dest.path().join("swap"), b"keep me").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("type transition"),
+        "expected a type transition error, got: {stderr}"
+    );
+    // The whole preflight refuses: the destination is untouched.
+    assert_eq!(
+        fs::read_to_string(dest.path().join("swap")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn test_case_collision_preflight_on_case_insensitive_target() {
     let (source, dest) = setup_test_dir();
     fs::write(source.path().join("case_test.txt"), "source content").unwrap();

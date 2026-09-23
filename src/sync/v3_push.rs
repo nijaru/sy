@@ -590,6 +590,18 @@ pub(super) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             _ => {}
         }
     }
+    if let RemotePushControllerError::UnsupportedTypeTransition {
+        path,
+        source_kind,
+        destination_kind,
+    } = &error
+    {
+        return SyncError::UnsupportedTypeTransition {
+            path: path.as_path().to_path_buf(),
+            source_kind: format!("{source_kind:?}"),
+            destination_kind: format!("{destination_kind:?}"),
+        };
+    }
     map_io(error)
 }
 
