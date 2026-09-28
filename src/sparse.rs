@@ -2,6 +2,7 @@
 ///
 /// This module provides functions for detecting and working with sparse files
 /// (files with holes). It supports both local and remote (SSH) sparse file transfers.
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
 use std::path::Path;

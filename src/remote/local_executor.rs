@@ -354,7 +354,7 @@ impl LocalSyncExecutor {
                     .await
                     .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
             }
-            tokio::fs::symlink(&target, &backup)
+            create_symlink_preserving(&target, &backup)
                 .await
                 .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
             return Ok(());
@@ -394,7 +394,7 @@ impl LocalSyncExecutor {
             let target = tokio::fs::read_link(&source)
                 .await
                 .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-            tokio::fs::symlink(&target, &backup)
+            create_symlink_preserving(&target, &backup)
                 .await
                 .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
             tokio::fs::remove_file(&source)
@@ -761,7 +761,7 @@ impl LocalSyncExecutor {
         }
         let temp = crate::temp_file::TempFileGuard::temp_path_for(&dest);
         let guard = crate::temp_file::TempFileGuard::new(&temp);
-        tokio::fs::symlink(target, &temp)
+        create_symlink_preserving(target, &temp)
             .await
             .map_err(|error| LocalSyncError::Destination(temp.clone(), error))?;
         tokio::fs::rename(&temp, &dest)
@@ -1344,6 +1344,26 @@ fn metadata_work(
         unix_mode,
         modified,
     })
+}
+
+/// Create a symbolic link at `dest` pointing at `target` without resolving it.
+///
+/// Windows needs a target-kind-specific API and the preserved link target may
+/// not exist here, so symlink preservation stays Unix-only until a Windows
+/// reparse-point design lands.
+async fn create_symlink_preserving(target: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(target, dest).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink preservation is not implemented on this platform",
+        ))
+    }
 }
 
 #[cfg(test)]
