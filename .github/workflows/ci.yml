@@ -91,6 +91,20 @@ jobs:
           "$BIN" "$work/source" "$work/copy"
           test "$(cat "$work/copy")" = "static smoke"
 
+  windows-check:
+    name: Windows compile surface
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      # Windows is a compile-tested surface only: the engine refuses sync
+      # there until rooted handle/reparse confinement exists. This gate keeps
+      # the refusal honest instead of letting the platform silently rot.
+      - run: cargo check --all-features
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
