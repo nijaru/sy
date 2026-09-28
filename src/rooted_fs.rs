@@ -7,7 +7,9 @@ mod acl_macos;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
 use std::ffi::OsString;
 use std::fs::File;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(unix)]

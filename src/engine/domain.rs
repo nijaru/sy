@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};

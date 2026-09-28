@@ -1008,7 +1008,9 @@ impl RemotePushExecutor {
             return Ok(());
         }
         let path = self.source_root.join(source.path.as_path());
-        let metadata = tokio::fs::symlink_metadata(&path).await?;
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|_| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
         if metadata.is_dir() {
             return Ok(());
         }
