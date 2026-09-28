@@ -1,5 +1,6 @@
 use crate::endpoint::{
-    BoxReader, Capabilities, Endpoint, EndpointType, FileMetadata, StagedWriter,
+    BoxReader, Capabilities, Endpoint, EndpointType, ExpectedDestination, FileMetadata,
+    StagedWriter,
 };
 use crate::error::{Result, SyncError};
 use async_trait::async_trait;
@@ -52,10 +53,93 @@ struct LocalStagedWriter {
     temp_path: PathBuf,
     final_path: PathBuf,
     guard: Option<crate::temp_file::TempFileGuard>,
+    expected_destination: ExpectedDestination,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DestinationObservation {
+    Absent,
+    Identified(sy::engine::domain::EntryIdentity),
+    Unidentified,
+}
+
+async fn observe_destination(path: &Path) -> Result<DestinationObservation> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(
+            match crate::endpoint::local_identity::identity_for_metadata(&metadata) {
+                Some(identity) => DestinationObservation::Identified(identity),
+                None => DestinationObservation::Unidentified,
+            },
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DestinationObservation::Absent)
+        }
+        Err(error) => Err(SyncError::Io(error)),
+    }
+}
+
+fn expected_destination_at_open(
+    path: &Path,
+    expectation: ExpectedDestination,
+    observed: DestinationObservation,
+) -> Result<ExpectedDestination> {
+    match (expectation, observed) {
+        (ExpectedDestination::Absent, DestinationObservation::Absent) => {
+            Ok(ExpectedDestination::Absent)
+        }
+        (ExpectedDestination::Absent, _) => Err(SyncError::DestinationChanged {
+            path: path.to_path_buf(),
+        }),
+        (ExpectedDestination::Unchanged(expected), DestinationObservation::Identified(actual))
+            if expected == actual =>
+        {
+            Ok(ExpectedDestination::Unchanged(expected))
+        }
+        (ExpectedDestination::Unchanged(_), _) => Err(SyncError::DestinationChanged {
+            path: path.to_path_buf(),
+        }),
+        (ExpectedDestination::SnapshotAtOpen, DestinationObservation::Absent) => {
+            Ok(ExpectedDestination::Absent)
+        }
+        (ExpectedDestination::SnapshotAtOpen, DestinationObservation::Identified(identity)) => {
+            Ok(ExpectedDestination::Unchanged(identity))
+        }
+        (ExpectedDestination::SnapshotAtOpen, DestinationObservation::Unidentified)
+        | (ExpectedDestination::Unverified, _) => Ok(ExpectedDestination::Unverified),
+    }
+}
+
+pub(crate) async fn capture_destination_expectation(
+    path: &Path,
+    expectation: ExpectedDestination,
+) -> Result<ExpectedDestination> {
+    let observed = observe_destination(path).await?;
+    expected_destination_at_open(path, expectation, observed)
+}
+
+pub(crate) async fn verify_destination_expectation(
+    path: &Path,
+    expectation: ExpectedDestination,
+) -> Result<()> {
+    let observed = observe_destination(path).await?;
+    match (expectation, observed) {
+        (ExpectedDestination::Absent, DestinationObservation::Absent)
+        | (ExpectedDestination::Unverified, _) => Ok(()),
+        (ExpectedDestination::Unchanged(expected), DestinationObservation::Identified(actual))
+            if expected == actual =>
+        {
+            Ok(())
+        }
+        _ => Err(SyncError::DestinationChanged {
+            path: path.to_path_buf(),
+        }),
+    }
 }
 
 impl LocalStagedWriter {
-    async fn new(final_path: PathBuf) -> Result<Self> {
+    async fn new(final_path: PathBuf, expectation: ExpectedDestination) -> Result<Self> {
+        let expected_destination =
+            capture_destination_expectation(&final_path, expectation).await?;
         if let Some(parent) = final_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -73,6 +157,7 @@ impl LocalStagedWriter {
             temp_path,
             final_path,
             guard: Some(guard),
+            expected_destination,
         })
     }
 
@@ -252,6 +337,7 @@ impl StagedWriter for LocalStagedWriter {
             file.flush().await?;
             drop(file);
         }
+        verify_destination_expectation(&self.final_path, self.expected_destination).await?;
         tokio::fs::rename(&self.temp_path, &self.final_path).await?;
         if let Some(guard) = self.guard.take() {
             guard.defuse();
@@ -481,8 +567,14 @@ impl Endpoint for LocalEndpoint {
         Ok(Box::pin(file))
     }
 
-    async fn begin_write(&self, path: &Path) -> Result<Box<dyn StagedWriter>> {
-        Ok(Box::new(LocalStagedWriter::new(self.resolve(path)).await?))
+    async fn begin_write(
+        &self,
+        path: &Path,
+        expected_destination: ExpectedDestination,
+    ) -> Result<Box<dyn StagedWriter>> {
+        Ok(Box::new(
+            LocalStagedWriter::new(self.resolve(path), expected_destination).await?,
+        ))
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
@@ -569,7 +661,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
         writer.write(b"new").await.unwrap();
         writer.abort().await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
@@ -579,7 +674,10 @@ mod tests {
     async fn staged_hash_reads_uncommitted_bytes() {
         let dir = TempDir::new().unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
         writer.write(b"content").await.unwrap();
         let hash = writer.staged_hash().await.unwrap().unwrap();
         assert_eq!(hash, blake3::hash(b"content"));
@@ -592,11 +690,62 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-        let mut writer = endpoint.begin_write(Path::new("file")).await.unwrap();
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
         writer.write(b"content").await.unwrap();
         writer.set_metadata(&make_meta()).await.unwrap();
         writer.commit().await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn staged_commit_preserves_a_concurrent_destination_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"scanned").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let identity = crate::endpoint::local_identity::identity_for_metadata(&metadata).unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Unchanged(identity))
+            .await
+            .unwrap();
+        writer.write(b"replacement").await.unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"concurrent edit").unwrap();
+        let error = match writer.commit().await {
+            Ok(()) => panic!("concurrent destination replacement must abort"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"concurrent edit");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn staged_create_refuses_a_destination_appearing_before_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("file");
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"staged").await.unwrap();
+
+        fs::write(&path, b"concurrent create").unwrap();
+        let error = match writer.commit().await {
+            Ok(()) => panic!("a path appearing after scan must abort"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"concurrent create");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
