@@ -425,7 +425,7 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 
 #[cfg(not(unix))]
 fn expand_tilde(path: PathBuf) -> PathBuf {
-    let value = path.to_string_lossy();
+    let value = path.to_string_lossy().into_owned();
     if value == "~" {
         dirs::home_dir().unwrap_or(path)
     } else if let Some(rest) = value
