@@ -3,6 +3,7 @@ use crate::error::{Result, SyncError};
 use async_trait::async_trait;
 use std::path::Path;
 use std::pin::Pin;
+use sy::engine::domain::EntryIdentity;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// A streaming reader returned by an endpoint.
@@ -36,6 +37,19 @@ impl Preservation {
     pub const fn is_empty(&self) -> bool {
         self.xattrs.is_none() && self.acl.is_none()
     }
+}
+
+/// Destination state a staged write must still observe at commit.
+#[derive(Debug, Clone, Copy)]
+pub enum ExpectedDestination {
+    /// A create: the destination path must remain absent through commit.
+    Absent,
+    /// An update: the destination must still carry the scanned identity.
+    Unchanged(EntryIdentity),
+    /// Capture the current destination identity when staging begins.
+    SnapshotAtOpen,
+    /// No scan observation exists; destination race checks are skipped.
+    Unverified,
 }
 
 /// Verify the staged file's effective mode after preservation application.
@@ -85,10 +99,12 @@ impl FileMetadata {
 
 /// Transactional destination write.
 ///
-/// Implementations write into endpoint-private staging state. `commit` makes
-/// the staged object visible at the destination path; dropping or aborting a
-/// writer must leave the previous destination intact whenever the endpoint can
-/// provide atomic replacement semantics.
+/// Implementations write into endpoint-private staging state. The writer must
+/// honor the `ExpectedDestination` passed to `Endpoint::begin_write` both when
+/// staging begins and immediately before commit. `commit` makes the staged
+/// object visible at the destination path; dropping or aborting a writer must
+/// leave the previous destination intact whenever the endpoint can provide
+/// atomic replacement semantics.
 #[async_trait]
 pub trait StagedWriter: Send {
     async fn write(&mut self, data: &[u8]) -> Result<()>;
@@ -132,12 +148,15 @@ pub struct StreamCopyResult {
 pub struct StreamCopyPolicy<'a> {
     /// Hash bytes as they flow and verify the staged result before commit.
     pub verify: bool,
+    /// Destination state required at staging and again at commit.
+    pub expected_destination: ExpectedDestination,
     /// Shared `--bwlimit` pacing applied at the userspace byte stream.
     pub rate_limiter:
         Option<&'a std::sync::Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
     /// Preservation payload applied to staging before commit.
     pub preservation: &'a Preservation,
-    /// Last-moment validation (source/destination race checks) before commit.
+    /// Last-moment source race validation before commit. The staged writer
+    /// validates its expected destination state itself.
     pub pre_commit: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
 }
 
@@ -153,8 +172,9 @@ pub struct StreamCopyPolicy<'a> {
 /// entirely when a limit is set).
 ///
 /// `policy.pre_commit` runs after all bytes and preservation are staged and
-/// immediately before the endpoint commit — the transfer layer's last chance
-/// to validate source/destination race expectations. An error aborts staging.
+/// immediately before the endpoint commit to validate source state. The
+/// writer independently validates its expected destination state at commit.
+/// Any error aborts staging.
 pub async fn copy_file_streaming(
     source: &dyn Endpoint,
     source_path: &Path,
@@ -166,7 +186,9 @@ pub async fn copy_file_streaming(
 
     let metadata = source.metadata(source_path).await?;
     let mut reader = source.open_reader(source_path).await?;
-    let mut writer = dest.begin_write(dest_path).await?;
+    let mut writer = dest
+        .begin_write(dest_path, policy.expected_destination)
+        .await?;
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut hasher = policy.verify.then(blake3::Hasher::new);
     let mut bytes_written = 0_u64;

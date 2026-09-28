@@ -356,6 +356,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pull_preserves_a_concurrent_destination_edit() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("file"), b"source content").unwrap();
+        std::fs::write(destination_root.path().join("file"), b"old").unwrap();
+        let raced_destination = destination_root.path().join("file");
+        let server_raced_destination = raced_destination.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::FileFetch(incoming) => {
+                        // The client has already opened staging and pinned the
+                        // scanned destination expectation before requesting bytes.
+                        std::fs::write(&server_raced_destination, b"concurrent edit").unwrap();
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _other => panic!("unexpected v3 pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let error = execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &supported_config(),
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        server.await.unwrap();
+        assert!(error
+            .to_string()
+            .contains("Destination changed during transfer"));
+        assert_eq!(
+            std::fs::read(&raced_destination).unwrap(),
+            b"concurrent edit"
+        );
+        assert_eq!(
+            std::fs::read_dir(destination_root.path()).unwrap().count(),
+            1
+        );
+    }
+
     /// -X/--preserve-xattrs over v3 pull: the remote source's attributes are
     /// read through the pinned root and mirrored onto the local destination
     /// after the staged commit.

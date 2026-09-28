@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub use io::{BoxReader, StagedWriter};
+pub use io::{BoxReader, ExpectedDestination, StagedWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
@@ -260,11 +260,18 @@ pub trait Endpoint: Send + Sync {
         )))
     }
 
-    /// Begin a transactional incremental write.
+    /// Begin a transactional incremental write against the scanned destination
+    /// state. Implementations must reject a mismatch before staging and recheck
+    /// the expectation immediately before commit. A separate stat and rename
+    /// remain weaker than an atomic compare-and-swap against hostile writers.
     ///
     /// The returned writer owns staging state. `commit` is the only operation
     /// that may make the new object visible at `path`.
-    async fn begin_write(&self, path: &Path) -> Result<Box<dyn StagedWriter>> {
+    async fn begin_write(
+        &self,
+        path: &Path,
+        _expected_destination: io::ExpectedDestination,
+    ) -> Result<Box<dyn StagedWriter>> {
         Err(SyncError::Config(format!(
             "{:?} endpoint does not implement staged writes for {}",
             self.endpoint_type(),

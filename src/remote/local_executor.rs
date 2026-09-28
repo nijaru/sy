@@ -696,9 +696,9 @@ impl LocalSyncExecutor {
                     destination: match destination {
                         Some(destination) => destination
                             .identity
-                            .map(crate::endpoint::transfer::ExpectedDestination::Unchanged)
-                            .unwrap_or(crate::endpoint::transfer::ExpectedDestination::Unverified),
-                        None => crate::endpoint::transfer::ExpectedDestination::Absent,
+                            .map(crate::endpoint::io::ExpectedDestination::Unchanged)
+                            .unwrap_or(crate::endpoint::io::ExpectedDestination::Unverified),
+                        None => crate::endpoint::io::ExpectedDestination::Absent,
                     },
                 },
                 preservation,

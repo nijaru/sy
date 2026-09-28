@@ -6,7 +6,7 @@
 //! reduces physical writes; non-COW local files use a normal whole-file copy.
 
 use crate::endpoint::io::{
-    copy_file_streaming, Preservation, StreamCopyPolicy, VerificationStatus,
+    copy_file_streaming, ExpectedDestination, Preservation, StreamCopyPolicy, VerificationStatus,
 };
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
@@ -67,21 +67,6 @@ pub enum SourceExpectation {
     SnapshotAtOpen,
     /// No observation is available; source race checks are skipped and the
     /// weaker guarantee is the caller's documented limitation.
-    Unverified,
-}
-
-/// Destination state the commit must still observe.
-#[derive(Debug, Clone, Copy)]
-pub enum ExpectedDestination {
-    /// A create: the destination path must remain absent through commit.
-    Absent,
-    /// An update: the destination must still carry the scanned identity, so a
-    /// concurrent edit is never silently overwritten.
-    Unchanged(EntryIdentity),
-    /// No scan observation exists (single-file copy): capture the identity at
-    /// transfer start and require it unchanged at commit.
-    SnapshotAtOpen,
-    /// No observation is available; destination race checks are skipped.
     Unverified,
 }
 
@@ -249,11 +234,9 @@ impl CommitChecks {
         })
     }
 
-    /// Prove the scanned (or snapshot) state still holds.
-    ///
-    /// Runs at transfer start (closing the scan-to-open window) and again
-    /// immediately before the visible commit (closing the read window).
-    fn verify(&self, checkpoint: CheckPoint) -> Result<()> {
+    /// Prove the source observation still holds. The test hook runs at the
+    /// final check so destination mutations are caught by the staged writer.
+    fn verify_source(&self, checkpoint: CheckPoint) -> Result<()> {
         if checkpoint == CheckPoint::Commit {
             if let Some(hook) = &self.test_hook {
                 hook();
@@ -268,6 +251,10 @@ impl CommitChecks {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn verify_destination(&self) -> Result<()> {
         match &self.destination {
             DestinationCheck::Absent(path) => {
                 if observe(path, false)? != Observation::Missing {
@@ -282,6 +269,21 @@ impl CommitChecks {
             DestinationCheck::Unverified => {}
         }
         Ok(())
+    }
+
+    fn expected_destination(&self) -> ExpectedDestination {
+        match self.destination {
+            DestinationCheck::Absent(_) => ExpectedDestination::Absent,
+            DestinationCheck::Unchanged { identity, .. } => {
+                ExpectedDestination::Unchanged(identity)
+            }
+            DestinationCheck::Unverified => ExpectedDestination::Unverified,
+        }
+    }
+
+    fn verify(&self, checkpoint: CheckPoint) -> Result<()> {
+        self.verify_source(checkpoint)?;
+        self.verify_destination()
     }
 }
 
@@ -368,6 +370,7 @@ async fn transfer_file_inner(
     )?;
     // Close the scan-to-open window before any staging work begins.
     checks.verify(CheckPoint::Open)?;
+    let expected_destination = checks.expected_destination();
 
     let native_pair = if options.rate_limiter.is_none() {
         (source_native, dest_native)
@@ -457,9 +460,10 @@ async fn transfer_file_inner(
             dest_path,
             &StreamCopyPolicy {
                 verify: options.verify,
+                expected_destination,
                 rate_limiter: options.rate_limiter.as_ref(),
                 preservation: &options.preservation,
-                pre_commit: Some(&|| checks.verify(CheckPoint::Commit)),
+                pre_commit: Some(&|| checks.verify_source(CheckPoint::Commit)),
             },
         )
         .await?;

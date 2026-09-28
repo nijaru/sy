@@ -240,9 +240,9 @@ impl SyncSession {
                     // transfer start so mid-transfer edits still abort.
                     source: crate::endpoint::transfer::SourceExpectation::SnapshotAtOpen,
                     destination: if existed {
-                        crate::endpoint::transfer::ExpectedDestination::SnapshotAtOpen
+                        crate::endpoint::io::ExpectedDestination::SnapshotAtOpen
                     } else {
-                        crate::endpoint::transfer::ExpectedDestination::Absent
+                        crate::endpoint::io::ExpectedDestination::Absent
                     },
                 },
                 preservation: crate::endpoint::io::Preservation::default(),

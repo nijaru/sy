@@ -12,7 +12,7 @@
 //! supports it, but the safety-critical ordering — complete preflight, then
 //! main work, then reverse-order deletes, then finalize — must land first.
 
-use crate::endpoint::io::StagedWriter;
+use crate::endpoint::io::{ExpectedDestination, StagedWriter};
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::engine::compression::CompressionPolicy;
@@ -60,6 +60,12 @@ pub enum RemotePullError {
     #[error("regular-file pull requires Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
 
+    #[error("pull destination lacks a scan-time identity for {0}")]
+    MissingDestinationIdentity(PathBuf),
+
+    #[error(transparent)]
+    Endpoint(#[from] crate::error::SyncError),
+
     #[error("transactional type replacement is not implemented for directory transition at {0}")]
     TransactionalDirectoryReplace(PathBuf),
 
@@ -74,6 +80,18 @@ pub enum RemotePullError {
 }
 
 pub type Result<T> = std::result::Result<T, RemotePullError>;
+
+fn destination_expectation(destination: Option<&Entry>) -> Result<ExpectedDestination> {
+    match destination {
+        None => Ok(ExpectedDestination::Absent),
+        Some(entry) => entry
+            .identity
+            .map(ExpectedDestination::Unchanged)
+            .ok_or_else(|| {
+                RemotePullError::MissingDestinationIdentity(entry.path.as_path().to_path_buf())
+            }),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum RemotePullAction {
@@ -294,6 +312,7 @@ impl RemotePullExecutor {
                     }
                 }
                 let is_update = destination.is_some();
+                let expected_destination = destination_expectation(destination.as_ref())?;
                 // Read the remote source attributes before any local mutation
                 // (backup or fetch) so a source metadata failure cannot leave
                 // a half-mutated destination.
@@ -322,6 +341,7 @@ impl RemotePullExecutor {
                 let summary = self
                     .fetch_into_staging(
                         &source,
+                        expected_destination,
                         &metadata,
                         &crate::endpoint::io::Preservation { xattrs, acl: acls },
                     )
@@ -404,6 +424,7 @@ impl RemotePullExecutor {
         metadata: PullTransferMetadata,
         group: [u8; 32],
     ) -> Result<Option<crate::remote::transfer::TransferSummary>> {
+        let expected_destination = destination_expectation(destination.as_ref())?;
         let mut groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(&group).cloned() {
             let is_update = destination.is_some();
@@ -424,7 +445,7 @@ impl RemotePullExecutor {
             }
             let first_abs = self.dest_path(&first);
             let dest_abs = self.dest_path(&source.path);
-            link_local_file(&first_abs, &dest_abs).await?;
+            link_local_file(&first_abs, &dest_abs, expected_destination).await?;
             if let Some(mode) = metadata.unix_mode {
                 set_local_mode(&dest_abs, mode).await?;
             }
@@ -465,6 +486,7 @@ impl RemotePullExecutor {
         let summary = self
             .fetch_into_staging(
                 &source,
+                expected_destination,
                 &metadata,
                 &crate::endpoint::io::Preservation { xattrs, acl: acls },
             )
@@ -493,18 +515,15 @@ impl RemotePullExecutor {
     async fn fetch_into_staging(
         &self,
         source: &Entry,
+        expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
         preservation: &crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let endpoint = LocalEndpoint::new(self.destination_root.clone());
         let mut staged = endpoint
-            .begin_write(source.path.as_path())
-            .await
-            .map_err(|error| {
-                let message = error.to_string();
-                RemotePullError::LocalMutation(dest.clone(), std::io::Error::other(message))
-            })?;
+            .begin_write(source.path.as_path(), expected_destination)
+            .await?;
         let summary = fetch_file(
             &self.sender,
             source,
@@ -527,17 +546,8 @@ impl RemotePullExecutor {
             )
         })?;
         set_staged_metadata(staged.as_mut(), mode, metadata.modified).await?;
-        staged
-            .apply_preservation(preservation, Some(mode))
-            .await
-            .map_err(|error| {
-                let message = error.to_string();
-                RemotePullError::LocalMutation(dest.clone(), std::io::Error::other(message))
-            })?;
-        staged.commit().await.map_err(|error| {
-            let message = error.to_string();
-            RemotePullError::LocalMutation(dest, std::io::Error::other(message))
-        })?;
+        staged.apply_preservation(preservation, Some(mode)).await?;
+        staged.commit().await?;
         Ok(summary)
     }
 
@@ -768,15 +778,19 @@ async fn copy_local_backup(
     Ok(())
 }
 
-/// Stage a symlink beside the destination and rename it into place so a
-/// link-over-file (or link-over-link) replacement is atomic.
-/// Atomically link `dest` to the existing `first` inode (`-H`): stage the
-/// link under a temporary name in the held destination parent, then rename
-/// over the destination. Replacing a directory fails loudly; a file or
-/// symlink is replaced atomically.
-async fn link_local_file(first: &Path, dest: &Path) -> Result<()> {
+/// Stage a hardlink beside the destination and replace it only if the scanned
+/// destination state still holds. The final stat/rename pair is not an atomic
+/// compare-and-swap against arbitrary concurrent writers.
+async fn link_local_file(
+    first: &Path,
+    dest: &Path,
+    expected_destination: ExpectedDestination,
+) -> Result<()> {
     #[cfg(unix)]
     {
+        let expected_destination =
+            crate::endpoint::local::capture_destination_expectation(dest, expected_destination)
+                .await?;
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -787,6 +801,7 @@ async fn link_local_file(first: &Path, dest: &Path) -> Result<()> {
         tokio::fs::hard_link(first, &temp)
             .await
             .map_err(|error| RemotePullError::LocalMutation(temp.clone(), error))?;
+        crate::endpoint::local::verify_destination_expectation(dest, expected_destination).await?;
         tokio::fs::rename(&temp, dest)
             .await
             .map_err(|error| RemotePullError::LocalMutation(dest.to_path_buf(), error))?;
@@ -795,7 +810,7 @@ async fn link_local_file(first: &Path, dest: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (first, dest);
+        let _ = (first, expected_destination);
         Err(RemotePullError::LocalMutation(
             dest.to_path_buf(),
             std::io::Error::other("hardlink preservation is not supported on this platform"),
