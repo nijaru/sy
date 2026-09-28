@@ -514,13 +514,7 @@ impl RemotePullExecutor {
             self.rate_limiter.as_ref(),
         )
         .await?;
-        if self.compression.is_some()
-            && !self
-                .remote
-                .ready()
-                .capabilities
-                .contains(crate::protocol::CapabilitySet::ZSTD)
-        {
+        if self.compression.is_some() && !self.remote.capabilities().zstd {
             return Err(RemotePullError::Remote(RemoteSessionError::PeerLacksZstd));
         }
         // Staging is private at 0600; commit applies the final metadata. A

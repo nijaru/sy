@@ -4,11 +4,12 @@ use super::mutation::{
     request_replace_symlink,
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
+use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{CapabilitySet, FrameKind, Operation, PlatformOs, SessionReady};
+use crate::protocol::{FrameKind, Operation, PlatformOs};
 use crate::remote::hash::{request_content_hash, require_blake3};
 use crate::remote::router::RouterSender;
 use crate::remote::scan::request_scan;
@@ -37,7 +38,8 @@ use std::path::{Path, PathBuf};
 pub struct ClientRemoteHandle {
     operation: Operation,
     peer: PlatformOs,
-    ready: SessionReady,
+    capabilities: EndpointCapabilities,
+    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
     sender: RouterSender,
 }
 
@@ -46,7 +48,8 @@ impl ClientRemoteSession {
         ClientRemoteHandle {
             operation: self.operation,
             peer: self.server.platform.os,
-            ready: self.ready,
+            capabilities: self.capabilities,
+            namespace_semantics: self.namespace_semantics,
             sender: self.router.sender(),
         }
     }
@@ -61,14 +64,16 @@ impl ClientRemoteHandle {
         self.peer
     }
 
-    pub const fn ready(&self) -> SessionReady {
-        self.ready
+    pub const fn capabilities(&self) -> &EndpointCapabilities {
+        &self.capabilities
     }
 
     /// Destination name-comparison semantics probed by the server for the
     /// negotiated root. `None` only when the negotiated protocol is 3.0.
-    pub fn namespace_semantics(&self) -> Option<crate::engine::namespace::NamespaceSemantics> {
-        self.ready.namespace_semantics.map(Into::into)
+    pub const fn namespace_semantics(
+        &self,
+    ) -> Option<crate::engine::namespace::NamespaceSemantics> {
+        self.namespace_semantics
     }
 
     /// The session's frame router sender. Executors open fetch streams
@@ -85,7 +90,7 @@ impl ClientRemoteHandle {
         &self,
         basis: &Entry,
     ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
-        require_blake3(self.ready.capabilities)?;
+        require_blake3(&self.capabilities)?;
         request_content_hash(&self.sender, basis, self.peer).await
     }
 
@@ -93,11 +98,7 @@ impl ClientRemoteHandle {
         &self,
         basis: &Entry,
     ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
-        if !self
-            .ready
-            .capabilities
-            .contains(CapabilitySet::ROLLING_SIGNATURES)
-        {
+        if !self.capabilities.rolling_signatures {
             return Err(RemoteSignatureError::UnsupportedByPeer);
         }
         if !basis.is_file() {
@@ -114,11 +115,7 @@ impl ClientRemoteHandle {
         basis: &Entry,
         limits: BasisIndexLimits,
     ) -> Result<Option<BasisIndex>> {
-        if !self
-            .ready
-            .capabilities
-            .contains(CapabilitySet::ROLLING_SIGNATURES)
-        {
+        if !self.capabilities.rolling_signatures {
             return Err(RemoteSignatureError::UnsupportedByPeer.into());
         }
         if !basis.is_file() {
@@ -213,7 +210,7 @@ impl ClientRemoteHandle {
         compression: Option<CompressionPolicy>,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        if compression.is_some() && !self.ready.capabilities.contains(CapabilitySet::ZSTD) {
+        if compression.is_some() && !self.capabilities.zstd {
             return Err(RemoteSessionError::PeerLacksZstd);
         }
         request_file_transfer_with_policy(

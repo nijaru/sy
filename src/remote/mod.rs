@@ -18,7 +18,7 @@ pub mod ssh;
 pub mod transfer;
 pub mod xattr;
 
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Capabilities as EndpointCapabilities, Endpoint};
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
@@ -66,7 +66,8 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 #[derive(Debug, Clone)]
 struct ClientSession {
     server: ServerHello,
-    ready: SessionReady,
+    capabilities: EndpointCapabilities,
+    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,8 +116,15 @@ where
     let frame = read_frame(reader).await?;
     expect_control(&frame, FrameKind::SessionReady)?;
     let ready = SessionReady::decode(frame.payload(), server.version)?;
+    let capabilities =
+        EndpointCapabilities::from_negotiated_wire(ready.capabilities, ready.modtime_precision_ns);
+    let namespace_semantics = ready.namespace_semantics.map(Into::into);
 
-    Ok(ClientSession { server, ready })
+    Ok(ClientSession {
+        server,
+        capabilities,
+        namespace_semantics,
+    })
 }
 
 /// Perform the server half of the v3 control-plane handshake and pin the
@@ -466,65 +474,53 @@ mod tests {
         assert_eq!(client.server.version, PROTOCOL_V3_1);
         // The client receives the probed root semantics, not an OS guess.
         assert_eq!(
-            client.ready.namespace_semantics,
-            Some(crate::fs_util::namespace_semantics(root.path()).into())
+            client.namespace_semantics,
+            Some(crate::fs_util::namespace_semantics(root.path()))
         );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
         assert_eq!(opened.rooted.root_path(), root.path());
-        assert!(client.ready.capabilities.contains(CapabilitySet::BLAKE3));
-        assert!(client.ready.capabilities.contains(CapabilitySet::RAW_PATHS));
-        assert!(client
-            .ready
-            .capabilities
-            .contains(CapabilitySet::MULTIPLEXING));
+        let capabilities = &client.capabilities;
+        assert!(capabilities.blake3);
+        assert!(capabilities.raw_paths);
+        assert!(capabilities.multiplexing);
         assert_eq!(
-            client
-                .ready
-                .capabilities
-                .contains(CapabilitySet::ROLLING_SIGNATURES),
+            capabilities.rolling_signatures,
             supports_rolling_signatures(Platform::current().os)
         );
         assert_eq!(
-            client
-                .ready
-                .capabilities
-                .contains(CapabilitySet::ATOMIC_REPLACE),
+            capabilities.atomic_rename,
             supports_staged_files(Platform::current().os)
         );
         assert_eq!(
-            client
-                .ready
-                .capabilities
-                .contains(CapabilitySet::STAGED_WRITE),
+            capabilities.staged_write,
             supports_staged_files(Platform::current().os)
         );
-        assert!(!client
-            .ready
-            .capabilities
-            .contains(CapabilitySet::RANDOM_READ));
-        assert!(!client
-            .ready
-            .capabilities
-            .contains(CapabilitySet::RANDOM_WRITE));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::REFLINK));
-        assert!(!client.ready.capabilities.contains(CapabilitySet::SPARSE));
         assert_eq!(
-            client.ready.capabilities.contains(CapabilitySet::XATTR),
+            capabilities.staged_verify,
+            supports_staged_files(Platform::current().os)
+        );
+        assert!(!capabilities.random_read);
+        assert!(!capabilities.random_write);
+        assert!(!capabilities.reflink);
+        assert!(!capabilities.sparse);
+        assert_eq!(
+            capabilities.preserve_xattrs,
             supports_xattrs(Platform::current().os)
         );
         assert_eq!(
-            client.ready.capabilities.contains(CapabilitySet::ACL),
+            capabilities.preserve_acls,
             acl_advertised_for(Platform::current().os),
         );
         assert_eq!(
-            client.ready.capabilities.contains(CapabilitySet::HARDLINK),
+            capabilities.preserve_hardlinks,
             supports_hardlinks(Platform::current().os)
         );
         assert_eq!(
-            client.ready.capabilities.contains(CapabilitySet::BSD_FLAGS),
+            capabilities.preserve_flags,
             supports_bsd_flags(Platform::current().os),
         );
+        assert!(capabilities.zstd);
     }
 
     #[test]

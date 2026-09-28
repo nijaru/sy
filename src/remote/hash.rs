@@ -1,8 +1,9 @@
 use crate::endpoint::local_identity::metadata_identity;
+use crate::endpoint::Capabilities;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
-    CapabilitySet, Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId,
-    WireHashRequest, WireHashResult, HASH_DIGEST_LEN,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireHashRequest,
+    WireHashResult, HASH_DIGEST_LEN,
 };
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
@@ -290,8 +291,8 @@ fn require_result_flags(frame: &Frame) -> Result<()> {
     }
 }
 
-pub fn require_blake3(capabilities: CapabilitySet) -> Result<()> {
-    if capabilities.contains(CapabilitySet::BLAKE3) {
+pub fn require_blake3(capabilities: &Capabilities) -> Result<()> {
+    if capabilities.blake3 {
         Ok(())
     } else {
         Err(RemoteHashError::UnsupportedByPeer)
