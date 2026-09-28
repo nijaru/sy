@@ -32,12 +32,12 @@ pub enum EndpointType {
     Gcs,
 }
 
-/// Operations an endpoint can perform efficiently and safely.
+/// Policy-facing endpoint and session capabilities.
 ///
-/// Transfer strategy selection is based on these capabilities rather than on
-/// endpoint-type branches. Endpoint type remains useful for diagnostics and
-/// protocol negotiation.
-#[derive(Debug, Clone)]
+/// Wire capability bits are translated into this semantic representation at
+/// negotiation, so transfer and executor policy do not depend on protocol
+/// encoding. Endpoint type remains useful for diagnostics, not feature tests.
+#[derive(Debug, Clone, Copy)]
 pub struct Capabilities {
     /// A staged object can atomically replace the destination path.
     pub atomic_rename: bool,
@@ -61,6 +61,16 @@ pub struct Capabilities {
     pub preserve_acls: bool,
     pub preserve_hardlinks: bool,
     pub preserve_flags: bool,
+    /// BLAKE3 content verification is available through this endpoint.
+    pub blake3: bool,
+    /// The endpoint can provide rolling block signatures for delta planning.
+    pub rolling_signatures: bool,
+    /// The endpoint participates in multiplexed requests.
+    pub multiplexing: bool,
+    /// Native path bytes can be represented without lossy conversion.
+    pub raw_paths: bool,
+    /// Compressed transfer frames are supported.
+    pub zstd: bool,
     pub modtime_precision: Duration,
 }
 
@@ -80,12 +90,51 @@ impl Default for Capabilities {
             preserve_acls: false,
             preserve_hardlinks: false,
             preserve_flags: false,
+            blake3: false,
+            rolling_signatures: false,
+            multiplexing: false,
+            raw_paths: false,
+            zstd: false,
             modtime_precision: Duration::ZERO,
         }
     }
 }
 
 impl Capabilities {
+    /// Translate negotiated v3 wire flags into endpoint semantics once, at
+    /// the protocol boundary. Transfer and executor code must not depend on
+    /// wire-level capability bits.
+    pub fn from_negotiated_wire(
+        wire: sy::protocol::CapabilitySet,
+        modtime_precision_ns: u64,
+    ) -> Self {
+        use sy::protocol::CapabilitySet as Wire;
+
+        let staged_write = wire.contains(Wire::STAGED_WRITE);
+        let blake3 = wire.contains(Wire::BLAKE3);
+        Self {
+            atomic_rename: wire.contains(Wire::ATOMIC_REPLACE),
+            streaming_read: true,
+            staged_write,
+            staged_verify: staged_write && blake3,
+            random_read: wire.contains(Wire::RANDOM_READ),
+            random_write: wire.contains(Wire::RANDOM_WRITE),
+            reflink: wire.contains(Wire::REFLINK),
+            sparse: wire.contains(Wire::SPARSE),
+            server_side_copy: false,
+            preserve_xattrs: wire.contains(Wire::XATTR),
+            preserve_acls: wire.contains(Wire::ACL),
+            preserve_hardlinks: wire.contains(Wire::HARDLINK),
+            preserve_flags: wire.contains(Wire::BSD_FLAGS),
+            blake3,
+            rolling_signatures: wire.contains(Wire::ROLLING_SIGNATURES),
+            multiplexing: wire.contains(Wire::MULTIPLEXING),
+            raw_paths: wire.contains(Wire::RAW_PATHS),
+            zstd: wire.contains(Wire::ZSTD),
+            modtime_precision: Duration::from_nanos(modtime_precision_ns),
+        }
+    }
+
     pub fn local() -> Self {
         Self {
             atomic_rename: true,
@@ -102,6 +151,11 @@ impl Capabilities {
             preserve_acls: cfg!(all(unix, feature = "acl")),
             preserve_hardlinks: true,
             preserve_flags: cfg!(target_os = "macos"),
+            blake3: true,
+            rolling_signatures: true,
+            multiplexing: false,
+            raw_paths: cfg!(unix),
+            zstd: true,
             modtime_precision: Duration::from_nanos(1),
         }
     }
@@ -222,4 +276,45 @@ pub trait Endpoint: Send + Sync {
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capabilities;
+    use std::time::Duration;
+    use sy::protocol::CapabilitySet;
+
+    #[test]
+    fn negotiated_wire_capabilities_map_to_endpoint_semantics() {
+        let wire = CapabilitySet::all();
+        let capabilities = Capabilities::from_negotiated_wire(wire, 17);
+
+        assert!(capabilities.atomic_rename);
+        assert!(capabilities.streaming_read);
+        assert!(capabilities.staged_write);
+        assert!(capabilities.staged_verify);
+        assert!(capabilities.random_read);
+        assert!(capabilities.random_write);
+        assert!(capabilities.reflink);
+        assert!(capabilities.sparse);
+        assert!(!capabilities.server_side_copy);
+        assert!(capabilities.preserve_xattrs);
+        assert!(capabilities.preserve_acls);
+        assert!(capabilities.preserve_hardlinks);
+        assert!(capabilities.preserve_flags);
+        assert!(capabilities.blake3);
+        assert!(capabilities.rolling_signatures);
+        assert!(capabilities.multiplexing);
+        assert!(capabilities.raw_paths);
+        assert!(capabilities.zstd);
+        assert_eq!(capabilities.modtime_precision, Duration::from_nanos(17));
+    }
+
+    #[test]
+    fn staged_verification_requires_staging_and_blake3() {
+        let capabilities = Capabilities::from_negotiated_wire(CapabilitySet::STAGED_WRITE, 0);
+        assert!(capabilities.staged_write);
+        assert!(!capabilities.staged_verify);
+        assert!(!capabilities.blake3);
+    }
 }

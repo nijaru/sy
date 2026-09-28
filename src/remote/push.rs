@@ -1,10 +1,10 @@
+use crate::endpoint::Capabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::WorkItem;
-use crate::protocol::CapabilitySet;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::bsdflags::{
     apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
@@ -1039,7 +1039,7 @@ impl RemotePushExecutor {
         let delta_index = if delta_candidate(
             &destination,
             self.delta_min_size,
-            self.remote.ready().capabilities,
+            self.remote.capabilities(),
         ) {
             self.remote
                 .delta_basis(&destination, self.delta_limits)
@@ -1129,11 +1129,11 @@ impl RemotePushExecutor {
     }
 }
 
-fn delta_candidate(destination: &Entry, minimum_size: u64, capabilities: CapabilitySet) -> bool {
+fn delta_candidate(destination: &Entry, minimum_size: u64, capabilities: &Capabilities) -> bool {
     destination.is_file()
         && destination.size >= minimum_size
         && destination.identity.is_some()
-        && capabilities.contains(CapabilitySet::ROLLING_SIGNATURES)
+        && capabilities.rolling_signatures
 }
 
 #[cfg(test)]
@@ -1279,20 +1279,25 @@ mod tests {
     #[test]
     fn delta_candidate_requires_size_identity_and_negotiated_support() {
         let destination = file("file", DEFAULT_REMOTE_DELTA_MIN_SIZE, 0o644);
+        let supported = Capabilities {
+            rolling_signatures: true,
+            ..Capabilities::default()
+        };
+        let unsupported = Capabilities::default();
         assert!(delta_candidate(
             &destination,
             DEFAULT_REMOTE_DELTA_MIN_SIZE,
-            CapabilitySet::ROLLING_SIGNATURES,
+            &supported,
         ));
         assert!(!delta_candidate(
             &destination,
             DEFAULT_REMOTE_DELTA_MIN_SIZE + 1,
-            CapabilitySet::ROLLING_SIGNATURES,
+            &supported,
         ));
         assert!(!delta_candidate(
             &destination,
             DEFAULT_REMOTE_DELTA_MIN_SIZE,
-            CapabilitySet::empty(),
+            &unsupported,
         ));
     }
 

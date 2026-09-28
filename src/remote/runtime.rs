@@ -6,12 +6,11 @@ mod metadata;
 mod mutation;
 pub use client::ClientRemoteHandle;
 
+use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{
-    CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
-};
+use crate::protocol::{ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady};
 use crate::remote::acl::serve_incoming_acl_rooted;
 use crate::remote::bsdflags::serve_incoming_bsd_flags_rooted;
 use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
@@ -111,7 +110,8 @@ pub type Result<T> = std::result::Result<T, RemoteSessionError>;
 pub struct ClientRemoteSession {
     operation: Operation,
     server: ServerHello,
-    ready: SessionReady,
+    capabilities: EndpointCapabilities,
+    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
     router: FrameRouter,
 }
 
@@ -132,7 +132,8 @@ impl ClientRemoteSession {
         Ok(Self {
             operation,
             server: negotiated.server,
-            ready: negotiated.ready,
+            capabilities: negotiated.capabilities,
+            namespace_semantics: negotiated.namespace_semantics,
             router,
         })
     }
@@ -145,8 +146,14 @@ impl ClientRemoteSession {
         &self.server
     }
 
-    pub const fn ready(&self) -> SessionReady {
-        self.ready
+    pub const fn capabilities(&self) -> &EndpointCapabilities {
+        &self.capabilities
+    }
+
+    pub const fn namespace_semantics(
+        &self,
+    ) -> Option<crate::engine::namespace::NamespaceSemantics> {
+        self.namespace_semantics
     }
 
     pub fn sender(&self) -> RouterSender {
@@ -161,7 +168,7 @@ impl ClientRemoteSession {
         &self,
         basis: &Entry,
     ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
-        crate::remote::hash::require_blake3(self.ready.capabilities)?;
+        crate::remote::hash::require_blake3(&self.capabilities)?;
         request_content_hash(&self.router.sender(), basis, self.server.platform.os).await
     }
 
@@ -169,11 +176,7 @@ impl ClientRemoteSession {
         &self,
         basis: &Entry,
     ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
-        if !self
-            .ready
-            .capabilities
-            .contains(CapabilitySet::ROLLING_SIGNATURES)
-        {
+        if !self.capabilities.rolling_signatures {
             return Err(RemoteSignatureError::UnsupportedByPeer);
         }
         if !basis.is_file() {
@@ -197,11 +200,7 @@ impl ClientRemoteSession {
         basis: &Entry,
         limits: BasisIndexLimits,
     ) -> Result<Option<BasisIndex>> {
-        if !self
-            .ready
-            .capabilities
-            .contains(CapabilitySet::ROLLING_SIGNATURES)
-        {
+        if !self.capabilities.rolling_signatures {
             return Err(RemoteSignatureError::UnsupportedByPeer.into());
         }
         if !basis.is_file() {
