@@ -132,6 +132,10 @@ destination commit; `--verify` adds staged verification on local copies.
 
 ## Feature Status
 
+Linux and macOS are the sync platforms exercised by CI. Windows is compile-checked
+only; synchronization is not supported there yet because native race-safe file
+identity and root-confined filesystem operations are not implemented.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Local sync | Stable | Staged atomic commits, race-checked |

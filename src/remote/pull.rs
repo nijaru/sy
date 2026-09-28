@@ -974,6 +974,7 @@ async fn set_staged_metadata(
 ) -> Result<()> {
     // Non-Unix staged metadata is applied nowhere else in 0.5; keep the
     // contract loud if ever reached.
+    let _ = staged;
     Err(RemotePullError::LocalMutation(
         PathBuf::new(),
         std::io::Error::other("staged metadata is unix-only in the v3 pull"),
