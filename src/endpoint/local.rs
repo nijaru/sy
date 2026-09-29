@@ -686,6 +686,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn common_finalizer_verifies_staging_before_publication() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("existing"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let metadata = make_meta();
+        let preservation = crate::endpoint::io::Preservation::default();
+
+        let mut writer = endpoint
+            .begin_write(Path::new("existing"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
+        writer.write(b"content").await.unwrap();
+        let mismatch = crate::endpoint::io::finalize_staged_writer(
+            writer,
+            &metadata,
+            &preservation,
+            Some(blake3::hash(b"different")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            mismatch,
+            crate::endpoint::io::VerificationStatus::Failed { .. }
+        ));
+        assert_eq!(fs::read(dir.path().join("existing")).unwrap(), b"old");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let mut writer = endpoint
+            .begin_write(Path::new("created"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"content").await.unwrap();
+        let verified = crate::endpoint::io::finalize_staged_writer(
+            writer,
+            &metadata,
+            &preservation,
+            Some(blake3::hash(b"content")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified, crate::endpoint::io::VerificationStatus::Verified);
+        assert_eq!(fs::read(dir.path().join("created")).unwrap(), b"content");
+    }
+
+    #[tokio::test]
     async fn staged_commit_replaces_destination() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();

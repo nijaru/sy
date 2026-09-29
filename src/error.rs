@@ -50,6 +50,9 @@ pub enum SyncError {
         actual: u32,
     },
 
+    #[error("staged operation failed ({operation}) and abort also failed ({abort})")]
+    StagingAbortFailed { operation: String, abort: String },
+
     #[error(
         "Source changed during transfer: {path}\nThe source was modified or replaced after it was scanned; the destination was left unchanged."
     )]

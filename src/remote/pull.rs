@@ -12,9 +12,9 @@
 //! supports it, but the safety-critical ordering — complete preflight, then
 //! main work, then reverse-order deletes, then finalize — must land first.
 
-use crate::endpoint::io::{ExpectedDestination, StagedWriter};
+use crate::endpoint::io::{ExpectedDestination, VerificationStatus};
 use crate::endpoint::local::LocalEndpoint;
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Endpoint, FileMetadata};
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
@@ -59,6 +59,13 @@ pub enum RemotePullError {
 
     #[error("regular-file pull requires Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
+
+    #[error("staged pull verification failed for {path}: expected {expected}, got {actual}")]
+    StagedVerificationFailed {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
 
     #[error("pull destination lacks a scan-time identity for {0}")]
     MissingDestinationIdentity(PathBuf),
@@ -506,6 +513,7 @@ impl RemotePullExecutor {
         metadata: &PullTransferMetadata,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let dest = self.dest_path(&source.path);
+        let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone());
         let mut staged = endpoint
             .begin_write(source.path.as_path(), expected_destination)
@@ -527,30 +535,39 @@ impl RemotePullExecutor {
             },
         )
         .await?;
-        // Staging is private at 0600; commit applies the final metadata. A
-        // missing scanned mode is an error, matching the push side's
-        // create-mode contract.
-        let Some(mode) = metadata.unix_mode else {
-            self.cancel_staged_fetch(fetched.stream_id).await;
-            return Err(RemotePullError::LocalMutation(
-                dest.clone(),
-                std::io::Error::other("scanned source file is missing its Unix mode"),
-            ));
+        // The common endpoint finalizer independently hashes the local staged
+        // bytes against the verified fetch digest before metadata and commit.
+        let verification = crate::endpoint::io::finalize_staged_writer(
+            staged,
+            &staged_metadata,
+            &fetched.preservation,
+            Some(blake3::Hash::from_bytes(fetched.summary.digest)),
+            None,
+        )
+        .await;
+        let verification = match verification {
+            Ok(verification) => verification,
+            Err(error) => {
+                self.cancel_staged_fetch(fetched.stream_id).await;
+                return Err(error.into());
+            }
         };
-        if let Err(error) = set_staged_metadata(staged.as_mut(), mode, metadata.modified).await {
-            self.cancel_staged_fetch(fetched.stream_id).await;
-            return Err(error);
-        }
-        if let Err(error) = staged
-            .apply_preservation(&fetched.preservation, Some(mode))
-            .await
-        {
-            self.cancel_staged_fetch(fetched.stream_id).await;
-            return Err(error.into());
-        }
-        if let Err(error) = staged.commit().await {
-            self.cancel_staged_fetch(fetched.stream_id).await;
-            return Err(error.into());
+        match verification {
+            VerificationStatus::Verified => {}
+            VerificationStatus::Failed { expected, actual } => {
+                self.cancel_staged_fetch(fetched.stream_id).await;
+                return Err(RemotePullError::StagedVerificationFailed {
+                    path: dest,
+                    expected: expected.to_hex().to_string(),
+                    actual: actual.to_hex().to_string(),
+                });
+            }
+            VerificationStatus::NotRequested => {
+                self.cancel_staged_fetch(fetched.stream_id).await;
+                return Err(RemotePullError::Endpoint(crate::error::SyncError::Config(
+                    "pull finalized without verifying staged bytes".into(),
+                )));
+            }
         }
         crate::remote::fetch::acknowledge_fetch(&self.sender, fetched.stream_id)
             .await
@@ -988,43 +1005,38 @@ async fn set_mtime_via_filetime(path: &Path, modified: Timestamp) -> Result<()> 
 }
 
 #[cfg(unix)]
-async fn set_staged_metadata(
-    staged: &mut dyn StagedWriter,
-    mode: u32,
-    modified: Option<Timestamp>,
-) -> Result<()> {
-    use crate::endpoint::FileMetadata;
+fn staged_file_metadata(
+    source: &Entry,
+    metadata: &PullTransferMetadata,
+    destination: &Path,
+) -> Result<FileMetadata> {
+    let mode = metadata
+        .unix_mode
+        .ok_or_else(|| RemotePullError::MissingScannedMode(destination.to_path_buf()))?;
     // Without --times the committed file keeps its natural creation time
     // (rsync semantics: no -t means the destination mtime is "now"); with
     // --times it carries the source's scanned mtime.
-    let modified = modified
+    let modified = metadata
+        .modified
         .map(system_time_from_timestamp)
         .unwrap_or_else(std::time::SystemTime::now);
-    let metadata = FileMetadata {
-        size: 0,
+    Ok(FileMetadata {
+        size: source.size,
         modified,
         is_dir: false,
         is_symlink: false,
         mode,
-    };
-    staged.set_metadata(&metadata).await.map_err(|error| {
-        let message = error.to_string();
-        RemotePullError::LocalMutation(PathBuf::new(), std::io::Error::other(message))
-    })?;
-    Ok(())
+    })
 }
 
 #[cfg(not(unix))]
-async fn set_staged_metadata(
-    staged: &mut dyn StagedWriter,
-    _mode: u32,
-    _modified: Option<Timestamp>,
-) -> Result<()> {
-    // Non-Unix staged metadata is applied nowhere else in 0.5; keep the
-    // contract loud if ever reached.
-    let _ = staged;
+fn staged_file_metadata(
+    _source: &Entry,
+    _metadata: &PullTransferMetadata,
+    destination: &Path,
+) -> Result<FileMetadata> {
     Err(RemotePullError::LocalMutation(
-        PathBuf::new(),
+        destination.to_path_buf(),
         std::io::Error::other("staged metadata is unix-only in the v3 pull"),
     ))
 }
