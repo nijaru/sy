@@ -883,6 +883,9 @@ fn reconstruct_file(
                     acls.as_deref(),
                     begin.unix_mode(),
                 )?;
+                if prepared.staged.staged_hash_blocking()?.as_bytes() != &digest {
+                    return Err(RemoteTransferError::DigestMismatch);
+                }
                 // The scanned destination state must still hold at commit.
                 validate_destination_state(
                     &prepared.rooted,

@@ -77,7 +77,7 @@ pub enum LocalSyncAction {
     TransferFile {
         source: Entry,
         destination: Option<Entry>,
-        metadata: LocalTransferMetadata,
+        metadata: crate::endpoint::transfer::TransferMetadata,
     },
     ReplaceSymlink {
         source: Entry,
@@ -90,10 +90,12 @@ pub enum LocalSyncAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LocalTransferMetadata {
-    pub unix_mode: Option<u32>,
-    pub modified: Option<Timestamp>,
+pub type LocalTransferMetadata = crate::endpoint::transfer::TransferMetadata;
+
+#[derive(Debug, Clone)]
+struct HardlinkRepresentative {
+    path: RelativePath,
+    metadata: LocalTransferMetadata,
 }
 
 pub struct LocalSyncExecutor {
@@ -117,7 +119,8 @@ pub struct LocalSyncExecutor {
     /// The mutex is held across a grouped transfer so members serialize
     /// (ungrouped files stay concurrent), mirroring the remote executors.
     hardlinks: bool,
-    hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
+    hardlink_groups:
+        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], HardlinkRepresentative>>,
     /// -X/--preserve-xattrs: mirror the source's extended attributes onto the
     /// destination for every entry this executor creates or updates. Symlinks
     /// are skipped (their attributes are not portable).
@@ -563,21 +566,16 @@ impl LocalSyncExecutor {
         let mut groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(&group).cloned() {
             self.check_source_identity(&source).await?;
+            let dest_abs = self.destination_path(&source.path);
+            validate_hardlink_metadata(&dest_abs, first.metadata, metadata)?;
             let is_update = destination.is_some();
             if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
                 self.backup_replacement_file(&source.path).await?;
             }
-            let first_abs = self.destination_path(&first);
-            let dest_abs = self.destination_path(&source.path);
+            let first_abs = self.destination_path(&first.path);
             link_local_file(&first_abs, &dest_abs)
                 .await
                 .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
-            if let Some(mode) = metadata.unix_mode {
-                self.set_mode(&dest_abs, mode).await?;
-            }
-            if let Some(modified) = metadata.modified {
-                self.set_mtime(&dest_abs, modified).await?;
-            }
             self.remove_committed_source(&source).await?;
             let op = if is_update {
                 crate::sync::output::ItemizeOp::Update
@@ -613,7 +611,13 @@ impl LocalSyncExecutor {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
         }
-        groups.insert(group, source.path.clone());
+        groups.insert(
+            group,
+            HardlinkRepresentative {
+                path: source.path.clone(),
+                metadata,
+            },
+        );
         drop(groups);
         self.remove_committed_source(&source).await?;
         let op = if is_update {
@@ -669,7 +673,7 @@ impl LocalSyncExecutor {
         &self,
         source: &Entry,
         destination: &Option<Entry>,
-        metadata: &LocalTransferMetadata,
+        metadata: &crate::endpoint::transfer::TransferMetadata,
         preservation: crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let source_endpoint = crate::endpoint::local::LocalEndpoint::new(self.source_root.clone());
@@ -702,6 +706,7 @@ impl LocalSyncExecutor {
                     },
                 },
                 preservation,
+                metadata: Some(*metadata),
             },
         )
         .await
@@ -726,21 +731,8 @@ impl LocalSyncExecutor {
                 actual: actual.to_hex().to_string(),
             });
         }
-        // The transfer layer applies staged metadata itself for native
-        // strategies; the final mode/mtime land through the explicit calls
-        // below so every strategy path shares one ordering.
-        let destination_path = self.destination_path(&source.path);
-        if let Some(mode) = metadata.unix_mode {
-            self.set_mode(&destination_path, mode).await?;
-        }
-        if let Some(modified) = metadata.modified {
-            if source.kind != EntryKind::Symlink {
-                self.set_mtime(&destination_path, modified).await?;
-            }
-        }
-        // The native strategies do not compute a whole-file digest on the
-        // happy path (verification is staged-hash based and surfaced
-        // above); the summary carries byte accounting for the controller's
+        // Native strategies do not compute a whole-file digest on the happy
+        // path; the summary carries byte accounting for the controller's
         // counters.
         Ok(crate::remote::transfer::TransferSummary {
             file_size: source.size,
@@ -1091,6 +1083,32 @@ async fn link_local_file(first: &Path, dest: &Path) -> std::result::Result<(), s
     }
 }
 
+fn validate_hardlink_metadata(
+    path: &Path,
+    representative: LocalTransferMetadata,
+    requested: LocalTransferMetadata,
+) -> Result<()> {
+    #[cfg(unix)]
+    let modes_match = representative.unix_mode.map(|mode| mode & 0o7777)
+        == requested.unix_mode.map(|mode| mode & 0o7777);
+    #[cfg(not(unix))]
+    let modes_match = representative.unix_mode == requested.unix_mode;
+
+    if !modes_match {
+        return Err(LocalSyncError::Destination(
+            path.to_path_buf(),
+            std::io::Error::other("hardlink group members request incompatible permission modes"),
+        ));
+    }
+    if representative.modified != requested.modified {
+        return Err(LocalSyncError::Destination(
+            path.to_path_buf(),
+            std::io::Error::other("hardlink group members request incompatible modification times"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn action_resources(action: &LocalSyncAction) -> ResourceRequest {
     match action {
         LocalSyncAction::TransferFile { .. } => ResourceRequest {
@@ -1375,6 +1393,38 @@ mod tests {
 
     fn rel(path: &str) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_members_must_share_requested_inode_metadata() {
+        let time = Timestamp::new(123, 456).unwrap();
+        let representative = LocalTransferMetadata {
+            unix_mode: Some(0o100640),
+            modified: Some(time),
+        };
+        let same_mode = LocalTransferMetadata {
+            unix_mode: Some(0o640),
+            modified: Some(time),
+        };
+        assert!(validate_hardlink_metadata(Path::new("member"), representative, same_mode).is_ok());
+
+        let conflicting_mode = LocalTransferMetadata {
+            unix_mode: Some(0o600),
+            modified: Some(time),
+        };
+        assert!(matches!(
+            validate_hardlink_metadata(Path::new("member"), representative, conflicting_mode),
+            Err(LocalSyncError::Destination(_, _))
+        ));
+        let conflicting_time = LocalTransferMetadata {
+            unix_mode: Some(0o640),
+            modified: Some(Timestamp::new(124, 0).unwrap()),
+        };
+        assert!(matches!(
+            validate_hardlink_metadata(Path::new("member"), representative, conflicting_time),
+            Err(LocalSyncError::Destination(_, _))
+        ));
     }
 
     #[tokio::test]

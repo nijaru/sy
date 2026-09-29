@@ -141,6 +141,25 @@ impl RootedStagedFile {
         &mut self.file
     }
 
+    /// Hash staged bytes through the already-open descriptor so restrictive
+    /// final permissions do not prevent verification before commit.
+    pub(crate) fn staged_hash_blocking(&mut self) -> Result<blake3::Hash> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let read = self.file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(hasher.finalize())
+    }
+
     /// Apply requested regular-file metadata to the still-private staging inode.
     /// This is intentionally performed before `commit`, so a metadata failure
     /// cannot expose a newly reconstructed file with temporary permissions.
@@ -1431,7 +1450,7 @@ fn create_staging_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         libc::openat(
             parent,
             component.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
     };
@@ -1683,12 +1702,13 @@ mod tests {
             .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
         staged
-            .apply_metadata_blocking(Some(0o640), Some(modified))
+            .apply_metadata_blocking(Some(0), Some(modified))
             .unwrap();
+        assert_eq!(staged.staged_hash_blocking().unwrap(), blake3::hash(b"new"));
         staged.commit().unwrap();
 
         let metadata = std::fs::metadata(root.path().join("file")).unwrap();
-        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mode() & 0o7777, 0);
         assert_eq!(metadata.mtime(), modified.seconds());
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
     }

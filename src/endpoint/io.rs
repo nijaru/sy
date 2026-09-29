@@ -151,7 +151,7 @@ pub(crate) async fn abort_staged_writer(
         })
 }
 
-/// Verify staged bytes, apply common metadata/preservation, then commit.
+/// Apply common metadata/preservation, verify staged bytes, then commit.
 ///
 /// `expected_hash` is computed from the trusted source byte stream. Comparing
 /// it to the endpoint's staged hash proves the bytes to be published are the
@@ -165,6 +165,11 @@ pub(crate) async fn finalize_staged_writer(
     pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
 ) -> Result<VerificationStatus> {
     let prepared = async {
+        writer.set_metadata(metadata).await?;
+        writer
+            .apply_preservation(preservation, metadata.preserved_mode())
+            .await?;
+
         let verification = if let Some(expected) = expected_hash {
             let actual = writer.staged_hash().await?.ok_or_else(|| {
                 SyncError::Config("destination cannot verify staged bytes before commit".into())
@@ -177,10 +182,6 @@ pub(crate) async fn finalize_staged_writer(
             VerificationStatus::NotRequested
         };
 
-        writer.set_metadata(metadata).await?;
-        writer
-            .apply_preservation(preservation, metadata.preserved_mode())
-            .await?;
         if let Some(pre_commit) = pre_commit {
             pre_commit()?;
         }
@@ -337,4 +338,98 @@ pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result
     }
 
     Ok(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    struct RecordingWriter {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        hash: blake3::Hash,
+    }
+
+    #[async_trait::async_trait]
+    impl StagedWriter for RecordingWriter {
+        async fn write(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn set_metadata(&mut self, _metadata: &FileMetadata) -> Result<()> {
+            self.events.lock().unwrap().push("metadata");
+            Ok(())
+        }
+
+        async fn apply_preservation(
+            &mut self,
+            _preservation: &Preservation,
+            _expected_mode: Option<u32>,
+        ) -> Result<()> {
+            self.events.lock().unwrap().push("preservation");
+            Ok(())
+        }
+
+        async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
+            self.events.lock().unwrap().push("verification");
+            Ok(Some(self.hash))
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.events.lock().unwrap().push("commit");
+            Ok(())
+        }
+
+        async fn abort(self: Box<Self>) -> Result<()> {
+            self.events.lock().unwrap().push("abort");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn finalization_applies_metadata_before_verifying_and_committing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let expected = blake3::hash(b"bytes");
+        let writer = Box::new(RecordingWriter {
+            events: Arc::clone(&events),
+            hash: expected,
+        });
+        let metadata = FileMetadata {
+            size: 5,
+            modified: SystemTime::UNIX_EPOCH,
+            is_dir: false,
+            is_symlink: false,
+            #[cfg(unix)]
+            mode: 0o640,
+        };
+        let preservation = Preservation::default();
+        let pre_commit_events = Arc::clone(&events);
+        let pre_commit = move || {
+            pre_commit_events.lock().unwrap().push("pre-commit");
+            Ok(())
+        };
+
+        let verification = finalize_staged_writer(
+            writer,
+            &metadata,
+            &preservation,
+            Some(expected),
+            Some(&pre_commit),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(verification, VerificationStatus::Verified);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "metadata",
+                "preservation",
+                "verification",
+                "pre-commit",
+                "commit"
+            ]
+        );
+    }
 }
