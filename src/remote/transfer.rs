@@ -21,6 +21,20 @@ pub(crate) const PRODUCER_QUEUE_DEPTH: usize = 8;
 const RECONSTRUCTION_QUEUE_DEPTH: usize = 8;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransferPreservationRequest {
+    /// Capture xattrs from the held source file used for the byte stream.
+    pub xattrs: bool,
+    /// Capture ACLs from the held source file used for the byte stream.
+    pub acls: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferStreamPolicy {
+    pub preservation: TransferPreservationRequest,
+    pub compression: Option<crate::engine::compression::CompressionPolicy>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransferMetadata {
     pub unix_mode: Option<u32>,
@@ -30,6 +44,30 @@ pub struct TransferMetadata {
     /// Complete exacl-unified ACL text applied to staging before commit when
     /// `-A` is on (empty text clears).
     pub acls: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CapturedTransferPreservation {
+    xattrs: Option<Vec<(OsString, Vec<u8>)>>,
+    acls: Option<String>,
+}
+
+fn read_transfer_preservation(
+    rooted: &RootedFs,
+    file: &File,
+    path: &RelativePath,
+    request: TransferPreservationRequest,
+) -> Result<CapturedTransferPreservation> {
+    let xattrs = request
+        .xattrs
+        .then(|| rooted.read_open_file_xattrs_blocking(file, path))
+        .transpose()?;
+    let acls = request
+        .acls
+        .then(|| rooted.read_open_file_acl_blocking(file, path))
+        .transpose()?
+        .map(|acl| acl.unwrap_or_default());
+    Ok(CapturedTransferPreservation { xattrs, acls })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +107,8 @@ pub enum RemoteTransferError {
     #[error("file transfer requires a scanned source identity")]
     MissingSourceIdentity,
 
-    #[error(
-        "peer cannot provide transaction-bound {feature} preservation metadata for file fetch"
-    )]
-    FetchPreservationUnavailable { feature: &'static str },
+    #[error("peer did not negotiate transaction-bound {feature} preservation for file transfer")]
+    PreservationUnavailable { feature: &'static str },
 
     #[error("file fetch omitted requested {0} preservation metadata")]
     MissingFetchPreservation(&'static str),
@@ -309,6 +345,30 @@ pub async fn request_file_transfer_with_policy(
     peer: PlatformOs,
     compression: Option<crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
+    request_file_transfer_with_stream_policy(
+        sender,
+        source_root,
+        source,
+        destination,
+        metadata,
+        peer,
+        TransferStreamPolicy {
+            preservation: TransferPreservationRequest::default(),
+            compression,
+        },
+    )
+    .await
+}
+
+pub async fn request_file_transfer_with_stream_policy(
+    sender: &RouterSender,
+    source_root: PathBuf,
+    source: Entry,
+    destination: Option<TransferDestination>,
+    metadata: TransferMetadata,
+    peer: PlatformOs,
+    stream_policy: TransferStreamPolicy,
+) -> Result<TransferSummary> {
     ensure_compatible_path_encoding(peer)?;
     if !source.is_file() {
         return Err(RemoteTransferError::InvalidSource);
@@ -320,13 +380,24 @@ pub async fn request_file_transfer_with_policy(
     let rooted = RootedFs::open(source_root).await?;
     let source_path = source.path.clone();
     let expected_size = source.size;
-    let source_file = tokio::task::spawn_blocking(move || {
+    let preservation_request = stream_policy.preservation;
+    let compression = stream_policy.compression;
+    let (source_file, captured_preservation) = tokio::task::spawn_blocking(move || {
         let file = rooted.open_regular_blocking(&source_path)?;
         validate_source(&file, expected_identity, expected_size)?;
-        Ok::<_, RemoteTransferError>(file)
+        let preservation =
+            read_transfer_preservation(&rooted, &file, &source_path, preservation_request)?;
+        Ok::<_, RemoteTransferError>((file, preservation))
     })
     .await
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    let mut metadata = metadata;
+    if preservation_request.xattrs {
+        metadata.xattrs = captured_preservation.xattrs;
+    }
+    if preservation_request.acls {
+        metadata.acls = captured_preservation.acls;
+    }
 
     let encoded_path = encode_relative_path(source.path.as_path())?;
     let (begin, basis_index) = match destination {
@@ -1238,6 +1309,65 @@ mod tests {
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             source_data
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_preservation_capture_stays_on_held_source_after_path_replacement() {
+        let source_root = tempfile::TempDir::new().unwrap();
+        let source_path = source_root.path().join("file.bin");
+        let replacement_path = source_root.path().join("replacement.bin");
+        std::fs::write(&source_path, b"held source").unwrap();
+        std::fs::write(&replacement_path, b"replacement").unwrap();
+        xattr::set(&source_path, "user.sy_test", b"held").unwrap();
+        xattr::set(&replacement_path, "user.sy_test", b"replacement").unwrap();
+
+        let rooted = RootedFs::open(source_root.path().to_path_buf())
+            .await
+            .unwrap();
+        let relative = RelativePath::new(PathBuf::from("file.bin")).unwrap();
+        let (rooted, file, relative) = tokio::task::spawn_blocking(move || {
+            let file = rooted.open_regular_blocking(&relative)?;
+            validate_source(
+                &file,
+                crate::endpoint::local_identity::metadata_identity(
+                    &file.metadata()?,
+                    EntryKind::File,
+                )
+                .ok_or(RemoteTransferError::MissingOpenedIdentity)?,
+                b"held source".len() as u64,
+            )?;
+            Ok::<_, RemoteTransferError>((rooted, file, relative))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::rename(&replacement_path, &source_path).unwrap();
+
+        let preservation = tokio::task::spawn_blocking(move || {
+            read_transfer_preservation(
+                &rooted,
+                &file,
+                &relative,
+                TransferPreservationRequest {
+                    xattrs: true,
+                    acls: false,
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let xattrs = preservation.xattrs.unwrap();
+        assert_eq!(
+            xattrs
+                .iter()
+                .find(|(name, _)| name == "user.sy_test")
+                .map(|(_, value)| value.as_slice()),
+            Some(&b"held"[..])
+        );
+        assert!(preservation.acls.is_none());
     }
 
     #[tokio::test]

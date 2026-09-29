@@ -81,7 +81,7 @@ pub async fn fetch_file(
         ),
     ] {
         if requested && (!supported || policy.protocol_version < PROTOCOL_V3_2) {
-            return Err(RemoteTransferError::FetchPreservationUnavailable { feature });
+            return Err(RemoteTransferError::PreservationUnavailable { feature });
         }
     }
     if !source.is_file() {

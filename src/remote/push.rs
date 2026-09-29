@@ -10,7 +10,10 @@ use crate::remote::bsdflags::{
     apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
 };
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
-use crate::remote::transfer::{TransferDestination, TransferMetadata, TransferSummary};
+use crate::remote::transfer::{
+    TransferDestination, TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
+    TransferSummary,
+};
 use crate::remote::xattr::{
     apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
 };
@@ -690,24 +693,25 @@ impl RemotePushExecutor {
                     }
                 }
                 let destination_transfer = self.prepare_destination(destination).await?;
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                // Preservation rides the transfer stream into server staging;
-                // a failure there aborts the replacement before commit.
-                let metadata = TransferMetadata {
-                    xattrs,
-                    acls,
-                    ..metadata
+                // The requester captures xattrs/ACLs from the same held file
+                // descriptor that produces transfer bytes, then sends them on
+                // the transfer stream into private staging.
+                let stream_policy = TransferStreamPolicy {
+                    preservation: TransferPreservationRequest {
+                        xattrs: self.xattrs,
+                        acls: self.acls,
+                    },
+                    compression: self.compression,
                 };
                 let summary = self
                     .remote
-                    .transfer_file_with_policy(
+                    .transfer_file_with_stream_policy(
                         self.source_root.clone(),
                         source.clone(),
                         destination_transfer,
                         metadata,
-                        self.compression,
+                        stream_policy,
                     )
                     .await?;
                 // Only rename-incompatible flags remain post-commit finalization.
@@ -818,24 +822,24 @@ impl RemotePushExecutor {
             }
         }
         let destination_transfer = self.prepare_destination(destination).await?;
-        let xattrs = self.read_source_xattrs(&source).await?;
-        let acls = self.read_source_acls(&source).await?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        // Preservation rides the transfer stream into server staging; a
-        // failure there aborts the replacement before commit.
-        let metadata = TransferMetadata {
-            xattrs,
-            acls,
-            ..metadata
+        // The requester captures xattrs/ACLs from the same held file
+        // descriptor that produces transfer bytes.
+        let stream_policy = TransferStreamPolicy {
+            preservation: TransferPreservationRequest {
+                xattrs: self.xattrs,
+                acls: self.acls,
+            },
+            compression: self.compression,
         };
         let summary = self
             .remote
-            .transfer_file_with_policy(
+            .transfer_file_with_stream_policy(
                 self.source_root.clone(),
                 source.clone(),
                 destination_transfer,
                 metadata,
-                self.compression,
+                stream_policy,
             )
             .await?;
         // Only rename-incompatible flags remain post-commit finalization.
