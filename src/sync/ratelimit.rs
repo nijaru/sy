@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::time::{Duration, Instant};
 
-/// Simple token bucket rate limiter
+#[derive(Debug)]
 pub struct RateLimiter {
     bytes_per_second: u64,
     last_refill: Instant,

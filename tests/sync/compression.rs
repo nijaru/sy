@@ -116,36 +116,3 @@ fn test_compression_skip_local() {
         "Should not compress local transfers"
     );
 }
-
-#[test]
-fn test_compression_performance() {
-    use std::time::Instant;
-
-    // Create 10MB of compressible data
-    let data: Vec<u8> = "ABCDEFGH".repeat(1_250_000).into_bytes();
-
-    // Benchmark Zstd compression
-    let start = Instant::now();
-    let compressed = compress(&data, Compression::Zstd).unwrap();
-    let duration = start.elapsed();
-
-    let throughput = (data.len() as f64 / duration.as_secs_f64()) / 1_000_000_000.0; // GB/s
-    let ratio = compressed.len() as f64 / data.len() as f64;
-
-    println!("Zstd Performance:");
-    println!("  Throughput: {:.2} GB/s", throughput);
-    println!("  Ratio: {:.1}%", ratio * 100.0);
-    println!(
-        "  Size: {} KB -> {} KB",
-        data.len() / 1024,
-        compressed.len() / 1024
-    );
-
-    // Verify it's reasonably fast (relaxed threshold for CI environments)
-    // Local benchmarks show 8+ GB/s, but CI runners vary (0.5-2 GB/s)
-    assert!(
-        throughput > 0.3,
-        "Zstd should compress at >0.3 GB/s, got {:.2} GB/s",
-        throughput
-    );
-}

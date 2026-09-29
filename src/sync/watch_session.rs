@@ -14,6 +14,7 @@ use tokio::signal;
 pub struct WatchSession {
     session: SyncSession,
     source: PathBuf,
+    #[allow(dead_code)]
     destination: PathBuf,
     debounce: Duration,
 }

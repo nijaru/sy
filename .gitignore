@@ -32,7 +32,7 @@ PERFORMANCE_ANALYSIS.md
 man/
 __pycache__
 
-# AI agent context
+# AI agent local context (untracked; private notes live in knowledge).
 ai/
 .pi/
 .tasks/
