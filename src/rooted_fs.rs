@@ -269,19 +269,17 @@ impl RootedStagedFile {
         }
     }
 
-    pub fn commit(mut self) -> Result<()> {
-        if let Err(operation) = self.file.sync_all() {
-            return Err(self.abort_after(operation.into()));
-        }
-        self.commit_synced()
+    /// Publish the staged inode atomically in the destination namespace.
+    /// This is not a power-loss durability guarantee: no parent-directory
+    /// persistence ordering is provided, and syncing every file without that
+    /// stronger contract would penalize many-small-file syncs substantially.
+    pub fn commit(self) -> Result<()> {
+        self.commit_prepared()
     }
 
     /// Commit with cancellation serialized against the publication syscall.
     /// The caller sets the shared state when its awaiting future is dropped.
     pub fn commit_cancellable(mut self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
-        if let Err(operation) = self.file.sync_all() {
-            return Err(self.abort_after(operation.into()));
-        }
         let state = cancellation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -289,10 +287,10 @@ impl RootedStagedFile {
             drop(state);
             return Err(self.abort_after(RootedFsError::CommitCancelled));
         }
-        self.commit_synced()
+        self.commit_prepared()
     }
 
-    fn commit_synced(mut self) -> Result<()> {
+    fn commit_prepared(mut self) -> Result<()> {
         match self.commit_blocking() {
             Err(operation) if !self.committed => Err(self.abort_after(operation)),
             result => result,

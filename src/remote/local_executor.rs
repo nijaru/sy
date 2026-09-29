@@ -101,6 +101,8 @@ struct HardlinkRepresentative {
 pub struct LocalSyncExecutor {
     source_root: PathBuf,
     destination_root: PathBuf,
+    source_endpoint: crate::endpoint::local::LocalEndpoint,
+    destination_endpoint: crate::endpoint::local::LocalEndpoint,
     scheduler: Scheduler,
     /// --backup: enabled marker, backup directory (None = beside the file),
     /// and suffix, mirroring the other executors.
@@ -140,9 +142,14 @@ pub struct LocalSyncExecutor {
 
 impl LocalSyncExecutor {
     pub fn new(source_root: PathBuf, destination_root: PathBuf, scheduler: Scheduler) -> Self {
+        let source_endpoint = crate::endpoint::local::LocalEndpoint::new(source_root.clone());
+        let destination_endpoint =
+            crate::endpoint::local::LocalEndpoint::new(destination_root.clone());
         Self {
             source_root,
             destination_root,
+            source_endpoint,
+            destination_endpoint,
             scheduler,
             backup: false,
             backup_dir: None,
@@ -676,13 +683,10 @@ impl LocalSyncExecutor {
         metadata: &crate::endpoint::transfer::TransferMetadata,
         preservation: crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
-        let source_endpoint = crate::endpoint::local::LocalEndpoint::new(self.source_root.clone());
-        let destination_endpoint =
-            crate::endpoint::local::LocalEndpoint::new(self.destination_root.clone());
         let result: TransferResult = transfer_file(
-            &source_endpoint,
+            &self.source_endpoint,
             source.path.as_path(),
-            &destination_endpoint,
+            &self.destination_endpoint,
             source.path.as_path(),
             TransferOptions {
                 // A type replacement (file over symlink, link over file)

@@ -1,6 +1,7 @@
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use async_trait::async_trait;
+use std::fs::File;
 use std::path::Path;
 use std::pin::Pin;
 use sy::engine::domain::EntryIdentity;
@@ -133,6 +134,16 @@ pub trait StagedWriter: Send {
         Ok(None)
     }
 
+    /// Copy from an endpoint-provided held file into private staging. This is
+    /// reserved for native same-host strategies; generic endpoint pairs use
+    /// the bounded async `write` path. The source handle is returned so the
+    /// transfer layer can validate the same observation after copying.
+    async fn copy_from_native_file(&mut self, _source: File) -> Result<(File, u64)> {
+        Err(SyncError::Config(
+            "destination cannot copy from a native source handle".to_string(),
+        ))
+    }
+
     async fn commit(self: Box<Self>) -> Result<()>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }
@@ -219,6 +230,9 @@ pub struct StreamCopyResult {
 
 /// Inputs for one bounded streaming copy.
 pub struct StreamCopyPolicy<'a> {
+    /// Metadata observed for the selected source object (including a followed
+    /// symlink target) and requested transfer overrides.
+    pub metadata: &'a FileMetadata,
     /// Hash bytes as they flow and verify the staged result before commit.
     pub verify: bool,
     /// Destination state required at staging and again at commit.
@@ -257,7 +271,7 @@ pub async fn copy_file_streaming(
 ) -> Result<StreamCopyResult> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
-    let metadata = source.metadata(source_path).await?;
+    let metadata = policy.metadata;
     let mut reader = source.open_reader(source_path).await?;
     let mut writer = dest
         .begin_write(dest_path, policy.expected_destination)
@@ -309,7 +323,7 @@ pub async fn copy_file_streaming(
     let expected_hash = hasher.map(|hasher| hasher.finalize());
     let verification = finalize_staged_writer(
         writer,
-        &metadata,
+        metadata,
         policy.preservation,
         expected_hash,
         policy.pre_commit,

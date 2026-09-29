@@ -187,6 +187,14 @@ pub trait Endpoint: Send + Sync {
         None
     }
 
+    /// Open a regular file for a same-host native transfer. Implementations
+    /// must resolve the path through their rooted authority and return the
+    /// held file descriptor; transfer code validates its identity before and
+    /// after copying. `None` selects the generic streaming path.
+    async fn open_native_file(&self, _path: &Path) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
     async fn exists(&self, path: &Path) -> Result<bool>;
     async fn metadata(&self, path: &Path) -> Result<FileMetadata>;
 
