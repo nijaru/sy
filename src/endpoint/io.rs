@@ -144,6 +144,15 @@ pub trait StagedWriter: Send {
         ))
     }
 
+    /// Attempt a sparse-aware copy from a held source into private staging.
+    /// `None` means sparse extents are unavailable or the source has no holes;
+    /// in that case staging is unchanged and the returned source can be copied
+    /// through `copy_from_native_file` instead. Implementations must not retain
+    /// an extent list proportional to file fragmentation.
+    async fn copy_sparse_from_native_file(&mut self, source: File) -> Result<(File, Option<u64>)> {
+        Ok((source, None))
+    }
+
     async fn commit(self: Box<Self>) -> Result<()>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }

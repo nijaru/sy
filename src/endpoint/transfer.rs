@@ -161,6 +161,15 @@ fn verify_open_source_identity(
     Ok(())
 }
 
+fn verify_open_source_size(file: &std::fs::File, expected_size: u64, path: &Path) -> Result<()> {
+    if file.metadata()?.len() != expected_size {
+        return Err(SyncError::SourceChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TransferResult {
     pub bytes_written: u64,
@@ -504,61 +513,76 @@ async fn transfer_file_inner(
         (None, None)
     };
     if let (Some(source_native), Some(dest_native)) = native_pair {
-        if source_caps.sparse
-            && dest_caps.sparse
-            && native_file_is_sparse(&source_native).unwrap_or(false)
-        {
-            if let Some(result) = native_sparse_copy(
-                source_native.clone(),
-                dest_native.clone(),
-                metadata.clone(),
-                options.verify,
-                checks.clone(),
-                options.preservation.clone(),
-            )
-            .await?
-            {
-                return Ok(TransferResult {
-                    bytes_written: result.bytes_written,
-                    strategy: TransferStrategy::NativeSparseCopy,
-                    verification: result.verification,
-                });
-            }
-        }
-
-        if options.update
-            && metadata.size >= 16 * 1024 * 1024
-            && source_caps.random_read
-            && dest_caps.random_write
-            && dest_caps.reflink
-            && dest_caps.atomic_rename
-            && crate::fs_util::supports_cow_reflinks(&dest_native)
-            && !crate::fs_util::has_hard_links(&dest_native)
-        {
-            if let Some(result) = reflink_patch(
-                source_native.clone(),
-                dest_native.clone(),
-                metadata.clone(),
-                options.verify,
-                checks.clone(),
-                options.preservation.clone(),
-            )
-            .await?
-            {
-                return Ok(TransferResult {
-                    bytes_written: result.bytes_written,
-                    strategy: TransferStrategy::ReflinkPatch,
-                    verification: result.verification,
-                });
-            }
-        }
-
         if dest_caps.atomic_rename && !options.follow_symlinks {
-            if let Some(source_file) = source.open_native_file(source_path).await? {
+            if let Some(mut source_file) = source.open_native_file(source_path).await? {
                 let expected_source = checks.expected_source_identity();
                 verify_open_source_identity(&source_file, expected_source, source_path)?;
                 let mut native_metadata = file_metadata_from_open_file(&source_file)?;
                 apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
+
+                let sparse_candidate = if source_caps.sparse && dest_caps.sparse {
+                    match native_file_is_sparse(&source_file) {
+                        Ok(true) => source.native_file_has_sparse_holes(&source_file).await?,
+                        Ok(false) => false,
+                        Err(error) => {
+                            tracing::debug!("native sparse candidate check failed: {error}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if sparse_candidate {
+                    let (returned_source, result) = native_sparse_staged_copy(
+                        source_file,
+                        source_path,
+                        dest,
+                        dest_path,
+                        NativeStagedCopyPolicy {
+                            metadata: native_metadata.clone(),
+                            expected_destination,
+                            verify: options.verify,
+                            checks: checks.clone(),
+                            preservation: options.preservation.clone(),
+                        },
+                    )
+                    .await?;
+                    source_file = returned_source;
+                    if let Some(result) = result {
+                        return Ok(TransferResult {
+                            bytes_written: result.bytes_written,
+                            strategy: TransferStrategy::NativeSparseCopy,
+                            verification: result.verification,
+                        });
+                    }
+                }
+
+                if options.update
+                    && native_metadata.size >= 16 * 1024 * 1024
+                    && source_caps.random_read
+                    && dest_caps.random_write
+                    && dest_caps.reflink
+                    && crate::fs_util::supports_cow_reflinks(&dest_native)
+                    && !crate::fs_util::has_hard_links(&dest_native)
+                {
+                    if let Some(result) = reflink_patch(
+                        source_native.clone(),
+                        dest_native.clone(),
+                        native_metadata.clone(),
+                        options.verify,
+                        checks.clone(),
+                        options.preservation.clone(),
+                    )
+                    .await?
+                    {
+                        return Ok(TransferResult {
+                            bytes_written: result.bytes_written,
+                            strategy: TransferStrategy::ReflinkPatch,
+                            verification: result.verification,
+                        });
+                    }
+                }
+
                 let result = native_whole_staged_copy(
                     source_file,
                     source_path,
@@ -659,7 +683,8 @@ async fn native_whole_staged_copy(
     let expected_source = policy.checks.expected_source_identity();
     let pre_commit = || {
         policy.checks.verify_source(CheckPoint::Commit)?;
-        verify_open_source_identity(&source_file, expected_source, source_path)
+        verify_open_source_identity(&source_file, expected_source, source_path)?;
+        verify_open_source_size(&source_file, policy.metadata.size, source_path)
     };
     let verification = crate::endpoint::io::finalize_staged_writer(
         writer,
@@ -851,102 +876,98 @@ fn reflink_clone(_source: &Path, _dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn native_file_is_sparse(path: &Path) -> std::io::Result<bool> {
+fn native_file_is_sparse(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path)?;
-    let allocated = metadata.blocks() * 512;
+    let metadata = file.metadata()?;
+    let allocated = metadata.blocks().saturating_mul(512);
     Ok(metadata.len() > 4096 && allocated < metadata.len().saturating_sub(4096))
 }
 
 #[cfg(not(unix))]
-fn native_file_is_sparse(_path: &Path) -> std::io::Result<bool> {
+fn native_file_is_sparse(_file: &std::fs::File) -> std::io::Result<bool> {
     Ok(false)
 }
 
-#[cfg(unix)]
-async fn native_sparse_copy(
-    source: PathBuf,
-    dest: PathBuf,
-    metadata: FileMetadata,
-    verify: bool,
-    checks: CommitChecks,
-    preservation: Preservation,
-) -> Result<Option<NativeTransferResult>> {
-    tokio::task::spawn_blocking(move || {
-        use std::fs::File;
-        use std::io::{Read, Seek, SeekFrom, Write};
+async fn native_sparse_staged_copy(
+    mut source_file: std::fs::File,
+    source_path: &Path,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    policy: NativeStagedCopyPolicy,
+) -> Result<(std::fs::File, Option<NativeTransferResult>)> {
+    let expected_hash = if policy.verify {
+        let (source, hash) = tokio::task::spawn_blocking(move || {
+            let hash = hash_native_open_file(&mut source_file)?;
+            Ok::<_, SyncError>((source_file, hash))
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
+        source_file = source;
+        Some(hash)
+    } else {
+        None
+    };
 
-        let regions = match crate::sparse::detect_data_regions(&source) {
-            Ok(regions) => regions,
-            Err(error) => {
-                tracing::debug!("sparse extent discovery failed, falling back: {error}");
-                return Ok(None);
-            }
+    let mut writer = dest
+        .begin_write(dest_path, policy.expected_destination)
+        .await?;
+    let (source_file, bytes_written) = match writer.copy_sparse_from_native_file(source_file).await
+    {
+        Ok(copied) => copied,
+        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let operation = SyncError::SourceChanged {
+                path: source_path.to_path_buf(),
+            };
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
+        Err(operation) => {
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
+    };
+    let Some(bytes_written) = bytes_written else {
+        writer.abort().await?;
+        return Ok((source_file, None));
+    };
+
+    let source_size = match source_file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let operation = SyncError::Io(error);
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
+    };
+    if source_size != policy.metadata.size {
+        let operation = SyncError::SourceChanged {
+            path: source_path.to_path_buf(),
         };
+        crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+        return Err(operation);
+    }
+    let expected_source = policy.checks.expected_source_identity();
+    let pre_commit = || {
+        policy.checks.verify_source(CheckPoint::Commit)?;
+        verify_open_source_identity(&source_file, expected_source, source_path)?;
+        verify_open_source_size(&source_file, policy.metadata.size, source_path)
+    };
+    let verification = crate::endpoint::io::finalize_staged_writer(
+        writer,
+        &policy.metadata,
+        &policy.preservation,
+        expected_hash,
+        Some(&pre_commit),
+    )
+    .await?;
 
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = TempFileGuard::temp_path_for(&dest);
-        let guard = TempFileGuard::new(&temp);
-        let mut source_file = File::open(&source)?;
-        let mut staged = File::create(&temp)?;
-        staged.set_len(metadata.size)?;
-        let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
-        let mut bytes_written = 0_u64;
-
-        for region in regions {
-            source_file.seek(SeekFrom::Start(region.offset))?;
-            staged.seek(SeekFrom::Start(region.offset))?;
-            let mut remaining = region.length;
-            while remaining > 0 {
-                let chunk = remaining.min(buffer.len() as u64) as usize;
-                let read = source_file.read(&mut buffer[..chunk])?;
-                if read == 0 {
-                    break;
-                }
-                staged.write_all(&buffer[..read])?;
-                remaining -= read as u64;
-                bytes_written += read as u64;
-            }
-        }
-
-        staged.flush()?;
-        drop(staged);
-        let mut staged_file = File::open(&temp)?;
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
-        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
-        if matches!(verification, VerificationStatus::Failed { .. }) {
-            return Ok(Some(NativeTransferResult {
-                bytes_written,
-                verification,
-            }));
-        }
-        checks.verify(CheckPoint::Commit)?;
-        std::fs::rename(&temp, &dest)?;
-        guard.defuse();
-        Ok(Some(NativeTransferResult {
+    Ok((
+        source_file,
+        Some(NativeTransferResult {
             bytes_written,
             verification,
-        }))
-    })
-    .await
-    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
-}
-
-#[cfg(not(unix))]
-async fn native_sparse_copy(
-    _source: PathBuf,
-    _dest: PathBuf,
-    _metadata: FileMetadata,
-    _verify: bool,
-    _checks: CommitChecks,
-    _preservation: Preservation,
-) -> Result<Option<NativeTransferResult>> {
-    Ok(None)
+        }),
+    ))
 }
 
 fn verify_native_staging(
@@ -1594,6 +1615,89 @@ mod tests {
         assert!(matches!(error, SyncError::DestinationChanged { .. }));
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"KEEP");
         assert_eq!(fixture.dest_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn sparse_staged_copy_preserves_logical_bytes_and_verifies() {
+        let fixture = Fixture::new();
+        let source_path = fixture.source_file();
+        let size = 1024 * 1024;
+        let mut file = std::fs::File::create(&source_path).unwrap();
+        file.set_len(size).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(128 * 1024)).unwrap();
+        file.write_all(b"middle").unwrap();
+        file.seek(SeekFrom::Start(size - 4)).unwrap();
+        file.write_all(b"tail").unwrap();
+        drop(file);
+
+        let mut expected = vec![0; size as usize];
+        expected[128 * 1024..128 * 1024 + 6].copy_from_slice(b"middle");
+        expected[size as usize - 4..].copy_from_slice(b"tail");
+        let result = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            TransferOptions {
+                verify: true,
+                ..options(create_identity(&fixture), false)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), expected);
+        assert_eq!(result.verification, VerificationStatus::Verified);
+        assert!(matches!(
+            result.strategy,
+            TransferStrategy::NativeSparseCopy | TransferStrategy::NativeWholeCopy
+        ));
+        if result.strategy == TransferStrategy::NativeSparseCopy {
+            assert!(result.bytes_written < size);
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_staged_copy_preserves_data_before_a_trailing_hole_without_verify() {
+        let fixture = Fixture::new();
+        let source_path = fixture.source_file();
+        let size = 1024 * 1024;
+        use std::io::Write;
+        let mut file = std::fs::File::create(&source_path).unwrap();
+        file.write_all(b"prefix-data").unwrap();
+        file.set_len(size).unwrap();
+        drop(file);
+        let source_endpoint = fixture.source_endpoint();
+        let source_handle = source_endpoint
+            .open_native_file(Path::new(NAME))
+            .await
+            .unwrap()
+            .unwrap();
+        let expects_sparse = native_file_is_sparse(&source_handle).unwrap()
+            && source_endpoint
+                .native_file_has_sparse_holes(&source_handle)
+                .await
+                .unwrap();
+
+        let result = transfer_file(
+            &source_endpoint,
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options(create_identity(&fixture), false),
+        )
+        .await
+        .unwrap();
+
+        let copied = std::fs::read(fixture.dest_file()).unwrap();
+        assert_eq!(copied.len(), size as usize);
+        assert_eq!(&copied[..b"prefix-data".len()], b"prefix-data");
+        assert!(copied[b"prefix-data".len()..].iter().all(|byte| *byte == 0));
+        if expects_sparse {
+            assert_eq!(result.strategy, TransferStrategy::NativeSparseCopy);
+            assert!(result.bytes_written < size);
+        }
     }
 
     fn cow_fixture() -> Option<Fixture> {

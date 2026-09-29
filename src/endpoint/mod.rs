@@ -195,6 +195,12 @@ pub trait Endpoint: Send + Sync {
         Ok(None)
     }
 
+    /// Check whether a held native file exposes useful sparse extents. This
+    /// probe must use the supplied descriptor rather than reopening its path.
+    async fn native_file_has_sparse_holes(&self, _file: &std::fs::File) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn exists(&self, path: &Path) -> Result<bool>;
     async fn metadata(&self, path: &Path) -> Result<FileMetadata>;
 
