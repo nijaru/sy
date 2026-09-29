@@ -10,7 +10,6 @@ use crate::endpoint::io::{
 };
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
-use crate::temp_file::TempFileGuard;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -170,6 +169,25 @@ fn verify_open_source_size(file: &std::fs::File, expected_size: u64, path: &Path
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn verify_open_destination_identity(
+    file: &std::fs::File,
+    expected: EntryIdentity,
+    path: &Path,
+) -> Result<()> {
+    let metadata = file.metadata()?;
+    let actual = crate::endpoint::local_identity::metadata_identity(
+        &metadata,
+        sy::engine::domain::EntryKind::File,
+    );
+    if actual != Some(expected) {
+        return Err(SyncError::DestinationChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TransferResult {
     pub bytes_written: u64,
@@ -184,6 +202,15 @@ struct NativeTransferResult {
 }
 
 struct NativeStagedCopyPolicy {
+    metadata: FileMetadata,
+    expected_destination: ExpectedDestination,
+    verify: bool,
+    checks: CommitChecks,
+    preservation: Preservation,
+}
+
+struct NativeReflinkPatchPolicy {
+    source_path: PathBuf,
     metadata: FileMetadata,
     expected_destination: ExpectedDestination,
     verify: bool,
@@ -507,102 +534,108 @@ async fn transfer_file_inner(
     .await?;
     let expected_destination = checks.expected_destination();
 
-    let native_pair = if options.rate_limiter.is_none() {
-        (source_native, dest_native)
-    } else {
-        (None, None)
-    };
-    if let (Some(source_native), Some(dest_native)) = native_pair {
-        if dest_caps.atomic_rename && !options.follow_symlinks {
-            if let Some(mut source_file) = source.open_native_file(source_path).await? {
-                let expected_source = checks.expected_source_identity();
-                verify_open_source_identity(&source_file, expected_source, source_path)?;
-                let mut native_metadata = file_metadata_from_open_file(&source_file)?;
-                apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
+    if options.rate_limiter.is_none()
+        && source_native.is_some()
+        && dest_native.is_some()
+        && dest_caps.atomic_rename
+        && !options.follow_symlinks
+    {
+        if let Some(mut source_file) = source.open_native_file(source_path).await? {
+            let expected_source = checks.expected_source_identity();
+            verify_open_source_identity(&source_file, expected_source, source_path)?;
+            let mut native_metadata = file_metadata_from_open_file(&source_file)?;
+            apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
 
-                let sparse_candidate = if source_caps.sparse && dest_caps.sparse {
-                    match native_file_is_sparse(&source_file) {
-                        Ok(true) => source.native_file_has_sparse_holes(&source_file).await?,
-                        Ok(false) => false,
-                        Err(error) => {
-                            tracing::debug!("native sparse candidate check failed: {error}");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                if sparse_candidate {
-                    let (returned_source, result) = native_sparse_staged_copy(
-                        source_file,
-                        source_path,
-                        dest,
-                        dest_path,
-                        NativeStagedCopyPolicy {
-                            metadata: native_metadata.clone(),
-                            expected_destination,
-                            verify: options.verify,
-                            checks: checks.clone(),
-                            preservation: options.preservation.clone(),
-                        },
-                    )
-                    .await?;
-                    source_file = returned_source;
-                    if let Some(result) = result {
-                        return Ok(TransferResult {
-                            bytes_written: result.bytes_written,
-                            strategy: TransferStrategy::NativeSparseCopy,
-                            verification: result.verification,
-                        });
+            let sparse_candidate = if source_caps.sparse && dest_caps.sparse {
+                match native_file_is_sparse(&source_file) {
+                    Ok(true) => source.native_file_has_sparse_holes(&source_file).await?,
+                    Ok(false) => false,
+                    Err(error) => {
+                        tracing::debug!("native sparse candidate check failed: {error}");
+                        false
                     }
                 }
-
-                if options.update
-                    && native_metadata.size >= 16 * 1024 * 1024
-                    && source_caps.random_read
-                    && dest_caps.random_write
-                    && dest_caps.reflink
-                    && crate::fs_util::supports_cow_reflinks(&dest_native)
-                    && !crate::fs_util::has_hard_links(&dest_native)
-                {
-                    if let Some(result) = reflink_patch(
-                        source_native.clone(),
-                        dest_native.clone(),
-                        native_metadata.clone(),
-                        options.verify,
-                        checks.clone(),
-                        options.preservation.clone(),
-                    )
-                    .await?
-                    {
-                        return Ok(TransferResult {
-                            bytes_written: result.bytes_written,
-                            strategy: TransferStrategy::ReflinkPatch,
-                            verification: result.verification,
-                        });
-                    }
-                }
-
-                let result = native_whole_staged_copy(
+            } else {
+                false
+            };
+            if sparse_candidate {
+                let (returned_source, result) = native_sparse_staged_copy(
                     source_file,
                     source_path,
                     dest,
                     dest_path,
                     NativeStagedCopyPolicy {
-                        metadata: native_metadata,
+                        metadata: native_metadata.clone(),
                         expected_destination,
                         verify: options.verify,
-                        checks,
-                        preservation: options.preservation,
+                        checks: checks.clone(),
+                        preservation: options.preservation.clone(),
                     },
                 )
                 .await?;
-                return Ok(TransferResult {
-                    bytes_written: result.bytes_written,
-                    strategy: TransferStrategy::NativeWholeCopy,
-                    verification: result.verification,
-                });
+                source_file = returned_source;
+                if let Some(result) = result {
+                    return Ok(TransferResult {
+                        bytes_written: result.bytes_written,
+                        strategy: TransferStrategy::NativeSparseCopy,
+                        verification: result.verification,
+                    });
+                }
             }
+
+            #[cfg(target_os = "linux")]
+            if options.update
+                && native_metadata.size >= 16 * 1024 * 1024
+                && source_caps.random_read
+                && dest_caps.random_write
+                && dest_caps.reflink
+                && dest_native
+                    .as_deref()
+                    .is_some_and(crate::fs_util::supports_cow_reflinks)
+            {
+                let (returned_source, result) = reflink_patch(
+                    source_file,
+                    dest,
+                    dest_path,
+                    NativeReflinkPatchPolicy {
+                        source_path: source_path.to_path_buf(),
+                        metadata: native_metadata.clone(),
+                        expected_destination,
+                        verify: options.verify,
+                        checks: checks.clone(),
+                        preservation: options.preservation.clone(),
+                    },
+                )
+                .await?;
+                source_file = returned_source;
+                if let Some(result) = result {
+                    return Ok(TransferResult {
+                        bytes_written: result.bytes_written,
+                        strategy: TransferStrategy::ReflinkPatch,
+                        verification: result.verification,
+                    });
+                }
+            }
+
+            let result = native_whole_staged_copy(
+                source_file,
+                source_path,
+                dest,
+                dest_path,
+                NativeStagedCopyPolicy {
+                    metadata: native_metadata,
+                    expected_destination,
+                    verify: options.verify,
+                    checks,
+                    preservation: options.preservation,
+                },
+            )
+            .await?;
+            return Ok(TransferResult {
+                bytes_written: result.bytes_written,
+                strategy: TransferStrategy::NativeWholeCopy,
+                verification: result.verification,
+            });
         }
     }
 
@@ -701,177 +734,129 @@ async fn native_whole_staged_copy(
     })
 }
 
+#[cfg(target_os = "linux")]
 async fn reflink_patch(
-    source: PathBuf,
-    dest: PathBuf,
-    metadata: FileMetadata,
-    verify: bool,
-    checks: CommitChecks,
-    preservation: Preservation,
-) -> Result<Option<NativeTransferResult>> {
-    tokio::task::spawn_blocking(move || {
-        if !dest.exists() {
-            return Ok(None);
+    source_file: std::fs::File,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    policy: NativeReflinkPatchPolicy,
+) -> Result<(std::fs::File, Option<NativeTransferResult>)> {
+    let NativeReflinkPatchPolicy {
+        source_path,
+        metadata,
+        expected_destination,
+        verify,
+        checks,
+        preservation,
+    } = policy;
+    let ExpectedDestination::Unchanged(expected_destination_identity) = expected_destination else {
+        return Ok((source_file, None));
+    };
+    let Some(destination_basis) = (match dest.open_native_file(dest_path).await {
+        Ok(file) => file,
+        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SyncError::DestinationChanged {
+                path: dest_path.to_path_buf(),
+            });
         }
+        Err(error) => {
+            tracing::debug!("could not open reflink basis, falling back to whole copy: {error}");
+            return Ok((source_file, None));
+        }
+    }) else {
+        return Ok((source_file, None));
+    };
+    verify_open_destination_identity(&destination_basis, expected_destination_identity, dest_path)?;
+    if destination_basis.metadata()?.nlink() > 1 {
+        return Ok((source_file, None));
+    }
 
-        // Reflink patching trades an extra destination read for fewer physical
-        // writes. Keep it conservative until the benchmark suite tunes this.
-        let ratio = match sy::transfer::ratio::estimate_change_ratio(
-            &source,
-            &dest,
+    // Reflink patching trades an extra destination read for fewer physical
+    // writes. Keep it conservative until the benchmark suite tunes this.
+    let (source_file, destination_basis, ratio) = tokio::task::spawn_blocking(move || {
+        let mut source_file = source_file;
+        let mut destination_basis = destination_basis;
+        let ratio = sy::transfer::ratio::estimate_change_ratio_files(
+            &mut source_file,
+            &mut destination_basis,
             TRANSFER_BUFFER_SIZE,
             Some(16),
             Some(0.25),
-        ) {
-            Ok(ratio) if ratio.use_delta => ratio,
-            Ok(_) => return Ok(None),
-            Err(error) => {
-                tracing::debug!("reflink change sampling failed: {error}");
-                return Ok(None);
-            }
-        };
-
-        tracing::debug!(
-            changed = %ratio.change_ratio_percent(),
-            "using reflink patch strategy"
         );
-
-        let temp = TempFileGuard::temp_path_for(&dest);
-        let guard = TempFileGuard::new(&temp);
-        if let Err(error) = reflink_clone(&dest, &temp) {
-            tracing::debug!("reflink clone failed, falling back to whole copy: {error}");
-            return Ok(None);
-        }
-
-        strip_xattrs(&temp)?;
-        let bytes_written = patch_changed_blocks(&source, &dest, &temp, metadata.size)?;
-        let mut staged_file = std::fs::OpenOptions::new().read(true).open(&temp)?;
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
-        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
-        if matches!(verification, VerificationStatus::Failed { .. }) {
-            return Ok(Some(NativeTransferResult {
-                bytes_written,
-                verification,
-            }));
-        }
-        checks.verify(CheckPoint::Commit)?;
-        std::fs::rename(&temp, &dest)?;
-        guard.defuse();
-        Ok(Some(NativeTransferResult {
-            bytes_written,
-            verification,
-        }))
+        (source_file, destination_basis, ratio)
     })
     .await
-    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
-}
-
-fn patch_changed_blocks(
-    source: &Path,
-    old_dest: &Path,
-    staged: &Path,
-    source_size: u64,
-) -> std::io::Result<u64> {
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let mut source_file = File::open(source)?;
-    let mut dest_file = File::open(old_dest)?;
-    let mut staged_file = OpenOptions::new().write(true).open(staged)?;
-    let mut source_buf = vec![0_u8; TRANSFER_BUFFER_SIZE];
-    let mut dest_buf = vec![0_u8; TRANSFER_BUFFER_SIZE];
-    let mut offset = 0_u64;
-    let mut bytes_written = 0_u64;
-
-    loop {
-        let source_read = source_file.read(&mut source_buf)?;
-        if source_read == 0 {
-            break;
+    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+    let ratio = match ratio {
+        Ok(ratio) if ratio.use_delta => ratio,
+        Ok(_) => return Ok((source_file, None)),
+        Err(error) => {
+            tracing::debug!("reflink change sampling failed: {error}");
+            return Ok((source_file, None));
         }
-        let dest_read = dest_file.read(&mut dest_buf)?;
+    };
+    tracing::debug!(
+        changed = %ratio.change_ratio_percent(),
+        "using reflink patch strategy"
+    );
 
-        if source_read != dest_read || source_buf[..source_read] != dest_buf[..dest_read] {
-            staged_file.seek(SeekFrom::Start(offset))?;
-            staged_file.write_all(&source_buf[..source_read])?;
-            bytes_written += source_read as u64;
+    let (source_file, expected_hash) = if verify {
+        tokio::task::spawn_blocking(move || {
+            let mut source_file = source_file;
+            let hash = hash_native_open_file(&mut source_file)?;
+            Ok::<_, std::io::Error>((source_file, Some(hash)))
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
+        .map_err(SyncError::Io)?
+    } else {
+        (source_file, None)
+    };
+
+    let mut writer = dest.begin_write(dest_path, expected_destination).await?;
+    let (source_file, _destination_basis, bytes_written) = match writer
+        .reflink_patch_from_native_files(source_file, destination_basis, metadata.size)
+        .await
+    {
+        Ok(result) => result,
+        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let operation = SyncError::SourceChanged {
+                path: source_path.to_path_buf(),
+            };
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
         }
+        Err(operation) => {
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
+    };
+    let Some(bytes_written) = bytes_written else {
+        writer.abort().await?;
+        return Ok((source_file, None));
+    };
 
-        offset += source_read as u64;
-    }
+    let expected_source = checks.expected_source_identity();
+    let pre_commit = || {
+        checks.verify_source(CheckPoint::Commit)?;
+        verify_open_source_identity(&source_file, expected_source, &source_path)?;
+        verify_open_source_size(&source_file, metadata.size, &source_path)
+    };
+    let verification = crate::endpoint::io::finalize_staged_writer(
+        writer,
+        &metadata,
+        &preservation,
+        expected_hash,
+        Some(&pre_commit),
+    )
+    .await?;
 
-    staged_file.set_len(source_size)?;
-    staged_file.flush()?;
-    Ok(bytes_written)
-}
-
-#[cfg(target_os = "linux")]
-fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
-    use std::fs::{File, OpenOptions};
-    use std::os::fd::AsRawFd;
-
-    // FICLONE is a fixed 32-bit request code; `libc::Ioctl` differs between
-    // glibc (c_ulong) and musl (c_int), and the kernel only compares the low
-    // 32 bits of the request word.
-    const FICLONE: libc::Ioctl = 0x4004_9409_u32 as libc::Ioctl;
-
-    let source_file = File::open(source)?;
-    let dest_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
-
-    // SAFETY: both file descriptors are valid for the duration of the ioctl;
-    // `source_file` is open for reading and `dest_file` is a distinct, newly
-    // created writable file as required by FICLONE.
-    let rc = unsafe { libc::ioctl(dest_file.as_raw_fd(), FICLONE, source_file.as_raw_fd()) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        let error = std::io::Error::last_os_error();
-        drop(dest_file);
-        let _ = std::fs::remove_file(dest);
-        Err(error)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn reflink_clone(source: &Path, dest: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    unsafe extern "C" {
-        fn clonefile(
-            source: *const libc::c_char,
-            dest: *const libc::c_char,
-            flags: libc::c_int,
-        ) -> libc::c_int;
-    }
-
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
-    let dest = CString::new(dest.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
-
-    // SAFETY: both pointers come from live `CString` values and are therefore
-    // NUL-terminated and valid for this call. The destination path is a fresh
-    // staging path and flags=0 matches the documented clonefile contract.
-    let rc = unsafe { clonefile(source.as_ptr(), dest.as_ptr(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reflink_clone(_source: &Path, _dest: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "reflinks unsupported on this platform",
+    Ok((
+        source_file,
+        Some(NativeTransferResult {
+            bytes_written,
+            verification,
+        }),
     ))
 }
 
@@ -1712,6 +1697,7 @@ mod tests {
 
     /// A large, mostly-unchanged update is eligible for reflink patching on COW
     /// filesystems; the strategy must still honor the commit checks.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reflink_patch_enforces_commit_checks() {
         let Some(fixture) = cow_fixture() else {
@@ -1750,11 +1736,12 @@ mod tests {
             return;
         };
         let size = 16 * 1024 * 1024 + 1;
-        let mut content = vec![b'A'; size];
-        content[0] = b'B';
-        std::fs::write(fixture.source_file(), &content).unwrap();
-        content[0] = b'A';
-        std::fs::write(fixture.dest_file(), &content).unwrap();
+        let mut source_content = vec![b'A'; size];
+        source_content[0] = b'B';
+        std::fs::write(fixture.source_file(), &source_content).unwrap();
+        let mut dest_content = source_content.clone();
+        dest_content[0] = b'A';
+        std::fs::write(fixture.dest_file(), &dest_content).unwrap();
         let identity = update_identity(&fixture);
 
         let result = transfer_file(
@@ -1767,8 +1754,11 @@ mod tests {
         .await
         .unwrap();
 
+        #[cfg(target_os = "linux")]
         assert_eq!(result.strategy, TransferStrategy::ReflinkPatch);
-        assert_eq!(std::fs::read(fixture.dest_file()).unwrap()[0], b'B');
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), source_content);
     }
 
     #[tokio::test]

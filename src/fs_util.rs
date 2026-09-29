@@ -40,6 +40,7 @@ use sy::engine::namespace::NamespaceSemantics;
 /// }
 /// ```
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // Used by platform tests; the rooted clone path is Linux-only.
 pub fn supports_cow_reflinks(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -118,6 +119,7 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(dead_code)] // Used by platform tests; the rooted clone path is Linux-only.
 pub fn supports_cow_reflinks(_path: &Path) -> bool {
     // Windows ReFS supports reflinks via FSCTL_DUPLICATE_EXTENTS_TO_FILE,
     // but it's rare. For now, assume no COW on Windows/other platforms.
@@ -209,6 +211,7 @@ pub fn same_filesystem(_path1: &Path, _path2: &Path) -> bool {
 /// }
 /// ```
 #[cfg(unix)]
+#[allow(dead_code)] // Kept as a public filesystem utility and exercised by tests.
 pub fn has_hard_links(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -218,6 +221,7 @@ pub fn has_hard_links(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)] // Kept as a public filesystem utility and exercised by tests.
 pub fn has_hard_links(_path: &Path) -> bool {
     // Windows has hard links but less common, and we don't use COW there anyway
     false

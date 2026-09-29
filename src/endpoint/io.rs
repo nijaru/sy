@@ -153,6 +153,20 @@ pub trait StagedWriter: Send {
         Ok((source, None))
     }
 
+    /// Attempt a descriptor-bound reflink patch from a held source and prior
+    /// destination into private staging. `None` means the endpoint/platform
+    /// cannot safely perform this optimization; staging must remain unchanged
+    /// so the caller can abort it and use whole-file copy instead. Return both
+    /// handles for post-copy identity checks.
+    async fn reflink_patch_from_native_files(
+        &mut self,
+        source: File,
+        destination_basis: File,
+        _source_size: u64,
+    ) -> Result<(File, File, Option<u64>)> {
+        Ok((source, destination_basis, None))
+    }
+
     async fn commit(self: Box<Self>) -> Result<()>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }

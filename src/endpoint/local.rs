@@ -565,6 +565,119 @@ fn copy_sparse_native_file_blocking(
     Ok(Some(bytes_written))
 }
 
+/// Clone the held destination basis into rooted staging, then patch changed
+/// ranges from the held source. Linux FICLONE accepts file descriptors, so no
+/// visible pathname is reopened by this optimization.
+#[cfg(target_os = "linux")]
+fn reflink_patch_native_files_blocking(
+    source: &mut std::fs::File,
+    destination_basis: &mut std::fs::File,
+    staged: &mut std::fs::File,
+    source_size: u64,
+) -> std::io::Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+
+    // FICLONE is a fixed 32-bit request code; libc::Ioctl differs between
+    // glibc and musl, while the kernel compares the low 32 bits.
+    const FICLONE: libc::Ioctl = 0x4004_9409_u32 as libc::Ioctl;
+
+    staged.set_len(0)?;
+    let result = unsafe {
+        // SAFETY: both descriptors are held regular files. `destination_basis`
+        // is open for reading and `staged` is a distinct writable private inode,
+        // as required by FICLONE.
+        libc::ioctl(staged.as_raw_fd(), FICLONE, destination_basis.as_raw_fd())
+    };
+    if result < 0 {
+        // A failed clone must leave staging ready for a different strategy.
+        staged.set_len(0)?;
+        staged.seek(SeekFrom::Start(0))?;
+        return Ok(None);
+    }
+
+    patch_native_reflink_ranges_blocking(source, destination_basis, staged, source_size).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn patch_native_reflink_ranges_blocking(
+    source: &mut std::fs::File,
+    destination_basis: &mut std::fs::File,
+    staged: &mut std::fs::File,
+    source_size: u64,
+) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    source.seek(SeekFrom::Start(0))?;
+    destination_basis.seek(SeekFrom::Start(0))?;
+    let mut source_buffer = vec![0_u8; 1024 * 1024];
+    let mut basis_buffer = vec![0_u8; 1024 * 1024];
+    let mut offset = 0_u64;
+    let mut bytes_written = 0_u64;
+    loop {
+        let source_read = read_up_to(source, &mut source_buffer)?;
+        if source_read == 0 {
+            break;
+        }
+        let basis_read = read_up_to(destination_basis, &mut basis_buffer)?;
+        if source_read != basis_read || source_buffer[..source_read] != basis_buffer[..basis_read] {
+            staged.seek(SeekFrom::Start(offset))?;
+            staged.write_all(&source_buffer[..source_read])?;
+            bytes_written = bytes_written
+                .checked_add(u64::try_from(source_read).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "reflink patch byte count exceeds u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "reflink patch byte count overflow",
+                    )
+                })?;
+        }
+        offset = offset
+            .checked_add(u64::try_from(source_read).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "reflink source offset exceeds u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "reflink offset overflow")
+            })?;
+    }
+    if offset != source_size || source.metadata()?.len() != source_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source changed while applying reflink patch",
+        ));
+    }
+
+    staged.set_len(source_size)?;
+    staged.flush()?;
+    Ok(bytes_written)
+}
+
+/// Read a full buffer unless EOF arrives. Regular files can still return short
+/// reads, and patch comparison must keep source and basis offsets aligned.
+#[cfg(target_os = "linux")]
+fn read_up_to(file: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 /// Apply a preservation payload to one local staging path before commit.
 pub(crate) fn apply_preservation_blocking(
     full_path: &Path,
@@ -652,6 +765,26 @@ impl StagedWriter for LocalStagedWriter {
         {
             Ok((source, None))
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn reflink_patch_from_native_files(
+        &mut self,
+        mut source: std::fs::File,
+        mut destination_basis: std::fs::File,
+        source_size: u64,
+    ) -> Result<(std::fs::File, std::fs::File, Option<u64>)> {
+        self.file_mut()?.flush().await?;
+        self.with_staged(move |staged| {
+            let bytes_written = reflink_patch_native_files_blocking(
+                &mut source,
+                &mut destination_basis,
+                staged.file_mut(),
+                source_size,
+            )?;
+            Ok((source, destination_basis, bytes_written))
+        })
+        .await
     }
 
     async fn apply_preservation(
@@ -1097,6 +1230,84 @@ mod tests {
             #[cfg(unix)]
             mode: 0o644,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reflink_clone_uses_held_files_or_leaves_staging_empty() {
+        const BUFFER: usize = 1024 * 1024;
+
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source");
+        let basis_path = dir.path().join("basis");
+        let staged_path = dir.path().join("staged");
+        let mut source = vec![b'a'; BUFFER + 1];
+        source[BUFFER] = b'b';
+        let basis = vec![b'a'; source.len()];
+        fs::write(&source_path, &source).unwrap();
+        fs::write(&basis_path, &basis).unwrap();
+        fs::write(&staged_path, b"stale staging bytes").unwrap();
+
+        let mut source_file = fs::File::open(source_path).unwrap();
+        let mut basis_file = fs::File::open(basis_path).unwrap();
+        let mut staged_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&staged_path)
+            .unwrap();
+        let result = reflink_patch_native_files_blocking(
+            &mut source_file,
+            &mut basis_file,
+            &mut staged_file,
+            source.len() as u64,
+        )
+        .unwrap();
+        drop(staged_file);
+
+        match result {
+            Some(bytes_written) => {
+                assert_eq!(bytes_written, 1);
+                assert_eq!(fs::read(staged_path).unwrap(), source);
+            }
+            None => assert_eq!(fs::metadata(staged_path).unwrap().len(), 0),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_reflink_patch_matches_source_across_changed_and_equal_blocks() {
+        const BUFFER: usize = 1024 * 1024;
+
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source");
+        let basis_path = dir.path().join("basis");
+        let staged_path = dir.path().join("staged");
+        let mut source = vec![b'a'; 2 * BUFFER + 11];
+        source[7] = b'b';
+        source[2 * BUFFER + 10] = b'c';
+        let basis = vec![b'a'; source.len()];
+        fs::write(&source_path, &source).unwrap();
+        fs::write(&basis_path, &basis).unwrap();
+        fs::write(&staged_path, &basis).unwrap();
+
+        let mut source_file = fs::File::open(source_path).unwrap();
+        let mut basis_file = fs::File::open(basis_path).unwrap();
+        let mut staged_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&staged_path)
+            .unwrap();
+        let bytes_written = patch_native_reflink_ranges_blocking(
+            &mut source_file,
+            &mut basis_file,
+            &mut staged_file,
+            source.len() as u64,
+        )
+        .unwrap();
+        drop(staged_file);
+
+        assert_eq!(bytes_written, (BUFFER + 11) as u64);
+        assert_eq!(fs::read(staged_path).unwrap(), source);
     }
 
     #[test]
