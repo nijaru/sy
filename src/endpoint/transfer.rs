@@ -12,7 +12,7 @@ use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
 use std::path::{Path, PathBuf};
-use sy::engine::domain::EntryIdentity;
+use sy::engine::domain::{EntryIdentity, Timestamp};
 
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -42,6 +42,31 @@ pub struct TransferOptions {
     /// Preservation payload read from the validated source; applied to staging
     /// before commit so a failure aborts instead of committing bare content.
     pub preservation: Preservation,
+    /// Requested mode and mtime to apply to staging instead of source metadata.
+    pub metadata: Option<TransferMetadata>,
+}
+
+/// Policy-selected mode and timestamp for a staged transfer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferMetadata {
+    pub unix_mode: Option<u32>,
+    pub modified: Option<Timestamp>,
+}
+
+pub(crate) fn timestamp_to_system_time(timestamp: Timestamp) -> Option<std::time::SystemTime> {
+    let nanos = u64::from(timestamp.nanoseconds());
+    if timestamp.seconds() >= 0 {
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
+            u64::try_from(timestamp.seconds()).ok()?,
+            timestamp.nanoseconds(),
+        ))
+    } else {
+        // Timestamps use a non-negative nanosecond field even before the epoch:
+        // (-1, 999_999_999) is one nanosecond before it.
+        let delta = std::time::Duration::from_secs(timestamp.seconds().unsigned_abs())
+            .checked_sub(std::time::Duration::from_nanos(nanos))?;
+        std::time::UNIX_EPOCH.checked_sub(delta)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,6 +365,26 @@ async fn transfer_file_inner(
             source_path.display()
         )));
     }
+    if let Some(transfer_metadata) = options.metadata {
+        if let Some(modified) = transfer_metadata.modified {
+            metadata.modified = timestamp_to_system_time(modified).ok_or_else(|| {
+                SyncError::Config(format!(
+                    "requested timestamp for {} is outside the supported range",
+                    source_path.display()
+                ))
+            })?;
+        }
+        #[cfg(unix)]
+        if let Some(mode) = transfer_metadata.unix_mode {
+            metadata.mode = mode;
+        }
+        #[cfg(not(unix))]
+        if transfer_metadata.unix_mode.is_some() {
+            return Err(SyncError::Config(
+                "Unix mode preservation is not supported on this platform".to_string(),
+            ));
+        }
+    }
 
     let source_caps = source.capabilities();
     let dest_caps = dest.capabilities();
@@ -498,18 +543,18 @@ async fn native_whole_copy(
         let guard = TempFileGuard::new(&temp);
         let bytes_written = std::fs::copy(&source, &temp)?;
         strip_xattrs(&temp)?;
+        let mut staged_file = std::fs::OpenOptions::new().read(true).open(&temp)?;
 
-        let verification = verify_native_staging(&source, &temp, verify)?;
+        apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
             return Ok(NativeTransferResult {
                 bytes_written,
                 verification,
             });
         }
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
         checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -566,18 +611,18 @@ async fn reflink_patch(
 
         strip_xattrs(&temp)?;
         let bytes_written = patch_changed_blocks(&source, &dest, &temp, metadata.size)?;
+        let mut staged_file = std::fs::OpenOptions::new().read(true).open(&temp)?;
 
-        let verification = verify_native_staging(&source, &temp, verify)?;
+        apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
             return Ok(Some(NativeTransferResult {
                 bytes_written,
                 verification,
             }));
         }
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
         checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -759,18 +804,18 @@ async fn native_sparse_copy(
 
         staged.flush()?;
         drop(staged);
+        let mut staged_file = File::open(&temp)?;
 
-        let verification = verify_native_staging(&source, &temp, verify)?;
+        apply_metadata(&temp, &metadata)?;
+        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
+        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
+        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
         if matches!(verification, VerificationStatus::Failed { .. }) {
             return Ok(Some(NativeTransferResult {
                 bytes_written,
                 verification,
             }));
         }
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
         checks.verify(CheckPoint::Commit)?;
         std::fs::rename(&temp, &dest)?;
         guard.defuse();
@@ -797,7 +842,7 @@ async fn native_sparse_copy(
 
 fn verify_native_staging(
     source: &Path,
-    staged: &Path,
+    staged: &mut std::fs::File,
     verify: bool,
 ) -> std::io::Result<VerificationStatus> {
     if !verify {
@@ -805,7 +850,7 @@ fn verify_native_staging(
     }
 
     let expected = hash_native_file(source)?;
-    let actual = hash_native_file(staged)?;
+    let actual = hash_native_open_file(staged)?;
     if expected == actual {
         Ok(VerificationStatus::Verified)
     } else {
@@ -814,10 +859,14 @@ fn verify_native_staging(
 }
 
 fn hash_native_file(path: &Path) -> std::io::Result<blake3::Hash> {
-    use std::fs::File;
-    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    hash_native_open_file(&mut file)
+}
 
-    let mut file = File::open(path)?;
+fn hash_native_open_file(file: &mut std::fs::File) -> std::io::Result<blake3::Hash> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
     let mut hasher = blake3::Hasher::new();
 
@@ -829,6 +878,7 @@ fn hash_native_file(path: &Path) -> std::io::Result<blake3::Hash> {
         hasher.update(&buffer[..read]);
     }
 
+    file.seek(SeekFrom::End(0))?;
     Ok(hasher.finalize())
 }
 
@@ -947,6 +997,7 @@ mod tests {
             rate_limiter: None,
             preservation: Preservation::default(),
             identity,
+            metadata: None,
         }
     }
 
@@ -1002,6 +1053,72 @@ mod tests {
 
         assert_eq!(result.strategy, TransferStrategy::Streaming);
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn requested_file_metadata_is_staged_before_commit() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        std::fs::set_permissions(
+            fixture.source_file(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::set_permissions(fixture.dest_file(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let old_time = timestamp_to_system_time(Timestamp::new(50, 0).unwrap()).unwrap();
+        let requested_time =
+            timestamp_to_system_time(Timestamp::new(123, 456_789_000).unwrap()).unwrap();
+        filetime::set_file_mtime(
+            fixture.dest_file(),
+            filetime::FileTime::from_system_time(old_time),
+        )
+        .unwrap();
+        let identity = update_identity(&fixture);
+        let dest_file = fixture.dest_file();
+        let hook = hook(move || {
+            assert_eq!(std::fs::read(&dest_file).unwrap(), b"OLD!");
+            let metadata = std::fs::metadata(&dest_file).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(metadata.modified().unwrap(), old_time);
+        });
+        let mut transfer_options = options(identity, true);
+        transfer_options.verify = true;
+        transfer_options.metadata = Some(TransferMetadata {
+            unix_mode: Some(0o200),
+            modified: Some(Timestamp::new(123, 456_789_000).unwrap()),
+        });
+
+        transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            transfer_options,
+            hook,
+        )
+        .await
+        .unwrap();
+
+        let metadata = std::fs::metadata(fixture.dest_file()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o200);
+        assert_eq!(metadata.modified().unwrap(), requested_time);
+        std::fs::set_permissions(fixture.dest_file(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[test]
+    fn timestamp_conversion_handles_pre_epoch_values() {
+        let one_nanosecond_before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .unwrap();
+        assert_eq!(
+            timestamp_to_system_time(Timestamp::new(-1, 999_999_999).unwrap()),
+            Some(one_nanosecond_before_epoch)
+        );
     }
 
     #[tokio::test]

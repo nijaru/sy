@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -147,6 +147,7 @@ impl LocalStagedWriter {
         let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&final_path);
         let guard = crate::temp_file::TempFileGuard::new(&temp_path);
         let file = tokio::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path)
@@ -299,9 +300,10 @@ impl StagedWriter for LocalStagedWriter {
 
     async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
         const BUFFER_SIZE: usize = 1024 * 1024;
-        self.file_mut()?.flush().await?;
+        let file = self.file_mut()?;
+        file.flush().await?;
+        file.seek(SeekFrom::Start(0)).await?;
 
-        let mut file = tokio::fs::File::open(&self.temp_path).await?;
         let mut buffer = vec![0_u8; BUFFER_SIZE];
         let mut hasher = blake3::Hasher::new();
         loop {
@@ -311,6 +313,7 @@ impl StagedWriter for LocalStagedWriter {
             }
             hasher.update(&buffer[..read]);
         }
+        file.seek(SeekFrom::End(0)).await?;
         Ok(Some(hasher.finalize()))
     }
 
@@ -730,6 +733,41 @@ mod tests {
         .unwrap();
         assert_eq!(verified, crate::endpoint::io::VerificationStatus::Verified);
         assert_eq!(fs::read(dir.path().join("created")).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalizer_hashes_staging_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("private"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"private bytes").await.unwrap();
+        let mut metadata = make_meta();
+        metadata.mode = 0;
+
+        let result = crate::endpoint::io::finalize_staged_writer(
+            writer,
+            &metadata,
+            &crate::endpoint::io::Preservation::default(),
+            Some(blake3::hash(b"private bytes")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, crate::endpoint::io::VerificationStatus::Verified);
+        let path = dir.path().join("private");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"private bytes");
     }
 
     #[tokio::test]

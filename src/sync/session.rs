@@ -246,6 +246,7 @@ impl SyncSession {
                     },
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
+                metadata: None,
             },
         )
         .await?;
