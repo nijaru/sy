@@ -53,6 +53,19 @@ pub enum SyncError {
     #[error("staged operation failed ({operation}) and abort also failed ({abort})")]
     StagingAbortFailed { operation: String, abort: String },
 
+    #[error("destination was committed at {path}, but private staging cleanup failed: {reason}")]
+    CommittedCleanupPending { path: PathBuf, reason: String },
+
+    #[error("destination was committed at {destination}, but the configured root path {root} could not be verified after commit ({reason}); locate and verify the file before retrying")]
+    CommittedRootChanged {
+        destination: PathBuf,
+        root: PathBuf,
+        reason: String,
+    },
+
+    #[error("destination was committed at {path}, but its parent no longer matches the rooted path: {reason}; locate and verify the file before retrying")]
+    CommittedParentChanged { path: PathBuf, reason: String },
+
     #[error(
         "Source changed during transfer: {path}\nThe source was modified or replaced after it was scanned; the destination was left unchanged."
     )]

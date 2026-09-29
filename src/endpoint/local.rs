@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -17,14 +17,36 @@ use std::os::unix::fs::MetadataExt;
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
+    rooted: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<sy::rooted_fs::RootedFs>>>,
 }
 
 impl LocalEndpoint {
     pub fn new(root: PathBuf) -> Self {
+        let root = if root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            root
+        };
         Self {
             root,
             capabilities: Capabilities::local(),
+            rooted: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    async fn rooted_fs(&self) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
+        let root = self.root.clone();
+        let rooted = self
+            .rooted
+            .get_or_try_init(|| async move {
+                tokio::fs::create_dir_all(&root).await?;
+                let rooted = sy::rooted_fs::RootedFs::open(root)
+                    .await
+                    .map_err(map_rooted_fs_error)?;
+                Ok::<_, SyncError>(std::sync::Arc::new(rooted))
+            })
+            .await?;
+        Ok(std::sync::Arc::clone(rooted))
     }
 
     fn resolve(&self, relative: &Path) -> PathBuf {
@@ -47,13 +69,31 @@ fn file_metadata_from_fs(meta: &fs::Metadata) -> FileMetadata {
     }
 }
 
-/// Transactional local regular-file write backed by a same-directory temp file.
-struct LocalStagedWriter {
-    file: Option<tokio::fs::File>,
-    temp_path: PathBuf,
-    final_path: PathBuf,
-    guard: Option<crate::temp_file::TempFileGuard>,
-    expected_destination: ExpectedDestination,
+fn rooted_expected_destination(expected: ExpectedDestination) -> sy::endpoint::ExpectedDestination {
+    match expected {
+        ExpectedDestination::Absent => sy::endpoint::ExpectedDestination::Absent,
+        ExpectedDestination::Unchanged(identity) => sy::endpoint::ExpectedDestination::Unchanged(
+            sy::engine::domain::EntryIdentity::from_bytes(*identity.as_bytes()),
+        ),
+        ExpectedDestination::SnapshotAtOpen => sy::endpoint::ExpectedDestination::SnapshotAtOpen,
+        ExpectedDestination::Unverified => sy::endpoint::ExpectedDestination::Unverified,
+    }
+}
+
+fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
+    match error {
+        sy::rooted_fs::RootedFsError::DestinationChanged(path) => {
+            SyncError::DestinationChanged { path }
+        }
+        sy::rooted_fs::RootedFsError::CommittedCleanupPending { path, reason } => {
+            SyncError::CommittedCleanupPending { path, reason }
+        }
+        sy::rooted_fs::RootedFsError::CommittedParentChanged { path, reason } => {
+            SyncError::CommittedParentChanged { path, reason }
+        }
+        sy::rooted_fs::RootedFsError::RootChanged(path) => SyncError::DestinationChanged { path },
+        error => SyncError::Io(std::io::Error::other(error)),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,30 +176,102 @@ pub(crate) async fn verify_destination_expectation(
     }
 }
 
-impl LocalStagedWriter {
-    async fn new(final_path: PathBuf, expectation: ExpectedDestination) -> Result<Self> {
-        let expected_destination =
-            capture_destination_expectation(&final_path, expectation).await?;
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+/// Local staged writes share the rooted endpoint transaction owner.
+struct LocalStagedWriter {
+    rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
+    root_path: PathBuf,
+    destination_path: PathBuf,
+    staged: Option<sy::rooted_fs::RootedStagedFile>,
+    file: Option<tokio::fs::File>,
+    #[cfg(test)]
+    commit_queued: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
-        let temp_path = crate::temp_file::TempFileGuard::temp_path_for(&final_path);
-        let guard = crate::temp_file::TempFileGuard::new(&temp_path);
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await?;
+struct CommitCancellationGuard {
+    state: Option<std::sync::Arc<std::sync::Mutex<bool>>>,
+}
+
+impl CommitCancellationGuard {
+    fn new(state: std::sync::Arc<std::sync::Mutex<bool>>) -> Self {
+        Self { state: Some(state) }
+    }
+
+    fn disarm(&mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for CommitCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(state) = &self.state {
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        }
+    }
+}
+
+impl LocalStagedWriter {
+    async fn new(
+        rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
+        relative: sy::engine::domain::RelativePath,
+        expectation: ExpectedDestination,
+        root_path: PathBuf,
+        destination_path: PathBuf,
+    ) -> Result<Self> {
+        let parent = relative.parent();
+        let rooted_for_staging = std::sync::Arc::clone(&rooted);
+        let (staged, file) = tokio::task::spawn_blocking(move || {
+            rooted_for_staging
+                .verify_root_path_blocking()
+                .map_err(map_rooted_fs_error)?;
+            if let Some(parent) = parent {
+                rooted_for_staging
+                    .create_directories_blocking(&parent)
+                    .map_err(map_rooted_fs_error)?;
+            }
+            let staged = rooted_for_staging
+                .begin_staged_file_with_expectation_blocking(
+                    &relative,
+                    rooted_expected_destination(expectation),
+                )
+                .map_err(map_rooted_fs_error)?;
+            let file = staged.try_clone_file().map_err(map_rooted_fs_error)?;
+            Ok::<_, SyncError>((staged, file))
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
 
         Ok(Self {
-            file: Some(file),
-            temp_path,
-            final_path,
-            guard: Some(guard),
-            expected_destination,
+            rooted,
+            root_path,
+            destination_path,
+            staged: Some(staged),
+            file: Some(tokio::fs::File::from_std(file)),
+            #[cfg(test)]
+            commit_queued: None,
         })
+    }
+
+    async fn with_staged<T, F>(&mut self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut sy::rooted_fs::RootedStagedFile) -> sy::rooted_fs::Result<T>
+            + Send
+            + 'static,
+    {
+        let mut staged = self
+            .staged
+            .take()
+            .ok_or_else(|| SyncError::Config("staged writer is already closed".to_string()))?;
+        let (staged, result) = tokio::task::spawn_blocking(move || {
+            let result = operation(&mut staged);
+            (staged, result)
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        self.staged = Some(staged);
+        result.map_err(map_rooted_fs_error)
     }
 
     fn file_mut(&mut self) -> Result<&mut tokio::fs::File> {
@@ -281,40 +393,22 @@ impl StagedWriter for LocalStagedWriter {
 
     async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()> {
         self.file_mut()?.flush().await?;
-        filetime::set_file_mtime(
-            &self.temp_path,
-            filetime::FileTime::from_system_time(metadata.modified),
-        )?;
-
+        let time = filetime::FileTime::from_system_time(metadata.modified);
+        let modified = sy::engine::domain::Timestamp::new(time.seconds(), time.nanoseconds())
+            .map_err(|error| SyncError::Config(error.to_string()))?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(
-                &self.temp_path,
-                std::fs::Permissions::from_mode(metadata.mode),
-            )
-            .await?;
-        }
-        Ok(())
+        let unix_mode = Some(metadata.mode);
+        #[cfg(not(unix))]
+        let unix_mode = None;
+        self.with_staged(move |staged| staged.apply_metadata_blocking(unix_mode, Some(modified)))
+            .await
     }
 
     async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
-        const BUFFER_SIZE: usize = 1024 * 1024;
-        let file = self.file_mut()?;
-        file.flush().await?;
-        file.seek(SeekFrom::Start(0)).await?;
-
-        let mut buffer = vec![0_u8; BUFFER_SIZE];
-        let mut hasher = blake3::Hasher::new();
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        file.seek(SeekFrom::End(0)).await?;
-        Ok(Some(hasher.finalize()))
+        self.file_mut()?.flush().await?;
+        self.with_staged(|staged| staged.staged_hash_blocking())
+            .await
+            .map(Some)
     }
 
     async fn apply_preservation(
@@ -323,48 +417,86 @@ impl StagedWriter for LocalStagedWriter {
         expected_mode: Option<u32>,
     ) -> Result<()> {
         self.file_mut()?.flush().await?;
-        if !preservation.is_empty() {
-            let temp_path = self.temp_path.clone();
-            let preservation = preservation.clone();
-            tokio::task::spawn_blocking(move || {
-                apply_preservation_blocking(&temp_path, &preservation)
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
-        }
-        crate::endpoint::io::verify_staged_mode(&self.temp_path, expected_mode)
+        let preservation = preservation.clone();
+        self.with_staged(move |staged| {
+            staged.apply_preservation_blocking(
+                preservation.xattrs.as_deref(),
+                preservation.acl.as_deref(),
+                expected_mode,
+            )
+        })
+        .await
     }
 
     async fn commit(mut self: Box<Self>) -> Result<()> {
         if let Some(mut file) = self.file.take() {
-            file.flush().await?;
+            if let Err(operation) = file.flush().await {
+                drop(file);
+                return match self.abort().await {
+                    Ok(()) => Err(SyncError::Io(operation)),
+                    Err(abort) => Err(SyncError::StagingAbortFailed {
+                        operation: operation.to_string(),
+                        abort: abort.to_string(),
+                    }),
+                };
+            }
             drop(file);
         }
-        verify_destination_expectation(&self.final_path, self.expected_destination).await?;
-        tokio::fs::rename(&self.temp_path, &self.final_path).await?;
-        if let Some(guard) = self.guard.take() {
-            guard.defuse();
+        let staged = self
+            .staged
+            .take()
+            .ok_or_else(|| SyncError::Config("staged writer is already closed".to_string()))?;
+        let cancellation = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let worker_cancellation = std::sync::Arc::clone(&cancellation);
+        let rooted = std::sync::Arc::clone(&self.rooted);
+        let root_path = self.root_path.clone();
+        let destination_path = self.destination_path.clone();
+        let mut cancellation_guard = CommitCancellationGuard::new(cancellation);
+        let worker = tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Err(operation) = rooted.verify_root_path_blocking() {
+                let operation = map_rooted_fs_error(operation);
+                return match staged.abort() {
+                    Ok(()) => Err(operation),
+                    Err(abort) => Err(SyncError::StagingAbortFailed {
+                        operation: operation.to_string(),
+                        abort: abort.to_string(),
+                    }),
+                };
+            }
+            staged
+                .commit_cancellable(worker_cancellation)
+                .map_err(map_rooted_fs_error)?;
+            match rooted.verify_root_path_blocking() {
+                Ok(()) => Ok(()),
+                Err(error) => Err(SyncError::CommittedRootChanged {
+                    destination: destination_path,
+                    root: root_path,
+                    reason: error.to_string(),
+                }),
+            }
+        });
+        #[cfg(test)]
+        if let Some(queued) = self.commit_queued.take() {
+            let _ = queued.send(());
         }
-        Ok(())
+        let result = worker
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        cancellation_guard.disarm();
+        result
     }
 
     async fn abort(mut self: Box<Self>) -> Result<()> {
         self.file.take();
-        match tokio::fs::remove_file(&self.temp_path).await {
-            Ok(()) => {
-                if let Some(guard) = self.guard.take() {
-                    guard.defuse();
-                }
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(guard) = self.guard.take() {
-                    guard.defuse();
-                }
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+        let staged = self.staged.take().ok_or_else(|| {
+            SyncError::Io(std::io::Error::other(
+                "staged writer lost its transaction before explicit abort",
+            ))
+        })?;
+        tokio::task::spawn_blocking(move || staged.abort())
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
+            .map_err(map_rooted_fs_error)
     }
 }
 
@@ -575,8 +707,19 @@ impl Endpoint for LocalEndpoint {
         path: &Path,
         expected_destination: ExpectedDestination,
     ) -> Result<Box<dyn StagedWriter>> {
+        let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
+            .map_err(|error| SyncError::Config(error.to_string()))?;
+        let rooted = self.rooted_fs().await?;
+        let destination_path = self.root.join(relative.as_path());
         Ok(Box::new(
-            LocalStagedWriter::new(self.resolve(path), expected_destination).await?,
+            LocalStagedWriter::new(
+                rooted,
+                relative,
+                expected_destination,
+                self.root.clone(),
+                destination_path,
+            )
+            .await?,
         ))
     }
 
@@ -657,6 +800,111 @@ mod tests {
             #[cfg(unix)]
             mode: 0o644,
         }
+    }
+
+    #[tokio::test]
+    async fn staged_write_creates_missing_root_and_parent_directories_confined() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("new-root");
+        let endpoint = LocalEndpoint::new(root.clone());
+        let mut writer = endpoint
+            .begin_write(Path::new("nested/dir/file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"content").await.unwrap();
+        writer.commit().await.unwrap();
+
+        assert_eq!(fs::read(root.join("nested/dir/file")).unwrap(), b"content");
+    }
+
+    #[test]
+    fn cancelling_queued_commit_preserves_destination() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"old").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+            let rooted = endpoint.rooted_fs().await.unwrap();
+            let relative = sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap();
+            let mut writer = LocalStagedWriter::new(
+                rooted,
+                relative,
+                ExpectedDestination::SnapshotAtOpen,
+                dir.path().to_path_buf(),
+                dir.path().join("file"),
+            )
+            .await
+            .unwrap();
+            writer.write(b"new").await.unwrap();
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+            writer.commit_queued = Some(queued_tx);
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            let commit = tokio::spawn(async move { Box::new(writer).commit().await });
+            queued_rx.await.unwrap();
+            commit.abort();
+            assert!(commit.await.unwrap_err().is_cancelled());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if fs::read_dir(dir.path()).unwrap().count() == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
+        });
+    }
+
+    #[tokio::test]
+    async fn rooted_local_writer_refuses_root_replacement_during_transaction() {
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("root");
+        let moved = parent.path().join("moved-root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(root.clone());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
+        writer.write(b"new").await.unwrap();
+
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(matches!(
+            writer.commit().await,
+            Err(SyncError::DestinationChanged { .. })
+        ));
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"old");
+        assert!(!root.join("file").exists());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert!(matches!(
+            endpoint
+                .begin_write(Path::new("another"), ExpectedDestination::Absent)
+                .await,
+            Err(SyncError::DestinationChanged { .. })
+        ));
     }
 
     #[tokio::test]
@@ -912,6 +1160,16 @@ mod tests {
                 .await
                 .unwrap()
                 .is_symlink
+        );
+    }
+
+    #[test]
+    fn empty_endpoint_root_means_current_directory() {
+        let endpoint = LocalEndpoint::new(PathBuf::new());
+        assert_eq!(endpoint.root(), Path::new("."));
+        assert_eq!(
+            endpoint.native_path(Path::new("dest")),
+            Some(PathBuf::from("./dest"))
         );
     }
 

@@ -251,6 +251,31 @@ fn test_single_file_sync() {
 }
 
 #[test]
+fn single_file_rate_limited_sync_accepts_bare_relative_destination() {
+    let source = TempDir::new().unwrap();
+    let working = TempDir::new().unwrap();
+    let source_file = source.path().join("source.txt");
+    fs::write(&source_file, b"streamed content").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([source_file.to_str().unwrap(), "dest.txt", "--bwlimit=60KB"])
+        .current_dir(working.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(working.path().join("dest.txt")).unwrap(),
+        b"streamed content"
+    );
+}
+
+#[test]
 fn test_git_directory_excluded() {
     let (source, dest) = setup_test_dir("git_excluded");
 
