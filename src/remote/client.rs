@@ -9,7 +9,7 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{FrameKind, Operation, PlatformOs};
+use crate::protocol::{FrameKind, Operation, PlatformOs, ProtocolVersion};
 use crate::remote::hash::{request_content_hash, require_blake3};
 use crate::remote::router::RouterSender;
 use crate::remote::scan::request_scan;
@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 pub struct ClientRemoteHandle {
     operation: Operation,
     peer: PlatformOs,
+    protocol_version: ProtocolVersion,
     capabilities: EndpointCapabilities,
     namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
     sender: RouterSender,
@@ -48,6 +49,7 @@ impl ClientRemoteSession {
         ClientRemoteHandle {
             operation: self.operation,
             peer: self.server.platform.os,
+            protocol_version: self.server.version,
             capabilities: self.capabilities,
             namespace_semantics: self.namespace_semantics,
             sender: self.router.sender(),
@@ -62,6 +64,10 @@ impl ClientRemoteHandle {
 
     pub const fn peer_platform(&self) -> PlatformOs {
         self.peer
+    }
+
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
     }
 
     pub const fn capabilities(&self) -> &EndpointCapabilities {

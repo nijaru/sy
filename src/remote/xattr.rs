@@ -333,13 +333,13 @@ pub(crate) fn name_bytes(name: &OsString) -> Bytes {
 }
 
 #[cfg(unix)]
-fn os_string_from_name(name: &[u8]) -> OsString {
+pub(crate) fn os_string_from_name(name: &[u8]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
     OsString::from_vec(name.to_vec())
 }
 
 #[cfg(not(unix))]
-fn os_string_from_name(name: &[u8]) -> OsString {
+pub(crate) fn os_string_from_name(name: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(name).into_owned())
 }
 

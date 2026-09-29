@@ -69,6 +69,20 @@ pub enum RemoteTransferError {
     #[error("file transfer requires a scanned source identity")]
     MissingSourceIdentity,
 
+    #[error(
+        "peer cannot provide transaction-bound {feature} preservation metadata for file fetch"
+    )]
+    FetchPreservationUnavailable { feature: &'static str },
+
+    #[error("file fetch omitted requested {0} preservation metadata")]
+    MissingFetchPreservation(&'static str),
+
+    #[error("peer cancelled file fetch stream {stream_id} before commit acknowledgement")]
+    FetchCancelled { stream_id: u32 },
+
+    #[error("file fetch supplied unrequested {0} preservation metadata")]
+    UnexpectedFetchPreservation(&'static str),
+
     #[error("delta transfer requires a regular-file basis at the source path")]
     InvalidBasis,
 

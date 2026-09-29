@@ -243,6 +243,55 @@ impl Drop for RootedStagedFile {
     }
 }
 
+#[cfg(unix)]
+fn read_xattrs_from_file(file: &File) -> Result<Vec<(OsString, Vec<u8>)>> {
+    use xattr::FileExt;
+
+    let mut xattrs = Vec::new();
+    let mut total = 0_usize;
+    for name in file.list_xattr()? {
+        // A value may be large on filesystems that store it out of line
+        // (macOS resource forks). Check the aggregate bound before retaining it.
+        let Some(value) = file.get_xattr(&name)? else {
+            continue;
+        };
+        total = total
+            .checked_add(name.as_bytes().len())
+            .and_then(|value_total| value_total.checked_add(value.len()))
+            .ok_or(RootedFsError::XattrSetTooLarge {
+                len: usize::MAX,
+                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+            })?;
+        if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
+            return Err(RootedFsError::XattrSetTooLarge {
+                len: total,
+                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
+            });
+        }
+        xattrs.push((name, value));
+    }
+    Ok(xattrs)
+}
+
+#[cfg(not(unix))]
+fn read_xattrs_from_file(_file: &File) -> Result<Vec<(OsString, Vec<u8>)>> {
+    Err(RootedFsError::UnsupportedPlatform)
+}
+
+#[cfg(any(
+    all(target_os = "linux", feature = "acl"),
+    all(target_os = "macos", feature = "acl")
+))]
+fn check_acl_text_bounded(text: String) -> Result<Option<String>> {
+    if text.len() > crate::protocol::MAX_ACL_TEXT_BYTES {
+        return Err(RootedFsError::AclSetTooLarge {
+            len: text.len(),
+            max: crate::protocol::MAX_ACL_TEXT_BYTES,
+        });
+    }
+    Ok(Some(text))
+}
+
 impl RootedFs {
     /// Open and pin a root directory without blocking a Tokio worker thread.
     pub async fn open(root: PathBuf) -> Result<Self> {
@@ -425,6 +474,22 @@ impl RootedFs {
         self.read_xattrs_path_blocking(relative.as_path(), kind)
     }
 
+    /// Read preservation xattrs through a regular file handle opened beneath
+    /// this root. The caller must pass the handle whose identity was validated
+    /// for the in-flight transfer; this keeps metadata bound to those bytes.
+    pub(crate) fn read_open_file_xattrs_blocking(
+        &self,
+        file: &File,
+        relative: &RelativePath,
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
+        if !file.metadata()?.file_type().is_file() {
+            return Err(RootedFsError::NotRegularFile(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        read_xattrs_from_file(file)
+    }
+
     /// Mirror an extended-attribute set onto one file or directory beneath the
     /// pinned root: every requested attribute is set and every existing
     /// attribute absent from the request is removed. The leaf is opened without
@@ -459,6 +524,21 @@ impl RootedFs {
             return Err(RootedFsError::UnsupportedSymlinkAcls);
         }
         self.read_acl_path_blocking(relative.as_path(), kind)
+    }
+
+    /// Read a file's ACL through the already-open handle for its in-flight
+    /// transfer, rather than reopening the visible path for a metadata RPC.
+    pub(crate) fn read_open_file_acl_blocking(
+        &self,
+        file: &File,
+        relative: &RelativePath,
+    ) -> Result<Option<String>> {
+        if !file.metadata()?.file_type().is_file() {
+            return Err(RootedFsError::NotRegularFile(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        self.read_acl_from_file(file)
     }
 
     /// Mirror an access-control list, as exacl unified-entries text, onto one
@@ -926,34 +1006,8 @@ impl RootedFs {
         relative: &Path,
         kind: EntryKind,
     ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        use xattr::FileExt;
-
         let file = self.open_xattr_entry_blocking(relative, kind)?;
-        let mut xattrs = Vec::new();
-        let mut total = 0_usize;
-        for name in file.list_xattr()? {
-            // A value may be large on filesystems that store it out of line
-            // (macOS resource forks). The running total is checked before the
-            // value is retained so an oversized set fails loudly.
-            let Some(value) = file.get_xattr(&name)? else {
-                continue;
-            };
-            total = total
-                .checked_add(name.as_bytes().len())
-                .and_then(|value_total| value_total.checked_add(value.len()))
-                .ok_or(RootedFsError::XattrSetTooLarge {
-                    len: usize::MAX,
-                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-                })?;
-            if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
-                return Err(RootedFsError::XattrSetTooLarge {
-                    len: total,
-                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-                });
-            }
-            xattrs.push((name, value));
-        }
-        Ok(xattrs)
+        read_xattrs_from_file(&file)
     }
 
     #[cfg(not(unix))]
@@ -1030,13 +1084,19 @@ impl RootedFs {
     /// If `/proc` is unavailable the lookup fails loudly instead of
     /// silently reading the wrong file.
     #[cfg(all(target_os = "linux", feature = "acl"))]
-    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        let entries = exacl::getfacl(fd_alias_path(&file), None)?;
+    fn read_acl_from_file(&self, file: &File) -> Result<Option<String>> {
+        let entries = exacl::getfacl(fd_alias_path(file), None)?;
         if entries.is_empty() {
             return Ok(None);
         }
-        Ok(Some(exacl::to_string(&entries)?))
+        let text = exacl::to_string(&entries)?;
+        check_acl_text_bounded(text)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "acl"))]
+    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        self.read_acl_from_file(&file)
     }
 
     #[cfg(all(target_os = "linux", feature = "acl"))]
@@ -1050,13 +1110,19 @@ impl RootedFs {
     /// syscalls in `acl_macos` carry the conversion instead. Same
     /// no-follow held descriptor, same exacl text format.
     #[cfg(all(target_os = "macos", feature = "acl"))]
-    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
+    fn read_acl_from_file(&self, file: &File) -> Result<Option<String>> {
         let entries = acl_macos::read_fd_entries(file.as_raw_fd())?;
         if entries.is_empty() {
             return Ok(None);
         }
-        Ok(Some(exacl::to_string(&entries)?))
+        let text = exacl::to_string(&entries)?;
+        check_acl_text_bounded(text)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "acl"))]
+    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        self.read_acl_from_file(&file)
     }
 
     #[cfg(all(target_os = "macos", feature = "acl"))]
@@ -1066,6 +1132,13 @@ impl RootedFs {
     }
 
     #[cfg(all(unix, not(feature = "acl")))]
+    fn read_acl_from_file(&self, _file: &File) -> Result<Option<String>> {
+        Err(RootedFsError::AclUnsupported(
+            "ACL preservation requires the acl feature; rebuild with --features acl",
+        ))
+    }
+
+    #[cfg(all(unix, not(feature = "acl")))]
     fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
         Err(RootedFsError::AclUnsupported(
             "ACL preservation requires the acl feature; rebuild with --features acl",
@@ -1090,6 +1163,18 @@ impl RootedFs {
         not(target_os = "linux"),
         not(target_os = "macos")
     ))]
+    fn read_acl_from_file(&self, _file: &File) -> Result<Option<String>> {
+        Err(RootedFsError::AclUnsupported(
+            "access control lists are only supported on Linux and macOS",
+        ))
+    }
+
+    #[cfg(all(
+        unix,
+        feature = "acl",
+        not(target_os = "linux"),
+        not(target_os = "macos")
+    ))]
     fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
         Err(RootedFsError::AclUnsupported(
             "access control lists are only supported on Linux and macOS",
@@ -1111,6 +1196,11 @@ impl RootedFs {
         Err(RootedFsError::AclUnsupported(
             "access control lists are only supported on Linux and macOS",
         ))
+    }
+
+    #[cfg(not(unix))]
+    fn read_acl_from_file(&self, _file: &File) -> Result<Option<String>> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     #[cfg(not(unix))]
@@ -1780,6 +1870,29 @@ mod tests {
                     .unwrap()
             ),
             vec![(name, b"dir".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_file_xattrs_stay_bound_after_path_replacement() {
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"scanned source").unwrap();
+        xattr::set(&path, "user.sy-source", b"scanned").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let opened = rooted.open_regular_blocking(&relative("file")).unwrap();
+
+        std::fs::rename(&path, root.path().join("old-file")).unwrap();
+        std::fs::write(&path, b"replacement source").unwrap();
+        xattr::set(&path, "user.sy-source", b"replacement").unwrap();
+
+        assert_eq!(
+            user_xattrs(
+                rooted
+                    .read_open_file_xattrs_blocking(&opened, &relative("file"))
+                    .unwrap()
+            ),
+            vec![(OsString::from("user.sy-source"), b"scanned".to_vec())]
         );
     }
 

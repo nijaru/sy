@@ -10,7 +10,10 @@ use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
-use crate::protocol::{ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady};
+use crate::protocol::{
+    CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
+    PROTOCOL_V3_2,
+};
 use crate::remote::acl::serve_incoming_acl_rooted;
 use crate::remote::bsdflags::serve_incoming_bsd_flags_rooted;
 use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
@@ -703,6 +706,23 @@ impl ServerRemoteSession {
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
             FrameKind::FileFetchRequest if self.opened.operation == Operation::Pull => {
+                let request =
+                    crate::protocol::WireFileFetchRequest::decode(incoming.first.frame().payload())
+                        .map_err(crate::remote::RemoteError::from)?;
+                for (requested, capability, name) in [
+                    (request.preserve_xattrs(), CapabilitySet::XATTR, "xattrs"),
+                    (request.preserve_acls(), CapabilitySet::ACL, "ACLs"),
+                ] {
+                    if requested
+                        && (self.opened.version < PROTOCOL_V3_2
+                            || !self.opened.ready.capabilities.contains(capability))
+                    {
+                        return Err(RemoteTransferError::FetchPreservationUnavailable {
+                            feature: name,
+                        }
+                        .into());
+                    }
+                }
                 Ok(Some(IncomingRequest::FileFetch(incoming)))
             }
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {

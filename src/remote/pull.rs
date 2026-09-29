@@ -23,7 +23,7 @@ use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation,
 use crate::remote::bsdflags::{
     apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
 };
-use crate::remote::fetch::fetch_file;
+use crate::remote::fetch::{fetch_file, FetchPolicy, FetchPreservationRequest};
 use crate::remote::router::RouterSender;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::xattr::{
@@ -62,6 +62,9 @@ pub enum RemotePullError {
 
     #[error("pull destination lacks a scan-time identity for {0}")]
     MissingDestinationIdentity(PathBuf),
+
+    #[error("destination {path} committed, but the fetch acknowledgement failed: {reason}")]
+    CommittedAckFailed { path: PathBuf, reason: String },
 
     #[error(transparent)]
     Endpoint(#[from] crate::error::SyncError),
@@ -313,11 +316,7 @@ impl RemotePullExecutor {
                 }
                 let is_update = destination.is_some();
                 let expected_destination = destination_expectation(destination.as_ref())?;
-                // Read the remote source attributes before any local mutation
-                // (backup or fetch) so a source metadata failure cannot leave
-                // a half-mutated destination.
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
+                self.validate_file_fetch_options()?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 // --backup preserves the replaced destination file first, as a
                 // local copy (the destination is local in a pull). A backup
@@ -339,12 +338,7 @@ impl RemotePullExecutor {
                     }
                 }
                 let summary = self
-                    .fetch_into_staging(
-                        &source,
-                        expected_destination,
-                        &metadata,
-                        &crate::endpoint::io::Preservation { xattrs, acl: acls },
-                    )
+                    .fetch_into_staging(&source, expected_destination, &metadata)
                     .await?;
                 // Only rename-incompatible flags remain post-commit
                 // finalization; xattrs/ACLs ride into staging and a failure
@@ -466,9 +460,7 @@ impl RemotePullExecutor {
             }));
         }
         let is_update = destination.is_some();
-        // Read the remote source attributes before any local mutation.
-        let xattrs = self.read_source_xattrs(&source).await?;
-        let acls = self.read_source_acls(&source).await?;
+        self.validate_file_fetch_options()?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
         if let Some(existing) = &destination {
             if existing.is_file() && self.backup_enabled() {
@@ -484,12 +476,7 @@ impl RemotePullExecutor {
             }
         }
         let summary = self
-            .fetch_into_staging(
-                &source,
-                expected_destination,
-                &metadata,
-                &crate::endpoint::io::Preservation { xattrs, acl: acls },
-            )
+            .fetch_into_staging(&source, expected_destination, &metadata)
             .await?;
         // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
@@ -509,46 +496,98 @@ impl RemotePullExecutor {
 
     /// Fetch one source file into endpoint staging and commit atomically.
     ///
-    /// The staged bytes are BLAKE3-verified against the server-reported
-    /// digest inside `fetch_file` before the Ack is sent; metadata is applied
-    /// to the staged file so a failure never touches the visible destination.
+    /// The staged bytes are BLAKE3-verified and preservation is applied before
+    /// commit. The server receives Ack only after the local staged writer
+    /// publishes; any earlier failure sends Cancel and leaves it waiting no longer.
     async fn fetch_into_staging(
         &self,
         source: &Entry,
         expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
-        preservation: &crate::endpoint::io::Preservation,
     ) -> Result<crate::remote::transfer::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let endpoint = LocalEndpoint::new(self.destination_root.clone());
         let mut staged = endpoint
             .begin_write(source.path.as_path(), expected_destination)
             .await?;
-        let summary = fetch_file(
+        let fetched = fetch_file(
             &self.sender,
             source,
             self.remote.peer_platform(),
             staged.as_mut(),
-            self.compression,
-            self.rate_limiter.as_ref(),
+            FetchPolicy {
+                compression: self.compression,
+                rate_limiter: self.rate_limiter.as_ref(),
+                preservation: FetchPreservationRequest {
+                    xattrs: self.xattrs,
+                    acls: self.acls,
+                },
+                protocol_version: self.remote.protocol_version(),
+                capabilities: self.remote.capabilities(),
+            },
         )
         .await?;
-        if self.compression.is_some() && !self.remote.capabilities().zstd {
-            return Err(RemotePullError::Remote(RemoteSessionError::PeerLacksZstd));
-        }
         // Staging is private at 0600; commit applies the final metadata. A
         // missing scanned mode is an error, matching the push side's
         // create-mode contract.
-        let mode = metadata.unix_mode.ok_or_else(|| {
-            RemotePullError::LocalMutation(
+        let Some(mode) = metadata.unix_mode else {
+            self.cancel_staged_fetch(fetched.stream_id).await;
+            return Err(RemotePullError::LocalMutation(
                 dest.clone(),
                 std::io::Error::other("scanned source file is missing its Unix mode"),
-            )
-        })?;
-        set_staged_metadata(staged.as_mut(), mode, metadata.modified).await?;
-        staged.apply_preservation(preservation, Some(mode)).await?;
-        staged.commit().await?;
-        Ok(summary)
+            ));
+        };
+        if let Err(error) = set_staged_metadata(staged.as_mut(), mode, metadata.modified).await {
+            self.cancel_staged_fetch(fetched.stream_id).await;
+            return Err(error);
+        }
+        if let Err(error) = staged
+            .apply_preservation(&fetched.preservation, Some(mode))
+            .await
+        {
+            self.cancel_staged_fetch(fetched.stream_id).await;
+            return Err(error.into());
+        }
+        if let Err(error) = staged.commit().await {
+            self.cancel_staged_fetch(fetched.stream_id).await;
+            return Err(error.into());
+        }
+        crate::remote::fetch::acknowledge_fetch(&self.sender, fetched.stream_id)
+            .await
+            .map_err(|error| RemotePullError::CommittedAckFailed {
+                path: source.path.as_path().to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        Ok(fetched.summary)
+    }
+
+    async fn cancel_staged_fetch(&self, stream_id: crate::protocol::StreamId) {
+        if let Err(error) = crate::remote::fetch::cancel_fetch(&self.sender, stream_id).await {
+            tracing::warn!(%error, stream_id = stream_id.get(), "failed to cancel an aborted staged fetch");
+        }
+    }
+
+    fn validate_file_fetch_options(&self) -> Result<()> {
+        let capabilities = self.remote.capabilities();
+        for (requested, supported, feature) in [
+            (self.xattrs, capabilities.preserve_xattrs, "xattrs"),
+            (self.acls, capabilities.preserve_acls, "ACLs"),
+        ] {
+            if requested
+                && (!supported || self.remote.protocol_version() < crate::protocol::PROTOCOL_V3_2)
+            {
+                return Err(
+                    crate::remote::transfer::RemoteTransferError::FetchPreservationUnavailable {
+                        feature,
+                    }
+                    .into(),
+                );
+            }
+        }
+        if self.compression.is_some() && !capabilities.zstd {
+            return Err(RemotePullError::Remote(RemoteSessionError::PeerLacksZstd));
+        }
+        Ok(())
     }
 
     /// --backup is on when a suffix policy exists. The suffix defaults to

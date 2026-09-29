@@ -15,11 +15,14 @@ pub const FETCH_IDENTITY_LEN: usize = TRANSFER_BASIS_IDENTITY_LEN;
 /// `FileEnd` carrying the BLAKE3 digest of the uncompressed source bytes;
 /// the client acknowledges only after its staged copy is verified and
 /// committed, mirroring the push direction's ack-after-commit ordering.
-/// Request flag: the client asked for per-chunk zstd (`-z`/`--compress`).
-/// The per-frame COMPRESSED flag alone describes each payload, but the
-/// server must not compress when this bit is absent — otherwise `-z` off
-/// would be a silent no-op.
+/// Request flags are explicit policy choices; the server must not infer any
+/// of them from process-wide capabilities. Bit 0 requests per-chunk zstd.
+/// In protocol 3.2, bits 1 and 2 request xattrs and ACLs, returned as
+/// FileXattrs/FileAcls frames on this stream before file bytes; an empty value
+/// explicitly clears destination metadata.
 pub const FETCH_FLAG_COMPRESSED: u8 = 1 << 0;
+pub const FETCH_FLAG_XATTRS: u8 = 1 << 1;
+pub const FETCH_FLAG_ACLS: u8 = 1 << 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireFileFetchRequest {
@@ -48,6 +51,20 @@ impl WireFileFetchRequest {
         self.flags & FETCH_FLAG_COMPRESSED != 0
     }
 
+    pub const fn preserve_xattrs(&self) -> bool {
+        self.flags & FETCH_FLAG_XATTRS != 0
+    }
+
+    pub const fn preserve_acls(&self) -> bool {
+        self.flags & FETCH_FLAG_ACLS != 0
+    }
+
+    pub fn with_preservation(mut self, xattrs: bool, acls: bool) -> Self {
+        self.flags |= u8::from(xattrs) * FETCH_FLAG_XATTRS;
+        self.flags |= u8::from(acls) * FETCH_FLAG_ACLS;
+        self
+    }
+
     pub const fn file_size(&self) -> u64 {
         self.file_size
     }
@@ -71,7 +88,7 @@ impl WireFileFetchRequest {
         let file_size = reader.u64()?;
         let identity = reader.array::<FETCH_IDENTITY_LEN>()?;
         let flags = reader.u8()?;
-        if flags & !FETCH_FLAG_COMPRESSED != 0 {
+        if flags & !(FETCH_FLAG_COMPRESSED | FETCH_FLAG_XATTRS | FETCH_FLAG_ACLS) != 0 {
             return Err(ProtocolError::InvalidField {
                 field: "file_fetch_flags",
                 reason: "unknown fetch request flag bits",
@@ -123,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn file_fetch_request_round_trips_compression_bit() {
+    fn file_fetch_request_round_trips_request_flags() {
         let path =
             RelativeWirePath::from_components([b"dir".as_slice(), b"file.txt".as_slice()]).unwrap();
         let off = WireFileFetchRequest::new(path, 4096, [7_u8; FETCH_IDENTITY_LEN], false);
@@ -131,9 +148,14 @@ mod tests {
         assert!(!WireFileFetchRequest::decode(&off.encode())
             .unwrap()
             .compressed());
-        assert!(WireFileFetchRequest::decode(&request().encode())
-            .unwrap()
-            .compressed());
+
+        let preservation = request().with_preservation(true, true);
+        let decoded = WireFileFetchRequest::decode(&preservation.encode()).unwrap();
+        assert!(decoded.compressed());
+        assert!(decoded.preserve_xattrs());
+        assert!(decoded.preserve_acls());
+        assert!(!request().preserve_xattrs());
+        assert!(!request().preserve_acls());
     }
 
     #[test]

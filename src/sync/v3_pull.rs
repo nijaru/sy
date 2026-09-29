@@ -384,14 +384,17 @@ mod tests {
                         // The client has already opened staging and pinned the
                         // scanned destination expectation before requesting bytes.
                         std::fs::write(&server_raced_destination, b"concurrent edit").unwrap();
-                        sy::remote::fetch::serve_incoming_file_fetch(
+                        let result = sy::remote::fetch::serve_incoming_file_fetch(
                             rooted.clone(),
                             incoming,
                             &sender,
                             peer,
                         )
-                        .await
-                        .unwrap();
+                        .await;
+                        assert!(matches!(
+                            result,
+                            Err(sy::remote::transfer::RemoteTransferError::FetchCancelled { .. })
+                        ));
                     }
                     _other => panic!("unexpected v3 pull request variant"),
                 }
@@ -433,8 +436,8 @@ mod tests {
     }
 
     /// -X/--preserve-xattrs over v3 pull: the remote source's attributes are
-    /// read through the pinned root and mirrored onto the local destination
-    /// after the staged commit.
+    /// read through the same held source file as its bytes, then applied to
+    /// local staging before commit.
     #[tokio::test]
     async fn xattrs_are_read_from_remote_source_and_mirrored_over_v3_pull() {
         let source_root = TempDir::new().unwrap();
@@ -456,16 +459,11 @@ mod tests {
             let rooted = session.scan_handler_rooted();
             let sender = session.sender();
             let peer = session.client().platform.os;
-            let xattr_handler = session.xattr_handler();
-            // Remote scan, then per file the xattr read and the whole-file
-            // fetch: exactly three requests, so an extra round-trip regression
-            // cannot hide.
-            for _ in 0..3 {
+            // Remote scan, then one fetch carrying both file bytes and the
+            // requested xattrs on the same stream.
+            for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::Xattr(incoming) => {
-                        xattr_handler.serve(incoming).await.unwrap();
-                    }
                     IncomingRequest::FileFetch(incoming) => {
                         sy::remote::fetch::serve_incoming_file_fetch(
                             rooted.clone(),
@@ -510,9 +508,9 @@ mod tests {
         );
     }
 
-    /// -A/--preserve-acls over v3 pull: the remote source's list is read
-    /// through the pinned root and mirrored onto the local destination after
-    /// the staged commit.
+    /// -A/--preserve-acls over v3 pull: the remote source's ACL is read
+    /// through the same held source file as its bytes, then applied to local
+    /// staging before commit.
     #[cfg(all(unix, feature = "acl"))]
     #[tokio::test]
     async fn acls_are_read_from_remote_source_and_mirrored_over_v3_pull() {
@@ -543,16 +541,11 @@ mod tests {
             let rooted = session.scan_handler_rooted();
             let sender = session.sender();
             let peer = session.client().platform.os;
-            let acl_handler = session.acl_handler();
-            // Remote scan, then the acl read and the whole-file fetch:
-            // exactly three requests, so an extra round-trip regression
-            // cannot hide.
-            for _ in 0..3 {
+            // Remote scan, then one fetch carrying both file bytes and the
+            // requested ACL on the same stream.
+            for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::Acl(incoming) => {
-                        acl_handler.serve(incoming).await.unwrap();
-                    }
                     IncomingRequest::FileFetch(incoming) => {
                         sy::remote::fetch::serve_incoming_file_fetch(
                             rooted.clone(),
