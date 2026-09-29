@@ -89,13 +89,31 @@ pub fn estimate_change_ratio(
     sample_count: Option<usize>,
     threshold: Option<f64>,
 ) -> std::io::Result<ChangeRatioResult> {
-    let sample_count = sample_count.unwrap_or(20);
-    let threshold = threshold.unwrap_or(0.75);
-
     // Explicit sample buffers already provide the desired bounded I/O. Extra
     // BufReaders here only duplicate memory without improving random seeks.
     let mut source_file = File::open(source)?;
     let mut dest_file = File::open(dest)?;
+    estimate_change_ratio_files(
+        &mut source_file,
+        &mut dest_file,
+        block_size,
+        sample_count,
+        threshold,
+    )
+}
+
+/// Estimate a change ratio from already-open files. Native transfer callers
+/// use this form to keep sampling bound to the validated source and destination
+/// observations rather than reopening visible paths.
+pub fn estimate_change_ratio_files(
+    source_file: &mut File,
+    dest_file: &mut File,
+    block_size: usize,
+    sample_count: Option<usize>,
+    threshold: Option<f64>,
+) -> std::io::Result<ChangeRatioResult> {
+    let sample_count = sample_count.unwrap_or(20);
+    let threshold = threshold.unwrap_or(0.75);
 
     // Get file sizes
     let source_size = source_file.metadata()?.len();
@@ -216,6 +234,34 @@ mod tests {
         std::fs::write(&dest, &data).unwrap();
 
         let result = estimate_change_ratio(&source, &dest, 64 * 1024, None, None).unwrap();
+
+        assert_eq!(result.blocks_changed, 0);
+        assert_eq!(result.change_ratio, 0.0);
+        assert!(result.use_delta);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_file_sampling_does_not_reopen_replaced_paths() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source.bin");
+        let dest = temp.path().join("dest.bin");
+        let replacement_source = temp.path().join("replacement-source.bin");
+        let replacement_dest = temp.path().join("replacement-dest.bin");
+        let original = vec![42_u8; 1024 * 1024];
+        std::fs::write(&source, &original).unwrap();
+        std::fs::write(&dest, &original).unwrap();
+        let mut source_file = File::open(&source).unwrap();
+        let mut dest_file = File::open(&dest).unwrap();
+
+        std::fs::write(&replacement_source, vec![1_u8; original.len()]).unwrap();
+        std::fs::write(&replacement_dest, vec![2_u8; original.len()]).unwrap();
+        std::fs::rename(&replacement_source, &source).unwrap();
+        std::fs::rename(&replacement_dest, &dest).unwrap();
+
+        let result =
+            estimate_change_ratio_files(&mut source_file, &mut dest_file, 64 * 1024, None, None)
+                .unwrap();
 
         assert_eq!(result.blocks_changed, 0);
         assert_eq!(result.change_ratio, 0.0);
