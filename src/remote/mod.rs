@@ -22,7 +22,7 @@ use crate::endpoint::{Capabilities as EndpointCapabilities, Endpoint};
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
-    VersionRange, WirePath, PROTOCOL_V3, PROTOCOL_V3_1,
+    VersionRange, WirePath, PROTOCOL_V3, PROTOCOL_V3_2,
 };
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::ffi::OsString;
@@ -73,6 +73,7 @@ struct ClientSession {
 #[derive(Debug, Clone)]
 struct OpenedServerSession {
     client: ClientHello,
+    version: crate::protocol::ProtocolVersion,
     operation: Operation,
     root: PathBuf,
     rooted: RootedFs,
@@ -91,7 +92,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let versions = VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_1)?;
+    let versions = VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_2)?;
     let hello = ClientHello::new(
         versions,
         process_capabilities(),
@@ -140,7 +141,7 @@ where
 
     let version = negotiate_version(
         client.versions,
-        VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_1)?,
+        VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_2)?,
     )?;
     let server = ServerHello::new(
         version,
@@ -176,6 +177,7 @@ where
 
     Ok(OpenedServerSession {
         client,
+        version,
         operation: open.operation,
         root,
         rooted,
@@ -471,7 +473,7 @@ mod tests {
         .unwrap();
         let opened = server.await.unwrap().unwrap();
 
-        assert_eq!(client.server.version, PROTOCOL_V3_1);
+        assert_eq!(client.server.version, PROTOCOL_V3_2);
         // The client receives the probed root semantics, not an OS guess.
         assert_eq!(
             client.namespace_semantics,
