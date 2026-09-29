@@ -717,10 +717,9 @@ impl ServerRemoteSession {
                         && (self.opened.version < PROTOCOL_V3_2
                             || !self.opened.ready.capabilities.contains(capability))
                     {
-                        return Err(RemoteTransferError::FetchPreservationUnavailable {
-                            feature: name,
-                        }
-                        .into());
+                        return Err(
+                            RemoteTransferError::PreservationUnavailable { feature: name }.into(),
+                        );
                     }
                 }
                 Ok(Some(IncomingRequest::FileFetch(incoming)))

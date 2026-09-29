@@ -594,7 +594,7 @@ impl RemotePullExecutor {
                 && (!supported || self.remote.protocol_version() < crate::protocol::PROTOCOL_V3_2)
             {
                 return Err(
-                    crate::remote::transfer::RemoteTransferError::FetchPreservationUnavailable {
+                    crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
                         feature,
                     }
                     .into(),

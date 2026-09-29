@@ -18,8 +18,8 @@ use crate::remote::signature::{
     SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, request_file_transfer_with_policy, TransferDestination,
-    TransferMetadata, TransferSummary,
+    request_file_transfer, request_file_transfer_with_stream_policy, TransferDestination,
+    TransferMetadata, TransferPreservationRequest, TransferStreamPolicy, TransferSummary,
 };
 use crate::remote::xattr::{request_read_xattrs, request_write_xattrs};
 use crate::transfer::delta::{
@@ -215,18 +215,60 @@ impl ClientRemoteHandle {
         metadata: TransferMetadata,
         compression: Option<CompressionPolicy>,
     ) -> Result<TransferSummary> {
+        self.transfer_file_with_stream_policy(
+            source_root,
+            source,
+            destination,
+            metadata,
+            TransferStreamPolicy {
+                preservation: TransferPreservationRequest::default(),
+                compression,
+            },
+        )
+        .await
+    }
+
+    pub async fn transfer_file_with_stream_policy(
+        &self,
+        source_root: PathBuf,
+        source: Entry,
+        destination: Option<TransferDestination>,
+        metadata: TransferMetadata,
+        stream_policy: TransferStreamPolicy,
+    ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
-        if compression.is_some() && !self.capabilities.zstd {
+        for (requested, supported, feature) in [
+            (
+                stream_policy.preservation.xattrs,
+                self.capabilities.preserve_xattrs,
+                "xattrs",
+            ),
+            (
+                stream_policy.preservation.acls,
+                self.capabilities.preserve_acls,
+                "ACLs",
+            ),
+        ] {
+            if requested && (self.protocol_version < crate::protocol::PROTOCOL_V3_2 || !supported) {
+                return Err(
+                    crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
+                        feature,
+                    }
+                    .into(),
+                );
+            }
+        }
+        if stream_policy.compression.is_some() && !self.capabilities.zstd {
             return Err(RemoteSessionError::PeerLacksZstd);
         }
-        request_file_transfer_with_policy(
+        request_file_transfer_with_stream_policy(
             &self.sender,
             source_root,
             source,
             destination,
             metadata,
             self.peer,
-            compression,
+            stream_policy,
         )
         .await
         .map_err(Into::into)
