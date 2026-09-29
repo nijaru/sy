@@ -87,6 +87,7 @@ fn rooted_expected_destination(expected: ExpectedDestination) -> sy::endpoint::E
 
 fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
     match error {
+        sy::rooted_fs::RootedFsError::Io(error) => SyncError::Io(error),
         sy::rooted_fs::RootedFsError::DestinationChanged(path) => {
             SyncError::DestinationChanged { path }
         }
@@ -400,6 +401,170 @@ fn copy_native_file_blocking(
     }
 }
 
+#[cfg(unix)]
+const SEEK_DATA: libc::c_int = libc::SEEK_DATA;
+#[cfg(unix)]
+const SEEK_HOLE: libc::c_int = libc::SEEK_HOLE;
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ExtentSeek {
+    Position(u64),
+    End,
+    Unsupported,
+}
+
+#[cfg(unix)]
+fn seek_extent(
+    fd: std::os::fd::RawFd,
+    offset: u64,
+    whence: libc::c_int,
+) -> std::io::Result<ExtentSeek> {
+    let offset = libc::off_t::try_from(offset).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file offset exceeds platform range",
+        )
+    })?;
+    // SAFETY: `fd` is borrowed from the live held source file and `lseek` only
+    // reads or updates that descriptor's file position for this operation.
+    let result = unsafe { libc::lseek(fd, offset, whence) };
+    if result >= 0 {
+        return Ok(ExtentSeek::Position(u64::try_from(result).map_err(
+            |_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative sparse extent"),
+        )?));
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENXIO) => Ok(ExtentSeek::End),
+        Some(code) if code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP => {
+            Ok(ExtentSeek::Unsupported)
+        }
+        _ => Err(error),
+    }
+}
+
+/// Quickly identify at least one reported hole without walking a fragmented
+/// file's entire extent map. Unsupported or conservative maps select whole copy.
+#[cfg(unix)]
+fn sparse_extent_map_has_holes(fd: std::os::fd::RawFd, file_len: u64) -> std::io::Result<bool> {
+    if file_len == 0 {
+        return Ok(false);
+    }
+    let data = match seek_extent(fd, 0, SEEK_DATA)? {
+        ExtentSeek::Position(data) if data < file_len => data,
+        ExtentSeek::Position(_) | ExtentSeek::End | ExtentSeek::Unsupported => return Ok(false),
+    };
+    if data > 0 {
+        return Ok(true);
+    }
+    match seek_extent(fd, data, SEEK_HOLE)? {
+        ExtentSeek::Position(hole) => Ok(hole < file_len),
+        ExtentSeek::End | ExtentSeek::Unsupported => Ok(false),
+    }
+}
+
+/// Visit sparse data ranges with constant memory. The callback is invoked in
+/// ascending file-offset order; `None` reports that SEEK_DATA/SEEK_HOLE cannot
+/// provide a trustworthy map on this filesystem.
+#[cfg(unix)]
+fn visit_sparse_extents(
+    fd: std::os::fd::RawFd,
+    file_len: u64,
+    mut visit: impl FnMut(u64, u64) -> std::io::Result<()>,
+) -> std::io::Result<Option<bool>> {
+    if file_len == 0 {
+        return Ok(Some(false));
+    }
+    let mut cursor = 0_u64;
+    let mut saw_data = false;
+    let mut has_holes = false;
+    loop {
+        let data = match seek_extent(fd, cursor, SEEK_DATA)? {
+            ExtentSeek::Position(data) if data < file_len => data,
+            ExtentSeek::Position(_) | ExtentSeek::Unsupported => return Ok(None),
+            ExtentSeek::End if !saw_data => return Ok(None),
+            ExtentSeek::End => break,
+        };
+        if data < cursor {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sparse data extents are not ordered",
+            ));
+        }
+        has_holes |= data > cursor;
+
+        let end = match seek_extent(fd, data, SEEK_HOLE)? {
+            ExtentSeek::Position(end) => end.min(file_len),
+            ExtentSeek::End => file_len,
+            ExtentSeek::Unsupported => return Ok(None),
+        };
+        if end <= data {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sparse extent did not advance",
+            ));
+        }
+        has_holes |= end < file_len;
+        visit(data, end)?;
+        saw_data = true;
+        cursor = end;
+        if cursor == file_len {
+            break;
+        }
+    }
+    Ok(Some(has_holes))
+}
+
+#[cfg(unix)]
+fn copy_sparse_native_file_blocking(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+) -> std::io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    let file_len = source.metadata()?.len();
+    let fd = source.as_raw_fd();
+    let sparse = visit_sparse_extents(fd, file_len, |_, _| Ok(()))?;
+    if sparse != Some(true) {
+        return Ok(None);
+    }
+
+    destination.set_len(0)?;
+    destination.set_len(file_len)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut bytes_written = 0_u64;
+    let second_pass = visit_sparse_extents(fd, file_len, |start, end| {
+        source.seek(SeekFrom::Start(start))?;
+        destination.seek(SeekFrom::Start(start))?;
+        let mut remaining = end - start;
+        while remaining > 0 {
+            let amount = remaining.min(buffer.len() as u64) as usize;
+            let read = source.read(&mut buffer[..amount])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "source changed while copying sparse extent",
+                ));
+            }
+            destination.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+            bytes_written += read as u64;
+        }
+        Ok(())
+    })?;
+    if second_pass != Some(true) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source sparse extents changed during copy",
+        ));
+    }
+    destination.flush()?;
+    Ok(Some(bytes_written))
+}
+
 /// Apply a preservation payload to one local staging path before commit.
 pub(crate) fn apply_preservation_blocking(
     full_path: &Path,
@@ -467,6 +632,26 @@ impl StagedWriter for LocalStagedWriter {
             Ok((source, bytes_written))
         })
         .await
+    }
+
+    async fn copy_sparse_from_native_file(
+        &mut self,
+        mut source: std::fs::File,
+    ) -> Result<(std::fs::File, Option<u64>)> {
+        #[cfg(unix)]
+        {
+            self.file_mut()?.flush().await?;
+            self.with_staged(move |staged| {
+                let bytes_written =
+                    copy_sparse_native_file_blocking(&mut source, staged.file_mut())?;
+                Ok((source, bytes_written))
+            })
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            Ok((source, None))
+        }
     }
 
     async fn apply_preservation(
@@ -791,6 +976,29 @@ impl Endpoint for LocalEndpoint {
         }
     }
 
+    async fn native_file_has_sparse_holes(&self, file: &std::fs::File) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let file = file.try_clone()?;
+            let has_holes = tokio::task::spawn_blocking(move || {
+                let file_len = file.metadata()?.len();
+                sparse_extent_map_has_holes(file.as_raw_fd(), file_len)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
+            .map_err(SyncError::Io)?;
+            return Ok(has_holes);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(false)
+        }
+    }
+
     async fn begin_write(
         &self,
         path: &Path,
@@ -889,6 +1097,18 @@ mod tests {
             #[cfg(unix)]
             mode: 0o644,
         }
+    }
+
+    #[test]
+    fn rooted_io_error_keeps_its_kind_when_mapped() {
+        let operation = sy::rooted_fs::RootedFsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source changed during sparse copy",
+        ));
+        let SyncError::Io(error) = map_rooted_fs_error(operation) else {
+            panic!("rooted I/O error was mapped to the wrong error kind");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[cfg(unix)]

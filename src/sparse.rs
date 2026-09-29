@@ -29,8 +29,8 @@ pub struct DataRegion {
 #[cfg(unix)]
 #[allow(dead_code)] // Foundation for future sparse file optimizations
 pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
-    const SEEK_DATA: i32 = 3; // Find next data region
-    const SEEK_HOLE: i32 = 4; // Find next hole
+    const SEEK_DATA: i32 = libc::SEEK_DATA; // Find next data region
+    const SEEK_HOLE: i32 = libc::SEEK_HOLE; // Find next hole
 
     let file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -278,13 +278,18 @@ mod tests {
 
         match regions {
             Ok(r) => {
-                // Should detect data region at ~1MB offset
-                assert!(!r.is_empty(), "Should have at least one data region");
-                assert!(
-                    r[0].offset >= 1024 * 1024,
-                    "First region should start at/after 1MB, got offset: {}",
-                    r[0].offset
-                );
+                // Filesystems may conservatively report a sparse file as fully
+                // allocated. That loses the optimization but remains safe.
+                let size = std::fs::metadata(&file_path).unwrap().len();
+                let reported_dense = r.len() == 1 && r[0].offset == 0 && r[0].length == size;
+                if !reported_dense {
+                    assert!(!r.is_empty(), "Should have at least one data region");
+                    assert!(
+                        r[0].offset >= 1024 * 1024,
+                        "First region should start at/after 1MB, got offset: {}",
+                        r[0].offset
+                    );
+                }
             }
             Err(e)
                 if e.raw_os_error() == Some(libc::EINVAL)
@@ -373,7 +378,14 @@ mod tests {
 
         match regions {
             Ok(r) => {
-                // Should detect multiple data regions (at least 2-3)
+                // Some filesystems conservatively report the complete logical
+                // file as data; do not treat that as sparse-copy evidence.
+                let size = std::fs::metadata(&file_path).unwrap().len();
+                let reported_dense = r.len() == 1 && r[0].offset == 0 && r[0].length == size;
+                if reported_dense {
+                    return;
+                }
+
                 assert!(
                     r.len() >= 2,
                     "Should have multiple data regions, got {}",
