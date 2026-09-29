@@ -11,6 +11,8 @@ use crate::endpoint::io::{
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use crate::temp_file::TempFileGuard;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use sy::engine::domain::{EntryIdentity, Timestamp};
 
@@ -69,6 +71,96 @@ pub(crate) fn timestamp_to_system_time(timestamp: Timestamp) -> Option<std::time
     }
 }
 
+fn apply_requested_metadata(
+    metadata: &mut FileMetadata,
+    requested: Option<TransferMetadata>,
+    source_path: &Path,
+) -> Result<()> {
+    if let Some(transfer_metadata) = requested {
+        if let Some(modified) = transfer_metadata.modified {
+            metadata.modified = timestamp_to_system_time(modified).ok_or_else(|| {
+                SyncError::Config(format!(
+                    "requested timestamp for {} is outside the supported range",
+                    source_path.display()
+                ))
+            })?;
+        }
+        #[cfg(unix)]
+        if let Some(mode) = transfer_metadata.unix_mode {
+            metadata.mode = mode;
+        }
+        #[cfg(not(unix))]
+        if transfer_metadata.unix_mode.is_some() {
+            return Err(SyncError::Config(
+                "Unix mode preservation is not supported on this platform".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validated_source_metadata(
+    source: &dyn Endpoint,
+    source_path: &Path,
+    follow_symlinks: bool,
+    checks: &CommitChecks,
+    requested: Option<TransferMetadata>,
+) -> Result<FileMetadata> {
+    let mut metadata = source.metadata(source_path).await?;
+    if follow_symlinks && metadata.is_symlink {
+        // The scan reported the target; preserve its metadata as well as its
+        // bytes when --copy-links is active.
+        metadata = source.metadata_following(source_path).await?;
+    }
+    checks.verify_source(CheckPoint::Open)?;
+    if metadata.is_dir || metadata.is_symlink {
+        return Err(SyncError::Config(format!(
+            "file transfer requested for non-regular source {}",
+            source_path.display()
+        )));
+    }
+    apply_requested_metadata(&mut metadata, requested, source_path)?;
+    Ok(metadata)
+}
+
+fn file_metadata_from_open_file(file: &std::fs::File) -> Result<FileMetadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(SyncError::Config(
+            "native transfer source is not a regular file".to_string(),
+        ));
+    }
+    Ok(FileMetadata {
+        size: metadata.len(),
+        modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        is_dir: false,
+        is_symlink: false,
+        #[cfg(unix)]
+        mode: metadata.mode(),
+    })
+}
+
+fn verify_open_source_identity(
+    file: &std::fs::File,
+    expected: Option<EntryIdentity>,
+    path: &Path,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let metadata = file.metadata()?;
+    let actual = crate::endpoint::local_identity::metadata_identity(
+        &metadata,
+        sy::engine::domain::EntryKind::File,
+    );
+    if actual != Some(expected) {
+        return Err(SyncError::SourceChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TransferResult {
     pub bytes_written: u64,
@@ -80,6 +172,14 @@ pub struct TransferResult {
 struct NativeTransferResult {
     bytes_written: u64,
     verification: VerificationStatus,
+}
+
+struct NativeStagedCopyPolicy {
+    metadata: FileMetadata,
+    expected_destination: ExpectedDestination,
+    verify: bool,
+    checks: CommitChecks,
+    preservation: Preservation,
 }
 
 /// What the transfer must prove about the source before committing bytes.
@@ -296,6 +396,10 @@ impl CommitChecks {
         Ok(())
     }
 
+    fn expected_source_identity(&self) -> Option<EntryIdentity> {
+        self.source.as_ref().map(|source| source.identity)
+    }
+
     fn expected_destination(&self) -> ExpectedDestination {
         match self.destination {
             DestinationCheck::Absent(_) => ExpectedDestination::Absent,
@@ -353,39 +457,6 @@ async fn transfer_file_inner(
     options: TransferOptions,
     test_hook: Option<RaceHook>,
 ) -> Result<TransferResult> {
-    let mut metadata = source.metadata(source_path).await?;
-    if options.follow_symlinks && metadata.is_symlink {
-        // The scan reported the target; resolve the link so the transfer
-        // guards and size decisions describe the bytes that will be copied.
-        metadata = source.metadata_following(source_path).await?;
-    }
-    if metadata.is_dir || metadata.is_symlink {
-        return Err(SyncError::Config(format!(
-            "file transfer requested for non-regular source {}",
-            source_path.display()
-        )));
-    }
-    if let Some(transfer_metadata) = options.metadata {
-        if let Some(modified) = transfer_metadata.modified {
-            metadata.modified = timestamp_to_system_time(modified).ok_or_else(|| {
-                SyncError::Config(format!(
-                    "requested timestamp for {} is outside the supported range",
-                    source_path.display()
-                ))
-            })?;
-        }
-        #[cfg(unix)]
-        if let Some(mode) = transfer_metadata.unix_mode {
-            metadata.mode = mode;
-        }
-        #[cfg(not(unix))]
-        if transfer_metadata.unix_mode.is_some() {
-            return Err(SyncError::Config(
-                "Unix mode preservation is not supported on this platform".to_string(),
-            ));
-        }
-    }
-
     let source_caps = source.capabilities();
     let dest_caps = dest.capabilities();
 
@@ -413,8 +484,18 @@ async fn transfer_file_inner(
         options.follow_symlinks,
         test_hook,
     )?;
-    // Close the scan-to-open window before any staging work begins.
+    // Close the scan-to-open window before observing transfer metadata. The
+    // second source check brackets metadata capture so SnapshotAtOpen cannot
+    // pair a new byte stream with stale mode/mtime from an earlier stat.
     checks.verify(CheckPoint::Open)?;
+    let metadata = validated_source_metadata(
+        source,
+        source_path,
+        options.follow_symlinks,
+        &checks,
+        options.metadata,
+    )
+    .await?;
     let expected_destination = checks.expected_destination();
 
     let native_pair = if options.rate_limiter.is_none() {
@@ -472,21 +553,32 @@ async fn transfer_file_inner(
             }
         }
 
-        if dest_caps.atomic_rename {
-            let result = native_whole_copy(
-                source_native,
-                dest_native,
-                metadata,
-                options.verify,
-                checks,
-                options.preservation,
-            )
-            .await?;
-            return Ok(TransferResult {
-                bytes_written: result.bytes_written,
-                strategy: TransferStrategy::NativeWholeCopy,
-                verification: result.verification,
-            });
+        if dest_caps.atomic_rename && !options.follow_symlinks {
+            if let Some(source_file) = source.open_native_file(source_path).await? {
+                let expected_source = checks.expected_source_identity();
+                verify_open_source_identity(&source_file, expected_source, source_path)?;
+                let mut native_metadata = file_metadata_from_open_file(&source_file)?;
+                apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
+                let result = native_whole_staged_copy(
+                    source_file,
+                    source_path,
+                    dest,
+                    dest_path,
+                    NativeStagedCopyPolicy {
+                        metadata: native_metadata,
+                        expected_destination,
+                        verify: options.verify,
+                        checks,
+                        preservation: options.preservation,
+                    },
+                )
+                .await?;
+                return Ok(TransferResult {
+                    bytes_written: result.bytes_written,
+                    strategy: TransferStrategy::NativeWholeCopy,
+                    verification: result.verification,
+                });
+            }
         }
     }
 
@@ -504,6 +596,7 @@ async fn transfer_file_inner(
             dest,
             dest_path,
             &StreamCopyPolicy {
+                metadata: &metadata,
                 verify: options.verify,
                 expected_destination,
                 rate_limiter: options.rate_limiter.as_ref(),
@@ -526,45 +619,61 @@ async fn transfer_file_inner(
     )))
 }
 
-async fn native_whole_copy(
-    source: PathBuf,
-    dest: PathBuf,
-    metadata: FileMetadata,
-    verify: bool,
-    checks: CommitChecks,
-    preservation: Preservation,
+async fn native_whole_staged_copy(
+    mut source_file: std::fs::File,
+    source_path: &Path,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    policy: NativeStagedCopyPolicy,
 ) -> Result<NativeTransferResult> {
-    tokio::task::spawn_blocking(move || {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let temp = TempFileGuard::temp_path_for(&dest);
-        let guard = TempFileGuard::new(&temp);
-        let bytes_written = std::fs::copy(&source, &temp)?;
-        strip_xattrs(&temp)?;
-        let mut staged_file = std::fs::OpenOptions::new().read(true).open(&temp)?;
-
-        apply_metadata(&temp, &metadata)?;
-        crate::endpoint::local::apply_preservation_blocking(&temp, &preservation)?;
-        crate::endpoint::io::verify_staged_mode(&temp, metadata.preserved_mode())?;
-        let verification = verify_native_staging(&source, &mut staged_file, verify)?;
-        if matches!(verification, VerificationStatus::Failed { .. }) {
-            return Ok(NativeTransferResult {
-                bytes_written,
-                verification,
-            });
-        }
-        checks.verify(CheckPoint::Commit)?;
-        std::fs::rename(&temp, &dest)?;
-        guard.defuse();
-        Ok(NativeTransferResult {
-            bytes_written,
-            verification,
+    let expected_hash = if policy.verify {
+        let (source, hash) = tokio::task::spawn_blocking(move || {
+            let hash = hash_native_open_file(&mut source_file)?;
+            Ok::<_, SyncError>((source_file, hash))
         })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
+        source_file = source;
+        Some(hash)
+    } else {
+        None
+    };
+    let mut writer = dest
+        .begin_write(dest_path, policy.expected_destination)
+        .await?;
+    let (source_file, bytes_written) = match writer.copy_from_native_file(source_file).await {
+        Ok(copied) => copied,
+        Err(operation) => {
+            crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
+    };
+    if bytes_written != policy.metadata.size {
+        let operation = SyncError::SourceChanged {
+            path: source_path.to_path_buf(),
+        };
+        crate::endpoint::io::abort_staged_writer(writer, &operation).await?;
+        return Err(operation);
+    }
+
+    let expected_source = policy.checks.expected_source_identity();
+    let pre_commit = || {
+        policy.checks.verify_source(CheckPoint::Commit)?;
+        verify_open_source_identity(&source_file, expected_source, source_path)
+    };
+    let verification = crate::endpoint::io::finalize_staged_writer(
+        writer,
+        &policy.metadata,
+        &policy.preservation,
+        expected_hash,
+        Some(&pre_commit),
+    )
+    .await?;
+
+    Ok(NativeTransferResult {
+        bytes_written,
+        verification,
     })
-    .await
-    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
 }
 
 async fn reflink_patch(
@@ -1021,7 +1130,7 @@ mod tests {
         std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
         let identity = update_identity(&fixture);
 
-        transfer_file(
+        let result = transfer_file(
             &fixture.source_endpoint(),
             Path::new(NAME),
             &fixture.dest_endpoint(),
@@ -1031,7 +1140,80 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn native_whole_copy_refuses_parent_moved_outside_root() {
+        let fixture = Fixture::new();
+        let source_parent = fixture.source_root.path().join("nested");
+        let dest_parent = fixture.dest_root.path().join("nested");
+        let moved_parent = fixture.dest_root.path().join("moved");
+        std::fs::create_dir(&source_parent).unwrap();
+        std::fs::create_dir(&dest_parent).unwrap();
+        std::fs::write(source_parent.join(NAME), b"NEW!").unwrap();
+        std::fs::write(dest_parent.join(NAME), b"OLD!").unwrap();
+        let identity = TransferIdentity {
+            source: SourceExpectation::Scanned(identity_of(&source_parent.join(NAME))),
+            destination: ExpectedDestination::Unchanged(identity_of(&dest_parent.join(NAME))),
+        };
+        let racing_parent = dest_parent.clone();
+        let racing_moved = moved_parent.clone();
+        let racing = hook(move || {
+            std::fs::rename(&racing_parent, &racing_moved).unwrap();
+            std::fs::create_dir(&racing_parent).unwrap();
+        });
+
+        let error = transfer_file_with_hook(
+            &fixture.source_endpoint(),
+            Path::new("nested/file"),
+            &fixture.dest_endpoint(),
+            Path::new("nested/file"),
+            options(identity, true),
+            racing,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::DestinationChanged { .. }));
+        assert_eq!(std::fs::read(moved_parent.join(NAME)).unwrap(), b"OLD!");
+        assert!(!dest_parent.join(NAME).exists());
+        assert_eq!(std::fs::read_dir(&dest_parent).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_links_streaming_uses_target_metadata() {
+        let fixture = Fixture::new();
+        let target = fixture.source_root.path().join("target");
+        std::fs::write(&target, b"target bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let target_time = filetime::FileTime::from_unix_time(123, 456_000_000);
+        filetime::set_file_mtime(&target, target_time).unwrap();
+        std::os::unix::fs::symlink("target", fixture.source_file()).unwrap();
+        let identity = TransferIdentity {
+            source: SourceExpectation::Scanned(identity_of(&target)),
+            destination: ExpectedDestination::Absent,
+        };
+        let mut options = options(identity, false);
+        options.follow_symlinks = true;
+
+        let result = transfer_file(
+            &fixture.source_endpoint(),
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy, TransferStrategy::Streaming);
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"target bytes");
+        let metadata = std::fs::metadata(fixture.dest_file()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.modified().unwrap(), target_time.into());
     }
 
     #[tokio::test]
@@ -1483,6 +1665,33 @@ mod tests {
 
         assert_eq!(result.strategy, TransferStrategy::ReflinkPatch);
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap()[0], b'B');
+    }
+
+    #[tokio::test]
+    async fn snapshot_metadata_rejects_mutation_between_identity_and_capture() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"before").unwrap();
+        let source = fixture.source_endpoint();
+        let dest = fixture.dest_endpoint();
+        let checks = CommitChecks::resolve(
+            TransferIdentity {
+                source: SourceExpectation::SnapshotAtOpen,
+                destination: ExpectedDestination::Absent,
+            },
+            source.native_path(Path::new(NAME)).as_deref(),
+            dest.native_path(Path::new(NAME)).as_deref(),
+            false,
+            None,
+        )
+        .unwrap();
+        checks.verify(CheckPoint::Open).unwrap();
+        std::fs::write(fixture.source_file(), b"changed after identity capture").unwrap();
+
+        let error = validated_source_metadata(&source, Path::new(NAME), false, &checks, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
     }
 
     #[tokio::test]

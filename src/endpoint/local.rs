@@ -34,12 +34,17 @@ impl LocalEndpoint {
         }
     }
 
-    async fn rooted_fs(&self) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
+    async fn rooted_fs(
+        &self,
+        create_root: bool,
+    ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
         let root = self.root.clone();
         let rooted = self
             .rooted
             .get_or_try_init(|| async move {
-                tokio::fs::create_dir_all(&root).await?;
+                if create_root {
+                    tokio::fs::create_dir_all(&root).await?;
+                }
                 let rooted = sy::rooted_fs::RootedFs::open(root)
                     .await
                     .map_err(map_rooted_fs_error)?;
@@ -354,6 +359,47 @@ pub(crate) fn write_acl_blocking(full_path: &Path, acl: &str) -> Result<()> {
     Ok(())
 }
 
+/// Copy from a held source descriptor into the still-private staging inode.
+/// macOS `fcopyfile` keeps the operating system's native copy path available
+/// without reopening a user-visible destination pathname.
+fn copy_native_file_blocking(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+
+    source.seek(SeekFrom::Start(0))?;
+    destination.set_len(0)?;
+    destination.seek(SeekFrom::Start(0))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: both descriptors refer to open regular files held for this
+        // call. `state` must be null for the current fcopyfile implementation;
+        // COPYFILE_DATA copies bytes only, leaving requested metadata and
+        // preservation to the transaction finalizer.
+        let result = unsafe {
+            libc::fcopyfile(
+                source.as_raw_fd(),
+                destination.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        destination.metadata().map(|metadata| metadata.len())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::io::copy(source, destination)
+    }
+}
+
 /// Apply a preservation payload to one local staging path before commit.
 pub(crate) fn apply_preservation_blocking(
     full_path: &Path,
@@ -409,6 +455,18 @@ impl StagedWriter for LocalStagedWriter {
         self.with_staged(|staged| staged.staged_hash_blocking())
             .await
             .map(Some)
+    }
+
+    async fn copy_from_native_file(
+        &mut self,
+        mut source: std::fs::File,
+    ) -> Result<(std::fs::File, u64)> {
+        self.file_mut()?.flush().await?;
+        self.with_staged(move |staged| {
+            let bytes_written = copy_native_file_blocking(&mut source, staged.file_mut())?;
+            Ok((source, bytes_written))
+        })
+        .await
     }
 
     async fn apply_preservation(
@@ -702,6 +760,37 @@ impl Endpoint for LocalEndpoint {
         Ok(Box::pin(file))
     }
 
+    async fn open_native_file(&self, path: &Path) -> Result<Option<std::fs::File>> {
+        #[cfg(unix)]
+        {
+            let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
+                .map_err(|error| SyncError::Config(error.to_string()))?;
+            // Unlike destination preparation, opening a source must not create
+            // a missing root as a side effect.
+            let rooted = self.rooted_fs(false).await?;
+            return tokio::task::spawn_blocking(move || {
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(map_rooted_fs_error)?;
+                let file = rooted
+                    .open_regular_blocking(&relative)
+                    .map_err(map_rooted_fs_error)?;
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(map_rooted_fs_error)?;
+                Ok(Some(file))
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
     async fn begin_write(
         &self,
         path: &Path,
@@ -709,7 +798,7 @@ impl Endpoint for LocalEndpoint {
     ) -> Result<Box<dyn StagedWriter>> {
         let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
             .map_err(|error| SyncError::Config(error.to_string()))?;
-        let rooted = self.rooted_fs().await?;
+        let rooted = self.rooted_fs(true).await?;
         let destination_path = self.root.join(relative.as_path());
         Ok(Box::new(
             LocalStagedWriter::new(
@@ -802,6 +891,27 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_source_open_is_rooted_and_does_not_create_roots() {
+        let dir = TempDir::new().unwrap();
+        let missing_root = dir.path().join("missing");
+        let missing_endpoint = LocalEndpoint::new(missing_root.clone());
+        assert!(missing_endpoint
+            .open_native_file(Path::new("file"))
+            .await
+            .is_err());
+        assert!(!missing_root.exists());
+
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let endpoint = LocalEndpoint::new(root);
+        assert!(endpoint.open_native_file(Path::new("link")).await.is_err());
+    }
+
     #[tokio::test]
     async fn staged_write_creates_missing_root_and_parent_directories_confined() {
         let dir = TempDir::new().unwrap();
@@ -830,7 +940,7 @@ mod tests {
 
         runtime.block_on(async {
             let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-            let rooted = endpoint.rooted_fs().await.unwrap();
+            let rooted = endpoint.rooted_fs(true).await.unwrap();
             let relative = sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap();
             let mut writer = LocalStagedWriter::new(
                 rooted,
