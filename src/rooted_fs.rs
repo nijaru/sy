@@ -75,8 +75,17 @@ pub enum RootedFsError {
     #[error("access control lists are unsupported: {0}")]
     AclUnsupported(&'static str),
 
-    #[error("could not allocate a unique staging file after {0} attempts")]
+    #[error("could not allocate a unique staging entry after {0} attempts")]
     StagingNameExhausted(usize),
+
+    #[error("destination was committed at {path}, but private staging cleanup failed: {reason}")]
+    CommittedCleanupPending { path: PathBuf, reason: String },
+
+    #[error("staging directory identity changed; refusing to remove an unowned directory")]
+    StagingDirectoryChanged,
+
+    #[error("staging preparation failed ({operation}) and cleanup also failed ({cleanup})")]
+    StagingPreparationCleanupFailed { operation: String, cleanup: String },
 
     #[error("held-root filesystem confinement is unsupported on this platform")]
     UnsupportedPlatform,
@@ -110,20 +119,24 @@ impl std::fmt::Debug for RootedFs {
     }
 }
 
-/// Same-directory temporary file whose parent directory is held by descriptor.
+/// File staged inside a private same-filesystem directory held by descriptor.
 ///
-/// Dropping this value before `commit` removes only the temporary leaf through
-/// the held parent descriptor. `commit` fsyncs file contents and atomically
-/// renames the temporary leaf over the destination without resolving the
-/// destination pathname from the process working directory or root pathname.
+/// The staging directory remains inaccessible to other users even after the
+/// staged inode receives permissive final mode/ACL metadata. All namespace
+/// operations stay relative to the held destination parent and staging dir.
 pub struct RootedStagedFile {
     file: File,
     #[cfg(unix)]
     parent_fd: OwnedFd,
     #[cfg(unix)]
+    staging_dir_fd: OwnedFd,
+    #[cfg(unix)]
+    staging_dir_name: OsString,
+    #[cfg(unix)]
     temp_name: OsString,
     #[cfg(unix)]
     destination_name: OsString,
+    destination_path: PathBuf,
     committed: bool,
 }
 
@@ -230,18 +243,27 @@ impl RootedStagedFile {
 
     pub fn commit(mut self) -> Result<()> {
         self.file.sync_all()?;
-        self.commit_blocking()?;
-        self.committed = true;
-        Ok(())
+        self.commit_blocking()
     }
 
     #[cfg(unix)]
     fn commit_blocking(&mut self) -> Result<()> {
-        rename_at(
-            self.parent_fd.as_raw_fd(),
+        rename_between_at(
+            self.staging_dir_fd.as_raw_fd(),
             &self.temp_name,
+            self.parent_fd.as_raw_fd(),
             &self.destination_name,
+        )?;
+        self.committed = true;
+        remove_owned_staging_dir_at(
+            self.parent_fd.as_raw_fd(),
+            self.staging_dir_fd.as_raw_fd(),
+            &self.staging_dir_name,
         )
+        .map_err(|error| RootedFsError::CommittedCleanupPending {
+            path: self.destination_path.clone(),
+            reason: error.to_string(),
+        })
     }
 
     #[cfg(not(unix))]
@@ -257,7 +279,12 @@ impl Drop for RootedStagedFile {
         }
         #[cfg(unix)]
         {
-            let _ = unlink_at(self.parent_fd.as_raw_fd(), &self.temp_name, false);
+            let _ = unlink_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name, false);
+            let _ = remove_owned_staging_dir_at(
+                self.parent_fd.as_raw_fd(),
+                self.staging_dir_fd.as_raw_fd(),
+                &self.staging_dir_name,
+            );
         }
     }
 }
@@ -684,22 +711,50 @@ impl RootedFs {
     #[cfg(unix)]
     fn begin_staged_path_blocking(&self, relative: &Path) -> Result<RootedStagedFile> {
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
+        let temp_name = OsString::from("contents");
 
         for _ in 0..TEMP_CREATE_ATTEMPTS {
-            let temp_name = next_temp_name();
-            match create_staging_file_at(parent_fd.as_raw_fd(), &temp_name) {
-                Ok(file) => {
-                    return Ok(RootedStagedFile {
-                        file,
-                        parent_fd,
-                        temp_name,
-                        destination_name,
-                        committed: false,
-                    });
+            let staging_dir_name = next_temp_name();
+            let staging_dir_fd =
+                match create_private_staging_dir_at(parent_fd.as_raw_fd(), &staging_dir_name) {
+                    Ok(fd) => fd,
+                    Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+
+            let file = match create_staging_file_at(staging_dir_fd.as_raw_fd(), &temp_name) {
+                Ok(file) => file,
+                Err(error) => {
+                    return Err(cleanup_staging_directory_preparation(
+                        error,
+                        parent_fd.as_raw_fd(),
+                        staging_dir_fd.as_raw_fd(),
+                        &staging_dir_name,
+                    ));
                 }
-                Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {}
-                Err(error) => return Err(error),
+            };
+            if let Err(error) = verify_staging_file_group(parent_fd.as_raw_fd(), &file) {
+                drop(file);
+                return Err(cleanup_staging_file_preparation(
+                    error,
+                    parent_fd.as_raw_fd(),
+                    staging_dir_fd.as_raw_fd(),
+                    &temp_name,
+                    &staging_dir_name,
+                ));
             }
+            return Ok(RootedStagedFile {
+                file,
+                parent_fd,
+                staging_dir_fd,
+                staging_dir_name,
+                temp_name,
+                destination_name,
+                destination_path: relative.to_path_buf(),
+                committed: false,
+            });
         }
 
         Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
@@ -1362,6 +1417,313 @@ fn open_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
     })
 }
 
+#[cfg(unix)]
+fn create_private_staging_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
+    let name = component_cstring(component)?;
+    let result = unsafe {
+        // SAFETY: `parent` is a held directory descriptor and `name` is a live
+        // single component. The directory is created beneath that descriptor.
+        libc::mkdirat(parent, name.as_ptr(), 0o700)
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let created = match stat_at_no_follow(parent, component) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(RootedFsError::StagingPreparationCleanupFailed {
+                operation: error.to_string(),
+                cleanup: "could not identify the created directory; left its name untouched"
+                    .to_string(),
+            });
+        }
+    };
+    // Do not mutate or remove a same-name replacement if another actor raced
+    // the mkdirat/openat interval.
+    // SAFETY: `geteuid` reads effective process credentials without pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    if created.st_mode & libc::S_IFMT != libc::S_IFDIR || created.st_uid != effective_uid {
+        return Err(RootedFsError::StagingDirectoryChanged);
+    }
+
+    let directory = match open_dir_at(parent, component) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return Err(RootedFsError::StagingPreparationCleanupFailed {
+                operation: error.to_string(),
+                cleanup: "could not hold the created directory; left its name untouched"
+                    .to_string(),
+            });
+        }
+    };
+    let opened = match stat_fd(directory.as_raw_fd()) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(cleanup_staging_directory_preparation(
+                error,
+                parent,
+                directory.as_raw_fd(),
+                component,
+            ));
+        }
+    };
+    if opened.st_dev != created.st_dev || opened.st_ino != created.st_ino {
+        return Err(RootedFsError::StagingDirectoryChanged);
+    }
+    if let Err(error) = make_staging_directory_private(parent, directory.as_raw_fd()) {
+        return match remove_owned_staging_dir_at(parent, directory.as_raw_fd(), component) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(RootedFsError::StagingPreparationCleanupFailed {
+                operation: error.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn cleanup_staging_directory_preparation(
+    operation: RootedFsError,
+    parent: RawFd,
+    staging_dir: RawFd,
+    staging_dir_name: &OsStr,
+) -> RootedFsError {
+    match remove_owned_staging_dir_at(parent, staging_dir, staging_dir_name) {
+        Ok(()) => operation,
+        Err(cleanup) => RootedFsError::StagingPreparationCleanupFailed {
+            operation: operation.to_string(),
+            cleanup: cleanup.to_string(),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_staging_file_preparation(
+    operation: RootedFsError,
+    parent: RawFd,
+    staging_dir: RawFd,
+    temp_name: &OsStr,
+    staging_dir_name: &OsStr,
+) -> RootedFsError {
+    let remove_file = unlink_at(staging_dir, temp_name, false).err();
+    let remove_dir = remove_owned_staging_dir_at(parent, staging_dir, staging_dir_name).err();
+    let cleanup = remove_file
+        .into_iter()
+        .chain(remove_dir)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if cleanup.is_empty() {
+        operation
+    } else {
+        RootedFsError::StagingPreparationCleanupFailed {
+            operation: operation.to_string(),
+            cleanup: cleanup.join("; "),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn verify_staging_file_group(parent: RawFd, file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = stat_fd(parent)?;
+    if parent.st_mode & libc::S_ISGID != 0 && file.metadata()?.gid() != parent.st_gid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staged file did not inherit its setgid destination group",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stat_at_no_follow(parent: RawFd, component: &OsStr) -> Result<libc::stat> {
+    let component = component_cstring(component)?;
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        // SAFETY: `parent` is held, `component` is a live single component,
+        // and AT_SYMLINK_NOFOLLOW inspects the entry without following it.
+        libc::fstatat(
+            parent,
+            component.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe {
+        // SAFETY: successful fstatat initialized the complete stat structure.
+        metadata.assume_init()
+    })
+}
+
+#[cfg(unix)]
+fn stat_fd(fd: RawFd) -> Result<libc::stat> {
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        // SAFETY: `fd` is live and `metadata` is writable stat storage.
+        libc::fstat(fd, metadata.as_mut_ptr())
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe {
+        // SAFETY: successful fstat initialized the complete stat structure.
+        metadata.assume_init()
+    })
+}
+
+#[cfg(unix)]
+fn make_staging_directory_private(parent: RawFd, fd: RawFd) -> Result<()> {
+    let initial = stat_fd(fd)?;
+    let parent_metadata = stat_fd(parent)?;
+    // SAFETY: `geteuid` reads effective process credentials without pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    if initial.st_uid != effective_uid || initial.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(RootedFsError::StagingDirectoryChanged);
+    }
+
+    // macOS inherited allow ACEs are not constrained by POSIX mode bits.
+    // Linux's inherited access-ACL mask is bounded by the 0700 mkdir mode.
+    // mkdirat applies the requested owner-only mode while inheriting the
+    // filesystem's setgid/group policy. Avoid chmod: nonmembers can lose the
+    // setgid bit even when they are allowed to create entries in that parent.
+    let expected_mode = 0o700 | (initial.st_mode & libc::S_ISGID);
+    if initial.st_mode & 0o7777 != expected_mode
+        || (parent_metadata.st_mode & libc::S_ISGID != 0
+            && initial.st_gid != parent_metadata.st_gid)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging directory did not retain private permissions and inherited group ownership",
+        )
+        .into());
+    }
+
+    #[cfg(target_os = "macos")]
+    clear_macos_acl(fd)?;
+
+    let secured = stat_fd(fd)?;
+    if secured.st_mode & 0o7777 != expected_mode
+        || secured.st_uid != effective_uid
+        || secured.st_gid != initial.st_gid
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging directory permissions or ownership changed during ACL isolation",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_owned_staging_dir_at(parent: RawFd, staging_dir: RawFd, component: &OsStr) -> Result<()> {
+    let mut held = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        // SAFETY: `staging_dir` is the held directory descriptor and `held` is
+        // writable storage for fstat's complete result.
+        libc::fstat(staging_dir, held.as_mut_ptr())
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let held = unsafe {
+        // SAFETY: successful fstat initialized the complete stat structure.
+        held.assume_init()
+    };
+    let name = component_cstring(component)?;
+    let mut named = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        // SAFETY: `parent` is held, `name` is a live single component, and
+        // AT_SYMLINK_NOFOLLOW inspects rather than follows the named entry.
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            named.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let named = unsafe {
+        // SAFETY: successful fstatat initialized the complete stat structure.
+        named.assume_init()
+    };
+    if named.st_dev != held.st_dev
+        || named.st_ino != held.st_ino
+        || named.st_mode & libc::S_IFMT != libc::S_IFDIR
+    {
+        return Err(RootedFsError::StagingDirectoryChanged);
+    }
+
+    // A hostile concurrent rename can still race this final identity check;
+    // portable unlinkat has no inode-compare-and-delete operation.
+    unlink_at(parent, component, true)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_acl(fd: RawFd) -> Result<()> {
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut c_void;
+        fn acl_init(count: libc::c_int) -> *mut c_void;
+        fn acl_set_fd(fd: libc::c_int, acl: *mut c_void) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    let inherited = unsafe {
+        // SAFETY: `fd` is the live staging directory descriptor.
+        acl_get_fd(fd)
+    };
+    if inherited.is_null() {
+        let error = std::io::Error::last_os_error();
+        let code = error.raw_os_error();
+        if code == Some(libc::ENOENT)
+            || code == Some(libc::ENOTSUP)
+            || code == Some(libc::EOPNOTSUPP)
+        {
+            // No extended ACL is present or supported; owner-only mode remains
+            // the complete access-control mechanism on this filesystem.
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    unsafe {
+        // SAFETY: `inherited` was returned by `acl_get_fd` and is freed exactly once.
+        acl_free(inherited);
+    }
+
+    let acl = unsafe {
+        // SAFETY: `acl_init(0)` allocates an empty ACL object owned by this call.
+        acl_init(0)
+    };
+    if acl.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let result = unsafe {
+        // SAFETY: `fd` is the live staging directory descriptor and `acl` is a
+        // valid empty ACL; the call replaces inherited ACEs on this directory.
+        acl_set_fd(fd, acl)
+    };
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    unsafe {
+        // SAFETY: `acl` was returned by `acl_init` and is freed exactly once.
+        acl_free(acl);
+    }
+    if let Some(error) = error {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 /// Alias an already-open leaf as a `/proc/self/fd/N` path.
 ///
 /// Linux resolves this magic link to the open file description for
@@ -1586,13 +1948,28 @@ fn link_at(
 
 #[cfg(unix)]
 fn rename_at(parent: RawFd, from: &OsStr, to: &OsStr) -> Result<()> {
-    let from = component_cstring(from)?;
-    let to = component_cstring(to)?;
+    rename_between_at(parent, from, parent, to)
+}
+
+#[cfg(unix)]
+fn rename_between_at(
+    source_parent: RawFd,
+    source: &OsStr,
+    destination_parent: RawFd,
+    destination: &OsStr,
+) -> Result<()> {
+    let source = component_cstring(source)?;
+    let destination = component_cstring(destination)?;
     let result = unsafe {
-        // SAFETY: `parent` remains open for the call and both names are live
-        // NUL-terminated single components. Both lookups stay inside the held
-        // directory descriptor.
-        libc::renameat(parent, from.as_ptr(), parent, to.as_ptr())
+        // SAFETY: both directory descriptors remain open and both names are
+        // live NUL-terminated single components. renameat moves only the leaf
+        // between these held parents and cannot follow a symlink component.
+        libc::renameat(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+        )
     };
     if result < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1691,6 +2068,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permissive_staged_mode_remains_behind_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("file"))
+            .unwrap();
+        staged.file_mut().write_all(b"new").unwrap();
+        staged.apply_metadata_blocking(Some(0o777), None).unwrap();
+
+        let staging_path = root.path().join(&staged.staging_dir_name);
+        assert_eq!(
+            std::fs::metadata(&staging_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(staging_path.join(&staged.temp_name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777
+        );
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+
+        staged.commit().unwrap();
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "acl"))]
+    #[tokio::test]
+    async fn inherited_macos_acl_is_cleared_on_private_staging_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        // SAFETY: `getuid` reads process credentials and has no pointer arguments.
+        let uid = unsafe { libc::getuid() };
+        let inherited = exacl::AclEntry::allow_user(
+            &uid.to_string(),
+            exacl::Perm::READ | exacl::Perm::EXECUTE | exacl::Perm::READATTR,
+            exacl::Flag::FILE_INHERIT | exacl::Flag::DIRECTORY_INHERIT,
+        );
+        exacl::setfacl(&[root.path()], &[inherited], None).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let staged = rooted
+            .begin_staged_file_blocking(&relative("file"))
+            .unwrap();
+
+        let directory_acl = acl_macos::read_fd_entries(staged.staging_dir_fd.as_raw_fd()).unwrap();
+        let file_acl = acl_macos::read_fd_entries(staged.file.as_raw_fd()).unwrap();
+        assert!(directory_acl.is_empty());
+        assert!(file_acl.is_empty());
+        drop(staged);
+    }
+
+    #[tokio::test]
+    async fn staging_preserves_setgid_parent_group_inheritance() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let parent = root.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        if let Some(group) = supplementary_group_other_than_effective() {
+            std::os::unix::fs::chown(&parent, None, Some(group)).unwrap();
+        }
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let parent_metadata = std::fs::metadata(&parent).unwrap();
+        let parent_gid = parent_metadata.gid();
+        let _parent_setgid = parent_metadata.mode() & 0o2000;
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("shared/file"))
+            .unwrap();
+        let staging_path = parent.join(&staged.staging_dir_name);
+
+        let staging_mode = std::fs::metadata(&staging_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(staging_mode & 0o700, 0o700);
+        assert_eq!(staging_mode & 0o077, 0);
+        #[cfg(target_os = "linux")]
+        assert_eq!(staging_mode & 0o2000, _parent_setgid);
+        assert_eq!(std::fs::metadata(&staging_path).unwrap().gid(), parent_gid);
+        assert_eq!(staged.file.metadata().unwrap().gid(), parent_gid);
+        staged.file_mut().write_all(b"new").unwrap();
+        staged.commit().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent.join("file")).unwrap().gid(),
+            parent_gid
+        );
+    }
+
+    fn supplementary_group_other_than_effective() -> Option<libc::gid_t> {
+        // SAFETY: a zero-sized getgroups query has no output pointer and only
+        // asks for the number of supplementary groups.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count <= 0 {
+            return None;
+        }
+        let mut groups = vec![0; count as usize];
+        // SAFETY: `groups` has `count` writable gid_t slots, matching the size.
+        let written = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if written < 0 {
+            return None;
+        }
+        groups.truncate(written as usize);
+        // SAFETY: getegid reads process credentials and has no pointer arguments.
+        let effective = unsafe { libc::getegid() };
+        groups.into_iter().find(|group| *group != effective)
+    }
+
+    #[tokio::test]
+    async fn staging_cleanup_never_removes_replacement_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("file"))
+            .unwrap();
+        staged.file_mut().write_all(b"new").unwrap();
+        let staging_path = root.path().join(&staged.staging_dir_name);
+        let moved_path = root.path().join("moved-private-stage");
+        std::fs::rename(&staging_path, &moved_path).unwrap();
+        std::fs::create_dir(&staging_path).unwrap();
+
+        assert!(matches!(
+            staged.commit(),
+            Err(RootedFsError::CommittedCleanupPending { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
+        assert!(staging_path.is_dir());
+        assert_eq!(std::fs::read_dir(&staging_path).unwrap().count(), 0);
+        assert!(moved_path.is_dir());
+        assert_eq!(std::fs::read_dir(moved_path).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn staged_metadata_is_applied_before_atomic_commit() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"old").unwrap();
@@ -1711,6 +2231,30 @@ mod tests {
         assert_eq!(metadata.mode() & 0o7777, 0);
         assert_eq!(metadata.mtime(), modified.seconds());
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+    }
+
+    #[tokio::test]
+    async fn committed_stage_cleanup_failure_is_not_reported_as_rollback() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"old").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("file"))
+            .unwrap();
+        staged.file_mut().write_all(b"new").unwrap();
+        let staging_path = root.path().join(&staged.staging_dir_name);
+        std::fs::write(staging_path.join("unexpected"), b"keep").unwrap();
+
+        let result = staged.commit();
+        assert!(matches!(
+            result,
+            Err(RootedFsError::CommittedCleanupPending { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(staging_path.join("unexpected")).unwrap(),
+            b"keep"
+        );
     }
 
     #[tokio::test]
