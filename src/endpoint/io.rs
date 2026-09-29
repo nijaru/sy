@@ -137,6 +137,78 @@ pub trait StagedWriter: Send {
     async fn abort(self: Box<Self>) -> Result<()>;
 }
 
+/// Abort owned staging while retaining both the operation and cleanup failures.
+pub(crate) async fn abort_staged_writer(
+    writer: Box<dyn StagedWriter>,
+    operation: &SyncError,
+) -> Result<()> {
+    writer
+        .abort()
+        .await
+        .map_err(|abort| SyncError::StagingAbortFailed {
+            operation: operation.to_string(),
+            abort: abort.to_string(),
+        })
+}
+
+/// Verify staged bytes, apply common metadata/preservation, then commit.
+///
+/// `expected_hash` is computed from the trusted source byte stream. Comparing
+/// it to the endpoint's staged hash proves the bytes to be published are the
+/// bytes that were received, not merely that the incoming stream was valid.
+/// Any pre-commit failure aborts only this writer's private staging.
+pub(crate) async fn finalize_staged_writer(
+    mut writer: Box<dyn StagedWriter>,
+    metadata: &FileMetadata,
+    preservation: &Preservation,
+    expected_hash: Option<blake3::Hash>,
+    pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
+) -> Result<VerificationStatus> {
+    let prepared = async {
+        let verification = if let Some(expected) = expected_hash {
+            let actual = writer.staged_hash().await?.ok_or_else(|| {
+                SyncError::Config("destination cannot verify staged bytes before commit".into())
+            })?;
+            if expected != actual {
+                return Ok(VerificationStatus::Failed { expected, actual });
+            }
+            VerificationStatus::Verified
+        } else {
+            VerificationStatus::NotRequested
+        };
+
+        writer.set_metadata(metadata).await?;
+        writer
+            .apply_preservation(preservation, metadata.preserved_mode())
+            .await?;
+        if let Some(pre_commit) = pre_commit {
+            pre_commit()?;
+        }
+        Ok(verification)
+    }
+    .await;
+
+    match prepared {
+        Ok(VerificationStatus::Failed { expected, actual }) => {
+            let operation =
+                format!("staged content hash mismatch: expected {expected}, got {actual}");
+            let cause = SyncError::Config(operation);
+            // An abort failure means staging cleanup is uncertain and must not
+            // be reported as an ordinary verification result.
+            abort_staged_writer(writer, &cause).await?;
+            Ok(VerificationStatus::Failed { expected, actual })
+        }
+        Ok(verification) => {
+            writer.commit().await?;
+            Ok(verification)
+        }
+        Err(operation) => {
+            abort_staged_writer(writer, &operation).await?;
+            Err(operation)
+        }
+    }
+}
+
 /// Result of a bounded streaming copy.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamCopyResult {
@@ -197,8 +269,9 @@ pub async fn copy_file_streaming(
         let read = match reader.as_mut().read(&mut buffer).await {
             Ok(read) => read,
             Err(error) => {
-                let _ = writer.abort().await;
-                return Err(error.into());
+                let operation = SyncError::Io(error);
+                abort_staged_writer(writer, &operation).await?;
+                return Err(operation);
             }
         };
 
@@ -210,71 +283,37 @@ pub async fn copy_file_streaming(
             hasher.update(&buffer[..read]);
         }
         if let Some(limiter) = policy.rate_limiter {
+            // Discard the poisoned mutex error (which owns the guard) before
+            // awaiting staging cleanup; no blocking guard may cross an await.
             let sleep = limiter
                 .lock()
-                .map_err(|_| SyncError::Config("rate limiter poisoned".to_string()))?
-                .consume(u64::try_from(read).unwrap_or(0));
+                .map(|mut limiter| limiter.consume(read as u64))
+                .ok();
+            let Some(sleep) = sleep else {
+                let operation = SyncError::Config("rate limiter poisoned".to_string());
+                abort_staged_writer(writer, &operation).await?;
+                return Err(operation);
+            };
             if !sleep.is_zero() {
                 tokio::time::sleep(sleep).await;
             }
         }
-        if let Err(error) = writer.write(&buffer[..read]).await {
-            let _ = writer.abort().await;
-            return Err(error);
+        if let Err(operation) = writer.write(&buffer[..read]).await {
+            abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
         }
         bytes_written += read as u64;
     }
 
-    let verification = if let Some(hasher) = hasher {
-        let expected = hasher.finalize();
-        let actual = match writer.staged_hash().await {
-            Ok(Some(hash)) => hash,
-            Ok(None) => {
-                let _ = writer.abort().await;
-                return Err(SyncError::Config(format!(
-                    "{:?} destination does not support pre-commit verification",
-                    dest.endpoint_type()
-                )));
-            }
-            Err(error) => {
-                let _ = writer.abort().await;
-                return Err(error);
-            }
-        };
-
-        if expected != actual {
-            let _ = writer.abort().await;
-            return Ok(StreamCopyResult {
-                bytes_written,
-                verification: VerificationStatus::Failed { expected, actual },
-            });
-        }
-        VerificationStatus::Verified
-    } else {
-        VerificationStatus::NotRequested
-    };
-
-    if let Err(error) = writer.set_metadata(&metadata).await {
-        let _ = writer.abort().await;
-        return Err(error);
-    }
-
-    if let Err(error) = writer
-        .apply_preservation(policy.preservation, metadata.preserved_mode())
-        .await
-    {
-        let _ = writer.abort().await;
-        return Err(error);
-    }
-
-    if let Some(pre_commit) = policy.pre_commit {
-        if let Err(error) = pre_commit() {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
-    }
-
-    writer.commit().await?;
+    let expected_hash = hasher.map(|hasher| hasher.finalize());
+    let verification = finalize_staged_writer(
+        writer,
+        &metadata,
+        policy.preservation,
+        expected_hash,
+        policy.pre_commit,
+    )
+    .await?;
     Ok(StreamCopyResult {
         bytes_written,
         verification,
