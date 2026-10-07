@@ -404,7 +404,7 @@ impl WireMutation {
             }),
             (_, _, _, true) => Err(ProtocolError::InvalidField {
                 field: "expected_identity",
-                reason: "expected identity is valid only for remove mutations",
+                reason: "expected identity is valid only for remove or replace-symlink mutations",
             }),
         }
     }
