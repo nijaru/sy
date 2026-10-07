@@ -56,6 +56,22 @@ pub enum RemotePushControllerError {
         destination_kind: crate::engine::domain::EntryKind,
     },
 
+    #[error(
+        "unsupported type transition at '{path}': discarding a non-empty directory ({discarded_entries} entries) requires --delete"
+    )]
+    NonEmptyDirectoryReplacementRequiresDelete {
+        path: RelativePath,
+        discarded_entries: u64,
+    },
+
+    #[error(
+        "unsupported type transition at '{path}': directory contains protected or excluded entry '{descendant}'"
+    )]
+    CannotReplaceDirectoryWithProtectedDescendant {
+        path: RelativePath,
+        descendant: RelativePath,
+    },
+
     #[error("remote push worker failed: {0}")]
     Worker(String),
 
@@ -168,6 +184,10 @@ pub async fn preflight_remote_push_scoped(
     .await
 }
 
+fn is_descendant_of(path: &RelativePath, ancestor: &RelativePath) -> bool {
+    path.as_path() != ancestor.as_path() && path.as_path().starts_with(ancestor.as_path())
+}
+
 /// Complete remote-push preflight with asynchronous content comparison
 /// for planner decisions that cannot be resolved from scan metadata.
 ///
@@ -201,8 +221,60 @@ where
     let mut collision_detector =
         crate::engine::namespace::NamespaceCollisionDetector::new(policy.namespace_semantics);
     let mut operations = 0_u64;
+    let mut active_replaced_dir: Option<(RelativePath, u64)> = None;
 
     while let Some(item) = reconciler.next().await? {
+        let item_path = match &item {
+            ReconcileItem::SourceOnly(source) => &source.path,
+            ReconcileItem::Matched { source, .. } => &source.path,
+            ReconcileItem::DestinationOnly(destination) => &destination.path,
+        };
+
+        if let Some((replaced_path, _)) = &active_replaced_dir {
+            if !is_descendant_of(item_path, replaced_path) {
+                let (path, count) = active_replaced_dir.take().unwrap();
+                if count > 0 && delete.is_none() {
+                    return Err(
+                        RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                            path,
+                            discarded_entries: count,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some((replaced_path, discarded_count)) = &mut active_replaced_dir {
+            match item {
+                ReconcileItem::DestinationOnly(destination) => {
+                    let in_scope = delete_in_scope(&destination);
+                    if !in_scope {
+                        return Err(
+                            RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+                                path: replaced_path.clone(),
+                                descendant: destination.path,
+                            },
+                        );
+                    }
+                    *discarded_count = checked_add(*discarded_count, 1, "discarded descendant")?;
+                    if let Some(delete) = &mut delete {
+                        delete
+                            .observe_replaced_directory_descendant(&destination)
+                            .await?;
+                    }
+                    collision_detector.record(&destination.path).await?;
+                    continue;
+                }
+                ReconcileItem::SourceOnly(source) | ReconcileItem::Matched { source, .. } => {
+                    return Err(RemotePushControllerError::UnsupportedTypeTransition {
+                        path: source.path,
+                        source_kind: source.kind,
+                        destination_kind: crate::engine::domain::EntryKind::Directory,
+                    });
+                }
+            }
+        }
+
         let decision = match item {
             ReconcileItem::SourceOnly(source) => {
                 if let Some(delete) = &mut delete {
@@ -254,24 +326,43 @@ where
                 finish_content_comparison(source, destination, contents_equal, policy)
             }
         };
-        // Type transitions involving directories need a tree transaction that
-        // does not exist yet. The whole preflight rejects them before any
-        // destination mutation instead of failing mid-execution.
         if let SyncOp::Replace {
             source,
             destination,
         } = &operation
         {
-            if source.is_directory() || destination.is_directory() {
+            if source.is_directory() {
                 return Err(RemotePushControllerError::UnsupportedTypeTransition {
                     path: source.path.clone(),
                     source_kind: source.kind,
                     destination_kind: destination.kind,
                 });
             }
+            if destination.is_directory() {
+                if !delete_in_scope(destination) {
+                    return Err(
+                        RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+                            path: destination.path.clone(),
+                            descendant: destination.path.clone(),
+                        },
+                    );
+                }
+                active_replaced_dir = Some((destination.path.clone(), 0));
+            }
         }
         journal.append(&operation).await?;
         operations = checked_add(operations, 1, "operation")?;
+    }
+
+    if let Some((path, count)) = active_replaced_dir.take() {
+        if count > 0 && delete.is_none() {
+            return Err(
+                RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                    path,
+                    discarded_entries: count,
+                },
+            );
+        }
     }
 
     // Alias proof completes with the rest of preflight: no mutation may run
@@ -1282,9 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_rejects_directory_transitions_before_mutation() {
-        // A directory on either side of a replacement needs a tree
-        // transaction; the whole preflight refuses before any mutation.
+    async fn preflight_rejects_source_directory_replacement_before_subtree_staging() {
         let source = entries(vec![directory("swap", 0o755)]);
         let destination = entries(vec![file("swap", 3, 1)]);
         let err = preflight_remote_push(
@@ -1300,9 +1389,12 @@ mod tests {
             err,
             RemotePushControllerError::UnsupportedTypeTransition { .. }
         ));
+    }
 
+    #[tokio::test]
+    async fn preflight_rejects_non_empty_directory_replacement_without_delete() {
         let source = entries(vec![file("swap", 3, 1)]);
-        let destination = entries(vec![directory("swap", 0o755)]);
+        let destination = entries(vec![directory("swap", 0o755), file("swap/child", 10, 1)]);
         let err = preflight_remote_push(
             source,
             destination,
@@ -1312,10 +1404,132 @@ mod tests {
         )
         .await
         .unwrap_err();
+        match err {
+            RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                path,
+                discarded_entries,
+            } => {
+                assert_eq!(path, RelativePath::new("swap").unwrap());
+                assert_eq!(discarded_entries, 1);
+            }
+            other => panic!(
+                "expected NonEmptyDirectoryReplacementRequiresDelete, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_empty_directory_replacement_without_delete() {
+        let source = entries(vec![file("swap", 3, 1)]);
+        let destination = entries(vec![directory("swap", 0o755)]);
+        let plan = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.operations, 1);
+        assert!(plan.delete.is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_accounts_discarded_descendants_in_delete_plan() {
+        let source = entries(vec![file("swap", 3, 1)]);
+        let destination = entries(vec![
+            directory("swap", 0o755),
+            file("swap/first", 10, 1),
+            file("swap/second", 20, 1),
+        ]);
+        let policy = DeletePolicy {
+            limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
+            force: false,
+        };
+        let mut plan = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(policy),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.operations, 1);
+        let delete = plan.delete.take().unwrap();
+        assert_eq!(delete.delete_candidates(), 2);
+        assert_eq!(delete.eligible_destination_entries(), 3); // swap (dir), swap/first, swap/second
+
+        // Replaced directory descendants must NOT be present in delete journal replay
+        let mut replay = delete.into_replay();
+        assert!(replay.next_action().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_enforces_delete_threshold_for_directory_replacement_descendants() {
+        let source = entries(vec![file("swap", 3, 1)]);
+        let destination = entries(vec![
+            directory("swap", 0o755),
+            file("swap/first", 10, 1),
+            file("swap/second", 20, 1),
+        ]);
+        let policy = DeletePolicy {
+            limit: crate::engine::delete_plan::DeleteLimit::Count(1),
+            force: false,
+        };
+        let err = preflight_remote_push(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(policy),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
-            RemotePushControllerError::UnsupportedTypeTransition { .. }
+            RemotePushControllerError::DeletePlan(DeletePlanError::CountExceeded {
+                delete_candidates: 2,
+                limit: 1,
+            })
         ));
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_directory_replacement_with_protected_descendant() {
+        let source = entries(vec![file("swap", 3, 1)]);
+        let destination = entries(vec![
+            directory("swap", 0o755),
+            file("swap/protected", 10, 1),
+        ]);
+        let err = preflight_remote_push_scoped(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            Some(DeletePolicy {
+                limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
+                force: false,
+            }),
+            |_| true,
+            |dest| dest.path.as_path() != std::path::Path::new("swap/protected"),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+                path,
+                descendant,
+            } => {
+                assert_eq!(path, RelativePath::new("swap").unwrap());
+                assert_eq!(descendant, RelativePath::new("swap/protected").unwrap());
+            }
+            other => panic!(
+                "expected CannotReplaceDirectoryWithProtectedDescendant, got {:?}",
+                other
+            ),
+        }
     }
 
     #[tokio::test]

@@ -42,6 +42,19 @@ pub enum SyncError {
     },
 
     #[error(
+        "Unsupported type transition: '{path}' replaces a non-empty directory ({discarded_entries} discarded entries) without --delete\nThe destination was left unchanged."
+    )]
+    NonEmptyDirectoryReplacementRequiresDelete {
+        path: PathBuf,
+        discarded_entries: u64,
+    },
+
+    #[error(
+        "Unsupported type transition: '{path}' contains protected or excluded entry '{descendant}'\nThe destination was left unchanged."
+    )]
+    CannotReplaceDirectoryWithProtectedDescendant { path: PathBuf, descendant: PathBuf },
+
+    #[error(
         "Preservation conflict: {path} ended with mode {actual:#o} after applying its ACL (expected {expected:#o})"
     )]
     PreservationConflict {
