@@ -502,7 +502,7 @@ pub struct NamespaceCollisionDetector {
     budget: SpillBudget,
     buffer: Vec<SortRecord>,
     buffered_bytes: usize,
-    runs: Vec<RunFile>,
+    levels: Vec<Vec<RunFile>>,
 }
 
 impl NamespaceCollisionDetector {
@@ -519,7 +519,7 @@ impl NamespaceCollisionDetector {
             },
             buffer: Vec::new(),
             buffered_bytes: 0,
-            runs: Vec::new(),
+            levels: Vec::new(),
         }
     }
 
@@ -557,15 +557,18 @@ impl NamespaceCollisionDetector {
         if self.semantics.is_byte_exact() {
             return Ok(());
         }
-        if self.runs.is_empty() {
+        if self.levels.is_empty() {
             return scan_buffered(std::mem::take(&mut self.buffer));
         }
 
         self.spill_run().await?;
-        while self.runs.len() > self.budget.merge_fan_in {
+        let mut remaining: Vec<RunFile> = Vec::new();
+        for level in self.levels.drain(..) {
+            remaining.extend(level);
+        }
+        while remaining.len() > self.budget.merge_fan_in {
             let mut next_round: Vec<RunFile> = Vec::new();
-            let runs = std::mem::take(&mut self.runs);
-            let mut groups = runs.into_iter().peekable();
+            let mut groups = remaining.into_iter().peekable();
             while groups.peek().is_some() {
                 let mut group = Vec::new();
                 for run in groups.by_ref().take(self.budget.merge_fan_in) {
@@ -579,10 +582,12 @@ impl NamespaceCollisionDetector {
                     next_round.push(run);
                 }
             }
-            self.runs = next_round;
+            remaining = next_round;
         }
 
-        merge_group(std::mem::take(&mut self.runs), false).await?;
+        if !remaining.is_empty() {
+            merge_group(remaining, false).await?;
+        }
         Ok(())
     }
 
@@ -613,7 +618,23 @@ impl NamespaceCollisionDetector {
         writer.flush().await?;
         let mut file = writer.into_inner();
         file.seek(SeekFrom::Start(0)).await?;
-        self.runs.push(RunFile { file });
+        let mut current_run = RunFile { file };
+        let mut level = 0;
+        loop {
+            if level >= self.levels.len() {
+                self.levels.push(Vec::new());
+            }
+            self.levels[level].push(current_run);
+            if self.levels[level].len() < self.budget.merge_fan_in {
+                break;
+            }
+            let group = std::mem::take(&mut self.levels[level]);
+            let Some(merged) = merge_group(group, true).await? else {
+                break;
+            };
+            current_run = merged;
+            level += 1;
+        }
         Ok(())
     }
 }

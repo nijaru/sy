@@ -2398,16 +2398,18 @@ fn rename_exchange_at(
 ) -> Result<()> {
     let source = component_cstring(source)?;
     let destination = component_cstring(destination)?;
+    const RENAME_EXCHANGE: libc::c_uint = 2;
     let result = unsafe {
         // SAFETY: both directory descriptors remain open and both names are
-        // live NUL-terminated single components. libc::renameat2 with
+        // live NUL-terminated single components. The Linux renameat2 syscall with
         // RENAME_EXCHANGE atomically swaps the two entries without following symlinks.
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             source_parent,
             source.as_ptr(),
             destination_parent,
             destination.as_ptr(),
-            libc::RENAME_EXCHANGE,
+            RENAME_EXCHANGE,
         )
     };
     if result < 0 {
@@ -2453,7 +2455,7 @@ fn rename_exchange_at(
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn rename_exchange_at(
     _source_parent: RawFd,
     _source: &OsStr,
