@@ -257,7 +257,7 @@ fn entry_from_metadata(
     let mut entry = match kind {
         EntryKind::File => Entry::file(relative, metadata.len(), modified),
         EntryKind::Directory => Entry::directory(relative, modified),
-        EntryKind::Symlink => unreachable!("symlinks use fstatat metadata"),
+        EntryKind::Symlink => Entry::symlink(relative, PathBuf::new(), modified),
     };
     if request.metadata.unix_mode {
         entry.unix_mode = Some(metadata.mode() & 0o7777);

@@ -122,12 +122,10 @@ fn lower_replace(
     _destination: Entry,
     policy: PullLowerPolicy,
 ) -> Result<LoweredPull> {
-    if source.is_directory() {
-        return Err(RemotePullError::TransactionalDirectoryReplace(
-            source.path.as_path().to_path_buf(),
-        ));
-    }
     match source.kind {
+        EntryKind::Directory => Err(RemotePullError::TransactionalDirectoryReplace(
+            source.path.as_path().to_path_buf(),
+        )),
         EntryKind::File => {
             let mode = source.unix_mode.ok_or_else(|| {
                 RemotePullError::MissingScannedMode(source.path.as_path().to_path_buf())
@@ -152,7 +150,6 @@ fn lower_replace(
             })),
             finalize: None,
         }),
-        EntryKind::Directory => unreachable!("directory transition refused above"),
     }
 }
 

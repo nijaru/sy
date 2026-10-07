@@ -232,13 +232,10 @@ fn lower_replace(
     _destination: Entry,
     policy: RemotePushPolicy,
 ) -> LowerResult<LoweredPush> {
-    if source.is_directory() {
-        return Err(RemotePushLowerError::TransactionalDirectoryReplace(
-            source.path.as_path().to_path_buf(),
-        ));
-    }
-
     match source.kind {
+        EntryKind::Directory => Err(RemotePushLowerError::TransactionalDirectoryReplace(
+            source.path.as_path().to_path_buf(),
+        )),
         EntryKind::File => {
             let mode = source.unix_mode.ok_or_else(|| {
                 RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
@@ -268,7 +265,6 @@ fn lower_replace(
             })),
             finalize: None,
         }),
-        EntryKind::Directory => unreachable!("directory transitions returned above"),
     }
 }
 

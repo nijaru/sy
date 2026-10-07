@@ -955,13 +955,7 @@ impl LocalSyncExecutor {
                 ));
             }
         }
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
-            }
-        } else if action.is_directory {
+        if action.is_directory {
             match tokio::fs::remove_dir(&path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -981,7 +975,11 @@ impl LocalSyncExecutor {
                 Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
             }
         } else {
-            unreachable!()
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
+            }
         }
         self.report(
             crate::sync::output::ItemizeOp::Delete,
@@ -1314,13 +1312,11 @@ fn lower_replace(
     destination: Entry,
     policy: LocalLowerPolicy,
 ) -> std::result::Result<LoweredLocal, LocalSyncError> {
-    if source.is_directory() {
-        return Err(LocalSyncError::Destination(
+    match source.kind {
+        EntryKind::Directory => Err(LocalSyncError::Destination(
             source.path.as_path().to_path_buf(),
             std::io::Error::other("transactional directory replacement is not implemented"),
-        ));
-    }
-    match source.kind {
+        )),
         EntryKind::File => {
             let mode = source.unix_mode.ok_or_else(|| {
                 LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf())
@@ -1345,7 +1341,6 @@ fn lower_replace(
             })),
             finalize: None,
         }),
-        EntryKind::Directory => unreachable!("directory transitions refused above"),
     }
 }
 
