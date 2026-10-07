@@ -1,22 +1,15 @@
-//! v3 pull execution: SSH source root -> local destination root.
+//! Pull execution: SSH source root -> local destination root.
 //!
-//! Mirrors `v3_push` with the roles inverted. The remote session is opened
-//! with `Operation::Pull`, so the server serves scans, content hashes, and
+//! Mirrors `push` with the roles inverted. The remote session is opened with
+//! `Operation::Pull`, so the server serves scans, content hashes, and
 //! whole-file fetches, and the session router rejects every mutation request.
 //! The local side owns reconciliation (the shared preflight controller),
-//! transactional staging, metadata, and the delete journal once deletes land
-//! (see `legacy_fallback_reason`).
-//!
-//! Policy helpers are shared with `v3_push` so both directions make
-//! identical decisions for identical CLI flags.
+//! transactional staging, metadata, and the delete journal.
 
+use super::policy::*;
 use crate::cli::SymlinkMode;
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::ScanOptions;
-use crate::sync::v3_push::{
-    comparison_policy, compression_policy, delete_policy, map_controller_error, map_io,
-    preview_stats, source_scan_request, summary_stats,
-};
 use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -34,24 +27,19 @@ use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 
 /// Whether a pull must fall back to the legacy v2 stack.
 ///
-/// The preservation cluster stays deferred to item 6 (executor unification)
-/// so it lands once, not twice. Pull-specific refusals (delete,
-/// remove-source-files, copy-links) are handled by CLI validation before a
-/// connection is opened; this returns None for every pull the CLI accepts.
-/// Whether a pull must fall back to the legacy v2 stack.
+/// Pull-specific option refusals.
 ///
-/// The preservation cluster is complete on v3 (pull-specific refusals for
-/// delete, remove-source-files, and copy-links stay, handled below). The
-/// function stays until item 7 deletes the condemned stacks (P2).
-pub(super) fn legacy_fallback_reason(config: &SyncConfig) -> Option<&'static str> {
+/// Refuses operations not yet supported over pull (server-side source removal,
+/// follow-scans, or delete protection).
+pub(super) fn pull_unsupported_reason(config: &SyncConfig) -> Option<&'static str> {
     if config.delete.is_enabled() {
-        return Some("v3 pull --delete is not yet implemented (remote ignore-scope delete protection is the remaining design)");
+        return Some("pull --delete is not yet implemented (remote ignore-scope delete protection is the remaining design)");
     }
     if config.remove_source_files {
-        return Some("v3 pull --remove-source-files is not yet implemented (server-side source removal needs a confined mutation design)");
+        return Some("pull --remove-source-files is not yet implemented (server-side source removal needs a confined mutation design)");
     }
     if config.preserve.symlink_mode == SymlinkMode::Follow {
-        return Some("v3 pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
+        return Some("pull --copy-links is not yet implemented (remote follow-scans need a confined walk design)");
     }
     None
 }
@@ -167,7 +155,7 @@ async fn execute_with_handle(
         let diff_mode = config.diff_mode;
         let preview = preview_remote_push(plan, |item| {
             if diff_mode {
-                crate::sync::v3_push::emit_diff_line(item);
+                emit_diff_line(item);
             }
         })
         .await
@@ -257,7 +245,7 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
         include_git_dir: true,
         follow_symlinks: false,
         max_depth: None,
-        metadata: crate::sync::v3_push::metadata_request(config),
+        metadata: metadata_request(config),
     }
 }
 
@@ -439,7 +427,7 @@ mod tests {
     /// read through the same held source file as its bytes, then applied to
     /// local staging before commit.
     #[tokio::test]
-    async fn xattrs_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+    async fn xattrs_are_read_from_remote_source_and_mirrored_over_pull() {
         let source_root = TempDir::new().unwrap();
         let destination_root = TempDir::new().unwrap();
         let name = "user.sy-e2e";
@@ -513,7 +501,7 @@ mod tests {
     /// staging before commit.
     #[cfg(all(unix, feature = "acl"))]
     #[tokio::test]
-    async fn acls_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+    async fn acls_are_read_from_remote_source_and_mirrored_over_pull() {
         let source_root = TempDir::new().unwrap();
         let destination_root = TempDir::new().unwrap();
         let source_file = source_root.path().join("file");
@@ -595,7 +583,7 @@ mod tests {
     /// after the staged commit (macOS only).
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn bsd_flags_are_read_from_remote_source_and_mirrored_over_v3_pull() {
+    async fn bsd_flags_are_read_from_remote_source_and_mirrored_over_pull() {
         use std::ffi::CString;
         use std::os::macos::fs::MetadataExt;
         use std::os::unix::ffi::OsStrExt;
@@ -846,22 +834,22 @@ mod tests {
     #[test]
     fn accepted_pull_maps_to_v3_without_fallback() {
         let mut config = supported_config();
-        assert_eq!(legacy_fallback_reason(&config), None);
+        assert_eq!(pull_unsupported_reason(&config), None);
         config.itemize_changes = true;
         config.json = true;
         config.perf = true;
         config.backup = Some(String::new());
         config.timeout = Some(30);
-        assert_eq!(legacy_fallback_reason(&config), None);
+        assert_eq!(pull_unsupported_reason(&config), None);
 
         // -X/-A/-F route to v3; only pull-specific refusals remain.
         config.preserve.xattrs = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
+        assert_eq!(pull_unsupported_reason(&config), None);
         config.preserve.acls = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
+        assert_eq!(pull_unsupported_reason(&config), None);
         config.preserve.acls = false;
         config.preserve.flags = true;
-        assert_eq!(legacy_fallback_reason(&config), None);
+        assert_eq!(pull_unsupported_reason(&config), None);
         config.preserve.flags = false;
 
         // The refused cluster keeps its reasons for defense-in-depth: if
@@ -870,7 +858,7 @@ mod tests {
             limit: sy::engine::delete_plan::DeleteLimit::Unlimited,
             force: false,
         };
-        assert!(legacy_fallback_reason(&config).is_some());
+        assert!(pull_unsupported_reason(&config).is_some());
     }
 
     /// A source modified between the scan and the fetch must fail loudly:

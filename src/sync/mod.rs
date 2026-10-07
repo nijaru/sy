@@ -1,14 +1,15 @@
 #![allow(dead_code)]
 pub mod config;
+mod local;
 pub mod output;
+pub mod policy;
+#[cfg(feature = "ssh")]
+mod pull;
+mod push;
 pub mod ratelimit;
 pub mod scanner;
 pub mod session;
 pub mod stats;
-mod v3_local;
-#[cfg(feature = "ssh")]
-mod v3_pull;
-mod v3_push;
 #[cfg(feature = "watch")]
 pub mod watch_session;
 

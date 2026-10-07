@@ -1,24 +1,15 @@
-//! v3 local execution: local source root -> local destination root (item 6).
+//! Local execution: local source root -> local destination root.
 //!
-//! The same controller pipeline as the remote directions — shared preflight
-//! (one reconcile pass, single-pass `DeleteTracker`), bounded concurrent
-//! execution, reverse-order deletes, journal-owned finalize — with
-//! `LocalSyncExecutor` on both sides. Native fast paths (clonefile,
-//! reflink+patch, sparse copy) live in the transfer layer and are preserved
-//! untouched.
-//!
-//! The legacy reconcile/TaskExecutor path remains for the deferred
-//! preservation cluster (ACLs/BSD flags) until that preservation lands once on
-//! this executor; every other CLI-accepted local sync routes here.
+//! Uses the shared controller pipeline — shared preflight (one reconcile pass,
+//! single-pass `DeleteTracker`), bounded concurrent execution, reverse-order
+//! deletes, journal-owned finalize — with `LocalSyncExecutor` on both sides.
+//! Native fast paths (clonefile, reflink+patch, sparse copy) live in the
+//! transfer layer.
 
+use super::policy::*;
 use crate::cli::SymlinkMode;
 use crate::error::{Result, SyncError};
 use crate::sync::scanner::ScanOptions;
-use crate::sync::v3_push::{
-    comparison_policy, delete_policy, entry_in_depth_scope, entry_in_size_scope,
-    entry_in_vcs_scope, entry_not_source_ignored, entry_selected_by_symlink_mode, map_io,
-    preview_stats, summary_stats,
-};
 use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -57,23 +48,23 @@ pub(super) async fn run(
     // the files live; the destination scan stays COMPLETE (gitignore never
     // narrows what reconciliation sees) — the same boundary as every other
     // direction.
-    let source = crate::sync::v3_push::filtered_source_stream(
+    let source = filtered_source_stream(
         sy::endpoint::local_entry_scan::local_entry_stream(
             source_root.to_path_buf(),
-            crate::sync::v3_push::source_scan_request(config, scan_options),
+            source_scan_request(config, scan_options),
         ),
         config.filter_engine.clone(),
     );
     let destination = sy::endpoint::local_entry_scan::local_entry_stream(
         destination_root.to_path_buf(),
-        crate::sync::v3_push::destination_scan_request(config),
+        destination_scan_request(config),
     );
 
     let min_size = config.min_size;
     let max_size = config.max_size;
     let skip_symlinks = config.preserve.symlink_mode == SymlinkMode::Skip;
     let delete_filter = config.filter_engine.clone();
-    let max_depth = crate::sync::v3_push::selection_max_depth(config, scan_options);
+    let max_depth = selection_max_depth(config, scan_options);
     let include_git_dir = scan_options.include_git_dir;
     // Source-derived ignore scope: destination-only paths the source rules
     // would ignore are protected from deletion (see `engine::ignore_scope`).
@@ -133,7 +124,7 @@ pub(super) async fn run(
             },
         )
         .await
-        .map_err(crate::sync::v3_push::map_controller_error)?
+        .map_err(map_controller_error)?
     } else {
         preflight_remote_push_scoped(
             source,
@@ -155,18 +146,18 @@ pub(super) async fn run(
             },
         )
         .await
-        .map_err(crate::sync::v3_push::map_controller_error)?
+        .map_err(map_controller_error)?
     };
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
         let preview = preview_remote_push(plan, |item| {
             if diff_mode {
-                crate::sync::v3_push::emit_diff_line(item);
+                emit_diff_line(item);
             }
         })
         .await
-        .map_err(crate::sync::v3_push::map_controller_error)?;
+        .map_err(map_controller_error)?;
         return preview_stats(preview);
     }
 
@@ -211,7 +202,7 @@ pub(super) async fn run(
     let summary: RemotePushSummary = RemotePushController::new(executor, max_in_flight)
         .execute(plan)
         .await
-        .map_err(crate::sync::v3_push::map_controller_error)?;
+        .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;
     // --verify's staged verification is fail-fast on this path: a successful
     // run verified every transferred file.
