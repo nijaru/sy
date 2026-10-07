@@ -47,7 +47,7 @@ pub enum LocalSyncError {
     #[error("symlink action is missing the scanned target for {0}")]
     MissingSymlinkTarget(PathBuf),
 
-    #[error("symlink replacement requires scanned destination identity for {0}")]
+    #[error("destination mutation requires scanned identity for {0}")]
     MissingDestinationIdentity(PathBuf),
 
     #[error("regular-file transfer requires scanned Unix mode metadata for {0}")]
@@ -55,6 +55,9 @@ pub enum LocalSyncError {
 
     #[error("--backup location for {0} is not representable")]
     InvalidBackupPath(PathBuf),
+
+    #[error(transparent)]
+    Rooted(#[from] crate::rooted_fs::RootedFsError),
 
     #[error("staged verification failed for {path}: expected {expected}, got {actual}")]
     VerificationFailed {
@@ -353,81 +356,43 @@ impl LocalSyncExecutor {
     /// basis for the replacement transfer's staging. The copy never follows
     /// symlinks; a backup that resolved a link target would copy the wrong
     /// tree (and could touch a target outside both roots).
-    async fn backup_replacement_file(&self, relative: &RelativePath) -> Result<()> {
-        let source = self.destination_path(relative);
+    async fn backup_replacement_file(
+        &self,
+        relative: &RelativePath,
+        identity: Option<crate::engine::domain::EntryIdentity>,
+    ) -> Result<()> {
+        let expected = identity.ok_or_else(|| {
+            LocalSyncError::MissingDestinationIdentity(self.destination_path(relative))
+        })?;
         let backup = self.backup_destination_for(relative)?;
-        let metadata = tokio::fs::symlink_metadata(&source)
-            .await
-            .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-        if metadata.file_type().is_symlink() {
-            // Preserve the link itself; the replacement proceeds, and the
-            // link is recreated from the scanned target.
-            let target = tokio::fs::read_link(&source)
-                .await
-                .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-            if let Some(parent) = backup.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-            }
-            create_symlink_preserving(&target, &backup)
-                .await
-                .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-            return Ok(());
-        }
-        if !metadata.is_file() {
-            return Ok(());
-        }
-        if let Some(parent) = backup.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-        }
-        tokio::fs::copy(&source, &backup)
-            .await
-            .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
+        let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+        let relative = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.backup_file_blocking(&relative, &backup, expected)
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         Ok(())
     }
 
-    /// Preserve a to-be-DELETED destination entry. MOVE semantics: rename
-    /// is atomic, cannot leave a partial backup, and IS the deletion for
-    /// the original path. Returns `true` when the entry was moved away (the
-    /// caller must NOT remove it again); a cross-device --backup-dir falls
-    /// back to a copy and the caller removes the original normally.
-    async fn backup_deleted_entry(&self, relative: &RelativePath) -> Result<bool> {
-        let source = self.destination_path(relative);
+    /// Copy a regular deletion candidate privately, then revalidate before
+    /// unlinking it. Unlike move-backed backups, copy failure cannot remove
+    /// the original. Neither the final stat/unlink nor backup commit is CAS.
+    async fn backup_deleted_entry(
+        &self,
+        relative: &RelativePath,
+        expected: crate::engine::domain::EntryIdentity,
+    ) -> Result<()> {
         let backup = self.backup_destination_for(relative)?;
-        let metadata = tokio::fs::symlink_metadata(&source)
-            .await
-            .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-        if let Some(parent) = backup.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-        }
-        if metadata.file_type().is_symlink() {
-            // Preserve the link itself; the target is never resolved.
-            let target = tokio::fs::read_link(&source)
-                .await
-                .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-            create_symlink_preserving(&target, &backup)
-                .await
-                .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-            tokio::fs::remove_file(&source)
-                .await
-                .map_err(|error| LocalSyncError::Destination(source.clone(), error))?;
-            return Ok(true);
-        }
-        if !metadata.is_file() {
-            return Ok(false);
-        }
-        if tokio::fs::rename(&source, &backup).await.is_ok() {
-            return Ok(true);
-        }
-        tokio::fs::copy(&source, &backup)
-            .await
-            .map_err(|error| LocalSyncError::Destination(backup.clone(), error))?;
-        Ok(false)
+        let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+        let relative = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.backup_file_blocking(&relative, &backup, expected)?;
+            rooted.remove_blocking(&relative, false, Some(expected))
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+        Ok(())
     }
 
     async fn execute(
@@ -597,8 +562,12 @@ impl LocalSyncExecutor {
             let dest_abs = self.destination_path(&source.path);
             validate_hardlink_metadata(&dest_abs, first.metadata, metadata)?;
             let is_update = destination.is_some();
-            if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
-                self.backup_replacement_file(&source.path).await?;
+            if let Some(existing) = destination
+                .as_ref()
+                .filter(|entry| self.backup && entry.is_file())
+            {
+                self.backup_replacement_file(&existing.path, existing.identity)
+                    .await?;
             }
             let first_abs = self.destination_path(&first.path);
             link_local_file(&first_abs, &dest_abs)
@@ -712,7 +681,9 @@ impl LocalSyncExecutor {
         crate::engine::work::TransferSummary,
         PublishedDestinationReceipt,
     )> {
-        let backup = self.backup && destination.as_ref().is_some_and(|entry| entry.is_file());
+        let backup = destination
+            .as_ref()
+            .filter(|entry| self.backup && entry.is_file());
         let result: TransferResult = crate::endpoint::transfer::transfer_file_with_before_stage(
             &self.source_endpoint,
             source.path.as_path(),
@@ -745,8 +716,8 @@ impl LocalSyncExecutor {
                 metadata: Some(*metadata),
             },
             || async {
-                if backup {
-                    self.backup_replacement_file(&source.path)
+                if let Some(existing) = backup {
+                    self.backup_replacement_file(&existing.path, existing.identity)
                         .await
                         .map_err(std::io::Error::other)?;
                 }
@@ -881,96 +852,40 @@ impl LocalSyncExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
-        let mut moved_by_backup = false;
-        if self.backup && !action.is_directory {
-            // A backup failure of a symlink is tolerated (the target is
-            // never resolved); regular files must back up before removal.
-            // A move-semantics backup already removed the original path.
-            match self.backup_deleted_entry(&action.path).await {
-                Ok(moved) => moved_by_backup = moved,
-                Err(error) => {
-                    let is_symlink =
-                        tokio::fs::symlink_metadata(self.destination_path(&action.path))
-                            .await
-                            .map(|meta| meta.file_type().is_symlink())
-                            .unwrap_or(false);
-                    if !is_symlink {
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        if moved_by_backup {
-            self.report(
-                crate::sync::output::ItemizeOp::Delete,
-                crate::sync::output::ItemizeKind::File,
-                &action.path,
-            );
-            return Ok(());
-        }
         let path = self.destination_path(&action.path);
-        let metadata = match tokio::fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
-        };
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
+        let expected = action
+            .identity
+            .ok_or_else(|| LocalSyncError::MissingDestinationIdentity(path.clone()))?;
+        if self.backup && action.kind == EntryKind::File {
+            self.backup_deleted_entry(&action.path, expected).await?;
         } else {
-            EntryKind::File
-        };
-        if action.is_directory != (kind == EntryKind::Directory) {
-            return Err(LocalSyncError::Destination(
-                path,
-                std::io::Error::other("destination entry type changed since the scan"),
-            ));
-        }
-        if let Some(expected) = action.identity {
-            let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
-                .ok_or_else(|| {
-                    LocalSyncError::Destination(
-                        path.clone(),
-                        std::io::Error::other("destination entry changed between scan and removal"),
-                    )
-                })?;
-            if current != expected {
-                return Err(LocalSyncError::Destination(
-                    path,
-                    std::io::Error::other("destination entry changed between scan and removal"),
-                ));
-            }
-        }
-        if action.is_directory {
-            match tokio::fs::remove_dir(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                        || error.raw_os_error() == Some(66)
-                        || error.raw_os_error() == Some(39) =>
-                {
-                    // Kept without an error: the directory holds surviving
-                    // legitimate content (a protected descendant or a --backup
-                    // file), mirroring the legacy journal replay.
-                    tracing::debug!(
-                        path = %path.display(),
-                        "kept non-empty destination directory"
-                    );
+            let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+            let action = action.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if rooted.path_identity_blocking(&action.path)?.is_none() {
+                    return Ok(());
                 }
-                Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
-            }
-        } else {
-            match tokio::fs::remove_file(&path).await {
+                rooted.remove_blocking(
+                    &action.path,
+                    action.kind == EntryKind::Directory,
+                    Some(expected),
+                )
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?;
+            match result {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(LocalSyncError::Destination(path.clone(), error)),
+                Err(crate::rooted_fs::RootedFsError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         self.report(
             crate::sync::output::ItemizeOp::Delete,
-            if action.is_directory {
+            if action.kind == EntryKind::Directory {
                 crate::sync::output::ItemizeKind::Directory
             } else {
                 crate::sync::output::ItemizeKind::File
@@ -1359,26 +1274,6 @@ fn metadata_work(
     })
 }
 
-/// Create a symbolic link at `dest` pointing at `target` without resolving it.
-///
-/// Windows needs a target-kind-specific API and the preserved link target may
-/// not exist here, so symlink preservation stays Unix-only until a Windows
-/// reparse-point design lands.
-async fn create_symlink_preserving(target: &Path, dest: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        tokio::fs::symlink(target, dest).await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, dest);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "symlink preservation is not implemented on this platform",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,6 +1367,46 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_backup_rejects_changed_destination_without_touching_backup() {
+        for symlink in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            let path = destination.path().join("file");
+            let backup = destination.path().join("file~");
+            std::fs::write(&path, b"scanned").unwrap();
+            std::fs::write(&backup, b"previous backup").unwrap();
+            let expected = crate::endpoint::local_identity::identity_for_metadata(
+                &std::fs::symlink_metadata(&path).unwrap(),
+            );
+            let target = source.path().join("target");
+            std::fs::write(&target, b"raced contents").unwrap();
+            if symlink {
+                std::fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            } else {
+                std::fs::write(&path, b"raced contents").unwrap();
+            }
+            let executor = LocalSyncExecutor::new(
+                source.path().to_path_buf(),
+                destination.path().to_path_buf(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_backup(true, None, "~".into());
+            assert!(executor
+                .backup_replacement_file(&rel("file"), expected)
+                .await
+                .is_err());
+            assert_eq!(std::fs::read(&backup).unwrap(), b"previous backup");
+            assert_eq!(std::fs::read(&path).unwrap(), b"raced contents");
+            assert_eq!(std::fs::read(&target).unwrap(), b"raced contents");
+            if symlink {
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn local_execute_delete_validates_identity() {
         let temp_src = tempfile::TempDir::new().unwrap();
@@ -1502,7 +1437,7 @@ mod tests {
         executor
             .execute_delete(DeleteAction {
                 path: rel("missing"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: Some(file_id),
             })
             .await
@@ -1513,7 +1448,7 @@ mod tests {
         let err = executor
             .execute_delete(DeleteAction {
                 path: rel("file"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: Some(wrong_id),
             })
             .await
@@ -1525,7 +1460,7 @@ mod tests {
         let err = executor
             .execute_delete(DeleteAction {
                 path: rel("file"),
-                is_directory: true,
+                kind: EntryKind::Directory,
                 identity: None,
             })
             .await
@@ -1537,7 +1472,7 @@ mod tests {
         executor
             .execute_delete(DeleteAction {
                 path: rel("file"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: Some(file_id),
             })
             .await
@@ -1548,7 +1483,7 @@ mod tests {
         let err = executor
             .execute_delete(DeleteAction {
                 path: rel("dir"),
-                is_directory: true,
+                kind: EntryKind::Directory,
                 identity: Some(wrong_id),
             })
             .await
@@ -1560,7 +1495,7 @@ mod tests {
         executor
             .execute_delete(DeleteAction {
                 path: rel("dir"),
-                is_directory: true,
+                kind: EntryKind::Directory,
                 identity: Some(dir_id),
             })
             .await

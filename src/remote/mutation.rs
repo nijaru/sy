@@ -53,6 +53,9 @@ pub enum RemoteMutationError {
     #[error("copy-file mutation is missing its source path")]
     MissingCopySource,
 
+    #[error("copy-file mutation is missing its source identity")]
+    MissingCopySourceIdentity,
+
     #[error("native symlink target encoding is unsupported for peer platform {0:?}")]
     UnsupportedTargetEncoding(PlatformOs),
 
@@ -126,12 +129,17 @@ pub async fn request_copy_file(
     sender: &RouterSender,
     source: &RelativePath,
     destination: &RelativePath,
+    expected_source_identity: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     let source = encode_relative_path(source.as_path())?;
     let destination = encode_relative_path(destination.as_path())?;
-    request_mutation(sender, WireMutation::copy_file(source, destination)).await
+    request_mutation(
+        sender,
+        WireMutation::copy_file(source, destination, *expected_source_identity.as_bytes()),
+    )
+    .await
 }
 
 /// Request a server-side hardlink beneath the pinned root
@@ -267,7 +275,9 @@ fn apply_mutation(
         }
         WireMutationKind::CopyFile => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
-            rooted.copy_file_blocking(&source, &path)?;
+            let expected =
+                expected_identity.ok_or(RemoteMutationError::MissingCopySourceIdentity)?;
+            rooted.copy_file_blocking(&source, &path, expected)?;
         }
         WireMutationKind::Hardlink => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;

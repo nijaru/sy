@@ -3,7 +3,7 @@ use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::Capabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
-use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
@@ -598,7 +598,8 @@ impl RemotePushExecutor {
                                 existing.path.as_path().to_path_buf(),
                             )
                         })?;
-                        self.remote.copy_file(&existing.path, &backup_path).await?;
+                        self.copy_backup(&existing.path, &backup_path, existing.identity)
+                            .await?;
                     }
                 }
                 let destination_transfer = self.prepare_destination(destination).await?;
@@ -723,7 +724,8 @@ impl RemotePushExecutor {
                     let backup_path = plan.destination(&existing.path).ok_or_else(|| {
                         RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
                     })?;
-                    self.remote.copy_file(&existing.path, &backup_path).await?;
+                    self.copy_backup(&existing.path, &backup_path, existing.identity)
+                        .await?;
                 }
             }
             self.remote.hardlink(&first, &source.path).await?;
@@ -749,7 +751,8 @@ impl RemotePushExecutor {
                 let backup_path = plan.destination(&existing.path).ok_or_else(|| {
                     RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
                 })?;
-                self.remote.copy_file(&existing.path, &backup_path).await?;
+                self.copy_backup(&existing.path, &backup_path, existing.identity)
+                    .await?;
             }
         }
         let destination_transfer = self.prepare_destination(destination).await?;
@@ -828,6 +831,19 @@ impl RemotePushExecutor {
         Ok(())
     }
 
+    async fn copy_backup(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        identity: Option<EntryIdentity>,
+    ) -> Result<()> {
+        let expected = identity.ok_or_else(|| {
+            RemotePushError::MissingDestinationIdentity(source.as_path().to_path_buf())
+        })?;
+        self.remote.copy_file(source, destination, expected).await?;
+        Ok(())
+    }
+
     pub async fn execute_delete(&self, action: DeleteAction) -> Result<()> {
         let _permit = self
             .scheduler
@@ -842,31 +858,24 @@ impl RemotePushExecutor {
         // beneath the pinned root; symlinks are removed without a backup so a
         // dangling or escaped target is never resolved.
         if let Some(plan) = &self.backup {
-            if !action.is_directory {
+            if action.kind == EntryKind::File {
                 let backup_path = plan.destination(&action.path).ok_or_else(|| {
                     RemotePushError::InvalidBackupPath(action.path.as_path().to_path_buf())
                 })?;
-                let copied = self.remote.copy_file(&action.path, &backup_path).await;
-                match copied {
-                    Ok(()) => {}
-                    // The entry may be a symlink (or otherwise not a regular
-                    // file): remove proceeds without a backup.
-                    Err(error) => {
-                        tracing::debug!(
-                            path = %action.path.as_path().display(),
-                            error = %error,
-                            "delete backup copy unavailable; removing without backup"
-                        );
-                    }
-                }
+                self.copy_backup(&action.path, &backup_path, action.identity)
+                    .await?;
             }
         }
         self.remote
-            .remove(&action.path, action.is_directory, action.identity)
+            .remove(
+                &action.path,
+                action.kind == EntryKind::Directory,
+                action.identity,
+            )
             .await?;
         self.report(
             crate::sync::output::ItemizeOp::Delete,
-            if action.is_directory {
+            if action.kind == EntryKind::Directory {
                 crate::sync::output::ItemizeKind::Directory
             } else {
                 crate::sync::output::ItemizeKind::File

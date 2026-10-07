@@ -1,4 +1,4 @@
-use super::domain::EntryIdentity;
+use super::domain::{EntryIdentity, EntryKind};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,7 @@ pub type Result<T> = std::result::Result<T, io::Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteKind {
-    FileLike,
-    Directory,
+    Entry(EntryKind),
     /// Marks an earlier candidate directory as non-deletable because the
     /// destination subtree contains a source-backed or excluded descendant.
     ProtectDirectory,
@@ -73,9 +72,10 @@ impl DeleteJournal {
 
         self.file
             .write_u8(match kind {
-                DeleteKind::FileLike => 0,
-                DeleteKind::Directory => 1,
+                DeleteKind::Entry(EntryKind::File) => 0,
+                DeleteKind::Entry(EntryKind::Directory) => 1,
                 DeleteKind::ProtectDirectory => 2,
+                DeleteKind::Entry(EntryKind::Symlink) => 3,
             })
             .await?;
         if let Some(id) = identity {
@@ -147,9 +147,10 @@ impl DeleteJournalReader {
 
         self.file.seek(SeekFrom::Start(start)).await?;
         let kind = match self.file.read_u8().await? {
-            0 => DeleteKind::FileLike,
-            1 => DeleteKind::Directory,
+            0 => DeleteKind::Entry(EntryKind::File),
+            1 => DeleteKind::Entry(EntryKind::Directory),
             2 => DeleteKind::ProtectDirectory,
+            3 => DeleteKind::Entry(EntryKind::Symlink),
             value => {
                 return Err(invalid_data(format!(
                     "invalid delete journal entry kind: {value}"
@@ -263,7 +264,11 @@ mod tests {
         let mut journal = DeleteJournal::new().await.unwrap();
         let file_id = EntryIdentity::from_bytes([42; 32]);
         journal
-            .append(Path::new("parent"), DeleteKind::Directory, None)
+            .append(
+                Path::new("parent"),
+                DeleteKind::Entry(EntryKind::Directory),
+                None,
+            )
             .await
             .unwrap();
         journal
@@ -273,7 +278,7 @@ mod tests {
         journal
             .append(
                 Path::new("parent/file"),
-                DeleteKind::FileLike,
+                DeleteKind::Entry(EntryKind::File),
                 Some(file_id),
             )
             .await
@@ -287,7 +292,7 @@ mod tests {
             reader.next().await.unwrap(),
             Some(DeleteRecord {
                 path: PathBuf::from("parent/file"),
-                kind: DeleteKind::FileLike,
+                kind: DeleteKind::Entry(EntryKind::File),
                 identity: Some(file_id),
             })
         );
@@ -303,7 +308,7 @@ mod tests {
             reader.next().await.unwrap(),
             Some(DeleteRecord {
                 path: PathBuf::from("parent"),
-                kind: DeleteKind::Directory,
+                kind: DeleteKind::Entry(EntryKind::Directory),
                 identity: None,
             })
         );
@@ -327,7 +332,7 @@ mod tests {
         let path = PathBuf::from(OsString::from_vec(vec![b'f', 0x80, b'o']));
         let mut journal = DeleteJournal::new().await.unwrap();
         journal
-            .append(&path, DeleteKind::FileLike, None)
+            .append(&path, DeleteKind::Entry(EntryKind::File), None)
             .await
             .unwrap();
         let mut reader = journal.seal().await.unwrap();
@@ -338,7 +343,7 @@ mod tests {
     async fn rejects_corrupt_trailing_record_length() {
         let mut journal = DeleteJournal::new().await.unwrap();
         journal
-            .append(Path::new("file"), DeleteKind::FileLike, None)
+            .append(Path::new("file"), DeleteKind::Entry(EntryKind::File), None)
             .await
             .unwrap();
         let mut reader = journal.seal().await.unwrap();

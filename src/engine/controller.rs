@@ -469,7 +469,7 @@ pub async fn preview_sync(
         while let Some(action) = replay.next_action().await? {
             diff_detail(PreviewOp::Delete(PreviewDelete {
                 path: action.path,
-                is_directory: action.is_directory,
+                is_directory: action.kind == EntryKind::Directory,
             }));
         }
     }
@@ -1041,7 +1041,7 @@ mod tests {
             replay.next_action().await.unwrap(),
             Some(crate::engine::delete_plan::DeleteAction {
                 path: path("remove"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: None,
             })
         );
@@ -1194,7 +1194,7 @@ mod tests {
             replay.next_action().await.unwrap(),
             Some(crate::engine::delete_plan::DeleteAction {
                 path: path("remove"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: None,
             })
         );

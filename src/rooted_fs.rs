@@ -40,6 +40,12 @@ pub enum RootedFsError {
     #[error("destination entry changed between observation and mutation for {0}")]
     DestinationChanged(PathBuf),
 
+    #[error("backup source changed between observation and copy for {0}")]
+    CopySourceChanged(PathBuf),
+
+    #[error("backup destination aliases its source: {0}")]
+    BackupAliasesSource(PathBuf),
+
     #[error("root directory identity changed after it was opened: {0}")]
     RootChanged(PathBuf),
 
@@ -136,6 +142,89 @@ pub struct RootedFs {
     root_path: Arc<PathBuf>,
     #[cfg(unix)]
     root_fd: Arc<OwnedFd>,
+}
+
+/// Keeps both the no-follow source handle and its namespace binding alive
+/// until the backup commits. Identity checks detect races, not snapshot isolation.
+#[cfg(unix)]
+struct RootedCopySource<'a> {
+    rooted: &'a RootedFs,
+    path: &'a Path,
+    parent: OwnedFd,
+    leaf: OsString,
+    file: File,
+    expected: EntryIdentity,
+}
+
+#[cfg(unix)]
+impl RootedCopySource<'_> {
+    fn verify(&self) -> Result<()> {
+        let changed = || RootedFsError::CopySourceChanged(self.path.to_path_buf());
+        let actual = crate::endpoint::local_identity::identity_for_metadata(&self.file.metadata()?);
+        let named = stat_at_optional(self.parent.as_raw_fd(), &self.leaf)?
+            .and_then(|stat| identity_from_stat(&stat));
+        if actual != Some(self.expected) || named != Some(self.expected) {
+            return Err(changed());
+        }
+        let (parent, _) = self
+            .rooted
+            .open_parent_blocking(self.path)
+            .map_err(|_| changed())?;
+        let current = stat_fd(parent.as_raw_fd())?;
+        let held = stat_fd(self.parent.as_raw_fd())?;
+        if current.st_dev != held.st_dev || current.st_ino != held.st_ino {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    fn copy_to(self, rooted: &RootedFs, destination: &Path) -> Result<()> {
+        self.verify()?;
+        if let Some(parent) = destination.parent() {
+            rooted.ensure_directories_blocking(parent)?;
+        }
+        let (parent, leaf) = rooted.open_parent_blocking(destination)?;
+        // Compare observations, not spellings: case/normalization aliases and
+        // hardlinks must not let a backup overwrite the held source inode.
+        let destination_identity =
+            stat_at_optional(parent.as_raw_fd(), &leaf)?.and_then(|stat| identity_from_stat(&stat));
+        if destination_identity == Some(self.expected) {
+            return Err(RootedFsError::BackupAliasesSource(
+                destination.to_path_buf(),
+            ));
+        }
+
+        let mut staged =
+            rooted.begin_staged_path_blocking(destination, ExpectedDestination::SnapshotAtOpen)?;
+        let mut prepare = || -> Result<()> {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = self.file.metadata()?;
+            if crate::endpoint::local_identity::identity_for_metadata(&metadata)
+                != Some(self.expected)
+            {
+                return Err(RootedFsError::CopySourceChanged(self.path.to_path_buf()));
+            }
+            let mode = metadata.permissions().mode() & 0o7777;
+            let nanos = u32::try_from(metadata.mtime_nsec())
+                .map_err(|_| RootedFsError::TimestampOutOfRange)?;
+            let modified = Timestamp::new(metadata.mtime(), nanos)
+                .map_err(|_| RootedFsError::TimestampOutOfRange)?;
+            use std::io::Read;
+            let copied = std::io::copy(&mut (&self.file).take(metadata.len()), staged.file_mut())?;
+            if copied != metadata.len() {
+                return Err(RootedFsError::CopySourceChanged(self.path.to_path_buf()));
+            }
+            staged.apply_metadata_blocking(Some(mode), Some(modified))?;
+            // Validate the same held file and path after copying, before
+            // publishing over an existing backup. The final check/rename is
+            // not an atomic compare-and-swap against concurrent writers.
+            self.verify()
+        };
+        if let Err(operation) = prepare() {
+            return Err(staged.namespace.abort_after(operation));
+        }
+        staged.commit()
+    }
 }
 
 impl std::fmt::Debug for RootedFs {
@@ -759,8 +848,42 @@ impl RootedFs {
         &self,
         source: &RelativePath,
         destination: &RelativePath,
+        expected_source_identity: EntryIdentity,
     ) -> Result<()> {
-        self.copy_file_path_blocking(source.as_path(), destination.as_path())
+        self.copy_file_path_blocking(
+            source.as_path(),
+            destination.as_path(),
+            expected_source_identity,
+        )
+    }
+
+    /// Local deletion backups may use an operator-selected directory outside
+    /// the sync root. Validate and hold the source before creating any backup
+    /// directories; the backup itself uses the same staged-copy transaction.
+    pub(crate) fn backup_file_blocking(
+        &self,
+        source: &RelativePath,
+        destination: &Path,
+        expected_source_identity: EntryIdentity,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let source = self.bind_copy_source(source.as_path(), expected_source_identity)?;
+            let parent = destination
+                .parent()
+                .ok_or(RootedFsError::InvalidRelativePath)?;
+            let leaf = destination
+                .file_name()
+                .ok_or(RootedFsError::InvalidRelativePath)?;
+            std::fs::create_dir_all(parent)?;
+            let backup_root = Self::open_blocking(parent.to_path_buf())?;
+            source.copy_to(&backup_root, Path::new(leaf))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, destination, expected_source_identity);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     /// Privately stage a symlink and publish through the common namespace
@@ -1204,36 +1327,47 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn copy_file_path_blocking(&self, source: &Path, destination: &Path) -> Result<()> {
-        // Parent directories of the backup location may not exist yet; create
-        // each one root-confined (mkdir -p semantics beneath the pinned root).
-        if let Some(parent) = destination.parent() {
-            self.ensure_directories_blocking(parent)?;
-        }
-
-        let source_file = self.open_regular_path_blocking(source)?;
-        let source_metadata = source_file.metadata()?;
-        if !source_metadata.file_type().is_file() {
+    fn bind_copy_source<'a>(
+        &'a self,
+        source: &'a Path,
+        expected: EntryIdentity,
+    ) -> Result<RootedCopySource<'a>> {
+        let (parent, leaf) = self.open_parent_blocking(source)?;
+        // A raced FIFO must not block the backup worker before type validation.
+        let file = open_file_at(parent.as_raw_fd(), &leaf)?;
+        if !file.metadata()?.is_file() {
             return Err(RootedFsError::NotRegularFile(source.to_path_buf()));
         }
-        let source_mode = {
-            use std::os::unix::fs::PermissionsExt;
-            Some(source_metadata.permissions().mode() & 0o7777)
+        let binding = RootedCopySource {
+            rooted: self,
+            path: source,
+            parent,
+            leaf,
+            file,
+            expected,
         };
-        let source_mtime = source_metadata.modified().ok().and_then(|time| {
-            let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
-            Timestamp::new(duration.as_secs() as i64, duration.subsec_nanos()).ok()
-        });
+        binding.verify()?;
+        Ok(binding)
+    }
 
-        let mut staged =
-            self.begin_staged_path_blocking(destination, ExpectedDestination::Unverified)?;
-        std::io::copy(&mut &source_file, staged.file_mut())?;
-        staged.apply_metadata_blocking(source_mode, source_mtime)?;
-        staged.commit()
+    #[cfg(unix)]
+    fn copy_file_path_blocking(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.bind_copy_source(source, expected)?
+            .copy_to(self, destination)
     }
 
     #[cfg(not(unix))]
-    fn copy_file_path_blocking(&self, _source: &Path, _destination: &Path) -> Result<()> {
+    fn copy_file_path_blocking(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+        _expected: EntryIdentity,
+    ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -2246,9 +2380,9 @@ fn apply_acl_fd(_file: &File, _acl: &str) -> Result<()> {
 fn open_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
     let component = component_cstring(component)?;
     let fd = unsafe {
-        // SAFETY: `parent` remains open for this call and `component` is a live
-        // NUL-terminated single component. O_NOFOLLOW prevents a raced leaf
-        // symlink from redirecting the read.
+        // SAFETY: parent/name remain live; no-follow prevents leaf escapes.
+        // Nonblocking open prevents a raced FIFO from pinning this worker.
+        // Regular files ignore O_NONBLOCK; callers validate descriptor type.
         libc::openat(
             parent,
             component.as_ptr(),
@@ -2259,7 +2393,7 @@ fn open_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         return Err(std::io::Error::last_os_error().into());
     }
     let owned = unsafe {
-        // SAFETY: successful `openat` returned a fresh owned descriptor.
+        // SAFETY: successful openat returned a fresh owned descriptor.
         OwnedFd::from_raw_fd(fd)
     };
     Ok(File::from(owned))
@@ -2550,6 +2684,91 @@ mod tests {
             .into_iter()
             .filter(|(name, _)| name.to_string_lossy().starts_with("user."))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn backup_copy_rejects_stale_identity_before_creating_parents() {
+        for external in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let backup = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("source"), b"scanned").unwrap();
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let source = relative("source");
+            let (_, expected) = rooted.path_identity_blocking(&source).unwrap().unwrap();
+            std::fs::write(root.path().join("source"), b"changed after scan").unwrap();
+            let destination = if external {
+                backup.path().join("missing/file")
+            } else {
+                root.path().join("missing/file")
+            };
+            let result = if external {
+                rooted.backup_file_blocking(&source, &destination, expected)
+            } else {
+                rooted.copy_file_blocking(&source, &relative("missing/file"), expected)
+            };
+            assert!(matches!(result, Err(RootedFsError::CopySourceChanged(_))));
+            assert!(!destination.parent().unwrap().exists());
+            assert_eq!(
+                std::fs::read(root.path().join("source")).unwrap(),
+                b"changed after scan"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_source_binding_revalidates_held_file_and_parent() {
+        for moved_parent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("dir")).unwrap();
+            std::fs::write(root.path().join("dir/source"), b"scanned").unwrap();
+            std::fs::write(root.path().join("backup"), b"previous backup").unwrap();
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let source = relative("dir/source");
+            let (_, expected) = rooted.path_identity_blocking(&source).unwrap().unwrap();
+            let binding = rooted.bind_copy_source(source.as_path(), expected).unwrap();
+            if moved_parent {
+                std::fs::rename(root.path().join("dir"), root.path().join("moved")).unwrap();
+                std::fs::create_dir(root.path().join("dir")).unwrap();
+            }
+            std::fs::write(root.path().join("dir/source"), b"raced").unwrap();
+            assert!(matches!(
+                binding.copy_to(&rooted, Path::new("backup")),
+                Err(RootedFsError::CopySourceChanged(_))
+            ));
+            assert_eq!(
+                std::fs::read(root.path().join("backup")).unwrap(),
+                b"previous backup"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("dir/source")).unwrap(),
+                b"raced"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_cannot_replace_its_own_source() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source"), b"precious").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let source = relative("source");
+        std::fs::hard_link(root.path().join("source"), root.path().join("linked")).unwrap();
+        // Adding a hardlink changes ctime, so observe the new stable identity.
+        let (_, expected) = rooted.path_identity_blocking(&source).unwrap().unwrap();
+        for destination in [&source, &relative("linked")] {
+            assert!(matches!(
+                rooted.copy_file_blocking(&source, destination, expected),
+                Err(RootedFsError::BackupAliasesSource(_))
+            ));
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("source")).unwrap(),
+            b"precious"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("linked")).unwrap(),
+            b"precious"
+        );
     }
 
     #[tokio::test]
