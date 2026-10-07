@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::cli::SymlinkMode;
 use crate::compress::CompressionDetection;
 use crate::filter::FilterEngine;
