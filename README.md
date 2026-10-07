@@ -155,9 +155,9 @@ identity and root-confined filesystem operations are not implemented.
 | --update / --existing | Stable | Comparison modes for selective sync |
 | --ignore-times / --ignore-existing | Stable | Force transfer / skip existing |
 | --verify | Stable | Staged verification (`after`/`only`) |
-| Directory type transitions | Not implemented | Refused in preflight before any mutation |
+| Directory type transitions | Supported | Atomic exchange for file/symlink over directory; directory over file refused in preflight |
 | Bidirectional sync (bisync) | Removed | Not part of 0.5 |
-| S3/GCS endpoints | Not implemented | Planned after the filesystem/SSH engine |
+| S3/GCS endpoints | Planned | Not part of 0.5 (local and SSH sync engine focus) |
 
 ## Benchmarks
 
