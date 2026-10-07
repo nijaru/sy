@@ -11,7 +11,7 @@
 //! entire point of local sync and must not regress behind a generic
 //! streaming loop.
 
-use crate::endpoint::transfer::{transfer_file, TransferOptions, TransferResult};
+use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
@@ -477,19 +477,18 @@ impl LocalSyncExecutor {
                     }
                 }
                 let is_update = destination.is_some();
-                // Read the source attributes before any destination mutation.
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
+                // BSD flags remain a post-commit phase; xattrs and ACLs are
+                // captured by the transfer layer from the held byte source.
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
-                    self.backup_replacement_file(&source.path).await?;
-                }
                 let transfer = self
                     .transfer_source_file(
                         &source,
                         &destination,
                         &metadata,
-                        crate::endpoint::io::Preservation { xattrs, acl: acls },
+                        crate::endpoint::io::PreservationRequest {
+                            xattrs: self.xattrs && !source.is_symlink(),
+                            acl: self.acls && !source.is_symlink(),
+                        },
                     )
                     .await?;
                 // Only rename-incompatible flags remain post-commit
@@ -598,19 +597,18 @@ impl LocalSyncExecutor {
             });
         }
         let is_update = destination.is_some();
-        // Read the source attributes before any destination mutation.
-        let xattrs = self.read_source_xattrs(&source).await?;
-        let acls = self.read_source_acls(&source).await?;
+        // BSD flags remain a post-commit phase; xattrs and ACLs are captured
+        // from the held source that supplies the representative's bytes.
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        if self.backup && destination.as_ref().is_some_and(|entry| entry.is_file()) {
-            self.backup_replacement_file(&source.path).await?;
-        }
         let transfer = self
             .transfer_source_file(
                 &source,
                 &destination,
                 &metadata,
-                crate::endpoint::io::Preservation { xattrs, acl: acls },
+                crate::endpoint::io::PreservationRequest {
+                    xattrs: self.xattrs && !source.is_symlink(),
+                    acl: self.acls && !source.is_symlink(),
+                },
             )
             .await?;
         // Only rename-incompatible flags remain post-commit finalization.
@@ -681,9 +679,10 @@ impl LocalSyncExecutor {
         source: &Entry,
         destination: &Option<Entry>,
         metadata: &crate::endpoint::transfer::TransferMetadata,
-        preservation: crate::endpoint::io::Preservation,
+        preservation_request: crate::endpoint::io::PreservationRequest,
     ) -> Result<crate::remote::transfer::TransferSummary> {
-        let result: TransferResult = transfer_file(
+        let backup = self.backup && destination.as_ref().is_some_and(|entry| entry.is_file());
+        let result: TransferResult = crate::endpoint::transfer::transfer_file_with_before_stage(
             &self.source_endpoint,
             source.path.as_path(),
             &self.destination_endpoint,
@@ -709,8 +708,17 @@ impl LocalSyncExecutor {
                         None => crate::endpoint::io::ExpectedDestination::Absent,
                     },
                 },
-                preservation,
+                preservation: crate::endpoint::io::Preservation::default(),
+                preservation_request,
                 metadata: Some(*metadata),
+            },
+            || async {
+                if backup {
+                    self.backup_replacement_file(&source.path)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(())
             },
         )
         .await

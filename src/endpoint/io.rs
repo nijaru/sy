@@ -28,6 +28,12 @@ pub enum VerificationStatus {
 /// previous destination survives; no entry commits without its requested
 /// xattrs/ACLs. BSD/platform flags that can block rename stay post-commit
 /// finalization (see the transfer layer).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreservationRequest {
+    pub xattrs: bool,
+    pub acl: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Preservation {
     pub xattrs: Option<Vec<(std::ffi::OsString, Vec<u8>)>>,
@@ -292,10 +298,19 @@ pub async fn copy_file_streaming(
     dest_path: &Path,
     policy: &StreamCopyPolicy<'_>,
 ) -> Result<StreamCopyResult> {
+    let reader = source.open_reader(source_path).await?;
+    copy_file_streaming_from_reader(reader, dest, dest_path, policy).await
+}
+
+pub(crate) async fn copy_file_streaming_from_reader(
+    mut reader: BoxReader,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    policy: &StreamCopyPolicy<'_>,
+) -> Result<StreamCopyResult> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
     let metadata = policy.metadata;
-    let mut reader = source.open_reader(source_path).await?;
     let mut writer = dest
         .begin_write(dest_path, policy.expected_destination)
         .await?;

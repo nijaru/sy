@@ -353,6 +353,66 @@ mod tests {
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn copy_links_preserves_requested_metadata_on_followed_files() {
+        let source_root = TempDir::new().unwrap();
+        let target_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let source_file = source_root.path().join("file");
+        let target_file = target_root.path().join("target");
+        std::fs::write(&target_file, b"followed content").unwrap();
+        std::os::unix::fs::symlink(&target_file, &source_file).unwrap();
+        xattr::set(&target_file, "user.sy-copy-links", b"preserved").unwrap();
+        #[cfg(feature = "acl")]
+        let expected_acl = {
+            let mut acl = exacl::getfacl(&target_file, None).unwrap();
+            // SAFETY: `getuid` has no pointer arguments or other preconditions.
+            let uid = unsafe { libc::getuid() };
+            acl.push(exacl::AclEntry::allow_user(
+                &uid.to_string(),
+                exacl::Perm::READ,
+                exacl::Flag::empty(),
+            ));
+            exacl::setfacl(&[&target_file], &acl, None).unwrap();
+            exacl::to_string(&exacl::getfacl(&target_file, None).unwrap())
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.symlink_mode = SymlinkMode::Follow;
+        config.preserve.xattrs = true;
+        #[cfg(feature = "acl")]
+        {
+            config.preserve.acls = true;
+        }
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            xattr::get(destination_root.path().join("file"), "user.sy-copy-links").unwrap(),
+            Some(b"preserved".to_vec())
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("file")).unwrap(),
+            b"followed content"
+        );
+        #[cfg(feature = "acl")]
+        assert_eq!(
+            exacl::to_string(&exacl::getfacl(destination_root.path().join("file"), None).unwrap())
+                .unwrap()
+                .trim(),
+            expected_acl
+        );
+    }
+
     /// -A/--preserve-acls locally: the source list is mirrored onto the
     /// destination after the transfer, and a later pass clears entries the
     /// source dropped.

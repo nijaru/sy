@@ -195,6 +195,32 @@ pub trait Endpoint: Send + Sync {
         Ok(None)
     }
 
+    /// Open a transfer source while following symlinks according to the
+    /// caller's explicit copy-links policy. Implementations must return the
+    /// held target file so bytes and preservation can share its identity.
+    async fn open_native_file_following(&self, _path: &Path) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
+    /// Read requested preservation from the held file that will supply the
+    /// transfer bytes. Endpoints that cannot bind metadata reads to that file
+    /// must refuse rather than silently reopening the visible path.
+    async fn read_open_file_preservation(
+        &self,
+        path: &Path,
+        _file: &std::fs::File,
+        request: io::PreservationRequest,
+    ) -> Result<io::Preservation> {
+        if request.xattrs || request.acl {
+            return Err(SyncError::Config(format!(
+                "{:?} endpoint cannot bind requested preservation to an open source file",
+                self.endpoint_type()
+            )));
+        }
+        let _ = path;
+        Ok(io::Preservation::default())
+    }
+
     /// Check whether a held native file exposes useful sparse extents. This
     /// probe must use the supplied descriptor rather than reopening its path.
     async fn native_file_has_sparse_holes(&self, _file: &std::fs::File) -> Result<bool> {

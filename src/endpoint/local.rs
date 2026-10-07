@@ -1109,6 +1109,88 @@ impl Endpoint for LocalEndpoint {
         }
     }
 
+    async fn open_native_file_following(&self, path: &Path) -> Result<Option<std::fs::File>> {
+        #[cfg(unix)]
+        {
+            let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
+                .map_err(|error| SyncError::Config(error.to_string()))?;
+            let full_path = self.resolve(relative.as_path());
+            let rooted = self.rooted_fs(false).await?;
+            return tokio::task::spawn_blocking(move || {
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(map_rooted_fs_error)?;
+                // --copy-links explicitly follows the leaf (and intermediate)
+                // symlinks. O_NONBLOCK prevents a raced FIFO replacement from
+                // pinning this worker before descriptor-type validation.
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK);
+                let file = options.open(&full_path)?;
+                if !file.metadata()?.is_file() {
+                    return Err(SyncError::Config(
+                        "followed native transfer source is not a regular file".to_string(),
+                    ));
+                }
+                use std::os::fd::AsRawFd;
+                let fd = file.as_raw_fd();
+                // SAFETY: `fd` is a live open descriptor.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags >= 0 {
+                    // SAFETY: `fd` is live; clear O_NONBLOCK so subsequent reads use normal blocking I/O.
+                    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+                }
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(map_rooted_fs_error)?;
+                Ok(Some(file))
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
+    async fn read_open_file_preservation(
+        &self,
+        path: &Path,
+        file: &std::fs::File,
+        request: crate::endpoint::io::PreservationRequest,
+    ) -> Result<crate::endpoint::io::Preservation> {
+        if !request.xattrs && !request.acl {
+            return Ok(crate::endpoint::io::Preservation::default());
+        }
+        let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
+            .map_err(|error| SyncError::Config(error.to_string()))?;
+        let file = file.try_clone()?;
+        let rooted = self.rooted_fs(false).await?;
+        tokio::task::spawn_blocking(move || {
+            rooted
+                .verify_root_path_blocking()
+                .map_err(map_rooted_fs_error)?;
+            let xattrs = request
+                .xattrs
+                .then(|| rooted.read_open_file_xattrs_blocking(&file, &relative))
+                .transpose()
+                .map_err(map_rooted_fs_error)?;
+            let acl = request
+                .acl
+                .then(|| rooted.read_open_file_acl_blocking(&file, &relative))
+                .transpose()
+                .map_err(map_rooted_fs_error)?
+                .map(|acl| acl.unwrap_or_default());
+            Ok(crate::endpoint::io::Preservation { xattrs, acl })
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
+    }
+
     async fn native_file_has_sparse_holes(&self, file: &std::fs::File) -> Result<bool> {
         #[cfg(unix)]
         {
@@ -1620,6 +1702,84 @@ mod tests {
         assert!(matches!(error, SyncError::DestinationChanged { .. }));
         assert_eq!(fs::read(&path).unwrap(), b"concurrent create");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followed_native_open_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is NUL-terminated and points to a valid temporary
+        // pathname; mkfifo only reads it for the duration of this call.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(result, 0);
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            endpoint.open_native_file_following(Path::new("fifo")),
+        )
+        .await
+        .expect("opening a FIFO must not block")
+        .unwrap_err();
+        assert!(matches!(result, SyncError::Config(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_file_preservation_ignores_a_replacement_at_the_source_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"original").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        endpoint
+            .write_xattrs(
+                Path::new("file"),
+                &[(OsString::from("user.sy-bound"), b"original".to_vec())],
+            )
+            .await
+            .unwrap();
+        let opened = endpoint
+            .open_native_file(Path::new("file"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        fs::rename(&path, dir.path().join("original-file")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        endpoint
+            .write_xattrs(
+                Path::new("file"),
+                &[(OsString::from("user.sy-bound"), b"replacement".to_vec())],
+            )
+            .await
+            .unwrap();
+
+        let preservation = endpoint
+            .read_open_file_preservation(
+                Path::new("file"),
+                &opened,
+                crate::endpoint::io::PreservationRequest {
+                    xattrs: true,
+                    acl: false,
+                },
+            )
+            .await
+            .unwrap();
+        let user_xattrs = preservation
+            .xattrs
+            .unwrap()
+            .into_iter()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("user."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_xattrs,
+            vec![(OsString::from("user.sy-bound"), b"original".to_vec())]
+        );
     }
 
     #[cfg(unix)]
