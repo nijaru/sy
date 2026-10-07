@@ -13,5 +13,7 @@ pub mod planner;
 pub mod reconcile;
 pub mod rolling;
 pub mod scan;
+#[cfg(unix)]
+pub(crate) mod scan_sort;
 pub mod scheduler;
 pub mod work;
