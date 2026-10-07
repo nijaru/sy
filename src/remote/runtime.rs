@@ -308,11 +308,24 @@ impl ClientRemoteSession {
             .map_err(Into::into)
     }
 
-    pub async fn replace_symlink(&self, path: &RelativePath, target: &Path) -> Result<()> {
+    pub async fn replace_symlink(
+        &self,
+        path: &RelativePath,
+        target: &Path,
+        expected_identity: Option<EntryIdentity>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
-        request_replace_symlink(&self.router.sender(), path, target, self.server.platform.os)
-            .await
-            .map_err(Into::into)
+        request_replace_symlink(
+            &self.router.sender(),
+            path,
+            target,
+            expected_identity,
+            modified,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn remove(
@@ -1122,7 +1135,7 @@ mod tests {
         session.create_directory(&dir).await.unwrap();
         let link = RelativePath::new("link").unwrap();
         session
-            .replace_symlink(&link, Path::new("../target"))
+            .replace_symlink(&link, Path::new("../target"), None, None)
             .await
             .unwrap();
         session

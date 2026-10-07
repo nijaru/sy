@@ -45,6 +45,7 @@ pub enum RemotePushAction {
     },
     ReplaceSymlink {
         source: Entry,
+        destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
     ApplyMetadata {
@@ -163,6 +164,7 @@ fn lower_create(
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: None,
         }))),
     }
 }
@@ -198,13 +200,14 @@ fn lower_update(
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }
 
 fn lower_replace(
     source: Entry,
-    _destination: Entry,
+    destination: Entry,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match source.kind {
@@ -223,16 +226,15 @@ fn lower_replace(
             };
             Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
-                // A type replacement cannot reuse the old non-file leaf as
-                // a rolling basis. Same-directory staged rename still makes
-                // file-over-symlink replacement atomic.
-                destination: None,
+                // Keep the namespace precondition even without a regular-file basis.
+                destination: Some(destination),
                 metadata,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }
@@ -641,16 +643,26 @@ impl RemotePushExecutor {
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
                 Ok(Some(summary))
             }
-            RemotePushAction::ReplaceSymlink { source, modified } => {
+            RemotePushAction::ReplaceSymlink {
+                source,
+                destination,
+                modified,
+            } => {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     RemotePushError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
-                self.remote.replace_symlink(&source.path, target).await?;
-                if let Some(modified) = modified {
-                    self.remote
-                        .apply_metadata(&source.path, EntryKind::Symlink, None, Some(modified))
-                        .await?;
-                }
+                let expected_identity = destination
+                    .map(|destination| {
+                        destination.identity.ok_or_else(|| {
+                            RemotePushError::MissingDestinationIdentity(
+                                destination.path.as_path().to_path_buf(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                self.remote
+                    .replace_symlink(&source.path, target, expected_identity, modified)
+                    .await?;
                 let receipt =
                     PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
                 self.remove_committed_source(&receipt, &source).await?;
@@ -1260,12 +1272,61 @@ mod tests {
     }
 
     #[test]
-    fn symlink_create_is_main_phase_and_preserves_target() {
+    fn symlink_lowering_preserves_expected_destination_on_push_and_pull() {
         let source = symlink("link", "../target");
-        let lowered = lower_sync_op(SyncOp::Create { source }, ExecutionPolicy::default()).unwrap();
-        let RemotePushAction::ReplaceSymlink { source, .. } = lowered.unwrap().into_action() else {
-            panic!("expected symlink replacement");
-        };
-        assert_eq!(source.symlink_target, Some(PathBuf::from("../target")));
+        for destination in [
+            None,
+            Some(symlink("link", "old")),
+            Some(file("link", 1, 0o644)),
+            Some(directory("link", 0o755)),
+        ] {
+            let op = match &destination {
+                None => SyncOp::Create {
+                    source: source.clone(),
+                },
+                Some(destination) if destination.is_symlink() => SyncOp::Update {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                },
+                Some(destination) => SyncOp::Replace {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                },
+            };
+            let policy = ExecutionPolicy {
+                preserve_times: true,
+                ..ExecutionPolicy::default()
+            };
+            let push = lower_sync_op(op.clone(), policy)
+                .unwrap()
+                .unwrap()
+                .into_action();
+            let RemotePushAction::ReplaceSymlink {
+                source: pushed,
+                destination: push_expected,
+                modified,
+            } = push
+            else {
+                panic!("expected symlink replacement");
+            };
+            assert_eq!(pushed, source);
+            assert_eq!(push_expected, destination);
+            assert_eq!(modified, Some(source.modified));
+            let pull = crate::remote::pull_lower::lower_pull_op(op, policy)
+                .unwrap()
+                .unwrap()
+                .into_action();
+            let crate::remote::pull::RemotePullAction::ReplaceSymlink {
+                source: pulled,
+                destination: pull_expected,
+                modified,
+            } = pull
+            else {
+                panic!("expected symlink replacement");
+            };
+            assert_eq!(pulled, source);
+            assert_eq!(pull_expected, destination);
+            assert_eq!(modified, Some(source.modified));
+        }
     }
 }

@@ -51,7 +51,9 @@ pub struct WireMutation {
     /// Copy source for `CopyFile` mutations; the primary `path` is the copy
     /// destination (the backup location). Both stay beneath the pinned root.
     copy_source: Option<RelativeWirePath>,
+    /// For symlinks, None means expected Absent, never an unchecked overwrite.
     expected_identity: Option<[u8; 32]>,
+    modified: Option<(i64, u32)>,
 }
 
 impl WireMutation {
@@ -62,16 +64,23 @@ impl WireMutation {
             symlink_target: None,
             copy_source: None,
             expected_identity: None,
+            modified: None,
         }
     }
 
-    pub const fn replace_symlink(path: RelativeWirePath, target: WirePath) -> Self {
+    pub const fn replace_symlink(
+        path: RelativeWirePath,
+        target: WirePath,
+        expected_identity: Option<[u8; 32]>,
+        modified: Option<(i64, u32)>,
+    ) -> Self {
         Self {
             path,
             kind: WireMutationKind::ReplaceSymlink,
             symlink_target: Some(target),
             copy_source: None,
-            expected_identity: None,
+            expected_identity,
+            modified,
         }
     }
 
@@ -85,6 +94,7 @@ impl WireMutation {
             symlink_target: None,
             copy_source: None,
             expected_identity,
+            modified: None,
         }
     }
 
@@ -98,6 +108,7 @@ impl WireMutation {
             symlink_target: None,
             copy_source: None,
             expected_identity,
+            modified: None,
         }
     }
 
@@ -112,6 +123,7 @@ impl WireMutation {
             symlink_target: None,
             copy_source: Some(source),
             expected_identity: None,
+            modified: None,
         }
     }
 
@@ -127,6 +139,7 @@ impl WireMutation {
             symlink_target: None,
             copy_source: Some(source),
             expected_identity: None,
+            modified: None,
         }
     }
 
@@ -144,6 +157,10 @@ impl WireMutation {
 
     pub const fn expected_identity(&self) -> Option<&[u8; 32]> {
         self.expected_identity.as_ref()
+    }
+
+    pub const fn modified(&self) -> Option<(i64, u32)> {
+        self.modified
     }
 
     pub fn encode(&self) -> Result<Bytes> {
@@ -194,8 +211,16 @@ impl WireMutation {
                     "mutation payload length overflow",
                 ))?;
         }
+        if self.kind == WireMutationKind::ReplaceSymlink {
+            capacity = capacity
+                .checked_add(1 + if self.modified.is_some() { 12 } else { 0 })
+                .ok_or(ProtocolError::InvalidMessage(
+                    "mutation payload length overflow",
+                ))?;
+        }
         if self.kind == WireMutationKind::RemoveFileLike
             || self.kind == WireMutationKind::RemoveDirectory
+            || self.kind == WireMutationKind::ReplaceSymlink
         {
             capacity = capacity
                 .checked_add(
@@ -224,10 +249,20 @@ impl WireMutation {
         }
         if self.kind == WireMutationKind::RemoveFileLike
             || self.kind == WireMutationKind::RemoveDirectory
+            || self.kind == WireMutationKind::ReplaceSymlink
         {
             if let Some(identity) = self.expected_identity {
                 out.put_u8(1);
                 out.extend_from_slice(&identity);
+            } else {
+                out.put_u8(0);
+            }
+        }
+        if self.kind == WireMutationKind::ReplaceSymlink {
+            if let Some((seconds, nanos)) = self.modified {
+                out.put_u8(1);
+                out.put_i64(seconds);
+                out.put_u32(nanos);
             } else {
                 out.put_u8(0);
             }
@@ -277,6 +312,7 @@ impl WireMutation {
             };
         let expected_identity = if kind == WireMutationKind::RemoveFileLike
             || kind == WireMutationKind::RemoveDirectory
+            || kind == WireMutationKind::ReplaceSymlink
         {
             match reader.u8()? {
                 0 => None,
@@ -291,6 +327,20 @@ impl WireMutation {
         } else {
             None
         };
+        let modified = if kind == WireMutationKind::ReplaceSymlink {
+            match reader.u8()? {
+                0 => None,
+                1 => Some((reader.i64()?, reader.u32()?)),
+                _ => {
+                    return Err(ProtocolError::InvalidField {
+                        field: "modified",
+                        reason: "unknown timestamp presence flag",
+                    })
+                }
+            }
+        } else {
+            None
+        };
         reader.finish()?;
         let mutation = Self {
             path,
@@ -298,19 +348,35 @@ impl WireMutation {
             symlink_target,
             copy_source,
             expected_identity,
+            modified,
         };
         mutation.validate()?;
         Ok(mutation)
     }
 
     fn validate(&self) -> Result<()> {
+        if self.modified.is_some() && self.kind != WireMutationKind::ReplaceSymlink {
+            return Err(ProtocolError::InvalidField {
+                field: "modified",
+                reason: "timestamp is valid only for replace-symlink mutation",
+            });
+        }
+        if self
+            .modified
+            .is_some_and(|(_, nanos)| nanos >= 1_000_000_000)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "modified_nanoseconds",
+                reason: "nanoseconds must be less than one second",
+            });
+        }
         match (
             self.kind,
             self.symlink_target.is_some(),
             self.copy_source.is_some(),
             self.expected_identity.is_some(),
         ) {
-            (WireMutationKind::ReplaceSymlink, true, false, false)
+            (WireMutationKind::ReplaceSymlink, true, false, _)
             | (WireMutationKind::CopyFile, false, true, false)
             | (WireMutationKind::Hardlink, false, true, false)
             | (WireMutationKind::CreateDirectory, false, false, false)
@@ -359,7 +425,8 @@ mod tests {
         let backup_dir = RelativeWirePath::from_components([b"backup".as_slice()]).unwrap();
         let mutations = [
             WireMutation::create_directory(path()),
-            WireMutation::replace_symlink(path(), target),
+            WireMutation::replace_symlink(path(), target.clone(), None, None),
+            WireMutation::replace_symlink(path(), target, Some([9; 32]), Some((-10, 123))),
             WireMutation::remove_file_like(path(), None),
             WireMutation::remove_file_like(path(), Some([7; 32])),
             WireMutation::remove_directory(path(), None),
@@ -377,9 +444,47 @@ mod tests {
 
     #[test]
     fn decoder_rejects_unknown_kind_truncation_and_trailing_data() {
+        let symlink = WireMutation::replace_symlink(
+            path(),
+            WirePath::new(Bytes::from_static(b"target")).unwrap(),
+            Some([9; 32]),
+            Some((-10, 123)),
+        )
+        .encode()
+        .unwrap();
         let encoded = WireMutation::create_directory(path()).encode().unwrap();
-        for len in 0..encoded.len() {
-            assert!(WireMutation::decode(&encoded[..len]).is_err());
+        for message in [&encoded, &symlink] {
+            for len in 0..message.len() {
+                assert!(WireMutation::decode(&message[..len]).is_err());
+            }
+            let mut trailing = message.to_vec();
+            trailing.push(0);
+            assert!(WireMutation::decode(&trailing).is_err());
+        }
+        let mut bad_nanos = symlink.to_vec();
+        let len = bad_nanos.len();
+        bad_nanos[len - 4..].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+        assert!(matches!(
+            WireMutation::decode(&bad_nanos),
+            Err(ProtocolError::InvalidField {
+                field: "modified_nanoseconds",
+                ..
+            })
+        ));
+        let mut flags = WireMutation::replace_symlink(
+            path(),
+            WirePath::new(Bytes::from_static(b"target")).unwrap(),
+            None,
+            None,
+        )
+        .encode()
+        .unwrap()
+        .to_vec();
+        let len = flags.len();
+        for index in [len - 2, len - 1] {
+            flags[index] = 2;
+            assert!(WireMutation::decode(&flags).is_err());
+            flags[index] = 0;
         }
         let mut unknown = encoded.to_vec();
         unknown[0] = u8::MAX;
@@ -390,9 +495,6 @@ mod tests {
                 ..
             })
         ));
-        let mut trailing = encoded.to_vec();
-        trailing.push(0);
-        assert!(WireMutation::decode(&trailing).is_err());
     }
 
     proptest! {

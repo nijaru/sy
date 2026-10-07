@@ -684,8 +684,10 @@ fn test_replace_empty_directory_with_file_succeeds_without_delete() {
 }
 
 #[test]
-fn test_replace_nonempty_directory_with_file_requires_delete() {
+fn test_replace_nonempty_directory_with_file_is_refused_even_with_delete() {
     let (source, dest) = setup_test_dir();
+    fs::write(source.path().join("ahead"), b"must not publish").unwrap();
+    fs::write(dest.path().join("obsolete"), b"must not delete").unwrap();
     fs::write(source.path().join("swap"), b"new file").unwrap();
     fs::create_dir(dest.path().join("swap")).unwrap();
     fs::write(dest.path().join("swap/child"), b"preexisting").unwrap();
@@ -704,21 +706,24 @@ fn test_replace_nonempty_directory_with_file_requires_delete() {
     );
     assert!(dest.path().join("swap/child").exists());
 
-    // With --delete: atomic exchange replaces directory with file
+    // Even overriding the deletion threshold cannot authorize a subtree sweep.
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &["--delete"]))
+        .args(sync_args(&source, &dest, &["--delete", "--force-delete"]))
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cleanup authorization"));
+    assert!(dest.path().join("swap").is_dir());
+    assert_eq!(
+        fs::read(dest.path().join("swap/child")).unwrap(),
+        b"preexisting"
     );
-    let meta = fs::metadata(dest.path().join("swap")).unwrap();
-    assert!(meta.is_file());
-    assert_eq!(fs::read(dest.path().join("swap")).unwrap(), b"new file");
-    assert!(!dest.path().join("swap/child").exists());
+    assert!(!dest.path().join("ahead").exists());
+    assert_eq!(
+        fs::read(dest.path().join("obsolete")).unwrap(),
+        b"must not delete"
+    );
 }
 
 #[test]
@@ -747,7 +752,7 @@ fn test_replace_empty_directory_with_symlink_succeeds_without_delete() {
 }
 
 #[test]
-fn test_replace_nonempty_directory_with_symlink_requires_delete() {
+fn test_replace_nonempty_directory_with_symlink_is_refused_even_with_delete() {
     let (source, dest) = setup_test_dir();
     #[cfg(unix)]
     std::os::unix::fs::symlink("target", source.path().join("swap")).unwrap();
@@ -768,24 +773,19 @@ fn test_replace_nonempty_directory_with_symlink_requires_delete() {
     );
     assert!(dest.path().join("swap/child").exists());
 
-    // With --delete: atomic exchange replaces directory with symlink
+    // --delete is necessary, but cannot authorize a path-only recursive sweep.
     let output = Command::new(sy_bin())
         .args(sync_args(&source, &dest, &["--delete"]))
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let meta = fs::symlink_metadata(dest.path().join("swap")).unwrap();
-    assert!(meta.file_type().is_symlink());
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cleanup authorization"));
+    assert!(dest.path().join("swap").is_dir());
     assert_eq!(
-        fs::read_link(dest.path().join("swap")).unwrap(),
-        std::path::PathBuf::from("target")
+        fs::read(dest.path().join("swap/child")).unwrap(),
+        b"preexisting"
     );
-    assert!(!dest.path().join("swap/child").exists());
 }
 
 #[test]

@@ -546,10 +546,10 @@ struct SymlinkSnapshot {
 
 #[cfg(target_os = "linux")]
 const fn stat_mode_u32(stat: &libc::stat) -> u32 {
-    stat.st_mode
+    stat.st_mode as u32
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const fn stat_mode_u32(stat: &libc::stat) -> u32 {
     stat.st_mode as u32
 }
@@ -577,12 +577,8 @@ fn symlink_snapshot(stat: &libc::stat, path: &Path) -> Result<SymlinkSnapshot, R
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn stat_times(stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
-    let mtime_nsec =
-        u32::try_from(stat.st_mtime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
-    let ctime_nsec =
-        u32::try_from(stat.st_ctime_nsec).map_err(|_| RootedScanError::UnsupportedPlatform)?;
-    Ok((stat.st_mtime, mtime_nsec, stat.st_ctime, ctime_nsec))
+fn stat_times(_stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanError> {
+    Err(RootedScanError::UnsupportedPlatform)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -598,6 +594,60 @@ pub(super) fn directory_names(fd: RawFd) -> Result<Vec<OsString>, RootedScanErro
         .map_err(RootedScanError::ReadDirectory)
 }
 
+/// Bounded namespace check: stop at the first non-dot entry without collecting names.
+pub(super) fn directory_is_empty(fd: RawFd) -> Result<bool, RootedScanError> {
+    let scan_fd = unsafe {
+        // SAFETY: fd is a held directory; reopening dot gives an independent
+        // offset and cannot follow a peer-controlled component.
+        libc::openat(
+            fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if scan_fd < 0 {
+        return Err(RootedScanError::ReadDirectory(io::Error::last_os_error()));
+    }
+    let dir = unsafe {
+        // SAFETY: scan_fd is fresh; fdopendir takes ownership only on success.
+        libc::fdopendir(scan_fd)
+    };
+    if dir.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe {
+            // SAFETY: failed fdopendir left scan_fd owned here.
+            libc::close(scan_fd);
+        }
+        return Err(RootedScanError::ReadDirectory(error));
+    }
+    let guard = DirectoryStream(dir);
+    loop {
+        set_errno(0);
+        let entry = unsafe {
+            // SAFETY: guard owns a live DIR for this loop.
+            libc::readdir(guard.0)
+        };
+        if entry.is_null() {
+            let errno = get_errno();
+            return if errno == 0 {
+                Ok(true)
+            } else {
+                Err(RootedScanError::ReadDirectory(
+                    io::Error::from_raw_os_error(errno),
+                ))
+            };
+        }
+        let name = unsafe {
+            // SAFETY: successful readdir supplies a NUL-terminated name valid
+            // until the next readdir; no reference escapes this iteration.
+            CStr::from_ptr((*entry).d_name.as_ptr())
+        }
+        .to_bytes();
+        if name != b"." && name != b".." {
+            return Ok(false);
+        }
+    }
+}
 struct DirectoryStream(*mut libc::DIR);
 
 impl DirectoryStream {
@@ -800,35 +850,19 @@ fn component_cstring(name: &OsStr) -> Result<CString, RootedScanError> {
 }
 
 #[cfg(target_os = "linux")]
-fn set_errno(value: libc::c_int) {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__errno_location() = value;
-    }
-}
+fn set_errno(_value: libc::c_int) {}
 
-#[cfg(target_os = "linux")]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn get_errno() -> libc::c_int {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__errno_location()
-    }
+    0
 }
 
-#[cfg(target_os = "macos")]
-fn set_errno(value: libc::c_int) {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__error() = value;
-    }
-}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_errno(_value: libc::c_int) {}
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn get_errno() -> libc::c_int {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__error()
-    }
+    0
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

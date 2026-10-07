@@ -62,6 +62,7 @@ fn lower_create(
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: None,
         }))),
     }
 }
@@ -95,13 +96,14 @@ fn lower_update(
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }
 
 fn lower_replace(
     source: Entry,
-    _destination: Entry,
+    destination: Entry,
     policy: ExecutionPolicy,
 ) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
@@ -118,13 +120,14 @@ fn lower_replace(
             };
             Ok(Some(file_work(RemotePullAction::FetchFile {
                 source,
-                destination: None,
+                destination: Some(destination),
                 metadata,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }

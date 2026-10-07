@@ -73,6 +73,12 @@ pub enum ControllerError {
         descendant: RelativePath,
     },
 
+    #[error("unsupported type transition at '{path}': non-empty directory replacement ({discarded_entries} entries) requires identity-bearing descendant cleanup authorization, which is not implemented")]
+    NonEmptyDirectoryReplacementUnsupported {
+        path: RelativePath,
+        discarded_entries: u64,
+    },
+
     #[error("sync worker failed: {0}")]
     Worker(String),
 
@@ -233,6 +239,7 @@ where
         crate::engine::namespace::NamespaceCollisionDetector::new(policy.namespace_semantics);
     let mut operations = 0_u64;
     let mut active_replaced_dir: Option<(RelativePath, u64)> = None;
+    let mut unsupported_nonempty = None;
 
     while let Some(item) = reconciler.next().await? {
         let item_path = match &item {
@@ -251,6 +258,9 @@ where
                                 discarded_entries: count,
                             },
                         );
+                    }
+                    if count > 0 {
+                        unsupported_nonempty.get_or_insert((path, count));
                     }
                 }
             }
@@ -375,6 +385,9 @@ where
                 },
             );
         }
+        if count > 0 {
+            unsupported_nonempty.get_or_insert((path, count));
+        }
     }
 
     // Alias proof completes with the rest of preflight: no mutation may run
@@ -384,6 +397,15 @@ where
         Some(delete) => Some(delete.finish().await?),
         None => None,
     };
+    // Counting, threshold and protected-descendant validation above remain
+    // authoritative. A path-only subtree sweep cannot consume that authority:
+    // until descendant identities reach cleanup, refuse before any execution.
+    if let Some((path, discarded_entries)) = unsupported_nonempty {
+        return Err(ControllerError::NonEmptyDirectoryReplacementUnsupported {
+            path,
+            discarded_entries,
+        });
+    }
     Ok(SyncPlan {
         reader: journal.seal().await?,
         finalize: finalize.seal().await?,
@@ -1568,7 +1590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_accounts_discarded_descendants_in_delete_plan() {
+    async fn preflight_refuses_nonempty_replacement_even_with_delete() {
         let source = entries(vec![file("swap", 3, 1)]);
         let destination = entries(vec![
             directory("swap", 0o755),
@@ -1579,7 +1601,7 @@ mod tests {
             limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
             force: false,
         };
-        let mut plan = preflight_sync(
+        let error = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1587,15 +1609,14 @@ mod tests {
             |_| true,
         )
         .await
-        .unwrap();
-        assert_eq!(plan.operations, 1);
-        let delete = plan.delete.take().unwrap();
-        assert_eq!(delete.delete_candidates(), 2);
-        assert_eq!(delete.eligible_destination_entries(), 3); // swap (dir), swap/first, swap/second
-
-        // Replaced directory descendants must NOT be present in delete journal replay
-        let mut replay = delete.into_replay();
-        assert!(replay.next_action().await.unwrap().is_none());
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControllerError::NonEmptyDirectoryReplacementUnsupported {
+                discarded_entries: 2,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

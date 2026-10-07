@@ -320,7 +320,23 @@ pub trait Endpoint: Send + Sync {
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()>;
     async fn create_dir_all(&self, path: &Path) -> Result<()>;
-    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()>;
+    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+        self.replace_symlink(target, dest, ExpectedDestination::Absent, None)
+            .await
+    }
+
+    /// Stage link metadata privately and validate the scanned destination before publication.
+    async fn replace_symlink(
+        &self,
+        _target: &Path,
+        _dest: &Path,
+        _expected: ExpectedDestination,
+        _modified: Option<crate::engine::domain::Timestamp>,
+    ) -> Result<()> {
+        Err(crate::error::SyncError::Config(
+            "transactional symlink replacement is unsupported".into(),
+        ))
+    }
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()>;
 }
 

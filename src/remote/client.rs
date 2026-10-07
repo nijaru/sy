@@ -295,11 +295,24 @@ impl ClientRemoteHandle {
             .map_err(Into::into)
     }
 
-    pub async fn replace_symlink(&self, path: &RelativePath, target: &Path) -> Result<()> {
+    pub async fn replace_symlink(
+        &self,
+        path: &RelativePath,
+        target: &Path,
+        expected_identity: Option<EntryIdentity>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
-        request_replace_symlink(&self.sender, path, target, self.peer)
-            .await
-            .map_err(Into::into)
+        request_replace_symlink(
+            &self.sender,
+            path,
+            target,
+            expected_identity,
+            modified,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn remove(

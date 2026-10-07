@@ -34,7 +34,7 @@ pub enum RootedFsError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("destination entry changed between scan and removal for {0}")]
+    #[error("destination entry changed between observation and mutation for {0}")]
     DestinationChanged(PathBuf),
 
     #[error("root directory identity changed after it was opened: {0}")]
@@ -103,6 +103,9 @@ pub enum RootedFsError {
     #[error("staged operation failed ({operation}) and abort also failed ({abort})")]
     StagingOperationAbortFailed { operation: String, abort: String },
 
+    #[error("nonempty directory replacement is not authorized at {0}")]
+    NonEmptyDirectoryReplacement(PathBuf),
+
     #[error("staged commit was cancelled before publication")]
     CommitCancelled,
 
@@ -145,6 +148,12 @@ impl std::fmt::Debug for RootedFs {
 /// operations stay relative to the held destination parent and staging dir.
 pub struct RootedStagedFile {
     file: File,
+    namespace: RootedNamespaceTransaction,
+}
+
+/// Owns private staging and publication independently of regular-file bytes.
+/// Symlinks and files use the same expected-state, parent binding and cleanup.
+struct RootedNamespaceTransaction {
     rooted: RootedFs,
     expected_destination: HeldDestinationExpectation,
     #[cfg(unix)]
@@ -165,7 +174,7 @@ impl std::fmt::Debug for RootedStagedFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RootedStagedFile")
-            .field("committed", &self.committed)
+            .field("committed", &self.namespace.committed)
             .finish_non_exhaustive()
     }
 }
@@ -269,17 +278,30 @@ impl RootedStagedFile {
         }
     }
 
-    /// Publish the staged inode atomically in the destination namespace.
-    /// This is not a power-loss durability guarantee: no parent-directory
-    /// persistence ordering is provided, and syncing every file without that
-    /// stronger contract would penalize many-small-file syncs substantially.
+    /// Publish atomically through the namespace owner. This is not a power-loss
+    /// durability guarantee: no parent-directory persistence ordering is provided.
     pub fn commit(self) -> Result<()> {
+        self.namespace.commit()
+    }
+
+    /// Serialize cancellation against publication; set the shared state when
+    /// the awaiting future is dropped.
+    pub fn commit_cancellable(self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
+        self.namespace.commit_cancellable(cancellation)
+    }
+
+    /// Explicitly abort and report cleanup failures rather than relying on Drop.
+    pub fn abort(self) -> Result<()> {
+        self.namespace.abort()
+    }
+}
+
+impl RootedNamespaceTransaction {
+    fn commit(self) -> Result<()> {
         self.commit_prepared()
     }
 
-    /// Commit with cancellation serialized against the publication syscall.
-    /// The caller sets the shared state when its awaiting future is dropped.
-    pub fn commit_cancellable(mut self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
+    fn commit_cancellable(mut self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
         let state = cancellation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -297,9 +319,7 @@ impl RootedStagedFile {
         }
     }
 
-    /// Explicitly abort and report cleanup failures instead of relying only on
-    /// Drop's best-effort fallback.
-    pub fn abort(mut self) -> Result<()> {
+    fn abort(mut self) -> Result<()> {
         self.abort_blocking()
     }
 
@@ -343,6 +363,12 @@ impl RootedStagedFile {
 
     #[cfg(unix)]
     fn commit_blocking(&mut self) -> Result<()> {
+        self.publish_blocking()?;
+        self.finish_commit_blocking()
+    }
+
+    #[cfg(unix)]
+    fn publish_blocking(&mut self) -> Result<()> {
         self.verify_parent_binding()?;
         self.verify_expected_destination()?;
 
@@ -357,6 +383,21 @@ impl RootedStagedFile {
             _ => false,
         };
 
+        if dest_stat.is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR) {
+            let directory = open_dir_at(self.parent_fd.as_raw_fd(), &self.destination_name)?;
+            if !scan::directory_is_empty(directory.as_raw_fd())
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+            {
+                return Err(RootedFsError::NonEmptyDirectoryReplacement(
+                    self.destination_path.clone(),
+                ));
+            }
+        }
+        // These checks detect observed races, not an atomic compare-and-swap.
+        // A child arriving after the empty check must never be recursively removed.
+        self.verify_parent_binding()?;
+        self.verify_expected_destination()?;
+
         if is_type_transition {
             rename_exchange_at(
                 self.staging_dir_fd.as_raw_fd(),
@@ -365,14 +406,25 @@ impl RootedStagedFile {
                 &self.destination_name,
             )?;
             self.committed = true;
-            let old_dest_stat = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
-            if let Some(stat) = old_dest_stat {
-                if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
-                    let _ = remove_dir_tree_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name);
-                } else {
-                    let _ = unlink_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name, false);
+        } else if matches!(
+            self.expected_destination,
+            HeldDestinationExpectation::Absent
+        ) {
+            // linkat does not replace a name that appeared after validation, and
+            // does not follow the staged symlink. Staging is on this filesystem.
+            link_at(
+                self.staging_dir_fd.as_raw_fd(),
+                &self.temp_name,
+                self.parent_fd.as_raw_fd(),
+                &self.destination_name,
+            )
+            .map_err(|error| match error {
+                RootedFsError::Io(ref io) if io.raw_os_error() == Some(libc::EEXIST) => {
+                    RootedFsError::DestinationChanged(self.destination_path.clone())
                 }
-            }
+                other => other,
+            })?;
+            self.committed = true;
         } else {
             rename_between_at(
                 self.staging_dir_fd.as_raw_fd(),
@@ -383,14 +435,36 @@ impl RootedStagedFile {
             self.committed = true;
         }
 
-        remove_owned_staging_dir_at(
-            self.parent_fd.as_raw_fd(),
-            self.staging_dir_fd.as_raw_fd(),
-            &self.staging_dir_name,
-        )
-        .map_err(|error| RootedFsError::CommittedCleanupPending {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn finish_commit_blocking(&mut self) -> Result<()> {
+        let cleanup = || -> Result<()> {
+            if let Some(stat) = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?
+            {
+                // Only the old entry itself is authorized. New descendants are
+                // retained inside private staging if rmdir refuses them.
+                unlink_at(
+                    self.staging_dir_fd.as_raw_fd(),
+                    &self.temp_name,
+                    stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                )?;
+            }
+            remove_owned_staging_dir_at(
+                self.parent_fd.as_raw_fd(),
+                self.staging_dir_fd.as_raw_fd(),
+                &self.staging_dir_name,
+            )
+        };
+        cleanup().map_err(|error| RootedFsError::CommittedCleanupPending {
             path: self.destination_path.clone(),
-            reason: error.to_string(),
+            reason: format!(
+                "{error}; private staging entry: {}",
+                self.destination_path
+                    .with_file_name(&self.staging_dir_name)
+                    .display(),
+            ),
         })?;
         self.verify_parent_binding()
             .map_err(|error| RootedFsError::CommittedParentChanged {
@@ -458,7 +532,7 @@ enum HeldDestinationExpectation {
     Unchanged(EntryIdentity),
 }
 
-impl Drop for RootedStagedFile {
+impl Drop for RootedNamespaceTransaction {
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -698,13 +772,68 @@ impl RootedFs {
         self.copy_file_path_blocking(source.as_path(), destination.as_path())
     }
 
-    /// Atomically replace a non-directory destination with a symlink while the
-    /// resolved parent directory remains pinned. The symlink target is stored as
+    /// Privately stage a symlink and publish through the common namespace
+    /// transaction. Empty directories require atomic exchange; nonempty ones
+    /// are refused. The resolved parent stays pinned. The target is stored as
     /// opaque native path data and is never resolved by this operation.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn replace_symlink_blocking(&self, relative: &RelativePath, target: &Path) -> Result<()> {
-        self.replace_symlink_path_blocking(relative.as_path(), target)
+    pub fn replace_symlink_blocking(
+        &self,
+        relative: &RelativePath,
+        target: &Path,
+        expected: ExpectedDestination,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        let staged = self.begin_staged_symlink_blocking(relative, target, expected, modified)?;
+        staged.commit()
+    }
+
+    fn begin_staged_symlink_blocking(
+        &self,
+        relative: &RelativePath,
+        target: &Path,
+        expected: ExpectedDestination,
+        modified: Option<Timestamp>,
+    ) -> Result<RootedNamespaceTransaction> {
+        #[cfg(unix)]
+        {
+            let mut namespace = self.begin_namespace_blocking(relative.as_path(), expected)?;
+            let prepare = || -> Result<()> {
+                let target = CString::new(target.as_os_str().as_bytes())
+                    .map_err(|_| RootedFsError::PathContainsNul)?;
+                let name = component_cstring(&namespace.temp_name)?;
+                let result = unsafe {
+                    // SAFETY: both strings are live and NUL terminated; the held
+                    // private directory owns the new leaf, target is not resolved.
+                    libc::symlinkat(
+                        target.as_ptr(),
+                        namespace.staging_dir_fd.as_raw_fd(),
+                        name.as_ptr(),
+                    )
+                };
+                if result < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if let Some(modified) = modified {
+                    set_symlink_mtime_at(
+                        namespace.staging_dir_fd.as_raw_fd(),
+                        &namespace.temp_name,
+                        modified,
+                    )?;
+                }
+                Ok(())
+            };
+            if let Err(error) = prepare() {
+                return Err(namespace.abort_after(error));
+            }
+            Ok(namespace)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, target, expected, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     /// Remove one file-like or directory leaf beneath the pinned root. Parent
@@ -723,21 +852,6 @@ impl RootedFs {
         expected_identity: Option<EntryIdentity>,
     ) -> Result<()> {
         self.remove_path_blocking(relative.as_path(), is_directory, expected_identity)
-    }
-
-    /// Recursively remove a directory tree beneath the pinned root using
-    /// directory-descriptor relative traversal with no-follow semantics.
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    #[cfg(unix)]
-    pub fn remove_dir_tree_blocking(&self, relative: &RelativePath) -> Result<()> {
-        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
-        remove_dir_tree_at(parent.as_raw_fd(), &leaf)
-    }
-
-    #[cfg(not(unix))]
-    pub fn remove_dir_tree_blocking(&self, _relative: &RelativePath) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Read every extended attribute of one file or directory beneath the
@@ -950,6 +1064,26 @@ impl RootedFs {
         relative: &Path,
         expected: ExpectedDestination,
     ) -> Result<RootedStagedFile> {
+        let mut namespace = self.begin_namespace_blocking(relative, expected)?;
+        let file = match create_staging_file_at(
+            namespace.staging_dir_fd.as_raw_fd(),
+            &namespace.temp_name,
+        ) {
+            Ok(file) => file,
+            Err(error) => return Err(namespace.abort_after(error)),
+        };
+        if let Err(error) = verify_staging_file_group(namespace.parent_fd.as_raw_fd(), &file) {
+            return Err(namespace.abort_after(error));
+        }
+        Ok(RootedStagedFile { file, namespace })
+    }
+
+    #[cfg(unix)]
+    fn begin_namespace_blocking(
+        &self,
+        relative: &Path,
+        expected: ExpectedDestination,
+    ) -> Result<RootedNamespaceTransaction> {
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
         let expected_destination = capture_destination_expectation(
             parent_fd.as_raw_fd(),
@@ -970,29 +1104,7 @@ impl RootedFs {
                     Err(error) => return Err(error),
                 };
 
-            let file = match create_staging_file_at(staging_dir_fd.as_raw_fd(), &temp_name) {
-                Ok(file) => file,
-                Err(error) => {
-                    return Err(cleanup_staging_directory_preparation(
-                        error,
-                        parent_fd.as_raw_fd(),
-                        staging_dir_fd.as_raw_fd(),
-                        &staging_dir_name,
-                    ));
-                }
-            };
-            if let Err(error) = verify_staging_file_group(parent_fd.as_raw_fd(), &file) {
-                drop(file);
-                return Err(cleanup_staging_file_preparation(
-                    error,
-                    parent_fd.as_raw_fd(),
-                    staging_dir_fd.as_raw_fd(),
-                    &temp_name,
-                    &staging_dir_name,
-                ));
-            }
-            return Ok(RootedStagedFile {
-                file,
+            return Ok(RootedNamespaceTransaction {
                 rooted: self.clone(),
                 expected_destination,
                 parent_fd,
@@ -1159,68 +1271,6 @@ impl RootedFs {
 
     #[cfg(not(unix))]
     fn create_directory_path_blocking(&self, _relative: &Path) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
-    fn replace_symlink_path_blocking(&self, relative: &Path, target: &Path) -> Result<()> {
-        let (parent, destination_name) = self.open_parent_blocking(relative)?;
-        let target = CString::new(target.as_os_str().as_bytes())
-            .map_err(|_| RootedFsError::PathContainsNul)?;
-
-        for _ in 0..TEMP_CREATE_ATTEMPTS {
-            let temp_name = next_temp_name();
-            let temp = component_cstring(&temp_name)?;
-            let result = unsafe {
-                // SAFETY: `target` and `temp` are live NUL-terminated strings,
-                // and `parent` pins the destination directory. symlinkat stores
-                // the target bytes verbatim and does not resolve them.
-                libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), temp.as_ptr())
-            };
-            if result < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EEXIST) {
-                    continue;
-                }
-                return Err(error.into());
-            }
-
-            let dest_stat = stat_at_optional(parent.as_raw_fd(), &destination_name)?;
-            let is_dest_dir =
-                dest_stat.is_some_and(|s| (s.st_mode & libc::S_IFMT) == libc::S_IFDIR);
-
-            if is_dest_dir {
-                match rename_exchange_at(
-                    parent.as_raw_fd(),
-                    &temp_name,
-                    parent.as_raw_fd(),
-                    &destination_name,
-                ) {
-                    Ok(()) => {
-                        let _ = remove_dir_tree_at(parent.as_raw_fd(), &temp_name);
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
-                        return Err(error);
-                    }
-                }
-            } else {
-                match rename_at(parent.as_raw_fd(), &temp_name, &destination_name) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
-    }
-
-    #[cfg(not(unix))]
-    fn replace_symlink_path_blocking(&self, _relative: &Path, _target: &Path) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1780,31 +1830,6 @@ fn cleanup_staging_directory_preparation(
 }
 
 #[cfg(unix)]
-fn cleanup_staging_file_preparation(
-    operation: RootedFsError,
-    parent: RawFd,
-    staging_dir: RawFd,
-    temp_name: &OsStr,
-    staging_dir_name: &OsStr,
-) -> RootedFsError {
-    let remove_file = unlink_at(staging_dir, temp_name, false).err();
-    let remove_dir = remove_owned_staging_dir_at(parent, staging_dir, staging_dir_name).err();
-    let cleanup = remove_file
-        .into_iter()
-        .chain(remove_dir)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    if cleanup.is_empty() {
-        operation
-    } else {
-        RootedFsError::StagingPreparationCleanupFailed {
-            operation: operation.to_string(),
-            cleanup: cleanup.join("; "),
-        }
-    }
-}
-
-#[cfg(unix)]
 fn verify_staging_file_group(parent: RawFd, file: &File) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -2343,7 +2368,7 @@ fn link_at(
     let result = unsafe {
         // SAFETY: both descriptors remain open and both names are live
         // NUL-terminated single components. Flags are zero so a symlink
-        // source is refused rather than followed.
+        // source is linked itself rather than followed.
         libc::linkat(
             source_parent,
             source.as_ptr(),
@@ -2466,34 +2491,6 @@ fn rename_exchange_at(
 }
 
 #[cfg(unix)]
-fn remove_dir_tree_at(parent: RawFd, component: &OsStr) -> Result<()> {
-    let stat = match stat_at_optional(parent, component)? {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
-    if !is_dir {
-        return unlink_at(parent, component, false);
-    }
-
-    let dir_fd = open_dir_at(parent, component)?;
-    let _ = unsafe {
-        // SAFETY: dir_fd is a valid open file descriptor pointing to the directory in private staging.
-        libc::fchmod(dir_fd.as_raw_fd(), 0o700)
-    };
-
-    let child_names = scan::directory_names(dir_fd.as_raw_fd())
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-
-    for child in child_names {
-        remove_dir_tree_at(dir_fd.as_raw_fd(), &child)?;
-    }
-
-    unlink_at(parent, component, true)
-}
-
-#[cfg(unix)]
 fn unlink_at(parent: RawFd, component: &OsStr, is_directory: bool) -> Result<()> {
     let component = component_cstring(component)?;
     let flags = if is_directory { libc::AT_REMOVEDIR } else { 0 };
@@ -2608,10 +2605,11 @@ mod tests {
         staged.file_mut().write_all(b"new").unwrap();
         staged.apply_metadata_blocking(Some(0o644), None).unwrap();
 
-        let staging_path = root.path().join(&staged.staging_dir_name);
-        let staged_acl =
-            exacl::to_string(&exacl::getfacl(staging_path.join(&staged.temp_name), None).unwrap())
-                .unwrap();
+        let staging_path = root.path().join(&staged.namespace.staging_dir_name);
+        let staged_acl = exacl::to_string(
+            &exacl::getfacl(staging_path.join(&staged.namespace.temp_name), None).unwrap(),
+        )
+        .unwrap();
         assert!(!staged_acl.contains("2147483646"));
         staged.commit().unwrap();
 
@@ -2715,7 +2713,7 @@ mod tests {
             .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
 
-        let staging_path = root.path().join(&staged.staging_dir_name);
+        let staging_path = root.path().join(&staged.namespace.staging_dir_name);
         let moved_path = root.path().join("moved-stage");
         std::fs::rename(&staging_path, &moved_path).unwrap();
         std::fs::create_dir(&staging_path).unwrap();
@@ -2739,7 +2737,11 @@ mod tests {
             .begin_staged_file_blocking(&relative("file"))
             .unwrap();
         let relocated = root.path().join("relocated-stage");
-        std::fs::rename(root.path().join(&staged.staging_dir_name), &relocated).unwrap();
+        std::fs::rename(
+            root.path().join(&staged.namespace.staging_dir_name),
+            &relocated,
+        )
+        .unwrap();
 
         assert!(matches!(
             staged.abort(),
@@ -2799,7 +2801,7 @@ mod tests {
         staged.file_mut().write_all(b"new").unwrap();
         staged.apply_metadata_blocking(Some(0o777), None).unwrap();
 
-        let staging_path = root.path().join(&staged.staging_dir_name);
+        let staging_path = root.path().join(&staged.namespace.staging_dir_name);
         assert_eq!(
             std::fs::metadata(&staging_path)
                 .unwrap()
@@ -2809,7 +2811,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            std::fs::metadata(staging_path.join(&staged.temp_name))
+            std::fs::metadata(staging_path.join(&staged.namespace.temp_name))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -2840,7 +2842,8 @@ mod tests {
             .begin_staged_file_blocking(&relative("file"))
             .unwrap();
 
-        let directory_acl = acl_macos::read_fd_entries(staged.staging_dir_fd.as_raw_fd()).unwrap();
+        let directory_acl =
+            acl_macos::read_fd_entries(staged.namespace.staging_dir_fd.as_raw_fd()).unwrap();
         let file_acl = acl_macos::read_fd_entries(staged.file.as_raw_fd()).unwrap();
         assert!(directory_acl.is_empty());
         assert!(file_acl.is_empty());
@@ -2865,7 +2868,7 @@ mod tests {
         let mut staged = rooted
             .begin_staged_file_blocking(&relative("shared/file"))
             .unwrap();
-        let staging_path = parent.join(&staged.staging_dir_name);
+        let staging_path = parent.join(&staged.namespace.staging_dir_name);
 
         let staging_mode = std::fs::metadata(&staging_path)
             .unwrap()
@@ -2913,7 +2916,7 @@ mod tests {
             .begin_staged_file_blocking(&relative("file"))
             .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
-        let staging_path = root.path().join(&staged.staging_dir_name);
+        let staging_path = root.path().join(&staged.namespace.staging_dir_name);
         let moved_path = root.path().join("moved-private-stage");
         std::fs::rename(&staging_path, &moved_path).unwrap();
         std::fs::create_dir(&staging_path).unwrap();
@@ -2961,7 +2964,7 @@ mod tests {
             .begin_staged_file_blocking(&relative("file"))
             .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
-        let staging_path = root.path().join(&staged.staging_dir_name);
+        let staging_path = root.path().join(&staged.namespace.staging_dir_name);
         std::fs::write(staging_path.join("unexpected"), b"keep").unwrap();
 
         let result = staged.commit();
@@ -3264,7 +3267,12 @@ mod tests {
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
 
         rooted
-            .replace_symlink_blocking(&relative("entry"), Path::new("../target"))
+            .replace_symlink_blocking(
+                &relative("entry"),
+                Path::new("../target"),
+                ExpectedDestination::SnapshotAtOpen,
+                None,
+            )
             .unwrap();
         let metadata = std::fs::symlink_metadata(root.path().join("entry")).unwrap();
         assert!(metadata.file_type().is_symlink());
@@ -3403,12 +3411,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_file_replaces_directory_atomically() {
+    async fn staged_symlink_rejects_racing_create_and_update_destinations() {
+        for update in [false, true] {
+            for directory in [false, true] {
+                let root = tempfile::TempDir::new().unwrap();
+                let dest = root.path().join("target");
+                let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+                let expected = if update {
+                    std::os::unix::fs::symlink("old", &dest).unwrap();
+                    let (_, identity) = rooted
+                        .path_identity_blocking(&relative("target"))
+                        .unwrap()
+                        .unwrap();
+                    ExpectedDestination::Unchanged(identity)
+                } else {
+                    ExpectedDestination::Absent
+                };
+                let staged = rooted
+                    .begin_staged_symlink_blocking(
+                        &relative("target"),
+                        Path::new("new"),
+                        expected,
+                        None,
+                    )
+                    .unwrap();
+                if update {
+                    std::fs::remove_file(&dest).unwrap();
+                }
+                if directory {
+                    std::fs::create_dir(&dest).unwrap();
+                    std::fs::write(dest.join("child"), b"raced").unwrap();
+                } else {
+                    std::fs::write(&dest, b"raced").unwrap();
+                }
+                assert!(matches!(
+                    staged.commit(),
+                    Err(RootedFsError::DestinationChanged(_))
+                ));
+                let retained = if directory { dest.join("child") } else { dest };
+                assert_eq!(std::fs::read(retained).unwrap(), b"raced");
+                assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn symlink_mtime_is_applied_behind_private_staging_before_publication() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("old", root.path().join("target")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let modified = Timestamp::new(1_600_000_000, 123_456_789).unwrap();
+        let staged = rooted
+            .begin_staged_symlink_blocking(
+                &relative("target"),
+                Path::new("new"),
+                ExpectedDestination::SnapshotAtOpen,
+                Some(modified),
+            )
+            .unwrap();
+        let private = root.path().join(&staged.staging_dir_name);
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let metadata = std::fs::symlink_metadata(private.join(&staged.temp_name)).unwrap();
+        assert_eq!(metadata.mtime(), modified.seconds());
+        assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+        assert_eq!(
+            std::fs::read_link(root.path().join("target")).unwrap(),
+            Path::new("old")
+        );
+        staged.commit().unwrap();
+        let metadata = std::fs::symlink_metadata(root.path().join("target")).unwrap();
+        assert_eq!(metadata.mtime(), modified.seconds());
+        assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+        assert!(!private.exists());
+    }
+
+    #[tokio::test]
+    async fn directory_gaining_child_before_commit_survives_file_and_symlink_replacement() {
+        for symlink in [false, true] {
+            let root = tempfile::TempDir::new().unwrap();
+            let dest = root.path().join("target");
+            std::fs::create_dir(&dest).unwrap();
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let (_, identity) = rooted
+                .path_identity_blocking(&relative("target"))
+                .unwrap()
+                .unwrap();
+            let expected = ExpectedDestination::Unchanged(identity);
+            let staged = if symlink {
+                rooted
+                    .begin_staged_symlink_blocking(
+                        &relative("target"),
+                        Path::new("new"),
+                        expected,
+                        None,
+                    )
+                    .unwrap()
+            } else {
+                rooted
+                    .begin_staged_file_with_expectation_blocking(&relative("target"), expected)
+                    .unwrap()
+                    .namespace
+            };
+            std::fs::write(dest.join("child"), b"keep").unwrap();
+            assert!(matches!(
+                staged.commit(),
+                Err(RootedFsError::NonEmptyDirectoryReplacement(_))
+            ));
+            assert_eq!(std::fs::read(dest.join("child")).unwrap(), b"keep");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_cleanup_retains_raced_in_children_and_reports_committed_failure() {
+        for symlink in [false, true] {
+            let root = tempfile::TempDir::new().unwrap();
+            let dest = root.path().join("target");
+            std::fs::create_dir(&dest).unwrap();
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let (_, identity) = rooted
+                .path_identity_blocking(&relative("target"))
+                .unwrap()
+                .unwrap();
+            let expected = ExpectedDestination::Unchanged(identity);
+            let mut staged = if symlink {
+                rooted
+                    .begin_staged_symlink_blocking(
+                        &relative("target"),
+                        Path::new("new"),
+                        expected,
+                        None,
+                    )
+                    .unwrap()
+            } else {
+                rooted
+                    .begin_staged_file_with_expectation_blocking(&relative("target"), expected)
+                    .unwrap()
+                    .namespace
+            };
+            let private = root.path().join(&staged.staging_dir_name);
+            let old = private.join(&staged.temp_name);
+            let held_directory =
+                open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
+            staged.publish_blocking().unwrap();
+            // A writer can keep using its old directory FD after exchange.
+            let mut child =
+                create_staging_file_at(held_directory.as_raw_fd(), OsStr::new("child")).unwrap();
+            child.write_all(b"keep").unwrap();
+            assert!(matches!(
+                staged.finish_commit_blocking(),
+                Err(RootedFsError::CommittedCleanupPending { .. })
+            ));
+            drop(staged);
+            assert_eq!(std::fs::read(old.join("child")).unwrap(), b"keep");
+            let metadata = std::fs::symlink_metadata(&dest).unwrap();
+            assert_eq!(metadata.file_type().is_symlink(), symlink);
+            assert_eq!(metadata.is_file(), !symlink);
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_file_replaces_empty_directory() {
         let root = tempfile::TempDir::new().unwrap();
         let dir_path = root.path().join("target");
-        std::fs::create_dir_all(dir_path.join("nested")).unwrap();
-        std::fs::write(dir_path.join("nested/child.txt"), b"old child").unwrap();
-        std::fs::write(dir_path.join("file.txt"), b"old file").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
 
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let mut staged = rooted
@@ -3420,19 +3590,22 @@ mod tests {
         let meta = std::fs::symlink_metadata(&dir_path).unwrap();
         assert!(meta.is_file());
         assert_eq!(std::fs::read(&dir_path).unwrap(), b"new file content");
-        assert!(!dir_path.join("nested").exists());
     }
 
     #[tokio::test]
-    async fn symlink_replaces_directory_atomically() {
+    async fn symlink_replaces_empty_directory() {
         let root = tempfile::TempDir::new().unwrap();
         let dir_path = root.path().join("target");
-        std::fs::create_dir_all(dir_path.join("sub")).unwrap();
-        std::fs::write(dir_path.join("sub/item"), b"content").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
 
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         rooted
-            .replace_symlink_blocking(&relative("target"), Path::new("somewhere/else"))
+            .replace_symlink_blocking(
+                &relative("target"),
+                Path::new("somewhere/else"),
+                ExpectedDestination::SnapshotAtOpen,
+                None,
+            )
             .unwrap();
 
         let meta = std::fs::symlink_metadata(&dir_path).unwrap();
@@ -3441,19 +3614,5 @@ mod tests {
             std::fs::read_link(&dir_path).unwrap(),
             PathBuf::from("somewhere/else")
         );
-    }
-
-    #[tokio::test]
-    async fn remove_dir_tree_recursively_cleans_nested_directory() {
-        let root = tempfile::TempDir::new().unwrap();
-        let dir_path = root.path().join("tree");
-        std::fs::create_dir_all(dir_path.join("a/b/c")).unwrap();
-        std::fs::write(dir_path.join("a/b/c/file"), b"deep").unwrap();
-        std::fs::write(dir_path.join("a/file2"), b"shallow").unwrap();
-
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        rooted.remove_dir_tree_blocking(&relative("tree")).unwrap();
-
-        assert!(!dir_path.exists());
     }
 }
