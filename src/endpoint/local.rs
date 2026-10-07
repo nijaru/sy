@@ -1839,7 +1839,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
         endpoint
-            .create_symlink(Path::new("first"), Path::new("link"))
+            .replace_symlink(
+                Path::new("first"),
+                Path::new("link"),
+                ExpectedDestination::Absent,
+                None,
+            )
             .await
             .unwrap();
         let identity = crate::endpoint::local_identity::metadata_identity(

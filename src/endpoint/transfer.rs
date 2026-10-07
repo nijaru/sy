@@ -1259,8 +1259,16 @@ mod tests {
             self.inner.create_dir_all(path).await
         }
 
-        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
-            self.inner.create_symlink(target, dest).await
+        async fn replace_symlink(
+            &self,
+            target: &Path,
+            dest: &Path,
+            expected: ExpectedDestination,
+            modified: Option<crate::engine::domain::Timestamp>,
+        ) -> Result<()> {
+            self.inner
+                .replace_symlink(target, dest, expected, modified)
+                .await
         }
 
         async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
@@ -1314,8 +1322,16 @@ mod tests {
             self.inner.create_dir_all(path).await
         }
 
-        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
-            self.inner.create_symlink(target, dest).await
+        async fn replace_symlink(
+            &self,
+            target: &Path,
+            dest: &Path,
+            expected: ExpectedDestination,
+            modified: Option<crate::engine::domain::Timestamp>,
+        ) -> Result<()> {
+            self.inner
+                .replace_symlink(target, dest, expected, modified)
+                .await
         }
 
         async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
@@ -1388,8 +1404,16 @@ mod tests {
             self.inner.create_dir_all(path).await
         }
 
-        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
-            self.inner.create_symlink(target, dest).await
+        async fn replace_symlink(
+            &self,
+            target: &Path,
+            dest: &Path,
+            expected: ExpectedDestination,
+            modified: Option<crate::engine::domain::Timestamp>,
+        ) -> Result<()> {
+            self.inner
+                .replace_symlink(target, dest, expected, modified)
+                .await
         }
 
         async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
