@@ -72,14 +72,12 @@ lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
 
 # Parallel processing
 rayon = "1.10"
-num_cpus = "1.16"  # CPU count detection for parallel scanning
 
 # SSH - Optional feature (OpenSSH is invoked as an external process; no
 # embedded SSH stack is linked)
 dirs = "5"
 futures = "0.3.31"
 bytes = "1.11.1"
-crossbeam-channel = "0.5.15"
 bitflags = "2.10.0"
 unicode-normalization = "0.1"
 
@@ -122,9 +120,6 @@ harness = false
 name = "sy-bench-gen"
 path = "src/bin/sy-bench-gen.rs"
 
-[[bin]]
-name = "sy-scan"
-path = "src/bin/sy-scan.rs"
 
 [[test]]
 name = "sync_basic"
@@ -171,21 +166,6 @@ name = "sync_compression"
 path = "tests/sync/compression.rs"
 
 [[test]]
-name = "sync_hardlinks"
-path = "tests/sync/hardlinks.rs"
-
-[[test]]
-name = "sync_large_file"
-path = "tests/sync/large_file.rs"
-
-[[test]]
-name = "sync_massive_dir"
-path = "tests/sync/massive_dir.rs"
-
-[[test]]
 name = "sync_property"
 path = "tests/sync/property.rs"
 
-[[test]]
-name = "sync_symlinks"
-path = "tests/sync/symlinks.rs"

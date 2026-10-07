@@ -584,7 +584,8 @@ fn test_sync_skips_identical_symlink() {
 }
 
 #[test]
-fn test_archive_preserves_permissions() {
+#[cfg(unix)]
+fn test_archive_short_flag_preserves_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let (source, dest) = setup_test_dir();
