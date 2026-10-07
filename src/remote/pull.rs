@@ -1113,6 +1113,7 @@ impl crate::remote::push_controller::SyncPlanExecutor for RemotePullExecutor {
     /// Pulls have no local source to remove; parity skips are just skips.
     async fn remove_verified_parity_source(
         &self,
+        _receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         _source: &Entry,
     ) -> std::result::Result<(), RemotePullError> {
         Ok(())

@@ -1,3 +1,4 @@
+use crate::endpoint::receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
 use crate::endpoint::Capabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
@@ -526,9 +527,10 @@ impl crate::remote::push_controller::SyncPlanExecutor for RemotePushExecutor {
 
     async fn remove_verified_parity_source(
         &self,
+        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &crate::engine::domain::Entry,
     ) -> std::result::Result<(), RemotePushError> {
-        RemotePushExecutor::remove_verified_parity_source(self, source).await
+        RemotePushExecutor::remove_verified_parity_source(self, receipt, source).await
     }
 
     fn on_execute_error(
@@ -714,12 +716,20 @@ impl RemotePushExecutor {
                         stream_policy,
                     )
                     .await?;
+                let mut receipt = PublishedDestinationReceipt::for_file(
+                    source.path.clone(),
+                    source.identity,
+                    &crate::endpoint::io::VerificationStatus::Verified,
+                    self.xattrs || self.acls,
+                    bsd_flags.is_none(),
+                );
                 // Only rename-incompatible flags remain post-commit finalization.
                 if let Some(flags) = bsd_flags {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
+                    receipt.mark_finalized();
                 }
-                self.remove_committed_source(&source).await?;
+                self.remove_committed_source(&receipt, &source).await?;
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -738,7 +748,9 @@ impl RemotePushExecutor {
                         .apply_metadata(&source.path, EntryKind::Symlink, None, Some(modified))
                         .await?;
                 }
-                self.remove_committed_source(&source).await?;
+                let receipt =
+                    PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
+                self.remove_committed_source(&receipt, &source).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
@@ -798,7 +810,9 @@ impl RemotePushExecutor {
                 }
             }
             self.remote.hardlink(&first, &source.path).await?;
-            self.remove_committed_source(&source).await?;
+            let receipt =
+                PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
+            self.remove_committed_source(&receipt, &source).await?;
             let op = if destination.is_some() {
                 crate::sync::output::ItemizeOp::Update
             } else {
@@ -842,14 +856,22 @@ impl RemotePushExecutor {
                 stream_policy,
             )
             .await?;
+        let mut receipt = PublishedDestinationReceipt::for_file(
+            source.path.clone(),
+            source.identity,
+            &crate::endpoint::io::VerificationStatus::Verified,
+            self.xattrs || self.acls,
+            bsd_flags.is_none(),
+        );
         // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
+            receipt.mark_finalized();
         }
         groups.insert(group, source.path.clone());
         drop(groups);
-        self.remove_committed_source(&source).await?;
+        self.remove_committed_source(&receipt, &source).await?;
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
         } else {
@@ -958,24 +980,46 @@ impl RemotePushExecutor {
     }
 
     /// --remove-source-files: remove an entry the planner verified as already
-    /// in sync with the destination. Only callable for non-directories whose
-    /// scan identity still matches; a changed source is refused.
-    pub async fn remove_verified_parity_source(&self, source: &Entry) -> Result<()> {
+    /// in sync with the destination. Requires a VerifiedExistingDestinationReceipt
+    /// (strong content verification). Quick-check equality alone never authorizes removal.
+    pub async fn remove_verified_parity_source(
+        &self,
+        receipt: &VerifiedExistingDestinationReceipt,
+        source: &Entry,
+    ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
-        self.remove_committed_source(source).await
+        receipt.validate_source_removal(source).map_err(|error| {
+            RemotePushError::SourceRemoval(
+                self.source_root.join(source.path.as_path()),
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        self.remove_source_entry_on_disk(source).await
     }
 
     /// Remove the source entry under --remove-source-files after the
-    /// destination commit is acknowledged. The scan identity is re-checked
-    /// first: a source replaced or modified after the scan must not be
-    /// removed, because the moved bytes would not be the verified ones.
-    #[cfg(unix)]
-    async fn remove_committed_source(&self, source: &Entry) -> Result<()> {
+    /// destination commit is acknowledged and produces an authorized publication receipt.
+    async fn remove_committed_source(
+        &self,
+        receipt: &PublishedDestinationReceipt,
+        source: &Entry,
+    ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
+        receipt.validate_source_removal(source).map_err(|error| {
+            RemotePushError::SourceRemoval(
+                self.source_root.join(source.path.as_path()),
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        self.remove_source_entry_on_disk(source).await
+    }
+
+    #[cfg(unix)]
+    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
         let path = self.source_root.join(source.path.as_path());
         let expected = source
             .identity
@@ -1007,10 +1051,7 @@ impl RemotePushExecutor {
     }
 
     #[cfg(not(unix))]
-    async fn remove_committed_source(&self, source: &Entry) -> Result<()> {
-        if !self.remove_source_files {
-            return Ok(());
-        }
+    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
         let path = self.source_root.join(source.path.as_path());
         let metadata = tokio::fs::symlink_metadata(&path)
             .await

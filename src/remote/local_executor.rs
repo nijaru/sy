@@ -11,6 +11,7 @@
 //! entire point of local sync and must not regress behind a generic
 //! streaming loop.
 
+use crate::endpoint::receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
@@ -480,7 +481,8 @@ impl LocalSyncExecutor {
                 // BSD flags remain a post-commit phase; xattrs and ACLs are
                 // captured by the transfer layer from the held byte source.
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let transfer = self
+                let pending_finalization = bsd_flags.is_some();
+                let (transfer, mut receipt) = self
                     .transfer_source_file(
                         &source,
                         &destination,
@@ -489,6 +491,7 @@ impl LocalSyncExecutor {
                             xattrs: self.xattrs && !source.is_symlink(),
                             acl: self.acls && !source.is_symlink(),
                         },
+                        pending_finalization,
                     )
                     .await?;
                 // Only rename-incompatible flags remain post-commit
@@ -497,8 +500,9 @@ impl LocalSyncExecutor {
                 if let Some(flags) = bsd_flags {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
+                    receipt.mark_finalized();
                 }
-                self.remove_committed_source(&source).await?;
+                self.remove_committed_source(&receipt, &source).await?;
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -516,7 +520,9 @@ impl LocalSyncExecutor {
                     self.set_mtime(&self.destination_path(&source.path), modified)
                         .await?;
                 }
-                self.remove_committed_source(&source).await?;
+                let receipt =
+                    PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
+                self.remove_committed_source(&receipt, &source).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
@@ -582,7 +588,9 @@ impl LocalSyncExecutor {
             link_local_file(&first_abs, &dest_abs)
                 .await
                 .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
-            self.remove_committed_source(&source).await?;
+            let receipt =
+                PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
+            self.remove_committed_source(&receipt, &source).await?;
             let op = if is_update {
                 crate::sync::output::ItemizeOp::Update
             } else {
@@ -600,7 +608,8 @@ impl LocalSyncExecutor {
         // BSD flags remain a post-commit phase; xattrs and ACLs are captured
         // from the held source that supplies the representative's bytes.
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        let transfer = self
+        let pending_finalization = bsd_flags.is_some();
+        let (transfer, mut receipt) = self
             .transfer_source_file(
                 &source,
                 &destination,
@@ -609,12 +618,14 @@ impl LocalSyncExecutor {
                     xattrs: self.xattrs && !source.is_symlink(),
                     acl: self.acls && !source.is_symlink(),
                 },
+                pending_finalization,
             )
             .await?;
         // Only rename-incompatible flags remain post-commit finalization.
         if let Some(flags) = bsd_flags {
             self.write_destination_bsd_flags(&source.path, source.kind, flags)
                 .await?;
+            receipt.mark_finalized();
         }
         groups.insert(
             group,
@@ -624,7 +635,7 @@ impl LocalSyncExecutor {
             },
         );
         drop(groups);
-        self.remove_committed_source(&source).await?;
+        self.remove_committed_source(&receipt, &source).await?;
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
         } else {
@@ -680,7 +691,11 @@ impl LocalSyncExecutor {
         destination: &Option<Entry>,
         metadata: &crate::endpoint::transfer::TransferMetadata,
         preservation_request: crate::endpoint::io::PreservationRequest,
-    ) -> Result<crate::remote::transfer::TransferSummary> {
+        pending_finalization: bool,
+    ) -> Result<(
+        crate::remote::transfer::TransferSummary,
+        PublishedDestinationReceipt,
+    )> {
         let backup = self.backup && destination.as_ref().is_some_and(|entry| entry.is_file());
         let result: TransferResult = crate::endpoint::transfer::transfer_file_with_before_stage(
             &self.source_endpoint,
@@ -710,6 +725,7 @@ impl LocalSyncExecutor {
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
                 preservation_request,
+                pending_finalization,
                 metadata: Some(*metadata),
             },
             || async {
@@ -746,12 +762,15 @@ impl LocalSyncExecutor {
         // Native strategies do not compute a whole-file digest on the happy
         // path; the summary carries byte accounting for the controller's
         // counters.
-        Ok(crate::remote::transfer::TransferSummary {
-            file_size: source.size,
-            digest: [0_u8; 32],
-            literal_bytes: result.bytes_written,
-            reused_bytes: 0,
-        })
+        Ok((
+            crate::remote::transfer::TransferSummary {
+                file_size: source.size,
+                digest: [0_u8; 32],
+                literal_bytes: result.bytes_written,
+                reused_bytes: 0,
+            },
+            result.receipt,
+        ))
     }
 
     /// Stage a symlink beside the destination and rename it into place so a
@@ -801,14 +820,30 @@ impl LocalSyncExecutor {
     }
 
     /// --remove-source-files: remove the source entry after the destination
-    /// commit. The scan identity is re-checked first — a source replaced or
-    /// modified after the scan must not be removed, because the moved bytes
-    /// would not be the verified ones. Only non-directories move; empty
-    /// directories stay, matching rsync.
-    async fn remove_committed_source(&self, source: &Entry) -> Result<()> {
+    /// commit has produced an authorized publication receipt. The receipt
+    /// is validated, and the on-disk scan identity is re-checked before
+    /// unlinking — a source replaced or modified after the scan must not be
+    /// removed, because the moved bytes would not be the verified ones.
+    /// Only non-directories move; empty directories stay, matching rsync.
+    async fn remove_committed_source(
+        &self,
+        receipt: &PublishedDestinationReceipt,
+        source: &Entry,
+    ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
+        receipt.validate_source_removal(source).map_err(|error| {
+            LocalSyncError::Source(
+                self.source_path(&source.path),
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        self.remove_source_entry_on_disk(source).await
+    }
+
+    /// Re-check source scan identity and unlink the non-directory source file.
+    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
         let path = self.source_path(&source.path);
         let Some(expected) = source.identity else {
             return Err(LocalSyncError::Source(
@@ -987,14 +1022,24 @@ impl LocalSyncExecutor {
         Ok(())
     }
 
-    /// --remove-source-files for parity-verified entries the planner marked
-    /// Skip::Unchanged: no transfer ran, but the destination holds the exact
-    /// verified bytes, so the source may move.
-    async fn remove_verified_parity_source(&self, source: &Entry) -> Result<()> {
+    /// --remove-source-files for parity-verified entries: requires a
+    /// VerifiedExistingDestinationReceipt (strong content verification).
+    /// Quick-check equality alone never authorizes removal.
+    async fn remove_verified_parity_source(
+        &self,
+        receipt: &VerifiedExistingDestinationReceipt,
+        source: &Entry,
+    ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
-        self.remove_committed_source(source).await
+        receipt.validate_source_removal(source).map_err(|error| {
+            LocalSyncError::Source(
+                self.source_path(&source.path),
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        self.remove_source_entry_on_disk(source).await
     }
 }
 
@@ -1058,9 +1103,10 @@ impl crate::remote::push_controller::SyncPlanExecutor for LocalSyncExecutor {
 
     async fn remove_verified_parity_source(
         &self,
+        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &Entry,
     ) -> std::result::Result<(), LocalSyncError> {
-        LocalSyncExecutor::remove_verified_parity_source(self, source).await
+        LocalSyncExecutor::remove_verified_parity_source(self, receipt, source).await
     }
 
     fn on_execute_error(

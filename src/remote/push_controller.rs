@@ -78,6 +78,7 @@ pub struct RemotePushPlan {
     operations: u64,
     delete: Option<DeletePlan>,
     execution_policy: RemotePushPolicy,
+    content_verified: bool,
 }
 
 impl RemotePushPlan {
@@ -286,6 +287,7 @@ where
         operations,
         delete,
         execution_policy,
+        content_verified: policy.mode == crate::engine::planner::ComparisonMode::Checksum,
     })
 }
 
@@ -409,6 +411,7 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
     fn remove_verified_parity_source(
         &self,
+        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &Entry,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
 
@@ -450,6 +453,7 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
             operations,
             delete,
             execution_policy,
+            content_verified,
         } = plan;
         let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
         let mut summary = RemotePushSummary {
@@ -462,10 +466,23 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
         while let Some(operation) = reader.next().await? {
             record_semantic_operation(&mut summary, &operation)?;
             if let Some(source) = removable_skip_source(&operation) {
-                self.executor
-                    .remove_verified_parity_source(source)
-                    .await
-                    .map_err(|error| self.executor.on_execute_error(&error))?;
+                if content_verified {
+                    let receipt =
+                        crate::endpoint::receipt::VerifiedExistingDestinationReceipt::new(
+                            source.path.clone(),
+                            source.identity,
+                            true,
+                        )
+                        .map_err(|error| {
+                            RemotePushControllerError::Worker(format!(
+                                "cannot verify destination receipt for source removal: {error}"
+                            ))
+                        })?;
+                    self.executor
+                        .remove_verified_parity_source(&receipt, source)
+                        .await
+                        .map_err(|error| self.executor.on_execute_error(&error))?;
+                }
                 continue;
             }
             let lowered = self
@@ -699,12 +716,13 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
         .ok_or(RemotePushControllerError::CounterOverflow(counter))
 }
 
-/// Under --remove-source-files, an entry the planner verified as unchanged
-/// (size/mtime parity, or content equality for checksum comparison) may move:
-/// the destination already holds the exact bytes. Skips for other reasons
-/// (--existing with a missing destination, --ignore-existing, --update with a
-/// newer destination, filtered entries) have no verified destination copy and
-/// must keep their source.
+/// Under --remove-source-files, an unchanged non-directory is a candidate for
+/// removal ONLY if the sync performed strong content verification (producing a
+/// `VerifiedExistingDestinationReceipt`). Quick-check parity alone NEVER
+/// authorizes source removal. Skips for other reasons (--existing with a
+/// missing destination, --ignore-existing, --update with a newer destination,
+/// filtered entries) have no verified destination copy and must keep their
+/// source.
 fn removable_skip_source(operation: &SyncOp) -> Option<&Entry> {
     match operation {
         SyncOp::Skip {
