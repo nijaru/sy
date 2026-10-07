@@ -1,232 +1,127 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
-use std::process::Command;
-use tempfile::TempDir;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::io::Cursor;
+use std::time::Duration;
+use sy::engine::rolling::WeakChecksum;
+use sy::transfer::delta::{match_delta, BasisBlock, BasisIndex, BasisIndexLimits, DeltaOp};
 
-fn create_sparse_file(path: &std::path::Path, size_mb: usize, modification_offset_mb: usize) {
-    let mut file = fs::File::create(path).unwrap();
+fn corpus(size: usize, mut seed: u64) -> Vec<u8> {
+    (0..size)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed.to_le_bytes()[0]
+        })
+        .collect()
+}
 
-    // Create sparse file by seeking
-    file.seek(SeekFrom::Start((size_mb * 1024 * 1024) as u64 - 1))
-        .unwrap();
-    file.write_all(&[0]).unwrap();
-    file.flush().unwrap();
+fn basis(bytes: &[u8], block_size: u32) -> BasisIndex {
+    BasisIndex::new(
+        block_size,
+        bytes
+            .chunks(block_size as usize)
+            .enumerate()
+            .map(|(index, chunk)| {
+                let mut strong = [0; 16];
+                strong.copy_from_slice(&blake3::hash(chunk).as_bytes()[..16]);
+                BasisBlock {
+                    index: index as u64,
+                    size: chunk.len() as u32,
+                    weak: WeakChecksum::hash(chunk),
+                    strong,
+                }
+            }),
+        BasisIndexLimits::default(),
+    )
+    .unwrap()
+}
 
-    // Write some data at the beginning
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(b"HEADER DATA AT START").unwrap();
-
-    // Write modification at specific offset (this will trigger delta sync)
-    file.seek(SeekFrom::Start(
-        (modification_offset_mb * 1024 * 1024) as u64,
-    ))
+fn verify_case(old: &[u8], source: &[u8], index: &BasisIndex) {
+    let mut reconstructed = Vec::new();
+    let summary = match_delta(Cursor::new(source), index, |op| {
+        match op {
+            DeltaOp::Copy {
+                basis_offset: offset,
+                len,
+            } => {
+                reconstructed
+                    .extend_from_slice(&old[offset as usize..offset as usize + len as usize]);
+            }
+            DeltaOp::Literal(bytes) => reconstructed.extend_from_slice(&bytes),
+        }
+        Ok(())
+    })
     .unwrap();
-    file.write_all(b"MODIFIED DATA HERE").unwrap();
-    file.flush().unwrap();
+    assert_eq!(reconstructed, source);
+    assert_eq!(summary.source_digest, *blake3::hash(source).as_bytes());
 }
 
-fn bench_delta_sync_small_change(c: &mut Criterion) {
-    let mut group = c.benchmark_group("delta_sync_small_change");
+// Measure the actual streaming SSH matcher, not local CLI copies (which use
+// native whole/sparse/reflink strategies). Signature creation is setup work.
+fn streaming_delta(c: &mut Criterion) {
+    let mut group = c.benchmark_group("streaming_delta");
     group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
 
-    for size_mb in [10, 50, 100].iter() {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}MB", size_mb)),
-            size_mb,
-            |b, &size_mb| {
-                b.iter(|| {
-                    let source = TempDir::new().unwrap();
-                    let dest = TempDir::new().unwrap();
-
-                    Command::new("git")
-                        .args(["init"])
-                        .current_dir(source.path())
-                        .output()
-                        .unwrap();
-
-                    // Create initial file
-                    create_sparse_file(&source.path().join("large.bin"), size_mb, 0);
-
-                    // First sync - full copy
-                    Command::new(env!("CARGO_BIN_EXE_sy"))
-                        .args([
-                            source.path().to_str().unwrap(),
-                            dest.path().to_str().unwrap(),
-                        ])
-                        .output()
-                        .unwrap();
-
-                    // Modify file slightly (1MB into the file)
-                    create_sparse_file(&source.path().join("large.bin"), size_mb, 1);
-
-                    // Second sync - should use delta sync
-                    let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                        .args([
-                            source.path().to_str().unwrap(),
-                            dest.path().to_str().unwrap(),
-                        ])
-                        .output()
-                        .unwrap();
-
-                    assert!(output.status.success());
-                    black_box(output);
-                });
-            },
-        );
+    for size in [1024 * 1024, 8 * 1024 * 1024] {
+        let old = corpus(size, 0x1234_5678);
+        let mut prepend = corpus(4096, 0xabcd_ef01);
+        prepend.extend_from_slice(&old);
+        let mut edits = old.clone();
+        for byte in edits.iter_mut().step_by(100) {
+            *byte ^= 0x5a;
+        }
+        let rewrite = corpus(size, 0x7654_3210);
+        for block_size in [4096, 64 * 1024, 1024 * 1024] {
+            let index = basis(&old, block_size);
+            for (case, source) in [
+                ("unchanged", old.as_slice()),
+                ("prepend", prepend.as_slice()),
+                ("one_percent_edits", edits.as_slice()),
+                ("rewrite", rewrite.as_slice()),
+            ] {
+                verify_case(&old, source, &index);
+                group.throughput(Throughput::Bytes(source.len() as u64));
+                group.bench_with_input(
+                    BenchmarkId::new(case, format!("{size}B-{block_size}block")),
+                    &source,
+                    |b, source| {
+                        b.iter(|| {
+                            black_box(
+                                match_delta(Cursor::new(black_box(*source)), &index, |op| {
+                                    black_box(op);
+                                    Ok(())
+                                })
+                                .unwrap(),
+                            );
+                        });
+                    },
+                );
+            }
+        }
     }
+
+    // These constant windows share the 16-bit rolling checksum at 64 KiB,
+    // but not the strong signature. This exposes overlapping-hash amplification.
+    let old = vec![0; 128 * 1024];
+    let source = vec![2; old.len()];
+    let index = basis(&old, 64 * 1024);
+    verify_case(&old, &source, &index);
+    group.throughput(Throughput::Bytes(source.len() as u64));
+    group.bench_function("weak_collision/128KiB-64KiBblock", |b| {
+        b.iter(|| {
+            black_box(
+                match_delta(Cursor::new(black_box(source.as_slice())), &index, |op| {
+                    black_box(op);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+        });
+    });
     group.finish();
 }
 
-fn bench_delta_sync_vs_full_copy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("delta_vs_full_50MB");
-    group.sample_size(10);
-
-    let size_mb = 50;
-
-    // Setup: Create modified file for delta sync
-    let source_delta = TempDir::new().unwrap();
-    let dest_delta = TempDir::new().unwrap();
-
-    Command::new("git")
-        .args(["init"])
-        .current_dir(source_delta.path())
-        .output()
-        .unwrap();
-
-    create_sparse_file(&source_delta.path().join("file.bin"), size_mb, 0);
-
-    // Initial sync
-    Command::new(env!("CARGO_BIN_EXE_sy"))
-        .args([
-            source_delta.path().to_str().unwrap(),
-            dest_delta.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    // Modify file
-    create_sparse_file(&source_delta.path().join("file.bin"), size_mb, 1);
-
-    // Benchmark delta sync (update)
-    group.bench_function("delta_sync", |b| {
-        b.iter(|| {
-            let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                .args([
-                    source_delta.path().to_str().unwrap(),
-                    dest_delta.path().to_str().unwrap(),
-                ])
-                .output()
-                .unwrap();
-
-            assert!(output.status.success());
-
-            // Restore original for next iteration
-            create_sparse_file(&source_delta.path().join("file.bin"), size_mb, 0);
-            Command::new(env!("CARGO_BIN_EXE_sy"))
-                .args([
-                    source_delta.path().to_str().unwrap(),
-                    dest_delta.path().to_str().unwrap(),
-                ])
-                .output()
-                .unwrap();
-            create_sparse_file(&source_delta.path().join("file.bin"), size_mb, 1);
-
-            black_box(output);
-        });
-    });
-
-    // Setup for full copy benchmark
-    let source_full = TempDir::new().unwrap();
-    Command::new("git")
-        .args(["init"])
-        .current_dir(source_full.path())
-        .output()
-        .unwrap();
-    create_sparse_file(&source_full.path().join("file.bin"), size_mb, 1);
-
-    // Benchmark full copy (create)
-    group.bench_function("full_copy", |b| {
-        b.iter(|| {
-            let dest = TempDir::new().unwrap();
-            let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                .args([
-                    source_full.path().to_str().unwrap(),
-                    dest.path().to_str().unwrap(),
-                ])
-                .output()
-                .unwrap();
-
-            assert!(output.status.success());
-            black_box(output);
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_delta_sync_large_file(c: &mut Criterion) {
-    let mut group = c.benchmark_group("delta_sync_1GB");
-    group.sample_size(10);
-
-    group.bench_function("1GB_file_small_change", |b| {
-        let source = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-
-        Command::new("git")
-            .args(["init"])
-            .current_dir(source.path())
-            .output()
-            .unwrap();
-
-        // Create 1GB sparse file
-        create_sparse_file(&source.path().join("huge.bin"), 1024, 0);
-
-        // Initial sync
-        Command::new(env!("CARGO_BIN_EXE_sy"))
-            .args([
-                source.path().to_str().unwrap(),
-                dest.path().to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-
-        // Modify file at 100MB offset
-        create_sparse_file(&source.path().join("huge.bin"), 1024, 100);
-
-        b.iter(|| {
-            let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                .args([
-                    source.path().to_str().unwrap(),
-                    dest.path().to_str().unwrap(),
-                ])
-                .output()
-                .unwrap();
-
-            assert!(output.status.success());
-
-            // Restore for next iteration
-            create_sparse_file(&source.path().join("huge.bin"), 1024, 0);
-            Command::new(env!("CARGO_BIN_EXE_sy"))
-                .args([
-                    source.path().to_str().unwrap(),
-                    dest.path().to_str().unwrap(),
-                ])
-                .output()
-                .unwrap();
-            create_sparse_file(&source.path().join("huge.bin"), 1024, 100);
-
-            black_box(output);
-        });
-    });
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_delta_sync_small_change,
-    bench_delta_sync_vs_full_copy,
-    bench_delta_sync_large_file
-);
+criterion_group!(benches, streaming_delta);
 criterion_main!(benches);
