@@ -560,13 +560,11 @@ impl Cli {
     }
 
     /// Check if permissions should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for permission preservation (planned feature)
     pub fn should_preserve_permissions(&self) -> bool {
         self.archive || self.preserve_permissions
     }
 
     /// Check if modification times should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for time preservation (planned feature)
     pub fn should_preserve_times(&self) -> bool {
         self.archive || self.preserve_times
     }

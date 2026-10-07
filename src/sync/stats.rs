@@ -26,16 +26,6 @@ pub struct SyncStats {
     pub errors: Vec<SyncError>,
 }
 
-impl SyncStats {
-    #[allow(dead_code)]
-    pub fn new(scanned: u64) -> Self {
-        Self {
-            files_scanned: scanned,
-            ..Default::default()
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SyncError {
     pub path: PathBuf,
