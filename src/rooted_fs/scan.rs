@@ -6,7 +6,7 @@ use crate::engine::scan::ScanRequest;
 use crate::engine::scan_sort::{read_name, NameSpool, SortBudget};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
@@ -137,19 +137,26 @@ impl Continuations {
 
     fn write(&mut self, depth: usize, frame: Continuation) -> io::Result<()> {
         self.0.seek(SeekFrom::Start(frame_offset(depth)?))?;
-        for value in [frame.run, frame.offset, frame.device, frame.inode] {
-            self.0.write_all(&value.to_le_bytes())?;
+        let mut record = [0; CONTINUATION_BYTES as usize];
+        for (field, value) in record.as_chunks_mut::<8>().0.iter_mut().zip([
+            frame.run,
+            frame.offset,
+            frame.device,
+            frame.inode,
+        ]) {
+            *field = value.to_le_bytes();
         }
+        self.0.write_all(&record)?;
         Ok(())
     }
 
     fn read(&mut self, depth: usize) -> io::Result<Continuation> {
         self.0.seek(SeekFrom::Start(frame_offset(depth)?))?;
+        let mut record = [0; CONTINUATION_BYTES as usize];
+        self.0.read_exact(&mut record)?;
         let mut values = [0; 4];
-        for value in &mut values {
-            let mut bytes = [0; 8];
-            self.0.read_exact(&mut bytes)?;
-            *value = u64::from_le_bytes(bytes);
+        for (field, value) in record.as_chunks::<8>().0.iter().zip(&mut values) {
+            *value = u64::from_le_bytes(*field);
         }
         Ok(Continuation {
             run: values[0],
@@ -330,9 +337,11 @@ fn walk_tree(
     stack
         .write(depth, frame)
         .map_err(RootedScanError::Scratch)?;
-    let mut names = spool
-        .open(frame.run, frame.offset)
-        .map_err(RootedScanError::Scratch)?;
+    let mut names = BufReader::new(
+        spool
+            .open(frame.run, frame.offset)
+            .map_err(RootedScanError::Scratch)?,
+    );
 
     while !sender.is_closed() {
         let Some(name) = read_name(&mut names).map_err(RootedScanError::Scratch)? else {
@@ -352,9 +361,11 @@ fn walk_tree(
             drop(directory);
             directory = reopen_directory(rooted, &path, &mut stack)?;
             frame = stack.read(depth).map_err(RootedScanError::Scratch)?;
-            names = spool
-                .open(frame.run, frame.offset)
-                .map_err(RootedScanError::Scratch)?;
+            names = BufReader::new(
+                spool
+                    .open(frame.run, frame.offset)
+                    .map_err(RootedScanError::Scratch)?,
+            );
             continue;
         };
         if !request.include_git_dir && name.as_bytes() == b".git" {
@@ -387,7 +398,7 @@ fn walk_tree(
                 stack
                     .write(depth, frame)
                     .map_err(RootedScanError::Scratch)?;
-                names = spool.open(frame.run, 0).map_err(RootedScanError::Scratch)?;
+                names = BufReader::new(spool.open(frame.run, 0).map_err(RootedScanError::Scratch)?);
             }
         }
     }
