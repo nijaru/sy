@@ -26,8 +26,6 @@ exclude = [
 [features]
 default = ["ssh"]
 acl = ["exacl"]
-s3 = ["object_store"]
-gcs = ["object_store"]
 ssh = []
 watch = ["dep:notify"]
 
@@ -67,7 +65,6 @@ thiserror = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 blake3 = "1"
 hex = "0.4"
-base64 = "0.22"
 
 # Compression
 zstd = "0.13"  # Level 3: 8.7 GB/s, best ratio
@@ -81,9 +78,6 @@ num_cpus = "1.16"  # CPU count detection for parallel scanning
 # embedded SSH stack is linked)
 dirs = "5"
 futures = "0.3.31"
-
-# Object storage (optional): object_store is a pure-Rust stack.
-object_store = { version = "0.14.1", features = ["aws", "gcp"], optional = true }
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
 bitflags = "2.10.0"
@@ -106,7 +100,6 @@ windows-sys = { version = "0.52", features = [
 criterion = "0.5"
 tempfile = "3"
 proptest = "1"
-serial_test = "3.0"
 
 [[bench]]
 name = "sync_bench"
