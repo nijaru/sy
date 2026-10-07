@@ -13,6 +13,7 @@
 
 use crate::endpoint::{io::Preservation, Capabilities};
 use crate::engine::compression::CompressionPolicy;
+use crate::engine::work::TransferSummary;
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolVersion, StreamId, WireAcl, WireAclResult,
     WireData, WireFileEnd, WireFileFetchRequest, WireXattr, WireXattrResult, PROTOCOL_V3_2,
@@ -21,7 +22,7 @@ use crate::remote::path::{decode_relative_path, ensure_compatible_path_encoding}
 use crate::remote::router::{IncomingStream, RouterSender, StreamInbox};
 use crate::rooted_fs::RootedFs;
 
-use crate::remote::transfer::{RemoteTransferError, TransferSummary, PRODUCER_QUEUE_DEPTH};
+use crate::remote::transfer::{RemoteTransferError, PRODUCER_QUEUE_DEPTH};
 use bytes::Bytes;
 use std::ffi::OsString;
 use std::sync::Arc;

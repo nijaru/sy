@@ -14,6 +14,7 @@
 use crate::endpoint::receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
@@ -428,7 +429,7 @@ impl LocalSyncExecutor {
     async fn execute(
         &self,
         item: WorkItem<LocalSyncAction>,
-    ) -> Result<Option<crate::remote::transfer::TransferSummary>> {
+    ) -> Result<Option<crate::engine::work::TransferSummary>> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
@@ -574,7 +575,7 @@ impl LocalSyncExecutor {
         destination: Option<Entry>,
         metadata: LocalTransferMetadata,
         group: [u8; 32],
-    ) -> Result<crate::remote::transfer::TransferSummary> {
+    ) -> Result<crate::engine::work::TransferSummary> {
         let mut groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(&group).cloned() {
             self.check_source_identity(&source).await?;
@@ -597,7 +598,7 @@ impl LocalSyncExecutor {
                 crate::sync::output::ItemizeOp::Create
             };
             self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-            return Ok(crate::remote::transfer::TransferSummary {
+            return Ok(crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
                 literal_bytes: 0,
@@ -693,7 +694,7 @@ impl LocalSyncExecutor {
         preservation_request: crate::endpoint::io::PreservationRequest,
         pending_finalization: bool,
     ) -> Result<(
-        crate::remote::transfer::TransferSummary,
+        crate::engine::work::TransferSummary,
         PublishedDestinationReceipt,
     )> {
         let backup = self.backup && destination.as_ref().is_some_and(|entry| entry.is_file());
@@ -763,7 +764,7 @@ impl LocalSyncExecutor {
         // path; the summary carries byte accounting for the controller's
         // counters.
         Ok((
-            crate::remote::transfer::TransferSummary {
+            crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
                 literal_bytes: result.bytes_written,
@@ -1037,47 +1038,26 @@ impl LocalSyncExecutor {
     }
 }
 
-impl crate::remote::push_controller::SyncPlanExecutor for LocalSyncExecutor {
+impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
     type Action = LocalSyncAction;
     type Error = LocalSyncError;
 
     fn lower(
         &self,
         op: crate::engine::domain::SyncOp,
-        policy: crate::remote::push::RemotePushPolicy,
-    ) -> std::result::Result<
-        crate::remote::push_controller::LoweredSyncWork<LocalSyncAction>,
-        LocalSyncError,
-    > {
-        let lowered = lower_local_op(
-            op,
-            LocalLowerPolicy {
-                preserve_permissions: policy.preserve_permissions,
-                preserve_times: policy.preserve_times,
-            },
-        )?;
-        Ok(crate::remote::push_controller::LoweredSyncWork {
-            main: lowered.main,
-            finalize: lowered.finalize,
-        })
+        policy: crate::engine::planner::ExecutionPolicy,
+    ) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
+        lower_local_op(op, policy)
     }
 
     fn is_directory_action(&self, action: &LocalSyncAction) -> bool {
         matches!(action, LocalSyncAction::CreateDirectory { .. })
     }
 
-    fn is_leaf_action(&self, _action: &LocalSyncAction) -> bool {
-        true
-    }
-
-    fn leaf_resources(&self, action: &LocalSyncAction) -> ResourceRequest {
-        action_resources(action)
-    }
-
     async fn execute(
         &self,
         item: WorkItem<LocalSyncAction>,
-    ) -> std::result::Result<Option<crate::remote::transfer::TransferSummary>, LocalSyncError> {
+    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, LocalSyncError> {
         LocalSyncExecutor::execute(self, item).await
     }
 
@@ -1101,13 +1081,6 @@ impl crate::remote::push_controller::SyncPlanExecutor for LocalSyncExecutor {
         source: &Entry,
     ) -> std::result::Result<(), LocalSyncError> {
         LocalSyncExecutor::remove_verified_parity_source(self, receipt, source).await
-    }
-
-    fn on_execute_error(
-        &self,
-        error: &LocalSyncError,
-    ) -> crate::remote::push_controller::RemotePushControllerError {
-        crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
     }
 }
 
@@ -1187,8 +1160,8 @@ pub fn action_resources(action: &LocalSyncAction) -> ResourceRequest {
 /// replacement is a separate design).
 pub fn lower_local_op(
     op: crate::engine::domain::SyncOp,
-    policy: LocalLowerPolicy,
-) -> std::result::Result<LoweredLocal, LocalSyncError> {
+    policy: ExecutionPolicy,
+) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     use crate::engine::domain::SyncOp;
 
     match op {
@@ -1205,39 +1178,20 @@ pub fn lower_local_op(
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(LoweredLocal::default()),
+        SyncOp::Skip { .. } => Ok(None),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalLowerPolicy {
-    pub preserve_permissions: bool,
-    pub preserve_times: bool,
-}
-
-/// Metadata a lowered action should apply: permission and/or mtime drift,
-/// both optional (None = not requested or already equal).
 pub type RequestedMetadata = Option<(Option<u32>, Option<Timestamp>)>;
-
-#[derive(Debug, Default)]
-pub struct LoweredLocal {
-    pub main: Option<WorkItem<LocalSyncAction>>,
-    pub finalize: Option<WorkItem<LocalSyncAction>>,
-}
 
 fn lower_create(
     source: Entry,
-    policy: LocalLowerPolicy,
-) -> std::result::Result<LoweredLocal, LocalSyncError> {
+    policy: ExecutionPolicy,
+) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     match source.kind {
-        EntryKind::Directory => {
-            let finalize = requested_metadata(&source, None, policy, true)?
-                .map(|(unix_mode, modified)| metadata_work(source.clone(), unix_mode, modified));
-            Ok(LoweredLocal {
-                main: Some(mutation_work(LocalSyncAction::CreateDirectory { source })),
-                finalize,
-            })
-        }
+        EntryKind::Directory => Ok(Some(mutation_work(LocalSyncAction::CreateDirectory {
+            source,
+        }))),
         EntryKind::File => {
             // Staged files are private at 0600, so a committed file always
             // needs an explicit final mode; the source's scanned mode is the
@@ -1249,30 +1203,24 @@ fn lower_create(
                 unix_mode: Some(mode),
                 modified: Some(source.modified),
             };
-            Ok(LoweredLocal {
-                main: Some(file_work(LocalSyncAction::TransferFile {
-                    source,
-                    destination: None,
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredLocal {
-            main: Some(mutation_work(LocalSyncAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                destination: None,
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_update(
     source: Entry,
     destination: Entry,
-    policy: LocalLowerPolicy,
-) -> std::result::Result<LoweredLocal, LocalSyncError> {
+    policy: ExecutionPolicy,
+) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     match source.kind {
         EntryKind::File => {
             let mode = if policy.preserve_permissions {
@@ -1287,31 +1235,25 @@ fn lower_update(
                 unix_mode: Some(mode),
                 modified: Some(source.modified),
             };
-            Ok(LoweredLocal {
-                main: Some(file_work(LocalSyncAction::TransferFile {
-                    source,
-                    destination: Some(destination),
-                    metadata,
-                })),
-                finalize: None,
-            })
+            Ok(Some(file_work(LocalSyncAction::TransferFile {
+                source,
+                destination: Some(destination),
+                metadata,
+            })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
-        EntryKind::Symlink => Ok(LoweredLocal {
-            main: Some(mutation_work(LocalSyncAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
-                source,
-            })),
-            finalize: None,
-        }),
+        EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_replace(
     source: Entry,
     destination: Entry,
-    policy: LocalLowerPolicy,
-) -> std::result::Result<LoweredLocal, LocalSyncError> {
+    policy: ExecutionPolicy,
+) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     match source.kind {
         EntryKind::Directory => Err(LocalSyncError::Destination(
             source.path.as_path().to_path_buf(),
@@ -1325,59 +1267,39 @@ fn lower_replace(
                 unix_mode: Some(mode),
                 modified: Some(source.modified),
             };
-            Ok(LoweredLocal {
-                main: Some(file_work(LocalSyncAction::TransferFile {
-                    source,
-                    destination: Some(destination),
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredLocal {
-            main: Some(mutation_work(LocalSyncAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                destination: Some(destination),
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_metadata(
     source: Entry,
     destination: Entry,
-    policy: LocalLowerPolicy,
-) -> std::result::Result<LoweredLocal, LocalSyncError> {
-    let Some((unix_mode, modified)) =
-        requested_metadata(&source, Some(&destination), policy, false)?
-    else {
-        return Ok(LoweredLocal::default());
-    };
-    let work = metadata_work(source.clone(), unix_mode, modified);
+    policy: ExecutionPolicy,
+) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     if source.is_directory() {
-        Ok(LoweredLocal {
-            main: None,
-            finalize: Some(work),
-        })
-    } else {
-        Ok(LoweredLocal {
-            main: Some(work),
-            finalize: None,
-        })
+        return Ok(None);
     }
+    let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
+        return Ok(None);
+    };
+    Ok(Some(metadata_work(source, unix_mode, modified)))
 }
 
 fn requested_metadata(
     source: &Entry,
-    destination: Option<&Entry>,
-    policy: LocalLowerPolicy,
-    include_requested_even_if_unknown_destination: bool,
+    destination: &Entry,
+    policy: ExecutionPolicy,
 ) -> std::result::Result<RequestedMetadata, LocalSyncError> {
-    let unix_mode = if policy.preserve_permissions
-        && (include_requested_even_if_unknown_destination
-            || destination.is_some_and(|entry| entry.unix_mode != source.unix_mode))
-    {
+    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
         Some(source.unix_mode.ok_or_else(|| {
             LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)
@@ -1387,8 +1309,8 @@ fn requested_metadata(
     let modified = policy
         .preserve_times
         .then_some(source.modified)
-        .filter(|_| destination.is_none_or(|entry| entry.modified != source.modified));
-    Ok(Some((unix_mode, modified)))
+        .filter(|_| destination.modified != source.modified);
+    Ok((unix_mode.is_some() || modified.is_some()).then_some((unix_mode, modified)))
 }
 
 fn file_work(action: LocalSyncAction) -> WorkItem<LocalSyncAction> {

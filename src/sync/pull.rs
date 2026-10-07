@@ -14,13 +14,11 @@ use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
+use sy::engine::controller::{preflight_sync_scoped, preview_sync, SyncController, SyncSummary};
 use sy::engine::scan::ScanRequest;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::pull::RemotePullExecutor;
-use sy::remote::push_controller::{
-    preflight_remote_push_scoped, preview_remote_push, RemotePushController, RemotePushSummary,
-};
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
@@ -137,7 +135,7 @@ async fn execute_with_handle(
     // The remote source walk is no-follow under root confinement, so no
     // follow selection exists; symlinks reconcile by target. Delete stays
     // disabled on v3 pull until the server-side ignore-scope design lands.
-    let plan = preflight_remote_push_scoped(
+    let plan = preflight_sync_scoped(
         source,
         destination,
         comparison_policy(
@@ -153,7 +151,7 @@ async fn execute_with_handle(
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
-        let preview = preview_remote_push(plan, |item| {
+        let preview = preview_sync(plan, |item| {
             if diff_mode {
                 emit_diff_line(item);
             }
@@ -194,7 +192,7 @@ async fn execute_with_handle(
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
-    let summary: RemotePushSummary = RemotePushController::new(executor, max_in_flight)
+    let summary: SyncSummary = SyncController::new(executor, max_in_flight)
         .execute(plan)
         .await
         .map_err(map_controller_error)?;

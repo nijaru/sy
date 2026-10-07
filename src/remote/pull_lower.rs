@@ -7,17 +7,15 @@
 //! direction-neutral.
 
 use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::ResourceRequest;
 use crate::engine::work::WorkItem;
 use crate::remote::pull::{PullTransferMetadata, RemotePullAction, RemotePullError, Result};
 
-#[derive(Debug, Default)]
-pub struct LoweredPull {
-    pub main: Option<WorkItem<RemotePullAction>>,
-    pub finalize: Option<WorkItem<RemotePullAction>>,
-}
-
-pub fn lower_pull_op(op: SyncOp, policy: PullLowerPolicy) -> Result<LoweredPull> {
+pub fn lower_pull_op(
+    op: SyncOp,
+    policy: ExecutionPolicy,
+) -> Result<Option<WorkItem<RemotePullAction>>> {
     match op {
         SyncOp::Create { source } => lower_create(source, policy),
         SyncOp::Update {
@@ -32,26 +30,18 @@ pub fn lower_pull_op(op: SyncOp, policy: PullLowerPolicy) -> Result<LoweredPull>
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(LoweredPull::default()),
+        SyncOp::Skip { .. } => Ok(None),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PullLowerPolicy {
-    pub preserve_permissions: bool,
-    pub preserve_times: bool,
-}
-
-fn lower_create(source: Entry, policy: PullLowerPolicy) -> Result<LoweredPull> {
+fn lower_create(
+    source: Entry,
+    policy: ExecutionPolicy,
+) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
-        EntryKind::Directory => {
-            let finalize = requested_metadata(&source, None, policy, true)?
-                .map(|(unix_mode, modified)| metadata_work(source.clone(), unix_mode, modified));
-            Ok(LoweredPull {
-                main: Some(mutation_work(RemotePullAction::CreateDirectory { source })),
-                finalize,
-            })
-        }
+        EntryKind::Directory => Ok(Some(mutation_work(RemotePullAction::CreateDirectory {
+            source,
+        }))),
         EntryKind::File => {
             // Staging is private at 0600, so a committed file always needs an
             // explicit final mode; the source's scanned mode is the create
@@ -63,26 +53,24 @@ fn lower_create(source: Entry, policy: PullLowerPolicy) -> Result<LoweredPull> {
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(LoweredPull {
-                main: Some(file_work(RemotePullAction::FetchFile {
-                    source,
-                    destination: None,
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredPull {
-            main: Some(mutation_work(RemotePullAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(RemotePullAction::FetchFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                destination: None,
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
-fn lower_update(source: Entry, destination: Entry, policy: PullLowerPolicy) -> Result<LoweredPull> {
+fn lower_update(
+    source: Entry,
+    destination: Entry,
+    policy: ExecutionPolicy,
+) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
         EntryKind::File => {
             let mode = if policy.preserve_permissions {
@@ -97,31 +85,25 @@ fn lower_update(source: Entry, destination: Entry, policy: PullLowerPolicy) -> R
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(LoweredPull {
-                main: Some(file_work(RemotePullAction::FetchFile {
-                    source,
-                    destination: Some(destination),
-                    metadata,
-                })),
-                finalize: None,
-            })
+            Ok(Some(file_work(RemotePullAction::FetchFile {
+                source,
+                destination: Some(destination),
+                metadata,
+            })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
-        EntryKind::Symlink => Ok(LoweredPull {
-            main: Some(mutation_work(RemotePullAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
-                source,
-            })),
-            finalize: None,
-        }),
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_replace(
     source: Entry,
     _destination: Entry,
-    policy: PullLowerPolicy,
-) -> Result<LoweredPull> {
+    policy: ExecutionPolicy,
+) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
         EntryKind::Directory => Err(RemotePullError::TransactionalDirectoryReplace(
             source.path.as_path().to_path_buf(),
@@ -134,59 +116,39 @@ fn lower_replace(
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(LoweredPull {
-                main: Some(file_work(RemotePullAction::FetchFile {
-                    source,
-                    destination: None,
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredPull {
-            main: Some(mutation_work(RemotePullAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(RemotePullAction::FetchFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                destination: None,
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_metadata(
     source: Entry,
     destination: Entry,
-    policy: PullLowerPolicy,
-) -> Result<LoweredPull> {
-    let Some((unix_mode, modified)) =
-        requested_metadata(&source, Some(&destination), policy, false)?
-    else {
-        return Ok(LoweredPull::default());
-    };
-    let work = metadata_work(source.clone(), unix_mode, modified);
+    policy: ExecutionPolicy,
+) -> Result<Option<WorkItem<RemotePullAction>>> {
     if source.is_directory() {
-        Ok(LoweredPull {
-            main: None,
-            finalize: Some(work),
-        })
-    } else {
-        Ok(LoweredPull {
-            main: Some(work),
-            finalize: None,
-        })
+        return Ok(None);
     }
+    let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
+        return Ok(None);
+    };
+    Ok(Some(metadata_work(source, unix_mode, modified)))
 }
 
 fn requested_metadata(
     source: &Entry,
-    destination: Option<&Entry>,
-    policy: PullLowerPolicy,
-    include_requested_even_if_unknown_destination: bool,
+    destination: &Entry,
+    policy: ExecutionPolicy,
 ) -> Result<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions
-        && (include_requested_even_if_unknown_destination
-            || destination.is_some_and(|entry| entry.unix_mode != source.unix_mode))
-    {
+    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePullError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)
@@ -196,8 +158,8 @@ fn requested_metadata(
     let modified = policy
         .preserve_times
         .then_some(source.modified)
-        .filter(|_| destination.is_none_or(|entry| entry.modified != source.modified));
-    Ok(Some((unix_mode, modified)))
+        .filter(|_| destination.modified != source.modified);
+    Ok((unix_mode.is_some() || modified.is_some()).then_some((unix_mode, modified)))
 }
 
 pub fn action_resources(action: &RemotePullAction) -> crate::engine::scheduler::ResourceRequest {

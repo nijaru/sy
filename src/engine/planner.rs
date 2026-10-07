@@ -28,6 +28,13 @@ pub struct ComparisonPolicy {
     pub namespace_semantics: NamespaceSemantics,
 }
 
+/// Preservation policy attached to a completed semantic plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionPolicy {
+    pub preserve_permissions: bool,
+    pub preserve_times: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanDecision {
     Ready(SyncOp),

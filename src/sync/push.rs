@@ -7,15 +7,14 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 use sy::endpoint::local_entry_scan::local_entry_stream;
+use sy::engine::controller::{
+    preflight_sync_scoped, preflight_sync_scoped_with_content, preview_sync, SyncController,
+};
 use sy::engine::namespace::NamespaceSemantics;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::hash::{hash_rooted_file, RemoteHashError};
 use sy::remote::push::{RemoteBackupPlan, RemotePushExecutor};
-use sy::remote::push_controller::{
-    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content, preview_remote_push,
-    RemotePushController,
-};
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
@@ -114,7 +113,7 @@ async fn execute_with_handle(
             .await
             .map_err(map_io)?;
         let hash_remote = remote.clone();
-        preflight_remote_push_scoped_with_content(
+        preflight_sync_scoped_with_content(
             source,
             destination,
             comparison_policy(config, namespace_semantics),
@@ -152,7 +151,7 @@ async fn execute_with_handle(
         .await
         .map_err(map_controller_error)?
     } else {
-        preflight_remote_push_scoped(
+        preflight_sync_scoped(
             source,
             destination,
             comparison_policy(config, namespace_semantics),
@@ -174,7 +173,7 @@ async fn execute_with_handle(
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
-        let preview = preview_remote_push(plan, |item| {
+        let preview = preview_sync(plan, |item| {
             if diff_mode {
                 emit_diff_line(item);
             }
@@ -235,7 +234,7 @@ async fn execute_with_handle(
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
-    let summary = RemotePushController::new(executor, max_in_flight)
+    let summary = SyncController::new(executor, max_in_flight)
         .execute(plan)
         .await
         .map_err(map_controller_error)?;
@@ -268,11 +267,11 @@ mod tests {
     use crate::sync::DeleteMode;
     use futures::stream;
     use std::path::PathBuf;
+    use sy::engine::controller::{preflight_sync, ControllerError};
     use sy::engine::delete_plan::{DeleteLimit, DeletePolicy};
     use sy::engine::domain::{Entry, RelativePath, Timestamp};
     use sy::engine::planner::ComparisonPolicy;
     use sy::engine::reconcile::{BoxError, EngineError, EntryStream, Side};
-    use sy::remote::push_controller::{preflight_remote_push, RemotePushControllerError};
     use sy::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
     use tempfile::TempDir;
 
@@ -1075,7 +1074,7 @@ mod tests {
         )]));
         let delete_filter = filter.clone();
 
-        let result = preflight_remote_push(
+        let result = preflight_sync(
             filtered_source_stream(source, filter),
             destination,
             ComparisonPolicy::default(),
@@ -1089,12 +1088,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(RemotePushControllerError::Reconcile(
-                EngineError::Endpoint {
-                    side: Side::Source,
-                    ..
-                }
-            ))
+            Err(ControllerError::Reconcile(EngineError::Endpoint {
+                side: Side::Source,
+                ..
+            }))
         ));
     }
 

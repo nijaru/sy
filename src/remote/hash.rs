@@ -374,3 +374,9 @@ mod tests {
         ));
     }
 }
+
+impl From<RemoteHashError> for crate::engine::controller::ControllerError {
+    fn from(error: RemoteHashError) -> Self {
+        Self::backend("content comparison", error)
+    }
+}

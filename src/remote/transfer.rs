@@ -1,5 +1,6 @@
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::BoxError;
+use crate::engine::work::TransferSummary;
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireData, WireDeltaCopy,
     WireFileBasis, WireFileBegin, WireFileEnd, MAX_TRANSFER_DATA_SIZE,
@@ -68,14 +69,6 @@ fn read_transfer_preservation(
         .transpose()?
         .map(|acl| acl.unwrap_or_default());
     Ok(CapturedTransferPreservation { xattrs, acls })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransferSummary {
-    pub file_size: u64,
-    pub digest: [u8; 32],
-    pub literal_bytes: u64,
-    pub reused_bytes: u64,
 }
 
 #[derive(Debug, thiserror::Error)]

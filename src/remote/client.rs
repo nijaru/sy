@@ -9,6 +9,7 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
+use crate::engine::work::TransferSummary;
 use crate::protocol::{FrameKind, Operation, PlatformOs, ProtocolVersion};
 use crate::remote::hash::{request_content_hash, require_blake3};
 use crate::remote::router::RouterSender;
@@ -19,7 +20,7 @@ use crate::remote::signature::{
 };
 use crate::remote::transfer::{
     request_file_transfer, request_file_transfer_with_stream_policy, TransferDestination,
-    TransferMetadata, TransferPreservationRequest, TransferStreamPolicy, TransferSummary,
+    TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
 };
 use crate::remote::xattr::{request_read_xattrs, request_write_xattrs};
 use crate::transfer::delta::{
