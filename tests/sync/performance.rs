@@ -451,7 +451,12 @@ fn perf_regression_gitignore_filtering() {
     // Note: .sy-dir-cache.json is not created by default (requires --use-cache=true)
     let synced_files = fs::read_dir(dest.path())
         .unwrap()
-        .filter(|e| e.as_ref().unwrap().path().is_file())
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            s != ".DS_Store" && !s.starts_with("._") && e.path().is_file()
+        })
         .count();
     assert_eq!(
         synced_files, 51,

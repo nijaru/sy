@@ -1086,7 +1086,21 @@ fn test_concurrent_sync_safety() {
         b"content2"
     );
     // Aborted transfers leave no staging leftovers.
-    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 2);
+    let entries: Vec<_> = fs::read_dir(dest.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .filter(|name| {
+            let s = name.to_string_lossy();
+            s != ".DS_Store" && !s.starts_with("._")
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "unexpected destination entries (e.g. staging leftovers): {:?}",
+        entries
+    );
 }
 
 #[test]

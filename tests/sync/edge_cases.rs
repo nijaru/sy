@@ -645,7 +645,21 @@ fn test_type_transition_with_directory_is_refused_before_mutation() {
         fs::read_to_string(dest.path().join("swap")).unwrap(),
         "keep me"
     );
-    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 1);
+    let entries: Vec<_> = fs::read_dir(dest.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .filter(|name| {
+            let s = name.to_string_lossy();
+            s != ".DS_Store" && !s.starts_with("._")
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "unexpected destination entries: {:?}",
+        entries
+    );
 }
 
 #[test]
