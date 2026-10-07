@@ -1,5 +1,5 @@
 use super::delete_journal::{DeleteJournal, DeleteJournalReader, DeleteKind};
-use super::domain::{Entry, EntryIdentity, InvalidRelativePath, RelativePath};
+use super::domain::{Entry, EntryIdentity, EntryKind, InvalidRelativePath, RelativePath};
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub struct DeletePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteAction {
     pub path: RelativePath,
-    pub is_directory: bool,
+    pub kind: EntryKind,
     pub identity: Option<EntryIdentity>,
 }
 
@@ -220,18 +220,18 @@ impl DeleteTracker {
     }
 
     async fn append_candidate(&mut self, entry: &Entry) -> Result<()> {
+        self.journal
+            .append(
+                entry.path.as_path(),
+                DeleteKind::Entry(entry.kind),
+                entry.identity,
+            )
+            .await?;
         if entry.is_directory() {
-            self.journal
-                .append(entry.path.as_path(), DeleteKind::Directory, entry.identity)
-                .await?;
             self.candidate_directories.push(CandidateDirectory {
                 path: entry.path.clone(),
                 protected: false,
             });
-        } else {
-            self.journal
-                .append(entry.path.as_path(), DeleteKind::FileLike, entry.identity)
-                .await?;
         }
         Ok(())
     }
@@ -295,25 +295,20 @@ impl DeleteReplay {
                         self.protected_directories.push(path);
                     }
                 }
-                DeleteKind::Directory => {
-                    if let Some(index) = self
-                        .protected_directories
-                        .iter()
-                        .rposition(|item| item == &path)
-                    {
-                        self.protected_directories.swap_remove(index);
-                        continue;
+                DeleteKind::Entry(kind) => {
+                    if kind == EntryKind::Directory {
+                        if let Some(index) = self
+                            .protected_directories
+                            .iter()
+                            .rposition(|item| item == &path)
+                        {
+                            self.protected_directories.swap_remove(index);
+                            continue;
+                        }
                     }
                     return Ok(Some(DeleteAction {
                         path,
-                        is_directory: true,
-                        identity: record.identity,
-                    }));
-                }
-                DeleteKind::FileLike => {
-                    return Ok(Some(DeleteAction {
-                        path,
-                        is_directory: false,
+                        kind,
                         identity: record.identity,
                     }));
                 }
@@ -380,7 +375,7 @@ mod tests {
             replay.next_action().await.unwrap(),
             Some(DeleteAction {
                 path: path("parent/file"),
-                is_directory: false,
+                kind: EntryKind::File,
                 identity: None,
             })
         );
@@ -388,7 +383,7 @@ mod tests {
             replay.next_action().await.unwrap(),
             Some(DeleteAction {
                 path: path("parent"),
-                is_directory: true,
+                kind: EntryKind::Directory,
                 identity: None,
             })
         );
@@ -396,25 +391,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_entry_identity_into_delete_action() {
-        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
-        let mut test_file = file("target");
-        let id = EntryIdentity::from_bytes([99; 32]);
-        test_file.identity = Some(id);
-        tracker
-            .observe_destination_only(&test_file, true)
-            .await
-            .unwrap();
-        let plan = tracker.finish().await.unwrap();
-        let mut replay = plan.into_replay();
-        assert_eq!(
-            replay.next_action().await.unwrap(),
-            Some(DeleteAction {
-                path: path("target"),
-                is_directory: false,
-                identity: Some(id),
-            })
-        );
+    async fn preserves_entry_kind_and_identity_into_delete_action() {
+        for kind in [EntryKind::File, EntryKind::Directory, EntryKind::Symlink] {
+            let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+            let mut entry = file("target");
+            let id = EntryIdentity::from_bytes([99; 32]);
+            entry.kind = kind;
+            entry.identity = Some(id);
+            tracker
+                .observe_destination_only(&entry, true)
+                .await
+                .unwrap();
+            let mut replay = tracker.finish().await.unwrap().into_replay();
+            assert_eq!(
+                replay.next_action().await.unwrap(),
+                Some(DeleteAction {
+                    path: path("target"),
+                    kind,
+                    identity: Some(id),
+                })
+            );
+            assert_eq!(replay.next_action().await.unwrap(), None);
+        }
     }
 
     #[tokio::test]

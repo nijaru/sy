@@ -57,6 +57,9 @@ pub enum RemotePullError {
     #[error("local destination mutation failed for {0}: {1}")]
     LocalMutation(PathBuf, std::io::Error),
 
+    #[error(transparent)]
+    DeleteBackup(#[from] crate::rooted_fs::RootedFsError),
+
     #[error("regular-file pull requires Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
 
@@ -735,33 +738,25 @@ impl RemotePullExecutor {
             })
             .await?;
         let path = self.dest_path(&action.path);
-        if self.backup_enabled() && !action.is_directory {
+        if self.backup_enabled() && action.kind == EntryKind::File {
+            let expected = action
+                .identity
+                .ok_or_else(|| RemotePullError::MissingDestinationIdentity(path.clone()))?;
             let backup_abs = self.backup_destination_for(&action.path)?;
-            if let Some(parent) = backup_abs.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| RemotePullError::LocalMutation(backup_abs.clone(), error))?;
-            }
-            let copied = copy_local_backup(&self.destination_root, &action.path, &backup_abs).await;
-            match copied {
-                Ok(()) => {}
-                // The entry may be a symlink: removal proceeds without a
-                // backup so the target is never resolved.
-                Err(error) => {
-                    tracing::debug!(
-                        path = %action.path.as_path().display(),
-                        error = %error,
-                        "delete backup copy unavailable; removing without backup"
-                    );
-                }
-            }
+            let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+            let relative = action.path.clone();
+            tokio::task::spawn_blocking(move || {
+                rooted.backup_file_blocking(&relative, &backup_abs, expected)
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         }
-        remove_local_entry(&path, action.is_directory, action.identity)
+        remove_local_entry(&path, action.kind == EntryKind::Directory, action.identity)
             .await
             .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
         self.report(
             crate::sync::output::ItemizeOp::Delete,
-            if action.is_directory {
+            if action.kind == EntryKind::Directory {
                 crate::sync::output::ItemizeKind::Directory
             } else {
                 crate::sync::output::ItemizeKind::File

@@ -349,12 +349,18 @@ impl ClientRemoteSession {
     /// Server-side copy beneath the pinned root. `--backup` uses this to
     /// preserve soon-to-be-replaced or deleted destination files; the same
     /// request is the seed of the object-native copy transfer strategy.
-    pub async fn copy_file(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+    pub async fn copy_file(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        expected_source_identity: EntryIdentity,
+    ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         request_copy_file(
             &self.router.sender(),
             source,
             destination,
+            expected_source_identity,
             self.server.platform.os,
         )
         .await

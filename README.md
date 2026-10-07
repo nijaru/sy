@@ -185,6 +185,12 @@ allowed. Remote files with indistinguishable inode and namespace identifiers
 are conservatively treated as aliases. These checks are not atomic with source
 unlink and do not provide isolation from concurrent namespace writers.
 
+Deletion backups apply to regular files only. Symlink targets are never copied.
+A backup is staged and identity-checked before publication; failure leaves the
+deletion candidate intact. Local deletion backups now copy then unlink rather
+than rename, which adds I/O. As with source removal, final checks and namespace
+mutation are not an atomic compare-and-swap.
+
 ## Benchmarks
 
 Historical 0.4-era measurements (macOS M3 Max, NVMe); the 0.5 engine will be
