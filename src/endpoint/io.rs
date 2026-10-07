@@ -291,19 +291,9 @@ pub struct StreamCopyPolicy<'a> {
 /// immediately before the endpoint commit to validate source state. The
 /// writer independently validates its expected destination state at commit.
 /// Any error aborts staging.
-pub async fn copy_file_streaming(
-    source: &dyn Endpoint,
-    source_path: &Path,
-    dest: &dyn Endpoint,
-    dest_path: &Path,
-    policy: &StreamCopyPolicy<'_>,
-) -> Result<StreamCopyResult> {
-    let reader = source.open_reader(source_path).await?;
-    copy_file_streaming_from_reader(reader, dest, dest_path, policy).await
-}
-
 pub(crate) async fn copy_file_streaming_from_reader(
     mut reader: BoxReader,
+    source_path: &Path,
     dest: &dyn Endpoint,
     dest_path: &Path,
     policy: &StreamCopyPolicy<'_>,
@@ -331,6 +321,13 @@ pub(crate) async fn copy_file_streaming_from_reader(
         if read == 0 {
             break;
         }
+        if read as u64 > metadata.size - bytes_written {
+            let operation = SyncError::SourceChanged {
+                path: source_path.to_path_buf(),
+            };
+            abort_staged_writer(writer, &operation).await?;
+            return Err(operation);
+        }
 
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&buffer[..read]);
@@ -356,6 +353,14 @@ pub(crate) async fn copy_file_streaming_from_reader(
             return Err(operation);
         }
         bytes_written += read as u64;
+    }
+
+    if bytes_written != metadata.size {
+        let operation = SyncError::SourceChanged {
+            path: source_path.to_path_buf(),
+        };
+        abort_staged_writer(writer, &operation).await?;
+        return Err(operation);
     }
 
     let expected_hash = hasher.map(|hasher| hasher.finalize());
@@ -436,6 +441,47 @@ mod tests {
         async fn abort(self: Box<Self>) -> Result<()> {
             self.events.lock().unwrap().push("abort");
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_length_mismatch_aborts_before_publication() {
+        use crate::endpoint::local::LocalEndpoint;
+
+        for size in [3, 5] {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("file");
+            std::fs::write(&destination, b"old").unwrap();
+            let endpoint = LocalEndpoint::new(root.path().to_path_buf());
+            let metadata = FileMetadata {
+                size,
+                modified: SystemTime::UNIX_EPOCH,
+                is_dir: false,
+                is_symlink: false,
+                #[cfg(unix)]
+                mode: 0o600,
+            };
+            let preservation = Preservation::default();
+            let error = copy_file_streaming_from_reader(
+                Box::pin(&b"data"[..]),
+                Path::new("source"),
+                &endpoint,
+                Path::new("file"),
+                &StreamCopyPolicy {
+                    metadata: &metadata,
+                    verify: false,
+                    expected_destination: ExpectedDestination::SnapshotAtOpen,
+                    rate_limiter: None,
+                    preservation: &preservation,
+                    pre_commit: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(error, SyncError::SourceChanged { .. }));
+            assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         }
     }
 

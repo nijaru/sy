@@ -107,11 +107,10 @@ fn apply_requested_metadata(
     Ok(())
 }
 
-async fn validated_source_metadata(
+async fn generic_source_metadata(
     source: &dyn Endpoint,
     source_path: &Path,
     follow_symlinks: bool,
-    checks: &CommitChecks,
     requested: Option<TransferMetadata>,
 ) -> Result<FileMetadata> {
     let mut metadata = source.metadata(source_path).await?;
@@ -120,7 +119,6 @@ async fn validated_source_metadata(
         // bytes when --copy-links is active.
         metadata = source.metadata_following(source_path).await?;
     }
-    checks.verify_source(CheckPoint::Open)?;
     if metadata.is_dir || metadata.is_symlink {
         return Err(SyncError::Config(format!(
             "file transfer requested for non-regular source {}",
@@ -140,7 +138,7 @@ fn file_metadata_from_open_file(file: &std::fs::File) -> Result<FileMetadata> {
     }
     Ok(FileMetadata {
         size: metadata.len(),
-        modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        modified: metadata.modified()?,
         is_dir: false,
         is_symlink: false,
         #[cfg(unix)]
@@ -572,18 +570,7 @@ where
         options.follow_symlinks,
         test_hook,
     )?;
-    // Close the scan-to-open window before observing transfer metadata. The
-    // second source check brackets metadata capture so SnapshotAtOpen cannot
-    // pair a new byte stream with stale mode/mtime from an earlier stat.
     checks.verify(CheckPoint::Open)?;
-    let metadata = validated_source_metadata(
-        source,
-        source_path,
-        options.follow_symlinks,
-        &checks,
-        options.metadata,
-    )
-    .await?;
     let expected_destination = checks.expected_destination();
     let mut before_stage = Some(before_stage);
     let dest_relative = sy::engine::domain::RelativePath::new(dest_path.to_path_buf())
@@ -597,15 +584,35 @@ where
         && !options.follow_symlinks;
     let preservation_requested =
         options.preservation_request.xattrs || options.preservation_request.acl;
-    let mut source_file = if source_native.is_some() && (native_strategy || preservation_requested)
-    {
-        if options.follow_symlinks {
-            source.open_native_file_following(source_path).await?
-        } else {
-            source.open_native_file(source_path).await?
-        }
+    // Bind bytes and metadata to one opened observation even when bandwidth
+    // pacing or destination capabilities select streaming rather than native
+    // copy. Path checks alone miss an ancestor swap restored after reader open.
+    let mut source_file = if options.follow_symlinks {
+        source.open_native_file_following(source_path).await?
     } else {
-        None
+        source.open_native_file(source_path).await?
+    };
+    let metadata = if let Some(file) = source_file.as_ref() {
+        verify_open_source_identity(file, checks.expected_source_identity(), source_path)?;
+        let mut metadata = file_metadata_from_open_file(file)?;
+        apply_requested_metadata(&mut metadata, options.metadata, source_path)?;
+        metadata
+    } else {
+        if source_native.is_some() || checks.expected_source_identity().is_some() {
+            return Err(SyncError::Config(format!(
+                "{:?} endpoint cannot bind source identity to the file supplying transfer bytes",
+                source.endpoint_type()
+            )));
+        }
+        // Generic endpoints may stream under the caller's explicit Unverified
+        // contract; never downgrade a requested native identity guarantee.
+        generic_source_metadata(
+            source,
+            source_path,
+            options.follow_symlinks,
+            options.metadata,
+        )
+        .await?
     };
     let mut preservation = options.preservation;
     if preservation_requested {
@@ -642,10 +649,6 @@ where
 
     if native_strategy {
         if let Some(mut source_file) = source_file.take() {
-            let expected_source = checks.expected_source_identity();
-            verify_open_source_identity(&source_file, expected_source, source_path)?;
-            let mut native_metadata = file_metadata_from_open_file(&source_file)?;
-            apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
             if let Some(before_stage) = before_stage.take() {
                 before_stage().await?;
             }
@@ -669,7 +672,7 @@ where
                     dest,
                     dest_path,
                     NativeStagedCopyPolicy {
-                        metadata: native_metadata.clone(),
+                        metadata: metadata.clone(),
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
@@ -691,7 +694,7 @@ where
 
             #[cfg(target_os = "linux")]
             if options.update
-                && native_metadata.size >= 16 * 1024 * 1024
+                && metadata.size >= 16 * 1024 * 1024
                 && source_caps.random_read
                 && dest_caps.random_write
                 && dest_caps.reflink
@@ -705,7 +708,7 @@ where
                     dest_path,
                     NativeReflinkPatchPolicy {
                         source_path: source_path.to_path_buf(),
-                        metadata: native_metadata.clone(),
+                        metadata: metadata.clone(),
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
@@ -731,7 +734,7 @@ where
                 dest,
                 dest_path,
                 NativeStagedCopyPolicy {
-                    metadata: native_metadata,
+                    metadata,
                     expected_destination,
                     verify: options.verify,
                     checks,
@@ -779,6 +782,7 @@ where
         }
         let result = copy_file_streaming_from_reader(
             reader,
+            source_path,
             dest,
             dest_path,
             &StreamCopyPolicy {
@@ -1264,6 +1268,135 @@ mod tests {
         }
     }
 
+    /// Model a streaming-only endpoint, with or without a locally observable
+    /// path. A path alone cannot bind the reader to a scanned identity.
+    struct ReaderOnlyEndpoint {
+        inner: LocalEndpoint,
+        expose_native_path: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Endpoint for ReaderOnlyEndpoint {
+        fn endpoint_type(&self) -> crate::endpoint::EndpointType {
+            self.inner.endpoint_type()
+        }
+
+        fn capabilities(&self) -> &crate::endpoint::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+
+        fn native_path(&self, path: &Path) -> Option<PathBuf> {
+            self.expose_native_path
+                .then(|| self.inner.root().join(path))
+        }
+
+        async fn open_reader(&self, path: &Path) -> Result<crate::endpoint::BoxReader> {
+            self.inner.open_reader(path).await
+        }
+
+        async fn exists(&self, path: &Path) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
+            self.inner.remove(path, recursive).await
+        }
+
+        async fn create_dir_all(&self, path: &Path) -> Result<()> {
+            self.inner.create_dir_all(path).await
+        }
+
+        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_symlink(target, dest).await
+        }
+
+        async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_hardlink(source, dest).await
+        }
+    }
+
+    /// Replace a real ancestor only while opening the byte source. Restoring
+    /// the directory leaves the original file's identity untouched, so path
+    /// checks before and after the transfer cannot detect the wrong reader.
+    struct SwapAncestorAtOpen {
+        inner: LocalEndpoint,
+    }
+
+    impl SwapAncestorAtOpen {
+        async fn open_swapped_file(&self, path: &Path) -> Result<std::fs::File> {
+            let root = self.inner.root();
+            let visible = root.join("nested");
+            let held = root.join("held");
+            let replacement = root.join("replacement");
+            std::fs::rename(&visible, &held)?;
+            std::fs::rename(&replacement, &visible)?;
+            let opened = self.inner.open_native_file(path).await;
+            std::fs::rename(&visible, &replacement)?;
+            std::fs::rename(&held, &visible)?;
+            opened?.ok_or_else(|| SyncError::Config("test requires native source handles".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Endpoint for SwapAncestorAtOpen {
+        fn endpoint_type(&self) -> crate::endpoint::EndpointType {
+            self.inner.endpoint_type()
+        }
+
+        fn capabilities(&self) -> &crate::endpoint::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+
+        fn native_path(&self, path: &Path) -> Option<PathBuf> {
+            self.inner.native_path(path)
+        }
+
+        async fn open_native_file(&self, path: &Path) -> Result<Option<std::fs::File>> {
+            self.open_swapped_file(path).await.map(Some)
+        }
+
+        async fn open_reader(&self, path: &Path) -> Result<crate::endpoint::BoxReader> {
+            let file = self.open_swapped_file(path).await?;
+            Ok(Box::pin(tokio::fs::File::from_std(file)))
+        }
+
+        async fn exists(&self, path: &Path) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
+            self.inner.remove(path, recursive).await
+        }
+
+        async fn create_dir_all(&self, path: &Path) -> Result<()> {
+            self.inner.create_dir_all(path).await
+        }
+
+        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_symlink(target, dest).await
+        }
+
+        async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_hardlink(source, dest).await
+        }
+    }
+
     impl Fixture {
         fn new() -> Self {
             Self {
@@ -1642,6 +1775,93 @@ mod tests {
 
         assert_eq!(result.strategy, TransferStrategy::Streaming);
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn reader_only_endpoints_do_not_silently_downgrade_identity_guarantees() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let mut source = ReaderOnlyEndpoint {
+            inner: fixture.source_endpoint(),
+            expose_native_path: true,
+        };
+        let error = transfer_file(
+            &source,
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            streaming_options(update_identity(&fixture), true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SyncError::Config(_)));
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
+
+        source.expose_native_path = false;
+        let identity = TransferIdentity {
+            source: SourceExpectation::Unverified,
+            destination: ExpectedDestination::Unchanged(identity_of(&fixture.dest_file())),
+        };
+        let result = transfer_file(
+            &source,
+            Path::new(NAME),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            streaming_options(identity, true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.strategy, TransferStrategy::Streaming);
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+        assert_eq!(std::fs::read(fixture.source_file()).unwrap(), b"NEW!");
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_swapped_source_reader_even_after_ancestor_is_restored() {
+        let fixture = Fixture::new();
+        let source_parent = fixture.source_root.path().join("nested");
+        let replacement_parent = fixture.source_root.path().join("replacement");
+        std::fs::create_dir(&source_parent).unwrap();
+        std::fs::create_dir(&replacement_parent).unwrap();
+        std::fs::write(source_parent.join(NAME), b"NEW!").unwrap();
+        std::fs::write(replacement_parent.join(NAME), b"FAKE").unwrap();
+        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+        let scanned_source = identity_of(&source_parent.join(NAME));
+        let identity = TransferIdentity {
+            source: SourceExpectation::Scanned(scanned_source),
+            destination: ExpectedDestination::Unchanged(identity_of(&fixture.dest_file())),
+        };
+        let source = SwapAncestorAtOpen {
+            inner: fixture.source_endpoint(),
+        };
+        // No xattrs/ACLs or verification: only --bwlimit forces streaming.
+        let error = transfer_file(
+            &source,
+            Path::new("nested/file"),
+            &fixture.dest_endpoint(),
+            Path::new(NAME),
+            streaming_options(identity, true),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(identity_of(&source_parent.join(NAME)), scanned_source);
+        assert_eq!(std::fs::read(source_parent.join(NAME)).unwrap(), b"NEW!");
+        assert_eq!(
+            std::fs::read(replacement_parent.join(NAME)).unwrap(),
+            b"FAKE"
+        );
+        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+        assert_eq!(fixture.dest_entries(), 1);
+        assert_eq!(
+            std::fs::read_dir(fixture.source_root.path())
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2160,33 +2380,6 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), source_content);
-    }
-
-    #[tokio::test]
-    async fn snapshot_metadata_rejects_mutation_between_identity_and_capture() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.source_file(), b"before").unwrap();
-        let source = fixture.source_endpoint();
-        let dest = fixture.dest_endpoint();
-        let checks = CommitChecks::resolve(
-            TransferIdentity {
-                source: SourceExpectation::SnapshotAtOpen,
-                destination: ExpectedDestination::Absent,
-            },
-            source.native_path(Path::new(NAME)).as_deref(),
-            dest.native_path(Path::new(NAME)).as_deref(),
-            false,
-            None,
-        )
-        .unwrap();
-        checks.verify(CheckPoint::Open).unwrap();
-        std::fs::write(fixture.source_file(), b"changed after identity capture").unwrap();
-
-        let error = validated_source_metadata(&source, Path::new(NAME), false, &checks, None)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, SyncError::SourceChanged { .. }));
     }
 
     #[tokio::test]
