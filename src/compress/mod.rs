@@ -60,7 +60,7 @@ pub fn compress_with_level(
 ///
 /// This avoids loading the entire file into memory by compressing in chunks.
 /// Suitable for large files that would otherwise cause OOM.
-#[allow(dead_code)] // Reserved for future use if sy-remote protocol is redesigned
+#[allow(dead_code)] // Compression utility for streaming readers/writers
 pub fn compress_streaming<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -89,8 +89,8 @@ pub fn compress_streaming<R: Read, W: Write>(
     }
 }
 
-/// Decompress data (used by sy-remote binary)
-#[allow(dead_code)] // Used by sy-remote binary, not library code
+/// Decompress data
+#[allow(dead_code)] // Public compression utility
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
@@ -104,7 +104,7 @@ fn compress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(lz4_flex::compress_prepend_size(data))
 }
 
-#[allow(dead_code)] // Called by decompress() which is used by sy-remote
+#[allow(dead_code)] // Called by decompress()
 fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
     lz4_flex::decompress_size_prepended(data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -122,7 +122,7 @@ fn compress_zstd_with_level(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-#[allow(dead_code)] // Called by decompress() which is used by sy-remote
+#[allow(dead_code)] // Called by decompress()
 fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decoder = zstd::Decoder::new(data)?;
     let mut result = Vec::new();
@@ -192,13 +192,8 @@ pub fn should_compress_adaptive(
     }
 
     // Skip very large files (would load entire file into RAM)
-    // Max 256MB for compression to avoid OOM on large files
-    //
-    // WHY THIS LIMIT:
-    // - sy-remote receive-file protocol requires buffering entire compressed data
-    // - Files >256MB use SFTP instead (already efficient, chunks internally)
-    // - True streaming compression would require protocol redesign
-    // - 256MB covers 99% of compressible files (logs, code, text files)
+    // Max 256MB for single-buffer compression to avoid high memory pressure on large files
+    // Files larger than this are streamed via per-chunk compression in the v3 engine.
     //
     // NOTE: compress_streaming() exists for future use if protocol supports it
     const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
@@ -316,13 +311,8 @@ pub fn should_compress_smart(
     }
 
     // Skip very large files (would load entire file into RAM)
-    // Max 256MB for compression to avoid OOM on large files
-    //
-    // WHY THIS LIMIT:
-    // - sy-remote receive-file protocol requires buffering entire compressed data
-    // - Files >256MB use SFTP instead (already efficient, chunks internally)
-    // - True streaming compression would require protocol redesign
-    // - 256MB covers 99% of compressible files (logs, code, text files)
+    // Max 256MB for single-buffer compression to avoid high memory pressure on large files
+    // Files larger than this are streamed via per-chunk compression in the v3 engine.
     //
     // NOTE: compress_streaming() exists for future use if protocol supports it
     const MAX_COMPRESSIBLE_SIZE: u64 = 256 * 1024 * 1024;
