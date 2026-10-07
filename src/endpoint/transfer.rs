@@ -642,7 +642,7 @@ where
             dest_relative.clone(),
             expected_source,
             verification,
-            preservation_requested,
+            true,
             !pending_finalization,
         )
     };

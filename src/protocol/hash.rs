@@ -1,5 +1,6 @@
 use super::codec::SliceReader;
 use super::{ProtocolError, RelativeWirePath, Result, MAX_WIRE_PATH_BYTES};
+use crate::endpoint::existing::FingerprintOptions;
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub const HASH_DIGEST_LEN: usize = 32;
@@ -10,6 +11,7 @@ pub struct WireHashRequest {
     pub path: RelativeWirePath,
     file_size: u64,
     identity: [u8; HASH_IDENTITY_LEN],
+    preservation: FingerprintOptions,
 }
 
 impl WireHashRequest {
@@ -17,11 +19,13 @@ impl WireHashRequest {
         path: RelativeWirePath,
         file_size: u64,
         identity: [u8; HASH_IDENTITY_LEN],
+        preservation: FingerprintOptions,
     ) -> Self {
         Self {
             path,
             file_size,
             identity,
+            preservation,
         }
     }
 
@@ -33,6 +37,10 @@ impl WireHashRequest {
         &self.identity
     }
 
+    pub const fn preservation(&self) -> FingerprintOptions {
+        self.preservation
+    }
+
     pub fn encode(&self) -> Result<Bytes> {
         let path_len = u32::try_from(self.path.as_encoded().len()).map_err(|_| {
             ProtocolError::InvalidField {
@@ -42,7 +50,7 @@ impl WireHashRequest {
         })?;
         let capacity = 4_usize
             .checked_add(self.path.as_encoded().len())
-            .and_then(|value| value.checked_add(8 + HASH_IDENTITY_LEN))
+            .and_then(|value| value.checked_add(9 + HASH_IDENTITY_LEN))
             .ok_or(ProtocolError::InvalidMessage(
                 "hash request payload length overflow",
             ))?;
@@ -51,6 +59,7 @@ impl WireHashRequest {
         out.extend_from_slice(self.path.as_encoded());
         out.put_u64(self.file_size);
         out.extend_from_slice(&self.identity);
+        out.put_u8(self.preservation.bits());
         Ok(out.freeze())
     }
 
@@ -66,8 +75,14 @@ impl WireHashRequest {
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
         let file_size = reader.u64()?;
         let identity = reader.array::<HASH_IDENTITY_LEN>()?;
+        let preservation = FingerprintOptions::from_bits(reader.u8()?).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "hash_preservation",
+                reason: "unknown preservation selection bits",
+            }
+        })?;
         reader.finish()?;
-        Ok(Self::new(path, file_size, identity))
+        Ok(Self::new(path, file_size, identity, preservation))
     }
 }
 
@@ -76,6 +91,8 @@ pub struct WireHashResult {
     file_size: u64,
     identity: [u8; HASH_IDENTITY_LEN],
     digest: [u8; HASH_DIGEST_LEN],
+    preservation: [u8; HASH_DIGEST_LEN],
+    binding: [u8; HASH_DIGEST_LEN],
 }
 
 impl WireHashResult {
@@ -83,11 +100,15 @@ impl WireHashResult {
         file_size: u64,
         identity: [u8; HASH_IDENTITY_LEN],
         digest: [u8; HASH_DIGEST_LEN],
+        preservation: [u8; HASH_DIGEST_LEN],
+        binding: [u8; HASH_DIGEST_LEN],
     ) -> Self {
         Self {
             file_size,
             identity,
             digest,
+            preservation,
+            binding,
         }
     }
 
@@ -103,11 +124,21 @@ impl WireHashResult {
         self.digest
     }
 
+    pub const fn preservation(self) -> [u8; HASH_DIGEST_LEN] {
+        self.preservation
+    }
+
+    pub const fn binding(self) -> [u8; HASH_DIGEST_LEN] {
+        self.binding
+    }
+
     pub fn encode(self) -> Bytes {
-        let mut out = BytesMut::with_capacity(8 + HASH_IDENTITY_LEN + HASH_DIGEST_LEN);
+        let mut out = BytesMut::with_capacity(8 + HASH_IDENTITY_LEN + 3 * HASH_DIGEST_LEN);
         out.put_u64(self.file_size);
         out.extend_from_slice(&self.identity);
         out.extend_from_slice(&self.digest);
+        out.extend_from_slice(&self.preservation);
+        out.extend_from_slice(&self.binding);
         out.freeze()
     }
 
@@ -116,8 +147,16 @@ impl WireHashResult {
         let file_size = reader.u64()?;
         let identity = reader.array::<HASH_IDENTITY_LEN>()?;
         let digest = reader.array::<HASH_DIGEST_LEN>()?;
+        let preservation = reader.array::<HASH_DIGEST_LEN>()?;
+        let binding = reader.array::<HASH_DIGEST_LEN>()?;
         reader.finish()?;
-        Ok(Self::new(file_size, identity, digest))
+        Ok(Self::new(
+            file_size,
+            identity,
+            digest,
+            preservation,
+            binding,
+        ))
     }
 }
 
@@ -132,29 +171,67 @@ mod tests {
 
     #[test]
     fn hash_messages_round_trip() {
-        let request = WireHashRequest::new(path(), 42, [7; HASH_IDENTITY_LEN]);
-        assert_eq!(
-            WireHashRequest::decode(&request.encode().unwrap()).unwrap(),
-            request
-        );
+        for preservation in [
+            FingerprintOptions::default(),
+            FingerprintOptions {
+                permissions: true,
+                times: true,
+                xattrs: true,
+                acls: true,
+                bsd_flags: true,
+            },
+        ] {
+            let request = WireHashRequest::new(path(), 42, [7; HASH_IDENTITY_LEN], preservation);
+            assert_eq!(
+                WireHashRequest::decode(&request.encode().unwrap()).unwrap(),
+                request
+            );
+        }
 
-        let result = WireHashResult::new(42, [7; HASH_IDENTITY_LEN], [9; HASH_DIGEST_LEN]);
+        let result = WireHashResult::new(
+            42,
+            [7; HASH_IDENTITY_LEN],
+            [9; HASH_DIGEST_LEN],
+            [8; HASH_DIGEST_LEN],
+            [6; HASH_DIGEST_LEN],
+        );
         assert_eq!(WireHashResult::decode(&result.encode()).unwrap(), result);
     }
 
     #[test]
     fn hash_decoders_reject_truncation_and_trailing_data() {
-        let request = WireHashRequest::new(path(), 42, [7; HASH_IDENTITY_LEN])
-            .encode()
-            .unwrap();
+        let request = WireHashRequest::new(
+            path(),
+            42,
+            [7; HASH_IDENTITY_LEN],
+            FingerprintOptions::default(),
+        )
+        .encode()
+        .unwrap();
         for len in 0..request.len() {
             assert!(WireHashRequest::decode(&request[..len]).is_err());
         }
         let mut trailing = request.to_vec();
         trailing.push(0);
         assert!(WireHashRequest::decode(&trailing).is_err());
+        let mut unknown_selection = request.to_vec();
+        *unknown_selection.last_mut().unwrap() = 32;
+        assert!(matches!(
+            WireHashRequest::decode(&unknown_selection),
+            Err(ProtocolError::InvalidField {
+                field: "hash_preservation",
+                ..
+            })
+        ));
 
-        let result = WireHashResult::new(42, [7; HASH_IDENTITY_LEN], [9; HASH_DIGEST_LEN]).encode();
+        let result = WireHashResult::new(
+            42,
+            [7; HASH_IDENTITY_LEN],
+            [9; HASH_DIGEST_LEN],
+            [8; HASH_DIGEST_LEN],
+            [6; HASH_DIGEST_LEN],
+        )
+        .encode();
         for len in 0..result.len() {
             assert!(WireHashResult::decode(&result[..len]).is_err());
         }

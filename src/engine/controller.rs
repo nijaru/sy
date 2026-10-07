@@ -1,6 +1,6 @@
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
-use crate::engine::domain::{Entry, EntryKind, RelativePath, SkipReason, SyncOp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use crate::engine::finalize_journal::{
     FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
@@ -113,7 +113,6 @@ pub struct SyncPlan {
     operations: u64,
     delete: Option<DeletePlan>,
     execution_policy: ExecutionPolicy,
-    content_verified: bool,
 }
 
 impl SyncPlan {
@@ -412,7 +411,6 @@ where
         operations,
         delete,
         execution_policy,
-        content_verified: policy.mode == crate::engine::planner::ComparisonMode::Checksum,
     })
 }
 
@@ -533,10 +531,11 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
         &self,
         metadata: FinalizeMetadata,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
-    fn remove_verified_parity_source(
+    fn remove_unchanged_source(
         &self,
-        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &Entry,
+        destination: &Entry,
+        policy: ExecutionPolicy,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
 }
 
@@ -567,7 +566,6 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             operations,
             delete,
             execution_policy,
-            content_verified,
         } = plan;
         let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
         let mut summary = SyncSummary {
@@ -580,21 +578,17 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         let main_result: Result<()> = async {
             while let Some(operation) = reader.next().await? {
                 record_semantic_operation(&mut summary, &operation)?;
-                if let Some(source) = removable_skip_source(&operation) {
-                    if content_verified {
-                        let receipt =
-                            crate::endpoint::receipt::VerifiedExistingDestinationReceipt::new(
-                                source.path.clone(),
-                                source.identity,
-                                true,
-                            )
-                            .map_err(|error| {
-                                ControllerError::Worker(format!(
-                                    "cannot verify destination receipt for source removal: {error}"
-                                ))
-                            })?;
+                if let SyncOp::Unchanged {
+                    source,
+                    destination,
+                    comparison,
+                } = &operation
+                {
+                    if *comparison == crate::engine::domain::ContentComparison::Blake3
+                        && source.is_file()
+                    {
                         self.executor
-                            .remove_verified_parity_source(&receipt, source)
+                            .remove_unchanged_source(source, destination, execution_policy)
                             .await
                             .map_err(|error| ControllerError::backend("execution", error))?;
                     }
@@ -797,7 +791,7 @@ fn record_preview_operation(preview: &mut SyncPreview, operation: &SyncOp) -> Re
                     checked_add(preview.files_updated, 1, "preview metadata update")?;
             }
         }
-        SyncOp::Skip { .. } => {
+        SyncOp::Skip { .. } | SyncOp::Unchanged { .. } => {
             preview.files_skipped = checked_add(preview.files_skipped, 1, "preview skipped entry")?;
         }
     }
@@ -833,7 +827,7 @@ fn record_semantic_operation(summary: &mut SyncSummary, operation: &SyncOp) -> R
                 summary.files_updated = checked_add(summary.files_updated, 1, "metadata update")?;
             }
         }
-        SyncOp::Skip { .. } => {
+        SyncOp::Skip { .. } | SyncOp::Unchanged { .. } => {
             summary.files_skipped = checked_add(summary.files_skipped, 1, "skipped entry")?;
         }
     }
@@ -844,23 +838,6 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
     value
         .checked_add(increment)
         .ok_or(ControllerError::CounterOverflow(counter))
-}
-
-/// Under --remove-source-files, an unchanged non-directory is a candidate for
-/// removal ONLY if the sync performed strong content verification (producing a
-/// `VerifiedExistingDestinationReceipt`). Quick-check parity alone NEVER
-/// authorizes source removal. Skips for other reasons (--existing with a
-/// missing destination, --ignore-existing, --update with a newer destination,
-/// filtered entries) have no verified destination copy and must keep their
-/// source.
-fn removable_skip_source(operation: &SyncOp) -> Option<&Entry> {
-    match operation {
-        SyncOp::Skip {
-            source,
-            reason: SkipReason::Unchanged,
-        } if !source.is_directory() => Some(source),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -948,10 +925,11 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_verified_parity_source(
+        async fn remove_unchanged_source(
             &self,
-            _receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
             _source: &Entry,
+            _destination: &Entry,
+            _policy: ExecutionPolicy,
         ) -> std::io::Result<()> {
             Ok(())
         }
@@ -1030,7 +1008,7 @@ mod tests {
         ));
         assert!(matches!(
             plan.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { source, .. }) if source.path == path("c")
+            Some(SyncOp::Unchanged { source, .. }) if source.path == path("c")
         ));
         assert!(plan.reader.next().await.unwrap().is_none());
     }
@@ -1167,7 +1145,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             equal.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { source, .. }) if source.path == path("a")
+            Some(SyncOp::Unchanged { source, .. }) if source.path == path("a")
         ));
 
         let mut changed = preflight_sync_scoped_with_content(
@@ -1271,7 +1249,7 @@ mod tests {
 
         assert!(matches!(
             plan.reader.next().await.unwrap(),
-            Some(SyncOp::Skip { source, .. }) if source.path == path("parent")
+            Some(SyncOp::Unchanged { source, .. }) if source.path == path("parent")
         ));
         assert_eq!(
             plan.finalize.next().await.unwrap(),
