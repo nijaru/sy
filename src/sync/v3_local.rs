@@ -520,4 +520,83 @@ mod tests {
 
         assert_eq!(std::fs::metadata(&destination_file).unwrap().st_flags(), 0);
     }
+
+    #[tokio::test]
+    async fn remove_source_files_moves_committed_and_retains_quick_check_unchanged() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+
+        let created = source_root.path().join("created.txt");
+        std::fs::write(&created, b"new-content").unwrap();
+
+        let unchanged_src = source_root.path().join("unchanged.txt");
+        let unchanged_dst = destination_root.path().join("unchanged.txt");
+        std::fs::write(&unchanged_src, b"same-content").unwrap();
+        std::fs::write(&unchanged_dst, b"same-content").unwrap();
+
+        let meta = std::fs::metadata(&unchanged_src).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&meta);
+        filetime::set_file_times(&unchanged_dst, mtime, mtime).unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.remove_source_files = true;
+
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Created file was transferred and committed, so source is removed.
+        assert!(!created.exists());
+        assert_eq!(
+            std::fs::read(destination_root.path().join("created.txt")).unwrap(),
+            b"new-content"
+        );
+
+        // Unchanged file under quick check was not content-verified, so source MUST be retained.
+        assert!(
+            unchanged_src.exists(),
+            "quick-check equality alone must not authorize source removal"
+        );
+        assert_eq!(std::fs::read(&unchanged_dst).unwrap(), b"same-content");
+    }
+
+    #[tokio::test]
+    async fn remove_source_files_with_checksum_moves_content_verified_unchanged() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+
+        let unchanged_src = source_root.path().join("unchanged.txt");
+        let unchanged_dst = destination_root.path().join("unchanged.txt");
+        std::fs::write(&unchanged_src, b"same-content").unwrap();
+        std::fs::write(&unchanged_dst, b"same-content").unwrap();
+
+        let meta = std::fs::metadata(&unchanged_src).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&meta);
+        filetime::set_file_times(&unchanged_dst, mtime, mtime).unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.remove_source_files = true;
+        config.comparison.checksum = true;
+
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // With --checksum, strong content parity authorizes a VerifiedExistingDestinationReceipt.
+        assert!(
+            !unchanged_src.exists(),
+            "checksum-verified unchanged file must be removed"
+        );
+        assert_eq!(std::fs::read(&unchanged_dst).unwrap(), b"same-content");
+    }
 }

@@ -628,10 +628,10 @@ mod tests {
         sized_file_entry(value, 1)
     }
 
-    /// --remove-source-files over v3: transferred files and planner-verified
-    /// unchanged files move; the destination keeps every byte and directories
-    /// stay. A skip without verified destination parity (missing destination
-    /// under --existing) must keep its source.
+    /// --remove-source-files over v3: transferred files move; quick-check
+    /// unchanged files stay at source because quick-check parity alone cannot
+    /// authorize source removal without strong content verification.
+    /// The destination keeps every byte and directories stay.
     #[tokio::test]
     async fn remove_source_files_moves_committed_and_unchanged_entries() {
         let source_root = TempDir::new().unwrap();
@@ -720,7 +720,137 @@ mod tests {
             std::fs::read(destination_root.path().join("keep-dir/inner")).unwrap(),
             b"inner"
         );
-        // Sources moved; the empty directory remains (rsync semantics).
+        // Transferred sources moved; quick-check unchanged file kept; empty directory remains.
+        assert!(!source_root.path().join("created").exists());
+        assert!(!source_root.path().join("updated").exists());
+        assert!(
+            source_root.path().join("unchanged").exists(),
+            "quick-check equality alone must not authorize source removal"
+        );
+        assert!(!source_root.path().join("keep-dir/inner").exists());
+        assert!(source_root.path().join("keep-dir").is_dir());
+    }
+
+    /// --remove-source-files with --checksum: unchanged files WITH verified content
+    /// parity produce a VerifiedExistingDestinationReceipt and move.
+    #[tokio::test]
+    async fn remove_source_files_with_checksum_moves_content_verified_unchanged_entries() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::create_dir(source_root.path().join("keep-dir")).unwrap();
+        std::fs::write(source_root.path().join("keep-dir/inner"), b"inner").unwrap();
+        std::fs::write(source_root.path().join("created"), b"new").unwrap();
+        std::fs::write(source_root.path().join("updated"), b"updated-new-value").unwrap();
+        let unchanged = source_root.path().join("unchanged");
+        std::fs::write(&unchanged, b"same").unwrap();
+        let dest_unchanged = destination_root.path().join("unchanged");
+        std::fs::write(&dest_unchanged, b"same").unwrap();
+        let metadata = std::fs::metadata(&unchanged).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        filetime::set_file_times(&dest_unchanged, mtime, mtime).unwrap();
+        std::fs::write(destination_root.path().join("updated"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let hash = session.hash_handler();
+            let file = session.file_handler();
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..6 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = scan.clone();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::Hash(incoming) => {
+                        let hash = hash.clone();
+                        tasks.spawn(async move {
+                            hash.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::File(incoming) => {
+                        let file = file.clone();
+                        tasks.spawn(async move {
+                            file.serve(incoming)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        let mutation = session.mutation_handler();
+                        tasks.spawn(async move {
+                            mutation
+                                .serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    _ => panic!("unexpected remove-source v3 adapter request"),
+                }
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.unwrap().unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.remove_source_files = true;
+        config.comparison.checksum = true;
+        let stats = execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(stats.files_created, 2, "created + inner");
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(stats.files_skipped, 1);
+
+        assert_eq!(
+            std::fs::read(destination_root.path().join("created")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("updated")).unwrap(),
+            b"updated-new-value"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("unchanged")).unwrap(),
+            b"same"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("keep-dir/inner")).unwrap(),
+            b"inner"
+        );
+
+        // Sources moved: content-verified unchanged file moved because it had a verified receipt.
         assert!(!source_root.path().join("created").exists());
         assert!(!source_root.path().join("updated").exists());
         assert!(!source_root.path().join("unchanged").exists());

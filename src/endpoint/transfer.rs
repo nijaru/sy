@@ -9,6 +9,7 @@ use crate::endpoint::io::{
     copy_file_streaming_from_reader, ExpectedDestination, Preservation, PreservationRequest,
     StreamCopyPolicy, VerificationStatus,
 };
+use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
 use std::future::Future;
@@ -48,6 +49,9 @@ pub struct TransferOptions {
     /// Attributes to capture from the same opened source file that supplies
     /// bytes. Requested fields replace the corresponding payload values.
     pub preservation_request: PreservationRequest,
+    /// When true, the resulting publication receipt remains unfinalized until
+    /// the caller executes required post-commit finalization.
+    pub pending_finalization: bool,
     /// Requested mode and mtime to apply to staging instead of source metadata.
     pub metadata: Option<TransferMetadata>,
 }
@@ -193,11 +197,12 @@ fn verify_open_destination_identity(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferResult {
     pub bytes_written: u64,
     pub strategy: TransferStrategy,
     pub verification: VerificationStatus,
+    pub receipt: PublishedDestinationReceipt,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,6 +586,9 @@ where
     .await?;
     let expected_destination = checks.expected_destination();
     let mut before_stage = Some(before_stage);
+    let dest_relative = sy::engine::domain::RelativePath::new(dest_path.to_path_buf())
+        .map_err(|error| SyncError::Config(error.to_string()))?;
+    let pending_finalization = options.pending_finalization;
 
     let native_strategy = options.rate_limiter.is_none()
         && source_native.is_some()
@@ -621,6 +629,17 @@ where
         }
     }
 
+    let expected_source = checks.expected_source_identity();
+    let make_receipt = move |verification: &VerificationStatus| {
+        PublishedDestinationReceipt::for_file(
+            dest_relative.clone(),
+            expected_source,
+            verification,
+            preservation_requested,
+            !pending_finalization,
+        )
+    };
+
     if native_strategy {
         if let Some(mut source_file) = source_file.take() {
             let expected_source = checks.expected_source_identity();
@@ -660,10 +679,12 @@ where
                 .await?;
                 source_file = returned_source;
                 if let Some(result) = result {
+                    let receipt = make_receipt(&result.verification);
                     return Ok(TransferResult {
                         bytes_written: result.bytes_written,
                         strategy: TransferStrategy::NativeSparseCopy,
                         verification: result.verification,
+                        receipt,
                     });
                 }
             }
@@ -694,10 +715,12 @@ where
                 .await?;
                 source_file = returned_source;
                 if let Some(result) = result {
+                    let receipt = make_receipt(&result.verification);
                     return Ok(TransferResult {
                         bytes_written: result.bytes_written,
                         strategy: TransferStrategy::ReflinkPatch,
                         verification: result.verification,
+                        receipt,
                     });
                 }
             }
@@ -716,10 +739,12 @@ where
                 },
             )
             .await?;
+            let receipt = make_receipt(&result.verification);
             return Ok(TransferResult {
                 bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
                 verification: result.verification,
+                receipt,
             });
         }
     }
@@ -766,10 +791,12 @@ where
             },
         )
         .await?;
+        let receipt = make_receipt(&result.verification);
         return Ok(TransferResult {
             bytes_written: result.bytes_written,
             strategy: TransferStrategy::Streaming,
             verification: result.verification,
+            receipt,
         });
     }
 
@@ -1290,6 +1317,7 @@ mod tests {
             rate_limiter: None,
             preservation: Preservation::default(),
             preservation_request: PreservationRequest::default(),
+            pending_finalization: false,
             identity,
             metadata: None,
         }
