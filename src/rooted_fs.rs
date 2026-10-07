@@ -345,13 +345,44 @@ impl RootedStagedFile {
     fn commit_blocking(&mut self) -> Result<()> {
         self.verify_parent_binding()?;
         self.verify_expected_destination()?;
-        rename_between_at(
-            self.staging_dir_fd.as_raw_fd(),
-            &self.temp_name,
-            self.parent_fd.as_raw_fd(),
-            &self.destination_name,
-        )?;
-        self.committed = true;
+
+        let dest_stat = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?;
+        let staged_stat = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
+        let is_type_transition = match (dest_stat, staged_stat) {
+            (Some(dest), Some(staged)) => {
+                let dest_is_dir = (dest.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+                let staged_is_dir = (staged.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+                dest_is_dir != staged_is_dir
+            }
+            _ => false,
+        };
+
+        if is_type_transition {
+            rename_exchange_at(
+                self.staging_dir_fd.as_raw_fd(),
+                &self.temp_name,
+                self.parent_fd.as_raw_fd(),
+                &self.destination_name,
+            )?;
+            self.committed = true;
+            let old_dest_stat = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
+            if let Some(stat) = old_dest_stat {
+                if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+                    let _ = remove_dir_tree_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name);
+                } else {
+                    let _ = unlink_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name, false);
+                }
+            }
+        } else {
+            rename_between_at(
+                self.staging_dir_fd.as_raw_fd(),
+                &self.temp_name,
+                self.parent_fd.as_raw_fd(),
+                &self.destination_name,
+            )?;
+            self.committed = true;
+        }
+
         remove_owned_staging_dir_at(
             self.parent_fd.as_raw_fd(),
             self.staging_dir_fd.as_raw_fd(),
@@ -692,6 +723,21 @@ impl RootedFs {
         expected_identity: Option<EntryIdentity>,
     ) -> Result<()> {
         self.remove_path_blocking(relative.as_path(), is_directory, expected_identity)
+    }
+
+    /// Recursively remove a directory tree beneath the pinned root using
+    /// directory-descriptor relative traversal with no-follow semantics.
+    ///
+    /// This is a blocking syscall API and must run on a blocking worker.
+    #[cfg(unix)]
+    pub fn remove_dir_tree_blocking(&self, relative: &RelativePath) -> Result<()> {
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        remove_dir_tree_at(parent.as_raw_fd(), &leaf)
+    }
+
+    #[cfg(not(unix))]
+    pub fn remove_dir_tree_blocking(&self, _relative: &RelativePath) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Read every extended attribute of one file or directory beneath the
@@ -1139,11 +1185,33 @@ impl RootedFs {
                 return Err(error.into());
             }
 
-            match rename_at(parent.as_raw_fd(), &temp_name, &destination_name) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
-                    return Err(error);
+            let dest_stat = stat_at_optional(parent.as_raw_fd(), &destination_name)?;
+            let is_dest_dir =
+                dest_stat.is_some_and(|s| (s.st_mode & libc::S_IFMT) == libc::S_IFDIR);
+
+            if is_dest_dir {
+                match rename_exchange_at(
+                    parent.as_raw_fd(),
+                    &temp_name,
+                    parent.as_raw_fd(),
+                    &destination_name,
+                ) {
+                    Ok(()) => {
+                        let _ = remove_dir_tree_at(parent.as_raw_fd(), &temp_name);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
+                        return Err(error);
+                    }
+                }
+            } else {
+                match rename_at(parent.as_raw_fd(), &temp_name, &destination_name) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        let _ = unlink_at(parent.as_raw_fd(), &temp_name, false);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -2321,6 +2389,108 @@ fn rename_between_at(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn rename_exchange_at(
+    source_parent: RawFd,
+    source: &OsStr,
+    destination_parent: RawFd,
+    destination: &OsStr,
+) -> Result<()> {
+    let source = component_cstring(source)?;
+    let destination = component_cstring(destination)?;
+    let result = unsafe {
+        // SAFETY: both directory descriptors remain open and both names are
+        // live NUL-terminated single components. libc::renameat2 with
+        // RENAME_EXCHANGE atomically swaps the two entries without following symlinks.
+        libc::renameat2(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exchange_at(
+    source_parent: RawFd,
+    source: &OsStr,
+    destination_parent: RawFd,
+    destination: &OsStr,
+) -> Result<()> {
+    let source = component_cstring(source)?;
+    let destination = component_cstring(destination)?;
+    const RENAME_SWAP: libc::c_uint = 2;
+    extern "C" {
+        fn renameatx_np(
+            fromfd: libc::c_int,
+            from: *const libc::c_char,
+            tofd: libc::c_int,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
+    }
+    let result = unsafe {
+        // SAFETY: both directory descriptors remain open and both names are
+        // live NUL-terminated single components. renameatx_np with RENAME_SWAP
+        // atomically swaps the two filesystem entries without following symlinks.
+        renameatx_np(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            RENAME_SWAP,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_exchange_at(
+    _source_parent: RawFd,
+    _source: &OsStr,
+    _destination_parent: RawFd,
+    _destination: &OsStr,
+) -> Result<()> {
+    Err(RootedFsError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+fn remove_dir_tree_at(parent: RawFd, component: &OsStr) -> Result<()> {
+    let stat = match stat_at_optional(parent, component)? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+    if !is_dir {
+        return unlink_at(parent, component, false);
+    }
+
+    let dir_fd = open_dir_at(parent, component)?;
+    let _ = unsafe {
+        // SAFETY: dir_fd is a valid open file descriptor pointing to the directory in private staging.
+        libc::fchmod(dir_fd.as_raw_fd(), 0o700)
+    };
+
+    let child_names = scan::directory_names(dir_fd.as_raw_fd())
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+    for child in child_names {
+        remove_dir_tree_at(dir_fd.as_raw_fd(), &child)?;
+    }
+
+    unlink_at(parent, component, true)
+}
+
 #[cfg(unix)]
 fn unlink_at(parent: RawFd, component: &OsStr, is_directory: bool) -> Result<()> {
     let component = component_cstring(component)?;
@@ -3228,5 +3398,60 @@ mod tests {
             std::fs::read(outside.path().join("file")).unwrap(),
             b"outside"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_file_replaces_directory_atomically() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir_path = root.path().join("target");
+        std::fs::create_dir_all(dir_path.join("nested")).unwrap();
+        std::fs::write(dir_path.join("nested/child.txt"), b"old child").unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"old file").unwrap();
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let mut staged = rooted
+            .begin_staged_file_blocking(&relative("target"))
+            .unwrap();
+        staged.file_mut().write_all(b"new file content").unwrap();
+        staged.commit().unwrap();
+
+        let meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(std::fs::read(&dir_path).unwrap(), b"new file content");
+        assert!(!dir_path.join("nested").exists());
+    }
+
+    #[tokio::test]
+    async fn symlink_replaces_directory_atomically() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir_path = root.path().join("target");
+        std::fs::create_dir_all(dir_path.join("sub")).unwrap();
+        std::fs::write(dir_path.join("sub/item"), b"content").unwrap();
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        rooted
+            .replace_symlink_blocking(&relative("target"), Path::new("somewhere/else"))
+            .unwrap();
+
+        let meta = std::fs::symlink_metadata(&dir_path).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&dir_path).unwrap(),
+            PathBuf::from("somewhere/else")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_dir_tree_recursively_cleans_nested_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir_path = root.path().join("tree");
+        std::fs::create_dir_all(dir_path.join("a/b/c")).unwrap();
+        std::fs::write(dir_path.join("a/b/c/file"), b"deep").unwrap();
+        std::fs::write(dir_path.join("a/file2"), b"shallow").unwrap();
+
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        rooted.remove_dir_tree_blocking(&relative("tree")).unwrap();
+
+        assert!(!dir_path.exists());
     }
 }

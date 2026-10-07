@@ -773,25 +773,21 @@ impl LocalSyncExecutor {
         ))
     }
 
-    /// Stage a symlink beside the destination and rename it into place so a
-    /// link-over-file (or link-over-link) replacement is atomic.
+    /// Replace a destination entry with a symlink.
     async fn replace_symlink(&self, target: &Path, relative: &RelativePath) -> Result<()> {
-        let dest = self.destination_path(relative);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| LocalSyncError::Destination(parent.to_path_buf(), error))?;
-        }
-        let temp = crate::temp_file::TempFileGuard::temp_path_for(&dest);
-        let guard = crate::temp_file::TempFileGuard::new(&temp);
-        create_symlink_preserving(target, &temp)
+        use crate::endpoint::Endpoint;
+        self.destination_endpoint
+            .create_symlink(target, relative.as_path())
             .await
-            .map_err(|error| LocalSyncError::Destination(temp.clone(), error))?;
-        tokio::fs::rename(&temp, &dest)
-            .await
-            .map_err(|error| LocalSyncError::Destination(dest.clone(), error))?;
-        guard.defuse();
-        Ok(())
+            .map_err(|error| match error {
+                crate::error::SyncError::Io(io) => {
+                    LocalSyncError::Destination(self.destination_path(relative), io)
+                }
+                other => LocalSyncError::Destination(
+                    self.destination_path(relative),
+                    std::io::Error::other(other.to_string()),
+                ),
+            })
     }
 
     async fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
@@ -1315,7 +1311,7 @@ fn lower_update(
 
 fn lower_replace(
     source: Entry,
-    _destination: Entry,
+    destination: Entry,
     policy: LocalLowerPolicy,
 ) -> std::result::Result<LoweredLocal, LocalSyncError> {
     if source.is_directory() {
@@ -1336,7 +1332,7 @@ fn lower_replace(
             Ok(LoweredLocal {
                 main: Some(file_work(LocalSyncAction::TransferFile {
                     source,
-                    destination: None,
+                    destination: Some(destination),
                     metadata,
                 })),
                 finalize: None,

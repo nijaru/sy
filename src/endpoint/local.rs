@@ -1256,30 +1256,47 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
-        let full_dest = self.resolve(dest);
-        if let Some(parent) = full_dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        let rel = match sy::engine::domain::RelativePath::new(dest.to_path_buf()) {
+            Ok(rel) => rel,
+            Err(_) => {
+                let full_dest = self.resolve(dest);
+                if let Some(parent) = full_dest.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
 
-        #[cfg(unix)]
-        {
-            // Stage the directory entry and atomically rename it over an existing
-            // file/symlink. Type-changing directory replacements are rejected by
-            // reconciliation before reaching this operation.
-            let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
-            let guard = crate::temp_file::TempFileGuard::new(&temp);
-            tokio::fs::symlink(target, &temp).await?;
-            tokio::fs::rename(&temp, &full_dest).await?;
-            guard.defuse();
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = target;
-            Err(SyncError::Config(
-                "symlink creation is not implemented for this platform".to_string(),
-            ))
-        }
+                #[cfg(unix)]
+                {
+                    let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
+                    let guard = crate::temp_file::TempFileGuard::new(&temp);
+                    tokio::fs::symlink(target, &temp).await?;
+                    tokio::fs::rename(&temp, &full_dest).await?;
+                    guard.defuse();
+                    return Ok(());
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = target;
+                    return Err(SyncError::Config(
+                        "symlink creation is not implemented for this platform".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let rooted = self.rooted_fs(true).await?;
+        let target = target.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = rel.parent() {
+                rooted
+                    .create_directories_blocking(&parent)
+                    .map_err(map_rooted_fs_error)?;
+            }
+            rooted
+                .replace_symlink_blocking(&rel, &target)
+                .map_err(map_rooted_fs_error)
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
     }
 
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
