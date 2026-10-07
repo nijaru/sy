@@ -878,16 +878,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1273,7 +1263,6 @@ dependencies = [
  "clap_mangen",
  "colored",
  "criterion",
- "crossbeam-channel",
  "dirs",
  "exacl",
  "filetime",
@@ -1284,7 +1273,6 @@ dependencies = [
  "libc",
  "lz4_flex",
  "notify",
- "num_cpus",
  "proptest",
  "rayon",
  "serde",
