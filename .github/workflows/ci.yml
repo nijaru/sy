@@ -32,6 +32,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -42,7 +43,7 @@ jobs:
           # glob without extension: the runner ships both .list and
           # deb822 .sources forms depending on image generation
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update && sudo apt-get install -y libacl1-dev
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout="20" && sudo apt-get install -y --no-install-recommends libacl1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -150,7 +151,7 @@ jobs:
           # glob without extension: the runner ships both .list and
           # deb822 .sources forms depending on image generation
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update && sudo apt-get install -y libacl1-dev
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout="20" && sudo apt-get install -y --no-install-recommends libacl1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests

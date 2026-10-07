@@ -11,13 +11,23 @@ pub mod temp_file;
 
 // Internal modules — public for binary/test access, not part of stable API
 #[doc(hidden)]
+pub mod config;
+#[doc(hidden)]
 pub mod endpoint;
 #[doc(hidden)]
 pub mod engine;
 #[doc(hidden)]
+pub mod filter;
+pub mod fs_util;
+#[doc(hidden)]
+pub mod hooks;
+pub mod path;
+#[doc(hidden)]
 pub mod protocol;
 #[doc(hidden)]
 pub mod remote;
+#[doc(hidden)]
+pub mod resource;
 #[doc(hidden)]
 pub mod rooted_fs;
 #[cfg(feature = "ssh")]
@@ -25,9 +35,3 @@ pub mod rooted_fs;
 pub mod ssh;
 #[doc(hidden)]
 pub mod transfer;
-
-// Private modules
-pub(crate) mod filter;
-pub mod fs_util;
-pub mod path;
-pub(crate) mod resource;

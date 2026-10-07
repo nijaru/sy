@@ -1,29 +1,15 @@
-mod cli;
-mod compress;
-mod config;
-mod endpoint;
-mod error;
-mod filter;
-mod fs_util;
-mod hooks;
-mod integrity;
-mod path;
-mod resource;
-mod sparse;
-mod sync;
-mod temp_file;
-
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use cli::{Cli, VerifyMode};
 use colored::Colorize;
-use config::Config;
-use filter::FilterEngine;
-use hooks::{HookContext, HookExecutor, HookType};
-use path::SyncPath;
-use resource::format_bytes;
 use std::path::PathBuf;
-use sync::session::{EndpointPair, SyncSession};
+use sy::cli::{self, Cli, VerifyMode};
+use sy::config::Config;
+use sy::filter::FilterEngine;
+use sy::hooks::{HookContext, HookExecutor, HookType};
+use sy::path::SyncPath;
+use sy::resource::format_bytes;
+use sy::sync;
+use sy::sync::session::{EndpointPair, SyncSession};
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Compute effective destination path based on rsync trailing slash semantics
@@ -624,7 +610,7 @@ Or install from local source with: cargo install --path . --features acl"#
         let effective_dest = compute_destination_path(source, destination);
 
         // Update session with effective destination
-        let dest_endpoint = EndpointPair::from_sync_path(&crate::path::SyncPath::Local {
+        let dest_endpoint = EndpointPair::from_sync_path(&SyncPath::Local {
             path: effective_dest.clone(),
             has_trailing_slash: false,
         })?;

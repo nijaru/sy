@@ -118,7 +118,7 @@ impl SyncSession {
     }
 
     async fn direct_local(&self) -> Result<SyncStats> {
-        super::v3_local::run(
+        super::local::run(
             self.source.root(),
             self.dest.root(),
             &self.config,
@@ -272,7 +272,7 @@ impl SyncSession {
                 ))
             }
         };
-        super::v3_push::run(
+        super::push::run(
             self.source.root(),
             dest_root,
             host,
@@ -290,10 +290,10 @@ impl SyncSession {
         };
         #[cfg(feature = "ssh")]
         {
-            if let Some(reason) = super::v3_pull::legacy_fallback_reason(&self.config) {
+            if let Some(reason) = super::pull::pull_unsupported_reason(&self.config) {
                 return Err(SyncError::Config(reason.to_string()));
             }
-            super::v3_pull::run(
+            super::pull::run(
                 &source_root.to_string_lossy(),
                 self.dest.root(),
                 host,
