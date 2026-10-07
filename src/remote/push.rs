@@ -229,10 +229,10 @@ fn lower_update(
 
 fn lower_replace(
     source: Entry,
-    destination: Entry,
+    _destination: Entry,
     policy: RemotePushPolicy,
 ) -> LowerResult<LoweredPush> {
-    if source.is_directory() || destination.is_directory() {
+    if source.is_directory() {
         return Err(RemotePushLowerError::TransactionalDirectoryReplace(
             source.path.as_path().to_path_buf(),
         ));
@@ -1292,9 +1292,9 @@ mod tests {
     }
 
     #[test]
-    fn directory_type_transitions_wait_for_transactional_replace() {
-        let source = file("node", 1, 0o644);
-        let destination = directory("node", 0o755);
+    fn directory_source_type_transitions_wait_for_subtree_staging() {
+        let source = directory("node", 0o755);
+        let destination = file("node", 1, 0o644);
         let error = lower_sync_op(
             SyncOp::Replace {
                 source,
@@ -1306,6 +1306,24 @@ mod tests {
         assert!(matches!(
             error,
             RemotePushLowerError::TransactionalDirectoryReplace(_)
+        ));
+    }
+
+    #[test]
+    fn file_over_directory_type_transition_lowers_to_transfer_file() {
+        let source = file("node", 1, 0o644);
+        let destination = directory("node", 0o755);
+        let lowered = lower_sync_op(
+            SyncOp::Replace {
+                source,
+                destination,
+            },
+            RemotePushPolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            lowered.main.unwrap().action(),
+            RemotePushAction::TransferFile { .. }
         ));
     }
 

@@ -332,7 +332,7 @@ fn stat_times(_stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanErro
     Err(RootedScanError::UnsupportedPlatform)
 }
 
-fn directory_names(fd: RawFd) -> Result<Vec<OsString>, RootedScanError> {
+pub(super) fn directory_names(fd: RawFd) -> Result<Vec<OsString>, RootedScanError> {
     let scan_fd = unsafe {
         // SAFETY: `fd` is a live directory descriptor and `.` is a fixed native
         // component. Reopening it creates a distinct open file description, so

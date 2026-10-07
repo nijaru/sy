@@ -652,6 +652,132 @@ fn test_type_transition_with_directory_is_refused_before_mutation() {
 }
 
 #[test]
+fn test_replace_empty_directory_with_file_succeeds_without_delete() {
+    let (source, dest) = setup_test_dir();
+    fs::write(source.path().join("swap"), b"new file").unwrap();
+    fs::create_dir(dest.path().join("swap")).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let meta = fs::metadata(dest.path().join("swap")).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(fs::read(dest.path().join("swap")).unwrap(), b"new file");
+}
+
+#[test]
+fn test_replace_nonempty_directory_with_file_requires_delete() {
+    let (source, dest) = setup_test_dir();
+    fs::write(source.path().join("swap"), b"new file").unwrap();
+    fs::create_dir(dest.path().join("swap")).unwrap();
+    fs::write(dest.path().join("swap/child"), b"preexisting").unwrap();
+
+    // Without --delete: refused before mutation
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("delete") || stderr.contains("discarded"),
+        "expected delete requirement error, got: {stderr}"
+    );
+    assert!(dest.path().join("swap/child").exists());
+
+    // With --delete: atomic exchange replaces directory with file
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--delete"]))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let meta = fs::metadata(dest.path().join("swap")).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(fs::read(dest.path().join("swap")).unwrap(), b"new file");
+    assert!(!dest.path().join("swap/child").exists());
+}
+
+#[test]
+fn test_replace_empty_directory_with_symlink_succeeds_without_delete() {
+    let (source, dest) = setup_test_dir();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("target", source.path().join("swap")).unwrap();
+    fs::create_dir(dest.path().join("swap")).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let meta = fs::symlink_metadata(dest.path().join("swap")).unwrap();
+    assert!(meta.file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(dest.path().join("swap")).unwrap(),
+        std::path::PathBuf::from("target")
+    );
+}
+
+#[test]
+fn test_replace_nonempty_directory_with_symlink_requires_delete() {
+    let (source, dest) = setup_test_dir();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("target", source.path().join("swap")).unwrap();
+    fs::create_dir(dest.path().join("swap")).unwrap();
+    fs::write(dest.path().join("swap/child"), b"preexisting").unwrap();
+
+    // Without --delete: refused before mutation
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &[]))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("delete") || stderr.contains("discarded"),
+        "expected delete requirement error, got: {stderr}"
+    );
+    assert!(dest.path().join("swap/child").exists());
+
+    // With --delete: atomic exchange replaces directory with symlink
+    let output = Command::new(sy_bin())
+        .args(sync_args(&source, &dest, &["--delete"]))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let meta = fs::symlink_metadata(dest.path().join("swap")).unwrap();
+    assert!(meta.file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(dest.path().join("swap")).unwrap(),
+        std::path::PathBuf::from("target")
+    );
+    assert!(!dest.path().join("swap/child").exists());
+}
+
+#[test]
 fn test_case_collision_preflight_on_case_insensitive_target() {
     let (source, dest) = setup_test_dir();
     fs::write(source.path().join("case_test.txt"), "source content").unwrap();
