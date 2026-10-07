@@ -31,6 +31,9 @@ gcs = ["object_store"]
 ssh = []
 watch = ["dep:notify"]
 
+[lints.clippy]
+double_must_use = "allow"
+
 [dependencies]
 # CLI & Config
 clap = { version = "4", features = ["derive", "env", "color"] }

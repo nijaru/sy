@@ -6,10 +6,12 @@
 //! reduces physical writes; non-COW local files use a normal whole-file copy.
 
 use crate::endpoint::io::{
-    copy_file_streaming, ExpectedDestination, Preservation, StreamCopyPolicy, VerificationStatus,
+    copy_file_streaming_from_reader, ExpectedDestination, Preservation, PreservationRequest,
+    StreamCopyPolicy, VerificationStatus,
 };
 use crate::endpoint::{Endpoint, FileMetadata};
 use crate::error::{Result, SyncError};
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -43,6 +45,9 @@ pub struct TransferOptions {
     /// Preservation payload read from the validated source; applied to staging
     /// before commit so a failure aborts instead of committing bare content.
     pub preservation: Preservation,
+    /// Attributes to capture from the same opened source file that supplies
+    /// bytes. Requested fields replace the corresponding payload values.
+    pub preservation_request: PreservationRequest,
     /// Requested mode and mtime to apply to staging instead of source metadata.
     pub metadata: Option<TransferMetadata>,
 }
@@ -461,7 +466,43 @@ pub async fn transfer_file(
     dest_path: &Path,
     options: TransferOptions,
 ) -> Result<TransferResult> {
-    transfer_file_inner(source, source_path, dest, dest_path, options, None).await
+    transfer_file_inner(
+        source,
+        source_path,
+        dest,
+        dest_path,
+        options,
+        None,
+        || async { Ok(()) },
+    )
+    .await
+}
+
+/// Transfer after asynchronously preparing any caller-owned destination
+/// side effects, once source preservation has been captured and before staging
+/// begins.
+pub(crate) async fn transfer_file_with_before_stage<F, Fut>(
+    source: &dyn Endpoint,
+    source_path: &Path,
+    dest: &dyn Endpoint,
+    dest_path: &Path,
+    options: TransferOptions,
+    before_stage: F,
+) -> Result<TransferResult>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    transfer_file_inner(
+        source,
+        source_path,
+        dest,
+        dest_path,
+        options,
+        None,
+        before_stage,
+    )
+    .await
 }
 
 /// Transfer with a deterministic race hook for unit tests.
@@ -481,18 +522,24 @@ pub(crate) async fn transfer_file_with_hook(
         dest_path,
         options,
         Some(test_hook),
+        || async { Ok(()) },
     )
     .await
 }
 
-async fn transfer_file_inner(
+async fn transfer_file_inner<F, Fut>(
     source: &dyn Endpoint,
     source_path: &Path,
     dest: &dyn Endpoint,
     dest_path: &Path,
     options: TransferOptions,
     test_hook: Option<RaceHook>,
-) -> Result<TransferResult> {
+    before_stage: F,
+) -> Result<TransferResult>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+{
     let source_caps = source.capabilities();
     let dest_caps = dest.capabilities();
 
@@ -533,18 +580,56 @@ async fn transfer_file_inner(
     )
     .await?;
     let expected_destination = checks.expected_destination();
+    let mut before_stage = Some(before_stage);
 
-    if options.rate_limiter.is_none()
+    let native_strategy = options.rate_limiter.is_none()
         && source_native.is_some()
         && dest_native.is_some()
         && dest_caps.atomic_rename
-        && !options.follow_symlinks
+        && !options.follow_symlinks;
+    let preservation_requested =
+        options.preservation_request.xattrs || options.preservation_request.acl;
+    let mut source_file = if source_native.is_some() && (native_strategy || preservation_requested)
     {
-        if let Some(mut source_file) = source.open_native_file(source_path).await? {
+        if options.follow_symlinks {
+            source.open_native_file_following(source_path).await?
+        } else {
+            source.open_native_file(source_path).await?
+        }
+    } else {
+        None
+    };
+    let mut preservation = options.preservation;
+    if preservation_requested {
+        let Some(file) = source_file.as_ref() else {
+            return Err(SyncError::Config(format!(
+                "{:?} endpoint cannot capture requested preservation from the file supplying transfer bytes",
+                source.endpoint_type()
+            )));
+        };
+        let expected_source = checks.expected_source_identity();
+        verify_open_source_identity(file, expected_source, source_path)?;
+        verify_open_source_size(file, metadata.size, source_path)?;
+        let captured = source
+            .read_open_file_preservation(source_path, file, options.preservation_request)
+            .await?;
+        if options.preservation_request.xattrs {
+            preservation.xattrs = captured.xattrs;
+        }
+        if options.preservation_request.acl {
+            preservation.acl = captured.acl;
+        }
+    }
+
+    if native_strategy {
+        if let Some(mut source_file) = source_file.take() {
             let expected_source = checks.expected_source_identity();
             verify_open_source_identity(&source_file, expected_source, source_path)?;
             let mut native_metadata = file_metadata_from_open_file(&source_file)?;
             apply_requested_metadata(&mut native_metadata, options.metadata, source_path)?;
+            if let Some(before_stage) = before_stage.take() {
+                before_stage().await?;
+            }
 
             let sparse_candidate = if source_caps.sparse && dest_caps.sparse {
                 match native_file_is_sparse(&source_file) {
@@ -569,7 +654,7 @@ async fn transfer_file_inner(
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
-                        preservation: options.preservation.clone(),
+                        preservation: preservation.clone(),
                     },
                 )
                 .await?;
@@ -603,7 +688,7 @@ async fn transfer_file_inner(
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
-                        preservation: options.preservation.clone(),
+                        preservation: preservation.clone(),
                     },
                 )
                 .await?;
@@ -627,7 +712,7 @@ async fn transfer_file_inner(
                     expected_destination,
                     verify: options.verify,
                     checks,
-                    preservation: options.preservation,
+                    preservation,
                 },
             )
             .await?;
@@ -647,9 +732,28 @@ async fn transfer_file_inner(
             )));
         }
 
-        let result = copy_file_streaming(
-            source,
-            source_path,
+        let mut identity_file = None;
+        let reader = if let Some(file) = source_file.take() {
+            identity_file = Some(file.try_clone()?);
+            Box::pin(tokio::fs::File::from_std(file)) as crate::endpoint::BoxReader
+        } else {
+            source.open_reader(source_path).await?
+        };
+        let expected_identity = checks.expected_source_identity();
+        let expected_size = metadata.size;
+        let pre_commit = || {
+            checks.verify_source(CheckPoint::Commit)?;
+            if let Some(file) = identity_file.as_ref() {
+                verify_open_source_identity(file, expected_identity, source_path)?;
+                verify_open_source_size(file, expected_size, source_path)?;
+            }
+            Ok(())
+        };
+        if let Some(before_stage) = before_stage.take() {
+            before_stage().await?;
+        }
+        let result = copy_file_streaming_from_reader(
+            reader,
             dest,
             dest_path,
             &StreamCopyPolicy {
@@ -657,8 +761,8 @@ async fn transfer_file_inner(
                 verify: options.verify,
                 expected_destination,
                 rate_limiter: options.rate_limiter.as_ref(),
-                preservation: &options.preservation,
-                pre_commit: Some(&|| checks.verify_source(CheckPoint::Commit)),
+                preservation: &preservation,
+                pre_commit: Some(&pre_commit),
             },
         )
         .await?;
@@ -1059,6 +1163,80 @@ mod tests {
         dest_root: tempfile::TempDir,
     }
 
+    #[cfg(feature = "acl")]
+    struct ReplacePathDuringCapture {
+        inner: LocalEndpoint,
+        root: PathBuf,
+        replacement_acl: String,
+    }
+
+    #[cfg(feature = "acl")]
+    #[async_trait::async_trait]
+    impl Endpoint for ReplacePathDuringCapture {
+        fn endpoint_type(&self) -> crate::endpoint::EndpointType {
+            self.inner.endpoint_type()
+        }
+
+        fn capabilities(&self) -> &crate::endpoint::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+
+        fn native_path(&self, path: &Path) -> Option<PathBuf> {
+            self.inner.native_path(path)
+        }
+
+        async fn open_native_file(&self, path: &Path) -> Result<Option<std::fs::File>> {
+            self.inner.open_native_file(path).await
+        }
+
+        async fn read_open_file_preservation(
+            &self,
+            path: &Path,
+            file: &std::fs::File,
+            request: PreservationRequest,
+        ) -> Result<Preservation> {
+            let visible = self.root.join(path);
+            let displaced = self.root.join("held-source");
+            std::fs::rename(&visible, &displaced)?;
+            std::fs::write(&visible, b"replacement bytes")?;
+            xattr::set(&visible, "user.sy-transfer", b"replacement")?;
+            if request.acl {
+                self.inner.write_acl(path, &self.replacement_acl).await?;
+            }
+            self.inner
+                .read_open_file_preservation(path, file, request)
+                .await
+        }
+
+        async fn exists(&self, path: &Path) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
+            self.inner.remove(path, recursive).await
+        }
+
+        async fn create_dir_all(&self, path: &Path) -> Result<()> {
+            self.inner.create_dir_all(path).await
+        }
+
+        async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_symlink(target, dest).await
+        }
+
+        async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
+            self.inner.create_hardlink(source, dest).await
+        }
+    }
+
     impl Fixture {
         fn new() -> Self {
             Self {
@@ -1111,6 +1289,7 @@ mod tests {
             follow_symlinks: false,
             rate_limiter: None,
             preservation: Preservation::default(),
+            preservation_request: PreservationRequest::default(),
             identity,
             metadata: None,
         }
@@ -1127,6 +1306,200 @@ mod tests {
 
     fn hook(mutate: impl Fn() + Send + Sync + 'static) -> RaceHook {
         Arc::new(mutate)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn requested_xattrs_are_captured_from_the_byte_source() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        let source = fixture.source_endpoint();
+        let destination = fixture.dest_endpoint();
+        source
+            .write_xattrs(
+                Path::new(NAME),
+                &[(
+                    std::ffi::OsString::from("user.sy-transfer"),
+                    b"bound".to_vec(),
+                )],
+            )
+            .await
+            .unwrap();
+        let mut transfer_options = options(create_identity(&fixture), false);
+        transfer_options.preservation_request.xattrs = true;
+
+        transfer_file(
+            &source,
+            Path::new(NAME),
+            &destination,
+            Path::new(NAME),
+            transfer_options,
+        )
+        .await
+        .unwrap();
+
+        assert!(destination
+            .read_xattrs(Path::new(NAME))
+            .await
+            .unwrap()
+            .contains(&(
+                std::ffi::OsString::from("user.sy-transfer"),
+                b"bound".to_vec()
+            )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_requested_xattrs_stay_bound_to_the_open_source_file() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        let source = fixture.source_endpoint();
+        let destination = fixture.dest_endpoint();
+        source
+            .write_xattrs(
+                Path::new(NAME),
+                &[(
+                    std::ffi::OsString::from("user.sy-stream"),
+                    b"bound".to_vec(),
+                )],
+            )
+            .await
+            .unwrap();
+        let mut transfer_options = streaming_options(create_identity(&fixture), false);
+        transfer_options.preservation_request.xattrs = true;
+
+        let result = transfer_file(
+            &source,
+            Path::new(NAME),
+            &destination,
+            Path::new(NAME),
+            transfer_options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy, TransferStrategy::Streaming);
+        assert!(destination
+            .read_xattrs(Path::new(NAME))
+            .await
+            .unwrap()
+            .contains(&(
+                std::ffi::OsString::from("user.sy-stream"),
+                b"bound".to_vec()
+            )));
+    }
+
+    #[cfg(feature = "acl")]
+    async fn assert_held_preservation_after_source_path_replacement(rate_limited: bool) {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source_file(), b"original bytes").unwrap();
+        let source_endpoint = fixture.source_endpoint();
+        source_endpoint
+            .write_xattrs(
+                Path::new(NAME),
+                &[(
+                    std::ffi::OsString::from("user.sy-transfer"),
+                    b"original".to_vec(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let base_acl = exacl::getfacl(fixture.source_file(), None).unwrap();
+        let base_acl_text = exacl::to_string(&base_acl).unwrap();
+        // SAFETY: `getuid` has no pointer arguments or other preconditions.
+        let uid = unsafe { libc::getuid() };
+        let mut original_acl = base_acl;
+        original_acl.push(exacl::AclEntry::allow_user(
+            &uid.to_string(),
+            exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        exacl::setfacl(&[&fixture.source_file()], &original_acl, None).unwrap();
+        let original_acl_text =
+            exacl::to_string(&exacl::getfacl(fixture.source_file(), None).unwrap())
+                .unwrap()
+                .trim()
+                .to_string();
+
+        let source = ReplacePathDuringCapture {
+            inner: source_endpoint,
+            root: fixture.source_root.path().to_path_buf(),
+            replacement_acl: base_acl_text,
+        };
+        let destination = fixture.dest_endpoint();
+        let identity = TransferIdentity {
+            source: SourceExpectation::Unverified,
+            destination: ExpectedDestination::Absent,
+        };
+        let mut transfer_options = if rate_limited {
+            streaming_options(identity, false)
+        } else {
+            options(identity, false)
+        };
+        transfer_options.preservation_request = PreservationRequest {
+            xattrs: true,
+            acl: true,
+        };
+
+        let source_during_staging = fixture.source_file();
+        let result = transfer_file_with_before_stage(
+            &source,
+            Path::new(NAME),
+            &destination,
+            Path::new(NAME),
+            transfer_options,
+            move || async move {
+                assert_eq!(
+                    std::fs::read(source_during_staging).unwrap(),
+                    b"replacement bytes"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(fixture.dest_file()).unwrap(),
+            b"original bytes"
+        );
+        assert!(destination
+            .read_xattrs(Path::new(NAME))
+            .await
+            .unwrap()
+            .contains(&(
+                std::ffi::OsString::from("user.sy-transfer"),
+                b"original".to_vec()
+            )));
+        assert_eq!(
+            destination
+                .read_acl(Path::new(NAME))
+                .await
+                .unwrap()
+                .unwrap()
+                .trim(),
+            original_acl_text
+        );
+        if rate_limited {
+            assert_eq!(result.strategy, TransferStrategy::Streaming);
+        } else {
+            assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
+        }
+
+        std::fs::remove_file(fixture.source_file()).unwrap();
+        std::fs::rename(
+            fixture.source_root.path().join("held-source"),
+            fixture.source_file(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn native_and_streaming_preservation_stays_with_held_byte_source() {
+        assert_held_preservation_after_source_path_replacement(false).await;
+        assert_held_preservation_after_source_path_replacement(true).await;
     }
 
     #[tokio::test]

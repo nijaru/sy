@@ -713,7 +713,7 @@ impl RootedFs {
     /// Read preservation xattrs through a regular file handle opened beneath
     /// this root. The caller must pass the handle whose identity was validated
     /// for the in-flight transfer; this keeps metadata bound to those bytes.
-    pub(crate) fn read_open_file_xattrs_blocking(
+    pub fn read_open_file_xattrs_blocking(
         &self,
         file: &File,
         relative: &RelativePath,
@@ -764,7 +764,7 @@ impl RootedFs {
 
     /// Read a file's ACL through the already-open handle for its in-flight
     /// transfer, rather than reopening the visible path for a metadata RPC.
-    pub(crate) fn read_open_file_acl_blocking(
+    pub fn read_open_file_acl_blocking(
         &self,
         file: &File,
         relative: &RelativePath,

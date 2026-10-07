@@ -209,6 +209,7 @@ impl RouterSender {
     /// Client-initiated streams are odd and server-initiated streams are even.
     /// Registration happens before the caller can send the opening frame, so a
     /// fast peer response cannot race ahead of the inbox.
+    #[allow(deprecated)]
     pub fn open_stream(&self) -> Result<StreamInbox, SharedRouterError> {
         let raw = self
             .inner
