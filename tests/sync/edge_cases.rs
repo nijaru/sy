@@ -194,10 +194,7 @@ fn test_trailing_slash_both() {
     );
 }
 
-// TODO: No-trailing-slash case needs adjusted dest path passed to SyncSession
-// Currently main.rs computes adjusted_dest but SyncSession gets the original path
 #[test]
-#[ignore]
 fn test_no_trailing_slash_copies_directory() {
     let (source, dest) = setup_test_dir();
 

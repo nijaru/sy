@@ -32,5 +32,4 @@ pub(crate) mod filter;
 pub mod fs_util;
 pub(crate) mod hooks;
 pub mod path;
-pub(crate) mod perf;
 pub(crate) mod resource;

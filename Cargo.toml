@@ -86,13 +86,6 @@ unicode-normalization = "0.1"
 xattr = "1.3"
 exacl = { version = "0.12", optional = true }
 
-[target.'cfg(windows)'.dependencies]
-# Win32_Foundation is required in addition to Win32_Storage_FileSystem:
-# GetDiskFreeSpaceExW lives behind both feature gates in windows-sys 0.52.
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -145,9 +138,6 @@ path = "tests/sync/edge_cases.rs"
 name = "sync_performance"
 path = "tests/sync/performance.rs"
 
-[[test]]
-name = "sync_advanced"
-path = "tests/sync/advanced.rs"
 
 [[test]]
 name = "sync_ssh"

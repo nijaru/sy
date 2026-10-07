@@ -8,7 +8,6 @@ mod fs_util;
 mod hooks;
 mod integrity;
 mod path;
-mod perf;
 mod resource;
 mod sparse;
 mod sync;

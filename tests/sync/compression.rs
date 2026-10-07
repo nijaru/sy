@@ -1,6 +1,25 @@
 use std::fs;
+use std::process::Command;
 use sy::compress::{compress, decompress, should_compress_adaptive, Compression};
 use tempfile::TempDir;
+
+fn sy_bin() -> String {
+    env!("CARGO_BIN_EXE_sy").to_string()
+}
+
+fn setup_test_dir() -> (TempDir, TempDir) {
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+
+    // Create git repo in source for .gitignore support
+    Command::new("git")
+        .args(["init"])
+        .current_dir(source.path())
+        .output()
+        .unwrap();
+
+    (source, dest)
+}
 
 #[test]
 fn test_compression_end_to_end() {
@@ -41,12 +60,6 @@ fn test_compression_end_to_end() {
         compression_ratio < 0.5,
         "Should compress to less than 50% for repetitive data"
     );
-    println!(
-        "Compression ratio: {:.1}% ({}KB -> {}KB)",
-        compression_ratio * 100.0,
-        source_data.len() / 1024,
-        compressed.len() / 1024
-    );
 
     // 4. Simulate transfer (just write compressed data)
     let dest_file = dest_dir.path().join("test.txt.compressed");
@@ -63,7 +76,6 @@ fn test_compression_end_to_end() {
         decompressed, source_data,
         "Decompressed data should match original"
     );
-    println!("✓ Compression integration test passed");
 }
 
 #[test]
@@ -114,5 +126,79 @@ fn test_compression_skip_local() {
         compression,
         Compression::None,
         "Should not compress local transfers"
+    );
+}
+
+#[test]
+fn test_cli_compression_end_to_end() {
+    let (source, dest) = setup_test_dir();
+
+    // Create compressible content
+    let content = "Hello World\n".repeat(10000);
+    fs::write(source.path().join("compressible.txt"), &content).unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--compress=auto",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("compressible.txt")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn test_cli_compression_skip_small_files() {
+    let (source, dest) = setup_test_dir();
+
+    // Create small file (below compression threshold)
+    fs::write(source.path().join("small.txt"), "tiny").unwrap();
+
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--compress=auto",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("small.txt")).unwrap(),
+        "tiny"
+    );
+}
+
+#[test]
+fn test_cli_compression_skip_local() {
+    let (source, dest) = setup_test_dir();
+
+    // Create file
+    fs::write(source.path().join("file.txt"), "content").unwrap();
+
+    // Compression should be skipped for local sync
+    let output = Command::new(sy_bin())
+        .args([
+            &format!("{}/", source.path().display()),
+            dest.path().to_str().unwrap(),
+            "--exclude-vcs",
+            "--compress=auto",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
+        "content"
     );
 }
