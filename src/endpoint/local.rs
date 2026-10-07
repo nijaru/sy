@@ -1068,14 +1068,10 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn open_reader(&self, path: &Path) -> Result<BoxReader> {
-        let full_path = self.resolve(path);
-        let file = tokio::fs::File::open(&full_path).await.map_err(|error| {
-            SyncError::Io(std::io::Error::new(
-                error.kind(),
-                format!("Failed to open file {}: {}", full_path.display(), error),
-            ))
+        let file = self.open_native_file(path).await?.ok_or_else(|| {
+            SyncError::Config("local endpoint cannot provide a rooted source reader".to_string())
         })?;
-        Ok(Box::pin(file))
+        Ok(Box::pin(tokio::fs::File::from_std(file)))
     }
 
     async fn open_native_file(&self, path: &Path) -> Result<Option<std::fs::File>> {
@@ -1431,6 +1427,10 @@ mod tests {
             .open_native_file(Path::new("file"))
             .await
             .is_err());
+        assert!(missing_endpoint
+            .open_reader(Path::new("file"))
+            .await
+            .is_err());
         assert!(!missing_root.exists());
 
         let root = dir.path().join("root");
@@ -1438,8 +1438,15 @@ mod tests {
         let outside = dir.path().join("outside");
         fs::write(&outside, b"outside").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let outside_dir = dir.path().join("outside-dir");
+        fs::create_dir(&outside_dir).unwrap();
+        fs::write(outside_dir.join("file"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("ancestor")).unwrap();
         let endpoint = LocalEndpoint::new(root);
-        assert!(endpoint.open_native_file(Path::new("link")).await.is_err());
+        for path in ["link", "ancestor/file"] {
+            assert!(endpoint.open_native_file(Path::new(path)).await.is_err());
+            assert!(endpoint.open_reader(Path::new(path)).await.is_err());
+        }
     }
 
     #[tokio::test]
