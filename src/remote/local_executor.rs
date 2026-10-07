@@ -862,8 +862,14 @@ impl LocalSyncExecutor {
             let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
             let action = action.clone();
             let result = tokio::task::spawn_blocking(move || {
-                if rooted.path_identity_blocking(&action.path)?.is_none() {
-                    return Ok(());
+                match rooted.path_identity_blocking(&action.path)? {
+                    None => return Ok(()),
+                    Some(observation) if observation != (action.kind, expected) => {
+                        return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
+                            action.path.as_path().to_path_buf(),
+                        ));
+                    }
+                    Some(_) => {}
                 }
                 rooted.remove_blocking(
                     &action.path,
@@ -1453,7 +1459,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(matches!(
+            err,
+            LocalSyncError::Rooted(crate::rooted_fs::RootedFsError::DestinationChanged(_))
+        ));
         assert!(file_path.exists());
 
         // Type mismatch fails.
@@ -1461,11 +1470,14 @@ mod tests {
             .execute_delete(DeleteAction {
                 path: rel("file"),
                 kind: EntryKind::Directory,
-                identity: None,
+                identity: Some(file_id),
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(matches!(
+            err,
+            LocalSyncError::Rooted(crate::rooted_fs::RootedFsError::DestinationChanged(_))
+        ));
         assert!(file_path.exists());
 
         // Matching file identity deletes successfully.
@@ -1488,7 +1500,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, LocalSyncError::Destination(_, _)));
+        assert!(matches!(
+            err,
+            LocalSyncError::Rooted(crate::rooted_fs::RootedFsError::DestinationChanged(_))
+        ));
         assert!(dir_path.exists());
 
         // Matching directory identity deletes successfully.
