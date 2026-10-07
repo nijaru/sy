@@ -156,6 +156,24 @@ impl DeleteTracker {
         }
     }
 
+    /// Record a destination descendant discarded because its parent directory
+    /// is being transactionally replaced by another entry kind.
+    ///
+    /// The descendant is counted in `eligible_destination_entries` and
+    /// `delete_candidates` so delete threshold and limit policies are strictly
+    /// enforced before any mutation, but it is NOT appended to the deletion
+    /// journal because cleanup is owned by the transition transaction.
+    pub async fn observe_replaced_directory_descendant(
+        &mut self,
+        destination: &Entry,
+    ) -> Result<()> {
+        self.close_candidate_directories(&destination.path);
+        self.eligible_destination_entries =
+            checked_add(self.eligible_destination_entries, 1, "eligible destination")?;
+        self.delete_candidates = checked_add(self.delete_candidates, 1, "delete candidate")?;
+        Ok(())
+    }
+
     pub async fn finish(self) -> Result<DeletePlan> {
         enforce_delete_policy(
             self.policy,
@@ -545,5 +563,61 @@ mod tests {
             .await
             .unwrap();
         assert!(tracker.finish().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn replaced_directory_descendants_count_toward_limit_without_journal_replay() {
+        let mut tracker = DeleteTracker::new(DeletePolicy {
+            limit: DeleteLimit::Count(1),
+            force: false,
+        })
+        .await
+        .unwrap();
+
+        // One normal destination-only file
+        tracker
+            .observe_destination_only(&file("old_root_file"), true)
+            .await
+            .unwrap();
+
+        // Replaced directory descendant: counts as a second candidate, exceeding limit of 1
+        tracker
+            .observe_replaced_directory_descendant(&file("replaced_dir/child"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            tracker.finish().await,
+            Err(DeletePlanError::CountExceeded {
+                delete_candidates: 2,
+                limit: 1,
+            })
+        ));
+
+        // When within limit, verify that the journal only replays the ordinary candidate
+        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+        tracker
+            .observe_destination_only(&file("ordinary_delete"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_replaced_directory_descendant(&file("replaced_dir/child"))
+            .await
+            .unwrap();
+        let plan = tracker.finish().await.unwrap();
+        assert_eq!(plan.delete_candidates(), 2);
+        assert_eq!(plan.eligible_destination_entries(), 2);
+
+        let mut replay = plan.replay;
+        let mut actions = Vec::new();
+        while let Some(action) = replay.next_action().await.unwrap() {
+            actions.push(action);
+        }
+        // Only ordinary_delete should be present in journal replay; replaced_dir/child is not
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].path.as_path(),
+            std::path::Path::new("ordinary_delete")
+        );
     }
 }

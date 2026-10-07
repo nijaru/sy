@@ -588,6 +588,26 @@ pub(super) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             destination_kind: format!("{destination_kind:?}"),
         };
     }
+    if let RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+        path,
+        discarded_entries,
+    } = &error
+    {
+        return SyncError::NonEmptyDirectoryReplacementRequiresDelete {
+            path: path.as_path().to_path_buf(),
+            discarded_entries: *discarded_entries,
+        };
+    }
+    if let RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+        path,
+        descendant,
+    } = &error
+    {
+        return SyncError::CannotReplaceDirectoryWithProtectedDescendant {
+            path: path.as_path().to_path_buf(),
+            descendant: descendant.as_path().to_path_buf(),
+        };
+    }
     map_io(error)
 }
 
