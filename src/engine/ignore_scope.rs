@@ -8,8 +8,7 @@
 //! toward protection: where evaluation and the walk could disagree, this
 //! module over-ignores (protects) rather than under-ignores (deletes).
 //!
-//! Chaining mirrors the `ignore` crate's internal semantics (source-verified
-//! contract in `ai/research/gitignore-delete-scope.md`): per-directory
+//! Chaining mirrors the `ignore` crate's tested semantics: per-directory
 //! `.ignore` and `.gitignore` files consulted deepest-first with the first
 //! matching file deciding, the last matching pattern winning within one
 //! file, `.ignore` ahead of `.gitignore` at the same level, then
@@ -27,12 +26,13 @@
 
 use crate::engine::domain::Entry;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 const GITIGNORE_FILE: &str = ".gitignore";
 const DOT_IGNORE_FILE: &str = ".ignore";
 const EXCLUDE_PATH: &str = "info/exclude";
+const DIRECTORY_RULE_CACHE_CAPACITY: usize = 64;
 
 /// Compiled rule files for one directory, loaded on first visit.
 #[derive(Clone, Default)]
@@ -44,8 +44,8 @@ struct DirectoryRules {
 /// Evaluator answering "would the source tree's ignore rules exclude this
 /// path?" for destination-side deletion scope.
 ///
-/// Matchers are compiled lazily per directory and cached; rule files are
-/// rare and read once. I/O and parse failures degrade to an empty matcher
+/// Matchers are compiled lazily into a bounded LRU cache. Wide trees do not
+/// retain one cache entry per directory; eviction only causes recomputation. I/O and parse failures degrade to an empty matcher
 /// with a warning, matching the walker's policy of ignoring unreadable
 /// ignore files rather than failing the sync.
 pub struct SourceIgnoreScope {
@@ -60,9 +60,10 @@ pub struct SourceIgnoreScope {
     git_dir: Option<PathBuf>,
     /// Explicit root `.gitignore` fallback, applied only for non-repository
     /// trees (the walker's `add_ignore` of the root file).
-    explicit_root: Option<Gitignore>,
-    /// Cached per-directory rule files, keyed by directory path.
-    dir_rules: HashMap<PathBuf, DirectoryRules>,
+    explicit_root: Option<Option<Gitignore>>,
+    /// Most-recently-used first. A short deque keeps the common same-directory
+    /// lookup at the front without a second index or cloning compiled matchers.
+    dir_rules: VecDeque<(PathBuf, DirectoryRules)>,
     exclude_matcher: Option<Option<Gitignore>>,
     global_matcher: Option<Gitignore>,
 }
@@ -75,7 +76,7 @@ impl SourceIgnoreScope {
             has_git: None,
             git_dir: None,
             explicit_root: None,
-            dir_rules: HashMap::new(),
+            dir_rules: VecDeque::new(),
             exclude_matcher: None,
             global_matcher: None,
         }
@@ -89,11 +90,14 @@ impl SourceIgnoreScope {
     pub fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
         let absolute = self.root.join(path);
 
-        // Pruning: any ignored directory between the root and the path's
-        // parent makes the whole subtree ignored. Ancestors are checked
-        // shallowest-first so each check itself sees only outer context.
-        for ancestor in ancestors_between(&self.root, &absolute) {
-            if self.chain_decision(&ancestor, true) == Some(true) {
+        // Every ancestor must be considered: a deeper whitelist cannot
+        // reinclude a child of an ignored directory. Iterate borrowed paths
+        // rather than materializing the full ancestor chain on each lookup.
+        for ancestor in absolute.ancestors().skip(1) {
+            if ancestor == self.root || !ancestor.starts_with(&self.root) {
+                break;
+            }
+            if self.chain_decision(ancestor, true) == Some(true) {
                 return true;
             }
         }
@@ -111,14 +115,18 @@ impl SourceIgnoreScope {
     /// yielding a match decides; `.ignore` precedes `.gitignore` at the
     /// same level, mirroring the walker's per-directory matcher order.
     fn chain_decision(&mut self, absolute: &Path, is_dir: bool) -> Option<bool> {
-        for directory in ancestor_chain(&self.root, absolute) {
-            let rules = self.rules_for(&directory);
+        let respect_gitignore = self.respect_gitignore;
+        for directory in absolute.ancestors().skip(1) {
+            if !directory.starts_with(&self.root) {
+                break;
+            }
+            let rules = self.rules_for(directory);
             let mut files = [rules.dot_ignore.as_ref(), rules.gitignore.as_ref()];
-            if !self.respect_gitignore {
+            if !respect_gitignore {
                 files[1] = None;
             }
             for matcher in files.into_iter().flatten() {
-                if let Some(decision) = self.match_one(matcher, absolute, is_dir) {
+                if let Some(decision) = Self::match_one(matcher, absolute, is_dir) {
                     return Some(decision);
                 }
             }
@@ -135,23 +143,23 @@ impl SourceIgnoreScope {
         }
         if self.git_rules_active() {
             if let Some(exclude) = self.exclude_matcher() {
-                if let Some(decision) = self.match_one(&exclude, absolute, is_dir) {
+                if let Some(decision) = Self::match_one(exclude, absolute, is_dir) {
                     return Some(decision);
                 }
             }
             if let Some(global) = self.global_matcher() {
-                if let Some(decision) = self.match_one(&global, absolute, is_dir) {
+                if let Some(decision) = Self::match_one(global, absolute, is_dir) {
                     return Some(decision);
                 }
             }
             None
         } else {
             let explicit = self.explicit_root_matcher()?;
-            self.match_one(&explicit, absolute, is_dir)
+            Self::match_one(explicit, absolute, is_dir)
         }
     }
 
-    fn match_one(&self, matcher: &Gitignore, absolute: &Path, is_dir: bool) -> Option<bool> {
+    fn match_one(matcher: &Gitignore, absolute: &Path, is_dir: bool) -> Option<bool> {
         match matcher.matched(absolute, is_dir) {
             ignore::Match::None => None,
             ignore::Match::Ignore(_) => Some(true),
@@ -159,17 +167,28 @@ impl SourceIgnoreScope {
         }
     }
 
-    fn rules_for(&mut self, directory: &Path) -> DirectoryRules {
-        if let Some(rules) = self.dir_rules.get(directory) {
-            return rules.clone();
+    fn rules_for(&mut self, directory: &Path) -> &DirectoryRules {
+        if let Some(index) = self
+            .dir_rules
+            .iter()
+            .position(|(path, _)| path == directory)
+        {
+            // The index came from this deque, so remove must return an entry.
+            if let Some(cached) = self.dir_rules.remove(index) {
+                self.dir_rules.push_front(cached);
+            }
+        } else {
+            let rules = DirectoryRules {
+                dot_ignore: compile_matcher(directory, DOT_IGNORE_FILE),
+                gitignore: compile_matcher(directory, GITIGNORE_FILE),
+            };
+            if self.dir_rules.len() == DIRECTORY_RULE_CACHE_CAPACITY {
+                self.dir_rules.pop_back();
+            }
+            self.dir_rules.push_front((directory.to_path_buf(), rules));
         }
-        let rules = DirectoryRules {
-            dot_ignore: compile_matcher(directory, DOT_IGNORE_FILE),
-            gitignore: compile_matcher(directory, GITIGNORE_FILE),
-        };
-        self.dir_rules
-            .insert(directory.to_path_buf(), rules.clone());
-        rules
+        // Either branch installs the requested entry at the front.
+        &self.dir_rules[0].1
     }
 
     fn git_rules_active(&mut self) -> bool {
@@ -184,7 +203,7 @@ impl SourceIgnoreScope {
         self.has_git.unwrap_or(false)
     }
 
-    fn exclude_matcher(&mut self) -> Option<Gitignore> {
+    fn exclude_matcher(&mut self) -> Option<&Gitignore> {
         if self.exclude_matcher.is_none() {
             self.exclude_matcher = Some(self.git_dir.as_ref().and_then(|git_dir| {
                 let exclude = git_dir.join(EXCLUDE_PATH);
@@ -195,10 +214,10 @@ impl SourceIgnoreScope {
                 }
             }));
         }
-        self.exclude_matcher.clone().flatten()
+        self.exclude_matcher.as_ref().and_then(Option::as_ref)
     }
 
-    fn global_matcher(&mut self) -> Option<Gitignore> {
+    fn global_matcher(&mut self) -> Option<&Gitignore> {
         if self.global_matcher.is_none() {
             let (matcher, error) = GitignoreBuilder::new(&self.root).build_global();
             if let Some(error) = error {
@@ -206,22 +225,23 @@ impl SourceIgnoreScope {
             }
             self.global_matcher = Some(matcher);
         }
-        self.global_matcher.clone()
+        self.global_matcher.as_ref()
     }
 
-    fn explicit_root_matcher(&mut self) -> Option<Gitignore> {
+    fn explicit_root_matcher(&mut self) -> Option<&Gitignore> {
         if self.explicit_root.is_none() {
             let root_gitignore = self.root.join(GITIGNORE_FILE);
-            if root_gitignore.exists() {
-                self.explicit_root = Some(compile_matcher_rooted(&self.root, &root_gitignore));
-            }
+            self.explicit_root = Some(
+                root_gitignore
+                    .exists()
+                    .then(|| compile_matcher_rooted(&self.root, &root_gitignore)),
+            );
         }
-        self.explicit_root.clone()
+        self.explicit_root.as_ref().and_then(Option::as_ref)
     }
 }
 
-/// Directories from `path.parent()` down to and including `root`, or the
-/// file's own directory chain when `path` sits directly in `root`.
+/// Load an optional per-directory rule file.
 fn compile_matcher(directory: &Path, file_name: &str) -> Option<Gitignore> {
     let rule_file = directory.join(file_name);
     if !rule_file.exists() {
@@ -253,32 +273,6 @@ fn compile_matcher_rooted(root: &Path, rule_file: &Path) -> Gitignore {
             Gitignore::empty()
         }
     }
-}
-
-/// Directories governing `path` (its parent chain), ordered deepest-first
-/// and ending at `root` itself.
-fn ancestor_chain(root: &Path, path: &Path) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut current = path.parent();
-    while let Some(directory) = current {
-        if directory == root || directory == Path::new("") {
-            break;
-        }
-        chain.push(directory.to_path_buf());
-        current = directory.parent();
-    }
-    chain.push(root.to_path_buf());
-    chain
-}
-
-/// Ancestor directories between `root` and `path`, shallowest-first, for
-/// pruning checks. Excludes `root` (its own ignore status is not a
-/// deletion-scope question) and `path` itself.
-fn ancestors_between(root: &Path, path: &Path) -> Vec<PathBuf> {
-    let mut ancestors = ancestor_chain(root, path);
-    ancestors.pop(); // drop root
-    ancestors.reverse(); // shallowest-first
-    ancestors
 }
 
 /// Resolve the repository directory, following the `gitdir:` indirection
@@ -402,6 +396,38 @@ mod tests {
         let mut scope = scope(root.path());
         assert!(!scope.is_ignored(Path::new("build"), false));
         assert!(scope.is_ignored(Path::new("build"), true));
+    }
+
+    #[test]
+    fn rule_cache_stays_bounded_and_eviction_preserves_ignore_decisions() {
+        let root = repo_root();
+        std::fs::write(root.path().join(".gitignore"), b"root-only\n").unwrap();
+        let mut scope = scope(root.path());
+        for index in 0..DIRECTORY_RULE_CACHE_CAPACITY * 3 {
+            let name = format!("dir-{index}");
+            let directory = root.path().join(&name);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join(".gitignore"), b"*.private\n!keep.private\n").unwrap();
+            for (file, ignored) in [
+                ("drop.private", true),
+                ("keep.private", false),
+                ("root-only", true),
+            ] {
+                assert_eq!(
+                    scope.is_ignored(&Path::new(&name).join(file), false),
+                    ignored
+                );
+                assert!(scope.dir_rules.len() <= DIRECTORY_RULE_CACHE_CAPACITY);
+            }
+        }
+        assert!(!scope
+            .dir_rules
+            .iter()
+            .any(|(path, _)| path == &root.path().join("dir-0")));
+        assert!(scope.is_ignored(Path::new("dir-0/drop.private"), false));
+        assert!(!scope.is_ignored(Path::new("dir-0/keep.private"), false));
+        assert!(scope.is_ignored(Path::new("dir-0/root-only"), false));
+        assert!(scope.dir_rules.len() <= DIRECTORY_RULE_CACHE_CAPACITY);
     }
 
     #[test]
