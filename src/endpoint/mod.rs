@@ -1,15 +1,9 @@
 #![allow(dead_code)]
-#[cfg(feature = "gcs")]
-pub mod gcs;
 pub mod io;
 pub mod local;
 pub mod local_entry_scan;
 pub(crate) mod local_identity;
 pub mod receipt;
-#[cfg(feature = "s3")]
-pub mod s3;
-#[cfg(feature = "ssh")]
-pub mod ssh;
 pub mod transfer;
 
 use crate::error::{Result, SyncError};
