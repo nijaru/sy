@@ -44,6 +44,7 @@ pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
     let file_size_i64 = file_size as i64;
 
     // Try SEEK_DATA first to check if supported
+    // SAFETY: `fd` is a valid, open file descriptor held by the caller.
     let first_data = unsafe { libc::lseek(fd, 0, SEEK_DATA) };
     if first_data < 0 {
         let err = io::Error::last_os_error();
@@ -75,6 +76,7 @@ pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
 
     while pos < file_size_i64 {
         // Find next data region
+        // SAFETY: `fd` is a valid, open file descriptor, and `pos` is non-negative and bounded by `file_size_i64`.
         let data_start = unsafe { libc::lseek(fd, pos, SEEK_DATA) };
         if data_start < 0 {
             break; // No more data (ENXIO)
@@ -84,6 +86,7 @@ pub fn detect_data_regions(path: &Path) -> io::Result<Vec<DataRegion>> {
         }
 
         // Find end of this data region (start of next hole)
+        // SAFETY: `fd` is a valid, open file descriptor, and `data_start` is a valid offset within file bounds.
         let hole_start = unsafe { libc::lseek(fd, data_start, SEEK_HOLE) };
         let data_end = if hole_start < 0 || hole_start > file_size_i64 {
             file_size_i64

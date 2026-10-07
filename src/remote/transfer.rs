@@ -636,7 +636,9 @@ pub async fn serve_incoming_file_rooted(
         };
         let is_end = matches!(op, ReconstructionOp::End(_));
         if reconstruction_tx.send(op).await.is_err() {
-            let worker = worker.take().expect("reconstruction worker exists");
+            let worker = worker
+                .take()
+                .ok_or(RemoteTransferError::ReconstructionStopped)?;
             return match await_reconstruction(worker).await {
                 Ok(_) => Err(RemoteTransferError::ReconstructionStopped),
                 Err(error) => Err(error),
@@ -646,12 +648,10 @@ pub async fn serve_incoming_file_rooted(
 
         if is_end {
             drop(reconstruction_tx);
-            let summary = await_reconstruction(
-                worker
-                    .take()
-                    .expect("reconstruction worker exists at FileEnd"),
-            )
-            .await?;
+            let worker = worker
+                .take()
+                .ok_or(RemoteTransferError::ReconstructionStopped)?;
+            let summary = await_reconstruction(worker).await?;
             sender
                 .send(Frame::new(
                     FrameKind::Ack,

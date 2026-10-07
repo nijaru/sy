@@ -76,6 +76,9 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
         Err(_) => return false,
     };
 
+    // SAFETY: `path_c` is a valid null-terminated C string, and `stat` points
+    // to writable memory for a `statfs` structure. `statfs` initializes the buffer
+    // on return code 0.
     unsafe {
         let mut stat: std::mem::MaybeUninit<statfs> = std::mem::MaybeUninit::uninit();
         if statfs(path_c.as_ptr(), stat.as_mut_ptr()) == 0 {
@@ -105,6 +108,9 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
         Err(_) => return false,
     };
 
+    // SAFETY: `path_c` is a valid null-terminated C string, and `stat` points
+    // to writable memory for `libc::statfs`. `libc::statfs` initializes the buffer
+    // on return code 0.
     unsafe {
         let mut stat: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
         if libc::statfs(path_c.as_ptr(), stat.as_mut_ptr()) == 0 {

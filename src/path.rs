@@ -134,14 +134,8 @@ impl SyncPath {
             // Check if this is a remote path (no / before the :)
             let before_colon = &s[..colon_pos];
 
-            // Check if this is a Windows drive letter (single letter followed by :)
-            if before_colon.len() == 1
-                && before_colon
-                    .chars()
-                    .next()
-                    .expect("length checked above")
-                    .is_ascii_alphabetic()
-            {
+            // Check if this is a Windows drive letter (single ASCII letter followed by :)
+            if matches!(before_colon.as_bytes(), [b'a'..=b'z' | b'A'..=b'Z']) {
                 // Windows drive letter, treat as local
                 return SyncPath::Local {
                     path: PathBuf::from(s),
