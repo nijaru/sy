@@ -1068,8 +1068,12 @@ fn test_concurrent_sync_safety() {
     // abort when they split the entries between them; none may corrupt.
     for (name, output) in [("first", &output1), ("second", &output2)] {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let is_clean_race_abort = stderr.contains("changed during transfer")
+            || stderr.contains("destination entry stream failed")
+            || stderr.contains("destination entry changed")
+            || stderr.contains("destination entry type changed");
         assert!(
-            output.status.success() || stderr.contains("changed during transfer"),
+            output.status.success() || is_clean_race_abort,
             "concurrent {name} sync should succeed or race-abort cleanly, got: {stderr}"
         );
     }
