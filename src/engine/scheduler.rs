@@ -2,7 +2,8 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Byte permits are quantized to keep Tokio's `u32` multi-permit API practical
-/// while still bounding resident/in-flight memory closely.
+/// while still bounding resident/in-flight memory conservatively. Capacity is
+/// rounded down; individual requests are rounded up.
 pub const BYTE_QUANTUM: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,9 @@ pub enum SchedulerError {
     #[error("scheduler budget {resource} must be greater than zero")]
     ZeroBudget { resource: &'static str },
 
+    #[error("scheduler byte budget {bytes} is below the minimum {quantum}-byte quantum")]
+    ByteBudgetTooSmall { bytes: u64, quantum: u64 },
+
     #[error(
         "scheduler byte budget is too large to represent: {bytes} bytes with {quantum}-byte permits"
     )]
@@ -76,14 +80,26 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(budget: ResourceBudget) -> Result<Self, SchedulerError> {
+    pub fn new(mut budget: ResourceBudget) -> Result<Self, SchedulerError> {
         validate_nonzero("active_files", budget.active_files)?;
         validate_nonzero("buffered_bytes", budget.buffered_bytes)?;
         validate_nonzero("metadata_ops", budget.metadata_ops)?;
         validate_nonzero("cpu_tasks", budget.cpu_tasks)?;
         validate_nonzero("network_writes", budget.network_writes)?;
 
-        let byte_units = byte_units(budget.buffered_bytes)?;
+        let byte_units = u32::try_from(budget.buffered_bytes / BYTE_QUANTUM).map_err(|_| {
+            SchedulerError::ByteBudgetTooLarge {
+                bytes: budget.buffered_bytes,
+                quantum: BYTE_QUANTUM,
+            }
+        })?;
+        if byte_units == 0 {
+            return Err(SchedulerError::ByteBudgetTooSmall {
+                bytes: budget.buffered_bytes,
+                quantum: BYTE_QUANTUM,
+            });
+        }
+        budget.buffered_bytes = u64::from(byte_units) * BYTE_QUANTUM;
         Ok(Self {
             budget,
             byte_units,
@@ -278,6 +294,47 @@ mod tests {
         assert!(matches!(
             Scheduler::new(invalid),
             Err(SchedulerError::ByteBudgetTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn byte_budget_never_rounds_capacity_up() {
+        let scheduler = Scheduler::new(ResourceBudget {
+            buffered_bytes: 2 * BYTE_QUANTUM - 1,
+            ..budget()
+        })
+        .unwrap();
+        let first = scheduler
+            .acquire(ResourceRequest {
+                buffered_bytes: BYTE_QUANTUM,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            scheduler.acquire(ResourceRequest {
+                buffered_bytes: BYTE_QUANTUM,
+                ..Default::default()
+            }),
+        )
+        .await
+        .is_err());
+        drop(first);
+        assert!(scheduler
+            .acquire(ResourceRequest {
+                buffered_bytes: BYTE_QUANTUM,
+                ..Default::default()
+            })
+            .await
+            .is_ok());
+        assert_eq!(scheduler.budget().buffered_bytes, BYTE_QUANTUM);
+        assert!(matches!(
+            Scheduler::new(ResourceBudget {
+                buffered_bytes: BYTE_QUANTUM - 1,
+                ..budget()
+            }),
+            Err(SchedulerError::ByteBudgetTooSmall { .. })
         ));
     }
 
