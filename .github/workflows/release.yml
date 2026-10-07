@@ -130,14 +130,11 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sy dist/
-          if [ -f target/${{ matrix.target }}/release/sy-remote ]; then
-            cp target/${{ matrix.target }}/release/sy-remote dist/
-          fi
 
       - name: Create tarball
         run: |
           cd dist
-          tar czf ${{ matrix.artifact_name }}.tar.gz sy sy-remote 2>/dev/null || tar czf ${{ matrix.artifact_name }}.tar.gz sy
+          tar czf ${{ matrix.artifact_name }}.tar.gz sy
           sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4

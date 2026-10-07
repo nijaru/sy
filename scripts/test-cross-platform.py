@@ -217,13 +217,11 @@ def build_local(runner: TestRunner) -> bool:
     """Build sy locally."""
     log_header("Building locally")
 
-    ok = runner.run("Build sy", ["cargo", "build", "--release", "--bin", "sy"])
-    ok = runner.run("Build sy-remote", ["cargo", "build", "--release", "--bin", "sy-remote"]) and ok
-    return ok
+    return runner.run("Build sy", ["cargo", "build", "--release", "--bin", "sy"])
 
 
 def build_fedora(runner: TestRunner) -> bool:
-    """Build sy-remote on Fedora."""
+    """Build sy on Fedora."""
     log_header("Building on Fedora")
 
     branch = subprocess.run(
@@ -241,18 +239,18 @@ def build_fedora(runner: TestRunner) -> bool:
     if not ok:
         return False
 
-    # Build sy-remote
+    # Build sy
     ok = runner.run_ssh(
-        "Build sy-remote (Fedora)",
-        f"cd {FEDORA_REPO} && cargo build --release --bin sy-remote"
+        "Build sy (Fedora)",
+        f"cd {FEDORA_REPO} && cargo build --release --bin sy"
     )
     if not ok:
         return False
 
     # Install to PATH
     ok = runner.run_ssh(
-        "Install sy-remote",
-        f"cd {FEDORA_REPO} && cargo install --path . --bin sy-remote --force"
+        "Install sy",
+        f"cd {FEDORA_REPO} && cargo install --path . --bin sy --force"
     )
     return ok
 
