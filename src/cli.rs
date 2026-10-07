@@ -42,6 +42,13 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
 
+    if !num.is_finite() || num < 0.0 {
+        return Err(format!(
+            "Invalid number '{}': must be a finite non-negative number",
+            num_str
+        ));
+    }
+
     let multiplier: u64 = match unit.trim() {
         "B" => 1,
         "KB" | "K" => 1024,
@@ -52,7 +59,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     };
 
     let result = num * multiplier as f64;
-    if result < 0.0 || result > u64::MAX as f64 {
+    if !result.is_finite() || result < 0.0 || result >= u64::MAX as f64 {
         return Err(format!("Size '{}' exceeds maximum (~16 exabytes)", s));
     }
     Ok(result as u64)
@@ -1220,6 +1227,12 @@ mod tests {
         assert_eq!(parse_size("1K").unwrap(), 1024);
         assert_eq!(parse_size("1M").unwrap(), 1024 * 1024);
         assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+
+        // Test non-finite and negative inputs
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("inf").is_err());
+        assert!(parse_size("-10MB").is_err());
+        assert!(parse_size("unknown").is_err());
     }
 
     #[test]
