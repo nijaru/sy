@@ -4,7 +4,9 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
+use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
+use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::bsdflags::{
@@ -13,7 +15,6 @@ use crate::remote::bsdflags::{
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{
     TransferDestination, TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
-    TransferSummary,
 };
 use crate::remote::xattr::{
     apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
@@ -31,12 +32,6 @@ pub const DEFAULT_REMOTE_DELTA_MIN_SIZE: u64 = 10 * 1024 * 1024;
 /// working-set budget, not the logical file size. The transfer protocol has its
 /// own global router byte budget in addition to this scheduler admission.
 pub const REMOTE_FILE_WORKING_SET: u64 = 8 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RemotePushPolicy {
-    pub preserve_permissions: bool,
-    pub preserve_times: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemotePushAction {
@@ -57,15 +52,6 @@ pub enum RemotePushAction {
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     },
-}
-
-/// Main-phase work may execute concurrently after a complete preflight.
-/// Finalize work is intentionally separate so directory mode/mtime is applied
-/// only after descendants have been created or updated.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LoweredPush {
-    pub main: Option<WorkItem<RemotePushAction>>,
-    pub finalize: Option<WorkItem<RemotePushAction>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +110,10 @@ pub type Result<T> = std::result::Result<T, RemotePushError>;
 /// Byte strategy is deliberately absent here. A changed destination file stays
 /// attached to `TransferFile`; the executor requests rolling signatures only if
 /// the negotiated peer capabilities and workload size make delta plausible.
-pub fn lower_sync_op(op: SyncOp, policy: RemotePushPolicy) -> LowerResult<LoweredPush> {
+pub fn lower_sync_op(
+    op: SyncOp,
+    policy: ExecutionPolicy,
+) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match op {
         SyncOp::Create { source } => lower_create(source, policy),
         SyncOp::Update {
@@ -139,20 +128,18 @@ pub fn lower_sync_op(op: SyncOp, policy: RemotePushPolicy) -> LowerResult<Lowere
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(LoweredPush::default()),
+        SyncOp::Skip { .. } => Ok(None),
     }
 }
 
-fn lower_create(source: Entry, policy: RemotePushPolicy) -> LowerResult<LoweredPush> {
+fn lower_create(
+    source: Entry,
+    policy: ExecutionPolicy,
+) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match source.kind {
-        EntryKind::Directory => {
-            let finalize = requested_metadata(&source, None, policy, true)?
-                .map(|(unix_mode, modified)| metadata_work(source.clone(), unix_mode, modified));
-            Ok(LoweredPush {
-                main: Some(mutation_work(RemotePushAction::CreateDirectory { source })),
-                finalize,
-            })
-        }
+        EntryKind::Directory => Ok(Some(mutation_work(RemotePushAction::CreateDirectory {
+            source,
+        }))),
         EntryKind::File => {
             // Staging stays private at 0600. A new committed file therefore
             // always needs an explicit sane final mode even when -p is absent.
@@ -167,30 +154,24 @@ fn lower_create(source: Entry, policy: RemotePushPolicy) -> LowerResult<LoweredP
                 xattrs: None,
                 acls: None,
             };
-            Ok(LoweredPush {
-                main: Some(file_work(RemotePushAction::TransferFile {
-                    source,
-                    destination: None,
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredPush {
-            main: Some(mutation_work(RemotePushAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                destination: None,
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_update(
     source: Entry,
     destination: Entry,
-    policy: RemotePushPolicy,
-) -> LowerResult<LoweredPush> {
+    policy: ExecutionPolicy,
+) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match source.kind {
         EntryKind::File => {
             let mode = if policy.preserve_permissions {
@@ -207,31 +188,25 @@ fn lower_update(
                 xattrs: None,
                 acls: None,
             };
-            Ok(LoweredPush {
-                main: Some(file_work(RemotePushAction::TransferFile {
-                    source,
-                    destination: Some(destination),
-                    metadata,
-                })),
-                finalize: None,
-            })
+            Ok(Some(file_work(RemotePushAction::TransferFile {
+                source,
+                destination: Some(destination),
+                metadata,
+            })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
-        EntryKind::Symlink => Ok(LoweredPush {
-            main: Some(mutation_work(RemotePushAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
-                source,
-            })),
-            finalize: None,
-        }),
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_replace(
     source: Entry,
     _destination: Entry,
-    policy: RemotePushPolicy,
-) -> LowerResult<LoweredPush> {
+    policy: ExecutionPolicy,
+) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match source.kind {
         EntryKind::Directory => Err(RemotePushLowerError::TransactionalDirectoryReplace(
             source.path.as_path().to_path_buf(),
@@ -246,72 +221,49 @@ fn lower_replace(
                 xattrs: None,
                 acls: None,
             };
-            Ok(LoweredPush {
-                main: Some(file_work(RemotePushAction::TransferFile {
-                    source,
-                    // A type replacement cannot reuse the old non-file leaf as
-                    // a rolling basis. Same-directory staged rename still makes
-                    // file-over-symlink replacement atomic.
-                    destination: None,
-                    metadata,
-                })),
-                finalize: None,
-            })
-        }
-        EntryKind::Symlink => Ok(LoweredPush {
-            main: Some(mutation_work(RemotePushAction::ReplaceSymlink {
-                modified: policy.preserve_times.then_some(source.modified),
+            Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
-            })),
-            finalize: None,
-        }),
+                // A type replacement cannot reuse the old non-file leaf as
+                // a rolling basis. Same-directory staged rename still makes
+                // file-over-symlink replacement atomic.
+                destination: None,
+                metadata,
+            })))
+        }
+        EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
+            modified: policy.preserve_times.then_some(source.modified),
+            source,
+        }))),
     }
 }
 
 fn lower_metadata(
     source: Entry,
     destination: Entry,
-    policy: RemotePushPolicy,
-) -> LowerResult<LoweredPush> {
-    let Some((unix_mode, modified)) =
-        requested_metadata(&source, Some(&destination), policy, false)?
-    else {
-        return Ok(LoweredPush::default());
-    };
-    let work = metadata_work(source.clone(), unix_mode, modified);
+    policy: ExecutionPolicy,
+) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     if source.is_directory() {
-        Ok(LoweredPush {
-            main: None,
-            finalize: Some(work),
-        })
-    } else {
-        Ok(LoweredPush {
-            main: Some(work),
-            finalize: None,
-        })
+        return Ok(None);
     }
+    let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
+        return Ok(None);
+    };
+    Ok(Some(metadata_work(source, unix_mode, modified)))
 }
 
 fn requested_metadata(
     source: &Entry,
-    destination: Option<&Entry>,
-    policy: RemotePushPolicy,
-    include_requested_even_if_unknown_destination: bool,
+    destination: &Entry,
+    policy: ExecutionPolicy,
 ) -> LowerResult<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions
-        && (include_requested_even_if_unknown_destination
-            || destination.is_some_and(|entry| entry.unix_mode != source.unix_mode))
-    {
+    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
         })?)
     } else {
         None
     };
-    let modified = if policy.preserve_times
-        && (include_requested_even_if_unknown_destination
-            || destination.is_some_and(|entry| entry.modified != source.modified))
-    {
+    let modified = if policy.preserve_times && destination.modified != source.modified {
         Some(source.modified)
     } else {
         None
@@ -446,64 +398,26 @@ pub struct RemotePushExecutor {
     reporter: Option<std::sync::Arc<crate::sync::output::SyncReporter>>,
 }
 
-impl crate::remote::push_controller::SyncPlanExecutor for RemotePushExecutor {
+impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
     type Action = RemotePushAction;
     type Error = RemotePushError;
 
     fn lower(
         &self,
         op: crate::engine::domain::SyncOp,
-        policy: RemotePushPolicy,
-    ) -> std::result::Result<
-        crate::remote::push_controller::LoweredSyncWork<RemotePushAction>,
-        RemotePushError,
-    > {
-        let lowered = lower_sync_op(op, policy)?;
-        Ok(crate::remote::push_controller::LoweredSyncWork {
-            main: lowered.main,
-            finalize: lowered.finalize,
-        })
+        policy: crate::engine::planner::ExecutionPolicy,
+    ) -> std::result::Result<Option<WorkItem<RemotePushAction>>, RemotePushError> {
+        lower_sync_op(op, policy).map_err(RemotePushError::from)
     }
 
     fn is_directory_action(&self, action: &RemotePushAction) -> bool {
         matches!(action, RemotePushAction::CreateDirectory { .. })
     }
 
-    fn is_leaf_action(&self, _action: &RemotePushAction) -> bool {
-        true
-    }
-
-    fn leaf_resources(
-        &self,
-        action: &RemotePushAction,
-    ) -> crate::engine::scheduler::ResourceRequest {
-        match action {
-            RemotePushAction::CreateDirectory { .. }
-            | RemotePushAction::ApplyMetadata { .. }
-            | RemotePushAction::ReplaceSymlink { .. } => {
-                crate::engine::scheduler::ResourceRequest {
-                    active_files: 0,
-                    buffered_bytes: 0,
-                    metadata_ops: 1,
-                    cpu_tasks: 0,
-                    network_writes: 1,
-                }
-            }
-            RemotePushAction::TransferFile { .. } => crate::engine::scheduler::ResourceRequest {
-                active_files: 1,
-                buffered_bytes: crate::remote::push::REMOTE_FILE_WORKING_SET,
-                metadata_ops: 0,
-                cpu_tasks: 1,
-                network_writes: 1,
-            },
-        }
-    }
-
     async fn execute(
         &self,
         item: crate::engine::work::WorkItem<RemotePushAction>,
-    ) -> std::result::Result<Option<crate::remote::transfer::TransferSummary>, RemotePushError>
-    {
+    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, RemotePushError> {
         RemotePushExecutor::execute(self, item).await
     }
 
@@ -527,13 +441,6 @@ impl crate::remote::push_controller::SyncPlanExecutor for RemotePushExecutor {
         source: &crate::engine::domain::Entry,
     ) -> std::result::Result<(), RemotePushError> {
         RemotePushExecutor::remove_verified_parity_source(self, receipt, source).await
-    }
-
-    fn on_execute_error(
-        &self,
-        error: &RemotePushError,
-    ) -> crate::remote::push_controller::RemotePushControllerError {
-        crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
     }
 }
 
@@ -1211,11 +1118,10 @@ mod tests {
             SyncOp::Create {
                 source: source.clone(),
             },
-            RemotePushPolicy::default(),
+            ExecutionPolicy::default(),
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
-        else {
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.unwrap().into_action() else {
             panic!("expected file transfer");
         };
         assert_eq!(metadata.unix_mode, Some(0o640));
@@ -1231,11 +1137,10 @@ mod tests {
                 source,
                 destination,
             },
-            RemotePushPolicy::default(),
+            ExecutionPolicy::default(),
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
-        else {
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.unwrap().into_action() else {
             panic!("expected file transfer");
         };
         assert_eq!(metadata.unix_mode, Some(0o600));
@@ -1251,14 +1156,13 @@ mod tests {
                 source,
                 destination,
             },
-            RemotePushPolicy {
+            ExecutionPolicy {
                 preserve_permissions: true,
                 preserve_times: true,
             },
         )
         .unwrap();
-        let RemotePushAction::TransferFile { metadata, .. } = lowered.main.unwrap().into_action()
-        else {
+        let RemotePushAction::TransferFile { metadata, .. } = lowered.unwrap().into_action() else {
             panic!("expected file transfer");
         };
         assert_eq!(metadata.unix_mode, Some(0o755));
@@ -1266,24 +1170,20 @@ mod tests {
     }
 
     #[test]
-    fn directory_metadata_is_deferred_until_finalize() {
+    fn directory_lowering_only_prepares_namespace() {
         let mut source = directory("dir", 0o750);
         source.modified = Timestamp::new(42, 0).unwrap();
         let lowered = lower_sync_op(
             SyncOp::Create { source },
-            RemotePushPolicy {
+            ExecutionPolicy {
                 preserve_permissions: true,
                 preserve_times: true,
             },
         )
         .unwrap();
         assert!(matches!(
-            lowered.main.unwrap().action(),
+            lowered.unwrap().action(),
             RemotePushAction::CreateDirectory { .. }
-        ));
-        assert!(matches!(
-            lowered.finalize.unwrap().action(),
-            RemotePushAction::ApplyMetadata { .. }
         ));
     }
 
@@ -1296,7 +1196,7 @@ mod tests {
                 source,
                 destination,
             },
-            RemotePushPolicy::default(),
+            ExecutionPolicy::default(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1314,11 +1214,11 @@ mod tests {
                 source,
                 destination,
             },
-            RemotePushPolicy::default(),
+            ExecutionPolicy::default(),
         )
         .unwrap();
         assert!(matches!(
-            lowered.main.unwrap().action(),
+            lowered.unwrap().action(),
             RemotePushAction::TransferFile { .. }
         ));
     }
@@ -1326,9 +1226,8 @@ mod tests {
     #[test]
     fn file_resource_reservation_is_bounded_independent_of_file_size() {
         let source = file("huge", 80 * 1024 * 1024 * 1024, 0o644);
-        let lowered =
-            lower_sync_op(SyncOp::Create { source }, RemotePushPolicy::default()).unwrap();
-        let resources = lowered.main.unwrap().resources();
+        let lowered = lower_sync_op(SyncOp::Create { source }, ExecutionPolicy::default()).unwrap();
+        let resources = lowered.unwrap().resources();
         assert_eq!(resources.active_files, 1);
         assert_eq!(resources.buffered_bytes, REMOTE_FILE_WORKING_SET);
         assert_eq!(resources.cpu_tasks, 1);
@@ -1363,10 +1262,8 @@ mod tests {
     #[test]
     fn symlink_create_is_main_phase_and_preserves_target() {
         let source = symlink("link", "../target");
-        let lowered =
-            lower_sync_op(SyncOp::Create { source }, RemotePushPolicy::default()).unwrap();
-        let RemotePushAction::ReplaceSymlink { source, .. } = lowered.main.unwrap().into_action()
-        else {
+        let lowered = lower_sync_op(SyncOp::Create { source }, ExecutionPolicy::default()).unwrap();
+        let RemotePushAction::ReplaceSymlink { source, .. } = lowered.unwrap().into_action() else {
             panic!("expected symlink replacement");
         };
         assert_eq!(source.symlink_target, Some(PathBuf::from("../target")));

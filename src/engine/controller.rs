@@ -9,17 +9,17 @@ use crate::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonPolicy, PlanDecision,
 };
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
-use crate::engine::scheduler::ResourceRequest;
+
+use crate::engine::planner::ExecutionPolicy;
+use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
-use crate::remote::push::{RemotePushError, RemotePushLowerError, RemotePushPolicy};
-use crate::remote::transfer::TransferSummary;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
 #[derive(Debug, thiserror::Error)]
-pub enum RemotePushControllerError {
+pub enum ControllerError {
     #[error(transparent)]
     Reconcile(#[from] EngineError),
 
@@ -35,16 +35,17 @@ pub enum RemotePushControllerError {
     #[error(transparent)]
     Namespace(#[from] crate::engine::namespace::NamespacePreflightError),
 
-    #[error(transparent)]
-    Lower(#[from] RemotePushLowerError),
+    #[error("sync {phase} failed: {source}")]
+    Backend {
+        phase: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
-    #[error(transparent)]
-    Execute(#[from] RemotePushError),
+    #[error("metadata preservation requires Unix mode metadata for {0}")]
+    MissingPreservedMode(RelativePath),
 
-    #[error(transparent)]
-    Hash(#[from] crate::remote::hash::RemoteHashError),
-
-    #[error("v3 remote checksum comparison is not implemented for {0}")]
+    #[error("content comparison was not supplied for {0}")]
     UnsupportedContentComparison(RelativePath),
 
     #[error(
@@ -72,14 +73,26 @@ pub enum RemotePushControllerError {
         descendant: RelativePath,
     },
 
-    #[error("remote push worker failed: {0}")]
+    #[error("sync worker failed: {0}")]
     Worker(String),
 
-    #[error("remote push {0} counter overflow")]
+    #[error("sync {0} counter overflow")]
     CounterOverflow(&'static str),
 }
 
-pub type Result<T> = std::result::Result<T, RemotePushControllerError>;
+pub type Result<T> = std::result::Result<T, ControllerError>;
+
+impl ControllerError {
+    pub fn backend(
+        phase: &'static str,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Backend {
+            phase,
+            source: Box::new(error),
+        }
+    }
+}
 
 /// Disk-backed semantic result of a complete no-mutation ordered merge.
 ///
@@ -88,16 +101,16 @@ pub type Result<T> = std::result::Result<T, RemotePushControllerError>;
 /// Returning this value means the
 /// whole merge completed and any enabled deletion threshold passed without
 /// mutating either endpoint.
-pub struct RemotePushPlan {
+pub struct SyncPlan {
     reader: PlanJournalReader,
     finalize: FinalizeJournalReader,
     operations: u64,
     delete: Option<DeletePlan>,
-    execution_policy: RemotePushPolicy,
+    execution_policy: ExecutionPolicy,
     content_verified: bool,
 }
 
-impl RemotePushPlan {
+impl SyncPlan {
     pub const fn operations(&self) -> u64 {
         self.operations
     }
@@ -115,9 +128,9 @@ impl RemotePushPlan {
     }
 }
 
-impl std::fmt::Debug for RemotePushPlan {
+impl std::fmt::Debug for SyncPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemotePushPlan")
+        f.debug_struct("SyncPlan")
             .field("operations", &self.operations)
             .field(
                 "eligible_destination_entries",
@@ -134,14 +147,14 @@ impl std::fmt::Debug for RemotePushPlan {
 /// `delete_in_scope` is evaluated only when deletion is enabled. Keeping scope
 /// policy at this boundary lets excluded destination subtrees protect candidate
 /// ancestors while the engine retains ownership of exact counting and replay.
-pub async fn preflight_remote_push(
+pub async fn preflight_sync(
     source: EntryStream,
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     delete_in_scope: impl FnMut(&Entry) -> bool,
-) -> Result<RemotePushPlan> {
-    preflight_remote_push_scoped(
+) -> Result<SyncPlan> {
+    preflight_sync_scoped(
         source,
         destination,
         policy,
@@ -160,15 +173,15 @@ pub async fn preflight_remote_push(
 /// suppress transfer work without making existing destination content appear
 /// source-absent. `delete_in_scope` continues to define which destination entries
 /// may participate in deletion.
-pub async fn preflight_remote_push_scoped(
+pub async fn preflight_sync_scoped(
     source: EntryStream,
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
     delete_in_scope: impl FnMut(&Entry) -> bool,
-) -> Result<RemotePushPlan> {
-    preflight_remote_push_scoped_with_content(
+) -> Result<SyncPlan> {
+    preflight_sync_scoped_with_content(
         source,
         destination,
         policy,
@@ -176,9 +189,7 @@ pub async fn preflight_remote_push_scoped(
         plan_in_scope,
         delete_in_scope,
         |source, _destination| async move {
-            Err::<bool, _>(RemotePushControllerError::UnsupportedContentComparison(
-                source.path,
-            ))
+            Err::<bool, _>(ControllerError::UnsupportedContentComparison(source.path))
         },
     )
     .await
@@ -194,7 +205,7 @@ fn is_descendant_of(path: &RelativePath, ancestor: &RelativePath) -> bool {
 /// The comparison future runs while the controller is still in the
 /// no-mutation phase. A comparison failure therefore prevents a plan,
 /// delete replay, and all namespace or file mutations.
-pub async fn preflight_remote_push_scoped_with_content<F, Fut>(
+pub async fn preflight_sync_scoped_with_content<F, Fut>(
     source: EntryStream,
     destination: EntryStream,
     policy: ComparisonPolicy,
@@ -202,7 +213,7 @@ pub async fn preflight_remote_push_scoped_with_content<F, Fut>(
     mut plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: impl FnMut(&Entry) -> bool,
     mut compare_content: F,
-) -> Result<RemotePushPlan>
+) -> Result<SyncPlan>
 where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
@@ -210,7 +221,7 @@ where
     let mut reconciler = OrderedReconciler::new(source, destination);
     let mut journal = PlanJournal::new().await?;
     let mut finalize = FinalizeJournal::new().await?;
-    let execution_policy = RemotePushPolicy {
+    let execution_policy = ExecutionPolicy {
         preserve_permissions: policy.preserve_permissions,
         preserve_times: policy.preserve_times,
     };
@@ -235,7 +246,7 @@ where
                 if let Some((path, count)) = active_replaced_dir.take() {
                     if count > 0 && delete.is_none() {
                         return Err(
-                            RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                            ControllerError::NonEmptyDirectoryReplacementRequiresDelete {
                                 path,
                                 discarded_entries: count,
                             },
@@ -251,7 +262,7 @@ where
                     let in_scope = delete_in_scope(&destination);
                     if !in_scope {
                         return Err(
-                            RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+                            ControllerError::CannotReplaceDirectoryWithProtectedDescendant {
                                 path: replaced_path.clone(),
                                 descendant: destination.path,
                             },
@@ -267,7 +278,7 @@ where
                     continue;
                 }
                 ReconcileItem::SourceOnly(source) | ReconcileItem::Matched { source, .. } => {
-                    return Err(RemotePushControllerError::UnsupportedTypeTransition {
+                    return Err(ControllerError::UnsupportedTypeTransition {
                         path: source.path,
                         source_kind: source.kind,
                         destination_kind: crate::engine::domain::EntryKind::Directory,
@@ -333,7 +344,7 @@ where
         } = &operation
         {
             if source.is_directory() {
-                return Err(RemotePushControllerError::UnsupportedTypeTransition {
+                return Err(ControllerError::UnsupportedTypeTransition {
                     path: source.path.clone(),
                     source_kind: source.kind,
                     destination_kind: destination.kind,
@@ -342,7 +353,7 @@ where
             if destination.is_directory() {
                 if !delete_in_scope(destination) {
                     return Err(
-                        RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
+                        ControllerError::CannotReplaceDirectoryWithProtectedDescendant {
                             path: destination.path.clone(),
                             descendant: destination.path.clone(),
                         },
@@ -358,7 +369,7 @@ where
     if let Some((path, count)) = active_replaced_dir.take() {
         if count > 0 && delete.is_none() {
             return Err(
-                RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                ControllerError::NonEmptyDirectoryReplacementRequiresDelete {
                     path,
                     discarded_entries: count,
                 },
@@ -373,7 +384,7 @@ where
         Some(delete) => Some(delete.finish().await?),
         None => None,
     };
-    Ok(RemotePushPlan {
+    Ok(SyncPlan {
         reader: journal.seal().await?,
         finalize: finalize.seal().await?,
         operations,
@@ -384,7 +395,7 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RemotePushPreview {
+pub struct SyncPreview {
     pub planned_operations: u64,
     pub delete_candidates: u64,
     pub files_created: u64,
@@ -413,20 +424,20 @@ pub struct PreviewDelete {
 /// `diff_detail` optionally receives one line per planned operation and one
 /// per delete candidate, the `--diff` byte-accounting view (`Would create:
 /// path (size)`).
-pub async fn preview_remote_push(
-    plan: RemotePushPlan,
+pub async fn preview_sync(
+    plan: SyncPlan,
     mut diff_detail: impl FnMut(PreviewOp),
-) -> Result<RemotePushPreview> {
-    let RemotePushPlan {
+) -> Result<SyncPreview> {
+    let SyncPlan {
         mut reader,
         operations,
         delete,
         ..
     } = plan;
-    let mut preview = RemotePushPreview {
+    let mut preview = SyncPreview {
         planned_operations: operations,
         delete_candidates: delete.as_ref().map_or(0, DeletePlan::delete_candidates),
-        ..RemotePushPreview::default()
+        ..SyncPreview::default()
     };
 
     while let Some(operation) = reader.next().await? {
@@ -453,7 +464,7 @@ pub enum PreviewOp<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RemotePushSummary {
+pub struct SyncSummary {
     pub planned_operations: u64,
     pub main_operations: u64,
     pub delete_candidates: u64,
@@ -479,16 +490,15 @@ pub struct RemotePushSummary {
 /// default is a no-op.
 pub trait SyncPlanExecutor: Send + Sync + 'static {
     type Action: Send + 'static;
-    type Error: std::fmt::Display + Send + 'static;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn lower(
         &self,
         op: SyncOp,
-        policy: RemotePushPolicy,
-    ) -> std::result::Result<LoweredSyncWork<Self::Action>, Self::Error>;
+        policy: ExecutionPolicy,
+    ) -> std::result::Result<Option<WorkItem<Self::Action>>, Self::Error>;
     fn is_directory_action(&self, action: &Self::Action) -> bool;
-    fn is_leaf_action(&self, action: &Self::Action) -> bool;
-    fn leaf_resources(&self, action: &Self::Action) -> ResourceRequest;
+
     fn execute(
         &self,
         item: WorkItem<Self::Action>,
@@ -506,16 +516,6 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
         receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &Entry,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
-
-    fn on_execute_error(&self, error: &Self::Error) -> RemotePushControllerError;
-}
-
-/// The lowered work shape shared by every direction: an optional main
-/// action and an optional finalize action.
-#[derive(Debug, Default)]
-pub struct LoweredSyncWork<A> {
-    pub main: Option<WorkItem<A>>,
-    pub finalize: Option<WorkItem<A>>,
 }
 
 /// Executes one preflighted v3 sync with bounded task fan-out.
@@ -525,12 +525,12 @@ pub struct LoweredSyncWork<A> {
 /// `max_in_flight` worker futures exist even before scheduler admission. All
 /// directory metadata is preflighted into a reverse journal and replayed
 /// child-before-parent only after main work and reverse deletes complete.
-pub struct RemotePushController<E: SyncPlanExecutor> {
+pub struct SyncController<E: SyncPlanExecutor> {
     executor: Arc<E>,
     max_in_flight: NonZeroUsize,
 }
 
-impl<E: SyncPlanExecutor> RemotePushController<E> {
+impl<E: SyncPlanExecutor> SyncController<E> {
     pub fn new(executor: E, max_in_flight: NonZeroUsize) -> Self {
         Self {
             executor: Arc::new(executor),
@@ -538,8 +538,8 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
         }
     }
 
-    pub async fn execute(&self, plan: RemotePushPlan) -> Result<RemotePushSummary> {
-        let RemotePushPlan {
+    pub async fn execute(&self, plan: SyncPlan) -> Result<SyncSummary> {
+        let SyncPlan {
             mut reader,
             mut finalize,
             operations,
@@ -548,70 +548,87 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
             content_verified,
         } = plan;
         let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
-        let mut summary = RemotePushSummary {
+        let mut summary = SyncSummary {
             planned_operations: operations,
             delete_candidates,
-            ..RemotePushSummary::default()
+            ..SyncSummary::default()
         };
         let mut workers = JoinSet::<std::result::Result<Option<TransferSummary>, E::Error>>::new();
 
-        while let Some(operation) = reader.next().await? {
-            record_semantic_operation(&mut summary, &operation)?;
-            if let Some(source) = removable_skip_source(&operation) {
-                if content_verified {
-                    let receipt =
-                        crate::endpoint::receipt::VerifiedExistingDestinationReceipt::new(
-                            source.path.clone(),
-                            source.identity,
-                            true,
-                        )
-                        .map_err(|error| {
-                            RemotePushControllerError::Worker(format!(
-                                "cannot verify destination receipt for source removal: {error}"
-                            ))
-                        })?;
-                    self.executor
-                        .remove_verified_parity_source(&receipt, source)
-                        .await
-                        .map_err(|error| self.executor.on_execute_error(&error))?;
+        let main_result: Result<()> = async {
+            while let Some(operation) = reader.next().await? {
+                record_semantic_operation(&mut summary, &operation)?;
+                if let Some(source) = removable_skip_source(&operation) {
+                    if content_verified {
+                        let receipt =
+                            crate::endpoint::receipt::VerifiedExistingDestinationReceipt::new(
+                                source.path.clone(),
+                                source.identity,
+                                true,
+                            )
+                            .map_err(|error| {
+                                ControllerError::Worker(format!(
+                                    "cannot verify destination receipt for source removal: {error}"
+                                ))
+                            })?;
+                        self.executor
+                            .remove_verified_parity_source(&receipt, source)
+                            .await
+                            .map_err(|error| ControllerError::backend("execution", error))?;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let lowered = self
-                .executor
-                .lower(operation, execution_policy)
-                .map_err(|error| self.executor.on_execute_error(&error))?;
-            // Finalize metadata is journal-owned: preflight appends every
-            // directory's mode/mtime to the finalize journal and the replay
-            // below applies it child-before-parent AFTER deletes. The
-            // lowered finalize field documents the shape but is not
-            // executed here — running it inline would race the delete
-            // phase (a parent's restored mode must not precede child
-            // deletions) and double the requests.
-            let Some(main) = lowered.main else {
-                continue;
-            };
-            summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
-
-            if self.executor.is_directory_action(main.action()) {
-                let result = self
+                let lowered = self
                     .executor
-                    .execute(main)
-                    .await
-                    .map_err(|error| self.executor.on_execute_error(&error))?;
-                record_transfer(&mut summary, result)?;
-                continue;
+                    .lower(operation, execution_policy)
+                    .map_err(|error| ControllerError::backend("execution", error))?;
+                let Some(main) = lowered else {
+                    continue;
+                };
+                summary.main_operations =
+                    checked_add(summary.main_operations, 1, "main operation")?;
+
+                if self.executor.is_directory_action(main.action()) {
+                    let result = self
+                        .executor
+                        .execute(main)
+                        .await
+                        .map_err(|error| ControllerError::backend("execution", error))?;
+                    record_transfer(&mut summary, result)?;
+                    continue;
+                }
+
+                while workers.len() >= self.max_in_flight.get() {
+                    collect_one::<E>(&mut workers, &mut summary).await?;
+                }
+                let executor = Arc::clone(&self.executor);
+                workers.spawn(async move { executor.execute(main).await });
             }
 
-            while workers.len() >= self.max_in_flight.get() {
+            while !workers.is_empty() {
                 collect_one::<E>(&mut workers, &mut summary).await?;
             }
-            let executor = Arc::clone(&self.executor);
-            workers.spawn(async move { executor.execute(main).await });
-        }
 
-        while !workers.is_empty() {
-            collect_one::<E>(&mut workers, &mut summary).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = main_result {
+            // Stop admitting work, but do not cancel an admitted transaction:
+            // it may be crossing its publication point or awaiting blocking
+            // filesystem work. Finish every worker before releasing session
+            // ownership; failed main work never authorizes delete/finalize.
+            while let Some(result) = workers.join_next().await {
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(secondary)) => {
+                        tracing::warn!(error = %secondary, "additional sync worker failure")
+                    }
+                    Err(secondary) => {
+                        tracing::warn!(error = %secondary, "sync worker join failed while draining")
+                    }
+                }
+            }
+            return Err(error);
         }
 
         if let Some(delete) = delete {
@@ -620,7 +637,7 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
                 self.executor
                     .execute_delete(action)
                     .await
-                    .map_err(|error| self.executor.on_execute_error(&error))?;
+                    .map_err(|error| ControllerError::backend("execution", error))?;
                 summary.deleted_entries = checked_add(summary.deleted_entries, 1, "deleted entry")?;
             }
         }
@@ -629,7 +646,7 @@ impl<E: SyncPlanExecutor> RemotePushController<E> {
             self.executor
                 .execute_finalize(metadata)
                 .await
-                .map_err(|error| self.executor.on_execute_error(&error))?;
+                .map_err(|error| ControllerError::backend("execution", error))?;
             summary.finalized_metadata =
                 checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
         }
@@ -672,9 +689,11 @@ fn directory_finalize_metadata(
         _ => source,
     };
     let unix_mode = if policy.preserve_permissions {
-        Some(final_entry.unix_mode.ok_or_else(|| {
-            RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
-        })?)
+        Some(
+            final_entry
+                .unix_mode
+                .ok_or_else(|| ControllerError::MissingPreservedMode(source.path.clone()))?,
+        )
     } else {
         None
     };
@@ -689,23 +708,20 @@ fn directory_finalize_metadata(
 }
 async fn collect_one<E: SyncPlanExecutor>(
     workers: &mut JoinSet<std::result::Result<Option<TransferSummary>, E::Error>>,
-    summary: &mut RemotePushSummary,
+    summary: &mut SyncSummary,
 ) -> Result<()> {
     let result = workers
         .join_next()
         .await
-        .ok_or_else(|| RemotePushControllerError::Worker("worker set ended early".to_string()))?
-        .map_err(|error| RemotePushControllerError::Worker(error.to_string()))?;
+        .ok_or_else(|| ControllerError::Worker("worker set ended early".to_string()))?
+        .map_err(|error| ControllerError::Worker(error.to_string()))?;
     match result {
         Ok(summary_item) => record_transfer(summary, summary_item),
-        Err(error) => Err(RemotePushControllerError::Worker(error.to_string())),
+        Err(error) => Err(ControllerError::backend("execution", error)),
     }
 }
 
-fn record_transfer(
-    summary: &mut RemotePushSummary,
-    transfer: Option<TransferSummary>,
-) -> Result<()> {
+fn record_transfer(summary: &mut SyncSummary, transfer: Option<TransferSummary>) -> Result<()> {
     let Some(transfer) = transfer else {
         return Ok(());
     };
@@ -722,7 +738,7 @@ fn record_transfer(
     Ok(())
 }
 
-fn record_preview_operation(preview: &mut RemotePushPreview, operation: &SyncOp) -> Result<()> {
+fn record_preview_operation(preview: &mut SyncPreview, operation: &SyncOp) -> Result<()> {
     match operation {
         SyncOp::Create { source } => match source.kind {
             EntryKind::File => {
@@ -766,7 +782,7 @@ fn record_preview_operation(preview: &mut RemotePushPreview, operation: &SyncOp)
     Ok(())
 }
 
-fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp) -> Result<()> {
+fn record_semantic_operation(summary: &mut SyncSummary, operation: &SyncOp) -> Result<()> {
     match operation {
         SyncOp::Create { source } => match source.kind {
             EntryKind::File => {
@@ -805,7 +821,7 @@ fn record_semantic_operation(summary: &mut RemotePushSummary, operation: &SyncOp
 fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64> {
     value
         .checked_add(increment)
-        .ok_or(RemotePushControllerError::CounterOverflow(counter))
+        .ok_or(ControllerError::CounterOverflow(counter))
 }
 
 /// Under --remove-source-files, an unchanged non-directory is a candidate for
@@ -857,11 +873,125 @@ mod tests {
         Box::pin(stream::iter(values.into_iter().map(Ok::<Entry, BoxError>)))
     }
 
+    struct FailingExecutor {
+        started: Arc<tokio::sync::Notify>,
+        failed: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+        tail_mutations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SyncPlanExecutor for FailingExecutor {
+        type Action = Entry;
+        type Error = std::io::Error;
+
+        fn lower(
+            &self,
+            op: SyncOp,
+            _policy: ExecutionPolicy,
+        ) -> std::io::Result<Option<WorkItem<Entry>>> {
+            match op {
+                SyncOp::Create { source } => Ok(Some(WorkItem::new(source, Default::default()))),
+                _ => Ok(None),
+            }
+        }
+
+        fn is_directory_action(&self, action: &Entry) -> bool {
+            action.is_directory()
+        }
+
+        async fn execute(&self, item: WorkItem<Entry>) -> std::io::Result<Option<TransferSummary>> {
+            if item.action().path == path("a") {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.completed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            } else {
+                self.started.notified().await;
+                self.failed.notify_one();
+                Err(std::io::Error::other("injected main-work failure"))
+            }
+        }
+
+        async fn execute_delete(&self, _action: DeleteAction) -> std::io::Result<()> {
+            self.tail_mutations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn execute_finalize(&self, _metadata: FinalizeMetadata) -> std::io::Result<()> {
+            self.tail_mutations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn remove_verified_parity_source(
+            &self,
+            _receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
+            _source: &Entry,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn main_failure_drains_admitted_work_without_delete_or_finalize() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let plan = preflight_sync(
+            entries(vec![
+                directory("0dir", 0o755),
+                file("a", 1, 1),
+                file("b", 1, 1),
+            ]),
+            entries(vec![directory("0dir", 0o755), file("obsolete", 1, 1)]),
+            ComparisonPolicy {
+                preserve_times: true,
+                ..Default::default()
+            },
+            Some(DeletePolicy {
+                limit: DeleteLimit::Percentage(100),
+                force: false,
+            }),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let tail_mutations = Arc::new(AtomicUsize::new(0));
+        let controller = SyncController::new(
+            FailingExecutor {
+                started: Arc::new(tokio::sync::Notify::new()),
+                failed: Arc::clone(&failed),
+                release: Arc::clone(&release),
+                completed: Arc::clone(&completed),
+                tail_mutations: Arc::clone(&tail_mutations),
+            },
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let execution = tokio::spawn(async move { controller.execute(plan).await });
+        failed.notified().await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !execution.is_finished(),
+            "session returned while a transaction was still active"
+        );
+        release.notify_one();
+        let error = execution.await.unwrap().unwrap_err();
+        assert!(matches!(error, ControllerError::Backend { .. }));
+        assert!(completed.load(Ordering::SeqCst));
+        assert_eq!(tail_mutations.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn preflight_spools_source_backed_operations_in_order() {
         let source = entries(vec![file("a", 1, 1), file("c", 3, 1)]);
         let destination = entries(vec![file("b", 2, 1), file("c", 3, 1)]);
-        let mut plan = preflight_remote_push(
+        let mut plan = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -887,7 +1017,7 @@ mod tests {
     async fn semantic_scope_skips_work_without_hiding_source_from_delete_preflight() {
         let source = entries(vec![file("parent/keep", 1, 1)]);
         let destination = entries(vec![directory("parent", 0o755), file("remove", 1, 1)]);
-        let mut plan = preflight_remote_push_scoped(
+        let mut plan = preflight_sync_scoped(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -920,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_only_source_directory_does_not_queue_finalize_metadata() {
-        let mut plan = preflight_remote_push(
+        let mut plan = preflight_sync(
             entries(vec![directory("missing", 0o755)]),
             entries(vec![]),
             ComparisonPolicy {
@@ -957,7 +1087,7 @@ mod tests {
             file("skip", 1, 1),
             file("update", 3, 1),
         ]);
-        let plan = preflight_remote_push(
+        let plan = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -970,7 +1100,7 @@ mod tests {
         .await
         .unwrap();
 
-        let preview = preview_remote_push(plan, |_| {}).await.unwrap();
+        let preview = preview_sync(plan, |_| {}).await.unwrap();
         assert_eq!(preview.planned_operations, 3);
         assert_eq!(preview.files_created, 1);
         assert_eq!(preview.files_updated, 1);
@@ -990,8 +1120,8 @@ mod tests {
         };
 
         assert!(matches!(
-            preflight_remote_push(source, destination, policy, None, |_| true).await,
-            Err(RemotePushControllerError::UnsupportedContentComparison(value))
+            preflight_sync(source, destination, policy, None, |_| true).await,
+            Err(ControllerError::UnsupportedContentComparison(value))
                 if value == path("a")
         ));
     }
@@ -1002,7 +1132,7 @@ mod tests {
             mode: crate::engine::planner::ComparisonMode::Checksum,
             ..ComparisonPolicy::default()
         };
-        let mut equal = preflight_remote_push_scoped_with_content(
+        let mut equal = preflight_sync_scoped_with_content(
             entries(vec![file("a", 4, 1)]),
             entries(vec![file("a", 4, 2)]),
             policy,
@@ -1018,7 +1148,7 @@ mod tests {
             Some(SyncOp::Skip { source, .. }) if source.path == path("a")
         ));
 
-        let mut changed = preflight_remote_push_scoped_with_content(
+        let mut changed = preflight_sync_scoped_with_content(
             entries(vec![file("b", 4, 1)]),
             entries(vec![file("b", 4, 2)]),
             policy,
@@ -1043,7 +1173,7 @@ mod tests {
             file("parent/keep", 1, 1),
             file("remove", 1, 1),
         ]);
-        let mut plan = preflight_remote_push(
+        let mut plan = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1077,7 +1207,7 @@ mod tests {
         let destination = entries(vec![file("keep", 1, 1), file("remove", 1, 1)]);
 
         assert!(matches!(
-            preflight_remote_push(
+            preflight_sync(
                 source,
                 destination,
                 ComparisonPolicy::default(),
@@ -1088,7 +1218,7 @@ mod tests {
                 |_| true,
             )
             .await,
-            Err(RemotePushControllerError::DeletePlan(
+            Err(ControllerError::DeletePlan(
                 DeletePlanError::ThresholdExceeded {
                     eligible_destination_entries: 2,
                     delete_candidates: 1,
@@ -1104,7 +1234,7 @@ mod tests {
         let mut source_directory = directory("parent", 0o755);
         source_directory.modified = modified;
         let destination_directory = source_directory.clone();
-        let mut plan = preflight_remote_push(
+        let mut plan = preflight_sync(
             entries(vec![source_directory]),
             entries(vec![destination_directory]),
             ComparisonPolicy {
@@ -1240,7 +1370,7 @@ mod tests {
             preserve_times: true,
             ..ComparisonPolicy::default()
         };
-        let plan = preflight_remote_push(
+        let plan = preflight_sync(
             source,
             destination,
             comparison,
@@ -1259,7 +1389,7 @@ mod tests {
             Scheduler::new(ResourceBudget::default()).unwrap(),
             BasisIndexLimits::default(),
         );
-        let controller = RemotePushController::new(executor, NonZeroUsize::new(4).unwrap());
+        let controller = SyncController::new(executor, NonZeroUsize::new(4).unwrap());
         let summary = controller.execute(plan).await.unwrap();
         let order = server.await.unwrap();
 
@@ -1299,12 +1429,12 @@ mod tests {
             ..ComparisonPolicy::default()
         };
 
-        let err = preflight_remote_push(source, destination, policy, None, |_| true)
+        let err = preflight_sync(source, destination, policy, None, |_| true)
             .await
             .unwrap_err();
 
         match err {
-            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
+            ControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
                 assert_eq!(collision.existing, path("dir/File.txt"));
                 assert_eq!(collision.colliding, path("dir/file.txt"));
             }
@@ -1322,12 +1452,12 @@ mod tests {
             ..ComparisonPolicy::default()
         };
 
-        let err = preflight_remote_push(source, destination, policy, None, |_| true)
+        let err = preflight_sync(source, destination, policy, None, |_| true)
             .await
             .unwrap_err();
 
         match err {
-            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
+            ControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
                 assert_eq!(collision.existing, path("FOO.txt"));
                 assert_eq!(collision.colliding, path("foo.txt"));
             }
@@ -1347,13 +1477,13 @@ mod tests {
             ..ComparisonPolicy::default()
         };
 
-        let err = preflight_remote_push(source, destination, policy, None, |_| true)
+        let err = preflight_sync(source, destination, policy, None, |_| true)
             .await
             .unwrap_err();
 
         assert!(matches!(
             err,
-            RemotePushControllerError::Namespace(NamespacePreflightError::Collision(_))
+            ControllerError::Namespace(NamespacePreflightError::Collision(_))
         ));
     }
 
@@ -1366,7 +1496,7 @@ mod tests {
             ..ComparisonPolicy::default()
         };
 
-        let plan = preflight_remote_push(source, destination, policy, None, |_| true)
+        let plan = preflight_sync(source, destination, policy, None, |_| true)
             .await
             .unwrap();
 
@@ -1377,7 +1507,7 @@ mod tests {
     async fn preflight_rejects_source_directory_replacement_before_subtree_staging() {
         let source = entries(vec![directory("swap", 0o755)]);
         let destination = entries(vec![file("swap", 3, 1)]);
-        let err = preflight_remote_push(
+        let err = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1388,7 +1518,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            RemotePushControllerError::UnsupportedTypeTransition { .. }
+            ControllerError::UnsupportedTypeTransition { .. }
         ));
     }
 
@@ -1396,7 +1526,7 @@ mod tests {
     async fn preflight_rejects_non_empty_directory_replacement_without_delete() {
         let source = entries(vec![file("swap", 3, 1)]);
         let destination = entries(vec![directory("swap", 0o755), file("swap/child", 10, 1)]);
-        let err = preflight_remote_push(
+        let err = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1406,7 +1536,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+            ControllerError::NonEmptyDirectoryReplacementRequiresDelete {
                 path,
                 discarded_entries,
             } => {
@@ -1424,7 +1554,7 @@ mod tests {
     async fn preflight_allows_empty_directory_replacement_without_delete() {
         let source = entries(vec![file("swap", 3, 1)]);
         let destination = entries(vec![directory("swap", 0o755)]);
-        let plan = preflight_remote_push(
+        let plan = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1449,7 +1579,7 @@ mod tests {
             limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
             force: false,
         };
-        let mut plan = preflight_remote_push(
+        let mut plan = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1480,7 +1610,7 @@ mod tests {
             limit: crate::engine::delete_plan::DeleteLimit::Count(1),
             force: false,
         };
-        let err = preflight_remote_push(
+        let err = preflight_sync(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1491,7 +1621,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            RemotePushControllerError::DeletePlan(DeletePlanError::CountExceeded {
+            ControllerError::DeletePlan(DeletePlanError::CountExceeded {
                 delete_candidates: 2,
                 limit: 1,
             })
@@ -1505,7 +1635,7 @@ mod tests {
             directory("swap", 0o755),
             file("swap/protected", 10, 1),
         ]);
-        let err = preflight_remote_push_scoped(
+        let err = preflight_sync_scoped(
             source,
             destination,
             ComparisonPolicy::default(),
@@ -1519,10 +1649,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
-                path,
-                descendant,
-            } => {
+            ControllerError::CannotReplaceDirectoryWithProtectedDescendant { path, descendant } => {
                 assert_eq!(path, RelativePath::new("swap").unwrap());
                 assert_eq!(descendant, RelativePath::new("swap/protected").unwrap());
             }
@@ -1542,13 +1669,13 @@ mod tests {
             ..ComparisonPolicy::default()
         };
 
-        let err = preflight_remote_push(source, destination, policy, None, |_| true)
+        let err = preflight_sync(source, destination, policy, None, |_| true)
             .await
             .unwrap_err();
 
         assert!(matches!(
             err,
-            RemotePushControllerError::Namespace(NamespacePreflightError::Ambiguity(_))
+            ControllerError::Namespace(NamespacePreflightError::Ambiguity(_))
         ));
     }
 }

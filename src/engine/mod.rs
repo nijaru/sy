@@ -1,4 +1,5 @@
 pub mod compression;
+pub mod controller;
 #[doc(hidden)]
 pub mod delete_journal;
 pub mod delete_plan;

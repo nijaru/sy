@@ -272,7 +272,7 @@ impl RemotePullExecutor {
     pub async fn execute(
         &self,
         item: WorkItem<RemotePullAction>,
-    ) -> Result<Option<crate::remote::transfer::TransferSummary>> {
+    ) -> Result<Option<crate::engine::work::TransferSummary>> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
@@ -424,7 +424,7 @@ impl RemotePullExecutor {
         destination: Option<Entry>,
         metadata: PullTransferMetadata,
         group: [u8; 32],
-    ) -> Result<Option<crate::remote::transfer::TransferSummary>> {
+    ) -> Result<Option<crate::engine::work::TransferSummary>> {
         let expected_destination = destination_expectation(destination.as_ref())?;
         let mut groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(&group).cloned() {
@@ -459,7 +459,7 @@ impl RemotePullExecutor {
                 crate::sync::output::ItemizeOp::Create
             };
             self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-            return Ok(Some(crate::remote::transfer::TransferSummary {
+            return Ok(Some(crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
                 literal_bytes: 0,
@@ -511,7 +511,7 @@ impl RemotePullExecutor {
         source: &Entry,
         expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
-    ) -> Result<crate::remote::transfer::TransferSummary> {
+    ) -> Result<crate::engine::work::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone());
@@ -1049,48 +1049,26 @@ fn system_time_from_timestamp(timestamp: Timestamp) -> std::time::SystemTime {
     }
 }
 
-impl crate::remote::push_controller::SyncPlanExecutor for RemotePullExecutor {
+impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
     type Action = RemotePullAction;
     type Error = RemotePullError;
 
     fn lower(
         &self,
         op: crate::engine::domain::SyncOp,
-        policy: crate::remote::push::RemotePushPolicy,
-    ) -> std::result::Result<
-        crate::remote::push_controller::LoweredSyncWork<RemotePullAction>,
-        RemotePullError,
-    > {
-        let lowered = crate::remote::pull_lower::lower_pull_op(
-            op,
-            crate::remote::pull_lower::PullLowerPolicy {
-                preserve_permissions: policy.preserve_permissions,
-                preserve_times: policy.preserve_times,
-            },
-        )?;
-        Ok(crate::remote::push_controller::LoweredSyncWork {
-            main: lowered.main,
-            finalize: lowered.finalize,
-        })
+        policy: crate::engine::planner::ExecutionPolicy,
+    ) -> std::result::Result<Option<WorkItem<RemotePullAction>>, RemotePullError> {
+        crate::remote::pull_lower::lower_pull_op(op, policy)
     }
 
     fn is_directory_action(&self, action: &RemotePullAction) -> bool {
         matches!(action, RemotePullAction::CreateDirectory { .. })
     }
 
-    fn is_leaf_action(&self, _action: &RemotePullAction) -> bool {
-        true
-    }
-
-    fn leaf_resources(&self, action: &RemotePullAction) -> ResourceRequest {
-        crate::remote::pull_lower::action_resources(action)
-    }
-
     async fn execute(
         &self,
         item: WorkItem<RemotePullAction>,
-    ) -> std::result::Result<Option<crate::remote::transfer::TransferSummary>, RemotePullError>
-    {
+    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, RemotePullError> {
         RemotePullExecutor::execute(self, item).await
     }
 
@@ -1115,13 +1093,6 @@ impl crate::remote::push_controller::SyncPlanExecutor for RemotePullExecutor {
         _source: &Entry,
     ) -> std::result::Result<(), RemotePullError> {
         Ok(())
-    }
-
-    fn on_execute_error(
-        &self,
-        error: &RemotePullError,
-    ) -> crate::remote::push_controller::RemotePushControllerError {
-        crate::remote::push_controller::RemotePushControllerError::Worker(error.to_string())
     }
 }
 

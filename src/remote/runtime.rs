@@ -10,6 +10,7 @@ use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::EntryStream;
 use crate::engine::scan::ScanRequest;
+use crate::engine::work::TransferSummary;
 use crate::protocol::{
     CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
     PROTOCOL_V3_2,
@@ -27,7 +28,7 @@ use crate::remote::signature::{
     RemoteSignatureError, SignatureEvent, SignatureStream,
 };
 use crate::remote::transfer::{
-    request_file_transfer, serve_incoming_file_rooted, RemoteTransferError, TransferSummary,
+    request_file_transfer, serve_incoming_file_rooted, RemoteTransferError,
 };
 use crate::remote::xattr::{
     request_read_xattrs, request_write_xattrs, serve_incoming_xattr_rooted, RemoteXattrError,

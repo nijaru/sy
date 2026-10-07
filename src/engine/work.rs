@@ -1,5 +1,14 @@
 use super::scheduler::ResourceRequest;
 
+/// Verified byte-transfer accounting returned by endpoint executors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferSummary {
+    pub file_size: u64,
+    pub digest: [u8; 32],
+    pub literal_bytes: u64,
+    pub reused_bytes: u64,
+}
+
 /// One concrete execution action paired with the scheduler resources it may
 /// consume while running.
 ///

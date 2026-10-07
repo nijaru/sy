@@ -14,15 +14,13 @@ use crate::sync::scanner::ScanOptions;
 use crate::sync::stats::SyncStats;
 use futures::{future, StreamExt};
 use sy::engine::compression::CompressionPolicy;
+use sy::engine::controller::{ControllerError, PreviewOp, SyncPreview, SyncSummary};
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use sy::engine::namespace::{NamespacePreflightError, NamespaceSemantics};
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
-use sy::remote::push_controller::{
-    PreviewOp, RemotePushControllerError, RemotePushPreview, RemotePushSummary,
-};
 
 pub(crate) struct SourceFilterSelection {
     filter: FilterEngine,
@@ -239,7 +237,7 @@ pub(crate) fn emit_diff_line(item: PreviewOp<'_>) {
     }
 }
 
-pub(crate) fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
+pub(crate) fn preview_stats(preview: SyncPreview) -> Result<SyncStats> {
     Ok(SyncStats {
         files_scanned: preview.planned_operations,
         files_created: preview.files_created,
@@ -254,7 +252,7 @@ pub(crate) fn preview_stats(preview: RemotePushPreview) -> Result<SyncStats> {
     })
 }
 
-pub(crate) fn summary_stats(summary: RemotePushSummary) -> Result<SyncStats> {
+pub(crate) fn summary_stats(summary: SyncSummary) -> Result<SyncStats> {
     Ok(SyncStats {
         files_scanned: summary.planned_operations,
         files_created: summary.files_created,
@@ -275,8 +273,8 @@ pub(crate) fn to_usize(value: u64, counter: &'static str) -> Result<usize> {
         .map_err(|_| SyncError::Config(format!("{counter} counter exceeds platform usize range")))
 }
 
-pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncError {
-    if let RemotePushControllerError::DeletePlan(DeletePlanError::ThresholdExceeded {
+pub(crate) fn map_controller_error(error: ControllerError) -> SyncError {
+    if let ControllerError::DeletePlan(DeletePlanError::ThresholdExceeded {
         eligible_destination_entries,
         delete_candidates,
         threshold,
@@ -292,7 +290,7 @@ pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             threshold: *threshold,
         };
     }
-    if let RemotePushControllerError::DeletePlan(DeletePlanError::CountExceeded {
+    if let ControllerError::DeletePlan(DeletePlanError::CountExceeded {
         delete_candidates,
         limit,
     }) = &error
@@ -302,7 +300,7 @@ pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             limit: *limit,
         };
     }
-    if let RemotePushControllerError::Namespace(error) = &error {
+    if let ControllerError::Namespace(error) = &error {
         match error {
             NamespacePreflightError::Collision(collision) => {
                 return SyncError::NamespaceCollision {
@@ -320,7 +318,7 @@ pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             _ => {}
         }
     }
-    if let RemotePushControllerError::UnsupportedTypeTransition {
+    if let ControllerError::UnsupportedTypeTransition {
         path,
         source_kind,
         destination_kind,
@@ -332,7 +330,7 @@ pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             destination_kind: format!("{destination_kind:?}"),
         };
     }
-    if let RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+    if let ControllerError::NonEmptyDirectoryReplacementRequiresDelete {
         path,
         discarded_entries,
     } = &error
@@ -342,10 +340,8 @@ pub(crate) fn map_controller_error(error: RemotePushControllerError) -> SyncErro
             discarded_entries: *discarded_entries,
         };
     }
-    if let RemotePushControllerError::CannotReplaceDirectoryWithProtectedDescendant {
-        path,
-        descendant,
-    } = &error
+    if let ControllerError::CannotReplaceDirectoryWithProtectedDescendant { path, descendant } =
+        &error
     {
         return SyncError::CannotReplaceDirectoryWithProtectedDescendant {
             path: path.as_path().to_path_buf(),

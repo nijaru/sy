@@ -14,13 +14,13 @@ use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use sy::engine::controller::{
+    preflight_sync_scoped, preflight_sync_scoped_with_content, preview_sync, ControllerError,
+    SyncController, SyncSummary,
+};
 use sy::engine::domain::Entry;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::remote::local_executor::LocalSyncExecutor;
-use sy::remote::push_controller::{
-    preflight_remote_push_scoped, preflight_remote_push_scoped_with_content, preview_remote_push,
-    RemotePushController, RemotePushControllerError, RemotePushSummary,
-};
 
 pub(super) async fn run(
     source_root: &Path,
@@ -78,7 +78,7 @@ pub(super) async fn run(
     let plan = if config.comparison.checksum {
         let source_root_owned = source_root.to_path_buf();
         let destination_root_owned = destination_root.to_path_buf();
-        preflight_remote_push_scoped_with_content(
+        preflight_sync_scoped_with_content(
             source,
             destination,
             comparison_policy(
@@ -112,13 +112,13 @@ pub(super) async fn run(
                         source.path.as_path(),
                     )
                     .await
-                    .map_err(|error| RemotePushControllerError::Worker(error.to_string()))?;
+                    .map_err(|error| ControllerError::Worker(error.to_string()))?;
                     let destination_hash = sy::endpoint::io::hash_file_streaming(
                         &destination_endpoint,
                         destination.path.as_path(),
                     )
                     .await
-                    .map_err(|error| RemotePushControllerError::Worker(error.to_string()))?;
+                    .map_err(|error| ControllerError::Worker(error.to_string()))?;
                     Ok(source_hash == destination_hash)
                 }
             },
@@ -126,7 +126,7 @@ pub(super) async fn run(
         .await
         .map_err(map_controller_error)?
     } else {
-        preflight_remote_push_scoped(
+        preflight_sync_scoped(
             source,
             destination,
             comparison_policy(
@@ -151,7 +151,7 @@ pub(super) async fn run(
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
-        let preview = preview_remote_push(plan, |item| {
+        let preview = preview_sync(plan, |item| {
             if diff_mode {
                 emit_diff_line(item);
             }
@@ -199,7 +199,7 @@ pub(super) async fn run(
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
-    let summary: RemotePushSummary = RemotePushController::new(executor, max_in_flight)
+    let summary: SyncSummary = SyncController::new(executor, max_in_flight)
         .execute(plan)
         .await
         .map_err(map_controller_error)?;
