@@ -188,14 +188,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
     cli.validate()?;
 
     // After validation, source and destination must be present
-    let source = cli
-        .source
-        .as_ref()
-        .expect("source required after validation");
-    let destination = cli
-        .destination
-        .as_ref()
-        .expect("destination required after validation");
+    let (source, destination) = match (&cli.source, &cli.destination) {
+        (Some(src), Some(dest)) => (src, dest),
+        _ => return Err(anyhow::anyhow!("Source and destination paths are required")),
+    };
 
     // Create hook executor (unless disabled)
     let hook_executor = if cli.no_hooks {

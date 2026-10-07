@@ -232,14 +232,15 @@ where
 
         if let Some((replaced_path, _)) = &active_replaced_dir {
             if !is_descendant_of(item_path, replaced_path) {
-                let (path, count) = active_replaced_dir.take().unwrap();
-                if count > 0 && delete.is_none() {
-                    return Err(
-                        RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
-                            path,
-                            discarded_entries: count,
-                        },
-                    );
+                if let Some((path, count)) = active_replaced_dir.take() {
+                    if count > 0 && delete.is_none() {
+                        return Err(
+                            RemotePushControllerError::NonEmptyDirectoryReplacementRequiresDelete {
+                                path,
+                                discarded_entries: count,
+                            },
+                        );
+                    }
                 }
             }
         }
