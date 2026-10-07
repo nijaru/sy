@@ -6,6 +6,9 @@ mod acl_macos;
 
 use crate::endpoint::ExpectedDestination;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
+use bounded_xattrs::read_from_file as read_xattrs_from_file;
+mod bounded_xattrs;
+
 use std::ffi::OsString;
 use std::fs::File;
 #[cfg(unix)]
@@ -63,6 +66,9 @@ pub enum RootedFsError {
 
     #[error("extended attributes exceed the bounded set size: {len} bytes (maximum {max})")]
     XattrSetTooLarge { len: usize, max: usize },
+
+    #[error("extended attribute count {count} exceeds maximum {max}")]
+    XattrTooManyEntries { count: usize, max: usize },
 
     #[error("preservation changed the staged mode: expected {expected:#o}, observed {actual:#o}")]
     PreservationModeConflict { expected: u32, actual: u32 },
@@ -549,41 +555,6 @@ impl Drop for RootedNamespaceTransaction {
     }
 }
 
-#[cfg(unix)]
-fn read_xattrs_from_file(file: &File) -> Result<Vec<(OsString, Vec<u8>)>> {
-    use xattr::FileExt;
-
-    let mut xattrs = Vec::new();
-    let mut total = 0_usize;
-    for name in file.list_xattr()? {
-        // A value may be large on filesystems that store it out of line
-        // (macOS resource forks). Check the aggregate bound before retaining it.
-        let Some(value) = file.get_xattr(&name)? else {
-            continue;
-        };
-        total = total
-            .checked_add(name.as_bytes().len())
-            .and_then(|value_total| value_total.checked_add(value.len()))
-            .ok_or(RootedFsError::XattrSetTooLarge {
-                len: usize::MAX,
-                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-            })?;
-        if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
-            return Err(RootedFsError::XattrSetTooLarge {
-                len: total,
-                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-            });
-        }
-        xattrs.push((name, value));
-    }
-    Ok(xattrs)
-}
-
-#[cfg(not(unix))]
-fn read_xattrs_from_file(_file: &File) -> Result<Vec<(OsString, Vec<u8>)>> {
-    Err(RootedFsError::UnsupportedPlatform)
-}
-
 #[cfg(any(
     all(target_os = "linux", feature = "acl"),
     all(target_os = "macos", feature = "acl")
@@ -672,6 +643,26 @@ impl RootedFs {
 
     #[cfg(not(unix))]
     pub fn verify_root_path_blocking(&self) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Namespace binding of a leaf: held parent device/inode plus native name.
+    /// Distinct hardlink names have distinct bindings even when their inode is shared.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // libc device/inode integer types differ by platform.
+    pub(crate) fn entry_binding_blocking(&self, relative: &RelativePath) -> Result<[u8; 32]> {
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        let stat = stat_fd(parent.as_raw_fd())?;
+        let mut binding = blake3::Hasher::new();
+        binding.update(b"sy-entry-binding-v1\0");
+        binding.update(&(stat.st_dev as u64).to_le_bytes());
+        binding.update(&(stat.st_ino as u64).to_le_bytes());
+        binding.update(leaf.as_bytes());
+        Ok(*binding.finalize().as_bytes())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn entry_binding_blocking(&self, _relative: &RelativePath) -> Result<[u8; 32]> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -974,6 +965,41 @@ impl RootedFs {
             return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
         }
         self.read_bsd_flags_path_blocking(relative.as_path(), kind)
+    }
+
+    /// Demand-driven flags bound to the scanned inode, not an unchecked pathname.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn read_observed_bsd_flags_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        expected: EntryIdentity,
+    ) -> Result<u32> {
+        use std::os::macos::fs::MetadataExt;
+        let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
+        let changed = || RootedFsError::DestinationChanged(relative.as_path().to_path_buf());
+        let before = file.metadata()?;
+        if crate::endpoint::local_identity::identity_for_metadata(&before) != Some(expected) {
+            return Err(changed());
+        }
+        let flags = before.st_flags();
+        if crate::endpoint::local_identity::identity_for_metadata(&file.metadata()?)
+            != Some(expected)
+            || self.path_identity_blocking(relative)? != Some((kind, expected))
+        {
+            return Err(changed());
+        }
+        Ok(flags)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn read_observed_bsd_flags_blocking(
+        &self,
+        _relative: &RelativePath,
+        _kind: EntryKind,
+        _expected: EntryIdentity,
+    ) -> Result<u32> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Mirror BSD file flags onto one file or directory beneath the pinned
@@ -2226,7 +2252,7 @@ fn open_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         libc::openat(
             parent,
             component.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {

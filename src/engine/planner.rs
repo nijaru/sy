@@ -1,4 +1,4 @@
-use super::domain::{Entry, EntryKind, SkipReason, SyncOp};
+use super::domain::{ContentComparison, Entry, EntryKind, SkipReason, SyncOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComparisonMode {
@@ -84,7 +84,12 @@ pub fn plan_entry(
     }
 
     match source.kind {
-        EntryKind::Directory => PlanDecision::Ready(metadata_or_skip(source, destination, policy)),
+        EntryKind::Directory => PlanDecision::Ready(metadata_or_skip(
+            source,
+            destination,
+            policy,
+            ContentComparison::Unverified,
+        )),
         EntryKind::Symlink => {
             if source.symlink_target != destination.symlink_target {
                 PlanDecision::Ready(SyncOp::Update {
@@ -92,7 +97,12 @@ pub fn plan_entry(
                     destination,
                 })
             } else {
-                PlanDecision::Ready(metadata_or_skip(source, destination, policy))
+                PlanDecision::Ready(metadata_or_skip(
+                    source,
+                    destination,
+                    policy,
+                    ContentComparison::Unverified,
+                ))
             }
         }
         EntryKind::File => plan_file(source, destination, policy),
@@ -109,7 +119,7 @@ pub fn finish_content_comparison(
     debug_assert_eq!(destination.kind, EntryKind::File);
 
     if contents_equal {
-        metadata_or_skip(source, destination, policy)
+        metadata_or_skip(source, destination, policy, ContentComparison::Blake3)
     } else {
         SyncOp::Update {
             source,
@@ -126,7 +136,12 @@ fn plan_file(source: Entry, destination: Entry, policy: ComparisonPolicy) -> Pla
         }),
         ComparisonMode::SizeOnly => {
             if source.size == destination.size {
-                PlanDecision::Ready(metadata_or_skip(source, destination, policy))
+                PlanDecision::Ready(metadata_or_skip(
+                    source,
+                    destination,
+                    policy,
+                    ContentComparison::Unverified,
+                ))
             } else {
                 PlanDecision::Ready(SyncOp::Update {
                     source,
@@ -136,7 +151,12 @@ fn plan_file(source: Entry, destination: Entry, policy: ComparisonPolicy) -> Pla
         }
         ComparisonMode::Quick => {
             if source.size == destination.size && source.modified == destination.modified {
-                PlanDecision::Ready(metadata_or_skip(source, destination, policy))
+                PlanDecision::Ready(metadata_or_skip(
+                    source,
+                    destination,
+                    policy,
+                    ContentComparison::Unverified,
+                ))
             } else {
                 PlanDecision::Ready(SyncOp::Update {
                     source,
@@ -160,7 +180,12 @@ fn plan_file(source: Entry, destination: Entry, policy: ComparisonPolicy) -> Pla
     }
 }
 
-fn metadata_or_skip(source: Entry, destination: Entry, policy: ComparisonPolicy) -> SyncOp {
+fn metadata_or_skip(
+    source: Entry,
+    destination: Entry,
+    policy: ComparisonPolicy,
+    comparison: ContentComparison,
+) -> SyncOp {
     let permission_change =
         policy.preserve_permissions && source.unix_mode != destination.unix_mode;
     let time_change = policy.preserve_times && source.modified != destination.modified;
@@ -171,9 +196,10 @@ fn metadata_or_skip(source: Entry, destination: Entry, policy: ComparisonPolicy)
             destination,
         }
     } else {
-        SyncOp::Skip {
+        SyncOp::Unchanged {
             source,
-            reason: SkipReason::Unchanged,
+            destination,
+            comparison,
         }
     }
 }

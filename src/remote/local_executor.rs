@@ -11,16 +11,15 @@
 //! entire point of local sync and must not regress behind a generic
 //! streaming loop.
 
-use crate::endpoint::receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
+use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptions};
+use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
-use crate::remote::bsdflags::{
-    apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
-};
+use crate::remote::bsdflags::{apply_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError};
 use crate::remote::xattr::{
     apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
 };
@@ -34,6 +33,8 @@ pub const LOCAL_FILE_WORKING_SET: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocalSyncError {
+    #[error(transparent)]
+    Existing(#[from] ExistingDestinationError),
     #[error(transparent)]
     Scheduler(#[from] crate::engine::scheduler::SchedulerError),
 
@@ -301,8 +302,7 @@ impl LocalSyncExecutor {
         if !self.bsd_flags || source.is_symlink() {
             return Ok(None);
         }
-        let location = BsdFlagsLocation::Local(self.source_root.as_path());
-        let flags = read_preserved_bsd_flags(&location, &source.path, source.kind).await?;
+        let flags = existing::observed_flags(self.source_root.clone(), source.clone()).await?;
         Ok(Some(flags))
     }
 
@@ -860,47 +860,12 @@ impl LocalSyncExecutor {
         self.remove_source_entry_on_disk(source).await
     }
 
-    /// Re-check source scan identity and unlink the non-directory source file.
+    /// Revalidate and unlink through a held root; never follow a raced ancestor.
     async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let path = self.source_path(&source.path);
-        let Some(expected) = source.identity else {
-            return Err(LocalSyncError::Source(
-                path.clone(),
-                std::io::Error::other("source entry changed between scan and removal"),
-            ));
-        };
-        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|_| {
-            LocalSyncError::Source(
-                path.clone(),
-                std::io::Error::other("source entry changed between scan and removal"),
-            )
-        })?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
-            .ok_or_else(|| {
-                LocalSyncError::Source(
-                    path.clone(),
-                    std::io::Error::other("source entry changed between scan and removal"),
-                )
-            })?;
-        if current != expected {
-            return Err(LocalSyncError::Source(
-                path.clone(),
-                std::io::Error::other("source entry changed between scan and removal"),
-            ));
-        }
-        if kind == EntryKind::Directory {
-            return Ok(());
-        }
-        tokio::fs::remove_file(&path)
+        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
             .await
-            .map_err(|error| LocalSyncError::Source(path.clone(), error))?;
+            .map_err(ExistingDestinationError::from)?;
+        existing::remove_observed_source(rooted, source.clone()).await?;
         Ok(())
     }
 
@@ -1038,24 +1003,58 @@ impl LocalSyncExecutor {
         Ok(())
     }
 
-    /// --remove-source-files for parity-verified entries: requires a
-    /// VerifiedExistingDestinationReceipt (strong content verification).
-    /// Quick-check equality alone never authorizes removal.
-    async fn remove_verified_parity_source(
+    /// Re-prove content and selected preservation on the observed destination;
+    /// a preflight comparison alone cannot authorize deletion later.
+    async fn remove_unchanged_source(
         &self,
-        receipt: &VerifiedExistingDestinationReceipt,
         source: &Entry,
+        destination: &Entry,
+        policy: ExecutionPolicy,
     ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
-        receipt.validate_source_removal(source).map_err(|error| {
-            LocalSyncError::Source(
-                self.source_path(&source.path),
-                std::io::Error::other(error.to_string()),
-            )
-        })?;
-        self.remove_source_entry_on_disk(source).await
+        let options = FingerprintOptions {
+            permissions: policy.preserve_permissions,
+            times: policy.preserve_times,
+            xattrs: self.xattrs,
+            acls: self.acls,
+            bsd_flags: self.bsd_flags,
+        };
+        let _permit = self
+            .scheduler
+            .acquire(ResourceRequest {
+                active_files: 1,
+                buffered_bytes: options.buffered_bytes(),
+                metadata_ops: 1,
+                cpu_tasks: 1,
+                ..ResourceRequest::default()
+            })
+            .await?;
+        let source_rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
+            .await
+            .map_err(ExistingDestinationError::from)?;
+        let destination_rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone())
+            .await
+            .map_err(ExistingDestinationError::from)?;
+        let source_fingerprint =
+            existing::fingerprint(source_rooted.clone(), source.clone(), options).await?;
+        let destination_fingerprint =
+            existing::fingerprint(destination_rooted.clone(), destination.clone(), options).await?;
+        let receipt = existing::receipt(
+            source,
+            destination,
+            source_fingerprint,
+            destination_fingerprint,
+        )?;
+        existing::remove_verified_source(
+            source_rooted,
+            source.clone(),
+            receipt,
+            Some(destination_rooted),
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -1096,12 +1095,13 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
         LocalSyncExecutor::execute_finalize(self, metadata).await
     }
 
-    async fn remove_verified_parity_source(
+    async fn remove_unchanged_source(
         &self,
-        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &Entry,
+        destination: &Entry,
+        policy: ExecutionPolicy,
     ) -> std::result::Result<(), LocalSyncError> {
-        LocalSyncExecutor::remove_verified_parity_source(self, receipt, source).await
+        LocalSyncExecutor::remove_unchanged_source(self, source, destination, policy).await
     }
 }
 
@@ -1199,7 +1199,7 @@ pub fn lower_local_op(
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(None),
+        SyncOp::Skip { .. } | SyncOp::Unchanged { .. } => Ok(None),
     }
 }
 

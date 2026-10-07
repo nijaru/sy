@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod existing;
 pub mod io;
 pub mod local;
 pub mod local_entry_scan;
@@ -14,9 +15,7 @@ use std::time::{Duration, SystemTime};
 
 pub use io::{BoxReader, ExpectedDestination, StagedWriter};
 #[allow(unused_imports)]
-pub use receipt::{
-    DestinationReceipt, PublishedDestinationReceipt, VerifiedExistingDestinationReceipt,
-};
+pub use receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {

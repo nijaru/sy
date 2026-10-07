@@ -30,7 +30,7 @@ pub fn lower_pull_op(
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(None),
+        SyncOp::Skip { .. } | SyncOp::Unchanged { .. } => Ok(None),
     }
 }
 

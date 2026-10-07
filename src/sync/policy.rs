@@ -222,7 +222,7 @@ pub(crate) fn emit_diff_line(item: PreviewOp<'_>) {
         PreviewOp::Operation(SyncOp::Metadata { source, .. }) => {
             tracing::info!("Would update metadata: {}", source.path)
         }
-        PreviewOp::Operation(SyncOp::Skip { source, .. }) => {
+        PreviewOp::Operation(SyncOp::Skip { source, .. } | SyncOp::Unchanged { source, .. }) => {
             tracing::info!("Would skip: {}", source.path)
         }
         PreviewOp::Delete(delete) => tracing::info!(

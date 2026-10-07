@@ -100,26 +100,29 @@ pub(super) async fn run(
                 let source_root = source_root_owned.clone();
                 let destination_root = destination_root_owned.clone();
                 async move {
-                    let source_endpoint = sy::endpoint::local::LocalEndpoint::new(source_root);
-                    let destination_endpoint =
-                        sy::endpoint::local::LocalEndpoint::new(destination_root);
-                    // Checksum comparison hashes both sides through the
-                    // same bounded streaming hasher the local verify path
-                    // uses; sizes are already equal (the planner only asks
-                    // for content comparison on size matches).
-                    let source_hash = sy::endpoint::io::hash_file_streaming(
-                        &source_endpoint,
-                        source.path.as_path(),
+                    let source_rooted = sy::rooted_fs::RootedFs::open(source_root)
+                        .await
+                        .map_err(|error| ControllerError::backend("content comparison", error))?;
+                    let destination_rooted = sy::rooted_fs::RootedFs::open(destination_root)
+                        .await
+                        .map_err(|error| ControllerError::backend("content comparison", error))?;
+                    // Comparison is bound to the scan observations, not merely to
+                    // whichever files happen to occupy these names when opened.
+                    let source_hash = sy::endpoint::existing::fingerprint(
+                        source_rooted,
+                        source,
+                        sy::endpoint::existing::FingerprintOptions::default(),
                     )
                     .await
-                    .map_err(|error| ControllerError::Worker(error.to_string()))?;
-                    let destination_hash = sy::endpoint::io::hash_file_streaming(
-                        &destination_endpoint,
-                        destination.path.as_path(),
+                    .map_err(|error| ControllerError::backend("content comparison", error))?;
+                    let destination_hash = sy::endpoint::existing::fingerprint(
+                        destination_rooted,
+                        destination,
+                        sy::endpoint::existing::FingerprintOptions::default(),
                     )
                     .await
-                    .map_err(|error| ControllerError::Worker(error.to_string()))?;
-                    Ok(source_hash == destination_hash)
+                    .map_err(|error| ControllerError::backend("content comparison", error))?;
+                    Ok(source_hash.content == destination_hash.content)
                 }
             },
         )

@@ -1,6 +1,6 @@
 use super::domain::{
-    Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath,
-    SkipReason, SyncOp, Timestamp,
+    ContentComparison, Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp,
+    RelativePath, SkipReason, SyncOp, Timestamp,
 };
 use std::ffi::OsStr;
 use std::io;
@@ -185,11 +185,23 @@ fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
             encode_entry(&mut payload, source)?;
             encode_entry(&mut payload, destination)?;
         }
+        SyncOp::Unchanged {
+            source,
+            destination,
+            comparison,
+        } => {
+            payload.push(5);
+            encode_entry(&mut payload, source)?;
+            encode_entry(&mut payload, destination)?;
+            payload.push(match comparison {
+                ContentComparison::Unverified => 0,
+                ContentComparison::Blake3 => 1,
+            });
+        }
         SyncOp::Skip { source, reason } => {
             payload.push(4);
             encode_entry(&mut payload, source)?;
             payload.push(match reason {
-                SkipReason::Unchanged => 0,
                 SkipReason::Filtered => 1,
                 SkipReason::ExistingOnly => 2,
                 SkipReason::DestinationNewer => 3,
@@ -221,7 +233,6 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
         4 => {
             let source = decode_entry(&mut reader)?;
             let reason = match reader.u8()? {
-                0 => SkipReason::Unchanged,
                 1 => SkipReason::Filtered,
                 2 => SkipReason::ExistingOnly,
                 3 => SkipReason::DestinationNewer,
@@ -233,6 +244,24 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
                 }
             };
             SyncOp::Skip { source, reason }
+        }
+        5 => {
+            let source = decode_entry(&mut reader)?;
+            let destination = decode_entry(&mut reader)?;
+            let comparison = match reader.u8()? {
+                0 => ContentComparison::Unverified,
+                1 => ContentComparison::Blake3,
+                _ => {
+                    return Err(PlanJournalError::InvalidRecord(
+                        "unknown content comparison",
+                    ))
+                }
+            };
+            SyncOp::Unchanged {
+                source,
+                destination,
+                comparison,
+            }
         }
         _ => {
             return Err(PlanJournalError::InvalidRecord(
@@ -474,6 +503,11 @@ mod tests {
                 source: source.clone(),
                 destination,
             },
+            SyncOp::Unchanged {
+                source: file("equal", 12, 3),
+                destination: file("equal", 12, 4),
+                comparison: ContentComparison::Blake3,
+            },
             SyncOp::Skip {
                 source: file("skip", 1, 0xBB),
                 reason: SkipReason::DestinationNewer,
@@ -538,7 +572,7 @@ mod tests {
         journal
             .append(&SyncOp::Skip {
                 source: file("skip", 1, 0xAA),
-                reason: SkipReason::Unchanged,
+                reason: SkipReason::Filtered,
             })
             .await
             .unwrap();
@@ -560,7 +594,7 @@ mod tests {
     fn decoder_rejects_trailing_bytes_and_unknown_tags() {
         let operation = SyncOp::Skip {
             source: file("skip", 1, 0xAA),
-            reason: SkipReason::Unchanged,
+            reason: SkipReason::Filtered,
         };
         let mut payload = encode_operation(&operation).unwrap();
         payload.push(0);

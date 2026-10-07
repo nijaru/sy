@@ -1,6 +1,8 @@
-use crate::endpoint::local_identity::metadata_identity;
+use crate::endpoint::existing::{
+    fingerprint, ExistingDestinationError, ExistingFingerprint, FingerprintOptions,
+};
 use crate::endpoint::Capabilities;
-use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
+use crate::engine::domain::{Entry, EntryIdentity, RelativePath, Timestamp};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireHashRequest,
     WireHashResult, HASH_DIGEST_LEN,
@@ -11,12 +13,11 @@ use crate::remote::path::{
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use bytes::Bytes;
-use std::io::Read;
-
-const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteHashError {
+    #[error(transparent)]
+    Fingerprint(#[from] ExistingDestinationError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
@@ -40,17 +41,6 @@ pub enum RemoteHashError {
 
     #[error("content hashing requires a scanned file identity")]
     MissingBasisIdentity,
-
-    #[error("opened file did not provide a stable identity")]
-    MissingObservedIdentity,
-
-    #[error(
-        "content-hash file size changed since scan (expected {expected} bytes, observed {actual} bytes)"
-    )]
-    SizeChanged { expected: u64, actual: u64 },
-
-    #[error("content-hash file identity changed since scan")]
-    IdentityChanged,
 
     #[error("content-hash stream {stream_id} ended before {expected:?}")]
     UnexpectedStreamEnd { stream_id: u32, expected: FrameKind },
@@ -90,6 +80,19 @@ pub async fn request_content_hash(
     basis: &Entry,
     peer: PlatformOs,
 ) -> Result<[u8; HASH_DIGEST_LEN]> {
+    Ok(
+        request_existing_fingerprint(sender, basis, peer, FingerprintOptions::default())
+            .await?
+            .content,
+    )
+}
+
+pub(crate) async fn request_existing_fingerprint(
+    sender: &RouterSender,
+    basis: &Entry,
+    peer: PlatformOs,
+    preservation: FingerprintOptions,
+) -> Result<ExistingFingerprint> {
     ensure_compatible_path_encoding(peer)?;
     if !basis.is_file() {
         return Err(RemoteHashError::InvalidBasis);
@@ -101,6 +104,7 @@ pub async fn request_content_hash(
         encode_relative_path(basis.path.as_path())?,
         basis.size,
         *identity.as_bytes(),
+        preservation,
     );
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
@@ -133,7 +137,11 @@ pub async fn request_content_hash(
     if result.file_size() != basis.size || result.identity() != *identity.as_bytes() {
         return Err(RemoteHashError::ResultSnapshotMismatch);
     }
-    let digest = result.digest();
+    let fingerprint = ExistingFingerprint {
+        content: result.digest(),
+        preservation: result.preservation(),
+        binding: result.binding(),
+    };
     drop(routed);
     sender
         .send(Frame::new(
@@ -143,7 +151,7 @@ pub async fn request_content_hash(
             Bytes::new(),
         )?)
         .await?;
-    Ok(digest)
+    Ok(fingerprint)
 }
 
 pub async fn serve_incoming_hash_rooted(
@@ -170,8 +178,16 @@ pub async fn serve_incoming_hash_rooted(
     let expected_identity = EntryIdentity::from_bytes(*request.identity());
     drop(first);
 
-    let digest = hash_rooted_file(rooted, path, expected_size, expected_identity).await?;
-    let result = WireHashResult::new(expected_size, *expected_identity.as_bytes(), digest);
+    let mut entry = Entry::file(path, expected_size, Timestamp::UNIX_EPOCH);
+    entry.identity = Some(expected_identity);
+    let observed = fingerprint(rooted, entry, request.preservation()).await?;
+    let result = WireHashResult::new(
+        expected_size,
+        *expected_identity.as_bytes(),
+        observed.content,
+        observed.preservation,
+        observed.binding,
+    );
     sender
         .send(Frame::new(
             FrameKind::HashResult,
@@ -189,58 +205,11 @@ pub async fn hash_rooted_file(
     expected_size: u64,
     expected_identity: EntryIdentity,
 ) -> Result<[u8; HASH_DIGEST_LEN]> {
-    tokio::task::spawn_blocking(move || {
-        hash_rooted_file_blocking(&rooted, &path, expected_size, expected_identity)
-    })
-    .await
-    .map_err(|error| RemoteHashError::Worker(error.to_string()))?
-}
-
-fn hash_rooted_file_blocking(
-    rooted: &RootedFs,
-    path: &RelativePath,
-    expected_size: u64,
-    expected_identity: EntryIdentity,
-) -> Result<[u8; HASH_DIGEST_LEN]> {
-    let mut file = rooted.open_regular_blocking(path)?;
-    validate_snapshot(&file, expected_size, expected_identity)?;
-
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
-    loop {
-        let read = match file.read(&mut buffer) {
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(RootedFsError::Io(error).into()),
-        };
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    validate_snapshot(&file, expected_size, expected_identity)?;
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn validate_snapshot(
-    file: &std::fs::File,
-    expected_size: u64,
-    expected_identity: EntryIdentity,
-) -> Result<()> {
-    let metadata = file.metadata().map_err(RootedFsError::Io)?;
-    if metadata.len() != expected_size {
-        return Err(RemoteHashError::SizeChanged {
-            expected: expected_size,
-            actual: metadata.len(),
-        });
-    }
-    let actual = metadata_identity(&metadata, EntryKind::File)
-        .ok_or(RemoteHashError::MissingObservedIdentity)?;
-    if actual != expected_identity {
-        return Err(RemoteHashError::IdentityChanged);
-    }
-    Ok(())
+    let mut entry = Entry::file(path, expected_size, Timestamp::UNIX_EPOCH);
+    entry.identity = Some(expected_identity);
+    Ok(fingerprint(rooted, entry, FingerprintOptions::default())
+        .await?
+        .content)
 }
 
 async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
@@ -302,6 +271,8 @@ pub fn require_blake3(capabilities: &Capabilities) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::endpoint::local_identity::metadata_identity;
+    use crate::engine::domain::EntryKind;
     use crate::engine::domain::Timestamp;
     use crate::protocol::Platform;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
@@ -359,6 +330,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hashing_keeps_the_negotiated_root_after_its_path_is_replaced() {
+        let root = tempfile::TempDir::new().unwrap();
+        let relocated = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("file"), b"original").unwrap();
+        let basis = file_entry(root.path(), "file");
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        std::fs::rename(root.path(), relocated.path().join("held")).unwrap();
+        std::fs::create_dir(root.path()).unwrap();
+        std::fs::write(root.path().join("file"), b"decoy").unwrap();
+        let digest = hash_rooted_file(rooted, basis.path, basis.size, basis.identity.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(digest, *blake3::hash(b"original").as_bytes());
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"decoy");
+    }
+
+    #[tokio::test]
     async fn rooted_hash_rejects_scan_snapshot_change() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"before").unwrap();
@@ -370,7 +358,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            RemoteHashError::SizeChanged { .. } | RemoteHashError::IdentityChanged
+            RemoteHashError::Fingerprint(ExistingDestinationError::ObservationChanged(_))
         ));
     }
 }

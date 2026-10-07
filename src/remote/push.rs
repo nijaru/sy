@@ -1,4 +1,5 @@
-use crate::endpoint::receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
+use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptions};
+use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::Capabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
@@ -9,9 +10,7 @@ use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
-use crate::remote::bsdflags::{
-    apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
-};
+use crate::remote::bsdflags::{apply_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError};
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{
     TransferDestination, TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
@@ -69,6 +68,8 @@ pub enum RemotePushLowerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushError {
+    #[error(transparent)]
+    Existing(#[from] ExistingDestinationError),
     #[error(transparent)]
     Scheduler(#[from] SchedulerError),
 
@@ -129,7 +130,7 @@ pub fn lower_sync_op(
             source,
             destination,
         } => lower_metadata(source, destination, policy),
-        SyncOp::Skip { .. } => Ok(None),
+        SyncOp::Skip { .. } | SyncOp::Unchanged { .. } => Ok(None),
     }
 }
 
@@ -437,12 +438,13 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         RemotePushExecutor::execute_finalize(self, metadata).await
     }
 
-    async fn remove_verified_parity_source(
+    async fn remove_unchanged_source(
         &self,
-        receipt: &crate::endpoint::receipt::VerifiedExistingDestinationReceipt,
         source: &crate::engine::domain::Entry,
+        destination: &crate::engine::domain::Entry,
+        policy: ExecutionPolicy,
     ) -> std::result::Result<(), RemotePushError> {
-        RemotePushExecutor::remove_verified_parity_source(self, receipt, source).await
+        RemotePushExecutor::remove_unchanged_source(self, source, destination, policy).await
     }
 }
 
@@ -625,7 +627,7 @@ impl RemotePushExecutor {
                     source.path.clone(),
                     source.identity,
                     &crate::endpoint::io::VerificationStatus::Verified,
-                    self.xattrs || self.acls,
+                    true,
                     bsd_flags.is_none(),
                 );
                 // Only rename-incompatible flags remain post-commit finalization.
@@ -775,7 +777,7 @@ impl RemotePushExecutor {
             source.path.clone(),
             source.identity,
             &crate::endpoint::io::VerificationStatus::Verified,
-            self.xattrs || self.acls,
+            true,
             bsd_flags.is_none(),
         );
         // Only rename-incompatible flags remain post-commit finalization.
@@ -894,24 +896,51 @@ impl RemotePushExecutor {
         Ok(())
     }
 
-    /// --remove-source-files: remove an entry the planner verified as already
-    /// in sync with the destination. Requires a VerifiedExistingDestinationReceipt
-    /// (strong content verification). Quick-check equality alone never authorizes removal.
-    pub async fn remove_verified_parity_source(
+    /// Re-prove destination content and preservation against scanned identities.
+    pub async fn remove_unchanged_source(
         &self,
-        receipt: &VerifiedExistingDestinationReceipt,
         source: &Entry,
+        destination: &Entry,
+        policy: ExecutionPolicy,
     ) -> Result<()> {
         if !self.remove_source_files {
             return Ok(());
         }
-        receipt.validate_source_removal(source).map_err(|error| {
-            RemotePushError::SourceRemoval(
-                self.source_root.join(source.path.as_path()),
-                std::io::Error::other(error.to_string()),
-            )
-        })?;
-        self.remove_source_entry_on_disk(source).await
+        let options = FingerprintOptions {
+            permissions: policy.preserve_permissions,
+            times: policy.preserve_times,
+            xattrs: self.xattrs,
+            acls: self.acls,
+            bsd_flags: self.bsd_flags,
+        };
+        let _permit = self
+            .scheduler
+            .acquire(ResourceRequest {
+                active_files: 1,
+                buffered_bytes: options.buffered_bytes(),
+                metadata_ops: 1,
+                cpu_tasks: 1,
+                network_writes: 1,
+            })
+            .await?;
+        let source_rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
+            .await
+            .map_err(ExistingDestinationError::from)?;
+        let source_fingerprint =
+            existing::fingerprint(source_rooted.clone(), source.clone(), options).await?;
+        let destination_fingerprint = self
+            .remote
+            .existing_fingerprint(destination, options)
+            .await
+            .map_err(RemoteSessionError::from)?;
+        let receipt = existing::receipt(
+            source,
+            destination,
+            source_fingerprint,
+            destination_fingerprint,
+        )?;
+        existing::remove_verified_source(source_rooted, source.clone(), receipt, None).await?;
+        Ok(())
     }
 
     /// Remove the source entry under --remove-source-files after the
@@ -933,50 +962,11 @@ impl RemotePushExecutor {
         self.remove_source_entry_on_disk(source).await
     }
 
-    #[cfg(unix)]
     async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let path = self.source_root.join(source.path.as_path());
-        let expected = source
-            .identity
-            .ok_or_else(|| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
-        let metadata = tokio::fs::symlink_metadata(&path)
+        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
             .await
-            .map_err(|_| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
-            .ok_or_else(|| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
-        if current != expected {
-            return Err(RemotePushError::SourceChangedBeforeRemoval(path));
-        }
-        // Only non-directories move. Empty directories stay, matching rsync's
-        // --remove-source-files semantics.
-        if kind == EntryKind::Directory {
-            return Ok(());
-        }
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| RemotePushError::SourceRemoval(path, error))?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let path = self.source_root.join(source.path.as_path());
-        let metadata = tokio::fs::symlink_metadata(&path)
-            .await
-            .map_err(|_| RemotePushError::SourceChangedBeforeRemoval(path.clone()))?;
-        if metadata.is_dir() {
-            return Ok(());
-        }
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| RemotePushError::SourceRemoval(path, error))?;
+            .map_err(ExistingDestinationError::from)?;
+        existing::remove_observed_source(rooted, source.clone()).await?;
         Ok(())
     }
 
@@ -1069,8 +1059,7 @@ impl RemotePushExecutor {
         if !self.bsd_flags || source.is_symlink() {
             return Ok(None);
         }
-        let location = BsdFlagsLocation::Local(self.source_root.as_path());
-        let flags = read_preserved_bsd_flags(&location, &source.path, source.kind).await?;
+        let flags = existing::observed_flags(self.source_root.clone(), source.clone()).await?;
         Ok(Some(flags))
     }
 

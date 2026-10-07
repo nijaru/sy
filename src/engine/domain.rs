@@ -235,21 +235,46 @@ impl Entry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    Unchanged,
     Filtered,
     ExistingOnly,
     MissingDestination,
     DestinationNewer,
 }
 
+/// The actual comparison performed for one unchanged regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentComparison {
+    Unverified,
+    Blake3,
+}
+
 /// Semantic result of reconciliation. No byte-transfer strategy appears here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOp {
-    Create { source: Entry },
-    Update { source: Entry, destination: Entry },
-    Replace { source: Entry, destination: Entry },
-    Metadata { source: Entry, destination: Entry },
-    Skip { source: Entry, reason: SkipReason },
+    Create {
+        source: Entry,
+    },
+    Update {
+        source: Entry,
+        destination: Entry,
+    },
+    Replace {
+        source: Entry,
+        destination: Entry,
+    },
+    Metadata {
+        source: Entry,
+        destination: Entry,
+    },
+    Unchanged {
+        source: Entry,
+        destination: Entry,
+        comparison: ContentComparison,
+    },
+    Skip {
+        source: Entry,
+        reason: SkipReason,
+    },
 }
 
 impl SyncOp {
@@ -259,6 +284,7 @@ impl SyncOp {
             | Self::Update { source, .. }
             | Self::Replace { source, .. }
             | Self::Metadata { source, .. }
+            | Self::Unchanged { source, .. }
             | Self::Skip { source, .. } => &source.path,
         }
     }

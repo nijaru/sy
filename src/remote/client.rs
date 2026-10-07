@@ -93,6 +93,16 @@ impl ClientRemoteHandle {
         request_scan(&self.sender, request, self.peer).await
     }
 
+    pub(crate) async fn existing_fingerprint(
+        &self,
+        basis: &Entry,
+        options: crate::endpoint::existing::FingerprintOptions,
+    ) -> crate::remote::hash::Result<crate::endpoint::existing::ExistingFingerprint> {
+        require_blake3(&self.capabilities)?;
+        crate::remote::hash::request_existing_fingerprint(&self.sender, basis, self.peer, options)
+            .await
+    }
+
     pub async fn content_hash(
         &self,
         basis: &Entry,

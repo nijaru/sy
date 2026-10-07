@@ -174,6 +174,17 @@ separate identity checks and rename/exchange syscalls, not atomic
 compare-and-swap; concurrent namespace writers can race those checks. Rename
 also does not promise power-loss durability or whole-run rollback.
 
+With `--remove-source-files`, transferred sources are removed only after commit
+and required preservation succeed. An unchanged regular file is eligible only
+with `--checksum`: sy re-reads both files and checks requested permissions,
+mtime, xattrs, ACLs and flags against the observed identities before removing
+its source. A changed destination or preservation mismatch stops the operation
+and retains the source. Quick-check skips and unchanged symlinks are retained.
+Source/destination namespace aliases are refused; distinct hardlink names are
+allowed. Remote files with indistinguishable inode and namespace identifiers
+are conservatively treated as aliases. These checks are not atomic with source
+unlink and do not provide isolation from concurrent namespace writers.
+
 ## Benchmarks
 
 Historical 0.4-era measurements (macOS M3 Max, NVMe); the 0.5 engine will be

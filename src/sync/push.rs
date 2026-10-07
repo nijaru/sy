@@ -430,7 +430,7 @@ mod tests {
             let hash = session.hash_handler();
             let file = session.file_handler();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..6 {
+            for _ in 0..7 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         let scan = scan.clone();

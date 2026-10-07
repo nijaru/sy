@@ -2,7 +2,7 @@
 //!
 //! Under the 0.5 transactional architecture, mutations to the destination
 //! (staging, verification, commit, post-commit finalization) produce an
-//! unforgeable `PublishedDestinationReceipt`.
+//! a `PublishedDestinationReceipt`.
 //!
 //! The source filesystem is read-only by default. `--remove-source-files` is the
 //! single authorized exception, and it strictly requires a verified receipt:
@@ -121,6 +121,12 @@ impl PublishedDestinationReceipt {
                 source.path.as_path().display()
             )));
         }
+        if !self.preservation_applied {
+            return Err(SyncError::Config(format!(
+                "cannot authorize source removal for '{}': required preservation incomplete",
+                source.path.as_path().display()
+            )));
+        }
         if !self.finalized {
             return Err(SyncError::Config(format!(
                 "cannot authorize source removal for '{}': post-commit finalization incomplete",
@@ -138,98 +144,32 @@ impl PublishedDestinationReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedExistingDestinationReceipt {
     path: RelativePath,
-    source_identity: Option<EntryIdentity>,
-    content_verified: bool,
+    source_identity: EntryIdentity,
+    destination_identity: EntryIdentity,
 }
 
 impl VerifiedExistingDestinationReceipt {
-    pub fn new(
+    // Only the endpoint proof owner may mint an existing-destination receipt.
+    pub(super) fn new(
         path: RelativePath,
-        source_identity: Option<EntryIdentity>,
-        content_verified: bool,
-    ) -> Result<Self> {
-        if !content_verified {
-            return Err(SyncError::Config(format!(
-                "quick-check equality alone cannot authorize source removal for '{}'",
-                path.as_path().display()
-            )));
-        }
-        Ok(Self {
+        source_identity: EntryIdentity,
+        destination_identity: EntryIdentity,
+    ) -> Self {
+        Self {
             path,
             source_identity,
-            content_verified,
-        })
+            destination_identity,
+        }
     }
 
     pub fn path(&self) -> &RelativePath {
         &self.path
     }
-
-    pub fn source_identity(&self) -> Option<EntryIdentity> {
+    pub fn source_identity(&self) -> EntryIdentity {
         self.source_identity
     }
-
-    pub fn is_content_verified(&self) -> bool {
-        self.content_verified
-    }
-
-    pub fn validate_source_removal(&self, source: &Entry) -> Result<()> {
-        if self.path != source.path {
-            return Err(SyncError::Config(format!(
-                "receipt path '{}' does not match source entry '{}'",
-                self.path.as_path().display(),
-                source.path.as_path().display()
-            )));
-        }
-        if let (Some(expected), Some(actual)) = (self.source_identity, source.identity) {
-            if expected != actual {
-                return Err(SyncError::SourceChanged {
-                    path: source.path.as_path().to_path_buf(),
-                });
-            }
-        }
-        if !self.content_verified {
-            return Err(SyncError::Config(format!(
-                "cannot authorize source removal for '{}': content was not verified",
-                source.path.as_path().display()
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Unified receipt authorizing source removal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DestinationReceipt {
-    Published(PublishedDestinationReceipt),
-    VerifiedExisting(VerifiedExistingDestinationReceipt),
-}
-
-impl DestinationReceipt {
-    pub fn path(&self) -> &RelativePath {
-        match self {
-            Self::Published(receipt) => receipt.path(),
-            Self::VerifiedExisting(receipt) => receipt.path(),
-        }
-    }
-
-    pub fn validate_source_removal(&self, source: &Entry) -> Result<()> {
-        match self {
-            Self::Published(receipt) => receipt.validate_source_removal(source),
-            Self::VerifiedExisting(receipt) => receipt.validate_source_removal(source),
-        }
-    }
-}
-
-impl From<PublishedDestinationReceipt> for DestinationReceipt {
-    fn from(receipt: PublishedDestinationReceipt) -> Self {
-        Self::Published(receipt)
-    }
-}
-
-impl From<VerifiedExistingDestinationReceipt> for DestinationReceipt {
-    fn from(receipt: VerifiedExistingDestinationReceipt) -> Self {
-        Self::VerifiedExisting(receipt)
+    pub fn destination_identity(&self) -> EntryIdentity {
+        self.destination_identity
     }
 }
 
@@ -324,16 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn verified_existing_receipt_requires_content_verification() {
+    fn published_receipt_rejects_missing_preservation() {
         let entry = sample_entry("foo/bar.txt", 42);
-        assert!(
-            VerifiedExistingDestinationReceipt::new(entry.path.clone(), entry.identity, false)
-                .is_err()
+        let receipt = PublishedDestinationReceipt::for_file(
+            entry.path.clone(),
+            entry.identity,
+            &VerificationStatus::Verified,
+            false,
+            true,
         );
-
-        let receipt =
-            VerifiedExistingDestinationReceipt::new(entry.path.clone(), entry.identity, true)
-                .unwrap();
-        assert!(receipt.validate_source_removal(&entry).is_ok());
+        assert!(receipt.validate_source_removal(&entry).is_err());
     }
 }
