@@ -1251,25 +1251,17 @@ impl Endpoint for LocalEndpoint {
         Ok(())
     }
 
-    async fn create_symlink(&self, target: &Path, dest: &Path) -> Result<()> {
+    async fn replace_symlink(
+        &self,
+        target: &Path,
+        dest: &Path,
+        expected: ExpectedDestination,
+        modified: Option<crate::engine::domain::Timestamp>,
+    ) -> Result<()> {
         #[cfg(unix)]
         {
-            let rel = match sy::engine::domain::RelativePath::new(dest.to_path_buf()) {
-                Ok(rel) => rel,
-                Err(_) => {
-                    let full_dest = self.resolve(dest);
-                    if let Some(parent) = full_dest.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-
-                    let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
-                    let guard = crate::temp_file::TempFileGuard::new(&temp);
-                    tokio::fs::symlink(target, &temp).await?;
-                    tokio::fs::rename(&temp, &full_dest).await?;
-                    guard.defuse();
-                    return Ok(());
-                }
-            };
+            let rel = sy::engine::domain::RelativePath::new(dest.to_path_buf())
+                .map_err(|error| SyncError::Config(error.to_string()))?;
 
             let rooted = self.rooted_fs(true).await?;
             let target = target.to_path_buf();
@@ -1280,7 +1272,12 @@ impl Endpoint for LocalEndpoint {
                         .map_err(map_rooted_fs_error)?;
                 }
                 rooted
-                    .replace_symlink_blocking(&rel, &target)
+                    .replace_symlink_blocking(
+                        &rel,
+                        &target,
+                        rooted_expected_destination(expected),
+                        modified,
+                    )
                     .map_err(map_rooted_fs_error)
             })
             .await
@@ -1288,7 +1285,7 @@ impl Endpoint for LocalEndpoint {
         }
         #[cfg(not(unix))]
         {
-            let _ = (target, dest);
+            let _ = (target, dest, expected, modified);
             Err(SyncError::Config(
                 "symlink creation is not implemented for this platform".to_string(),
             ))
@@ -1845,8 +1842,18 @@ mod tests {
             .create_symlink(Path::new("first"), Path::new("link"))
             .await
             .unwrap();
+        let identity = crate::endpoint::local_identity::metadata_identity(
+            &fs::symlink_metadata(dir.path().join("link")).unwrap(),
+            crate::engine::domain::EntryKind::Symlink,
+        )
+        .unwrap();
         endpoint
-            .create_symlink(Path::new("second"), Path::new("link"))
+            .replace_symlink(
+                Path::new("second"),
+                Path::new("link"),
+                ExpectedDestination::Unchanged(identity),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(

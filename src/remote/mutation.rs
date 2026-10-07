@@ -1,4 +1,4 @@
-use crate::engine::domain::{EntryIdentity, RelativePath};
+use crate::engine::domain::{EntryIdentity, RelativePath, Timestamp};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireMutation,
     WireMutationKind, WirePath,
@@ -85,6 +85,8 @@ pub async fn request_replace_symlink(
     sender: &RouterSender,
     path: &RelativePath,
     target: &Path,
+    expected_identity: Option<EntryIdentity>,
+    modified: Option<Timestamp>,
     peer: PlatformOs,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
@@ -93,6 +95,8 @@ pub async fn request_replace_symlink(
         WireMutation::replace_symlink(
             encode_relative_path(path.as_path())?,
             encode_native_target(target, peer)?,
+            expected_identity.map(|identity| *identity.as_bytes()),
+            modified.map(|time| (time.seconds(), time.nanoseconds())),
         ),
     )
     .await
@@ -201,6 +205,14 @@ pub async fn serve_incoming_mutation_rooted(
         .expected_identity()
         .copied()
         .map(EntryIdentity::from_bytes);
+    let modified = mutation
+        .modified()
+        .map(|(seconds, nanos)| Timestamp::new(seconds, nanos))
+        .transpose()
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "modified_nanoseconds",
+            reason: "nanoseconds must be less than one second",
+        })?;
     drop(first);
 
     tokio::task::spawn_blocking(move || {
@@ -211,6 +223,7 @@ pub async fn serve_incoming_mutation_rooted(
             target,
             copy_source,
             expected_identity,
+            modified,
         )
     })
     .await
@@ -234,12 +247,17 @@ fn apply_mutation(
     target: Option<PathBuf>,
     copy_source: Option<RelativePath>,
     expected_identity: Option<EntryIdentity>,
+    modified: Option<Timestamp>,
 ) -> Result<()> {
     match kind {
         WireMutationKind::CreateDirectory => rooted.create_directory_blocking(&path)?,
         WireMutationKind::ReplaceSymlink => {
             let target = target.ok_or(RemoteMutationError::MissingSymlinkTarget)?;
-            rooted.replace_symlink_blocking(&path, &target)?;
+            let expected = expected_identity.map_or(
+                crate::endpoint::ExpectedDestination::Absent,
+                crate::endpoint::ExpectedDestination::Unchanged,
+            );
+            rooted.replace_symlink_blocking(&path, &target, expected, modified)?;
         }
         WireMutationKind::RemoveFileLike => {
             rooted.remove_blocking(&path, false, expected_identity)?
@@ -409,7 +427,7 @@ mod tests {
         let peer = Platform::current().os;
 
         let server_task = tokio::spawn(async move {
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
                 serve_incoming_mutation_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
@@ -422,9 +440,32 @@ mod tests {
             .await
             .unwrap();
         let link = RelativePath::new("link").unwrap();
-        request_replace_symlink(&client.sender(), &link, Path::new("../target"), peer)
-            .await
-            .unwrap();
+        request_replace_symlink(
+            &client.sender(),
+            &link,
+            Path::new("../target"),
+            None,
+            None,
+            peer,
+        )
+        .await
+        .unwrap();
+        let link_id = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::symlink_metadata(root.path().join("link")).unwrap(),
+            crate::engine::domain::EntryKind::Symlink,
+        )
+        .unwrap();
+        let modified = Timestamp::new(1_600_000_000, 123_456_789).unwrap();
+        request_replace_symlink(
+            &client.sender(),
+            &link,
+            Path::new("../updated"),
+            Some(link_id),
+            Some(modified),
+            peer,
+        )
+        .await
+        .unwrap();
         let old = RelativePath::new("old").unwrap();
         let old_meta = std::fs::symlink_metadata(root.path().join("old")).unwrap();
         let old_id = crate::endpoint::local_identity::metadata_identity(
@@ -463,8 +504,86 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_link(root.path().join("link")).unwrap(),
-            Path::new("../target")
+            Path::new("../updated")
         );
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(root.path().join("link")).unwrap();
+        assert_eq!(metadata.mtime(), modified.seconds());
+        assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+    }
+
+    #[tokio::test]
+    async fn remote_symlink_replace_preserves_racing_entries() {
+        for update in [false, true] {
+            for directory in [false, true] {
+                let root = tempfile::TempDir::new().unwrap();
+                let path = root.path().join("target");
+                let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+                let expected = if update {
+                    std::os::unix::fs::symlink("old", &path).unwrap();
+                    let (_, identity) = rooted
+                        .path_identity_blocking(&RelativePath::new("target").unwrap())
+                        .unwrap()
+                        .unwrap();
+                    std::fs::remove_file(&path).unwrap();
+                    Some(identity)
+                } else {
+                    None
+                };
+                if directory {
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("child"), b"raced").unwrap();
+                } else {
+                    std::fs::write(&path, b"raced").unwrap();
+                }
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let (client_reader, client_writer) = tokio::io::split(client_io);
+                let (server_reader, server_writer) = tokio::io::split(server_io);
+                let client = FrameRouter::start(
+                    client_reader,
+                    client_writer,
+                    RouterRole::Client,
+                    RouterConfig::default(),
+                )
+                .unwrap();
+                let mut server = FrameRouter::start(
+                    server_reader,
+                    server_writer,
+                    RouterRole::Server,
+                    RouterConfig::default(),
+                )
+                .unwrap();
+                let sender = server.sender();
+                let peer = Platform::current().os;
+                let server_task = tokio::spawn(async move {
+                    let incoming = server.incoming().recv().await.unwrap().unwrap();
+                    let result =
+                        serve_incoming_mutation_rooted(rooted, incoming, &sender, peer).await;
+                    drop(server);
+                    drop(sender);
+                    result
+                });
+                assert!(request_replace_symlink(
+                    &client.sender(),
+                    &RelativePath::new("target").unwrap(),
+                    Path::new("new"),
+                    expected,
+                    None,
+                    peer
+                )
+                .await
+                .is_err());
+                assert!(matches!(
+                    server_task.await.unwrap(),
+                    Err(RemoteMutationError::RootedFs(
+                        RootedFsError::DestinationChanged(_)
+                    ))
+                ));
+                let retained = if directory { path.join("child") } else { path };
+                assert_eq!(std::fs::read(retained).unwrap(), b"raced");
+                assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+            }
+        }
     }
 
     #[tokio::test]

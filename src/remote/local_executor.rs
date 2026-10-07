@@ -46,6 +46,9 @@ pub enum LocalSyncError {
     #[error("symlink action is missing the scanned target for {0}")]
     MissingSymlinkTarget(PathBuf),
 
+    #[error("symlink replacement requires scanned destination identity for {0}")]
+    MissingDestinationIdentity(PathBuf),
+
     #[error("regular-file transfer requires scanned Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
 
@@ -83,6 +86,7 @@ pub enum LocalSyncAction {
     },
     ReplaceSymlink {
         source: Entry,
+        destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
     ApplyMetadata {
@@ -512,15 +516,26 @@ impl LocalSyncExecutor {
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
                 Ok(Some(transfer))
             }
-            LocalSyncAction::ReplaceSymlink { source, modified } => {
+            LocalSyncAction::ReplaceSymlink {
+                source,
+                destination,
+                modified,
+            } => {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     LocalSyncError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
-                self.replace_symlink(target, &source.path).await?;
-                if let Some(modified) = modified {
-                    self.set_mtime(&self.destination_path(&source.path), modified)
-                        .await?;
-                }
+                let expected = match destination {
+                    None => crate::endpoint::ExpectedDestination::Absent,
+                    Some(destination) => crate::endpoint::ExpectedDestination::Unchanged(
+                        destination.identity.ok_or_else(|| {
+                            LocalSyncError::MissingDestinationIdentity(
+                                destination.path.as_path().to_path_buf(),
+                            )
+                        })?,
+                    ),
+                };
+                self.replace_symlink(target, &source.path, expected, modified)
+                    .await?;
                 let receipt =
                     PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
                 self.remove_committed_source(&receipt, &source).await?;
@@ -775,10 +790,16 @@ impl LocalSyncExecutor {
     }
 
     /// Replace a destination entry with a symlink.
-    async fn replace_symlink(&self, target: &Path, relative: &RelativePath) -> Result<()> {
+    async fn replace_symlink(
+        &self,
+        target: &Path,
+        relative: &RelativePath,
+        expected: crate::endpoint::ExpectedDestination,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
         use crate::endpoint::Endpoint;
         self.destination_endpoint
-            .create_symlink(target, relative.as_path())
+            .replace_symlink(target, relative.as_path(), expected, modified)
             .await
             .map_err(|error| match error {
                 crate::error::SyncError::Io(io) => {
@@ -1212,6 +1233,7 @@ fn lower_create(
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: None,
         }))),
     }
 }
@@ -1245,6 +1267,7 @@ fn lower_update(
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }
@@ -1276,6 +1299,7 @@ fn lower_replace(
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination: Some(destination),
         }))),
     }
 }
@@ -1359,7 +1383,7 @@ async fn create_symlink_preserving(target: &Path, dest: &Path) -> std::io::Resul
 mod tests {
     use super::*;
     use crate::engine::delete_plan::DeleteAction;
-    use crate::engine::domain::EntryIdentity;
+    use crate::engine::domain::{EntryIdentity, SyncOp};
     use crate::engine::scheduler::ResourceBudget;
 
     fn rel(path: &str) -> RelativePath {
@@ -1396,6 +1420,56 @@ mod tests {
             validate_hardlink_metadata(Path::new("member"), representative, conflicting_time),
             Err(LocalSyncError::Destination(_, _))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_lowering_and_execution_preserve_racing_entries() {
+        for update in [false, true] {
+            for directory in [false, true] {
+                let source_root = tempfile::TempDir::new().unwrap();
+                let dest_root = tempfile::TempDir::new().unwrap();
+                let path = dest_root.path().join("link");
+                let source =
+                    Entry::symlink(rel("link"), PathBuf::from("new"), Timestamp::UNIX_EPOCH);
+                let op = if update {
+                    std::os::unix::fs::symlink("old", &path).unwrap();
+                    let mut destination =
+                        Entry::symlink(rel("link"), PathBuf::from("old"), Timestamp::UNIX_EPOCH);
+                    destination.identity = crate::endpoint::local_identity::metadata_identity(
+                        &std::fs::symlink_metadata(&path).unwrap(),
+                        EntryKind::Symlink,
+                    );
+                    SyncOp::Update {
+                        source,
+                        destination,
+                    }
+                } else {
+                    SyncOp::Create { source }
+                };
+                let work = lower_local_op(op, ExecutionPolicy::default())
+                    .unwrap()
+                    .unwrap();
+                if update {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                if directory {
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("child"), b"raced").unwrap();
+                } else {
+                    std::fs::write(&path, b"raced").unwrap();
+                }
+                let executor = LocalSyncExecutor::new(
+                    source_root.path().to_path_buf(),
+                    dest_root.path().to_path_buf(),
+                    Scheduler::new(ResourceBudget::default()).unwrap(),
+                );
+                assert!(executor.execute(work).await.is_err());
+                let retained = if directory { path.join("child") } else { path };
+                assert_eq!(std::fs::read(retained).unwrap(), b"raced");
+                assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 1);
+            }
+        }
     }
 
     #[tokio::test]

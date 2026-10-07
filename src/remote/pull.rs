@@ -115,6 +115,7 @@ pub enum RemotePullAction {
     },
     ReplaceSymlink {
         source: Entry,
+        destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
     ApplyMetadata {
@@ -362,15 +363,18 @@ impl RemotePullExecutor {
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
                 Ok(Some(summary))
             }
-            RemotePullAction::ReplaceSymlink { source, modified } => {
+            RemotePullAction::ReplaceSymlink {
+                source,
+                destination,
+                modified,
+            } => {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     RemotePullError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
-                let dest = self.dest_path(&source.path);
-                replace_local_symlink(target, &dest).await?;
-                if let Some(modified) = modified {
-                    set_local_mtime(&dest, modified).await?;
-                }
+                let expected = destination_expectation(destination.as_ref())?;
+                LocalEndpoint::new(self.destination_root.clone())
+                    .replace_symlink(target, source.path.as_path(), expected, modified)
+                    .await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
@@ -874,35 +878,6 @@ async fn link_local_file(
     }
 }
 
-async fn replace_local_symlink(target: &Path, dest: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| RemotePullError::LocalMutation(parent.to_path_buf(), error))?;
-        }
-        let temp = crate::temp_file::TempFileGuard::temp_path_for(dest);
-        let guard = crate::temp_file::TempFileGuard::new(&temp);
-        tokio::fs::symlink(target, &temp)
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(temp.clone(), error))?;
-        tokio::fs::rename(&temp, dest)
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(dest.to_path_buf(), error))?;
-        drop(guard);
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, dest);
-        Err(RemotePullError::LocalMutation(
-            dest.to_path_buf(),
-            std::io::Error::other("symlinks are not supported on this platform"),
-        ))
-    }
-}
-
 async fn remove_local_entry(
     path: &Path,
     is_directory: bool,
@@ -1099,6 +1074,74 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_symlink_executor_uses_rooted_empty_directory_exchange() {
+        use crate::engine::domain::SyncOp;
+        use crate::engine::planner::ExecutionPolicy;
+        use crate::engine::scheduler::ResourceBudget;
+        use crate::protocol::Operation;
+        use crate::remote::router::RouterConfig;
+        use crate::remote::runtime::{ClientRemoteSession, ServerRemoteSession};
+        use std::os::unix::fs::MetadataExt;
+
+        let source_root = tempfile::TempDir::new().unwrap();
+        let dest_root = tempfile::TempDir::new().unwrap();
+        let dest = dest_root.path().join("link");
+        std::fs::create_dir(&dest).unwrap();
+        let mut destination =
+            Entry::directory(RelativePath::new("link").unwrap(), Timestamp::UNIX_EPOCH);
+        destination.identity = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::symlink_metadata(&dest).unwrap(),
+            EntryKind::Directory,
+        );
+        let modified = Timestamp::new(1_600_000_000, 123_456_789).unwrap();
+        let source = Entry::symlink(
+            RelativePath::new("link").unwrap(),
+            PathBuf::from("../target"),
+            modified,
+        );
+        let work = crate::remote::pull_lower::lower_pull_op(
+            SyncOp::Replace {
+                source,
+                destination,
+            },
+            ExecutionPolicy {
+                preserve_times: true,
+                ..ExecutionPolicy::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (client, server) = tokio::join!(
+            ClientRemoteSession::connect(
+                client_reader,
+                client_writer,
+                Operation::Pull,
+                source_root.path(),
+                RouterConfig::default()
+            ),
+            ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default()),
+        );
+        let client = client.unwrap();
+        let _server = server.unwrap();
+        let executor = RemotePullExecutor::new(
+            dest_root.path().to_path_buf(),
+            client.request_handle(),
+            client.sender(),
+            Scheduler::new(ResourceBudget::default()).unwrap(),
+        );
+        executor.execute(work).await.unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), Path::new("../target"));
+        let metadata = std::fs::symlink_metadata(&dest).unwrap();
+        assert_eq!(metadata.mtime(), modified.seconds());
+        assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
+        assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 1);
+    }
 
     #[tokio::test]
     async fn pull_remove_local_entry_validates_identity() {

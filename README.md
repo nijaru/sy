@@ -143,7 +143,7 @@ identity and root-confined filesystem operations are not implemented.
 | SSH pull | Stable | Whole-file fetch with staged verification |
 | Delta sync (push) | Stable | Rolling weak checksums + BLAKE3 strong block signatures |
 | Filters (--exclude/--include) | Stable | rsync-style patterns, `--filter`, templates |
-| Delete mode (--delete) | Stable | With `--max-delete` safety threshold |
+| Delete mode (--delete) | Stable | Local/push, with `--max-delete` safety threshold; pull `--delete` is refused |
 | Compression (-z) | Stable | zstd, auto/always/never |
 | Hard links (-H) | Stable | Preserved on local sync |
 | Symlinks | Stable | `--links=preserve/follow/skip` |
@@ -155,9 +155,24 @@ identity and root-confined filesystem operations are not implemented.
 | --update / --existing | Stable | Comparison modes for selective sync |
 | --ignore-times / --ignore-existing | Stable | Force transfer / skip existing |
 | --verify | Stable | Staged verification (`after`/`only`) |
-| Directory type transitions | Supported | Atomic exchange for file/symlink over directory; directory over file refused in preflight |
+| Directory type transitions | Limited | Local/push file or symlink over an empty directory uses atomic exchange; nonempty replacements, directory over file/symlink, and pull directory transitions are refused in preflight |
 | Bidirectional sync (bisync) | Removed | Not part of 0.5 |
 | S3/GCS endpoints | Planned | Not part of 0.5 (local and SSH sync engine focus) |
+
+Nonempty directory replacements are refused even with `--delete`: descendant
+identities are not yet carried into transaction cleanup. Existing deletion
+scope, protected-descendant and threshold checks still apply before refusal.
+Empty-directory replacement checks for children before exchange and uses only
+`rmdir` afterward. If a child arrives after the check, the replacement may be
+published, but cleanup fails and the old directory stays in private staging;
+its children are never recursively deleted.
+
+Symlink replacements use private same-filesystem staging, apply requested
+mtime before publication, and validate the scanned destination and held parent.
+Creates do not overwrite a name that appeared concurrently. Updates still use
+separate identity checks and rename/exchange syscalls, not atomic
+compare-and-swap; concurrent namespace writers can race those checks. Rename
+also does not promise power-loss durability or whole-run rollback.
 
 ## Benchmarks
 
