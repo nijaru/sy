@@ -8,8 +8,9 @@
 //! Two bounds matter:
 //!
 //! - **Memory.** A tree (or one directory) can be arbitrarily wide, so the
-//!   detector spools sorted runs to anonymous temporary files and merges with
-//!   bounded fan-in instead of retaining a whole-tree map.
+//!   detector spools sorted runs to owned temporary files and merges with
+//!   bounded fan-in instead of retaining a whole-tree map. Inactive runs own
+//!   only scratch paths, not descriptors.
 //! - **Honesty.** Filesystem name rules are not fully knowable from an OS name
 //!   or a Unicode transform. `NamespaceSemantics` records what the destination
 //!   root actually folds; when a rule is unknown the check stays conservative
@@ -21,7 +22,7 @@ use super::native_path;
 use crate::protocol::PlatformOs;
 use std::cmp::Ordering;
 use std::io;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
 use unicode_normalization::UnicodeNormalization;
 
 /// How one name-comparison axis behaves on the destination filesystem.
@@ -262,9 +263,12 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// Resource bounds for the disk-backed alias sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpillBudget {
-    /// Buffered bytes before an in-memory run is sorted and spilled.
+    /// Encoded record bytes before an in-memory run is sorted and spilled.
+    /// Checked after each record, so overshoot is at most `MAX_RECORD_BYTES`,
+    /// not the sum of all ancestors of a path.
     pub run_bytes: usize,
-    /// Maximum simultaneously merged (and therefore open) run files.
+    /// Maximum simultaneously open input runs; a merge also owns one output
+    /// descriptor (unless it is the final, check-only merge).
     pub merge_fan_in: usize,
 }
 
@@ -487,15 +491,83 @@ impl AliasScanner {
 
 #[derive(Debug)]
 struct RunFile {
+    path: tempfile::TempPath,
+}
+
+/// An active scratch handle, separate from the inactive artifact owner.
+struct OpenRun {
     file: tokio::fs::File,
+    #[cfg(test)]
+    _descriptor: DescriptorGuard,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DescriptorCounts {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct DescriptorGuard(std::sync::Arc<DescriptorCounts>);
+
+#[cfg(test)]
+impl DescriptorGuard {
+    fn new(counts: &std::sync::Arc<DescriptorCounts>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let active = counts.active.fetch_add(1, Relaxed) + 1;
+        counts.peak.fetch_max(active, Relaxed);
+        Self(std::sync::Arc::clone(counts))
+    }
+}
+
+#[cfg(test)]
+impl Drop for DescriptorGuard {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl RunFile {
+    async fn create(
+        #[cfg(test)] counts: &std::sync::Arc<DescriptorCounts>,
+    ) -> Result<(Self, OpenRun)> {
+        let scratch = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
+            .await
+            .map_err(|error| NamespacePreflightError::Worker(error.to_string()))??;
+        let (file, path) = scratch.into_parts();
+        let opened = OpenRun {
+            file: tokio::fs::File::from_std(file),
+            #[cfg(test)]
+            _descriptor: DescriptorGuard::new(counts),
+        };
+        Ok((Self { path }, opened))
+    }
+
+    async fn open(
+        &self,
+        #[cfg(test)] counts: &std::sync::Arc<DescriptorCounts>,
+    ) -> Result<OpenRun> {
+        let file = tokio::fs::File::open(&self.path).await?;
+        Ok(OpenRun {
+            file,
+            #[cfg(test)]
+            _descriptor: DescriptorGuard::new(counts),
+        })
+    }
 }
 
 /// Bounded, exact destination-alias preflight over streaming names.
 ///
 /// `record` every selected source name, kept destination name, and (through
 /// `record`) their ancestor prefixes; `finish` proves the complete set before
-/// mutation. Memory stays within `SpillBudget::run_bytes` plus one record per
-/// merged run; open files stay within `SpillBudget::merge_fan_in`.
+/// mutation. The run buffer holds at most `SpillBudget::run_bytes` plus one
+/// maximum-size record, including on deep paths. Merging additionally holds
+/// one head per input run and bounded scanner/encoding buffers. Inactive runs
+/// hold no descriptors; open scratch files stay within
+/// `SpillBudget::merge_fan_in + 1`, accounting for the output.
 #[derive(Debug)]
 pub struct NamespaceCollisionDetector {
     semantics: NamespaceSemantics,
@@ -503,6 +575,10 @@ pub struct NamespaceCollisionDetector {
     buffer: Vec<SortRecord>,
     buffered_bytes: usize,
     levels: Vec<Vec<RunFile>>,
+    #[cfg(test)]
+    peak_buffered_bytes: usize,
+    #[cfg(test)]
+    descriptors: std::sync::Arc<DescriptorCounts>,
 }
 
 impl NamespaceCollisionDetector {
@@ -520,6 +596,10 @@ impl NamespaceCollisionDetector {
             buffer: Vec::new(),
             buffered_bytes: 0,
             levels: Vec::new(),
+            #[cfg(test)]
+            peak_buffered_bytes: 0,
+            #[cfg(test)]
+            descriptors: std::sync::Arc::default(),
         }
     }
 
@@ -532,22 +612,26 @@ impl NamespaceCollisionDetector {
         if self.semantics.is_byte_exact() {
             return Ok(());
         }
-        self.record_single(path)?;
+        self.record_single(path).await?;
         let mut current = path.parent();
         while let Some(parent) = current {
-            self.record_single(&parent)?;
+            self.record_single(&parent).await?;
             current = parent.parent();
-        }
-        while self.buffered_bytes >= self.budget.run_bytes {
-            self.spill_run().await?;
         }
         Ok(())
     }
 
-    fn record_single(&mut self, path: &RelativePath) -> Result<()> {
+    async fn record_single(&mut self, path: &RelativePath) -> Result<()> {
         let record = SortRecord::new(self.semantics, path)?;
         self.buffered_bytes += record.encoded_len();
         self.buffer.push(record);
+        #[cfg(test)]
+        {
+            self.peak_buffered_bytes = self.peak_buffered_bytes.max(self.buffered_bytes);
+        }
+        if self.buffered_bytes >= self.budget.run_bytes {
+            self.spill_run().await?;
+        }
         Ok(())
     }
 
@@ -578,7 +662,7 @@ impl NamespaceCollisionDetector {
                     if let Some(run) = group.pop() {
                         next_round.push(run);
                     }
-                } else if let Some(run) = merge_group(group, true).await? {
+                } else if let Some(run) = self.merge_group(group, true).await? {
                     next_round.push(run);
                 }
             }
@@ -586,7 +670,7 @@ impl NamespaceCollisionDetector {
         }
 
         if !remaining.is_empty() {
-            merge_group(remaining, false).await?;
+            self.merge_group(remaining, false).await?;
         }
         Ok(())
     }
@@ -597,13 +681,14 @@ impl NamespaceCollisionDetector {
         }
         let mut records = std::mem::take(&mut self.buffer);
         self.buffered_bytes = 0;
-        records.sort();
+        records.sort_unstable();
 
-        let file = tokio::task::spawn_blocking(tempfile::tempfile)
-            .await
-            .map_err(|error| NamespacePreflightError::Worker(error.to_string()))??;
-        let file = tokio::fs::File::from_std(file);
-        let mut writer = tokio::io::BufWriter::new(file);
+        let (mut current_run, mut opened) = RunFile::create(
+            #[cfg(test)]
+            &self.descriptors,
+        )
+        .await?;
+        let mut writer = tokio::io::BufWriter::new(&mut opened.file);
         let mut scanner = AliasScanner::new();
         let mut payload = Vec::new();
         for record in records {
@@ -616,9 +701,10 @@ impl NamespaceCollisionDetector {
         }
         scanner.finish()?;
         writer.flush().await?;
-        let mut file = writer.into_inner();
-        file.seek(SeekFrom::Start(0)).await?;
-        let mut current_run = RunFile { file };
+        // Flush completes the Tokio file's pending write before its handle is
+        // closed. Keep only the owned cleanup path while this run is inactive.
+        drop(writer);
+        drop(opened);
         let mut level = 0;
         loop {
             if level >= self.levels.len() {
@@ -629,7 +715,7 @@ impl NamespaceCollisionDetector {
                 break;
             }
             let group = std::mem::take(&mut self.levels[level]);
-            let Some(merged) = merge_group(group, true).await? else {
+            let Some(merged) = self.merge_group(group, true).await? else {
                 break;
             };
             current_run = merged;
@@ -637,86 +723,107 @@ impl NamespaceCollisionDetector {
         }
         Ok(())
     }
+
+    /// Merge sorted runs in bounded fan-in, alias-checking the emitted order.
+    ///
+    /// `write_output` is false for the final round: the records are proven
+    /// checked while scanning, so spilling a terminal run would only waste I/O.
+    async fn merge_group(
+        &mut self,
+        group: Vec<RunFile>,
+        write_output: bool,
+    ) -> Result<Option<RunFile>> {
+        debug_assert!(group.len() <= self.budget.merge_fan_in);
+        // Only this active merge group opens inputs. `group` retains cleanup
+        // ownership until all reads complete, including on early errors.
+        let mut files = Vec::with_capacity(group.len());
+        for run in &group {
+            files.push(
+                run.open(
+                    #[cfg(test)]
+                    &self.descriptors,
+                )
+                .await?,
+            );
+        }
+        let mut readers: Vec<codec::RecordReader<'_>> = files
+            .iter_mut()
+            .map(|opened| codec::RecordReader::new(&mut opened.file))
+            .collect();
+        let mut heads: Vec<Option<SortRecord>> = Vec::with_capacity(readers.len());
+        for reader in readers.iter_mut() {
+            heads.push(reader.record().await?);
+        }
+
+        let (output, mut opened) = if write_output {
+            let (run, opened) = RunFile::create(
+                #[cfg(test)]
+                &self.descriptors,
+            )
+            .await?;
+            (Some(run), Some(opened))
+        } else {
+            (None, None)
+        };
+        let mut writer = opened
+            .as_mut()
+            .map(|opened| tokio::io::BufWriter::new(&mut opened.file));
+
+        let mut scanner = AliasScanner::new();
+        loop {
+            // Bounded fan-in keeps this linear scan over ≤ merge_fan_in heads cheap.
+            let mut next: Option<usize> = None;
+            for (index, head) in heads.iter().enumerate() {
+                let Some(head) = head else {
+                    continue;
+                };
+                let select = match next {
+                    Some(best) => match heads[best].as_ref() {
+                        Some(best_head) => head.cmp(best_head) == Ordering::Less,
+                        None => true,
+                    },
+                    None => true,
+                };
+                if select {
+                    next = Some(index);
+                }
+            }
+            let Some(index) = next else {
+                break;
+            };
+            let Some(record) = heads[index].take() else {
+                continue;
+            };
+            heads[index] = readers[index].record().await?;
+
+            if let Some(emitted) = scanner.observe(record)? {
+                if let Some(writer) = writer.as_mut() {
+                    let mut payload = Vec::new();
+                    emitted.encode(&mut payload);
+                    writer.write_all(&payload).await?;
+                }
+            }
+        }
+        scanner.finish()?;
+
+        let Some(mut writer) = writer else {
+            // Check-only round consumed the group for verification alone.
+            return Ok(None);
+        };
+        writer.flush().await?;
+        drop(writer);
+        drop(opened);
+        Ok(output)
+    }
 }
 
 fn scan_buffered(mut records: Vec<SortRecord>) -> Result<()> {
-    records.sort();
+    records.sort_unstable();
     let mut scanner = AliasScanner::new();
     for record in records {
         scanner.observe(record)?;
     }
     scanner.finish()
-}
-
-/// Merge sorted runs in bounded fan-in, alias-checking the emitted order.
-///
-/// `write_output` is false for the final round: the records are proven checked
-/// while scanning, so spilling a terminal run would only waste I/O.
-async fn merge_group(group: Vec<RunFile>, write_output: bool) -> Result<Option<RunFile>> {
-    let mut group = group;
-    let mut readers: Vec<codec::RecordReader<'_>> = Vec::with_capacity(group.len());
-    for run in group.iter_mut() {
-        readers.push(codec::RecordReader::new(&mut run.file));
-    }
-    let mut heads: Vec<Option<SortRecord>> = Vec::with_capacity(readers.len());
-    for reader in readers.iter_mut() {
-        heads.push(reader.record().await?);
-    }
-
-    let mut writer = if write_output {
-        let file = tokio::task::spawn_blocking(tempfile::tempfile)
-            .await
-            .map_err(|error| NamespacePreflightError::Worker(error.to_string()))??;
-        Some(tokio::io::BufWriter::new(tokio::fs::File::from_std(file)))
-    } else {
-        None
-    };
-
-    let mut scanner = AliasScanner::new();
-    loop {
-        // Bounded fan-in keeps this linear scan over ≤ merge_fan_in heads cheap.
-        let mut next: Option<usize> = None;
-        for (index, head) in heads.iter().enumerate() {
-            let Some(head) = head else {
-                continue;
-            };
-            let select = match next {
-                Some(best) => match heads[best].as_ref() {
-                    Some(best_head) => head.cmp(best_head) == Ordering::Less,
-                    None => true,
-                },
-                None => true,
-            };
-            if select {
-                next = Some(index);
-            }
-        }
-        let Some(index) = next else {
-            break;
-        };
-        let Some(record) = heads[index].take() else {
-            continue;
-        };
-        heads[index] = readers[index].record().await?;
-
-        if let Some(emitted) = scanner.observe(record)? {
-            if let Some(writer) = writer.as_mut() {
-                let mut payload = Vec::new();
-                emitted.encode(&mut payload);
-                writer.write_all(&payload).await?;
-            }
-        }
-    }
-    scanner.finish()?;
-
-    let Some(mut writer) = writer else {
-        // Check-only round consumed the group for verification alone.
-        return Ok(None);
-    };
-    writer.flush().await?;
-    let mut file = writer.into_inner();
-    file.seek(SeekFrom::Start(0)).await?;
-    Ok(Some(RunFile { file }))
 }
 
 #[cfg(test)]
@@ -880,6 +987,73 @@ mod tests {
             error,
             NamespacePreflightError::Ambiguity(NamespaceAmbiguity { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn deep_path_spills_between_ancestor_records() {
+        let path = rel(&vec!["component"; 256].join("/"));
+        let budget = SpillBudget {
+            run_bytes: 256,
+            merge_fan_in: 2,
+        };
+        let largest_record = SortRecord::new(insensitive(), &path).unwrap().encoded_len();
+        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), budget);
+        detector.record(&path).await.unwrap();
+        // All ancestors fit this single-record maximum, not a depth-dependent
+        // sum. Measure the peak at every append, before any spill resets it.
+        assert!(detector.peak_buffered_bytes <= budget.run_bytes + largest_record);
+        assert!(detector.buffered_bytes < budget.run_bytes);
+        detector.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inactive_levels_close_descriptors_and_clean_scratch() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), tiny_budget());
+        let counts = std::sync::Arc::clone(&detector.descriptors);
+        // 127 one-record runs leave seven occupied binary merge levels, more
+        // than the three permitted active descriptors (two inputs + output).
+        for index in 0..127 {
+            detector
+                .record(&rel(&format!("name-{index:03}")))
+                .await
+                .unwrap();
+            assert_eq!(counts.active.load(Relaxed), 0);
+        }
+        assert_eq!(
+            detector
+                .levels
+                .iter()
+                .filter(|level| !level.is_empty())
+                .count(),
+            7
+        );
+        let scratch: Vec<_> = detector
+            .levels
+            .iter()
+            .flatten()
+            .map(|run| run.path.to_path_buf())
+            .collect();
+        detector.finish().await.unwrap();
+        assert_eq!(counts.active.load(Relaxed), 0);
+        assert_eq!(counts.peak.load(Relaxed), tiny_budget().merge_fan_in + 1);
+        assert!(scratch.iter().all(|path| !path.exists()));
+    }
+
+    #[tokio::test]
+    async fn merge_collision_closes_handles_and_removes_owned_runs() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), tiny_budget());
+        detector.record(&rel("alias")).await.unwrap();
+        let scratch = detector.levels[0][0].path.to_path_buf();
+        let counts = std::sync::Arc::clone(&detector.descriptors);
+        let error = detector.record(&rel("ALIAS")).await.unwrap_err();
+        assert!(matches!(error, NamespacePreflightError::Collision(_)));
+        assert_eq!(counts.active.load(Relaxed), 0);
+        assert!(counts.peak.load(Relaxed) <= tiny_budget().merge_fan_in + 1);
+        assert!(!scratch.exists());
     }
 
     #[tokio::test]

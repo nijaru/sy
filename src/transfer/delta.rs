@@ -9,6 +9,9 @@ pub const SOURCE_DIGEST_LEN: usize = 32;
 pub const DEFAULT_MAX_BASIS_BLOCKS: usize = 65_536;
 pub const MAX_LITERAL_BYTES: usize = 64 * 1024;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
+// Candidate hashing may revisit overlapping windows, but never hash more than
+// this multiple of the source bytes read. Comparisons get one credit per byte.
+const CANDIDATE_HASH_FACTOR: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BasisBlock {
@@ -142,7 +145,14 @@ impl BasisIndexBuilder {
         self.block_count
     }
 
-    pub fn finish(self) -> BasisIndex {
+    pub fn finish(mut self) -> BasisIndex {
+        // Equivalent signatures can reference any identical basis block. Keep
+        // the first offset without quadratic deduplication during ingestion;
+        // block_count still counts every received signature for limit checks.
+        for candidates in self.by_weak.values_mut() {
+            candidates.sort_unstable_by_key(|block| (block.size, block.strong, block.index));
+            candidates.dedup_by(|a, b| a.size == b.size && a.strong == b.strong);
+        }
         BasisIndex {
             block_size: self.block_size,
             block_count: self.block_count,
@@ -175,25 +185,29 @@ impl BasisIndex {
         self.block_count
     }
 
-    fn find_slice(&self, bytes: &[u8]) -> Option<BasisBlock> {
-        let size = u32::try_from(bytes.len()).ok()?;
-        let weak = WeakChecksum::hash(bytes);
-        let candidates = self.by_weak.get(&weak)?;
-        let strong = strong_signature(bytes);
-        candidates
-            .iter()
-            .copied()
-            .find(|candidate| candidate.size == size && candidate.strong == strong)
-    }
-
-    fn find_window(&self, weak: u32, window: &RollingWindow) -> Option<BasisBlock> {
-        let size = u32::try_from(window.len()).ok()?;
-        let candidates = self.by_weak.get(&weak)?;
-        let strong = window.strong_signature();
-        candidates
-            .iter()
-            .copied()
-            .find(|candidate| candidate.size == size && candidate.strong == strong)
+    fn find_match(
+        &self,
+        weak: u32,
+        slices: (&[u8], &[u8]),
+        work: &mut MatchWork,
+    ) -> CandidateMatch {
+        let Some(candidates) = self.by_weak.get(&weak) else {
+            return CandidateMatch::Miss;
+        };
+        let size = slices.0.len() + slices.1.len();
+        if !work.hash(size) {
+            return CandidateMatch::LiteralFallback;
+        }
+        let strong = strong_signature(slices);
+        for &candidate in candidates {
+            if !work.compare() {
+                return CandidateMatch::LiteralFallback;
+            }
+            if candidate.size as usize == size && candidate.strong == strong {
+                return CandidateMatch::Block(candidate);
+            }
+        }
+        CandidateMatch::Miss
     }
 
     fn offset(&self, block: BasisBlock) -> std::result::Result<u64, BasisIndexError> {
@@ -239,6 +253,54 @@ pub enum DeltaMatchError {
 
 pub type Result<T> = std::result::Result<T, DeltaMatchError>;
 
+enum CandidateMatch {
+    Block(BasisBlock),
+    Miss,
+    LiteralFallback,
+}
+
+/// Credits are earned only by consuming new source bytes, not by revisiting a
+/// window. Separate budgets bound both large-window hashes and long collision
+/// buckets. Saturating the hash limit can only reduce work, never wrap it.
+#[derive(Default)]
+struct MatchWork {
+    input_bytes: u64,
+    hashed_bytes: u64,
+    candidate_comparisons: u64,
+    exhausted: bool,
+}
+
+impl MatchWork {
+    fn read(&mut self, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| DeltaMatchError::ByteCountOverflow)?;
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(bytes)
+            .ok_or(DeltaMatchError::ByteCountOverflow)?;
+        Ok(())
+    }
+
+    fn hash(&mut self, bytes: usize) -> bool {
+        let bytes = bytes as u64;
+        let limit = self.input_bytes.saturating_mul(CANDIDATE_HASH_FACTOR);
+        if bytes > limit - self.hashed_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.hashed_bytes += bytes;
+        true
+    }
+
+    fn compare(&mut self) -> bool {
+        if self.candidate_comparisons == self.input_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.candidate_comparisons += 1;
+        true
+    }
+}
+
 /// Match one source stream against a bounded destination signature index.
 ///
 /// Memory is bounded by the signature index, one adaptive-size rolling window,
@@ -246,7 +308,24 @@ pub type Result<T> = std::result::Result<T, DeltaMatchError>;
 /// Operations are emitted directly to `sink`; no whole-file delta plan exists.
 /// The full source BLAKE3 digest is accumulated in output order during the same
 /// pass, so a successful transfer does not need to reopen or reread the source.
-pub fn match_delta<R, F>(reader: R, basis: &BasisIndex, mut sink: F) -> Result<DeltaSummary>
+/// Candidate hashing is capped at four times the bytes consumed and signature
+/// comparisons at one per byte. On exhaustion, buffered source bytes and the
+/// unread remainder stream as bounded literals through the same reader. Source
+/// identity validation before/after this pass remains the caller's responsibility.
+pub fn match_delta<R, F>(reader: R, basis: &BasisIndex, sink: F) -> Result<DeltaSummary>
+where
+    R: Read,
+    F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
+{
+    match_delta_with_work(reader, basis, sink, &mut MatchWork::default())
+}
+
+fn match_delta_with_work<R, F>(
+    reader: R,
+    basis: &BasisIndex,
+    mut sink: F,
+    work: &mut MatchWork,
+) -> Result<DeltaSummary>
 where
     R: Read,
     F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
@@ -259,13 +338,14 @@ where
     })?;
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, reader);
     let first = read_up_to(&mut reader, block_size)?;
+    work.read(first.len())?;
     let mut emitter = DeltaEmitter::new(&mut sink);
 
     if first.is_empty() {
         return emitter.finish();
     }
     if first.len() < block_size {
-        emit_final_slice(first, basis, &mut emitter)?;
+        emit_final_slice(first, basis, &mut emitter, work)?;
         return emitter.finish();
     }
 
@@ -273,25 +353,35 @@ where
     let mut weak = WeakChecksum::from_block(window.as_contiguous());
 
     loop {
-        if let Some(block) = basis.find_window(weak.digest(), &window) {
-            emitter.copy_slices(basis.offset(block)?, block.size, window.slices())?;
-            let next = read_up_to(&mut reader, block_size)?;
-            if next.is_empty() {
+        match basis.find_match(weak.digest(), window.slices(), work) {
+            CandidateMatch::Block(block) => {
+                emitter.copy_slices(basis.offset(block)?, block.size, window.slices())?;
+                let next = read_up_to(&mut reader, block_size)?;
+                work.read(next.len())?;
+                if next.is_empty() {
+                    return emitter.finish();
+                }
+                if next.len() < block_size {
+                    emit_final_slice(next, basis, &mut emitter, work)?;
+                    return emitter.finish();
+                }
+                window = RollingWindow::new(next);
+                weak = WeakChecksum::from_block(window.as_contiguous());
+                continue;
+            }
+            CandidateMatch::LiteralFallback => {
+                emitter.literal_slices(window.slices())?;
+                emit_literal_remainder(&mut reader, &mut emitter, work)?;
                 return emitter.finish();
             }
-            if next.len() < block_size {
-                emit_final_slice(next, basis, &mut emitter)?;
-                return emitter.finish();
-            }
-            window = RollingWindow::new(next);
-            weak = WeakChecksum::from_block(window.as_contiguous());
-            continue;
+            CandidateMatch::Miss => {}
         }
 
         let Some(incoming) = read_byte(&mut reader)? else {
             emitter.literal_slices(window.slices())?;
             return emitter.finish();
         };
+        work.read(1)?;
         let outgoing = window.roll(incoming);
         emitter.literal_byte(outgoing)?;
         weak.roll(outgoing, incoming);
@@ -302,14 +392,37 @@ fn emit_final_slice<F>(
     bytes: Vec<u8>,
     basis: &BasisIndex,
     emitter: &mut DeltaEmitter<'_, F>,
+    work: &mut MatchWork,
 ) -> Result<()>
 where
     F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
 {
-    if let Some(block) = basis.find_slice(&bytes) {
-        emitter.copy_slice(basis.offset(block)?, block.size, &bytes)
-    } else {
-        emitter.literal_slice(&bytes)
+    match basis.find_match(WeakChecksum::hash(&bytes), (&bytes, &[]), work) {
+        CandidateMatch::Block(block) => {
+            emitter.copy_slice(basis.offset(block)?, block.size, &bytes)
+        }
+        CandidateMatch::Miss | CandidateMatch::LiteralFallback => emitter.literal_slice(&bytes),
+    }
+}
+
+fn emit_literal_remainder<R, F>(
+    reader: &mut BufReader<R>,
+    emitter: &mut DeltaEmitter<'_, F>,
+    work: &mut MatchWork,
+) -> Result<()>
+where
+    R: Read,
+    F: FnMut(DeltaOp) -> std::result::Result<(), BoxError>,
+{
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        work.read(bytes.len())?;
+        emitter.literal_slice(bytes)?;
+        let consumed = bytes.len();
+        reader.consume(consumed);
     }
 }
 
@@ -338,8 +451,11 @@ fn read_byte<R: Read>(reader: &mut BufReader<R>) -> io::Result<Option<u8>> {
     Ok(Some(byte))
 }
 
-fn strong_signature(bytes: &[u8]) -> [u8; STRONG_SIGNATURE_LEN] {
-    let digest = blake3::hash(bytes);
+fn strong_signature(slices: (&[u8], &[u8])) -> [u8; STRONG_SIGNATURE_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(slices.0);
+    hasher.update(slices.1);
+    let digest = hasher.finalize();
     let mut strong = [0_u8; STRONG_SIGNATURE_LEN];
     strong.copy_from_slice(&digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
     strong
@@ -356,10 +472,6 @@ impl RollingWindow {
         Self { bytes, head: 0 }
     }
 
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
     fn as_contiguous(&self) -> &[u8] {
         debug_assert_eq!(self.head, 0);
         &self.bytes
@@ -368,17 +480,6 @@ impl RollingWindow {
     fn slices(&self) -> (&[u8], &[u8]) {
         let (before, after) = self.bytes.split_at(self.head);
         (after, before)
-    }
-
-    fn strong_signature(&self) -> [u8; STRONG_SIGNATURE_LEN] {
-        let (first, second) = self.slices();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(first);
-        hasher.update(second);
-        let digest = hasher.finalize();
-        let mut strong = [0_u8; STRONG_SIGNATURE_LEN];
-        strong.copy_from_slice(&digest.as_bytes()[..STRONG_SIGNATURE_LEN]);
-        strong
     }
 
     fn roll(&mut self, incoming: u8) -> u8 {
@@ -517,7 +618,7 @@ mod tests {
             index,
             size: bytes.len() as u32,
             weak: WeakChecksum::hash(bytes),
-            strong: strong_signature(bytes),
+            strong: strong_signature((bytes, &[])),
         }
     }
 
@@ -654,6 +755,151 @@ mod tests {
         }));
         assert_eq!(summary.literal_bytes, source.len() as u64);
         assert_eq!(reconstruct(&ops, &[]), source);
+    }
+
+    #[test]
+    fn repeated_weak_collisions_fall_back_on_the_same_source_stream() {
+        let block_size = 64 * 1024;
+        let mut destination = vec![1_u8; block_size];
+        destination.resize(block_size * 9, 0);
+        let index = basis(&destination, block_size);
+        assert_eq!(index.block_count(), 9);
+        assert_eq!(index.by_weak[&0].len(), 1); // Eight identical zero blocks.
+        assert_eq!(index.by_weak[&0][0].index, 1);
+
+        let mut source = vec![1_u8; block_size];
+        source.resize(block_size * 4 + 29, 2);
+        source.extend_from_slice(b"unread tail must survive fallback");
+        assert_eq!(WeakChecksum::hash(&source[block_size..2 * block_size]), 0);
+        let mut reader = io::Cursor::new(&source);
+        let mut work = MatchWork::default();
+        let mut ops = Vec::new();
+        let summary = match_delta_with_work(
+            &mut reader,
+            &index,
+            |op| {
+                ops.push(op);
+                Ok(())
+            },
+            &mut work,
+        )
+        .unwrap();
+
+        assert!(work.exhausted);
+        // One successful block followed by seven candidate-window hashes;
+        // the next collision exhausts credit, with a wrapped rolling window,
+        // pending literals, prefetched bytes, and unread source still present.
+        assert_eq!(work.hashed_bytes, 8 * block_size as u64);
+        assert_eq!(work.candidate_comparisons, 8);
+        assert_eq!(work.input_bytes, source.len() as u64);
+        assert_eq!(reader.position(), source.len() as u64);
+        assert_eq!(summary.source_bytes, source.len() as u64);
+        assert_eq!(summary.reused_bytes, block_size as u64);
+        assert_eq!(summary.literal_bytes, (source.len() - block_size) as u64);
+        assert_eq!(summary.source_digest, *blake3::hash(&source).as_bytes());
+        assert!(ops
+            .iter()
+            .all(|op| !matches!(op, DeltaOp::Literal(bytes) if bytes.len() > MAX_LITERAL_BYTES)));
+        assert_eq!(reconstruct(&ops, &destination), source);
+    }
+
+    #[test]
+    fn distinct_weak_bucket_candidates_have_a_comparison_budget() {
+        let source = b"abcdefghijkl";
+        let weak = WeakChecksum::hash(&source[..4]);
+        let candidates = (0_u64..128).map(|index| {
+            let mut strong = [0; STRONG_SIGNATURE_LEN];
+            strong[..8].copy_from_slice(&index.to_be_bytes());
+            assert_ne!(strong, strong_signature((&source[..4], &[])));
+            BasisBlock {
+                index,
+                size: 4,
+                weak,
+                strong,
+            }
+        });
+        let index = BasisIndex::new(4, candidates, BasisIndexLimits::default()).unwrap();
+        let mut work = MatchWork::default();
+        let mut ops = Vec::new();
+        let summary = match_delta_with_work(
+            source.as_slice(),
+            &index,
+            |op| {
+                ops.push(op);
+                Ok(())
+            },
+            &mut work,
+        )
+        .unwrap();
+        assert!(work.exhausted);
+        assert_eq!(work.hashed_bytes, 4);
+        assert_eq!(work.candidate_comparisons, 4);
+        assert_eq!(summary.reused_bytes, 0);
+        assert_eq!(summary.source_digest, *blake3::hash(source).as_bytes());
+        assert_eq!(reconstruct(&ops, &[]), source);
+    }
+
+    #[test]
+    fn literal_fallback_propagates_source_and_sink_failures() {
+        struct ReadThenFail<'a>(&'a [u8]);
+        impl Read for ReadThenFail<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(io::Error::other("source failed"));
+                }
+                self.0.read(out)
+            }
+        }
+
+        let block_size = 64 * 1024;
+        let index = basis(&vec![0; block_size], block_size);
+        let source = vec![2; block_size * 2 + 17];
+        for fail_sink in [false, true] {
+            let mut work = MatchWork::default();
+            let error = match_delta_with_work(
+                ReadThenFail(&source),
+                &index,
+                |_| {
+                    if fail_sink {
+                        Err(Box::new(io::Error::other("sink failed")) as BoxError)
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut work,
+            )
+            .unwrap_err();
+            assert!(work.exhausted);
+            if fail_sink {
+                assert!(matches!(error, DeltaMatchError::Sink(_)));
+            } else {
+                assert!(matches!(error, DeltaMatchError::Io(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn deduplicated_signatures_keep_first_offset_and_received_count_limit() {
+        let blocks = [block(0, b"abcd"), block(1, b"abcd"), block(2, b"efgh")];
+        let index = BasisIndex::new(4, blocks, BasisIndexLimits::default()).unwrap();
+        assert_eq!(index.block_count(), 3);
+        assert_eq!(index.by_weak[&blocks[0].weak].len(), 1);
+        let (ops, summary) = collect(b"abcdabcd", &index);
+        assert_eq!(
+            ops,
+            vec![
+                DeltaOp::Copy {
+                    basis_offset: 0,
+                    len: 4
+                };
+                2
+            ]
+        );
+        assert_eq!(summary.reused_bytes, 8);
+        assert_eq!(
+            BasisIndex::new(4, blocks, BasisIndexLimits { max_blocks: 2 }).unwrap_err(),
+            BasisIndexError::TooManyBlocks { max: 2 }
+        );
     }
 
     #[test]
