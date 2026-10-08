@@ -1,0 +1,51 @@
+name: Update Homebrew
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  update-homebrew:
+    name: Update Homebrew Tap
+    if: github.event.release.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nijaru/homebrew-tap
+          token: ${{ secrets.TAP_UPDATE_TOKEN }}
+
+      - name: Download checksums
+        run: |
+          gh release download "$TAG" \
+            --repo nijaru/sy \
+            --pattern '*.sha256'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Update formula
+        run: |
+          VERSION=${TAG#v}
+
+          ARM64_SHA=$(cat sy-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SOURCE_SHA=$(curl -fsSL "https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz" | shasum -a 256 | awk '{print $1}')
+
+          sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/sy.rb
+          sed -i "s|url \"https://github.com/nijaru/sy/releases/download/v.*/sy-aarch64-apple-darwin.tar.gz\"|url \"https://github.com/nijaru/sy/releases/download/$TAG/sy-aarch64-apple-darwin.tar.gz\"|" Formula/sy.rb
+          sed -i "/on_arm do/,/end/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/sy.rb
+          sed -i "s|url \"https://github.com/nijaru/sy/archive/refs/tags/v.*.tar.gz\"|url \"https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz\"|" Formula/sy.rb
+          sed -i "/on_intel do/,/depends_on/ s/sha256 \".*\"/sha256 \"$SOURCE_SHA\"/" Formula/sy.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sy.rb
+          git commit -m "chore: update sy to $TAG"
+          git push

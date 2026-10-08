@@ -157,7 +157,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test
+        run: |
+          cargo test --locked
+          cargo test --locked --lib --all-features
         timeout-minutes: 15
 
   test-macos:
@@ -169,5 +171,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test
+        run: |
+          cargo test --locked
+          cargo test --locked --lib --all-features
         timeout-minutes: 15
