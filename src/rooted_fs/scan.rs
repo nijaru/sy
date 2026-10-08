@@ -127,11 +127,15 @@ const CONTINUATION_BYTES: u64 = 32;
 struct Continuations(tempfile::NamedTempFile);
 
 impl Continuations {
+    #[cfg(test)]
     fn new() -> io::Result<Self> {
+        Self::new_in(&tempfile::env::temp_dir())
+    }
+    fn new_in(parent: &Path) -> io::Result<Self> {
         Ok(Self(
             tempfile::Builder::new()
                 .prefix("sy-scan-stack-")
-                .tempfile()?,
+                .tempfile_in(parent)?,
         ))
     }
 
@@ -269,64 +273,24 @@ fn validate_path_bound(path: &Path) -> Result<(), RootedScanError> {
     Ok(())
 }
 
-// Scratch may lie beneath the scanned root (e.g. scanning /tmp). Do not emit
-// our own bookkeeping as source data or recursively scan the run directory.
-// Match native name AND inode so an unrelated same-named entry is not excluded.
-struct ScratchEntry {
-    name: OsString,
-    device: libc::dev_t,
-    inode: libc::ino_t,
-}
-
-impl ScratchEntry {
-    fn new(path: &Path, file: &File) -> Result<Self, RootedScanError> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        let result = unsafe {
-            // SAFETY: file is live and the output buffer fits one stat.
-            libc::fstat(file.as_raw_fd(), stat.as_mut_ptr())
-        };
-        if result < 0 {
-            return Err(RootedScanError::Scratch(io::Error::last_os_error()));
-        }
-        let stat = unsafe {
-            // SAFETY: successful fstat initialized the output buffer.
-            stat.assume_init()
-        };
-        let name = path
-            .file_name()
-            .ok_or_else(|| RootedScanError::Scratch(io::Error::other("scratch path has no name")))?
-            .to_owned();
-        Ok(Self {
-            name,
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        })
-    }
-
-    fn matches(&self, parent: RawFd, name: &OsStr, path: &Path) -> Result<bool, RootedScanError> {
-        if name != self.name {
-            return Ok(false);
-        }
-        let stat = lstat_at(parent, name, path)?;
-        Ok(stat.st_dev == self.device && stat.st_ino == self.inode)
-    }
-}
-
 fn walk_tree(
     rooted: &RootedFs,
     request: ScanRequest,
     sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
     budget: SortBudget,
 ) -> Result<(), RootedScanError> {
-    let mut spool = NameSpool::new(budget).map_err(RootedScanError::Scratch)?;
-    let mut stack = Continuations::new().map_err(RootedScanError::Scratch)?;
-    let scratch = [
-        ScratchEntry::new(
-            spool.scratch_path(),
-            &File::open(spool.scratch_path()).map_err(RootedScanError::Scratch)?,
-        )?,
-        ScratchEntry::new(stack.0.path(), stack.0.as_file())?,
-    ];
+    let scratch_parent = tempfile::env::temp_dir();
+    let held_root = File::from(
+        rooted
+            .root_fd
+            .try_clone()
+            .map_err(RootedScanError::Scratch)?,
+    );
+    crate::engine::scan_sort::validate_scratch_root(&held_root, &scratch_parent)
+        .map_err(RootedScanError::Scratch)?;
+    drop(held_root);
+    let mut spool = NameSpool::new_in(budget, &scratch_parent).map_err(RootedScanError::Scratch)?;
+    let mut stack = Continuations::new_in(&scratch_parent).map_err(RootedScanError::Scratch)?;
     let mut directory = rooted
         .root_fd
         .try_clone()
@@ -372,11 +336,6 @@ fn walk_tree(
             continue;
         }
         let relative_path = path.join(&name);
-        if scratch[0].matches(directory.as_raw_fd(), &name, &relative_path)?
-            || scratch[1].matches(directory.as_raw_fd(), &name, &relative_path)?
-        {
-            continue;
-        }
         validate_path_bound(&relative_path)?;
         let relative = RelativePath::new(relative_path.clone())
             .map_err(|_| RootedScanError::InvalidRelativePath(relative_path))?;
@@ -934,10 +893,11 @@ mod tests {
         // this test process's limit would race unrelated parallel tests. Depth
         // exceeds the ceiling, so retaining even one FD per ancestor fails.
         use std::os::unix::process::CommandExt;
+        let scratch = tempfile::TempDir::new().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child.args(["--exact", "rooted_fs::scan::tests::tiny_budget_wide_and_deep_scans_are_incremental_and_ordered"])
             .env("SY_TEST_SCAN_FD_ROOT", root.path())
-            .env("TMPDIR", root.path());
+            .env("TMPDIR", scratch.path());
         unsafe {
             // SAFETY: the pre-exec hook only invokes async-signal-safe resource
             // limit syscalls, with valid local buffers; no locks/allocations.
@@ -947,7 +907,7 @@ mod tests {
                     return Err(io::Error::last_os_error());
                 }
                 let mut limit = limit.assume_init();
-                limit.rlim_cur = limit.rlim_cur.min(64);
+                limit.rlim_cur = limit.rlim_cur.min(32);
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
                     return Err(io::Error::last_os_error());
                 }

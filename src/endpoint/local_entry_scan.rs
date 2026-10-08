@@ -73,11 +73,21 @@ enum LocalScanError {
     UnsupportedFileType { path: PathBuf },
 }
 
+/// Reject unsafe temporary storage before the controller creates any session
+/// journals. Scanner workers repeat the check before creating their own scratch.
+pub async fn validate_scratch_location(root: PathBuf) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || traversal::validate_scratch_location(&root))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Scan a local endpoint into the engine's lean, strictly ordered entry stream.
 ///
 /// Blocking filesystem work runs on a blocking worker. Both the output channel
 /// and per-directory sort are bounded; inactive traversal continuations and
-/// ancestor identities live on disk, not in an in-memory depth stack.
+/// ancestor identities live on disk, not in an in-memory depth stack. Session
+/// owners must first validate source scratch placement before spawning other
+/// endpoint scans or creating journals in the same temporary directory.
 pub fn local_entry_stream(root: PathBuf, request: ScanRequest) -> EntryStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let join_sender = sender.clone();

@@ -7,10 +7,60 @@ use super::native_path;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 const MAX_NAME_BYTES: usize = crate::protocol::MAX_WIRE_COMPONENT_BYTES;
+
+pub(crate) fn unsafe_scratch() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "temporary directory is inside scanned root; configure temporary storage outside the source",
+    )
+}
+
+/// Compare the scratch parent's actual ancestry to the held scan root, not its
+/// pathname (which may have been renamed or replaced). This is a write-location
+/// guard, not a substitute for descriptor-rooted scan confinement. Concurrent
+/// external moves of the temporary directory remain outside this guarantee.
+#[cfg(unix)]
+pub(crate) fn validate_scratch_root(root: &File, scratch: &Path) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let identity = |file: &File| -> io::Result<_> {
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let root_identity = identity(root)?;
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(scratch)?;
+    loop {
+        let current = identity(&directory)?;
+        if current == root_identity {
+            return Err(unsafe_scratch());
+        }
+        // SAFETY: directory owns a live FD; '..' is a NUL-terminated component.
+        // Successful openat returns a fresh owned directory descriptor.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned a fresh exclusively owned FD.
+        let parent = unsafe { File::from_raw_fd(fd) };
+        if identity(&parent)? == current {
+            return Ok(());
+        }
+        directory = parent;
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct SortBudget {
@@ -42,7 +92,12 @@ pub(crate) struct NameSpool {
 }
 
 impl NameSpool {
+    #[cfg(test)]
     pub fn new(budget: SortBudget) -> io::Result<Self> {
+        Self::new_in(budget, &tempfile::env::temp_dir())
+    }
+
+    pub fn new_in(budget: SortBudget, parent: &Path) -> io::Result<Self> {
         if budget.bytes == 0 || budget.records == 0 || budget.fan_in < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -50,7 +105,9 @@ impl NameSpool {
             ));
         }
         Ok(Self {
-            scratch: tempfile::Builder::new().prefix("sy-scan-").tempdir()?,
+            scratch: tempfile::Builder::new()
+                .prefix("sy-scan-")
+                .tempdir_in(parent)?,
             next_id: 0,
             budget,
             #[cfg(test)]
@@ -255,6 +312,34 @@ pub(crate) fn read_name(reader: &mut impl Read) -> io::Result<Option<OsString>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_guard_uses_held_root_after_path_replacement() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let root = parent.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let held = File::open(&root).unwrap();
+        let moved = parent.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let scratch = moved.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let before = std::fs::metadata(&scratch).unwrap().modified().unwrap();
+        assert_eq!(
+            validate_scratch_root(&held, &scratch).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            std::fs::metadata(&scratch).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        // The replacement pathname is not the held scan root, and a temporary
+        // ancestor is safe: scratch children are siblings, not source children.
+        validate_scratch_root(&held, &root).unwrap();
+        validate_scratch_root(&held, parent.path()).unwrap();
+    }
 
     #[test]
     fn many_closed_runs_merge_with_tiny_budgets_in_native_order() {
