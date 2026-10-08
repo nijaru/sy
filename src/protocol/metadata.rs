@@ -11,6 +11,27 @@ bitflags! {
     }
 }
 
+/// Authority for a metadata request. Observed mutations always carry an
+/// endpoint-issued identity. Directory finalization is a distinct, currently
+/// unobserved lifecycle operation, never an optional-identity file update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireMetadataTarget {
+    Observed {
+        kind: WireEntryKind,
+        identity: [u8; 32],
+    },
+    DirectoryFinalize,
+}
+
+impl WireMetadataTarget {
+    fn kind(self) -> WireEntryKind {
+        match self {
+            Self::Observed { kind, .. } => kind,
+            Self::DirectoryFinalize => WireEntryKind::Directory,
+        }
+    }
+}
+
 /// One bounded metadata-only update for an existing destination entry.
 ///
 /// Presence bits express policy decisions made by the engine. The protocol
@@ -20,7 +41,7 @@ bitflags! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireMetadata {
     pub path: RelativeWirePath,
-    kind: WireEntryKind,
+    target: WireMetadataTarget,
     unix_mode: Option<u32>,
     modified: Option<(i64, u32)>,
 }
@@ -28,13 +49,13 @@ pub struct WireMetadata {
 impl WireMetadata {
     pub fn new(
         path: RelativeWirePath,
-        kind: WireEntryKind,
+        target: WireMetadataTarget,
         unix_mode: Option<u32>,
         modified: Option<(i64, u32)>,
     ) -> Result<Self> {
         let metadata = Self {
             path,
-            kind,
+            target,
             unix_mode,
             modified,
         };
@@ -42,8 +63,8 @@ impl WireMetadata {
         Ok(metadata)
     }
 
-    pub const fn kind(&self) -> WireEntryKind {
-        self.kind
+    pub const fn target(&self) -> WireMetadataTarget {
+        self.target
     }
 
     pub const fn unix_mode(&self) -> Option<u32> {
@@ -67,6 +88,12 @@ impl WireMetadata {
             .checked_add(1)
             .and_then(|value| value.checked_add(4))
             .and_then(|value| value.checked_add(self.path.as_encoded().len()))
+            .and_then(|value| {
+                value.checked_add(match self.target {
+                    WireMetadataTarget::Observed { .. } => 32,
+                    WireMetadataTarget::DirectoryFinalize => 0,
+                })
+            })
             .ok_or(ProtocolError::InvalidMessage(
                 "metadata payload length overflow",
             ))?;
@@ -86,10 +113,16 @@ impl WireMetadata {
         }
 
         let mut out = BytesMut::with_capacity(capacity);
-        out.put_u8(self.kind as u8);
+        out.put_u8(match self.target {
+            WireMetadataTarget::Observed { kind, .. } => kind as u8,
+            WireMetadataTarget::DirectoryFinalize => 0,
+        });
         out.put_u8(fields.bits());
         out.put_u32(path_len);
         out.extend_from_slice(self.path.as_encoded());
+        if let WireMetadataTarget::Observed { identity, .. } = self.target {
+            out.extend_from_slice(&identity);
+        }
         if let Some(mode) = self.unix_mode {
             out.put_u32(mode);
         }
@@ -102,7 +135,12 @@ impl WireMetadata {
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
-        let kind = WireEntryKind::try_from(reader.u8()?)?;
+        let target_tag = reader.u8()?;
+        let kind = if target_tag == 0 {
+            None
+        } else {
+            Some(WireEntryKind::try_from(target_tag)?)
+        };
         let raw_fields = reader.u8()?;
         let fields = MetadataFields::from_bits(raw_fields).ok_or(ProtocolError::InvalidField {
             field: "metadata_fields",
@@ -116,6 +154,15 @@ impl WireMetadata {
             });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
+        let target = match kind {
+            Some(kind) => WireMetadataTarget::Observed {
+                kind,
+                identity: reader.take(32)?.try_into().map_err(|_| {
+                    ProtocolError::InvalidMessage("invalid metadata identity length")
+                })?,
+            },
+            None => WireMetadataTarget::DirectoryFinalize,
+        };
         let unix_mode = fields
             .contains(MetadataFields::UNIX_MODE)
             .then(|| reader.u32())
@@ -126,7 +173,7 @@ impl WireMetadata {
             None
         };
         reader.finish()?;
-        Self::new(path, kind, unix_mode, modified)
+        Self::new(path, target, unix_mode, modified)
     }
 
     fn fields(&self) -> MetadataFields {
@@ -143,7 +190,7 @@ impl WireMetadata {
                 reason: "metadata request must contain at least one field",
             });
         }
-        if self.kind == WireEntryKind::Symlink && self.unix_mode.is_some() {
+        if self.target.kind() == WireEntryKind::Symlink && self.unix_mode.is_some() {
             return Err(ProtocolError::InvalidField {
                 field: "unix_mode",
                 reason: "symlink mode changes are unsupported",
@@ -167,6 +214,13 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn observed(kind: WireEntryKind) -> WireMetadataTarget {
+        WireMetadataTarget::Observed {
+            kind,
+            identity: [42; 32],
+        }
+    }
+
     fn path() -> RelativeWirePath {
         RelativeWirePath::from_components([b"dir".as_slice(), b"entry".as_slice()]).unwrap()
     }
@@ -175,7 +229,7 @@ mod tests {
     fn metadata_round_trip_preserves_requested_fields() {
         let metadata = WireMetadata::new(
             path(),
-            WireEntryKind::File,
+            observed(WireEntryKind::File),
             Some(0o100640),
             Some((-1, 999_999_999)),
         )
@@ -188,11 +242,13 @@ mod tests {
 
     #[test]
     fn metadata_rejects_empty_symlink_mode_and_invalid_time() {
-        assert!(WireMetadata::new(path(), WireEntryKind::File, None, None).is_err());
-        assert!(WireMetadata::new(path(), WireEntryKind::Symlink, Some(0o777), None).is_err());
+        assert!(WireMetadata::new(path(), observed(WireEntryKind::File), None, None).is_err());
+        assert!(
+            WireMetadata::new(path(), observed(WireEntryKind::Symlink), Some(0o777), None).is_err()
+        );
         assert!(WireMetadata::new(
             path(),
-            WireEntryKind::Directory,
+            WireMetadataTarget::DirectoryFinalize,
             None,
             Some((0, 1_000_000_000))
         )
@@ -201,11 +257,15 @@ mod tests {
 
     #[test]
     fn decoder_rejects_truncation_and_trailing_data() {
-        let encoded =
-            WireMetadata::new(path(), WireEntryKind::Directory, Some(0o755), Some((1, 2)))
-                .unwrap()
-                .encode()
-                .unwrap();
+        let encoded = WireMetadata::new(
+            path(),
+            observed(WireEntryKind::Directory),
+            Some(0o755),
+            Some((1, 2)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
         for len in 0..encoded.len() {
             assert!(WireMetadata::decode(&encoded[..len]).is_err());
         }
@@ -215,6 +275,21 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn observed_metadata_round_trips_opaque_identity(
+            identity in any::<[u8; 32]>(),
+            mode in any::<u32>(),
+            seconds in any::<i64>(),
+            nanoseconds in 0_u32..1_000_000_000,
+        ) {
+            let metadata = WireMetadata::new(
+                path(),
+                WireMetadataTarget::Observed { kind: WireEntryKind::File, identity },
+                Some(mode), Some((seconds, nanoseconds)),
+            ).unwrap();
+            prop_assert_eq!(WireMetadata::decode(&metadata.encode().unwrap()).unwrap(), metadata);
+        }
+
         #[test]
         fn arbitrary_metadata_payloads_never_panic(payload in prop::collection::vec(any::<u8>(), 0..4096)) {
             let _ = WireMetadata::decode(&payload);

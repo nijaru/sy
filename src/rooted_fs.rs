@@ -1144,19 +1144,48 @@ impl RootedFs {
     }
 
     /// Apply requested metadata to an existing entry beneath the pinned root.
-    /// Regular files and directories are opened without following the leaf;
-    /// symlink timestamps use `utimensat(..., AT_SYMLINK_NOFOLLOW)` and never
-    /// affect the symlink target.
+    /// Regular files and directories are identity-checked through the same held
+    /// no-follow descriptor used for mutation. Later namespace substitution
+    /// cannot redirect chmod/timestamps to a different inode. This is an
+    /// in-place update, not an atomic multi-field transaction.
+    ///
+    /// Symlink timestamps use a held parent and AT_SYMLINK_NOFOLLOW. Their
+    /// identity check and timestamp syscall are separate: they detect observed
+    /// substitution but do not provide compare-and-swap on the symlink inode.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn apply_metadata_blocking(
         &self,
         relative: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
-        self.apply_metadata_path_blocking(relative.as_path(), kind, unix_mode, modified)
+        self.apply_metadata_path_blocking(relative.as_path(), kind, expected, unix_mode, modified)
+    }
+
+    /// Directory finalization is root-confined but not yet observation-bound.
+    /// Kept distinct from observed metadata updates until creation receipts
+    /// are carried through the runtime finalization journal.
+    /// This blocking API must run on a blocking worker.
+    pub fn finalize_directory_metadata_blocking(
+        &self,
+        relative: &RelativePath,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+            let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
+            apply_fd_metadata(directory.as_raw_fd(), unix_mode, modified)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, unix_mode, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     #[cfg(unix)]
@@ -1521,30 +1550,44 @@ impl RootedFs {
         &self,
         relative: &Path,
         kind: EntryKind,
+        expected: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
+        let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
         match kind {
-            EntryKind::File => {
-                let file = open_file_at(parent.as_raw_fd(), &leaf)?;
-                if !file.metadata()?.file_type().is_file() {
-                    return Err(RootedFsError::EntryKindMismatch {
-                        path: relative.to_path_buf(),
-                        expected: kind,
-                    });
+            EntryKind::File | EntryKind::Directory => {
+                let file = if kind == EntryKind::File {
+                    open_file_at(parent.as_raw_fd(), &leaf)?
+                } else {
+                    File::from(open_dir_at(parent.as_raw_fd(), &leaf)?)
+                };
+                let stat = stat_fd(file.as_raw_fd())?;
+                let expected_type = if kind == EntryKind::File {
+                    libc::S_IFREG
+                } else {
+                    libc::S_IFDIR
+                };
+                if stat.st_mode & libc::S_IFMT != expected_type
+                    || identity_from_stat(&stat) != Some(expected)
+                {
+                    return Err(changed());
                 }
                 apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)
-            }
-            EntryKind::Directory => {
-                let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
-                apply_fd_metadata(directory.as_raw_fd(), unix_mode, modified)
             }
             EntryKind::Symlink => {
                 if unix_mode.is_some() {
                     return Err(RootedFsError::UnsupportedSymlinkMode);
                 }
                 ensure_symlink_at(parent.as_raw_fd(), &leaf, relative)?;
+                if stat_at_optional(parent.as_raw_fd(), &leaf)?
+                    .as_ref()
+                    .and_then(identity_from_stat)
+                    != Some(expected)
+                {
+                    return Err(changed());
+                }
                 if let Some(modified) = modified {
                     set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
                 }
@@ -1558,6 +1601,7 @@ impl RootedFs {
         &self,
         _relative: &Path,
         _kind: EntryKind,
+        _expected: EntryIdentity,
         _unix_mode: Option<u32>,
         _modified: Option<Timestamp>,
     ) -> Result<()> {
@@ -3298,6 +3342,11 @@ mod tests {
             .apply_metadata_blocking(
                 &relative("file"),
                 EntryKind::File,
+                rooted
+                    .path_identity_blocking(&relative("file"))
+                    .unwrap()
+                    .unwrap()
+                    .1,
                 Some(0o600),
                 Some(file_time),
             )
@@ -3306,12 +3355,27 @@ mod tests {
             .apply_metadata_blocking(
                 &relative("dir"),
                 EntryKind::Directory,
+                rooted
+                    .path_identity_blocking(&relative("dir"))
+                    .unwrap()
+                    .unwrap()
+                    .1,
                 Some(0o750),
                 Some(dir_time),
             )
             .unwrap();
         rooted
-            .apply_metadata_blocking(&relative("link"), EntryKind::Symlink, None, Some(link_time))
+            .apply_metadata_blocking(
+                &relative("link"),
+                EntryKind::Symlink,
+                rooted
+                    .path_identity_blocking(&relative("link"))
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                None,
+                Some(link_time),
+            )
             .unwrap();
 
         let file = std::fs::metadata(root.path().join("file")).unwrap();
@@ -3337,12 +3401,20 @@ mod tests {
         std::fs::write(outside.path().join("file"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let before = std::fs::metadata(outside.path().join("file"))
-            .unwrap()
-            .mode();
+        let outside_metadata = std::fs::metadata(outside.path().join("file")).unwrap();
+        let before = outside_metadata.mode();
+        // A valid outside token must not grant access through a symlink ancestor.
+        let outside_identity =
+            crate::endpoint::local_identity::identity_for_metadata(&outside_metadata).unwrap();
 
         assert!(rooted
-            .apply_metadata_blocking(&relative("escape/file"), EntryKind::File, Some(0o600), None,)
+            .apply_metadata_blocking(
+                &relative("escape/file"),
+                EntryKind::File,
+                outside_identity,
+                Some(0o600),
+                None,
+            )
             .is_err());
         assert_eq!(
             std::fs::metadata(outside.path().join("file"))

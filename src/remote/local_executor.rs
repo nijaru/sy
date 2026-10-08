@@ -14,7 +14,7 @@
 use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptions};
 use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
-use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
@@ -98,6 +98,7 @@ pub enum LocalSyncAction {
     },
     ApplyMetadata {
         source: Entry,
+        expected_destination: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     },
@@ -110,6 +111,7 @@ pub struct LocalSyncExecutor {
     destination_root: PathBuf,
     source_endpoint: crate::endpoint::local::LocalEndpoint,
     destination_endpoint: crate::endpoint::local::LocalEndpoint,
+    metadata_authority: tokio::sync::OnceCell<crate::rooted_fs::RootedFs>,
     scheduler: Scheduler,
     /// --backup: enabled marker, backup directory (None = beside the file),
     /// and suffix, mirroring the other executors.
@@ -156,6 +158,7 @@ impl LocalSyncExecutor {
             destination_root,
             source_endpoint,
             destination_endpoint,
+            metadata_authority: tokio::sync::OnceCell::new(),
             scheduler,
             backup: false,
             backup_dir: None,
@@ -400,15 +403,18 @@ impl LocalSyncExecutor {
 
         match action {
             LocalSyncAction::CreateDirectory { source } => {
-                let path = self.destination_path(&source.path);
                 // Read the source's attributes before creating anything so a
                 // source metadata failure cannot leave a partial entry.
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                tokio::fs::create_dir_all(&path)
+                let rooted = self.metadata_authority().await?.clone();
+                let relative = source.path.clone();
+                tokio::task::spawn_blocking(move || rooted.create_directory_blocking(&relative))
                     .await
-                    .map_err(|error| LocalSyncError::Destination(path.clone(), error))?;
+                    .map_err(|error| {
+                        crate::rooted_fs::RootedFsError::Worker(error.to_string())
+                    })??;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
                         .await?;
@@ -509,21 +515,27 @@ impl LocalSyncExecutor {
             }
             LocalSyncAction::ApplyMetadata {
                 source,
+                expected_destination,
                 unix_mode,
                 modified,
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let path = self.destination_path(&source.path);
-                if let Some(mode) = unix_mode {
-                    self.set_mode(&path, mode).await?;
-                }
-                if let Some(modified) = modified {
-                    if source.kind != EntryKind::Symlink {
-                        self.set_mtime(&path, modified).await?;
-                    }
-                }
+                let rooted = self.metadata_authority().await?.clone();
+                let relative = source.path.clone();
+                let kind = source.kind;
+                tokio::task::spawn_blocking(move || {
+                    rooted.apply_metadata_blocking(
+                        &relative,
+                        kind,
+                        expected_destination,
+                        unix_mode,
+                        modified,
+                    )
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
                         .await?;
@@ -754,29 +766,11 @@ impl LocalSyncExecutor {
             })
     }
 
-    async fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-                .await
-                .map_err(|error| LocalSyncError::Destination(path.to_path_buf(), error))?;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, mode);
-            Ok(())
-        }
-    }
-
-    /// mtime through the link: a symlink's own timestamp matters, not its
-    /// target's (filetime's symlink variant on Unix).
-    async fn set_mtime(&self, path: &Path, modified: Timestamp) -> Result<()> {
-        let time = filetime::FileTime::from_unix_time(modified.seconds(), modified.nanoseconds());
-        filetime::set_symlink_file_times(path, time, time)
-            .map_err(|error| LocalSyncError::Destination(path.to_path_buf(), error))?;
-        Ok(())
+    async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
+        self.metadata_authority
+            .get_or_try_init(|| crate::rooted_fs::RootedFs::open(self.destination_root.clone()))
+            .await
+            .map_err(Into::into)
     }
 
     /// --remove-source-files: remove the source entry after the destination
@@ -883,15 +877,16 @@ impl LocalSyncExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
-        let path = self.destination_path(&metadata.path);
-        if let Some(mode) = metadata.unix_mode {
-            self.set_mode(&path, mode).await?;
-        }
-        if let Some(modified) = metadata.modified {
-            if metadata.kind != EntryKind::Symlink {
-                self.set_mtime(&path, modified).await?;
-            }
-        }
+        let rooted = self.metadata_authority().await?.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.finalize_directory_metadata_blocking(
+                &metadata.path,
+                metadata.unix_mode,
+                metadata.modified,
+            )
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         Ok(())
     }
 
@@ -1181,7 +1176,15 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    Ok(Some(metadata_work(source, unix_mode, modified)))
+    let expected_destination = destination.identity.ok_or_else(|| {
+        LocalSyncError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
+    })?;
+    Ok(Some(metadata_work(
+        source,
+        expected_destination,
+        unix_mode,
+        modified,
+    )))
 }
 
 fn requested_metadata(
@@ -1215,11 +1218,13 @@ fn mutation_work(action: LocalSyncAction) -> WorkItem<LocalSyncAction> {
 
 fn metadata_work(
     source: Entry,
+    expected_destination: EntryIdentity,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<LocalSyncAction> {
     mutation_work(LocalSyncAction::ApplyMetadata {
         source,
+        expected_destination,
         unix_mode,
         modified,
     })

@@ -289,13 +289,40 @@ impl ClientRemoteHandle {
         &self,
         path: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
         self.require_push(FrameKind::Metadata)?;
-        request_metadata(&self.sender, path, kind, unix_mode, modified, self.peer)
-            .await
-            .map_err(Into::into)
+        request_metadata(
+            &self.sender,
+            path,
+            kind,
+            expected,
+            unix_mode,
+            modified,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn finalize_directory_metadata(
+        &self,
+        path: &RelativePath,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Metadata)?;
+        super::metadata::request_directory_finalize(
+            &self.sender,
+            path,
+            unix_mode,
+            modified,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn create_directory(&self, path: &RelativePath) -> Result<()> {

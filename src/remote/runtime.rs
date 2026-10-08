@@ -285,6 +285,7 @@ impl ClientRemoteSession {
         &self,
         path: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
@@ -293,6 +294,25 @@ impl ClientRemoteSession {
             &self.router.sender(),
             path,
             kind,
+            expected,
+            unix_mode,
+            modified,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn finalize_directory_metadata(
+        &self,
+        path: &RelativePath,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Metadata)?;
+        metadata::request_directory_finalize(
+            &self.router.sender(),
+            path,
             unix_mode,
             modified,
             self.server.platform.os,
@@ -1092,6 +1112,11 @@ mod tests {
             .apply_metadata(
                 &RelativePath::new("file").unwrap(),
                 EntryKind::File,
+                crate::endpoint::local_identity::metadata_identity(
+                    &std::fs::symlink_metadata(destination_root.path().join("file")).unwrap(),
+                    EntryKind::File,
+                )
+                .unwrap(),
                 Some(0o640),
                 Some(modified),
             )

@@ -1,6 +1,7 @@
-use crate::engine::domain::{EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireEntryKind, WireMetadata,
+    WireMetadataTarget,
 };
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
@@ -57,6 +58,47 @@ pub async fn request_metadata(
     sender: &RouterSender,
     path: &RelativePath,
     kind: EntryKind,
+    expected: EntryIdentity,
+    unix_mode: Option<u32>,
+    modified: Option<Timestamp>,
+    peer: PlatformOs,
+) -> Result<()> {
+    request_metadata_update(
+        sender,
+        path,
+        WireMetadataTarget::Observed {
+            kind: wire_kind(kind),
+            identity: *expected.as_bytes(),
+        },
+        unix_mode,
+        modified,
+        peer,
+    )
+    .await
+}
+
+pub async fn request_directory_finalize(
+    sender: &RouterSender,
+    path: &RelativePath,
+    unix_mode: Option<u32>,
+    modified: Option<Timestamp>,
+    peer: PlatformOs,
+) -> Result<()> {
+    request_metadata_update(
+        sender,
+        path,
+        WireMetadataTarget::DirectoryFinalize,
+        unix_mode,
+        modified,
+        peer,
+    )
+    .await
+}
+
+async fn request_metadata_update(
+    sender: &RouterSender,
+    path: &RelativePath,
+    target: WireMetadataTarget,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
     peer: PlatformOs,
@@ -64,7 +106,7 @@ pub async fn request_metadata(
     ensure_compatible_path_encoding(peer)?;
     let metadata = WireMetadata::new(
         encode_relative_path(path.as_path())?,
-        wire_kind(kind),
+        target,
         unix_mode,
         modified.map(|value| (value.seconds(), value.nanoseconds())),
     )?;
@@ -102,7 +144,7 @@ pub async fn serve_incoming_metadata_rooted(
 
     let metadata = WireMetadata::decode(frame.payload())?;
     let relative = decode_relative_path(metadata.path.clone(), peer)?;
-    let kind = domain_kind(metadata.kind());
+    let target = metadata.target();
     let unix_mode = metadata.unix_mode();
     let modified = metadata
         .modified()
@@ -114,8 +156,17 @@ pub async fn serve_incoming_metadata_rooted(
         })?;
     drop(first);
 
-    tokio::task::spawn_blocking(move || {
-        rooted.apply_metadata_blocking(&relative, kind, unix_mode, modified)
+    tokio::task::spawn_blocking(move || match target {
+        WireMetadataTarget::Observed { kind, identity } => rooted.apply_metadata_blocking(
+            &relative,
+            domain_kind(kind),
+            EntryIdentity::from_bytes(identity),
+            unix_mode,
+            modified,
+        ),
+        WireMetadataTarget::DirectoryFinalize => {
+            rooted.finalize_directory_metadata_blocking(&relative, unix_mode, modified)
+        }
     })
     .await
     .map_err(|error| RemoteMetadataError::Worker(error.to_string()))??;
@@ -195,6 +246,11 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let expected = rooted
+            .path_identity_blocking(&RelativePath::new("file").unwrap())
+            .unwrap()
+            .unwrap()
+            .1;
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
@@ -228,6 +284,7 @@ mod tests {
             &client.sender(),
             &path,
             EntryKind::File,
+            expected,
             Some(0o640),
             Some(modified),
             peer,
