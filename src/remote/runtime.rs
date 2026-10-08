@@ -720,6 +720,13 @@ impl ServerRemoteSession {
         }
     }
 
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        self.router
+            .shutdown()
+            .await
+            .map_err(RemoteSessionError::Router)
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);

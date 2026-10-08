@@ -47,13 +47,11 @@ pub struct RouterConfig {
     pub max_outbound_bytes: u64,
     /// Optional outbound `Data` payload pacing in bytes per second across all
     /// multiplexed streams (`--bwlimit`). Token-bucket with a one-second
-    /// burst, matching the legacy limiter. Applies to file-content bytes only;
-    /// acknowledgements, scans, and metadata are never throttled so control
-    /// traffic cannot starve behind bulk data.
+    /// burst, matching the legacy limiter. Only Data incurs pacing; other
+    /// frames have no additional delay but retain serialized queue order.
     pub outbound_payload_limit: Option<u64>,
-    /// Optional idle I/O deadline (`--timeout`): the session aborts when no
-    /// inbound frame arrives within this many seconds. `None` disables the
-    /// deadline, matching rsync's default of no I/O timeout.
+    /// Optional inbound progress deadline (`--timeout`), covering both frame
+    /// reads and admission/control-response backpressure. `None` disables it.
     pub idle_timeout: Option<std::time::Duration>,
 }
 
@@ -76,7 +74,7 @@ pub enum RouterError {
     #[error("active stream budget must be greater than zero")]
     ZeroStreamBudget,
 
-    #[error("no inbound frame within the configured I/O timeout (--timeout); aborting session")]
+    #[error("no inbound progress within the configured I/O timeout (--timeout); aborting session")]
     IdleTimeoutExceeded,
 
     #[error("{direction} frame budget must be greater than zero")]
@@ -105,6 +103,24 @@ pub enum RouterError {
 
     #[error("frame router is shutting down")]
     ShuttingDown,
+
+    #[error("transport reached EOF")]
+    TransportEof,
+
+    #[error("peer terminated the session with a control Error")]
+    PeerError,
+
+    #[error("unexpected control frame: {0:?}")]
+    UnexpectedControl(FrameKind),
+
+    #[error("session failed: {0}")]
+    SessionFailed(String),
+
+    #[error("transport task failed: {0}")]
+    TaskFailed(String),
+
+    #[error("transport {0} actor stopped before session termination")]
+    ActorStopped(&'static str),
 
     #[error("local stream id space exhausted")]
     StreamIdExhausted,
@@ -139,19 +155,21 @@ pub enum RouterError {
 
 pub type SharedRouterError = Arc<RouterError>;
 
-enum StreamMessage {
-    Frame(RoutedFrame),
+/// The first terminal transition wins. EOF stops admission and transport I/O,
+/// but already received stream responses remain readable. Failure discards work.
+#[derive(Clone)]
+enum Terminal {
+    Eof,
     Failed(SharedRouterError),
 }
 
-enum IncomingMessage {
-    Stream(IncomingStream),
-    Failed(SharedRouterError),
-    /// Orderly end of the incoming stream after a clean transport EOF.
-    /// Distinguished from `Failed` so `serve_transport` can drain active
-    /// tasks and exit successfully instead of treating a peer hangup
-    /// between frames as a transport failure.
-    Closed,
+impl Terminal {
+    fn error(&self) -> SharedRouterError {
+        match self {
+            Self::Eof => Arc::new(RouterError::TransportEof),
+            Self::Failed(error) => Arc::clone(error),
+        }
+    }
 }
 
 struct OutboundFrame {
@@ -184,14 +202,14 @@ impl fmt::Debug for RoutedFrame {
 }
 
 struct RouterInner {
-    streams: Mutex<HashMap<StreamId, mpsc::UnboundedSender<StreamMessage>>>,
-    failure: Mutex<Option<SharedRouterError>>,
-    incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
+    // This lock serializes registry/admission changes with terminal publication.
+    streams: Mutex<HashMap<StreamId, mpsc::UnboundedSender<RoutedFrame>>>,
+    terminal: watch::Sender<Option<Terminal>>,
+    incoming_tx: mpsc::UnboundedSender<IncomingStream>,
     inbound_frames: Arc<Semaphore>,
     inbound_bytes: Arc<Semaphore>,
     outbound_frames: Arc<Semaphore>,
     outbound_bytes: Arc<Semaphore>,
-    shutdown: watch::Sender<bool>,
     config: RouterConfig,
     role: RouterRole,
     next_stream_id: AtomicU32,
@@ -233,19 +251,19 @@ impl RouterSender {
     /// the writer to flush them so a completed operation cannot lose its final
     /// success signal when the router is dropped immediately afterward.
     pub async fn send(&self, frame: Frame) -> Result<(), SharedRouterError> {
-        if let Some(failure) = current_failure(&self.inner)? {
-            return Err(failure);
-        }
-
-        let (frame_permit, byte_permit) = acquire_capacity(
-            Arc::clone(&self.inner.outbound_frames),
-            Arc::clone(&self.inner.outbound_bytes),
-            frame.payload().len(),
-            self.inner.config.max_outbound_bytes,
-            "outbound",
-        )
-        .await
-        .map_err(Arc::new)?;
+        let mut terminal = self.inner.terminal.subscribe();
+        self.check_active()?;
+        let (frame_permit, byte_permit) = tokio::select! {
+            biased;
+            state = terminated(&mut terminal) => return Err(state.error()),
+            capacity = acquire_capacity(
+                Arc::clone(&self.inner.outbound_frames),
+                Arc::clone(&self.inner.outbound_bytes),
+                frame.payload().len(),
+                self.inner.config.max_outbound_bytes,
+                "outbound",
+            ) => capacity.map_err(Arc::new)?,
+        };
         let (written, completion) = if frame.kind() == FrameKind::Ack {
             let (written, completion) = oneshot::channel();
             (Some(written), Some(completion))
@@ -258,22 +276,49 @@ impl RouterSender {
             _frame_permit: frame_permit,
             _byte_permit: byte_permit,
         };
-        self.outbound_tx
-            .send(queued)
-            .map_err(|_| Arc::new(RouterError::WriterClosed))?;
-        if let Some(completion) = completion {
-            completion
-                .await
+        {
+            let _streams = self
+                .inner
+                .streams
+                .lock()
+                .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
+            self.check_active()?;
+            self.outbound_tx
+                .send(queued)
                 .map_err(|_| Arc::new(RouterError::WriterClosed))?;
         }
+        if let Some(completion) = completion {
+            tokio::select! {
+                biased;
+                // A flushed Ack remains successful if EOF arrives before the
+                // waiter is next polled. Otherwise completion is uncertain.
+                completed = completion => completed.map_err(|_| {
+                    self.check_active().err().unwrap_or_else(|| Arc::new(RouterError::WriterClosed))
+                })?,
+                state = terminated(&mut terminal) => return Err(state.error()),
+            }
+        }
         Ok(())
+    }
+
+    /// A point-in-time cancellation check, not a commit lock or rollback guarantee.
+    pub(crate) fn check_active(&self) -> Result<(), SharedRouterError> {
+        match self.inner.terminal.borrow().as_ref() {
+            Some(state) => Err(state.error()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn fail(&self, error: SharedRouterError) {
+        publish_terminal(&self.inner, Terminal::Failed(error));
     }
 }
 
 /// Inbox for one protocol stream.
 pub struct StreamInbox {
     stream_id: StreamId,
-    receiver: mpsc::UnboundedReceiver<StreamMessage>,
+    receiver: mpsc::UnboundedReceiver<RoutedFrame>,
+    terminal: watch::Receiver<Option<Terminal>>,
     inner: Weak<RouterInner>,
 }
 
@@ -283,16 +328,22 @@ impl StreamInbox {
     }
 
     pub async fn recv(&mut self) -> Result<Option<RoutedFrame>, SharedRouterError> {
-        match self.receiver.recv().await {
-            Some(StreamMessage::Frame(frame)) => Ok(Some(frame)),
-            Some(StreamMessage::Failed(error)) => Err(error),
-            None => match self.inner.upgrade() {
-                Some(inner) => match current_failure(&inner)? {
-                    Some(error) => Err(error),
-                    None => Ok(None),
-                },
-                None => Ok(None),
-            },
+        tokio::select! {
+            biased;
+            state = terminated(&mut self.terminal) => {
+                self.receiver.close();
+                match state {
+                    Terminal::Failed(error) => {
+                        while self.receiver.try_recv().is_ok() {}
+                        Err(error)
+                    }
+                    // A peer may exit immediately after flushing its final Ack.
+                    // Retain those already received responses, but never admit
+                    // more requests through IncomingStreams after EOF.
+                    Terminal::Eof => Ok(self.receiver.recv().await),
+                }
+            }
+            frame = self.receiver.recv() => Ok(frame),
         }
     }
 }
@@ -321,29 +372,66 @@ impl IncomingStream {
 }
 
 pub struct IncomingStreams {
-    receiver: mpsc::UnboundedReceiver<IncomingMessage>,
+    receiver: mpsc::UnboundedReceiver<IncomingStream>,
+    terminal: watch::Receiver<Option<Terminal>>,
 }
 
 impl IncomingStreams {
     pub async fn recv(&mut self) -> Result<Option<IncomingStream>, SharedRouterError> {
-        match self.receiver.recv().await {
-            Some(IncomingMessage::Stream(stream)) => Ok(Some(stream)),
-            Some(IncomingMessage::Failed(error)) => Err(error),
-            Some(IncomingMessage::Closed) => Ok(None),
-            None => Ok(None),
+        tokio::select! {
+            biased;
+            state = terminated(&mut self.terminal) => {
+                self.receiver.close();
+                while self.receiver.try_recv().is_ok() {}
+                match state {
+                    Terminal::Eof => Ok(None),
+                    Terminal::Failed(error) => Err(error),
+                }
+            }
+            incoming = self.receiver.recv() => Ok(incoming),
         }
     }
 }
 
+// Also terminate on actor panic/abort, including before its first poll. All
+// ordinary exits publish a terminal state first, so this is only a last-resort
+// failure transition; it cannot overwrite the authoritative cause.
+struct ActorLifetime {
+    inner: Arc<RouterInner>,
+    direction: &'static str,
+}
+
+impl Drop for ActorLifetime {
+    fn drop(&mut self) {
+        publish_terminal(
+            &self.inner,
+            Terminal::Failed(Arc::new(RouterError::ActorStopped(self.direction))),
+        );
+    }
+}
+
 pub struct RouterTasks {
+    inner: Arc<RouterInner>,
     reader: JoinHandle<Result<(), SharedRouterError>>,
     writer: JoinHandle<Result<(), SharedRouterError>>,
 }
 
 impl RouterTasks {
     pub fn abort(&self) {
+        publish_terminal(
+            &self.inner,
+            Terminal::Failed(Arc::new(RouterError::ShuttingDown)),
+        );
         self.reader.abort();
         self.writer.abort();
+    }
+
+    async fn finish(&mut self) -> Result<(), SharedRouterError> {
+        let (reader, writer) = tokio::join!(&mut self.reader, &mut self.writer);
+        for task in [reader, writer] {
+            task.map_err(|error| Arc::new(RouterError::TaskFailed(error.to_string())))??;
+        }
+        Ok(())
     }
 }
 
@@ -354,14 +442,9 @@ impl Drop for RouterTasks {
 }
 
 /// Owns the central reader/writer actors for one already-negotiated transport.
-///
-/// The router starts after the v3 control-plane handshake. Control stream 0 is
-/// registered immediately for later Error/Ping/Pong traffic; locally opened
-/// streams are registered before use, while unknown peer-owned streams are
-/// delivered through `IncomingStreams` with their first frame attached.
+/// Control traffic is handled by the reader, never left in an unconsumed inbox.
 pub struct FrameRouter {
     sender: RouterSender,
-    control: StreamInbox,
     incoming: IncomingStreams,
     tasks: RouterTasks,
 }
@@ -381,60 +464,66 @@ impl FrameRouter {
         let outbound_byte_units = byte_units(config.max_outbound_bytes, "outbound")?;
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let outbound_payload_limit = config.outbound_payload_limit;
+        let (terminal_tx, terminal_rx) = watch::channel(None);
         let inner = Arc::new(RouterInner {
             streams: Mutex::new(HashMap::new()),
-            failure: Mutex::new(None),
+            terminal: terminal_tx,
             incoming_tx,
             inbound_frames: Arc::new(Semaphore::new(config.max_inbound_frames as usize)),
             inbound_bytes: Arc::new(Semaphore::new(inbound_byte_units as usize)),
             outbound_frames: Arc::new(Semaphore::new(config.max_outbound_frames as usize)),
             outbound_bytes: Arc::new(Semaphore::new(outbound_byte_units as usize)),
-            shutdown: shutdown_tx,
             config,
             role,
             next_stream_id: AtomicU32::new(role.first_local_stream()),
         });
-
-        let control = register_stream_plain(&inner, StreamId::CONTROL)?;
         let sender = RouterSender {
             inner: Arc::clone(&inner),
             outbound_tx,
         };
-
-        let reader_inner = Arc::clone(&inner);
-        let reader_shutdown = shutdown_rx.clone();
+        let reader_sender = sender.clone();
+        let reader_terminal = terminal_rx.clone();
+        let reader_lifetime = ActorLifetime {
+            inner: Arc::clone(&inner),
+            direction: "reader",
+        };
         let reader_task = tokio::spawn(async move {
-            match reader_loop(reader, &reader_inner, reader_shutdown).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let error = Arc::new(error);
-                    publish_failure(&reader_inner, Arc::clone(&error));
-                    Err(error)
-                }
+            let _lifetime = reader_lifetime;
+            let result = reader_loop(reader, &reader_sender, reader_terminal).await;
+            if let Err(error) = &result {
+                reader_sender.fail(Arc::clone(error));
             }
+            result
         });
-
         let writer_inner = Arc::clone(&inner);
+        let writer_terminal = terminal_rx.clone();
+        let writer_lifetime = ActorLifetime {
+            inner: Arc::clone(&inner),
+            direction: "writer",
+        };
         let writer_task = tokio::spawn(async move {
-            match writer_loop(writer, outbound_rx, shutdown_rx, outbound_payload_limit).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let error = Arc::new(error);
-                    publish_failure(&writer_inner, Arc::clone(&error));
-                    Err(error)
-                }
+            let _lifetime = writer_lifetime;
+            let result = writer_loop(
+                writer,
+                outbound_rx,
+                &writer_inner,
+                writer_terminal,
+                config.outbound_payload_limit,
+            )
+            .await;
+            if let Err(error) = &result {
+                publish_terminal(&writer_inner, Terminal::Failed(Arc::clone(error)));
             }
+            result
         });
-
         Ok(Self {
             sender,
-            control,
             incoming: IncomingStreams {
                 receiver: incoming_rx,
+                terminal: terminal_rx,
             },
             tasks: RouterTasks {
+                inner,
                 reader: reader_task,
                 writer: writer_task,
             },
@@ -445,10 +534,6 @@ impl FrameRouter {
         self.sender.clone()
     }
 
-    pub fn control(&mut self) -> &mut StreamInbox {
-        &mut self.control
-    }
-
     pub fn incoming(&mut self) -> &mut IncomingStreams {
         &mut self.incoming
     }
@@ -456,187 +541,208 @@ impl FrameRouter {
     pub fn tasks(&self) -> &RouterTasks {
         &self.tasks
     }
+
+    /// Stop transport I/O and await its actors. Admitted handlers are owned
+    /// and drained by the server, not by the router.
+    pub(crate) async fn shutdown(&mut self) -> Result<(), SharedRouterError> {
+        self.sender.fail(Arc::new(RouterError::ShuttingDown));
+        self.tasks.finish().await
+    }
+}
+
+async fn terminated(terminal: &mut watch::Receiver<Option<Terminal>>) -> Terminal {
+    loop {
+        if let Some(state) = terminal.borrow_and_update().clone() {
+            return state;
+        }
+        if terminal.changed().await.is_err() {
+            return Terminal::Failed(Arc::new(RouterError::ShuttingDown));
+        }
+    }
 }
 
 async fn reader_loop<R>(
     mut reader: R,
-    inner: &Arc<RouterInner>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), RouterError>
+    sender: &RouterSender,
+    mut terminal: watch::Receiver<Option<Terminal>>,
+) -> Result<(), SharedRouterError>
 where
     R: AsyncRead + Unpin,
 {
+    let inner = &sender.inner;
     loop {
-        // `read_frame_or_eof` validates the 1 MiB protocol payload cap before
-        // allocation. The router then admits the completed frame into its
-        // global queue budget, so resident inbound memory is bounded by the
-        // configured budget plus at most one frame currently being read.
-        // The idle deadline (`--timeout`) wraps each read: a session that
-        // receives nothing for the configured window is presumed hung and
-        // torn down, matching rsync's I/O timeout semantics. Any inbound
-        // frame resets the window.
-        let deadline = inner.config.idle_timeout;
-        let frame = tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-                continue;
-            }
-            _ = async {
-                match deadline {
-                    Some(duration) => tokio::time::sleep(duration).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if deadline.is_some() => {
-                // Do NOT close streams cleanly here: the reader task's error
-                // path publishes this failure to every stream inbox so
-                // waiters observe the typed timeout, not a silent clean end.
-                return Err(RouterError::IdleTimeoutExceeded);
-            }
-            result = read_frame_or_eof(&mut reader) => match result? {
-                // A clean EOF is the peer hanging up between frames. It is not
-                // a transport failure: close stream inboxes orderly (waiters
-                // see stream end and surface typed `UnexpectedStreamEnd`
-                // errors if they still expected data) and let the writer drain
-                // queued acknowledgements before it observes the closed
-                // outbound channel.
-                ReadFrame::CleanEof => {
-                    close_all_streams(inner);
-                    return Ok(());
-                }
+        // The decoder validates the hard payload cap before allocation. Memory
+        // stays bounded by retained queue permits plus this one in-progress frame.
+        // Include budget waits and control responses in the deadline: otherwise
+        // an unconsumed stream can prevent both timeout and EOF observation.
+        let receive = async {
+            let frame = match read_frame_or_eof(&mut reader)
+                .await
+                .map_err(RouterError::from)
+                .map_err(Arc::new)?
+            {
+                ReadFrame::CleanEof => return Ok::<_, SharedRouterError>(false),
                 ReadFrame::Frame(frame) => frame,
-            },
+            };
+            if frame.stream_id().is_control() {
+                handle_control(sender, frame).await?;
+                return Ok(true);
+            }
+            let (frame_permit, byte_permit) = acquire_capacity(
+                Arc::clone(&inner.inbound_frames),
+                Arc::clone(&inner.inbound_bytes),
+                frame.payload().len(),
+                inner.config.max_inbound_bytes,
+                "inbound",
+            )
+            .await
+            .map_err(Arc::new)?;
+            route_inbound(
+                inner,
+                RoutedFrame {
+                    frame,
+                    _frame_permit: frame_permit,
+                    _byte_permit: byte_permit,
+                },
+            )
+            .map_err(Arc::new)?;
+            Ok(true)
         };
-        let (frame_permit, byte_permit) = acquire_capacity(
-            Arc::clone(&inner.inbound_frames),
-            Arc::clone(&inner.inbound_bytes),
-            frame.payload().len(),
-            inner.config.max_inbound_bytes,
-            "inbound",
-        )
-        .await?;
-        route_inbound(
-            inner,
-            RoutedFrame {
-                frame,
-                _frame_permit: frame_permit,
-                _byte_permit: byte_permit,
-            },
-        )?;
+        let result = tokio::select! {
+            biased;
+            _ = terminated(&mut terminal) => return Ok(()),
+            result = async {
+                match inner.config.idle_timeout {
+                    Some(duration) => tokio::time::timeout(duration, receive).await
+                        .map_err(|_| Arc::new(RouterError::IdleTimeoutExceeded))?,
+                    None => receive.await,
+                }
+            } => result?,
+        };
+        if !result {
+            publish_terminal(inner, Terminal::Eof);
+            return Ok(());
+        }
+    }
+}
+
+async fn handle_control(sender: &RouterSender, frame: Frame) -> Result<(), SharedRouterError> {
+    if !frame.flags().is_empty() {
+        return Err(Arc::new(RouterError::UnexpectedControl(frame.kind())));
+    }
+    match frame.kind() {
+        FrameKind::Ping => {
+            sender
+                .send(
+                    Frame::control(FrameKind::Pong, frame.into_payload())
+                        .map_err(RouterError::from)
+                        .map_err(Arc::new)?,
+                )
+                .await
+        }
+        FrameKind::Pong => Ok(()),
+        FrameKind::Error => Err(Arc::new(RouterError::PeerError)),
+        kind => Err(Arc::new(RouterError::UnexpectedControl(kind))),
     }
 }
 
 async fn writer_loop<W>(
     mut writer: W,
     mut receiver: mpsc::UnboundedReceiver<OutboundFrame>,
-    mut shutdown: watch::Receiver<bool>,
+    inner: &Arc<RouterInner>,
+    mut terminal: watch::Receiver<Option<Terminal>>,
     payload_limit: Option<u64>,
-) -> Result<(), RouterError>
+) -> Result<(), SharedRouterError>
 where
     W: AsyncWrite + Unpin,
 {
-    // Sole consumer of the limiter: the writer is the single point where all
-    // multiplexed streams converge, so no synchronization is needed.
     let mut limiter = payload_limit.map(crate::sync::ratelimit::RateLimiter::new);
     loop {
         let queued = tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-                continue;
-            }
+            biased;
+            _ = terminated(&mut terminal) => return Ok(()),
             queued = receiver.recv() => queued,
         };
         let Some(mut queued) = queued else {
-            writer
-                .flush()
-                .await
-                .map_err(crate::protocol::ProtocolError::from)?;
             return Ok(());
         };
-        // --bwlimit pacing: bulk `Data` frames sleep for their token deficit
-        // before the write; control frames (Ack/Scan/Metadata) skip the
-        // limiter entirely so they cannot starve behind a large transfer.
-        if let (Some(limiter), FrameKind::Data) = (limiter.as_mut(), queued.frame.kind()) {
-            let sleep = limiter.consume(u64::try_from(queued.frame.payload().len()).unwrap_or(0));
-            if !sleep.is_zero() {
-                tokio::time::sleep(sleep).await;
-            }
+        let result = tokio::select! {
+            biased;
+            _ = terminated(&mut terminal) => return Ok(()),
+            result = async {
+                if let (Some(limiter), FrameKind::Data) = (limiter.as_mut(), queued.frame.kind()) {
+                    let sleep = limiter.consume(queued.frame.payload().len() as u64);
+                    if !sleep.is_zero() {
+                        tokio::time::sleep(sleep).await;
+                    }
+                }
+                write_frame(&mut writer, &queued.frame).await
+                    .map_err(RouterError::from).map_err(Arc::new)?;
+                // Process stdout is line buffered; every complete frame must
+                // be flushed, not only Ack.
+                writer.flush().await
+                    .map_err(crate::protocol::ProtocolError::from)
+                    .map_err(RouterError::from).map_err(Arc::new)
+            } => result,
+        };
+        if let Err(error) = result {
+            // Publish before dropping the Ack completion sender: even on
+            // another worker, its waiter must see the authoritative cause.
+            publish_terminal(inner, Terminal::Failed(Arc::clone(&error)));
+            return Err(error);
         }
-        write_frame(&mut writer, &queued.frame).await?;
-        // Every frame is flushed, not only acknowledgements: the contract of a
-        // completed frame is that its bytes reached the transport, but process
-        // stdio implementations buffer binary payloads (std::io::Stdout is a
-        // LineWriter under tokio::io::stdout()) and would otherwise hold
-        // newlineless frames — including EntryEnd — until an unrelated Ack
-        // forces a flush, deadlocking the session.
-        writer
-            .flush()
-            .await
-            .map_err(crate::protocol::ProtocolError::from)?;
         if let Some(written) = queued.written.take() {
             let _ = written.send(());
         }
-        // `queued` drops here, releasing frame and byte capacity only after the
-        // bytes have been accepted by the underlying AsyncWrite.
+        // Cancellation may interrupt a partial frame or flush. We always drop
+        // the transport on that path; it must never resume writing another frame.
     }
 }
 
 fn route_inbound(inner: &Arc<RouterInner>, routed: RoutedFrame) -> Result<(), RouterError> {
-    {
-        let failure = inner
-            .failure
-            .lock()
-            .map_err(|_| RouterError::StatePoisoned)?;
-        if failure.is_some() {
-            return Err(RouterError::ShuttingDown);
-        }
-    }
-
     let stream_id = routed.frame.stream_id();
-    let sender = {
-        let mut streams = inner
-            .streams
-            .lock()
-            .map_err(|_| RouterError::StatePoisoned)?;
-        if let Some(sender) = streams.get(&stream_id) {
-            sender.clone()
-        } else if !inner.role.peer_owns(stream_id) {
+    let mut streams = inner
+        .streams
+        .lock()
+        .map_err(|_| RouterError::StatePoisoned)?;
+    if inner.terminal.borrow().is_some() {
+        return Err(RouterError::ShuttingDown);
+    }
+    if let Some(sender) = streams.get(&stream_id) {
+        sender
+            .send(routed)
+            .map_err(|_| RouterError::StreamClosed(stream_id.get()))
+    } else {
+        if !inner.role.peer_owns(stream_id) {
             return Err(RouterError::InvalidPeerStreamId {
                 role: inner.role,
                 stream_id: stream_id.get(),
             });
-        } else if !is_stream_opening_kind(routed.frame.kind()) {
+        }
+        if !is_stream_opening_kind(routed.frame.kind()) {
             return Err(RouterError::InvalidStreamOpen {
                 stream_id: stream_id.get(),
                 kind: routed.frame.kind(),
             });
-        } else {
-            ensure_stream_capacity(inner, &streams)?;
-            let (sender, receiver) = mpsc::unbounded_channel();
-            streams.insert(stream_id, sender);
-            let inbox = StreamInbox {
-                stream_id,
-                receiver,
-                inner: Arc::downgrade(inner),
-            };
-            drop(streams);
-            inner
-                .incoming_tx
-                .send(IncomingMessage::Stream(IncomingStream {
-                    first: routed,
-                    inbox,
-                }))
-                .map_err(|_| RouterError::IncomingClosed)?;
-            return Ok(());
         }
-    };
-
-    sender
-        .send(StreamMessage::Frame(routed))
-        .map_err(|_| RouterError::StreamClosed(stream_id.get()))
+        ensure_stream_capacity(inner, &streams)?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        streams.insert(stream_id, sender);
+        let inbox = StreamInbox {
+            stream_id,
+            receiver,
+            terminal: inner.terminal.subscribe(),
+            inner: Arc::downgrade(inner),
+        };
+        // Publication is serialized with termination. Never drop an inbox while
+        // holding the registry lock: its Drop removes its registration.
+        let result = inner.incoming_tx.send(IncomingStream {
+            first: routed,
+            inbox,
+        });
+        drop(streams);
+        result.map_err(|_| RouterError::IncomingClosed)
+    }
 }
 
 fn is_stream_opening_kind(kind: FrameKind) -> bool {
@@ -659,121 +765,69 @@ fn register_stream(
     inner: &Arc<RouterInner>,
     stream_id: StreamId,
 ) -> Result<StreamInbox, SharedRouterError> {
-    // Match `publish_failure`'s lock order. Holding the failure guard through
-    // registration prevents a stream from being inserted just after failure
-    // broadcast drained the registry.
-    let failure = inner
-        .failure
-        .lock()
-        .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
-    if let Some(error) = failure.as_ref() {
-        return Err(Arc::clone(error));
-    }
-    let (sender, receiver) = mpsc::unbounded_channel();
     let mut streams = inner
         .streams
         .lock()
         .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
+    if let Some(state) = inner.terminal.borrow().as_ref() {
+        return Err(state.error());
+    }
     if streams.contains_key(&stream_id) {
         return Err(Arc::new(RouterError::StreamAlreadyRegistered(
             stream_id.get(),
         )));
     }
     ensure_stream_capacity(inner, &streams).map_err(Arc::new)?;
-    streams.insert(stream_id, sender);
-    Ok(StreamInbox {
-        stream_id,
-        receiver,
-        inner: Arc::downgrade(inner),
-    })
-}
-
-fn register_stream_plain(
-    inner: &Arc<RouterInner>,
-    stream_id: StreamId,
-) -> Result<StreamInbox, RouterError> {
     let (sender, receiver) = mpsc::unbounded_channel();
-    let mut streams = inner
-        .streams
-        .lock()
-        .map_err(|_| RouterError::StatePoisoned)?;
-    if streams.contains_key(&stream_id) {
-        return Err(RouterError::StreamAlreadyRegistered(stream_id.get()));
-    }
     streams.insert(stream_id, sender);
     Ok(StreamInbox {
         stream_id,
         receiver,
+        terminal: inner.terminal.subscribe(),
         inner: Arc::downgrade(inner),
     })
 }
 
 fn ensure_stream_capacity(
     inner: &RouterInner,
-    streams: &HashMap<StreamId, mpsc::UnboundedSender<StreamMessage>>,
+    streams: &HashMap<StreamId, mpsc::UnboundedSender<RoutedFrame>>,
 ) -> Result<(), RouterError> {
-    let active = streams
-        .len()
-        .saturating_sub(usize::from(streams.contains_key(&StreamId::CONTROL)));
-    if active >= inner.config.max_active_streams as usize {
+    if streams.len() >= inner.config.max_active_streams as usize {
         return Err(RouterError::TooManyStreams(inner.config.max_active_streams));
     }
     Ok(())
 }
 
-fn current_failure(
-    inner: &Arc<RouterInner>,
-) -> Result<Option<SharedRouterError>, SharedRouterError> {
-    inner
-        .failure
-        .lock()
-        .map(|failure| failure.clone())
-        .map_err(|_| Arc::new(RouterError::StatePoisoned))
-}
-
-/// Close every stream inbox with an orderly stream end (no `Failed` message,
-/// no failure record). Waiters receiving `Ok(None)` from `recv` treat this as
-/// end of stream and report their own typed errors where data was still
-/// expected.
-fn close_all_streams(inner: &Arc<RouterInner>) {
-    if let Ok(mut streams) = inner.streams.lock() {
-        for (_, sender) in streams.drain() {
-            drop(sender);
-        }
-    }
-    let _ = inner.incoming_tx.send(IncomingMessage::Closed);
-}
-
-fn publish_failure(inner: &Arc<RouterInner>, error: SharedRouterError) {
-    let first_failure = match inner.failure.lock() {
-        Ok(mut failure) => {
-            if failure.is_some() {
-                false
-            } else {
-                *failure = Some(Arc::clone(&error));
-                true
+fn publish_terminal(inner: &Arc<RouterInner>, state: Terminal) {
+    let Ok(mut streams) = inner.streams.lock() else {
+        // Poisoning is itself terminal; still wake waiters and close budgets.
+        inner.terminal.send_if_modified(|terminal| {
+            if terminal.is_some() {
+                return false;
             }
-        }
-        Err(_) => false,
-    };
-    if !first_failure {
+            *terminal = Some(Terminal::Failed(Arc::new(RouterError::StatePoisoned)));
+            true
+        });
+        inner.inbound_frames.close();
+        inner.inbound_bytes.close();
+        inner.outbound_frames.close();
+        inner.outbound_bytes.close();
         return;
-    }
-
-    let _ = inner.shutdown.send(true);
-    inner.inbound_frames.close();
-    inner.inbound_bytes.close();
-    inner.outbound_frames.close();
-    inner.outbound_bytes.close();
-
-    if let Ok(mut streams) = inner.streams.lock() {
-        for (_, sender) in streams.drain() {
-            let _ = sender.send(StreamMessage::Failed(Arc::clone(&error)));
+    };
+    let changed = inner.terminal.send_if_modified(|terminal| {
+        if terminal.is_some() {
+            return false;
         }
+        *terminal = Some(state);
+        true
+    });
+    if changed {
+        inner.inbound_frames.close();
+        inner.inbound_bytes.close();
+        inner.outbound_frames.close();
+        inner.outbound_bytes.close();
+        streams.clear();
     }
-    let _ = inner
-        .incoming_tx
-        .send(IncomingMessage::Failed(Arc::clone(&error)));
 }
 
 fn validate_config(config: RouterConfig) -> Result<u32, RouterError> {
@@ -874,6 +928,356 @@ mod tests {
             Bytes::from_static(payload),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn eof_closes_admission_even_with_queued_requests() {
+        let (router_io, mut peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Server, RouterConfig::default())
+                .unwrap();
+        write_frame(
+            &mut peer,
+            &frame(FrameKind::ScanRequest, StreamId::new(1), b"request"),
+        )
+        .await
+        .unwrap();
+        peer.shutdown().await.unwrap();
+        (&mut router.tasks.reader).await.unwrap().unwrap();
+        assert!(
+            router.sender().open_stream().is_err(),
+            "EOF must close admission"
+        );
+        assert!(
+            router.incoming().recv().await.unwrap().is_none(),
+            "EOF must not admit queued requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_retains_final_responses_but_inbox_end_is_repeatable() {
+        let (router_io, mut peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                .unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        write_frame(&mut peer, &frame(FrameKind::Ack, inbox.stream_id(), b""))
+            .await
+            .unwrap();
+        peer.shutdown().await.unwrap();
+        (&mut router.tasks.reader).await.unwrap().unwrap();
+        assert_eq!(
+            inbox.recv().await.unwrap().unwrap().frame().kind(),
+            FrameKind::Ack
+        );
+        for _ in 0..2 {
+            assert!(inbox.recv().await.unwrap().is_none());
+            assert!(router.incoming().recv().await.unwrap().is_none());
+        }
+        assert!(matches!(
+            *router.sender().open_stream().err().unwrap(),
+            RouterError::TransportEof
+        ));
+    }
+
+    #[tokio::test]
+    async fn failure_preempts_queued_frames_and_requests() {
+        let (router_io, mut peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Server, RouterConfig::default())
+                .unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        write_frame(
+            &mut peer,
+            &frame(FrameKind::Entry, inbox.stream_id(), b"queued"),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut peer,
+            &frame(FrameKind::ScanRequest, StreamId::new(1), b"queued"),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut peer,
+            &frame(FrameKind::Entry, StreamId::new(3), b"invalid"),
+        )
+        .await
+        .unwrap();
+        assert!((&mut router.tasks.reader).await.unwrap().is_err());
+        assert!(
+            inbox.recv().await.is_err(),
+            "failure must preempt buffered work"
+        );
+        assert!(router.incoming().recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn timeout_releases_ack_waiter_during_stalled_write() {
+        let (router_io, _peer) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(router_io);
+        let router = FrameRouter::start(
+            reader,
+            writer,
+            RouterRole::Client,
+            RouterConfig {
+                idle_timeout: Some(Duration::from_millis(50)),
+                ..RouterConfig::default()
+            },
+        )
+        .unwrap();
+        let inbox = router.sender().open_stream().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            router
+                .sender()
+                .send(frame(FrameKind::Ack, inbox.stream_id(), b"ok")),
+        )
+        .await;
+        assert!(result.expect("Ack waiter stuck after timeout").is_err());
+    }
+
+    #[tokio::test]
+    async fn inbound_capacity_wait_is_covered_by_timeout() {
+        let (router_io, mut peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router = FrameRouter::start(
+            reader,
+            writer,
+            RouterRole::Client,
+            RouterConfig {
+                max_inbound_frames: 1,
+                idle_timeout: Some(Duration::from_millis(50)),
+                ..RouterConfig::default()
+            },
+        )
+        .unwrap();
+        let inbox = router.sender().open_stream().unwrap();
+        for _ in 0..2 {
+            write_frame(
+                &mut peer,
+                &frame(FrameKind::Entry, inbox.stream_id(), b"held"),
+            )
+            .await
+            .unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), router.incoming().recv()).await;
+        assert!(
+            matches!(result.expect("permit wait escaped timeout"), Err(error) if matches!(*error, RouterError::IdleTimeoutExceeded))
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_abort_before_first_poll_terminates_surviving_handles() {
+        let (router_io, _peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                .unwrap();
+        let sender = router.sender();
+        let mut inbox = sender.open_stream().unwrap();
+        router.tasks.writer.abort();
+        assert!((&mut router.tasks.writer).await.unwrap_err().is_cancelled());
+        let error = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(*error, RouterError::ActorStopped("writer")));
+        assert!(sender.open_stream().is_err());
+    }
+
+    #[tokio::test]
+    async fn control_traffic_cannot_fill_the_inbound_budget() {
+        let (router_io, mut peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let router = FrameRouter::start(
+            reader,
+            writer,
+            RouterRole::Client,
+            RouterConfig {
+                max_inbound_frames: 1,
+                ..RouterConfig::default()
+            },
+        )
+        .unwrap();
+        let mut inbox = router.sender().open_stream().unwrap();
+        for _ in 0..4 {
+            write_frame(
+                &mut peer,
+                &frame(FrameKind::Pong, StreamId::CONTROL, b"pong"),
+            )
+            .await
+            .unwrap();
+        }
+        write_frame(
+            &mut peer,
+            &frame(FrameKind::Entry, inbox.stream_id(), b"entry"),
+        )
+        .await
+        .unwrap();
+        let entry = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.frame().payload(), &Bytes::from_static(b"entry"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_payload_pacing_and_budget_waiters() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let (mut peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let mut router = FrameRouter::start(
+            reader,
+            writer,
+            RouterRole::Client,
+            RouterConfig {
+                max_outbound_frames: 1,
+                outbound_payload_limit: Some(1024),
+                ..RouterConfig::default()
+            },
+        )
+        .unwrap();
+        let sender = router.sender();
+        let inbox = sender.open_stream().unwrap();
+        let data = frame(FrameKind::Data, inbox.stream_id(), &[0; 1024]);
+        sender.send(data.clone()).await.unwrap();
+        crate::protocol::read_frame(&mut peer_reader).await.unwrap();
+        sender.send(data).await.unwrap();
+        let ack_sender = sender.clone();
+        let ack = tokio::spawn(async move {
+            ack_sender
+                .send(frame(FrameKind::Ack, inbox.stream_id(), b"ok"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        sender.fail(Arc::new(RouterError::PeerError));
+        tokio::time::timeout(Duration::from_millis(250), router.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            *ack.await.unwrap().unwrap_err(),
+            RouterError::PeerError
+        ));
+        assert!(matches!(
+            *sender.open_stream().err().unwrap(),
+            RouterError::PeerError
+        ));
+    }
+
+    struct StallingWriter {
+        flush: bool,
+        fail: bool,
+        first_write: bool,
+        reached: Option<oneshot::Sender<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.flush {
+                return std::task::Poll::Ready(Ok(bytes.len()));
+            }
+            if self.first_write {
+                self.first_write = false;
+                return std::task::Poll::Ready(Ok(1));
+            }
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+            }
+            if self.fail {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected write failure")))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+            }
+            if self.fail {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected flush failure")))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for StallingWriter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_or_failed_write_and_flush_drop_transport_and_wake_ack() {
+        for (flush, fail) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (reader, _peer) = tokio::io::duplex(4096);
+            let mut router = FrameRouter::start(
+                reader,
+                StallingWriter {
+                    flush,
+                    fail,
+                    first_write: true,
+                    reached: Some(reached_tx),
+                    dropped: Arc::clone(&dropped),
+                },
+                RouterRole::Client,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let sender = router.sender();
+            let inbox = sender.open_stream().unwrap();
+            let ack = tokio::spawn(async move {
+                sender
+                    .send(frame(FrameKind::Ack, inbox.stream_id(), b"ok"))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), reached_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), router.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(result.is_err(), fail);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "interrupted transport must be dropped"
+            );
+            let error = ack.await.unwrap().unwrap_err();
+            if fail {
+                assert!(matches!(
+                    *error,
+                    RouterError::Protocol(crate::protocol::ProtocolError::Io(_))
+                ));
+            } else {
+                assert!(matches!(*error, RouterError::ShuttingDown));
+            }
+        }
     }
 
     #[test]
@@ -1148,11 +1552,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_stream_is_pre_registered() {
+    async fn control_ping_is_answered_without_an_inbox() {
         let (router_io, peer_io) = tokio::io::duplex(4096);
         let (router_reader, router_writer) = tokio::io::split(router_io);
-        let (_peer_reader, mut peer_writer) = tokio::io::split(peer_io);
-        let mut router = FrameRouter::start(
+        let (mut peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+        let _router = FrameRouter::start(
             router_reader,
             router_writer,
             RouterRole::Client,
@@ -1166,8 +1570,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let routed = router.control().recv().await.unwrap().unwrap();
-        assert_eq!(routed.frame().kind(), FrameKind::Ping);
+        let pong = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::protocol::read_frame(&mut peer_reader),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pong.kind(), FrameKind::Pong);
+        assert_eq!(pong.payload(), &Bytes::from_static(b"ping"));
     }
 
     /// --timeout: a session that receives no inbound frame within the
@@ -1294,9 +1705,8 @@ mod tests {
             "paced frame arrived too early: {elapsed:?}"
         );
 
-        // A control acknowledgement must not wait behind bulk data: send it
-        // immediately after and expect it to arrive well before the next
-        // token refill.
+        // Once the paced data is written, Ack incurs no additional token
+        // delay even though the bucket is exhausted.
         let ack = frame(FrameKind::Ack, stream_id, b"ok");
         router.sender().send(ack).await.unwrap();
         let control = tokio::time::timeout(
