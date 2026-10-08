@@ -490,35 +490,38 @@ pub(super) async fn send_produced_file(
     mut producer_rx: mpsc::Receiver<ProducerItem>,
     producer: tokio::task::JoinHandle<Result<TransferSummary>>,
 ) -> Result<TransferSummary> {
-    let sent: Result<()> = async {
-        while let Some(item) = producer_rx.recv().await {
-            let frame = match item {
-                ProducerItem::Data(bytes) => Frame::new(
-                    FrameKind::Data,
-                    FrameFlags::empty(),
-                    stream_id,
-                    WireData::new(bytes)?.into_bytes(),
-                )?,
-                // The COMPRESSED flag appears only on frames whose payload is
-                // actually zstd-compressed, per the protocol contract.
-                ProducerItem::CompressedData(bytes) => Frame::new(
-                    FrameKind::Data,
-                    FrameFlags::COMPRESSED,
-                    stream_id,
-                    WireData::new(bytes)?.into_bytes(),
-                )?,
-                ProducerItem::Copy(copy) => Frame::new(
-                    FrameKind::DeltaCopy,
-                    FrameFlags::empty(),
-                    stream_id,
-                    copy.encode(),
-                )?,
-            };
-            sender.send(frame).await?;
-        }
-        Ok(())
-    }
-    .await;
+    let sent: Result<()> = tokio::select! {
+        biased;
+        error = sender.closed() => Err(RemoteTransferError::Router(error)),
+        result = async {
+            while let Some(item) = producer_rx.recv().await {
+                let frame = match item {
+                    ProducerItem::Data(bytes) => Frame::new(
+                        FrameKind::Data,
+                        FrameFlags::empty(),
+                        stream_id,
+                        WireData::new(bytes)?.into_bytes(),
+                    )?,
+                    // The COMPRESSED flag appears only on frames whose payload is
+                    // actually zstd-compressed, per the protocol contract.
+                    ProducerItem::CompressedData(bytes) => Frame::new(
+                        FrameKind::Data,
+                        FrameFlags::COMPRESSED,
+                        stream_id,
+                        WireData::new(bytes)?.into_bytes(),
+                    )?,
+                    ProducerItem::Copy(copy) => Frame::new(
+                        FrameKind::DeltaCopy,
+                        FrameFlags::empty(),
+                        stream_id,
+                        copy.encode(),
+                    )?,
+                };
+                sender.send(frame).await?;
+            }
+            Ok(())
+        } => result,
+    };
     drop(producer_rx);
     let produced = producer
         .await

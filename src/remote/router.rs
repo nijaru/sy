@@ -309,6 +309,12 @@ impl RouterSender {
         }
     }
 
+    /// Wake producers even if traversal/read work has not yielded its first item.
+    pub(crate) async fn closed(&self) -> SharedRouterError {
+        let mut terminal = self.inner.terminal.subscribe();
+        terminated(&mut terminal).await.error()
+    }
+
     pub(crate) fn fail(&self, error: SharedRouterError) {
         publish_terminal(&self.inner, Terminal::Failed(error));
     }
