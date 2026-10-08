@@ -42,6 +42,7 @@ pub enum RemotePushAction {
         source: Entry,
         destination: Option<Entry>,
         metadata: TransferMetadata,
+        source_removal: bool,
     },
     ReplaceSymlink {
         source: Entry,
@@ -166,6 +167,7 @@ fn lower_create(
                 source,
                 destination: None,
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
@@ -201,6 +203,7 @@ fn lower_update(
                 source,
                 destination: Some(destination),
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
@@ -236,6 +239,7 @@ fn lower_replace(
                 // Keep the namespace precondition even without a regular-file basis.
                 destination: Some(destination),
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
@@ -424,6 +428,14 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<RemotePushAction>>, RemotePushError> {
+        if let crate::engine::domain::SyncOp::Unchanged {
+            source,
+            destination,
+            comparison,
+        } = op
+        {
+            return self.lower_unchanged_file_preservation(source, destination, policy, comparison);
+        }
         lower_sync_op(op, policy).map_err(RemotePushError::from)
     }
 
@@ -546,6 +558,42 @@ impl RemotePushExecutor {
         self
     }
 
+    fn lower_unchanged_file_preservation(
+        &self,
+        source: Entry,
+        destination: Entry,
+        policy: ExecutionPolicy,
+        comparison: crate::engine::domain::ContentComparison,
+    ) -> Result<Option<WorkItem<RemotePushAction>>> {
+        if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
+            return Ok(None);
+        }
+        let mode = if policy.preserve_permissions {
+            source.unix_mode
+        } else {
+            destination.unix_mode
+        }
+        .ok_or_else(|| {
+            RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
+        })?;
+        let metadata = TransferMetadata {
+            unix_mode: Some(mode),
+            modified: Some(if policy.preserve_times {
+                source.modified
+            } else {
+                destination.modified
+            }),
+            xattrs: None,
+            acls: None,
+        };
+        Ok(Some(file_work(RemotePushAction::TransferFile {
+            source,
+            destination: Some(destination),
+            metadata,
+            source_removal: comparison == crate::engine::domain::ContentComparison::Blake3,
+        })))
+    }
+
     pub async fn execute(
         &self,
         item: WorkItem<RemotePushAction>,
@@ -579,6 +627,7 @@ impl RemotePushExecutor {
                 source,
                 destination,
                 metadata,
+                source_removal,
             } => {
                 // -H/--preserve-hardlinks: members of one scanned group
                 // share a single transferred representative; the rest become
@@ -590,7 +639,13 @@ impl RemotePushExecutor {
                     if let Some(identity) = source.hardlink_group {
                         let group = *identity.as_bytes();
                         return self
-                            .execute_grouped_file(source, destination, metadata, group)
+                            .execute_grouped_file(
+                                source,
+                                destination,
+                                metadata,
+                                group,
+                                source_removal,
+                            )
                             .await
                             .map(crate::engine::work::WorkResult::Transfer);
                     }
@@ -646,7 +701,9 @@ impl RemotePushExecutor {
                         .await?;
                     receipt.mark_finalized();
                 }
-                self.remove_committed_source(&receipt, &source).await?;
+                if source_removal {
+                    self.remove_committed_source(&receipt, &source).await?;
+                }
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -731,6 +788,7 @@ impl RemotePushExecutor {
         destination: Option<Entry>,
         metadata: TransferMetadata,
         group: [u8; 32],
+        source_removal: bool,
     ) -> Result<TransferSummary> {
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
@@ -748,7 +806,9 @@ impl RemotePushExecutor {
             self.remote.hardlink(&first.path, &source.path).await?;
             let receipt =
                 PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
-            self.remove_committed_source(&receipt, &source).await?;
+            if source_removal {
+                self.remove_committed_source(&receipt, &source).await?;
+            }
             let op = if destination.is_some() {
                 crate::sync::output::ItemizeOp::Update
             } else {
@@ -812,7 +872,9 @@ impl RemotePushExecutor {
             receipt.mark_finalized();
         }
         groups.insert(group, representative).await?;
-        self.remove_committed_source(&receipt, &source).await?;
+        if source_removal {
+            self.remove_committed_source(&receipt, &source).await?;
+        }
         drop(groups);
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
@@ -1051,6 +1113,11 @@ impl RemotePushExecutor {
         if !self.xattrs || source.is_symlink() {
             return Ok(None);
         }
+        if source.is_file() {
+            return Ok(Some(
+                existing::observed_xattrs(self.source_root.clone(), source.clone()).await?,
+            ));
+        }
         let location = XattrLocation::Local(self.source_root.as_path());
         let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
         Ok(Some(xattrs))
@@ -1073,6 +1140,13 @@ impl RemotePushExecutor {
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
         if !self.acls || source.is_symlink() {
             return Ok(None);
+        }
+        if source.is_file() {
+            return Ok(Some(
+                existing::observed_acl(self.source_root.clone(), source.clone())
+                    .await?
+                    .unwrap_or_default(),
+            ));
         }
         let location = AclLocation::Local(self.source_root.as_path());
         let acl = read_preserved_acls(&location, &source.path, source.kind).await?;

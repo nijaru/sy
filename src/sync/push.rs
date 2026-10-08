@@ -815,6 +815,93 @@ mod tests {
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xattrs_are_reconciled_for_quick_unchanged_files_and_directories_over_push() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-unchanged-push";
+        let stale = "user.sy-stale-push";
+        std::fs::create_dir(source_root.path().join("dir")).unwrap();
+        std::fs::write(source_root.path().join("file"), b"same").unwrap();
+        xattr::set(source_root.path().join("file"), name, b"source-file").unwrap();
+        xattr::set(source_root.path().join("dir"), name, b"source-dir").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let file = session.file_handler();
+            let xattr = session.xattr_handler();
+            for _ in 0..7 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::File(incoming) => {
+                        file.serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Mutation(incoming) => {
+                        session.mutation_handler().serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        session.metadata_handler().serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Xattr(incoming) => xattr.serve(incoming).await.unwrap(),
+                    _ => panic!("unexpected unchanged xattr push request"),
+                }
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.xattrs = true;
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        let destination_dir = destination_root.path().join("dir");
+        xattr::set(&destination_file, name, b"wrong").unwrap();
+        xattr::set(&destination_file, stale, b"remove").unwrap();
+        xattr::remove(source_root.path().join("dir"), name).unwrap();
+        xattr::set(&destination_dir, name, b"remove-dir").unwrap();
+        execute_with_handle(
+            source_root.path(),
+            destination_root.path(),
+            session.request_handle(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"source-file".to_vec())
+        );
+        assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+        assert!(xattr::get(&destination_dir, name).unwrap().is_none());
+    }
+
     /// -A/--preserve-acls over v3: the local source's list is mirrored onto
     /// the remote destination after each committed mutation, and dropping the
     /// source list clears the destination.

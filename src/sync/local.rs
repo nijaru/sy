@@ -352,6 +352,113 @@ mod tests {
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xattrs_are_reconciled_for_quick_unchanged_files_and_directories_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-unchanged";
+        let stale = "user.sy-stale";
+        std::fs::create_dir(source_root.path().join("dir")).unwrap();
+        std::fs::write(source_root.path().join("file"), b"same").unwrap();
+        xattr::set(source_root.path().join("file"), name, b"source-file").unwrap();
+        xattr::set(source_root.path().join("dir"), name, b"source-dir").unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.xattrs = true;
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        let destination_dir = destination_root.path().join("dir");
+        xattr::set(&destination_file, name, b"wrong").unwrap();
+        xattr::set(&destination_file, stale, b"remove").unwrap();
+        xattr::remove(source_root.path().join("dir"), name).unwrap();
+        xattr::set(&destination_dir, name, b"remove-dir").unwrap();
+
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"source-file".to_vec())
+        );
+        assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+        assert!(xattr::get(&destination_dir, name).unwrap().is_none());
+    }
+
+    #[cfg(all(unix, feature = "acl"))]
+    #[tokio::test]
+    async fn acls_are_reconciled_for_quick_unchanged_files_and_directories_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::create_dir(source_root.path().join("dir")).unwrap();
+        std::fs::write(source_root.path().join("file"), b"same").unwrap();
+
+        // SAFETY: `getuid` has no pointer arguments or other preconditions.
+        let uid = unsafe { libc::getuid() };
+        let add_acl = |path: &std::path::Path| {
+            let mut acl = exacl::getfacl(path, None).unwrap();
+            acl.push(exacl::AclEntry::allow_user(
+                &uid.to_string(),
+                exacl::Perm::READ,
+                exacl::Flag::empty(),
+            ));
+            exacl::setfacl(&[path], &acl, None).unwrap();
+            exacl::to_string(&exacl::getfacl(path, None).unwrap()).unwrap()
+        };
+        let source_file_acl = add_acl(&source_root.path().join("file"));
+        let source_dir_acl = add_acl(&source_root.path().join("dir"));
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.acls = true;
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        let destination_dir = destination_root.path().join("dir");
+        let base_file = exacl::from_str("").unwrap();
+        exacl::setfacl(&[destination_file.as_path()], &base_file, None).unwrap();
+        let base_dir = exacl::from_str("").unwrap();
+        exacl::setfacl(&[destination_dir.as_path()], &base_dir, None).unwrap();
+
+        run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap(),
+            source_file_acl
+        );
+        assert_eq!(
+            exacl::to_string(&exacl::getfacl(&destination_dir, None).unwrap()).unwrap(),
+            source_dir_acl
+        );
+    }
+
     #[tokio::test]
     async fn copy_links_preserves_requested_metadata_on_followed_files() {
         let source_root = TempDir::new().unwrap();
