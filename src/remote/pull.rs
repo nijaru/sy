@@ -289,42 +289,33 @@ impl RemotePullExecutor {
     pub async fn execute(
         &self,
         item: WorkItem<RemotePullAction>,
-    ) -> Result<Option<crate::engine::work::TransferSummary>> {
+    ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
             RemotePullAction::CreateDirectory { source } => {
-                // Read the source's attributes before creating anything so a
-                // source metadata failure cannot leave a partial entry.
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
-                let bsd_flags = self.read_source_bsd_flags(&source).await?;
+                let expected = source.identity.ok_or_else(|| {
+                    crate::rooted_fs::RootedFsError::DestinationChanged(
+                        source.path.as_path().to_path_buf(),
+                    )
+                })?;
+                self.remote
+                    .read_directory_preservation(&source.path, expected, Default::default())
+                    .await?;
                 let rooted = self.metadata_authority().await?.clone();
                 let relative = source.path.clone();
-                tokio::task::spawn_blocking(move || rooted.create_directory_blocking(&relative))
-                    .await
-                    .map_err(|error| {
-                        crate::rooted_fs::RootedFsError::Worker(error.to_string())
-                    })??;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                }
+                let identity = tokio::task::spawn_blocking(move || {
+                    rooted.create_directory_blocking(&relative)
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::DirectoryPrepared(identity))
             }
             RemotePullAction::FetchFile {
                 source,
@@ -338,7 +329,8 @@ impl RemotePullExecutor {
                         let group = *identity.as_bytes();
                         return self
                             .execute_grouped_fetch(source, destination, metadata, group)
-                            .await;
+                            .await
+                            .map(crate::engine::work::WorkResult::Transfer);
                     }
                 }
                 let is_update = destination.is_some();
@@ -366,7 +358,7 @@ impl RemotePullExecutor {
                     crate::sync::output::ItemizeOp::Create
                 };
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-                Ok(Some(summary))
+                Ok(crate::engine::work::WorkResult::Transfer(summary))
             }
             RemotePullAction::ReplaceSymlink {
                 source,
@@ -385,7 +377,7 @@ impl RemotePullExecutor {
                     crate::sync::output::ItemizeKind::Symlink,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
             RemotePullAction::ApplyMetadata {
                 source,
@@ -422,7 +414,7 @@ impl RemotePullExecutor {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
     }
@@ -437,7 +429,7 @@ impl RemotePullExecutor {
         destination: Option<Entry>,
         metadata: PullTransferMetadata,
         group: [u8; 32],
-    ) -> Result<Option<crate::engine::work::TransferSummary>> {
+    ) -> Result<crate::engine::work::TransferSummary> {
         let expected_destination = destination_expectation(destination.as_ref())?;
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
@@ -465,12 +457,12 @@ impl RemotePullExecutor {
                 crate::sync::output::ItemizeOp::Create
             };
             self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-            return Ok(Some(crate::engine::work::TransferSummary {
+            return Ok(crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
                 literal_bytes: 0,
                 reused_bytes: source.size,
-            }));
+            });
         }
         let is_update = destination.is_some();
         self.validate_file_fetch_options()?;
@@ -501,7 +493,7 @@ impl RemotePullExecutor {
             crate::sync::output::ItemizeOp::Create
         };
         self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-        Ok(Some(summary))
+        Ok(summary)
     }
 
     /// Fetch one source file into endpoint staging and commit atomically.
@@ -797,11 +789,32 @@ impl RemotePullExecutor {
             })
             .await?;
         let rooted = self.metadata_authority().await?.clone();
+        let crate::engine::finalize_journal::DirectoryTarget::Observed(expected) = metadata.target
+        else {
+            return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
+                metadata.path.as_path().to_path_buf(),
+            )
+            .into());
+        };
+        let request = crate::rooted_fs::DirectoryPreservationRequest {
+            xattrs: self.xattrs,
+            acl: self.acls,
+            bsd_flags: self.bsd_flags,
+        };
+        let preservation = if metadata.preserve_source {
+            self.remote
+                .read_directory_preservation(&metadata.path, metadata.source_identity, request)
+                .await?
+        } else {
+            Default::default()
+        };
         tokio::task::spawn_blocking(move || {
-            rooted.finalize_directory_metadata_blocking(
+            rooted.finalize_directory_blocking(
                 &metadata.path,
+                expected,
                 metadata.unix_mode,
                 metadata.modified,
+                &preservation,
             )
         })
         .await
@@ -996,7 +1009,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
     async fn execute(
         &self,
         item: WorkItem<RemotePullAction>,
-    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, RemotePullError> {
+    ) -> std::result::Result<crate::engine::work::WorkResult, RemotePullError> {
         RemotePullExecutor::execute(self, item).await
     }
 
@@ -1142,7 +1155,10 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), b"old");
             } else {
-                assert_eq!(result.unwrap().unwrap().reused_bytes, 3);
+                let crate::engine::work::WorkResult::Transfer(transfer) = result.unwrap() else {
+                    panic!("expected transfer receipt")
+                };
+                assert_eq!(transfer.reused_bytes, 3);
                 assert_eq!(
                     std::fs::metadata(dest_root.path().join("a")).unwrap().ino(),
                     std::fs::metadata(dest_root.path().join("b")).unwrap().ino()

@@ -1,5 +1,7 @@
 #[path = "client.rs"]
 mod client;
+#[path = "directory.rs"]
+mod directory;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "mutation.rs"]
@@ -303,25 +305,7 @@ impl ClientRemoteSession {
         .map_err(Into::into)
     }
 
-    pub async fn finalize_directory_metadata(
-        &self,
-        path: &RelativePath,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
-        self.require_push(FrameKind::Metadata)?;
-        metadata::request_directory_finalize(
-            &self.router.sender(),
-            path,
-            unix_mode,
-            modified,
-            self.server.platform.os,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    pub async fn create_directory(&self, path: &RelativePath) -> Result<()> {
+    pub async fn create_directory(&self, path: &RelativePath) -> Result<EntryIdentity> {
         self.require_push(FrameKind::Mutation)?;
         request_create_directory(&self.router.sender(), path, self.server.platform.os)
             .await
@@ -767,7 +751,11 @@ impl ServerRemoteSession {
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
             }
-            FrameKind::Metadata if self.opened.operation == Operation::Push => {
+            FrameKind::Metadata
+                if self.opened.operation == Operation::Push
+                    || incoming.first.frame().payload().first()
+                        == Some(&crate::protocol::DIRECTORY_READ) =>
+            {
                 Ok(Some(IncomingRequest::Metadata(incoming)))
             }
             FrameKind::Mutation if self.opened.operation == Operation::Push => {

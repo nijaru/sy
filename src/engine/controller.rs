@@ -2,7 +2,7 @@ use crate::engine::delete_plan::DeleteAction;
 use crate::engine::delete_plan::{DeletePlan, DeletePlanError, DeletePolicy, DeleteTracker};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use crate::engine::finalize_journal::{
-    FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
+    DirectoryTarget, FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
 use crate::engine::plan_journal::{PlanJournal, PlanJournalError, PlanJournalReader};
 use crate::engine::planner::{
@@ -11,8 +11,8 @@ use crate::engine::planner::{
 use crate::engine::reconcile::{EngineError, EntryStream, OrderedReconciler, ReconcileItem};
 
 use crate::engine::planner::ExecutionPolicy;
-use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
+use crate::engine::work::{TransferSummary, WorkResult};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -44,6 +44,19 @@ pub enum ControllerError {
 
     #[error("metadata preservation requires Unix mode metadata for {0}")]
     MissingPreservedMode(RelativePath),
+
+    #[error("committed directory finalization failed for {path}: {source}")]
+    CommittedDirectoryFinalization {
+        path: RelativePath,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("directory observation is missing for {0}")]
+    MissingDirectoryIdentity(RelativePath),
+
+    #[error("invalid directory preparation receipt for {0}")]
+    InvalidDirectoryReceipt(RelativePath),
 
     #[error("content comparison was not supplied for {0}")]
     UnsupportedContentComparison(RelativePath),
@@ -522,7 +535,7 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
     fn execute(
         &self,
         item: WorkItem<Self::Action>,
-    ) -> impl Future<Output = std::result::Result<Option<TransferSummary>, Self::Error>> + Send;
+    ) -> impl Future<Output = std::result::Result<WorkResult, Self::Error>> + Send;
     fn execute_delete(
         &self,
         action: DeleteAction,
@@ -573,11 +586,28 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             delete_candidates,
             ..SyncSummary::default()
         };
-        let mut workers = JoinSet::<std::result::Result<Option<TransferSummary>, E::Error>>::new();
+        let mut workers = JoinSet::<std::result::Result<WorkResult, E::Error>>::new();
+        let mut runtime_finalize = FinalizeJournal::new().await?;
+        let mut next_directory = finalize.next_forward().await?;
 
         let main_result: Result<()> = async {
             while let Some(operation) = reader.next().await? {
                 record_semantic_operation(&mut summary, &operation)?;
+                let directory = if next_directory
+                    .as_ref()
+                    .is_some_and(|record| &record.path == operation.path())
+                {
+                    let record = next_directory.take();
+                    next_directory = finalize.next_forward().await?;
+                    record
+                } else {
+                    None
+                };
+                if let Some(record) = &directory {
+                    if matches!(record.target, DirectoryTarget::Observed(_)) {
+                        runtime_finalize.append(record).await?;
+                    }
+                }
                 if let SyncOp::Unchanged {
                     source,
                     destination,
@@ -594,11 +624,15 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                     }
                     continue;
                 }
+                let operation_path = operation.path().clone();
                 let lowered = self
                     .executor
                     .lower(operation, execution_policy)
                     .map_err(|error| ControllerError::backend("execution", error))?;
                 let Some(main) = lowered else {
+                    if directory.is_some_and(|record| record.target == DirectoryTarget::Create) {
+                        return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
+                    }
                     continue;
                 };
                 summary.main_operations =
@@ -610,7 +644,17 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                         .execute(main)
                         .await
                         .map_err(|error| ControllerError::backend("execution", error))?;
-                    record_transfer(&mut summary, result)?;
+                    let Some(mut record) = directory else {
+                        return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
+                    };
+                    let WorkResult::DirectoryPrepared(identity) = result else {
+                        return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+                    };
+                    if record.target != DirectoryTarget::Create {
+                        return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+                    }
+                    record.target = DirectoryTarget::Observed(identity);
+                    runtime_finalize.append(&record).await?;
                     continue;
                 }
 
@@ -647,6 +691,11 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             return Err(error);
         }
 
+        if let Some(record) = next_directory {
+            return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+        }
+        let mut finalize = runtime_finalize.seal().await?;
+
         if let Some(delete) = delete {
             let mut replay = delete.into_replay();
             while let Some(action) = replay.next_action().await? {
@@ -659,10 +708,14 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         }
 
         while let Some(metadata) = finalize.next().await? {
+            let path = metadata.path.clone();
             self.executor
                 .execute_finalize(metadata)
                 .await
-                .map_err(|error| ControllerError::backend("execution", error))?;
+                .map_err(|error| ControllerError::CommittedDirectoryFinalization {
+                    path,
+                    source: Box::new(error),
+                })?;
             summary.finalized_metadata =
                 checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
         }
@@ -688,10 +741,7 @@ fn directory_finalize_metadata(
     destination: Option<&Entry>,
     policy: ComparisonPolicy,
 ) -> Result<Option<FinalizeMetadata>> {
-    if !source.is_directory()
-        || destination.is_some_and(|entry| !entry.is_directory())
-        || (!policy.preserve_permissions && !policy.preserve_times)
-    {
+    if !source.is_directory() || destination.is_some_and(|entry| !entry.is_directory()) {
         return Ok(None);
     }
 
@@ -715,15 +765,33 @@ fn directory_finalize_metadata(
     };
     let modified = policy.preserve_times.then_some(final_entry.modified);
 
+    let preserve_source = !destination.is_some_and(|entry| {
+        policy.ignore_existing || (policy.update_only && entry.modified > source.modified)
+    });
+    if !preserve_source && unix_mode.is_none() && modified.is_none() {
+        return Ok(None);
+    }
     Ok(Some(FinalizeMetadata {
         path: source.path.clone(),
         kind: source.kind,
+        source_identity: source
+            .identity
+            .ok_or_else(|| ControllerError::MissingDirectoryIdentity(source.path.clone()))?,
+        target: match destination {
+            None => DirectoryTarget::Create,
+            Some(entry) => DirectoryTarget::Observed(
+                entry
+                    .identity
+                    .ok_or_else(|| ControllerError::MissingDirectoryIdentity(entry.path.clone()))?,
+            ),
+        },
+        preserve_source,
         unix_mode,
         modified,
     }))
 }
 async fn collect_one<E: SyncPlanExecutor>(
-    workers: &mut JoinSet<std::result::Result<Option<TransferSummary>, E::Error>>,
+    workers: &mut JoinSet<std::result::Result<WorkResult, E::Error>>,
     summary: &mut SyncSummary,
 ) -> Result<()> {
     let result = workers
@@ -732,15 +800,16 @@ async fn collect_one<E: SyncPlanExecutor>(
         .ok_or_else(|| ControllerError::Worker("worker set ended early".to_string()))?
         .map_err(|error| ControllerError::Worker(error.to_string()))?;
     match result {
-        Ok(summary_item) => record_transfer(summary, summary_item),
+        Ok(WorkResult::Transfer(transfer)) => record_transfer(summary, transfer),
+        Ok(WorkResult::Metadata) => Ok(()),
+        Ok(WorkResult::DirectoryPrepared(_)) => Err(ControllerError::Worker(
+            "directory executed as leaf work".into(),
+        )),
         Err(error) => Err(ControllerError::backend("execution", error)),
     }
 }
 
-fn record_transfer(summary: &mut SyncSummary, transfer: Option<TransferSummary>) -> Result<()> {
-    let Some(transfer) = transfer else {
-        return Ok(());
-    };
+fn record_transfer(summary: &mut SyncSummary, transfer: TransferSummary) -> Result<()> {
     summary.files_transferred = checked_add(summary.files_transferred, 1, "file transfer")?;
     if transfer.reused_bytes > 0 {
         summary.delta_files = checked_add(summary.delta_files, 1, "delta file")?;
@@ -865,6 +934,7 @@ mod tests {
     fn directory(value: &str, mode: u32) -> Entry {
         let mut entry = Entry::directory(path(value), Timestamp::UNIX_EPOCH);
         entry.unix_mode = Some(mode);
+        entry.identity = Some(crate::engine::domain::EntryIdentity::from_bytes([7; 32]));
         entry
     }
 
@@ -899,13 +969,13 @@ mod tests {
             action.is_directory()
         }
 
-        async fn execute(&self, item: WorkItem<Entry>) -> std::io::Result<Option<TransferSummary>> {
+        async fn execute(&self, item: WorkItem<Entry>) -> std::io::Result<WorkResult> {
             if item.action().path == path("a") {
                 self.started.notify_one();
                 self.release.notified().await;
                 self.completed
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(None)
+                Ok(WorkResult::Metadata)
             } else {
                 self.started.notified().await;
                 self.failed.notify_one();
@@ -1256,6 +1326,11 @@ mod tests {
             Some(FinalizeMetadata {
                 path: path("parent"),
                 kind: EntryKind::Directory,
+                source_identity: crate::engine::domain::EntryIdentity::from_bytes([7; 32]),
+                target: DirectoryTarget::Observed(
+                    crate::engine::domain::EntryIdentity::from_bytes([7; 32])
+                ),
+                preserve_source: true,
                 unix_mode: None,
                 modified: Some(modified),
             })

@@ -272,11 +272,17 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
     )
     .unwrap();
     std::os::unix::fs::symlink(outside.path(), destination.path().join("dir")).unwrap();
-    let path = sy::engine::domain::RelativePath::new("dir/new").unwrap();
+    std::fs::create_dir(source.path().join("dir/new")).unwrap();
+    let entries = local_entry_stream(source.path().to_path_buf(), ScanRequest::default())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let observed = entries
+        .into_iter()
+        .find(|entry| entry.path.as_path() == Path::new("dir/new"))
+        .unwrap();
     let work = lower_local_op(
-        SyncOp::Create {
-            source: Entry::directory(path, sy::engine::domain::Timestamp::new(1, 0).unwrap()),
-        },
+        SyncOp::Create { source: observed },
         ExecutionPolicy::default(),
     )
     .unwrap()
@@ -288,6 +294,11 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
         FinalizeMetadata {
             path: sy::engine::domain::RelativePath::new("dir/child").unwrap(),
             kind: sy::engine::domain::EntryKind::Directory,
+            source_identity: sy::engine::domain::EntryIdentity::from_bytes([1; 32]),
+            target: sy::engine::finalize_journal::DirectoryTarget::Observed(
+                sy::engine::domain::EntryIdentity::from_bytes([2; 32])
+            ),
+            preserve_source: false,
             unix_mode: Some(0o600),
             modified: Some(sy::engine::domain::Timestamp::new(1, 0).unwrap()),
         }

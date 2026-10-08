@@ -1,5 +1,7 @@
+mod directory;
 #[cfg(unix)]
 mod scan;
+pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
 
 #[cfg(all(target_os = "macos", feature = "acl"))]
 mod acl_macos;
@@ -45,6 +47,9 @@ pub enum RootedFsError {
 
     #[error("backup destination aliases its source: {0}")]
     BackupAliasesSource(PathBuf),
+
+    #[error("directory mutation requires an observed finalization request")]
+    UnobservedDirectoryMutation,
 
     #[error("root directory identity changed after it was opened: {0}")]
     RootChanged(PathBuf),
@@ -810,11 +815,12 @@ impl RootedFs {
     }
 
     /// Create one directory beneath the pinned root without following any
-    /// peer-controlled parent symlink. Existing real directories are accepted
-    /// so repeated create requests are idempotent; files and symlinks are not.
+    /// peer-controlled parent symlink. The name must remain absent; existing
+    /// entries are refused rather than adopted as our creation. The returned
+    /// identity belongs to the held no-follow descriptor opened at creation.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn create_directory_blocking(&self, relative: &RelativePath) -> Result<()> {
+    pub fn create_directory_blocking(&self, relative: &RelativePath) -> Result<EntryIdentity> {
         self.create_directory_path_blocking(relative.as_path())
     }
 
@@ -1000,11 +1006,12 @@ impl RootedFs {
         read_xattrs_from_file(file)
     }
 
-    /// Mirror an extended-attribute set onto one file or directory beneath the
+    /// Mirror an extended-attribute set onto a regular file beneath the
     /// pinned root: every requested attribute is set and every existing
     /// attribute absent from the request is removed. The leaf is opened without
     /// following a symlink and every mutation goes through that held
-    /// descriptor. Symlinks are refused.
+    /// descriptor. Directories require observed journal finalization;
+    /// symlinks are refused.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn write_xattrs_blocking(
@@ -1013,6 +1020,9 @@ impl RootedFs {
         kind: EntryKind,
         xattrs: &[(OsString, Vec<u8>)],
     ) -> Result<()> {
+        if kind == EntryKind::Directory {
+            return Err(RootedFsError::UnobservedDirectoryMutation);
+        }
         self.write_xattrs_path_blocking(relative.as_path(), kind, xattrs)
     }
 
@@ -1052,11 +1062,11 @@ impl RootedFs {
     }
 
     /// Mirror an access-control list, as exacl unified-entries text, onto one
-    /// file or directory beneath the pinned root. An empty string clears the
+    /// regular file beneath the pinned root. An empty string clears the
     /// list (on Linux the mode-derived base entries are restored, matching
     /// `LocalEndpoint::write_acl`). The leaf is opened without following a
     /// symlink and every mutation goes through that held descriptor.
-    /// Symlinks are refused.
+    /// Directories require observed journal finalization; symlinks are refused.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn write_acl_blocking(
@@ -1065,6 +1075,9 @@ impl RootedFs {
         kind: EntryKind,
         acl: &str,
     ) -> Result<()> {
+        if kind == EntryKind::Directory {
+            return Err(RootedFsError::UnobservedDirectoryMutation);
+        }
         if kind == EntryKind::Symlink {
             return Err(RootedFsError::UnsupportedSymlinkAcls);
         }
@@ -1125,10 +1138,11 @@ impl RootedFs {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
-    /// Mirror BSD file flags onto one file or directory beneath the pinned
+    /// Mirror BSD file flags onto one regular file beneath the pinned
     /// root (macOS only): 0 clears every flag. The leaf is opened without
     /// following a symlink and the mutation goes through that held
-    /// descriptor. Symlinks are refused.
+    /// descriptor. Directories require observed journal finalization;
+    /// symlinks are refused.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn write_bsd_flags_blocking(
@@ -1137,6 +1151,9 @@ impl RootedFs {
         kind: EntryKind,
         flags: u32,
     ) -> Result<()> {
+        if kind == EntryKind::Directory {
+            return Err(RootedFsError::UnobservedDirectoryMutation);
+        }
         if kind == EntryKind::Symlink {
             return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
         }
@@ -1163,29 +1180,6 @@ impl RootedFs {
         modified: Option<Timestamp>,
     ) -> Result<()> {
         self.apply_metadata_path_blocking(relative.as_path(), kind, expected, unix_mode, modified)
-    }
-
-    /// Directory finalization is root-confined but not yet observation-bound.
-    /// Kept distinct from observed metadata updates until creation receipts
-    /// are carried through the runtime finalization journal.
-    /// This blocking API must run on a blocking worker.
-    pub fn finalize_directory_metadata_blocking(
-        &self,
-        relative: &RelativePath,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
-        #[cfg(unix)]
-        {
-            let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
-            let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
-            apply_fd_metadata(directory.as_raw_fd(), unix_mode, modified)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (relative, unix_mode, modified);
-            Err(RootedFsError::UnsupportedPlatform)
-        }
     }
 
     #[cfg(unix)]
@@ -1437,7 +1431,7 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn create_directory_path_blocking(&self, relative: &Path) -> Result<()> {
+    fn create_directory_path_blocking(&self, relative: &Path) -> Result<EntryIdentity> {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let leaf_c = component_cstring(&leaf)?;
         let result = unsafe {
@@ -1446,20 +1440,23 @@ impl RootedFs {
             // parent; the process umask applies to the requested default mode.
             libc::mkdirat(parent.as_raw_fd(), leaf_c.as_ptr(), 0o777)
         };
-        if result == 0 {
-            return Ok(());
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
-
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EEXIST) {
-            open_dir_at(parent.as_raw_fd(), &leaf)?;
-            return Ok(());
+        let created = stat_at_optional(parent.as_raw_fd(), &leaf)?
+            .and_then(|stat| identity_from_stat(&stat))
+            .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
+        let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
+        let opened = identity_from_stat(&stat_fd(directory.as_raw_fd())?)
+            .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
+        if opened != created {
+            return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
         }
-        Err(error.into())
+        Ok(opened)
     }
 
     #[cfg(not(unix))]
-    fn create_directory_path_blocking(&self, _relative: &Path) -> Result<()> {
+    fn create_directory_path_blocking(&self, _relative: &Path) -> Result<EntryIdentity> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -3459,11 +3456,21 @@ mod tests {
         )
         .is_empty());
 
+        let directory_identity = rooted
+            .path_identity_blocking(&relative("dir"))
+            .unwrap()
+            .unwrap()
+            .1;
         rooted
-            .write_xattrs_blocking(
+            .finalize_directory_blocking(
                 &relative("dir"),
-                EntryKind::Directory,
-                &[(name.clone(), b"dir".to_vec())],
+                directory_identity,
+                None,
+                None,
+                &DirectoryPreservation {
+                    xattrs: Some(vec![(name.clone(), b"dir".to_vec())]),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(

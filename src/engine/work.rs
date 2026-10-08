@@ -1,5 +1,13 @@
 use super::scheduler::ResourceRequest;
 
+/// Directory authority is captured at creation, not by a late path lookup.
+#[derive(Debug)]
+pub enum WorkResult {
+    DirectoryPrepared(super::domain::EntryIdentity),
+    Transfer(TransferSummary),
+    Metadata,
+}
+
 /// Verified byte-transfer accounting returned by endpoint executors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferSummary {

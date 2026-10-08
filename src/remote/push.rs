@@ -73,6 +73,8 @@ pub enum RemotePushLowerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushError {
+    #[error(transparent)]
+    Directory(#[from] crate::rooted_fs::RootedFsError),
     #[error("hardlink bookkeeping failed: {0}")]
     HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
@@ -432,7 +434,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
     async fn execute(
         &self,
         item: crate::engine::work::WorkItem<RemotePushAction>,
-    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, RemotePushError> {
+    ) -> std::result::Result<crate::engine::work::WorkResult, RemotePushError> {
         RemotePushExecutor::execute(self, item).await
     }
 
@@ -547,37 +549,31 @@ impl RemotePushExecutor {
     pub async fn execute(
         &self,
         item: WorkItem<RemotePushAction>,
-    ) -> Result<Option<TransferSummary>> {
+    ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
             RemotePushAction::CreateDirectory { source } => {
-                // Read the source's attributes before the first mutation so a
-                // source metadata failure cannot leave a half-created
-                // destination entry behind.
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
-                let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                self.remote.create_directory(&source.path).await?;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                }
+                let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+                let expected = source.identity.ok_or_else(|| {
+                    crate::rooted_fs::RootedFsError::DestinationChanged(
+                        source.path.as_path().to_path_buf(),
+                    )
+                })?;
+                let path = source.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    rooted.read_directory_preservation_blocking(&path, expected, Default::default())
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+                let identity = self.remote.create_directory(&source.path).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::DirectoryPrepared(identity))
             }
             RemotePushAction::TransferFile {
                 source,
@@ -595,7 +591,8 @@ impl RemotePushExecutor {
                         let group = *identity.as_bytes();
                         return self
                             .execute_grouped_file(source, destination, metadata, group)
-                            .await;
+                            .await
+                            .map(crate::engine::work::WorkResult::Transfer);
                     }
                 }
                 let is_update = destination.is_some();
@@ -656,7 +653,7 @@ impl RemotePushExecutor {
                     crate::sync::output::ItemizeOp::Create
                 };
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-                Ok(Some(summary))
+                Ok(crate::engine::work::WorkResult::Transfer(summary))
             }
             RemotePushAction::ReplaceSymlink {
                 source,
@@ -686,7 +683,7 @@ impl RemotePushExecutor {
                     crate::sync::output::ItemizeKind::Symlink,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
             RemotePushAction::ApplyMetadata {
                 source,
@@ -718,7 +715,7 @@ impl RemotePushExecutor {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
     }
@@ -734,7 +731,7 @@ impl RemotePushExecutor {
         destination: Option<Entry>,
         metadata: TransferMetadata,
         group: [u8; 32],
-    ) -> Result<Option<TransferSummary>> {
+    ) -> Result<TransferSummary> {
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
             self.check_source_identity(&source).await?;
@@ -758,12 +755,12 @@ impl RemotePushExecutor {
                 crate::sync::output::ItemizeOp::Create
             };
             self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-            return Ok(Some(TransferSummary {
+            return Ok(TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
                 literal_bytes: 0,
                 reused_bytes: source.size,
-            }));
+            });
         }
         let is_update = destination.is_some();
         if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
@@ -823,7 +820,7 @@ impl RemotePushExecutor {
             crate::sync::output::ItemizeOp::Create
         };
         self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-        Ok(Some(summary))
+        Ok(summary)
     }
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
@@ -901,8 +898,41 @@ impl RemotePushExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
+        let crate::engine::finalize_journal::DirectoryTarget::Observed(expected) = metadata.target
+        else {
+            return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
+                metadata.path.as_path().to_path_buf(),
+            )
+            .into());
+        };
+        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let path = metadata.path.clone();
+        let request = crate::rooted_fs::DirectoryPreservationRequest {
+            xattrs: self.xattrs,
+            acl: self.acls,
+            bsd_flags: self.bsd_flags,
+        };
+        let preservation = if metadata.preserve_source {
+            tokio::task::spawn_blocking(move || {
+                rooted.read_directory_preservation_blocking(
+                    &path,
+                    metadata.source_identity,
+                    request,
+                )
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??
+        } else {
+            Default::default()
+        };
         self.remote
-            .finalize_directory_metadata(&metadata.path, metadata.unix_mode, metadata.modified)
+            .finalize_directory_metadata(
+                &metadata.path,
+                expected,
+                metadata.unix_mode,
+                metadata.modified,
+                &preservation,
+            )
             .await?;
         Ok(())
     }

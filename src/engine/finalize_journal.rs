@@ -1,4 +1,6 @@
-use super::domain::{EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, Timestamp};
+use super::domain::{
+    EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, Timestamp,
+};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
@@ -10,10 +12,19 @@ const FIELD_MODE: u8 = 1 << 0;
 const FIELD_MODIFIED: u8 = 1 << 1;
 const FIELD_MASK: u8 = FIELD_MODE | FIELD_MODIFIED;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryTarget {
+    Create,
+    Observed(EntryIdentity),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizeMetadata {
     pub path: RelativePath,
     pub kind: EntryKind,
+    pub source_identity: EntryIdentity,
+    pub target: DirectoryTarget,
+    pub preserve_source: bool,
     pub unix_mode: Option<u32>,
     pub modified: Option<Timestamp>,
 }
@@ -66,7 +77,8 @@ impl FinalizeJournal {
     }
 
     pub async fn append(&mut self, metadata: &FinalizeMetadata) -> Result<()> {
-        if metadata.unix_mode.is_none() && metadata.modified.is_none() {
+        if !metadata.preserve_source && metadata.unix_mode.is_none() && metadata.modified.is_none()
+        {
             return Err(FinalizeJournalError::EmptyMetadata(
                 metadata.path.as_path().to_path_buf(),
             ));
@@ -85,6 +97,7 @@ impl FinalizeJournal {
                 maximum: MAX_RECORD_PAYLOAD,
             })?;
 
+        self.file.write_u32(payload_len).await?;
         self.file.write_all(&payload).await?;
         self.file.write_u32(payload_len).await?;
         self.records = self.records.checked_add(1).ok_or_else(|| {
@@ -103,6 +116,7 @@ impl FinalizeJournal {
             file: self.file,
             cursor,
             remaining: self.records,
+            forward_cursor: 0,
         })
     }
 }
@@ -111,9 +125,34 @@ pub struct FinalizeJournalReader {
     file: tokio::fs::File,
     cursor: u64,
     remaining: usize,
+    forward_cursor: u64,
 }
 
 impl FinalizeJournalReader {
+    /// Consume preparation requests in the same order as the semantic plan.
+    pub async fn next_forward(&mut self) -> Result<Option<FinalizeMetadata>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.file.seek(SeekFrom::Start(self.forward_cursor)).await?;
+        let len = self.file.read_u32().await? as usize;
+        if len == 0 || len > MAX_RECORD_PAYLOAD {
+            return Err(FinalizeJournalError::InvalidRecord(
+                "invalid forward record length",
+            ));
+        }
+        let mut payload = vec![0; len];
+        self.file.read_exact(&mut payload).await?;
+        if self.file.read_u32().await? as usize != len {
+            return Err(FinalizeJournalError::InvalidRecord(
+                "mismatched record lengths",
+            ));
+        }
+        self.forward_cursor += len as u64 + 2 * TRAILER_LEN;
+        self.remaining -= 1;
+        Ok(Some(decode_metadata(&payload)?))
+    }
+
     pub async fn next(&mut self) -> Result<Option<FinalizeMetadata>> {
         if self.cursor == 0 {
             if self.remaining != 0 {
@@ -165,8 +204,17 @@ impl FinalizeJournalReader {
         let mut payload = vec![0_u8; payload_len];
         self.file.read_exact(&mut payload).await?;
         let metadata = decode_metadata(&payload)?;
+        let header = start
+            .checked_sub(TRAILER_LEN)
+            .ok_or(FinalizeJournalError::InvalidRecord("missing record header"))?;
+        self.file.seek(SeekFrom::Start(header)).await?;
+        if self.file.read_u32().await? as usize != payload_len {
+            return Err(FinalizeJournalError::InvalidRecord(
+                "mismatched record lengths",
+            ));
+        }
 
-        self.cursor = start;
+        self.cursor = header;
         self.remaining =
             self.remaining
                 .checked_sub(1)
@@ -194,6 +242,15 @@ fn encode_metadata(metadata: &FinalizeMetadata) -> Result<Vec<u8>> {
         fields |= FIELD_MODIFIED;
     }
     payload.push(fields);
+    payload.extend_from_slice(metadata.source_identity.as_bytes());
+    match metadata.target {
+        DirectoryTarget::Create => payload.push(0),
+        DirectoryTarget::Observed(identity) => {
+            payload.push(1);
+            payload.extend_from_slice(identity.as_bytes());
+        }
+    }
+    payload.push(u8::from(metadata.preserve_source));
 
     if let Some(mode) = metadata.unix_mode {
         payload.extend_from_slice(&mode.to_be_bytes());
@@ -215,17 +272,41 @@ fn decode_metadata(payload: &[u8]) -> Result<FinalizeMetadata> {
         _ => return Err(FinalizeJournalError::InvalidRecord("unknown entry kind")),
     };
     let fields = reader.u8()?;
-    if fields == 0 {
-        return Err(FinalizeJournalError::InvalidRecord(
-            "metadata request has no fields",
-        ));
-    }
     if fields & !FIELD_MASK != 0 {
         return Err(FinalizeJournalError::InvalidRecord(
             "unknown metadata field bits",
         ));
     }
 
+    let source_identity = EntryIdentity::from_bytes(
+        reader
+            .take(32)?
+            .try_into()
+            .map_err(|_| FinalizeJournalError::InvalidRecord("identity length"))?,
+    );
+    let target = match reader.u8()? {
+        0 => DirectoryTarget::Create,
+        1 => DirectoryTarget::Observed(EntryIdentity::from_bytes(
+            reader
+                .take(32)?
+                .try_into()
+                .map_err(|_| FinalizeJournalError::InvalidRecord("identity length"))?,
+        )),
+        _ => {
+            return Err(FinalizeJournalError::InvalidRecord(
+                "unknown directory target",
+            ))
+        }
+    };
+    let preserve_source = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(FinalizeJournalError::InvalidRecord(
+                "invalid preservation policy",
+            ))
+        }
+    };
     let unix_mode = if fields & FIELD_MODE != 0 {
         Some(reader.u32()?)
     } else {
@@ -241,6 +322,9 @@ fn decode_metadata(payload: &[u8]) -> Result<FinalizeMetadata> {
     Ok(FinalizeMetadata {
         path,
         kind,
+        source_identity,
+        target,
+        preserve_source,
         unix_mode,
         modified,
     })
@@ -382,12 +466,18 @@ mod tests {
         let parent = FinalizeMetadata {
             path: path("parent"),
             kind: EntryKind::Directory,
+            source_identity: EntryIdentity::from_bytes([1; 32]),
+            target: DirectoryTarget::Observed(EntryIdentity::from_bytes([2; 32])),
+            preserve_source: true,
             unix_mode: Some(0o755),
             modified: Some(Timestamp::UNIX_EPOCH),
         };
         let child = FinalizeMetadata {
             path: path("parent/child"),
             kind: EntryKind::Directory,
+            source_identity: EntryIdentity::from_bytes([3; 32]),
+            target: DirectoryTarget::Create,
+            preserve_source: true,
             unix_mode: Some(0o700),
             modified: None,
         };
@@ -406,6 +496,9 @@ mod tests {
         let metadata = FinalizeMetadata {
             path: path("directory"),
             kind: EntryKind::Directory,
+            source_identity: EntryIdentity::from_bytes([1; 32]),
+            target: DirectoryTarget::Create,
+            preserve_source: false,
             unix_mode: None,
             modified: None,
         };
@@ -425,6 +518,9 @@ mod tests {
         let metadata = FinalizeMetadata {
             path,
             kind: EntryKind::Directory,
+            source_identity: EntryIdentity::from_bytes([1; 32]),
+            target: DirectoryTarget::Create,
+            preserve_source: true,
             unix_mode: None,
             modified: Some(Timestamp::UNIX_EPOCH),
         };
@@ -441,6 +537,9 @@ mod tests {
             .append(&FinalizeMetadata {
                 path: path("directory"),
                 kind: EntryKind::Directory,
+                source_identity: EntryIdentity::from_bytes([1; 32]),
+                target: DirectoryTarget::Create,
+                preserve_source: true,
                 unix_mode: Some(0o755),
                 modified: None,
             })

@@ -12,22 +12,19 @@ bitflags! {
 }
 
 /// Authority for a metadata request. Observed mutations always carry an
-/// endpoint-issued identity. Directory finalization is a distinct, currently
-/// unobserved lifecycle operation, never an optional-identity file update.
+/// endpoint-issued identity; there is no unobserved mutation authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireMetadataTarget {
     Observed {
         kind: WireEntryKind,
         identity: [u8; 32],
     },
-    DirectoryFinalize,
 }
 
 impl WireMetadataTarget {
     fn kind(self) -> WireEntryKind {
         match self {
             Self::Observed { kind, .. } => kind,
-            Self::DirectoryFinalize => WireEntryKind::Directory,
         }
     }
 }
@@ -91,7 +88,6 @@ impl WireMetadata {
             .and_then(|value| {
                 value.checked_add(match self.target {
                     WireMetadataTarget::Observed { .. } => 32,
-                    WireMetadataTarget::DirectoryFinalize => 0,
                 })
             })
             .ok_or(ProtocolError::InvalidMessage(
@@ -115,12 +111,12 @@ impl WireMetadata {
         let mut out = BytesMut::with_capacity(capacity);
         out.put_u8(match self.target {
             WireMetadataTarget::Observed { kind, .. } => kind as u8,
-            WireMetadataTarget::DirectoryFinalize => 0,
         });
         out.put_u8(fields.bits());
         out.put_u32(path_len);
         out.extend_from_slice(self.path.as_encoded());
-        if let WireMetadataTarget::Observed { identity, .. } = self.target {
+        let WireMetadataTarget::Observed { identity, .. } = self.target;
+        {
             out.extend_from_slice(&identity);
         }
         if let Some(mode) = self.unix_mode {
@@ -136,11 +132,7 @@ impl WireMetadata {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let target_tag = reader.u8()?;
-        let kind = if target_tag == 0 {
-            None
-        } else {
-            Some(WireEntryKind::try_from(target_tag)?)
-        };
+        let kind = WireEntryKind::try_from(target_tag)?;
         let raw_fields = reader.u8()?;
         let fields = MetadataFields::from_bits(raw_fields).ok_or(ProtocolError::InvalidField {
             field: "metadata_fields",
@@ -154,14 +146,12 @@ impl WireMetadata {
             });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
-        let target = match kind {
-            Some(kind) => WireMetadataTarget::Observed {
-                kind,
-                identity: reader.take(32)?.try_into().map_err(|_| {
-                    ProtocolError::InvalidMessage("invalid metadata identity length")
-                })?,
-            },
-            None => WireMetadataTarget::DirectoryFinalize,
+        let target = WireMetadataTarget::Observed {
+            kind,
+            identity: reader
+                .take(32)?
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidMessage("invalid metadata identity length"))?,
         };
         let unix_mode = fields
             .contains(MetadataFields::UNIX_MODE)
@@ -248,7 +238,7 @@ mod tests {
         );
         assert!(WireMetadata::new(
             path(),
-            WireMetadataTarget::DirectoryFinalize,
+            observed(WireEntryKind::Directory),
             None,
             Some((0, 1_000_000_000))
         )

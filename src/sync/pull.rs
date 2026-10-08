@@ -285,10 +285,8 @@ mod tests {
             let rooted = session.scan_handler_rooted();
             let sender = session.sender();
             let peer = session.client().platform.os;
-            // One scan + two fetches, bounded exactly: the plan transfers
-            // both files (the scan request count must stay exact so a
-            // protocol regression cannot hide behind extra round-trips).
-            for _ in 0..3 {
+            // Scan, two fetches, and observed directory preparation/final read.
+            for _ in 0..5 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         scan.serve(incoming).await.unwrap();
@@ -302,6 +300,9 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        session.metadata_handler().serve(incoming).await.unwrap();
                     }
                     _other => panic!("unexpected v3 pull request variant"),
                 }

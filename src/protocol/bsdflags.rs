@@ -145,6 +145,11 @@ impl WireBsdFlagsRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if self.kind == WireEntryKind::Directory && self.mode == BsdFlagsMode::Write {
+            return Err(ProtocolError::InvalidMessage(
+                "directory mutations require observed finalization",
+            ));
+        }
         match (self.mode, &self.flags) {
             (BsdFlagsMode::Read, None) | (BsdFlagsMode::Write, Some(_)) => Ok(()),
             (BsdFlagsMode::Read, Some(_)) => Err(ProtocolError::InvalidField {
@@ -224,8 +229,7 @@ mod tests {
     #[test]
     fn write_request_round_trips_value_including_zero_clear() {
         for flags in [0, 0x8000] {
-            let request =
-                WireBsdFlagsRequest::write(path(), WireEntryKind::Directory, flags).unwrap();
+            let request = WireBsdFlagsRequest::write(path(), WireEntryKind::File, flags).unwrap();
             let decoded = WireBsdFlagsRequest::decode(&request.encode().unwrap()).unwrap();
             assert_eq!(decoded, request);
             assert_eq!(decoded.mode(), BsdFlagsMode::Write);
