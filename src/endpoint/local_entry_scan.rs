@@ -89,36 +89,25 @@ pub async fn validate_scratch_location(root: PathBuf) -> std::io::Result<()> {
 /// owners must first validate source scratch placement before spawning other
 /// endpoint scans or creating journals in the same temporary directory.
 pub fn local_entry_stream(root: PathBuf, request: ScanRequest) -> EntryStream {
-    let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
-    let join_sender = sender.clone();
-
-    tokio::spawn(async move {
-        let scan = tokio::task::spawn_blocking(move || scan_worker(root, request, sender)).await;
-        if let Err(error) = scan {
-            let _ = join_sender.send(Err(Box::new(error) as BoxError)).await;
-        }
-    });
-
-    Box::pin(futures::stream::unfold(
-        receiver,
-        |mut receiver| async move { receiver.recv().await.map(|entry| (entry, receiver)) },
-    ))
+    EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
+        scan_worker(root, request, sender)
+    })
 }
 
 fn scan_worker(
     root: PathBuf,
     request: ScanRequest,
     sender: tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
-) {
-    if let Err(error) = traversal::walk_tree(&root, request, &sender, Default::default()) {
-        if !sender.is_closed() {
-            send_error(&sender, error);
+) -> Result<(), BoxError> {
+    match traversal::walk_tree(&root, request, &sender, Default::default()) {
+        Ok(()) => Ok(()),
+        Err(LocalScanError::Walk(error))
+            if sender.is_closed() && error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            Ok(())
         }
+        Err(error) => Err(Box::new(error)),
     }
-}
-
-fn send_error(sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>, error: LocalScanError) {
-    let _ = sender.blocking_send(Err(Box::new(error)));
 }
 
 fn entry_metadata(path: &Path, request: ScanRequest) -> Result<std::fs::Metadata, LocalScanError> {

@@ -92,6 +92,12 @@ pub enum ControllerError {
         discarded_entries: u64,
     },
 
+    #[error("preflight failed ({operation}) and scan draining failed ({drain})")]
+    PreflightDrain {
+        operation: Box<ControllerError>,
+        drain: EngineError,
+    },
+
     #[error("sync worker failed: {0}")]
     Worker(String),
 
@@ -228,6 +234,40 @@ pub async fn preflight_sync_scoped_with_content<F, Fut>(
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    plan_in_scope: impl FnMut(&Entry) -> bool,
+    delete_in_scope: impl FnMut(&Entry) -> bool,
+    compare_content: F,
+) -> Result<SyncPlan>
+where
+    F: FnMut(Entry, Entry) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let mut reconciler = OrderedReconciler::new(source, destination);
+    let result = collect_preflight_plan(
+        &mut reconciler,
+        policy,
+        delete_policy,
+        plan_in_scope,
+        delete_in_scope,
+        compare_content,
+    )
+    .await;
+    let drained = reconciler.close().await;
+    match (result, drained) {
+        (Err(operation), Err(drain)) => Err(ControllerError::PreflightDrain {
+            operation: Box::new(operation),
+            drain,
+        }),
+        (Err(operation), _) => Err(operation),
+        (_, Err(drain)) => Err(drain.into()),
+        (Ok(plan), Ok(())) => Ok(plan),
+    }
+}
+
+async fn collect_preflight_plan<F, Fut>(
+    reconciler: &mut OrderedReconciler,
+    policy: ComparisonPolicy,
+    delete_policy: Option<DeletePolicy>,
     mut plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: impl FnMut(&Entry) -> bool,
     mut compare_content: F,
@@ -236,7 +276,6 @@ where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    let mut reconciler = OrderedReconciler::new(source, destination);
     let mut journal = PlanJournal::new().await?;
     let mut finalize = FinalizeJournal::new().await?;
     let execution_policy = ExecutionPolicy {
@@ -974,7 +1013,84 @@ mod tests {
     }
 
     fn entries(values: Vec<Entry>) -> EntryStream {
-        Box::pin(stream::iter(values.into_iter().map(Ok::<Entry, BoxError>)))
+        EntryStream::new(stream::iter(values.into_iter().map(Ok::<Entry, BoxError>)))
+    }
+
+    #[tokio::test]
+    async fn failed_preflight_stops_both_scans_and_waits_for_native_cleanup() {
+        let mut scans = Vec::new();
+        let mut gates = Vec::new();
+        let mut scratch_paths = Vec::new();
+        for source in [true, false] {
+            let scratch = tempfile::tempdir().unwrap();
+            scratch_paths.push(scratch.path().to_path_buf());
+            let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let scan = EntryStream::spawn_blocking(1, move |sender| {
+                let _scratch = scratch;
+                if source {
+                    let _ = sender.blocking_send(Err(Box::new(std::io::Error::other(
+                        "injected source failure",
+                    ))));
+                }
+                let entry = Entry::file(
+                    RelativePath::new("queued").unwrap(),
+                    1,
+                    Timestamp::UNIX_EPOCH,
+                );
+                while sender.blocking_send(Ok(entry.clone())).is_ok() {}
+                closed_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            });
+            // Source filters must retain, rather than erase, worker ownership.
+            scans.push(scan.filter_map(|entry| std::future::ready(Some(entry))));
+            gates.push((closed_rx, release_tx));
+        }
+        let destination = scans.pop().unwrap();
+        let source = scans.pop().unwrap();
+        let task = tokio::spawn(preflight_sync(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            |_| true,
+        ));
+        let ((source_closed, source_release), (dest_closed, dest_release)) =
+            (gates.remove(0), gates.remove(0));
+        let queues_closed = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Duration::from_secs(10);
+            source_closed.recv_timeout(deadline).is_ok()
+                && dest_closed.recv_timeout(deadline).is_ok()
+        })
+        .await
+        .unwrap();
+        let returned_early = task.is_finished();
+        let scratch_retained = scratch_paths.iter().all(|path| path.exists());
+        // Release native work even when testing a broken drain implementation.
+        let _ = source_release.send(());
+        let _ = dest_release.send(());
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queues_closed,
+            "both queues must close before joining either worker"
+        );
+        assert!(!returned_early, "preflight detached admitted native work");
+        assert!(scratch_retained);
+        assert!(matches!(
+            outcome,
+            Err(ControllerError::Reconcile(EngineError::Endpoint {
+                side: crate::engine::reconcile::Side::Source,
+                ..
+            }))
+        ));
+        assert!(
+            scratch_paths.iter().all(|path| !path.exists()),
+            "worker scratch survived preflight return"
+        );
     }
 
     struct FailingExecutor {

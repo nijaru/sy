@@ -298,7 +298,7 @@ fn remote_entry_stream(
         })
         .map(|result| result.map_err(|error| Box::new(error) as BoxError));
 
-    Ok(Box::pin(stream))
+    Ok(EntryStream::new(stream))
 }
 
 fn scan_request_to_wire(request: ScanRequest) -> Result<WireScanRequest> {

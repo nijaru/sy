@@ -1,12 +1,10 @@
 use super::domain::{Entry, RelativePath};
-use futures::Stream;
 use futures::StreamExt;
 use std::error::Error as StdError;
 use std::fmt;
-use std::pin::Pin;
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
-pub type EntryStream = Pin<Box<dyn Stream<Item = Result<Entry, BoxError>> + Send>>;
+pub use super::entry_stream::EntryStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -37,6 +35,12 @@ pub enum EngineError {
         side: Side,
         previous: RelativePath,
         current: RelativePath,
+    },
+
+    #[error("both entry streams failed to drain (source: {source_error}; destination: {destination_error})")]
+    DrainBoth {
+        source_error: BoxError,
+        destination_error: BoxError,
     },
 
     #[error("engine invariant violated: {0}")]
@@ -149,6 +153,31 @@ impl OrderedReconciler {
         }
     }
 
+    /// Stop both queues before awaiting either worker, including on early errors.
+    pub async fn close(&mut self) -> Result<(), EngineError> {
+        self.source.stream.stop();
+        self.destination.stream.stop();
+        self.source_head.take();
+        self.destination_head.take();
+        let source = self.source.stream.close().await;
+        let destination = self.destination.stream.close().await;
+        match (source, destination) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(source_error), Err(destination_error)) => Err(EngineError::DrainBoth {
+                source_error,
+                destination_error,
+            }),
+            (Err(source), _) => Err(EngineError::Endpoint {
+                side: Side::Source,
+                source,
+            }),
+            (_, Err(source)) => Err(EngineError::Endpoint {
+                side: Side::Destination,
+                source,
+            }),
+        }
+    }
+
     async fn fill_heads(&mut self) -> Result<(), EngineError> {
         if self.source_head.is_none() && !self.source_finished {
             self.source_head = self.source.next().await?;
@@ -177,7 +206,7 @@ mod tests {
             .iter()
             .map(|path| Ok::<_, BoxError>(entry(path)))
             .collect::<Vec<_>>();
-        Box::pin(stream::iter(entries))
+        EntryStream::new(stream::iter(entries))
     }
 
     #[tokio::test]
@@ -245,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn attaches_side_to_endpoint_errors() {
         let source_error = std::io::Error::other("scan failed");
-        let source = Box::pin(stream::iter([Err::<Entry, BoxError>(Box::new(
+        let source = EntryStream::new(stream::iter([Err::<Entry, BoxError>(Box::new(
             source_error,
         ))]));
         let mut reconciler = OrderedReconciler::new(source, entries(&[]));
