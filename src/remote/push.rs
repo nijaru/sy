@@ -677,6 +677,7 @@ impl RemotePushExecutor {
                     .await?;
                 let mut receipt = PublishedDestinationReceipt::for_file(
                     source.path.clone(),
+                    source.path.clone(),
                     source.identity,
                     &crate::endpoint::io::VerificationStatus::Verified,
                     true,
@@ -719,8 +720,11 @@ impl RemotePushExecutor {
                 self.remote
                     .replace_symlink(&source.path, target, expected_identity, modified)
                     .await?;
-                let receipt =
-                    PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
+                let receipt = PublishedDestinationReceipt::for_symlink(
+                    source.path.clone(),
+                    source.path.clone(),
+                    source.identity,
+                );
                 self.remove_committed_source(&receipt, &source).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
@@ -791,8 +795,11 @@ impl RemotePushExecutor {
                 }
             }
             self.remote.hardlink(&first.path, &source.path).await?;
-            let receipt =
-                PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
+            let receipt = PublishedDestinationReceipt::for_hardlink(
+                source.path.clone(),
+                source.path.clone(),
+                source.identity,
+            );
             if source_removal {
                 self.defer_grouped_source_removal(group, &receipt, &source)
                     .await?;
@@ -847,6 +854,7 @@ impl RemotePushExecutor {
             )
             .await?;
         let mut receipt = PublishedDestinationReceipt::for_file(
+            source.path.clone(),
             source.path.clone(),
             source.identity,
             &crate::endpoint::io::VerificationStatus::Verified,

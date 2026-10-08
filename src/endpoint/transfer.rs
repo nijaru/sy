@@ -16,7 +16,7 @@ use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use sy::engine::domain::{EntryIdentity, Timestamp};
+use sy::engine::domain::{EntryIdentity, RelativePath, Timestamp};
 
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -573,7 +573,9 @@ where
     checks.verify(CheckPoint::Open)?;
     let expected_destination = checks.expected_destination();
     let mut before_stage = Some(before_stage);
-    let dest_relative = sy::engine::domain::RelativePath::new(dest_path.to_path_buf())
+    let source_relative = RelativePath::new(source_path.to_path_buf())
+        .map_err(|error| SyncError::Config(error.to_string()))?;
+    let dest_relative = RelativePath::new(dest_path.to_path_buf())
         .map_err(|error| SyncError::Config(error.to_string()))?;
     let pending_finalization = options.pending_finalization;
 
@@ -639,6 +641,7 @@ where
     let expected_source = checks.expected_source_identity();
     let make_receipt = move |verification: &VerificationStatus| {
         PublishedDestinationReceipt::for_file(
+            source_relative.clone(),
             dest_relative.clone(),
             expected_source,
             verification,
@@ -1688,24 +1691,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_expectations_commit() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.source_file(), b"NEW!").unwrap();
-        std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
-        let identity = update_identity(&fixture);
+    async fn matching_expectations_commit_with_same_or_renamed_destination() {
+        for destination_name in [NAME, "renamed"] {
+            let fixture = Fixture::new();
+            let destination = fixture.dest_root.path().join(destination_name);
+            std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+            std::fs::write(&destination, b"OLD!").unwrap();
+            let source_identity = identity_of(&fixture.source_file());
+            let identity = TransferIdentity {
+                source: SourceExpectation::Scanned(source_identity),
+                destination: ExpectedDestination::Unchanged(identity_of(&destination)),
+            };
 
-        let result = transfer_file(
-            &fixture.source_endpoint(),
-            Path::new(NAME),
-            &fixture.dest_endpoint(),
-            Path::new(NAME),
-            options(identity, true),
-        )
-        .await
-        .unwrap();
+            let result = transfer_file(
+                &fixture.source_endpoint(),
+                Path::new(NAME),
+                &fixture.dest_endpoint(),
+                Path::new(destination_name),
+                options(identity, true),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
-        assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"NEW!");
+            assert_eq!(result.strategy, TransferStrategy::NativeWholeCopy);
+            assert_eq!(std::fs::read(destination).unwrap(), b"NEW!");
+            let mut source = crate::engine::domain::Entry::file(
+                RelativePath::new(NAME).unwrap(),
+                4,
+                Timestamp::UNIX_EPOCH,
+            );
+            source.identity = Some(source_identity);
+            assert_eq!(
+                result.receipt.destination_path().as_path(),
+                Path::new(destination_name)
+            );
+            result.receipt.validate_source_removal(&source).unwrap();
+        }
     }
 
     #[tokio::test]

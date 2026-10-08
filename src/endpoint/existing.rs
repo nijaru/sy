@@ -286,7 +286,7 @@ pub(crate) fn receipt(
     source_fingerprint: ExistingFingerprint,
     destination_fingerprint: ExistingFingerprint,
 ) -> Result<VerifiedExistingDestinationReceipt> {
-    if source.path != destination.path || !source.is_file() || !destination.is_file() {
+    if !source.is_file() || !destination.is_file() {
         return Err(ExistingDestinationError::MissingObservation(
             source.path.clone(),
         ));
@@ -297,9 +297,7 @@ pub(crate) fn receipt(
     let destination_identity = destination
         .identity
         .ok_or_else(|| ExistingDestinationError::MissingObservation(destination.path.clone()))?;
-    if source.identity == destination.identity
-        && source_fingerprint.binding == destination_fingerprint.binding
-    {
+    if source_fingerprint.binding == destination_fingerprint.binding {
         return Err(ExistingDestinationError::SameBinding(source.path.clone()));
     }
     if source_fingerprint.content != destination_fingerprint.content {
@@ -314,6 +312,7 @@ pub(crate) fn receipt(
     }
     Ok(VerifiedExistingDestinationReceipt::new(
         source.path.clone(),
+        destination.path.clone(),
         source_identity,
         destination_identity,
     ))
@@ -325,7 +324,7 @@ pub(crate) async fn remove_verified_source(
     receipt: VerifiedExistingDestinationReceipt,
     local_destination: Option<RootedFs>,
 ) -> Result<()> {
-    if receipt.path() != &source.path || Some(receipt.source_identity()) != source.identity {
+    if receipt.source_path() != &source.path || Some(receipt.source_identity()) != source.identity {
         return Err(ExistingDestinationError::ObservationChanged(
             source.path.clone(),
         ));
@@ -335,18 +334,18 @@ pub(crate) async fn remove_verified_source(
         // it is queued. Remote fingerprints perform this check on the peer;
         // neither case promises cross-endpoint atomic compare-and-swap.
         if let Some(destination) = local_destination {
-            if rooted.entry_binding_blocking(receipt.path())?
-                == destination.entry_binding_blocking(receipt.path())?
+            if rooted.entry_binding_blocking(receipt.source_path())?
+                == destination.entry_binding_blocking(receipt.destination_path())?
             {
                 return Err(ExistingDestinationError::SameBinding(
-                    receipt.path().clone(),
+                    receipt.source_path().clone(),
                 ));
             }
-            if destination.path_identity_blocking(receipt.path())?
+            if destination.path_identity_blocking(receipt.destination_path())?
                 != Some((EntryKind::File, receipt.destination_identity()))
             {
                 return Err(ExistingDestinationError::ObservationChanged(
-                    receipt.path().clone(),
+                    receipt.destination_path().clone(),
                 ));
             }
         }
@@ -376,6 +375,101 @@ fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<
 mod tests {
     use super::*;
     use crate::engine::domain::Timestamp;
+
+    fn observe_file(root: &std::path::Path, name: &str) -> Entry {
+        let metadata = std::fs::metadata(root.join(name)).unwrap();
+        let mut entry = Entry::file(
+            RelativePath::new(name).unwrap(),
+            metadata.len(),
+            Timestamp::UNIX_EPOCH,
+        );
+        entry.identity = metadata_identity(&metadata, EntryKind::File);
+        entry
+    }
+
+    #[tokio::test]
+    async fn renamed_parity_receipt_keeps_source_and_destination_addresses_distinct() {
+        for hardlinked in [false, true] {
+            let root = tempfile::TempDir::new().unwrap();
+            std::fs::write(root.path().join("input"), b"keep at destination").unwrap();
+            if hardlinked {
+                std::fs::hard_link(root.path().join("input"), root.path().join("renamed")).unwrap();
+            } else {
+                std::fs::write(root.path().join("renamed"), b"keep at destination").unwrap();
+            }
+            let source = observe_file(root.path(), "input");
+            let destination = observe_file(root.path(), "renamed");
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let options = FingerprintOptions::default();
+            let proof = receipt(
+                &source,
+                &destination,
+                fingerprint(rooted.clone(), source.clone(), options)
+                    .await
+                    .unwrap(),
+                fingerprint(rooted.clone(), destination.clone(), options)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            // A hardlink has the same identity; that still cannot turn the
+            // destination address into the source this receipt may unlink.
+            assert!(remove_verified_source(
+                rooted.clone(),
+                destination,
+                proof.clone(),
+                Some(rooted.clone()),
+            )
+            .await
+            .is_err());
+            remove_verified_source(rooted.clone(), source, proof, Some(rooted))
+                .await
+                .unwrap();
+            assert!(!root.path().join("input").exists());
+            assert_eq!(
+                std::fs::read(root.path().join("renamed")).unwrap(),
+                b"keep at destination"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renamed_parity_receipt_revalidates_destination_before_unlink() {
+        let root = tempfile::TempDir::new().unwrap();
+        for name in ["input", "renamed"] {
+            std::fs::write(root.path().join(name), b"verified contents").unwrap();
+        }
+        let source = observe_file(root.path(), "input");
+        let destination = observe_file(root.path(), "renamed");
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let options = FingerprintOptions::default();
+        let proof = receipt(
+            &source,
+            &destination,
+            fingerprint(rooted.clone(), source.clone(), options)
+                .await
+                .unwrap(),
+            fingerprint(rooted.clone(), destination.clone(), options)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("replacement"), b"raced destination").unwrap();
+        std::fs::rename(root.path().join("replacement"), root.path().join("renamed")).unwrap();
+        assert!(matches!(
+            remove_verified_source(rooted.clone(), source, proof, Some(rooted)).await,
+            Err(ExistingDestinationError::ObservationChanged(path))
+                if path.as_path() == std::path::Path::new("renamed")
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("input")).unwrap(),
+            b"verified contents"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("renamed")).unwrap(),
+            b"raced destination"
+        );
+    }
 
     #[tokio::test]
     async fn source_unlink_refuses_the_original_inode_through_a_raced_symlink_ancestor() {

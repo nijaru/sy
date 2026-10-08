@@ -1,8 +1,8 @@
 //! Destination publication and parity receipts.
 //!
 //! Under the 0.5 transactional architecture, mutations to the destination
-//! (staging, verification, commit, post-commit finalization) produce an
-//! a `PublishedDestinationReceipt`.
+//! (staging, verification, commit, post-commit finalization) produce a
+//! `PublishedDestinationReceipt`.
 //!
 //! The source filesystem is read-only by default. `--remove-source-files` is the
 //! single authorized exception, and it strictly requires a verified receipt:
@@ -20,64 +20,82 @@ use sy::engine::domain::{Entry, EntryIdentity, RelativePath};
 /// Proof that an entry has been published to the destination endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedDestinationReceipt {
-    path: RelativePath,
+    source_path: RelativePath,
+    destination_path: RelativePath,
     source_identity: Option<EntryIdentity>,
-    verified: bool,
+    verification_completed: bool,
     preservation_applied: bool,
     finalized: bool,
 }
 
 impl PublishedDestinationReceipt {
     /// Construct a publication receipt for a transferred and committed file.
-    pub fn for_file(
-        path: RelativePath,
+    pub(crate) fn for_file(
+        source_path: RelativePath,
+        destination_path: RelativePath,
         source_identity: Option<EntryIdentity>,
         verification: &VerificationStatus,
         preservation_applied: bool,
         finalized: bool,
     ) -> Self {
-        let verified = !matches!(verification, VerificationStatus::Failed { .. });
+        let verification_completed = !matches!(verification, VerificationStatus::Failed { .. });
         Self {
-            path,
+            source_path,
+            destination_path,
             source_identity,
-            verified,
+            verification_completed,
             preservation_applied,
             finalized,
         }
     }
 
     /// Construct a publication receipt for an atomically replaced symlink.
-    pub fn for_symlink(path: RelativePath, source_identity: Option<EntryIdentity>) -> Self {
+    pub(crate) fn for_symlink(
+        source_path: RelativePath,
+        destination_path: RelativePath,
+        source_identity: Option<EntryIdentity>,
+    ) -> Self {
         Self {
-            path,
+            source_path,
+            destination_path,
             source_identity,
-            verified: true,
+            verification_completed: true,
             preservation_applied: true,
             finalized: true,
         }
     }
 
     /// Construct a publication receipt for a hardlinked member.
-    pub fn for_hardlink(path: RelativePath, source_identity: Option<EntryIdentity>) -> Self {
+    pub(crate) fn for_hardlink(
+        source_path: RelativePath,
+        destination_path: RelativePath,
+        source_identity: Option<EntryIdentity>,
+    ) -> Self {
         Self {
-            path,
+            source_path,
+            destination_path,
             source_identity,
-            verified: true,
+            verification_completed: true,
             preservation_applied: true,
             finalized: true,
         }
     }
 
-    pub fn path(&self) -> &RelativePath {
-        &self.path
+    pub fn source_path(&self) -> &RelativePath {
+        &self.source_path
+    }
+
+    pub fn destination_path(&self) -> &RelativePath {
+        &self.destination_path
     }
 
     pub fn source_identity(&self) -> Option<EntryIdentity> {
         self.source_identity
     }
 
-    pub fn is_verified(&self) -> bool {
-        self.verified
+    /// Required checks completed, including native copies without requested hashing.
+    pub fn required_verification_completed(&self) -> bool {
+        self.verification_completed
     }
 
     pub fn is_preservation_applied(&self) -> bool {
@@ -89,33 +107,31 @@ impl PublishedDestinationReceipt {
     }
 
     /// Mark post-commit finalization as complete (e.g. after platform/BSD flags).
-    pub fn mark_finalized(&mut self) {
+    pub(crate) fn mark_finalized(&mut self) {
         self.finalized = true;
     }
 
     /// Validate that this receipt authorizes source removal for `source`.
     ///
     /// Requires:
-    /// - Matching relative path.
-    /// - Matching source identity (if scanned).
+    /// - Matching source address (independent of the destination name).
+    /// - Matching observed source identity.
     /// - Successful verification (not failed).
     /// - Completed finalization.
-    pub fn validate_source_removal(&self, source: &Entry) -> Result<()> {
-        if self.path != source.path {
+    pub(crate) fn validate_source_removal(&self, source: &Entry) -> Result<()> {
+        if self.source_path != source.path {
             return Err(SyncError::Config(format!(
-                "receipt path '{}' does not match source entry '{}'",
-                self.path.as_path().display(),
+                "receipt source path '{}' does not match source entry '{}'",
+                self.source_path.as_path().display(),
                 source.path.as_path().display()
             )));
         }
-        if let (Some(expected), Some(actual)) = (self.source_identity, source.identity) {
-            if expected != actual {
-                return Err(SyncError::SourceChanged {
-                    path: source.path.as_path().to_path_buf(),
-                });
-            }
+        if self.source_identity.is_none() || self.source_identity != source.identity {
+            return Err(SyncError::SourceChanged {
+                path: source.path.as_path().to_path_buf(),
+            });
         }
-        if !self.verified {
+        if !self.verification_completed {
             return Err(SyncError::Config(format!(
                 "cannot authorize source removal for '{}': destination verification failed",
                 source.path.as_path().display()
@@ -143,7 +159,8 @@ impl PublishedDestinationReceipt {
 /// are required. Quick-check (size/mtime) equality alone CANNOT produce this receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedExistingDestinationReceipt {
-    path: RelativePath,
+    source_path: RelativePath,
+    destination_path: RelativePath,
     source_identity: EntryIdentity,
     destination_identity: EntryIdentity,
 }
@@ -151,19 +168,24 @@ pub struct VerifiedExistingDestinationReceipt {
 impl VerifiedExistingDestinationReceipt {
     // Only the endpoint proof owner may mint an existing-destination receipt.
     pub(super) fn new(
-        path: RelativePath,
+        source_path: RelativePath,
+        destination_path: RelativePath,
         source_identity: EntryIdentity,
         destination_identity: EntryIdentity,
     ) -> Self {
         Self {
-            path,
+            source_path,
+            destination_path,
             source_identity,
             destination_identity,
         }
     }
 
-    pub fn path(&self) -> &RelativePath {
-        &self.path
+    pub fn source_path(&self) -> &RelativePath {
+        &self.source_path
+    }
+    pub fn destination_path(&self) -> &RelativePath {
+        &self.destination_path
     }
     pub fn source_identity(&self) -> EntryIdentity {
         self.source_identity
@@ -192,52 +214,69 @@ mod tests {
     }
 
     #[test]
-    fn published_receipt_validates_matching_source() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
+    fn publication_receipt_binds_source_independently_of_destination_name() {
+        let source = sample_entry("input", 42);
+        let target = RelativePath::new("renamed").unwrap();
+        // Native copies do not require an extra BLAKE3 pass unless requested.
+        for verification in [
+            VerificationStatus::Verified,
+            VerificationStatus::NotRequested,
+        ] {
+            let receipt = PublishedDestinationReceipt::for_file(
+                source.path.clone(),
+                target.clone(),
+                source.identity,
+                &verification,
+                true,
+                true,
+            );
+            assert_eq!(receipt.source_path(), &source.path);
+            assert_eq!(receipt.destination_path(), &target);
+            assert!(receipt.validate_source_removal(&source).is_ok());
+            assert!(receipt
+                .validate_source_removal(&sample_entry("renamed", 42))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn source_removal_requires_identity_preservation_and_completed_verification() {
+        let source = sample_entry("input", 42);
+        let complete = PublishedDestinationReceipt::for_file(
+            source.path.clone(),
+            RelativePath::new("renamed").unwrap(),
+            source.identity,
             &VerificationStatus::Verified,
             true,
             true,
         );
-        assert!(receipt.validate_source_removal(&entry).is_ok());
-    }
+        assert!(complete
+            .validate_source_removal(&sample_entry("input", 99))
+            .is_err());
+        let mut unidentified = source.clone();
+        unidentified.identity = None;
+        assert!(complete.validate_source_removal(&unidentified).is_err());
 
-    #[test]
-    fn published_receipt_rejects_path_mismatch() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let other = sample_entry("foo/other.txt", 42);
-        let receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
-            &VerificationStatus::Verified,
-            true,
-            true,
-        );
-        assert!(receipt.validate_source_removal(&other).is_err());
-    }
-
-    #[test]
-    fn published_receipt_rejects_identity_mismatch() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let modified = sample_entry("foo/bar.txt", 99);
-        let receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
-            &VerificationStatus::Verified,
-            true,
-            true,
-        );
-        assert!(receipt.validate_source_removal(&modified).is_err());
-    }
-
-    #[test]
-    fn published_receipt_rejects_failed_verification() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
+        for incomplete in [
+            PublishedDestinationReceipt {
+                source_identity: None,
+                ..complete.clone()
+            },
+            PublishedDestinationReceipt {
+                preservation_applied: false,
+                ..complete.clone()
+            },
+            PublishedDestinationReceipt {
+                finalized: false,
+                ..complete.clone()
+            },
+        ] {
+            assert!(incomplete.validate_source_removal(&source).is_err());
+        }
+        let failed = PublishedDestinationReceipt::for_file(
+            source.path.clone(),
+            RelativePath::new("renamed").unwrap(),
+            source.identity,
             &VerificationStatus::Failed {
                 expected: blake3::hash(b"a"),
                 actual: blake3::hash(b"b"),
@@ -245,34 +284,12 @@ mod tests {
             true,
             true,
         );
-        assert!(receipt.validate_source_removal(&entry).is_err());
-    }
-
-    #[test]
-    fn published_receipt_rejects_incomplete_finalization() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let mut receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
-            &VerificationStatus::Verified,
-            true,
-            false,
-        );
-        assert!(receipt.validate_source_removal(&entry).is_err());
-        receipt.mark_finalized();
-        assert!(receipt.validate_source_removal(&entry).is_ok());
-    }
-
-    #[test]
-    fn published_receipt_rejects_missing_preservation() {
-        let entry = sample_entry("foo/bar.txt", 42);
-        let receipt = PublishedDestinationReceipt::for_file(
-            entry.path.clone(),
-            entry.identity,
-            &VerificationStatus::Verified,
-            false,
-            true,
-        );
-        assert!(receipt.validate_source_removal(&entry).is_err());
+        assert!(failed.validate_source_removal(&source).is_err());
+        let mut finalized = PublishedDestinationReceipt {
+            finalized: false,
+            ..complete
+        };
+        finalized.mark_finalized();
+        assert!(finalized.validate_source_removal(&source).is_ok());
     }
 }
