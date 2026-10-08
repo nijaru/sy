@@ -495,6 +495,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn xattrs_are_reconciled_for_quick_unchanged_files_and_directories_over_pull() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        let name = "user.sy-unchanged-pull";
+        let stale = "user.sy-stale-pull";
+        std::fs::create_dir(source_root.path().join("dir")).unwrap();
+        std::fs::write(source_root.path().join("file"), b"same").unwrap();
+        xattr::set(source_root.path().join("file"), name, b"source-file").unwrap();
+        xattr::set(source_root.path().join("dir"), name, b"source-dir").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
+                    .await
+                    .unwrap();
+            let scan = session.scan_handler();
+            let rooted = session.scan_handler_rooted();
+            let sender = session.sender();
+            let peer = session.client().platform.os;
+            for _ in 0..7 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+                    IncomingRequest::FileFetch(incoming) => {
+                        sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        session.metadata_handler().serve(incoming).await.unwrap();
+                    }
+                    _other => panic!("unexpected unchanged xattr pull request variant"),
+                }
+            }
+        });
+
+        let session = sy::remote::runtime::ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            source_root.path(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.preserve.xattrs = true;
+        execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let destination_file = destination_root.path().join("file");
+        let destination_dir = destination_root.path().join("dir");
+        xattr::set(&destination_file, name, b"wrong").unwrap();
+        xattr::set(&destination_file, stale, b"remove").unwrap();
+        xattr::remove(source_root.path().join("dir"), name).unwrap();
+        xattr::set(&destination_dir, name, b"remove-dir").unwrap();
+        execute_with_handle(
+            &source_root.path().to_string_lossy(),
+            destination_root.path(),
+            session.request_handle(),
+            session.sender(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            xattr::get(&destination_file, name).unwrap(),
+            Some(b"source-file".to_vec())
+        );
+        assert!(xattr::get(&destination_file, stale).unwrap().is_none());
+        assert!(xattr::get(&destination_dir, name).unwrap().is_none());
+    }
+
     /// -A/--preserve-acls over v3 pull: the remote source's ACL is read
     /// through the same held source file as its bytes, then applied to local
     /// staging before commit.

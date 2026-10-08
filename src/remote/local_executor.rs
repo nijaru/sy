@@ -56,6 +56,9 @@ pub enum LocalSyncError {
     #[error("regular-file transfer requires scanned Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
 
+    #[error("unchanged regular-file BSD flag reconciliation requires an expected-identity finalization path and is not implemented for {0}")]
+    UnchangedBsdFlags(PathBuf),
+
     #[error("--backup location for {0} is not representable")]
     InvalidBackupPath(PathBuf),
 
@@ -90,6 +93,7 @@ pub enum LocalSyncAction {
         source: Entry,
         destination: Option<Entry>,
         metadata: crate::endpoint::transfer::TransferMetadata,
+        source_removal: bool,
     },
     ReplaceSymlink {
         source: Entry,
@@ -256,6 +260,11 @@ impl LocalSyncExecutor {
         if !self.xattrs || source.is_symlink() {
             return Ok(None);
         }
+        if source.is_file() {
+            return Ok(Some(
+                existing::observed_xattrs(self.source_root.clone(), source.clone()).await?,
+            ));
+        }
         let location = XattrLocation::Local(self.source_root.as_path());
         let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
         Ok(Some(xattrs))
@@ -278,6 +287,13 @@ impl LocalSyncExecutor {
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
         if !self.acls || source.is_symlink() {
             return Ok(None);
+        }
+        if source.is_file() {
+            return Ok(Some(
+                existing::observed_acl(self.source_root.clone(), source.clone())
+                    .await?
+                    .unwrap_or_default(),
+            ));
         }
         let location = AclLocation::Local(self.source_root.as_path());
         let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
@@ -322,6 +338,43 @@ impl LocalSyncExecutor {
 
     fn destination_path(&self, relative: &RelativePath) -> PathBuf {
         self.destination_root.join(relative.as_path())
+    }
+
+    fn lower_unchanged_file_preservation(
+        &self,
+        source: Entry,
+        destination: Entry,
+        policy: ExecutionPolicy,
+        comparison: crate::engine::domain::ContentComparison,
+    ) -> Result<Option<WorkItem<LocalSyncAction>>> {
+        if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
+            return Ok(None);
+        }
+        if self.bsd_flags {
+            return Err(LocalSyncError::UnchangedBsdFlags(
+                source.path.as_path().to_path_buf(),
+            ));
+        }
+        let mode = if policy.preserve_permissions {
+            source.unix_mode
+        } else {
+            destination.unix_mode
+        }
+        .ok_or_else(|| LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf()))?;
+        let modified = Some(if policy.preserve_times {
+            source.modified
+        } else {
+            destination.modified
+        });
+        Ok(Some(file_work(LocalSyncAction::TransferFile {
+            source,
+            destination: Some(destination),
+            metadata: LocalTransferMetadata {
+                unix_mode: Some(mode),
+                modified,
+            },
+            source_removal: comparison == crate::engine::domain::ContentComparison::Blake3,
+        })))
     }
 
     /// Backup location for one destination-relative path, matching the
@@ -433,13 +486,20 @@ impl LocalSyncExecutor {
                 source,
                 destination,
                 metadata,
+                source_removal,
             } => {
                 // -H: members after the first link to the representative.
                 if self.hardlinks {
                     if let Some(identity) = source.hardlink_group {
                         let group = *identity.as_bytes();
                         return self
-                            .execute_grouped_file(source, destination, metadata, group)
+                            .execute_grouped_file(
+                                source,
+                                destination,
+                                metadata,
+                                group,
+                                source_removal,
+                            )
                             .await
                             .map(crate::engine::work::WorkResult::Transfer);
                     }
@@ -469,7 +529,9 @@ impl LocalSyncExecutor {
                         .await?;
                     receipt.mark_finalized();
                 }
-                self.remove_committed_source(&receipt, &source).await?;
+                if source_removal {
+                    self.remove_committed_source(&receipt, &source).await?;
+                }
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -558,6 +620,7 @@ impl LocalSyncExecutor {
         destination: Option<Entry>,
         metadata: LocalTransferMetadata,
         group: [u8; 32],
+        source_removal: bool,
     ) -> Result<crate::engine::work::TransferSummary> {
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
@@ -578,7 +641,9 @@ impl LocalSyncExecutor {
                 .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
             let receipt =
                 PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
-            self.remove_committed_source(&receipt, &source).await?;
+            if source_removal {
+                self.remove_committed_source(&receipt, &source).await?;
+            }
             let op = if is_update {
                 crate::sync::output::ItemizeOp::Update
             } else {
@@ -625,7 +690,9 @@ impl LocalSyncExecutor {
                 },
             )
             .await?;
-        self.remove_committed_source(&receipt, &source).await?;
+        if source_removal {
+            self.remove_committed_source(&receipt, &source).await?;
+        }
         drop(groups);
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
@@ -973,6 +1040,14 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
+        if let crate::engine::domain::SyncOp::Unchanged {
+            source,
+            destination,
+            comparison,
+        } = op
+        {
+            return self.lower_unchanged_file_preservation(source, destination, policy, comparison);
+        }
         lower_local_op(op, policy)
     }
 
@@ -1108,6 +1183,7 @@ fn lower_create(
                 source,
                 destination: None,
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
@@ -1141,6 +1217,7 @@ fn lower_update(
                 source,
                 destination: Some(destination),
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
@@ -1174,6 +1251,7 @@ fn lower_replace(
                 source,
                 destination: Some(destination),
                 metadata,
+                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {

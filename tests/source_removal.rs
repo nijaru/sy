@@ -98,12 +98,17 @@ async fn requested_xattr_parity_is_required_before_removing_unchanged_source() {
         .args(["--remove-source-files", "--checksum", "-X"])
         .output()
         .unwrap();
-    assert!(!result.status.success());
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!source.path().join("file").exists());
+    assert_eq!(std::fs::read(dest.path().join("file")).unwrap(), b"same");
     assert_eq!(
-        xattr::get(source.path().join("file"), "user.sy-preservation").unwrap(),
+        xattr::get(dest.path().join("file"), "user.sy-preservation").unwrap(),
         Some(b"keep".to_vec())
     );
-    assert_eq!(std::fs::read(dest.path().join("file")).unwrap(), b"same");
 }
 
 #[tokio::test]

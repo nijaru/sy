@@ -96,6 +96,26 @@ pub(crate) async fn observed_flags(root: std::path::PathBuf, source: Entry) -> R
     .map_err(ExistingDestinationError::from)
 }
 
+pub(crate) async fn observed_xattrs(
+    root: std::path::PathBuf,
+    source: Entry,
+) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+    let rooted = RootedFs::open(root).await?;
+    tokio::task::spawn_blocking(move || observed_xattrs_blocking(&rooted, &source))
+        .await
+        .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
+}
+
+pub(crate) async fn observed_acl(
+    root: std::path::PathBuf,
+    source: Entry,
+) -> Result<Option<String>> {
+    let rooted = RootedFs::open(root).await?;
+    tokio::task::spawn_blocking(move || observed_acl_blocking(&rooted, &source))
+        .await
+        .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
+}
+
 pub(crate) async fn fingerprint(
     rooted: RootedFs,
     entry: Entry,
@@ -130,6 +150,27 @@ pub(crate) fn validate_path(rooted: &RootedFs, entry: &Entry) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn observed_xattrs_blocking(
+    rooted: &RootedFs,
+    entry: &Entry,
+) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+    let file = rooted.open_regular_blocking(&entry.path)?;
+    validate_file(&file, entry)?;
+    let attrs = rooted.read_open_file_xattrs_blocking(&file, &entry.path)?;
+    validate_file(&file, entry)?;
+    validate_path(rooted, entry)?;
+    Ok(attrs)
+}
+
+fn observed_acl_blocking(rooted: &RootedFs, entry: &Entry) -> Result<Option<String>> {
+    let file = rooted.open_regular_blocking(&entry.path)?;
+    validate_file(&file, entry)?;
+    let acl = rooted.read_open_file_acl_blocking(&file, &entry.path)?;
+    validate_file(&file, entry)?;
+    validate_path(rooted, entry)?;
+    Ok(acl)
 }
 
 fn fingerprint_blocking(

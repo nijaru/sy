@@ -614,11 +614,31 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                     comparison,
                 } = &operation
                 {
-                    if *comparison == crate::engine::domain::ContentComparison::Blake3
-                        && source.is_file()
-                    {
+                    let remove_after_preservation = *comparison
+                        == crate::engine::domain::ContentComparison::Blake3
+                        && source.is_file();
+                    let source = source.clone();
+                    let destination = destination.clone();
+                    let operation_path = operation.path().clone();
+                    let lowered = self
+                        .executor
+                        .lower(operation, execution_policy)
+                        .map_err(|error| ControllerError::backend("execution", error))?;
+                    if let Some(main) = lowered {
+                        summary.main_operations =
+                            checked_add(summary.main_operations, 1, "main operation")?;
+                        if self.executor.is_directory_action(main.action()) {
+                            return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
+                        }
+                        let result = self
+                            .executor
+                            .execute(main)
+                            .await
+                            .map_err(|error| ControllerError::backend("execution", error))?;
+                        record_work_result(&mut summary, result)?;
+                    } else if remove_after_preservation {
                         self.executor
-                            .remove_unchanged_source(source, destination, execution_policy)
+                            .remove_unchanged_source(&source, &destination, execution_policy)
                             .await
                             .map_err(|error| ControllerError::backend("execution", error))?;
                     }
@@ -800,12 +820,18 @@ async fn collect_one<E: SyncPlanExecutor>(
         .ok_or_else(|| ControllerError::Worker("worker set ended early".to_string()))?
         .map_err(|error| ControllerError::Worker(error.to_string()))?;
     match result {
-        Ok(WorkResult::Transfer(transfer)) => record_transfer(summary, transfer),
-        Ok(WorkResult::Metadata) => Ok(()),
-        Ok(WorkResult::DirectoryPrepared(_)) => Err(ControllerError::Worker(
+        Ok(result) => record_work_result(summary, result),
+        Err(error) => Err(ControllerError::backend("execution", error)),
+    }
+}
+
+fn record_work_result(summary: &mut SyncSummary, result: WorkResult) -> Result<()> {
+    match result {
+        WorkResult::Transfer(transfer) => record_transfer(summary, transfer),
+        WorkResult::Metadata => Ok(()),
+        WorkResult::DirectoryPrepared(_) => Err(ControllerError::Worker(
             "directory executed as leaf work".into(),
         )),
-        Err(error) => Err(ControllerError::backend("execution", error)),
     }
 }
 
