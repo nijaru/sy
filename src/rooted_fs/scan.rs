@@ -1,7 +1,7 @@
 use super::RootedFs;
 use crate::endpoint::local_identity::metadata_identity;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
-use crate::engine::reconcile::{BoxError, EntryStream};
+use crate::engine::reconcile::BoxError;
 use crate::engine::scan::ScanRequest;
 use crate::engine::scan_sort::{read_name, NameSpool, SortBudget};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -11,6 +11,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+mod stream;
+use stream::RootedEntryStream;
 
 const CHANNEL_CAPACITY: usize = 256;
 const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
@@ -68,23 +71,8 @@ pub(crate) enum RootedScanError {
 impl RootedFs {
     /// Produce a strictly ordered metadata stream rooted at the directory inode
     /// pinned by this `RootedFs`. The root pathname is never consulted.
-    pub(crate) fn entry_stream(&self, request: ScanRequest) -> EntryStream {
-        let rooted = self.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
-        let join_sender = sender.clone();
-
-        tokio::spawn(async move {
-            let scan =
-                tokio::task::spawn_blocking(move || scan_worker(rooted, request, sender)).await;
-            if let Err(error) = scan {
-                let _ = join_sender.send(Err(Box::new(error) as BoxError)).await;
-            }
-        });
-
-        Box::pin(futures::stream::unfold(
-            receiver,
-            |mut receiver| async move { receiver.recv().await.map(|entry| (entry, receiver)) },
-        ))
+    pub(crate) fn entry_stream(&self, request: ScanRequest) -> RootedEntryStream {
+        RootedEntryStream::spawn(self.clone(), request)
     }
 }
 
@@ -810,6 +798,27 @@ mod tests {
             .map(|entry| entry.unwrap())
             .collect::<Vec<_>>()
             .await
+    }
+
+    #[tokio::test]
+    async fn closing_scan_releases_worker_root_and_discards_pending_entries() {
+        let root = tempfile::TempDir::new().unwrap();
+        for index in 0..1024 {
+            std::fs::write(root.path().join(format!("n{index:04}")), b"leaf").unwrap();
+        }
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let held_root = std::sync::Arc::downgrade(&rooted.root_fd);
+        let mut entries = rooted.entry_stream(ScanRequest::default());
+        drop(rooted);
+        assert!(entries.next().await.unwrap().is_ok());
+        entries.close().await.unwrap();
+        assert!(
+            held_root.upgrade().is_none(),
+            "scan worker still owns the root FD"
+        );
+        assert!(entries.next().await.is_none());
+        // Repeated close is harmless after exhaustion or an earlier close.
+        entries.close().await.unwrap();
     }
 
     type TestScan = (

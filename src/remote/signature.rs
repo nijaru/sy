@@ -226,25 +226,12 @@ pub async fn serve_incoming_signatures_rooted(
     let block_size = request.block_size;
     drop(first);
 
-    let (producer_tx, mut producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
+    let (producer_tx, producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
         produce_signatures(rooted, relative, block_size, producer_tx)
     });
 
-    while let Some(signature) = producer_rx.recv().await {
-        sender
-            .send(Frame::new(
-                FrameKind::Signature,
-                FrameFlags::empty(),
-                stream_id,
-                signature.encode(),
-            )?)
-            .await?;
-    }
-
-    let summary = producer
-        .await
-        .map_err(|error| RemoteSignatureError::ProducerJoin(error.to_string()))??;
+    let summary = send_produced_signatures(sender, stream_id, producer_rx, producer).await?;
     let end = WireSignatureEnd::new(
         summary.file_size,
         summary.block_count,
@@ -259,6 +246,41 @@ pub async fn serve_incoming_signatures_rooted(
         )?)
         .await?;
     receive_signature_ack(&mut inbox, stream_id).await
+}
+
+async fn send_produced_signatures(
+    sender: &RouterSender,
+    stream_id: StreamId,
+    mut producer_rx: mpsc::Receiver<WireSignature>,
+    producer: tokio::task::JoinHandle<
+        std::result::Result<SignatureSummary, SignatureProducerError>,
+    >,
+) -> Result<SignatureSummary> {
+    let sent: Result<()> = tokio::select! {
+        biased;
+        error = sender.closed() => Err(RemoteSignatureError::Router(error)),
+        result = async {
+            while let Some(signature) = producer_rx.recv().await {
+                sender
+                    .send(Frame::new(
+                        FrameKind::Signature,
+                        FrameFlags::empty(),
+                        stream_id,
+                        signature.encode(),
+                    )?)
+                    .await?;
+            }
+            Ok(())
+        } => result,
+    };
+    // Closing first wakes a producer blocked behind the bounded queue. A send
+    // failure must not return while that worker still owns the basis file.
+    drop(producer_rx);
+    let produced = producer
+        .await
+        .map_err(|error| RemoteSignatureError::ProducerJoin(error.to_string()))?;
+    sent?;
+    produced.map_err(RemoteSignatureError::Producer)
 }
 
 #[cfg(test)]
@@ -558,6 +580,61 @@ mod tests {
     fn file_identity(path: &Path) -> EntryIdentity {
         let metadata = std::fs::metadata(path).unwrap();
         crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File).unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_session_closes_signature_queue_and_joins_worker() {
+        for before_first_item in [false, true] {
+            let (router_io, _peer) = tokio::io::duplex(4096);
+            let (reader, writer) = tokio::io::split(router_io);
+            let mut router =
+                FrameRouter::start(reader, writer, RouterRole::Server, RouterConfig::default())
+                    .unwrap();
+            let sender = router.sender();
+            sender.fail(std::sync::Arc::new(
+                crate::remote::router::RouterError::SessionFailed(
+                    "injected transport failure".into(),
+                ),
+            ));
+
+            let (producer_tx, producer_rx) = mpsc::channel(1);
+            let queue_observer = producer_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let producer = tokio::task::spawn_blocking(move || {
+                let signature = WireSignature::new(0, 1, 0, [0; STRONG_SIGNATURE_LEN]).unwrap();
+                if before_first_item {
+                    // Model a basis read that has not produced any output yet.
+                    release_rx.recv().unwrap();
+                }
+                while producer_tx.blocking_send(signature).is_ok() {}
+                if !before_first_item {
+                    // Model cleanup after a backpressured producer is woken.
+                    release_rx.recv().unwrap();
+                }
+                Err(SignatureProducerError::ConsumerClosed)
+            });
+            let sending = tokio::spawn(async move {
+                send_produced_signatures(&sender, StreamId::new(1), producer_rx, producer).await
+            });
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_secs(10), queue_observer.closed())
+                    .await;
+            let returned_before_cleanup = sending.is_finished();
+            // Release before asserting so a regression cannot strand the runtime.
+            release_tx.send(()).unwrap();
+            drop(queue_observer);
+            let result = sending.await.unwrap();
+            assert!(
+                closed.is_ok(),
+                "terminal session did not close the producer queue"
+            );
+            assert!(matches!(result, Err(RemoteSignatureError::Router(_))));
+            assert!(
+                !returned_before_cleanup,
+                "handler detached its blocking worker"
+            );
+            router.shutdown().await.unwrap();
+        }
     }
 
     #[test]

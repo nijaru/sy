@@ -162,17 +162,27 @@ async fn serve_scan(
     require_data_stream(stream_id)?;
     let mut entries = rooted.entry_stream(request);
 
-    while let Some(entry) = entries.next().await {
-        let entry = entry.map_err(RemoteScanError::LocalScan)?;
-        let wire = entry_to_wire(&entry)?;
-        let frame = Frame::new(
-            FrameKind::Entry,
-            FrameFlags::empty(),
-            stream_id,
-            wire.encode()?,
-        )?;
-        sender.send(frame).await?;
-    }
+    let sent: Result<()> = tokio::select! {
+        biased;
+        error = sender.closed() => Err(RemoteScanError::Router(error)),
+        result = async {
+            while let Some(entry) = entries.next().await {
+                let entry = entry.map_err(RemoteScanError::LocalScan)?;
+                let wire = entry_to_wire(&entry)?;
+                let frame = Frame::new(
+                    FrameKind::Entry,
+                    FrameFlags::empty(),
+                    stream_id,
+                    wire.encode()?,
+                )?;
+                sender.send(frame).await?;
+            }
+            Ok(())
+        } => result,
+    };
+    let closed = entries.close().await.map_err(RemoteScanError::LocalScan);
+    sent?;
+    closed?;
 
     let end = Frame::new(
         FrameKind::EntryEnd,
