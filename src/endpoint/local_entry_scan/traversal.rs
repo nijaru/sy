@@ -30,16 +30,40 @@ fn identity(metadata: &std::fs::Metadata) -> io::Result<Identity> {
     Ok(Identity(metadata.dev(), metadata.ino()))
 }
 
-fn path_identity(path: &Path, metadata: &std::fs::Metadata) -> io::Result<Identity> {
+fn path_identity(path: &Path, metadata: &std::fs::Metadata, follow: bool) -> io::Result<Identity> {
     #[cfg(unix)]
     {
-        let _ = path;
+        let _ = (path, follow);
         identity(metadata)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
         let _ = metadata;
-        Directory::root(path)?.identity()
+        // No-follow scans identify the reparse point itself, including dangling
+        // links. Followed scans must use target IDs for ancestor cycle checks.
+        let flags = FILE_FLAG_BACKUP_SEMANTICS
+            | if follow {
+                0
+            } else {
+                FILE_FLAG_OPEN_REPARSE_POINT
+            };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(flags)
+            .open(path)?;
+        windows_identity(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata, follow);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "local scan identities unsupported",
+        ))
     }
 }
 
@@ -72,11 +96,15 @@ struct Frame {
 const FRAME_BYTES: u64 = 32;
 struct Stack(tempfile::NamedTempFile);
 impl Stack {
+    #[cfg(test)]
     fn new() -> io::Result<Self> {
+        Self::new_in(&tempfile::env::temp_dir())
+    }
+    fn new_in(parent: &Path) -> io::Result<Self> {
         Ok(Self(
             tempfile::Builder::new()
                 .prefix("sy-local-stack-")
-                .tempfile()?,
+                .tempfile_in(parent)?,
         ))
     }
     fn position(depth: usize) -> io::Result<u64> {
@@ -157,6 +185,30 @@ impl Directory {
                 "local scan identities unsupported on this platform",
             ))
         }
+    }
+    fn scratch_parent(&self) -> io::Result<PathBuf> {
+        let parent = tempfile::env::temp_dir();
+        #[cfg(unix)]
+        crate::engine::scan_sort::validate_scratch_root(&self.file, &parent)?;
+        #[cfg(windows)]
+        {
+            let root_identity = self.identity()?;
+            let mut ancestor = std::fs::canonicalize(&parent)?;
+            loop {
+                if Directory::root(&ancestor)?.identity()? == root_identity {
+                    return Err(crate::engine::scan_sort::unsafe_scratch());
+                }
+                if !ancestor.pop() {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scratch validation unsupported",
+        ));
+        Ok(parent)
     }
     fn child(&self, name: &OsStr, follow: bool) -> io::Result<Self> {
         #[cfg(unix)]
@@ -254,14 +306,18 @@ impl Scratch {
     fn new(path: &Path) -> io::Result<Self> {
         Ok(Self {
             path: path.to_path_buf(),
-            identity: path_identity(path, &std::fs::metadata(path)?)?,
+            identity: path_identity(path, &std::fs::metadata(path)?, false)?,
         })
     }
-    fn matches(&self, path: &Path, metadata: &std::fs::Metadata) -> io::Result<bool> {
+    fn matches(&self, path: &Path, metadata: &std::fs::Metadata, follow: bool) -> io::Result<bool> {
         // Identity also excludes followed aliases of our scratch directory.
         // Path excludes the owned name even if cleanup/removal races inspection.
-        Ok(path == self.path || path_identity(path, metadata)? == self.identity)
+        Ok(path == self.path || path_identity(path, metadata, follow)? == self.identity)
     }
+}
+
+pub(super) fn validate_scratch_location(root: &Path) -> io::Result<()> {
+    Directory::root(root)?.scratch_parent().map(|_| ())
 }
 
 pub(super) fn walk_tree(
@@ -276,8 +332,9 @@ pub(super) fn walk_tree(
     if request.max_depth == Some(0) {
         return Ok(());
     }
-    let mut spool = NameSpool::new(budget)?;
-    let mut stack = Stack::new()?;
+    let scratch_parent = directory.scratch_parent()?;
+    let mut spool = NameSpool::new_in(budget, &scratch_parent)?;
+    let mut stack = Stack::new_in(&scratch_parent)?;
     let scratch = [
         Scratch::new(spool.scratch_path())?,
         Scratch::new(stack.0.path())?,
@@ -311,8 +368,8 @@ pub(super) fn walk_tree(
             let relative = path.join(&name);
             let absolute = root.join(&relative);
             let metadata = entry_metadata(&absolute, request)?;
-            if scratch[0].matches(&absolute, &metadata)?
-                || scratch[1].matches(&absolute, &metadata)?
+            if scratch[0].matches(&absolute, &metadata, request.follow_symlinks)?
+                || scratch[1].matches(&absolute, &metadata, request.follow_symlinks)?
             {
                 continue;
             }
@@ -321,7 +378,7 @@ pub(super) fn walk_tree(
             // observation into a successful scan that authorizes deletion.
             if request.follow_symlinks
                 && metadata.is_dir()
-                && stack.contains(depth, path_identity(&absolute, &metadata)?)?
+                && stack.contains(depth, path_identity(&absolute, &metadata, true)?)?
             {
                 return Err(LocalScanError::SymlinkLoop(absolute));
             }
@@ -334,17 +391,18 @@ pub(super) fn walk_tree(
                 continue;
             }
             let entry = engine_entry(root, &absolute, &metadata, request)?;
-            let child =
-                if metadata.is_dir() && request.max_depth.is_none_or(|limit| depth + 1 < limit) {
-                    let child = directory.child(&name, request.follow_symlinks)?;
-                    let child_identity = child.identity()?;
-                    if child_identity != path_identity(&absolute, &metadata)? {
-                        return Err(LocalScanError::DirectoryChanged(absolute));
-                    }
-                    Some(child)
-                } else {
-                    None
-                };
+            let child = if metadata.is_dir()
+                && request.max_depth.is_none_or(|limit| depth + 1 < limit)
+            {
+                let child = directory.child(&name, request.follow_symlinks)?;
+                let child_identity = child.identity()?;
+                if child_identity != path_identity(&absolute, &metadata, request.follow_symlinks)? {
+                    return Err(LocalScanError::DirectoryChanged(absolute));
+                }
+                Some(child)
+            } else {
+                None
+            };
             if sender.blocking_send(Ok(entry)).is_err() {
                 return Ok(());
             }

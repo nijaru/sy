@@ -7,6 +7,70 @@ type TestScan = (
     tokio::task::JoinHandle<Result<(), LocalScanError>>,
 );
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_scratch_is_refused_before_scanner_writes() {
+    use futures::TryStreamExt;
+    if let Some(root) = std::env::var_os("SY_TEST_UNSAFE_SCRATCH_ROOT") {
+        let root = PathBuf::from(root);
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before_names = names();
+        let before_mtime = std::fs::metadata(&root).unwrap().modified().unwrap();
+        let scratch = tempfile::env::temp_dir();
+        let scratch_mtime = std::fs::metadata(&scratch).unwrap().modified().unwrap();
+        let local = local_entry_stream(root.clone(), ScanRequest::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(local
+            .to_string()
+            .contains("temporary directory is inside scanned root"));
+        let rooted = crate::rooted_fs::RootedFs::open(root.clone())
+            .await
+            .unwrap();
+        let remote = rooted
+            .entry_stream(ScanRequest::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(remote
+            .to_string()
+            .contains("temporary directory is inside scanned root"));
+        assert_eq!(names(), before_names);
+        assert_eq!(
+            std::fs::metadata(root).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(&scratch).unwrap().modified().unwrap(),
+            scratch_mtime
+        );
+        assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+        return;
+    }
+    let root = tempfile::TempDir::new().unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::write(root.path().join("file"), b"source").unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "endpoint::local_entry_scan::resource_tests::unsafe_scratch_is_refused_before_scanner_writes"])
+        .env("SY_TEST_UNSAFE_SCRATCH_ROOT", root.path())
+        .env("TMPDIR", &scratch).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn tiny_worker(root: PathBuf) -> TestScan {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let worker = tokio::task::spawn_blocking(move || {
@@ -29,6 +93,8 @@ fn tiny_worker(root: PathBuf) -> TestScan {
 async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
     if let Some(root) = std::env::var_os("SY_TEST_LOCAL_SCAN_FD_ROOT") {
         let root = PathBuf::from(root);
+        let scratch_parent = tempfile::env::temp_dir();
+        let root_modified = std::fs::metadata(&root).unwrap().modified().unwrap();
         let (mut receiver, worker) = tiny_worker(root.clone());
         let mut count = 0;
         let mut previous = None;
@@ -45,7 +111,7 @@ async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
         assert_eq!(
             std::fs::read_dir(&root).unwrap().count(),
             2,
-            "scratch was not excluded/cleaned"
+            "source names changed"
         );
 
         let (mut receiver, worker) = tiny_worker(root.clone());
@@ -68,7 +134,7 @@ async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
 
         let (mut receiver, worker) = tiny_worker(root.clone());
         assert!(receiver.recv().await.unwrap().is_ok());
-        let scratch = std::fs::read_dir(&root)
+        let scratch = std::fs::read_dir(&scratch_parent)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| {
@@ -78,7 +144,7 @@ async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
                     .starts_with("sy-scan-")
             })
             .unwrap();
-        let moved_scratch = root.join("injected-scratch-failure");
+        let moved_scratch = scratch_parent.join("injected-scratch-failure");
         // Rename is atomic even while a run is being written; recursive
         // removal here would race the writer and make fault injection flaky.
         std::fs::rename(scratch, &moved_scratch).unwrap();
@@ -91,7 +157,16 @@ async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
         assert_eq!(
             std::fs::read_dir(&root).unwrap().count(),
             2,
-            "failed scratch leaked"
+            "source names changed after scratch failure"
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().modified().unwrap(),
+            root_modified
+        );
+        assert_eq!(
+            std::fs::read_dir(scratch_parent).unwrap().count(),
+            0,
+            "scratch leaked"
         );
         return;
     }
@@ -106,11 +181,12 @@ async fn deep_wide_tiny_budget_low_fd_and_cancellation_cleanup() {
         std::fs::write(directory.join(format!("n{index:04}")), b"x").unwrap();
     }
     // The isolated child has a real FD ceiling below its traversal depth;
-    // TMPDIR inside source also proves scratch does not become source data.
+    // scratch is outside the source so bookkeeping cannot mutate it.
+    let scratch = tempfile::TempDir::new().unwrap();
     use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(std::env::current_exe().unwrap());
     child.args(["--exact", "endpoint::local_entry_scan::resource_tests::deep_wide_tiny_budget_low_fd_and_cancellation_cleanup"])
-        .env("SY_TEST_LOCAL_SCAN_FD_ROOT", root.path()).env("TMPDIR", root.path());
+        .env("SY_TEST_LOCAL_SCAN_FD_ROOT", root.path()).env("TMPDIR", scratch.path());
     // SAFETY: pre_exec uses only async-signal-safe syscalls and stack buffers;
     // it does not allocate, take locks, or touch the async runtime.
     unsafe {

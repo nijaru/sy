@@ -29,6 +29,10 @@ pub(super) async fn run(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    // Refuse before connecting or allocating controller/session journals.
+    sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
+        .await
+        .map_err(map_io)?;
     let started = Instant::now();
     // OpenSSH resolves this alias with the user's own ssh_config; only an
     // explicit `user@` from the command line overrides it.

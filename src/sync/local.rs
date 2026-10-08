@@ -28,6 +28,11 @@ pub(super) async fn run(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    // Controller journals are created before either entry stream is polled.
+    // Refuse unsafe scratch configuration before spawning even the dest scan.
+    sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
+        .await
+        .map_err(map_io)?;
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
