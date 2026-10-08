@@ -48,6 +48,9 @@ pub enum RootedFsError {
     #[error("backup destination aliases its source: {0}")]
     BackupAliasesSource(PathBuf),
 
+    #[error("in-place metadata update refused for shared regular file {path} ({links} links); group-aware staged replacement is required")]
+    SharedFileMetadata { path: PathBuf, links: u64 },
+
     #[error("directory mutation requires an observed finalization request")]
     UnobservedDirectoryMutation,
 
@@ -1715,6 +1718,9 @@ impl RootedFs {
                 {
                     return Err(changed());
                 }
+                if unix_mode.is_some() || modified.is_some() {
+                    require_exclusive_file_metadata(&file, relative)?;
+                }
                 apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)
             }
             EntryKind::Symlink => {
@@ -1794,6 +1800,7 @@ impl RootedFs {
         }
 
         let file = self.open_xattr_entry_blocking(relative, kind)?;
+        require_exclusive_file_metadata(&file, relative)?;
         for (name, value) in xattrs {
             file.set_xattr(name, value)?;
         }
@@ -1851,6 +1858,7 @@ impl RootedFs {
     #[cfg(all(target_os = "linux", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
+        require_exclusive_file_metadata(&file, relative)?;
         apply_acl_fd(&file, acl)
     }
 
@@ -1877,6 +1885,7 @@ impl RootedFs {
     #[cfg(all(target_os = "macos", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
+        require_exclusive_file_metadata(&file, relative)?;
         apply_acl_fd(&file, acl)
     }
 
@@ -1989,6 +1998,7 @@ impl RootedFs {
         flags: u32,
     ) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
+        require_exclusive_file_metadata(&file, relative)?;
         // SAFETY: `file` is a live held descriptor; `fchflags` only mutates
         // flags on the open file description.
         let ret = unsafe { libc::fchflags(file.as_raw_fd(), flags) };
@@ -2637,6 +2647,23 @@ fn create_staging_file_at(parent: RawFd, component: &OsStr) -> Result<File> {
         OwnedFd::from_raw_fd(fd)
     };
     Ok(File::from(owned))
+}
+
+// A destination inode can alias any source entry, including excluded ones.
+// Checking just the matched pair is insufficient. Refuse shared regular-file
+// writes until group-aware staging can preserve both bytes and hardlink topology.
+// Like identity checks, this does not provide CAS against concurrent link creation.
+#[cfg(unix)]
+fn require_exclusive_file_metadata(file: &File, relative: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if metadata.is_file() && metadata.nlink() > 1 {
+        return Err(RootedFsError::SharedFileMetadata {
+            path: relative.to_path_buf(),
+            links: metadata.nlink(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3491,6 +3518,43 @@ mod tests {
             std::fs::read(outside.path().join("secret")).unwrap(),
             b"outside"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_file_metadata_writes_are_refused_before_mutation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = tempfile::TempDir::new().unwrap();
+        let original = source.path().join("excluded");
+        std::fs::write(&original, b"keep").unwrap();
+        std::fs::hard_link(&original, root.path().join("alias")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let path = relative("alias");
+        let before = rooted.path_identity_blocking(&path).unwrap().unwrap();
+        let attempts = [
+            rooted.apply_metadata_blocking(&path, EntryKind::File, before.1, Some(0o600), None),
+            rooted.apply_metadata_blocking(
+                &path,
+                EntryKind::File,
+                before.1,
+                None,
+                Some(Timestamp::new(1_600_000_001, 0).unwrap()),
+            ),
+            rooted.write_xattrs_blocking(&path, EntryKind::File, &[]),
+            #[cfg(feature = "acl")]
+            rooted.write_acl_blocking(&path, EntryKind::File, ""),
+            #[cfg(target_os = "macos")]
+            rooted.write_bsd_flags_blocking(&path, EntryKind::File, 0),
+        ];
+        for result in attempts {
+            assert!(matches!(
+                result,
+                Err(RootedFsError::SharedFileMetadata { path: rejected, links: 2 })
+                    if rejected == path.as_path()
+            ));
+        }
+        assert_eq!(rooted.path_identity_blocking(&path).unwrap(), Some(before));
+        assert_eq!(std::fs::read(&original).unwrap(), b"keep");
+        assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
     }
 
     #[tokio::test]

@@ -200,6 +200,13 @@ allowed. Remote files with indistinguishable inode and namespace identifiers
 are conservatively treated as aliases. These checks are not atomic with source
 unlink and do not provide isolation from concurrent namespace writers.
 
+In-place metadata writes to regular files with multiple hardlinks are refused,
+locally and over SSH: an alias may belong to the source, even an excluded file.
+This includes permissions, timestamps, xattrs, ACLs and BSD flags. Supporting
+these updates requires group-aware staged replacement; sy does not silently
+break hardlink topology or modify the shared inode. The link-count check is not
+atomic with the write and cannot prevent concurrent creation of new aliases.
+
 Deletion backups apply to regular files only. Symlink targets are never copied.
 A backup is staged and identity-checked before publication; failure leaves the
 deletion candidate intact. Local deletion backups now copy then unlink rather

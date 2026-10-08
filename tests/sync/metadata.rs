@@ -35,6 +35,49 @@ fn sync_args<'a>(source: &'a TempDir, dest: &'a TempDir, extra: &[&str]) -> Vec<
 }
 
 #[test]
+fn metadata_update_refuses_to_mutate_an_excluded_source_alias() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+    let selected = source.path().join("a");
+    let excluded = source.path().join("b");
+    let target = dest.path().join("a");
+    fs::write(&selected, b"same").unwrap();
+    fs::write(&excluded, b"same").unwrap();
+    fs::set_permissions(&selected, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&excluded, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(&excluded, &target).unwrap();
+    let time = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(&selected, time).unwrap();
+    filetime::set_file_mtime(&excluded, time).unwrap();
+    let identity = fs::metadata(&excluded).unwrap().ino();
+
+    let mut source_operand = source.path().as_os_str().to_os_string();
+    source_operand.push("/");
+    let output = Command::new(sy_bin())
+        .arg(source_operand)
+        .arg(dest.path())
+        .args(["--preserve-permissions", "--exclude", "b"])
+        .output()
+        .unwrap();
+
+    // Pairwise source/destination identity checks cannot protect this alias:
+    // the destination aliases a different, excluded source entry.
+    assert_eq!(fs::metadata(&excluded).unwrap().mode() & 0o7777, 0o644);
+    assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o644);
+    assert_eq!(fs::metadata(&excluded).unwrap().ino(), identity);
+    assert_eq!(fs::metadata(&target).unwrap().ino(), identity);
+    assert_eq!(fs::read(&selected).unwrap(), b"same");
+    assert_eq!(fs::read(&excluded).unwrap(), b"same");
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 1);
+    assert!(
+        !output.status.success(),
+        "shared metadata mutation must fail loudly"
+    );
+}
+
+#[test]
 fn test_archive_mode_preserves_permissions() {
     let (source, dest) = setup_test_dir();
 
