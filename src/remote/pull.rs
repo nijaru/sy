@@ -1096,6 +1096,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
         RemotePullExecutor::execute_finalize(self, metadata).await
     }
 
+    async fn finish_deferred_source_removals(&self) -> std::result::Result<(), RemotePullError> {
+        Ok(())
+    }
+
     /// Pulls have no local source to remove; parity skips are just skips.
     async fn remove_unchanged_source(
         &self,

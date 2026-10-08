@@ -1,0 +1,302 @@
+//! Deferred `--remove-source-files` for preserved hardlink groups.
+//!
+//! Group members share one inode, so unlinking the representative immediately
+//! changes ctime/nlink for every later scanned member and makes exact identity
+//! checks fail. This journal records only successfully published group members,
+//! validates every recorded name before any unlink, then replays removals with a
+//! disk-backed per-group inode state. Memory and descriptor use do not scale
+//! with source tree size.
+
+use super::domain::{Entry, EntryIdentity, RelativePath};
+use super::native_path;
+use crate::rooted_fs::{HardlinkSourceState, RootedFs};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+const MAX_PATH_BYTES: usize = 1024 * 1024;
+const RECORD_FIXED_BYTES: usize = 64;
+const STATE_RECORD_BYTES: usize = 32 + HardlinkSourceState::ENCODED_BYTES;
+
+#[derive(Default)]
+pub(crate) struct HardlinkRemovalJournal {
+    disk: Arc<Mutex<Option<File>>>,
+}
+
+impl HardlinkRemovalJournal {
+    pub async fn append(&self, group: [u8; 32], source: &Entry) -> io::Result<()> {
+        let identity = source.identity.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hardlink source removal requires scanned source identity",
+            )
+        })?;
+        let path = source.path.clone();
+        self.with_disk(move |disk| disk.append(group, identity, &path))
+            .await
+    }
+
+    pub async fn replay(&self, source_root: PathBuf) -> io::Result<()> {
+        let disk = Arc::clone(&self.disk);
+        tokio::task::spawn_blocking(move || {
+            let mut state = disk
+                .lock()
+                .map_err(|_| io::Error::other("hardlink removal journal lock poisoned"))?;
+            let Some(journal) = state.as_mut() else {
+                return Ok(());
+            };
+            let rooted = RootedFs::open_blocking_for_worker(source_root)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let mut journal = DiskJournal { file: journal };
+            journal.validate_all(&rooted)?;
+            journal.remove_all(&rooted)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    async fn with_disk<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut DiskJournal) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let disk = Arc::clone(&self.disk);
+        tokio::task::spawn_blocking(move || {
+            let mut state = disk
+                .lock()
+                .map_err(|_| io::Error::other("hardlink removal journal lock poisoned"))?;
+            if state.is_none() {
+                *state = Some(tempfile::tempfile()?);
+            }
+            let file = state
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing hardlink removal journal"))?;
+            operation(&mut DiskJournal { file })
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
+struct DiskJournal<'a> {
+    file: &'a mut File,
+}
+
+#[derive(Debug)]
+struct RemovalRecord {
+    group: [u8; 32],
+    identity: EntryIdentity,
+    path: RelativePath,
+}
+
+impl DiskJournal<'_> {
+    fn append(
+        &mut self,
+        group: [u8; 32],
+        identity: EntryIdentity,
+        path: &RelativePath,
+    ) -> io::Result<()> {
+        let path = native_path::encode(path.as_path().as_os_str());
+        if path.len() > MAX_PATH_BYTES {
+            return Err(invalid("hardlink source-removal path exceeds record limit"));
+        }
+        let record_len = RECORD_FIXED_BYTES
+            .checked_add(path.len())
+            .ok_or_else(|| invalid("hardlink source-removal record length overflow"))?;
+        let record_len = u32::try_from(record_len)
+            .map_err(|_| invalid("hardlink source-removal record exceeds u32 length"))?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&record_len.to_le_bytes())?;
+        self.file.write_all(&group)?;
+        self.file.write_all(identity.as_bytes())?;
+        self.file.write_all(&path)?;
+        Ok(())
+    }
+
+    fn validate_all(&mut self, rooted: &RootedFs) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        while let Some(record) = self.read_record()? {
+            rooted
+                .validate_hardlink_source_member_blocking(&record.path, record.identity)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn remove_all(&mut self, rooted: &RootedFs) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut states = StateIndex::new()?;
+        while let Some(record) = self.read_record()? {
+            let expected = states.get(record.group)?;
+            let updated = rooted
+                .remove_hardlink_source_member_blocking(
+                    &record.path,
+                    record.identity,
+                    expected.as_ref(),
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            states.append(record.group, updated)?;
+        }
+        Ok(())
+    }
+
+    fn read_record(&mut self) -> io::Result<Option<RemovalRecord>> {
+        let mut len = [0; 4];
+        match self.file.read_exact(&mut len) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let len = u32::from_le_bytes(len) as usize;
+        if !(RECORD_FIXED_BYTES..=RECORD_FIXED_BYTES + MAX_PATH_BYTES).contains(&len) {
+            return Err(invalid("invalid hardlink source-removal record length"));
+        }
+        let mut fixed = [0; RECORD_FIXED_BYTES];
+        self.file.read_exact(&mut fixed)?;
+        let mut group = [0; 32];
+        group.copy_from_slice(&fixed[..32]);
+        let mut identity = [0; 32];
+        identity.copy_from_slice(&fixed[32..]);
+        let mut path = vec![0; len - RECORD_FIXED_BYTES];
+        self.file.read_exact(&mut path)?;
+        let path = RelativePath::new(native_path::decode(&path)?)
+            .map_err(|_| invalid("invalid hardlink source-removal path"))?;
+        Ok(Some(RemovalRecord {
+            group,
+            identity: EntryIdentity::from_bytes(identity),
+            path,
+        }))
+    }
+}
+
+struct StateIndex {
+    file: File,
+}
+
+impl StateIndex {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile()?,
+        })
+    }
+
+    fn get(&mut self, group: [u8; 32]) -> io::Result<Option<HardlinkSourceState>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut found = None;
+        let mut record = [0; STATE_RECORD_BYTES];
+        loop {
+            match self.file.read_exact(&mut record) {
+                Ok(()) => {
+                    if record[..32] == group {
+                        found = Some(HardlinkSourceState::decode(&record[32..])?);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(found),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn append(&mut self, group: [u8; 32], state: HardlinkSourceState) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&group)?;
+        self.file.write_all(&state.encode())?;
+        Ok(())
+    }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::domain::{EntryKind, Timestamp};
+
+    fn rel(path: &str) -> RelativePath {
+        RelativePath::new(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_group_replay_stays_within_low_descriptor_limit() {
+        const CHILD: &str = "SY_HARDLINK_REMOVAL_RESOURCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "ulimit -n 32; exec \"$1\" --exact engine::hardlink_removals::tests::large_group_replay_stays_within_low_descriptor_limit --nocapture",
+                    "hardlink-removal-resource-test",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            const LINKS: usize = 2_048;
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("member-0"), b"x").unwrap();
+            for index in 1..LINKS {
+                std::fs::hard_link(
+                    root.path().join("member-0"),
+                    root.path().join(format!("member-{index}")),
+                )
+                .unwrap();
+            }
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let journal = HardlinkRemovalJournal::default();
+            let group = [9; 32];
+            for index in 0..LINKS {
+                let path = rel(&format!("member-{index}"));
+                let (_, identity) = rooted.path_identity_blocking(&path).unwrap().unwrap();
+                let mut entry = Entry::file(path, 1, Timestamp::UNIX_EPOCH);
+                entry.identity = Some(identity);
+                journal.append(group, &entry).await.unwrap();
+            }
+            journal.replay(root.path().to_path_buf()).await.unwrap();
+            for index in 0..LINKS {
+                assert!(!root.path().join(format!("member-{index}")).exists());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validates_all_members_before_unlinking() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a"), b"same").unwrap();
+        std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let (_, a_identity) = rooted.path_identity_blocking(&rel("a")).unwrap().unwrap();
+        let (_, b_identity) = rooted.path_identity_blocking(&rel("b")).unwrap().unwrap();
+        let group = [1; 32];
+        let mut a = Entry::file(rel("a"), 4, Timestamp::UNIX_EPOCH);
+        a.kind = EntryKind::File;
+        a.identity = Some(a_identity);
+        let mut b = Entry::file(rel("b"), 4, Timestamp::UNIX_EPOCH);
+        b.identity = Some(b_identity);
+
+        let journal = HardlinkRemovalJournal::default();
+        journal.append(group, &a).await.unwrap();
+        journal.append(group, &b).await.unwrap();
+        std::fs::write(root.path().join("b"), b"changed").unwrap();
+
+        assert!(journal.replay(root.path().to_path_buf()).await.is_err());
+        assert!(root.path().join("a").exists());
+        assert!(root.path().join("b").exists());
+    }
+}

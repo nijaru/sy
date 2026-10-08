@@ -149,6 +149,64 @@ pub struct RootedFs {
     root_fd: Arc<OwnedFd>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HardlinkSourceState {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) nlink: u64,
+}
+
+impl HardlinkSourceState {
+    pub(crate) const ENCODED_BYTES: usize = 68;
+
+    pub(crate) fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        bytes[0..8].copy_from_slice(&self.dev.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.mode.to_le_bytes());
+        bytes[28..36].copy_from_slice(&self.mtime.to_le_bytes());
+        bytes[36..44].copy_from_slice(&self.mtime_nsec.to_le_bytes());
+        bytes[44..52].copy_from_slice(&self.ctime.to_le_bytes());
+        bytes[52..60].copy_from_slice(&self.ctime_nsec.to_le_bytes());
+        bytes[60..68].copy_from_slice(&self.nlink.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> std::io::Result<Self> {
+        if bytes.len() != Self::ENCODED_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid hardlink source state length",
+            ));
+        }
+        Ok(Self {
+            dev: u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| invalid_state())?),
+            ino: u64::from_le_bytes(bytes[8..16].try_into().map_err(|_| invalid_state())?),
+            size: u64::from_le_bytes(bytes[16..24].try_into().map_err(|_| invalid_state())?),
+            mode: u32::from_le_bytes(bytes[24..28].try_into().map_err(|_| invalid_state())?),
+            mtime: i64::from_le_bytes(bytes[28..36].try_into().map_err(|_| invalid_state())?),
+            mtime_nsec: i64::from_le_bytes(bytes[36..44].try_into().map_err(|_| invalid_state())?),
+            ctime: i64::from_le_bytes(bytes[44..52].try_into().map_err(|_| invalid_state())?),
+            ctime_nsec: i64::from_le_bytes(bytes[52..60].try_into().map_err(|_| invalid_state())?),
+            nlink: u64::from_le_bytes(bytes[60..68].try_into().map_err(|_| invalid_state())?),
+        })
+    }
+}
+
+fn invalid_state() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid hardlink source state",
+    )
+}
+
 /// Keeps both the no-follow source handle and its namespace binding alive
 /// until the backup commits. Identity checks detect races, not snapshot isolation.
 #[cfg(unix)]
@@ -159,6 +217,13 @@ struct RootedCopySource<'a> {
     leaf: OsString,
     file: File,
     expected: EntryIdentity,
+}
+
+#[cfg(unix)]
+struct RootedHardlinkSourceMember {
+    parent: OwnedFd,
+    leaf: OsString,
+    file: File,
 }
 
 #[cfg(unix)]
@@ -671,6 +736,10 @@ impl RootedFs {
             .map_err(|error| RootedFsError::Worker(error.to_string()))?
     }
 
+    pub(crate) fn open_blocking_for_worker(root: PathBuf) -> Result<Self> {
+        Self::open_blocking(root)
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
@@ -811,6 +880,63 @@ impl RootedFs {
         &self,
         _relative: &RelativePath,
     ) -> Result<Option<(EntryKind, EntryIdentity)>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Validate one deferred hardlink source name against its exact scanned
+    /// identity. The removal journal runs this for every published member
+    /// before unlinking any of them, so a pre-deferred race preserves the whole
+    /// group.
+    #[cfg(unix)]
+    pub(crate) fn validate_hardlink_source_member_blocking(
+        &self,
+        relative: &RelativePath,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        let (_, state) = self.open_hardlink_source_member(relative.as_path(), expected, None)?;
+        let _ = state;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_hardlink_source_member_blocking(
+        &self,
+        _relative: &RelativePath,
+        _expected: EntryIdentity,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Unlink one deferred hardlink source name while allowing only the
+    /// ctime/nlink transition caused by our own previous unlink in the same
+    /// group. The returned state becomes the next expected group anchor.
+    #[cfg(unix)]
+    pub(crate) fn remove_hardlink_source_member_blocking(
+        &self,
+        relative: &RelativePath,
+        scanned: EntryIdentity,
+        expected: Option<&HardlinkSourceState>,
+    ) -> Result<HardlinkSourceState> {
+        let (member, before) =
+            self.open_hardlink_source_member(relative.as_path(), scanned, expected)?;
+        unlink_at(member.parent.as_raw_fd(), &member.leaf, false)?;
+        let after =
+            hardlink_state_from_stat(&stat_fd(member.file.as_raw_fd())?, relative.as_path())?;
+        if !after_own_unlink(before, after) {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        Ok(after)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn remove_hardlink_source_member_blocking(
+        &self,
+        _relative: &RelativePath,
+        _scanned: EntryIdentity,
+        _expected: Option<&HardlinkSourceState>,
+    ) -> Result<HardlinkSourceState> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1347,6 +1473,36 @@ impl RootedFs {
     #[cfg(not(unix))]
     fn create_hardlink_path_blocking(&self, _source: &Path, _destination: &Path) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn open_hardlink_source_member(
+        &self,
+        relative: &Path,
+        scanned: EntryIdentity,
+        expected: Option<&HardlinkSourceState>,
+    ) -> Result<(RootedHardlinkSourceMember, HardlinkSourceState)> {
+        let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
+        let (parent, leaf) = self.open_parent_blocking(relative)?;
+        let file = open_file_at(parent.as_raw_fd(), &leaf)?;
+        let stat = stat_fd(file.as_raw_fd())?;
+        let state = hardlink_state_from_stat(&stat, relative)?;
+        let named = stat_at_optional(parent.as_raw_fd(), &leaf)?
+            .ok_or_else(changed)
+            .and_then(|stat| hardlink_state_from_stat(&stat, relative))?;
+        if named != state {
+            return Err(changed());
+        }
+        match expected {
+            Some(expected) if &state == expected => {}
+            Some(_) => return Err(changed()),
+            None => {
+                if identity_from_stat(&stat) != Some(scanned) {
+                    return Err(changed());
+                }
+            }
+        }
+        Ok((RootedHardlinkSourceMember { parent, leaf, file }, state))
     }
 
     #[cfg(unix)]
@@ -2111,6 +2267,37 @@ fn identity_from_stat(metadata: &libc::stat) -> Option<EntryIdentity> {
         _ => EntryKind::File,
     };
     crate::endpoint::local_identity::stat_identity(metadata, kind)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn hardlink_state_from_stat(metadata: &libc::stat, path: &Path) -> Result<HardlinkSourceState> {
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(RootedFsError::NotRegularFile(path.to_path_buf()));
+    }
+    Ok(HardlinkSourceState {
+        dev: metadata.st_dev as u64,
+        ino: metadata.st_ino as u64,
+        size: u64::try_from(metadata.st_size)
+            .map_err(|_| RootedFsError::DestinationChanged(path.to_path_buf()))?,
+        mode: metadata.st_mode as u32,
+        mtime: metadata.st_mtime as i64,
+        mtime_nsec: metadata.st_mtime_nsec as i64,
+        ctime: metadata.st_ctime as i64,
+        ctime_nsec: metadata.st_ctime_nsec as i64,
+        nlink: metadata.st_nlink as u64,
+    })
+}
+
+#[cfg(unix)]
+fn after_own_unlink(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
+    before.dev == after.dev
+        && before.ino == after.ino
+        && before.size == after.size
+        && before.mode == after.mode
+        && before.mtime == after.mtime
+        && before.mtime_nsec == after.mtime_nsec
+        && before.nlink == after.nlink.saturating_add(1)
 }
 
 #[cfg(unix)]

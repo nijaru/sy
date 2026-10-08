@@ -544,6 +544,9 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
         &self,
         metadata: FinalizeMetadata,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+    fn finish_deferred_source_removals(
+        &self,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
     fn remove_unchanged_source(
         &self,
         source: &Entry,
@@ -714,6 +717,7 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         if let Some(record) = next_directory {
             return Err(ControllerError::InvalidDirectoryReceipt(record.path));
         }
+
         let mut finalize = runtime_finalize.seal().await?;
 
         if let Some(delete) = delete {
@@ -739,6 +743,11 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             summary.finalized_metadata =
                 checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
         }
+
+        self.executor
+            .finish_deferred_source_removals()
+            .await
+            .map_err(|error| ControllerError::backend("execution", error))?;
 
         Ok(summary)
     }
@@ -1018,6 +1027,10 @@ mod tests {
         async fn execute_finalize(&self, _metadata: FinalizeMetadata) -> std::io::Result<()> {
             self.tail_mutations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn finish_deferred_source_removals(&self) -> std::io::Result<()> {
             Ok(())
         }
 

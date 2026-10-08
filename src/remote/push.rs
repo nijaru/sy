@@ -403,6 +403,7 @@ pub struct RemotePushExecutor {
     /// do not establish representatives.
     hardlinks: bool,
     hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
+    hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal,
     /// -X/--preserve-xattrs: mirror the local source's extended attributes
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -464,6 +465,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         RemotePushExecutor::execute_finalize(self, metadata).await
     }
 
+    async fn finish_deferred_source_removals(&self) -> std::result::Result<(), RemotePushError> {
+        RemotePushExecutor::finish_deferred_source_removals(self).await
+    }
+
     async fn remove_unchanged_source(
         &self,
         source: &crate::engine::domain::Entry,
@@ -492,6 +497,7 @@ impl RemotePushExecutor {
             compression: None,
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
+            hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal::default(),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -807,7 +813,8 @@ impl RemotePushExecutor {
             let receipt =
                 PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
             if source_removal {
-                self.remove_committed_source(&receipt, &source).await?;
+                self.defer_grouped_source_removal(group, &receipt, &source)
+                    .await?;
             }
             let op = if destination.is_some() {
                 crate::sync::output::ItemizeOp::Update
@@ -873,7 +880,8 @@ impl RemotePushExecutor {
         }
         groups.insert(group, representative).await?;
         if source_removal {
-            self.remove_committed_source(&receipt, &source).await?;
+            self.defer_grouped_source_removal(group, &receipt, &source)
+                .await?;
         }
         drop(groups);
         let op = if is_update {
@@ -883,6 +891,34 @@ impl RemotePushExecutor {
         };
         self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
         Ok(summary)
+    }
+
+    async fn defer_grouped_source_removal(
+        &self,
+        group: [u8; 32],
+        receipt: &PublishedDestinationReceipt,
+        source: &Entry,
+    ) -> Result<()> {
+        if !self.remove_source_files {
+            return Ok(());
+        }
+        receipt.validate_source_removal(source).map_err(|error| {
+            RemotePushError::SourceRemoval(
+                self.source_root.join(source.path.as_path()),
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
+        self.hardlink_removals.append(group, source).await?;
+        Ok(())
+    }
+
+    async fn finish_deferred_source_removals(&self) -> Result<()> {
+        if self.remove_source_files && self.hardlinks {
+            self.hardlink_removals
+                .replay(self.source_root.clone())
+                .await?;
+        }
+        Ok(())
     }
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
