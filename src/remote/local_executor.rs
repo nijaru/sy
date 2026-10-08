@@ -561,8 +561,11 @@ impl LocalSyncExecutor {
                 };
                 self.replace_symlink(target, &source.path, expected, modified)
                     .await?;
-                let receipt =
-                    PublishedDestinationReceipt::for_symlink(source.path.clone(), source.identity);
+                let receipt = PublishedDestinationReceipt::for_symlink(
+                    source.path.clone(),
+                    source.path.clone(),
+                    source.identity,
+                );
                 self.remove_committed_source(&receipt, &source).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
@@ -640,8 +643,11 @@ impl LocalSyncExecutor {
             link_local_file(&first_abs, &dest_abs)
                 .await
                 .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
-            let receipt =
-                PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
+            let receipt = PublishedDestinationReceipt::for_hardlink(
+                source.path.clone(),
+                source.path.clone(),
+                source.identity,
+            );
             if source_removal {
                 self.defer_grouped_source_removal(group, &receipt, &source)
                     .await?;
