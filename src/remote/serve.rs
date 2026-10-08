@@ -61,6 +61,15 @@ where
 {
     let max_tasks = config.max_active_streams as usize;
     let mut session = ServerRemoteSession::accept(reader, writer, config).await?;
+    let mut tasks = JoinSet::<RequestResult>::new();
+    serve_requests(&mut session, &mut tasks, max_tasks).await
+}
+
+async fn serve_requests(
+    session: &mut ServerRemoteSession,
+    tasks: &mut JoinSet<RequestResult>,
+    max_tasks: usize,
+) -> Result<()> {
     let handlers = RequestHandlers {
         scan: session.scan_handler(),
         hash: session.hash_handler(),
@@ -71,39 +80,56 @@ where
         xattr: session.xattr_handler(),
         acl: session.acl_handler(),
         bsd_flags: session.bsd_flags_handler(),
-        fetch: fetch_handler(&session),
+        fetch: fetch_handler(session),
     };
-    let mut tasks = JoinSet::<RequestResult>::new();
     let mut accepting = true;
+    let mut failure = None;
 
     while accepting || !tasks.is_empty() {
-        if !accepting || tasks.len() >= max_tasks {
-            join_one(&mut tasks).await?;
-            continue;
-        }
-
-        if tasks.is_empty() {
-            match session.next_request().await? {
-                Some(request) => spawn_request(&mut tasks, &handlers, request),
-                None => accepting = false,
-            }
-            continue;
-        }
-
-        tokio::select! {
-            request = session.next_request() => {
-                match request? {
-                    Some(request) => spawn_request(&mut tasks, &handlers, request),
-                    None => accepting = false,
+        let result = if !accepting || tasks.len() >= max_tasks {
+            check_joined(tasks.join_next().await)
+        } else {
+            tokio::select! {
+                biased;
+                joined = tasks.join_next(), if !tasks.is_empty() => check_joined(joined),
+                request = session.next_request() => match request {
+                    Ok(Some(request)) => {
+                        spawn_request(tasks, &handlers, request);
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        accepting = false;
+                        Ok(())
+                    }
+                    Err(error) => Err(ServeError::Session(error)),
                 }
             }
-            joined = tasks.join_next() => {
-                check_joined(joined)?;
+        };
+        if let Err(error) = result {
+            // Stop admission and wake all transport/stream waiters before
+            // draining. Never drop JoinSet on an error: handlers may own
+            // non-abortable blocking filesystem work and private staging.
+            accepting = false;
+            if failure.is_none() {
+                session.sender().fail(std::sync::Arc::new(
+                    crate::remote::router::RouterError::SessionFailed(error.to_string()),
+                ));
+                failure = Some(error);
             }
         }
     }
 
-    Ok(())
+    // Joining transport actors also guarantees an interrupted partial write
+    // cannot outlive the session or be resumed on the same transport.
+    if let Err(error) = session.shutdown().await {
+        if failure.is_none() {
+            failure = Some(ServeError::Session(error));
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Run the private v3 agent over stdin/stdout. No logging or user-facing output
@@ -234,10 +260,6 @@ fn spawn_request(
     }
 }
 
-async fn join_one(tasks: &mut JoinSet<RequestResult>) -> Result<()> {
-    check_joined(tasks.join_next().await)
-}
-
 fn check_joined(
     joined: Option<std::result::Result<RequestResult, tokio::task::JoinError>>,
 ) -> Result<()> {
@@ -247,5 +269,161 @@ fn check_joined(
     match joined? {
         Ok(()) => Ok(()),
         Err(error) => Err(ServeError::Request(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Frame, FrameFlags, FrameKind, Operation};
+    use crate::remote::runtime::ClientRemoteSession;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn terminal_paths_drain_admitted_handlers_and_blocking_work() {
+        for cause in ["request", "task", "router", "eof"] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (client_reader, client_writer) = tokio::io::split(client_io);
+            let (server_reader, server_writer) = tokio::io::split(server_io);
+            let (client, server) = tokio::join!(
+                ClientRemoteSession::connect(
+                    client_reader,
+                    client_writer,
+                    Operation::Push,
+                    root.path(),
+                    RouterConfig::default()
+                ),
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default()),
+            );
+            let client = client.unwrap();
+            let mut server = server.unwrap();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let worker_finished = Arc::clone(&finished);
+            let worker = tokio::task::spawn_blocking(move || {
+                release_rx.recv().unwrap();
+                worker_finished.store(true, Ordering::SeqCst);
+            });
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                worker.await.map_err(|error| error.to_string())?;
+                Ok(())
+            });
+            match cause {
+                "request" => {
+                    tasks.spawn(async { Err("handler failed".to_string()) });
+                }
+                "task" => {
+                    tasks.spawn(async {
+                        panic!("handler panicked");
+                    });
+                }
+                "router" => {
+                    let inbox = client.sender().open_stream().unwrap();
+                    client
+                        .sender()
+                        .send(
+                            Frame::new(
+                                FrameKind::Entry,
+                                FrameFlags::empty(),
+                                inbox.stream_id(),
+                                bytes::Bytes::new(),
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                "eof" => {}
+                _ => unreachable!(),
+            }
+            if cause == "eof" {
+                drop(client);
+            }
+            let mut serving =
+                tokio::spawn(async move { serve_requests(&mut server, &mut tasks, 8).await });
+            // Returning here would detach the blocking worker and abort its
+            // handler, exactly the old error-path JoinSet-drop defect.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut serving)
+                    .await
+                    .is_err(),
+                "{cause} returned before drainage"
+            );
+            release_tx.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), serving)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(finished.load(Ordering::SeqCst));
+            match cause {
+                "request" => assert!(
+                    matches!(result, Err(ServeError::Request(error)) if error == "handler failed")
+                ),
+                "task" => assert!(matches!(result, Err(ServeError::Task(_)))),
+                "router" => assert!(
+                    matches!(result, Err(ServeError::Session(RemoteSessionError::Router(error))) if matches!(*error, crate::remote::router::RouterError::InvalidStreamOpen { stream_id: 1, kind: FrameKind::Entry }))
+                ),
+                "eof" => assert!(result.is_ok()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_error_stops_admission_without_mutation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let serving = tokio::spawn(serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
+        let client = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Pull,
+            root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut inbox = client.sender().open_stream().unwrap();
+        client
+            .sender()
+            .send(
+                Frame::new(
+                    FrameKind::FileBegin,
+                    FrameFlags::empty(),
+                    inbox.stream_id(),
+                    bytes::Bytes::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ServeError::Session(RemoteSessionError::OperationMismatch {
+                operation: Operation::Pull,
+                kind: FrameKind::FileBegin
+            }))
+        ));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(client.sender().open_stream().is_err());
     }
 }
