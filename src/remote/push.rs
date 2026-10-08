@@ -50,6 +50,7 @@ pub enum RemotePushAction {
     },
     ApplyMetadata {
         source: Entry,
+        expected_destination: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     },
@@ -65,6 +66,9 @@ pub enum RemotePushLowerError {
 
     #[error("transactional type replacement is not implemented for directory transition at {0}")]
     TransactionalDirectoryReplace(PathBuf),
+
+    #[error("metadata mutation requires scanned destination identity for {0}")]
+    MissingDestinationIdentity(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -251,7 +255,15 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    Ok(Some(metadata_work(source, unix_mode, modified)))
+    let expected_destination = destination.identity.ok_or_else(|| {
+        RemotePushLowerError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
+    })?;
+    Ok(Some(metadata_work(
+        source,
+        expected_destination,
+        unix_mode,
+        modified,
+    )))
 }
 
 fn requested_metadata(
@@ -303,11 +315,13 @@ fn mutation_work(action: RemotePushAction) -> WorkItem<RemotePushAction> {
 
 fn metadata_work(
     source: Entry,
+    expected_destination: EntryIdentity,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<RemotePushAction> {
     mutation_work(RemotePushAction::ApplyMetadata {
         source,
+        expected_destination,
         unix_mode,
         modified,
     })
@@ -676,6 +690,7 @@ impl RemotePushExecutor {
             }
             RemotePushAction::ApplyMetadata {
                 source,
+                expected_destination,
                 unix_mode,
                 modified,
             } => {
@@ -683,7 +698,13 @@ impl RemotePushExecutor {
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 self.remote
-                    .apply_metadata(&source.path, source.kind, unix_mode, modified)
+                    .apply_metadata(
+                        &source.path,
+                        source.kind,
+                        expected_destination,
+                        unix_mode,
+                        modified,
+                    )
                     .await?;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
@@ -881,12 +902,7 @@ impl RemotePushExecutor {
             })
             .await?;
         self.remote
-            .apply_metadata(
-                &metadata.path,
-                metadata.kind,
-                metadata.unix_mode,
-                metadata.modified,
-            )
+            .finalize_directory_metadata(&metadata.path, metadata.unix_mode, metadata.modified)
             .await?;
         Ok(())
     }

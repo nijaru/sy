@@ -126,6 +126,7 @@ pub enum RemotePullAction {
     },
     ApplyMetadata {
         source: Entry,
+        expected_destination: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     },
@@ -143,6 +144,7 @@ pub struct PullTransferMetadata {
 /// staging, and commit.
 pub struct RemotePullExecutor {
     destination_root: PathBuf,
+    metadata_authority: tokio::sync::OnceCell<crate::rooted_fs::RootedFs>,
     remote: ClientRemoteHandle,
     sender: RouterSender,
     scheduler: Scheduler,
@@ -185,6 +187,7 @@ impl RemotePullExecutor {
     ) -> Self {
         Self {
             destination_root,
+            metadata_authority: tokio::sync::OnceCell::new(),
             remote,
             sender,
             scheduler,
@@ -272,6 +275,13 @@ impl RemotePullExecutor {
         }
     }
 
+    async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
+        self.metadata_authority
+            .get_or_try_init(|| crate::rooted_fs::RootedFs::open(self.destination_root.clone()))
+            .await
+            .map_err(Into::into)
+    }
+
     fn dest_path(&self, relative: &RelativePath) -> PathBuf {
         self.destination_root.join(relative.as_path())
     }
@@ -285,15 +295,18 @@ impl RemotePullExecutor {
 
         match action {
             RemotePullAction::CreateDirectory { source } => {
-                let path = self.dest_path(&source.path);
                 // Read the source's attributes before creating anything so a
                 // source metadata failure cannot leave a partial entry.
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                tokio::fs::create_dir_all(&path)
+                let rooted = self.metadata_authority().await?.clone();
+                let relative = source.path.clone();
+                tokio::task::spawn_blocking(move || rooted.create_directory_blocking(&relative))
                     .await
-                    .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
+                    .map_err(|error| {
+                        crate::rooted_fs::RootedFsError::Worker(error.to_string())
+                    })??;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
                         .await?;
@@ -376,21 +389,27 @@ impl RemotePullExecutor {
             }
             RemotePullAction::ApplyMetadata {
                 source,
+                expected_destination,
                 unix_mode,
                 modified,
             } => {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let dest = self.dest_path(&source.path);
-                if let Some(mode) = unix_mode {
-                    set_local_mode(&dest, mode).await?;
-                }
-                if let Some(modified) = modified {
-                    if source.kind != EntryKind::Symlink {
-                        set_local_mtime(&dest, modified).await?;
-                    }
-                }
+                let rooted = self.metadata_authority().await?.clone();
+                let relative = source.path.clone();
+                let kind = source.kind;
+                tokio::task::spawn_blocking(move || {
+                    rooted.apply_metadata_blocking(
+                        &relative,
+                        kind,
+                        expected_destination,
+                        unix_mode,
+                        modified,
+                    )
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 if let Some(xattrs) = xattrs.as_deref() {
                     self.write_destination_xattrs(&source.path, source.kind, xattrs)
                         .await?;
@@ -777,15 +796,16 @@ impl RemotePullExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
-        let dest = self.dest_path(&metadata.path);
-        if let Some(mode) = metadata.unix_mode {
-            set_local_mode(&dest, mode).await?;
-        }
-        if let Some(modified) = metadata.modified {
-            if metadata.kind != EntryKind::Symlink {
-                set_local_mtime(&dest, modified).await?;
-            }
-        }
+        let rooted = self.metadata_authority().await?.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.finalize_directory_metadata_blocking(
+                &metadata.path,
+                metadata.unix_mode,
+                metadata.modified,
+            )
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         Ok(())
     }
 }
@@ -908,45 +928,6 @@ async fn remove_local_entry(
             Err(error) => Err(error),
         }
     }
-}
-
-async fn set_local_mode(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(path.to_path_buf(), error))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
-    }
-}
-
-async fn set_local_mtime(path: &Path, modified: Timestamp) -> Result<()> {
-    #[cfg(unix)]
-    {
-        set_mtime_via_filetime(path, modified).await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = modified;
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-async fn set_mtime_via_filetime(path: &Path, modified: Timestamp) -> Result<()> {
-    let time = filetime::FileTime::from_unix_time(modified.seconds(), modified.nanoseconds());
-    let symlink_followed = false;
-    filetime::set_symlink_file_times(path, time, time).map_err(|error| {
-        let _ = symlink_followed;
-        RemotePullError::LocalMutation(path.to_path_buf(), error)
-    })?;
-    Ok(())
 }
 
 #[cfg(unix)]

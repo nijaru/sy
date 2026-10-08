@@ -6,7 +6,7 @@
 //! transactional-refused exactly as on push — the planner's contract is
 //! direction-neutral.
 
-use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, SyncOp, Timestamp};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::ResourceRequest;
 use crate::engine::work::WorkItem;
@@ -143,7 +143,15 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    Ok(Some(metadata_work(source, unix_mode, modified)))
+    let expected_destination = destination.identity.ok_or_else(|| {
+        RemotePullError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
+    })?;
+    Ok(Some(metadata_work(
+        source,
+        expected_destination,
+        unix_mode,
+        modified,
+    )))
 }
 
 fn requested_metadata(
@@ -214,11 +222,13 @@ fn mutation_work(action: RemotePullAction) -> WorkItem<RemotePullAction> {
 
 fn metadata_work(
     source: Entry,
+    expected_destination: EntryIdentity,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<RemotePullAction> {
     mutation_work(RemotePullAction::ApplyMetadata {
         source,
+        expected_destination,
         unix_mode,
         modified,
     })

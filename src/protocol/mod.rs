@@ -28,7 +28,7 @@ pub use handshake::{
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1, PROTOCOL_V3_2,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
-pub use metadata::WireMetadata;
+pub use metadata::{WireMetadata, WireMetadataTarget};
 pub use mutation::{WireMutation, WireMutationKind};
 pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,
