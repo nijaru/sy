@@ -737,7 +737,7 @@ mod tests {
 
     /// -H/--preserve-hardlinks on pull: one fetch moves the representative's
     /// bytes; the other member links to it locally. The server sees exactly
-    /// scan + one fetch — no second fetch, no mutation (the destination is
+    /// scan + one fetch + member validation — no second fetch or mutation (the destination is
     /// local, so linking never crosses the wire).
     #[tokio::test]
     async fn hardlink_group_fetches_once_and_links_locally() {
@@ -762,14 +762,24 @@ mod tests {
             let rooted = session.scan_handler_rooted();
             let sender = session.sender();
             let peer = session.client().platform.os;
-            // One scan + one fetch: the second group member links locally.
-            for _ in 0..2 {
+            // One scan, one fetch, and validation of the later member.
+            for _ in 0..3 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         scan.serve(incoming).await.unwrap();
                     }
                     IncomingRequest::FileFetch(incoming) => {
                         sy::remote::fetch::serve_incoming_file_fetch(
+                            rooted.clone(),
+                            incoming,
+                            &sender,
+                            peer,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    IncomingRequest::Hash(incoming) => {
+                        sy::remote::hash::serve_incoming_hash(
                             rooted.clone(),
                             incoming,
                             &sender,

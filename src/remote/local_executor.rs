@@ -15,6 +15,7 @@ use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptio
 use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
+use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
@@ -33,6 +34,8 @@ pub const LOCAL_FILE_WORKING_SET: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocalSyncError {
+    #[error("hardlink bookkeeping failed: {0}")]
+    HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
     Existing(#[from] ExistingDestinationError),
     #[error(transparent)]
@@ -102,12 +105,6 @@ pub enum LocalSyncAction {
 
 pub type LocalTransferMetadata = crate::endpoint::transfer::TransferMetadata;
 
-#[derive(Debug, Clone)]
-struct HardlinkRepresentative {
-    path: RelativePath,
-    metadata: LocalTransferMetadata,
-}
-
 pub struct LocalSyncExecutor {
     source_root: PathBuf,
     destination_root: PathBuf,
@@ -131,8 +128,7 @@ pub struct LocalSyncExecutor {
     /// The mutex is held across a grouped transfer so members serialize
     /// (ungrouped files stay concurrent), mirroring the remote executors.
     hardlinks: bool,
-    hardlink_groups:
-        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], HardlinkRepresentative>>,
+    hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
     /// -X/--preserve-xattrs: mirror the source's extended attributes onto the
     /// destination for every entry this executor creates or updates. Symlinks
     /// are skipped (their attributes are not portable).
@@ -169,7 +165,7 @@ impl LocalSyncExecutor {
             remove_source_files: false,
             verify_on_write: false,
             hardlinks: false,
-            hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -556,11 +552,11 @@ impl LocalSyncExecutor {
         metadata: LocalTransferMetadata,
         group: [u8; 32],
     ) -> Result<crate::engine::work::TransferSummary> {
-        let mut groups = self.hardlink_groups.lock().await;
-        if let Some(first) = groups.get(&group).cloned() {
+        let groups = self.hardlink_groups.lock().await;
+        if let Some(first) = groups.get(group).await? {
             self.check_source_identity(&source).await?;
             let dest_abs = self.destination_path(&source.path);
-            validate_hardlink_metadata(&dest_abs, first.metadata, metadata)?;
+            first.validate_metadata(metadata.unix_mode, metadata.modified)?;
             let is_update = destination.is_some();
             if let Some(existing) = destination
                 .as_ref()
@@ -612,15 +608,18 @@ impl LocalSyncExecutor {
                 .await?;
             receipt.mark_finalized();
         }
-        groups.insert(
-            group,
-            HardlinkRepresentative {
-                path: source.path.clone(),
-                metadata,
-            },
-        );
-        drop(groups);
+        groups
+            .insert(
+                group,
+                HardlinkRepresentative {
+                    path: source.path.clone(),
+                    unix_mode: metadata.unix_mode,
+                    modified: metadata.modified,
+                },
+            )
+            .await?;
         self.remove_committed_source(&receipt, &source).await?;
+        drop(groups);
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
         } else {
@@ -632,39 +631,11 @@ impl LocalSyncExecutor {
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
-        let Some(expected) = source.identity else {
-            return Err(LocalSyncError::Source(
-                self.source_path(&source.path),
-                std::io::Error::other("source entry changed between scan and link"),
-            ));
-        };
-        let path = self.source_path(&source.path);
-        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|_| {
-            LocalSyncError::Source(
-                path.clone(),
-                std::io::Error::other("source entry changed between scan and link"),
-            )
-        })?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
-            .ok_or_else(|| {
-                LocalSyncError::Source(
-                    path.clone(),
-                    std::io::Error::other("source entry changed between scan and link"),
-                )
-            })?;
-        if current != expected {
-            return Err(LocalSyncError::Source(
-                path,
-                std::io::Error::other("source entry changed between scan and link"),
-            ));
-        }
+        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
+            .await
+            .map_err(|error| ExistingDestinationError::Worker(error.to_string()))??;
         Ok(())
     }
 
@@ -1050,32 +1021,6 @@ async fn link_local_file(first: &Path, dest: &Path) -> std::result::Result<(), s
     }
 }
 
-fn validate_hardlink_metadata(
-    path: &Path,
-    representative: LocalTransferMetadata,
-    requested: LocalTransferMetadata,
-) -> Result<()> {
-    #[cfg(unix)]
-    let modes_match = representative.unix_mode.map(|mode| mode & 0o7777)
-        == requested.unix_mode.map(|mode| mode & 0o7777);
-    #[cfg(not(unix))]
-    let modes_match = representative.unix_mode == requested.unix_mode;
-
-    if !modes_match {
-        return Err(LocalSyncError::Destination(
-            path.to_path_buf(),
-            std::io::Error::other("hardlink group members request incompatible permission modes"),
-        ));
-    }
-    if representative.modified != requested.modified {
-        return Err(LocalSyncError::Destination(
-            path.to_path_buf(),
-            std::io::Error::other("hardlink group members request incompatible modification times"),
-        ));
-    }
-    Ok(())
-}
-
 pub fn action_resources(action: &LocalSyncAction) -> ResourceRequest {
     match action {
         LocalSyncAction::TransferFile { .. } => ResourceRequest {
@@ -1292,35 +1237,77 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn hardlink_members_must_share_requested_inode_metadata() {
-        let time = Timestamp::new(123, 456).unwrap();
-        let representative = LocalTransferMetadata {
-            unix_mode: Some(0o100640),
-            modified: Some(time),
-        };
-        let same_mode = LocalTransferMetadata {
-            unix_mode: Some(0o640),
-            modified: Some(time),
-        };
-        assert!(validate_hardlink_metadata(Path::new("member"), representative, same_mode).is_ok());
+    #[tokio::test]
+    async fn hardlink_members_preserve_group_fidelity_and_observed_entries() {
+        use futures::TryStreamExt;
+        use std::os::unix::fs::MetadataExt;
 
-        let conflicting_mode = LocalTransferMetadata {
-            unix_mode: Some(0o600),
-            modified: Some(time),
-        };
-        assert!(matches!(
-            validate_hardlink_metadata(Path::new("member"), representative, conflicting_mode),
-            Err(LocalSyncError::Destination(_, _))
-        ));
-        let conflicting_time = LocalTransferMetadata {
-            unix_mode: Some(0o640),
-            modified: Some(Timestamp::new(124, 0).unwrap()),
-        };
-        assert!(matches!(
-            validate_hardlink_metadata(Path::new("member"), representative, conflicting_time),
-            Err(LocalSyncError::Destination(_, _))
-        ));
+        for race in [false, true] {
+            let source_root = tempfile::tempdir().unwrap();
+            let dest_root = tempfile::tempdir().unwrap();
+            std::fs::write(source_root.path().join("a"), b"new").unwrap();
+            std::fs::hard_link(source_root.path().join("a"), source_root.path().join("b")).unwrap();
+            std::fs::write(dest_root.path().join("b"), b"old").unwrap();
+            let mut request = crate::engine::scan::ScanRequest::default();
+            request.metadata.hardlink_group = true;
+            request.metadata.unix_mode = true;
+            let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                source_root.path().to_path_buf(),
+                request,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let destination = crate::endpoint::local_entry_scan::local_entry_stream(
+                dest_root.path().to_path_buf(),
+                request,
+            )
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+            let executor = LocalSyncExecutor::new(
+                source_root.path().to_path_buf(),
+                dest_root.path().to_path_buf(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_hardlinks(true);
+            let first = lower_local_op(
+                SyncOp::Create {
+                    source: entries[0].clone(),
+                },
+                ExecutionPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
+            executor.execute(first).await.unwrap();
+            if race {
+                std::fs::write(source_root.path().join("b"), b"bad").unwrap();
+            }
+            let member = lower_local_op(
+                SyncOp::Update {
+                    source: entries[1].clone(),
+                    destination,
+                },
+                ExecutionPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let result = executor.execute(member).await;
+            assert_eq!(std::fs::read(dest_root.path().join("a")).unwrap(), b"new");
+            if race {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), b"old");
+            } else {
+                assert_eq!(result.unwrap().unwrap().reused_bytes, 3);
+                assert_eq!(
+                    std::fs::metadata(dest_root.path().join("a")).unwrap().ino(),
+                    std::fs::metadata(dest_root.path().join("b")).unwrap().ino()
+                );
+            }
+            assert!(source_root.path().join("b").exists());
+            assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 2);
+        }
     }
 
     #[cfg(unix)]
