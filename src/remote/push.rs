@@ -5,6 +5,7 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
+use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::TransferSummary;
@@ -68,6 +69,8 @@ pub enum RemotePushLowerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushError {
+    #[error("hardlink bookkeeping failed: {0}")]
+    HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
     Existing(#[from] ExistingDestinationError),
     #[error(transparent)]
@@ -78,9 +81,6 @@ pub enum RemotePushError {
 
     #[error("symlink action is missing the scanned target for {0}")]
     MissingSymlinkTarget(PathBuf),
-
-    #[error("source entry {0} changed between scan and removal; not removing")]
-    SourceChangedBeforeRemoval(PathBuf),
 
     #[error("scanned destination identity is required to commit a remote update: {0}")]
     MissingDestinationIdentity(PathBuf),
@@ -377,14 +377,12 @@ pub struct RemotePushExecutor {
     backup: Option<RemoteBackupPlan>,
     /// -z/--compress: chunk compression policy for file transfers.
     compression: Option<CompressionPolicy>,
-    /// -H/--preserve-hardlinks: deduplicate scanned hardlink groups. The
-    /// map holds group -> first committed destination path; the mutex is
-    /// held across a grouped transfer so members of one group serialize
-    /// (ungrouped files stay concurrent). Skipped groups never populate the
-    /// map, matching the legacy executor: a lone transferred member still
-    /// moves bytes correctly, just without link sharing.
+    /// -H/--preserve-hardlinks: exact scratch state retains each group's
+    /// committed representative and inode metadata. Grouped work serializes
+    /// through publication; ungrouped files stay concurrent. Skipped entries
+    /// do not establish representatives.
     hardlinks: bool,
-    hardlink_groups: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], RelativePath>>,
+    hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
     /// -X/--preserve-xattrs: mirror the local source's extended attributes
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -465,7 +463,7 @@ impl RemotePushExecutor {
             backup: None,
             compression: None,
             hardlinks: false,
-            hardlink_groups: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -716,9 +714,10 @@ impl RemotePushExecutor {
         metadata: TransferMetadata,
         group: [u8; 32],
     ) -> Result<Option<TransferSummary>> {
-        let mut groups = self.hardlink_groups.lock().await;
-        if let Some(first) = groups.get(&group).cloned() {
+        let groups = self.hardlink_groups.lock().await;
+        if let Some(first) = groups.get(group).await? {
             self.check_source_identity(&source).await?;
+            first.validate_metadata(metadata.unix_mode, metadata.modified)?;
             if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
                 if existing.is_file() {
                     let backup_path = plan.destination(&existing.path).ok_or_else(|| {
@@ -728,7 +727,7 @@ impl RemotePushExecutor {
                         .await?;
                 }
             }
-            self.remote.hardlink(&first, &source.path).await?;
+            self.remote.hardlink(&first.path, &source.path).await?;
             let receipt =
                 PublishedDestinationReceipt::for_hardlink(source.path.clone(), source.identity);
             self.remove_committed_source(&receipt, &source).await?;
@@ -766,6 +765,11 @@ impl RemotePushExecutor {
             },
             compression: self.compression,
         };
+        let representative = HardlinkRepresentative {
+            path: source.path.clone(),
+            unix_mode: metadata.unix_mode,
+            modified: metadata.modified,
+        };
         let summary = self
             .remote
             .transfer_file_with_stream_policy(
@@ -789,9 +793,9 @@ impl RemotePushExecutor {
                 .await?;
             receipt.mark_finalized();
         }
-        groups.insert(group, source.path.clone());
-        drop(groups);
+        groups.insert(group, representative).await?;
         self.remove_committed_source(&receipt, &source).await?;
+        drop(groups);
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
         } else {
@@ -803,31 +807,13 @@ impl RemotePushExecutor {
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
-        let Some(expected) = source.identity else {
-            return Err(RemotePushError::SourceChangedBeforeRemoval(
-                source.path.as_path().to_path_buf(),
-            ));
-        };
-        let path = self.source_root.join(source.path.as_path());
-        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|_| {
-            RemotePushError::SourceChangedBeforeRemoval(source.path.as_path().to_path_buf())
-        })?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-        let current = crate::endpoint::local_identity::metadata_identity(&metadata, kind)
-            .ok_or_else(|| {
-                RemotePushError::SourceChangedBeforeRemoval(source.path.as_path().to_path_buf())
-            })?;
-        if current != expected {
-            return Err(RemotePushError::SourceChangedBeforeRemoval(
-                source.path.as_path().to_path_buf(),
-            ));
-        }
+        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
+            .await
+            .map_err(ExistingDestinationError::from)?;
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
+            .await
+            .map_err(|error| ExistingDestinationError::Worker(error.to_string()))??;
         Ok(())
     }
 
