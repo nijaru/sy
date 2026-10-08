@@ -1,5 +1,10 @@
 use crate::path::SyncPath;
-use clap::{Parser, ValueEnum};
+use usage::ValueEnum;
+
+mod args;
+mod parser;
+pub use args::PathError;
+pub use parser::Arguments;
 use std::path::PathBuf;
 
 // Import integrity types for verification modes
@@ -20,10 +25,6 @@ pub enum VerifyMode {
     After,
     /// Audit file integrity without modifying anything
     Only,
-}
-
-fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
-    Ok(SyncPath::parse(s))
 }
 
 pub fn parse_size(s: &str) -> Result<u64, String> {
@@ -107,174 +108,144 @@ pub enum SymlinkMode {
     Skip,
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "sy")]
-#[command(about = "Modern file synchronization tool", long_about = None)]
-#[command(version)]
-#[command(after_help = "EXAMPLES:
-    # Basic sync
-    sy /source /destination
-
-    # Preview changes without applying
-    sy /source /destination --dry-run
-
-    # Mirror mode (delete extra files in destination)
-    sy /source /destination --delete
-
-    # Parallel transfers (20 workers)
-    sy /source /destination -j 20
-
-    # Sync single file
-    sy /path/to/file.txt /dest/file.txt
-
-    # Remote sync (SSH)
-    sy /local user@host:/remote
-    sy user@host:/remote /local
-
-    # Quiet mode (only errors)
-    sy /source /destination --quiet
-
-    # Verify file integrity after write
-    sy /source /destination --verify            # staged verification
-
-For more information: https://github.com/nijaru/sy")]
+#[derive(usage::Args, Debug)]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
     /// Optional when using --profile
-    #[arg(value_parser = parse_sync_path)]
+    #[usage(skip)]
     pub source: Option<SyncPath>,
 
     /// Destination path (local: /path or remote: user@host:/path)
     /// Optional when using --profile
-    #[arg(value_parser = parse_sync_path)]
+    #[usage(skip)]
     pub destination: Option<SyncPath>,
 
     /// Show changes without applying them (dry-run)
-    #[arg(short = 'n', long)]
+    #[usage(short = 'n', long)]
     pub dry_run: bool,
 
     /// Show detailed changes in dry-run mode (file sizes, byte changes)
     /// Requires --dry-run to be effective
-    #[arg(long)]
+    #[usage(long)]
     pub diff: bool,
 
     /// Delete files in destination not present in source
-    #[arg(short, long)]
+    #[usage(short, long)]
     pub delete: bool,
 
     /// Force deletion even if it exceeds safety threshold (use with --delete)
-    #[arg(long)]
+    #[usage(long)]
     pub force_delete: bool,
 
     /// Verbosity level (can be repeated: -v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[usage(short, long, count)]
     pub verbose: u8,
 
     /// Quiet mode (only show errors)
-    #[arg(short, long)]
+    #[usage(short, long)]
     pub quiet: bool,
 
     /// Show detailed performance summary at the end
-    #[arg(long)]
+    #[usage(long)]
     pub perf: bool,
 
     /// Show file transfer statistics after sync completes
-    #[arg(long)]
+    #[usage(long)]
     pub stats: bool,
 
     /// Show file sizes in human-readable format (e.g., 1K, 234M, 2G)
-    #[arg(long)]
+    #[usage(long)]
     pub human_readable: bool,
 
     /// Make backups of existing destination files
     /// Optional MODE: none, simple (default with -b)
-    #[arg(short = 'b', long, num_args = 0..=1, default_missing_value = "simple")]
+    #[usage(short = 'b', long, default_missing = "simple")]
     pub backup: Option<String>,
 
     /// Directory to store backup files (default: same as destination)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::DirPath)]
     pub backup_dir: Option<PathBuf>,
 
     /// Backup file suffix (default: ~)
-    #[arg(long, default_value = "~")]
+    #[usage(long, default = "~")]
     pub suffix: String,
 
     /// Remove source files after successful transfer (like mv)
-    #[arg(long)]
+    #[usage(long)]
     pub remove_source_files: bool,
 
     /// Don't create new files on destination, only update existing
-    #[arg(long)]
+    #[usage(long)]
     pub existing: bool,
 
     /// Transfer directories without recursing (like rsync -d)
-    #[arg(long)]
+    #[usage(long)]
     pub dirs: bool,
 
     /// I/O timeout in seconds (for SSH connections)
-    #[arg(long)]
+    #[usage(long)]
     pub timeout: Option<u64>,
 
     /// Connection timeout in seconds (for SSH connections)
-    #[arg(long)]
+    #[usage(long)]
     pub contimeout: Option<u64>,
 
     /// Show what changed for each file (like rsync -i)
-    #[arg(long, short = 'i')]
+    #[usage(long, short = 'i')]
     pub itemize_changes: bool,
 
     /// Number of parallel file transfers (default: 10)
-    #[arg(short = 'j', long, default_value = "10")]
+    #[usage(short = 'j', long, default = "10")]
     pub parallel: usize,
 
     /// Minimum file size to sync (e.g., "1MB", "500KB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub min_size: Option<u64>,
 
     /// Maximum file size to sync (e.g., "100MB", "1GB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub max_size: Option<u64>,
 
     /// Exclude files matching pattern (can be repeated)
     /// Examples: "*.log", "node_modules", "target/"
-    #[arg(long)]
+    #[usage(long)]
     pub exclude: Vec<String>,
 
     /// Include files matching pattern (can be repeated, processed in order with --exclude)
     /// Examples: "*.rs", "important.log"
-    #[arg(long)]
+    #[usage(long)]
     pub include: Vec<String>,
 
     /// Filter rules in rsync syntax: "+ pattern" (include) or "- pattern" (exclude)
     /// Can be repeated. Rules processed in order, first match wins.
     /// Examples: "+ *.rs", "- *.log", "- target/*"
-    #[arg(long, allow_hyphen_values = true)]
+    #[usage(long, allow_hyphen_values)]
     pub filter: Vec<String>,
 
     /// Read exclude patterns from file (one pattern per line)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::FilePath)]
     pub exclude_from: Option<std::path::PathBuf>,
 
     /// Read include patterns from file (one pattern per line)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::FilePath)]
     pub include_from: Option<std::path::PathBuf>,
 
     /// Apply exclude template from ~/.config/sy/templates/ (can be repeated)
     /// Examples: "rust", "node", "python"
-    #[arg(long)]
+    #[usage(long)]
     pub exclude_template: Vec<String>,
 
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub bwlimit: Option<u64>,
 
     /// Verify file integrity against staged BLAKE3 verification
     ///
     /// Modes:
-    /// - after: Verify each file after writing (default)
+    /// - after: Verify staged content before committing each file
     /// - only: Audit file integrity without modifying anything
     /// - no: Disable verification (default)
-    #[arg(long, value_enum, default_value = "no")]
+    #[usage(long, value_enum, default = "no")]
     pub verify: VerifyMode,
 
     /// Compression mode for transfers
@@ -285,39 +256,45 @@ pub struct Cli {
     ///
     /// -z (no value) enables auto compression
     /// --compress=MODE for explicit control
-    #[arg(short = 'z', long, value_enum, default_value = "never", default_missing_value = "auto", num_args = 0..=1)]
+    #[usage(
+        short = 'z',
+        long,
+        value_enum,
+        default = "never",
+        default_missing = "auto"
+    )]
     pub compress: CompressionDetection,
 
     /// Symlink handling mode (preserve, follow, skip)
-    #[arg(long, value_enum, default_value = "preserve")]
+    #[usage(long, value_enum, default = "preserve")]
     pub links: SymlinkMode,
 
     /// Follow symlinks and copy targets (shortcut for --links follow)
-    #[arg(short = 'L', long)]
+    #[usage(short = 'L', long)]
     pub copy_links: bool,
 
     /// Preserve extended attributes (xattrs)
-    #[arg(short = 'X', long)]
+    #[usage(short = 'X', long)]
     pub preserve_xattrs: bool,
 
     /// Preserve hard links (treat multiple links to the same file as one copy)
-    #[arg(short = 'H', long)]
+    #[usage(short = 'H', long)]
     pub preserve_hardlinks: bool,
 
     /// Preserve access control lists (ACLs)
-    #[arg(short = 'A', long)]
+    #[usage(short = 'A', long)]
     pub preserve_acls: bool,
 
     /// Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; refused on other platforms)
-    #[arg(short = 'F', long)]
+    #[usage(short = 'F', long)]
     pub preserve_flags: bool,
 
     /// Preserve permissions
-    #[arg(short = 'p', long)]
+    #[usage(short = 'p', long)]
     pub preserve_permissions: bool,
 
     /// Preserve modification times
-    #[arg(short = 't', long)]
+    #[usage(short = 't', long)]
     pub preserve_times: bool,
 
     /// Archive mode: preserve permissions, times, and symlinks (-rlpt) and copy everything
@@ -328,85 +305,95 @@ pub struct Cli {
     /// filtering, .git directories included).
     ///
     /// Does NOT include: -X (xattrs), -A (ACLs), -H (hardlinks) - add those flags separately.
-    #[arg(short = 'a', long)]
+    #[usage(short = 'a', long)]
     pub archive: bool,
 
     /// Filter files based on .gitignore rules (opt-in)
     ///
     /// By default, sy copies all files like rsync/cp.
     /// Use this flag to respect .gitignore rules for developer-friendly syncs.
-    #[arg(long)]
+    #[usage(long)]
     pub gitignore: bool,
 
     /// Exclude .git directories from the sync (opt-in)
     ///
     /// By default, sy copies .git directories like rsync/cp.
     /// Use this flag to skip version control directories for faster syncs.
-    #[arg(long)]
+    #[usage(long)]
     pub exclude_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
-    #[arg(long)]
+    #[usage(long)]
     pub ignore_times: bool,
 
     /// Only compare file size, skip mtime checks (rsync --size-only)
-    #[arg(long)]
+    #[usage(long)]
     pub size_only: bool,
 
     /// Always compare checksums instead of size+mtime (slow but thorough, rsync --checksum)
-    #[arg(short = 'c', long)]
+    #[usage(short = 'c', long)]
     pub checksum: bool,
 
     /// Skip files where destination is newer than source (rsync --update)
-    #[arg(short = 'u', long)]
+    #[usage(short = 'u', long)]
     pub update: bool,
 
     /// Skip files that already exist in destination (rsync --ignore-existing)
-    #[arg(long)]
+    #[usage(long)]
     pub ignore_existing: bool,
 
     /// Output JSON (newline-delimited JSON for scripting)
-    #[arg(long)]
+    #[usage(long)]
     pub json: bool,
 
     /// Watch mode - continuously monitor source for changes
-    #[arg(short = 'w', long)]
+    #[usage(short = 'w', long)]
     pub watch: bool,
 
     /// Disable hook execution (skip pre-sync and post-sync hooks)
-    #[arg(long)]
+    #[usage(long)]
     pub no_hooks: bool,
 
     /// Abort sync if any hook fails (default: warn and continue)
-    #[arg(long)]
+    #[usage(long)]
     pub abort_on_hook_failure: bool,
 
     /// Use named profile from config file
-    #[arg(long)]
+    #[usage(long)]
     pub profile: Option<String>,
 
     /// List all available profiles
-    #[arg(long)]
+    #[usage(long)]
     pub list_profiles: bool,
 
     /// Show details of a specific profile
-    #[arg(long)]
+    #[usage(long)]
     pub show_profile: Option<String>,
 
     /// Maximum deletions allowed
     /// - Absolute count: --max-delete=1000
     /// - Percentage: --max-delete=50%
     /// - 0 = unlimited (default: 50%)
-    #[arg(long, default_value = "50%")]
+    #[usage(long, default = "50%")]
     pub max_delete: String,
 
     // === rsync compatibility flags (hidden, no-op) ===
     /// Recursive (no-op: sy is always recursive, for rsync compatibility)
-    #[arg(short = 'r', hide = true)]
+    #[usage(short = 'r', hide)]
     pub recursive: bool,
 }
 
 impl Cli {
+    pub fn parse() -> Self {
+        match Arguments::parse().into_cli() {
+            Ok(cli) => cli,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         // --diff is a dry-run display variant; without --dry-run it silently
         // showed nothing, which reads as success while doing nothing at all.
@@ -595,6 +582,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn parse_cli(words: &[&str]) -> Cli {
+        let words: Vec<_> = words.iter().map(std::ffi::OsStr::new).collect();
+        Arguments::parse_from(&words).unwrap().into_cli().unwrap()
+    }
 
     #[test]
     fn test_validate_source_exists() {
@@ -820,14 +812,14 @@ mod tests {
         // remote source -> local destination with --delete must be refused
         // before any connection: v3 pull must evaluate the remote source's
         // ignore rules for delete protection before deletions are authorized.
-        let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", "--delete"]);
+        let cli = parse_cli(&["host:/src", "/tmp/dst", "--delete"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn test_validate_pull_rejects_unimplemented_v3_flags() {
         for flag in ["--remove-source-files", "--copy-links"] {
-            let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", flag]);
+            let cli = parse_cli(&["host:/src", "/tmp/dst", flag]);
             assert!(cli.validate().is_err(), "pull must reject {flag}");
         }
     }
@@ -845,7 +837,7 @@ mod tests {
             "--timeout=30",
             "--compress",
         ] {
-            let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst", flag]);
+            let cli = parse_cli(&["host:/src", "/tmp/dst", flag]);
             assert!(cli.validate().is_ok(), "pull must accept {flag}");
         }
     }
@@ -853,7 +845,7 @@ mod tests {
     #[test]
     fn test_validate_pull_accepts_supported_flags() {
         // The same flags stay valid on local->local syncs and plain pulls.
-        let cli = Cli::parse_from(["sy", "host:/src", "/tmp/dst"]);
+        let cli = parse_cli(&["host:/src", "/tmp/dst"]);
         assert!(cli.validate().is_ok());
     }
 
@@ -1312,7 +1304,7 @@ mod tests {
     fn test_diff_requires_dry_run() {
         // --diff without --dry-run previously did nothing silently; validation
         // must reject it so a mistaken invocation cannot read as success.
-        let cli = Cli::try_parse_from(["sy", "/tmp/source/", "/tmp/dest", "--diff"]).unwrap();
+        let cli = parse_cli(&["/tmp/source/", "/tmp/dest", "--diff"]);
         assert!(cli
             .validate()
             .unwrap_err()
