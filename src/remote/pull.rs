@@ -333,21 +333,7 @@ impl RemotePullExecutor {
                 // local copy (the destination is local in a pull). A backup
                 // failure aborts the fetch so the user's copy cannot be
                 // silently skipped.
-                if let Some(existing) = &destination {
-                    if existing.is_file() && self.backup_enabled() {
-                        let backup_abs = self.backup_destination_for(&existing.path)?;
-                        if let Some(parent) = backup_abs.parent() {
-                            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                                RemotePullError::LocalMutation(backup_abs.clone(), error)
-                            })?;
-                        }
-                        copy_local_backup(&self.destination_root, &existing.path, &backup_abs)
-                            .await
-                            .map_err(|error| {
-                                RemotePullError::LocalMutation(backup_abs.clone(), error)
-                            })?;
-                    }
-                }
+                self.backup_replacement(destination.as_ref()).await?;
                 let summary = self
                     .fetch_into_staging(&source, expected_destination, &metadata)
                     .await?;
@@ -436,21 +422,7 @@ impl RemotePullExecutor {
         let mut groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(&group).cloned() {
             let is_update = destination.is_some();
-            if let Some(existing) = &destination {
-                if existing.is_file() && self.backup_enabled() {
-                    let backup_abs = self.backup_destination_for(&existing.path)?;
-                    if let Some(parent) = backup_abs.parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                            RemotePullError::LocalMutation(backup_abs.clone(), error)
-                        })?;
-                    }
-                    copy_local_backup(&self.destination_root, &existing.path, &backup_abs)
-                        .await
-                        .map_err(|error| {
-                            RemotePullError::LocalMutation(backup_abs.clone(), error)
-                        })?;
-                }
-            }
+            self.backup_replacement(destination.as_ref()).await?;
             let first_abs = self.dest_path(&first);
             let dest_abs = self.dest_path(&source.path);
             link_local_file(&first_abs, &dest_abs, expected_destination).await?;
@@ -476,19 +448,7 @@ impl RemotePullExecutor {
         let is_update = destination.is_some();
         self.validate_file_fetch_options()?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        if let Some(existing) = &destination {
-            if existing.is_file() && self.backup_enabled() {
-                let backup_abs = self.backup_destination_for(&existing.path)?;
-                if let Some(parent) = backup_abs.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                        RemotePullError::LocalMutation(backup_abs.clone(), error)
-                    })?;
-                }
-                copy_local_backup(&self.destination_root, &existing.path, &backup_abs)
-                    .await
-                    .map_err(|error| RemotePullError::LocalMutation(backup_abs.clone(), error))?;
-            }
-        }
+        self.backup_replacement(destination.as_ref()).await?;
         let summary = self
             .fetch_into_staging(&source, expected_destination, &metadata)
             .await?;
@@ -610,6 +570,26 @@ impl RemotePullExecutor {
         }
         if self.compression.is_some() && !capabilities.zstd {
             return Err(RemotePullError::Remote(RemoteSessionError::PeerLacksZstd));
+        }
+        Ok(())
+    }
+
+    /// Preserve only scanned regular files, without changing the visible
+    /// destination or its identity before the replacement transaction.
+    async fn backup_replacement(&self, destination: Option<&Entry>) -> Result<()> {
+        if let Some(existing) = destination.filter(|entry| entry.is_file() && self.backup_enabled())
+        {
+            let expected = existing.identity.ok_or_else(|| {
+                RemotePullError::MissingDestinationIdentity(existing.path.as_path().to_path_buf())
+            })?;
+            let backup_abs = self.backup_destination_for(&existing.path)?;
+            copy_local_backup(
+                &self.destination_root,
+                &existing.path,
+                &backup_abs,
+                expected,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -793,44 +773,24 @@ impl RemotePullExecutor {
     }
 }
 
-/// Copy a to-be-replaced or deleted local file to its --backup location.
-/// The copy never follows symlinks: a backup must preserve the link
-/// semantics decision to the remove step, and a dangling target must not
-/// turn a cheap rename-class operation into a resolvable read.
+/// Privately copy the scanned regular destination before replacement. The
+/// rooted helper binds the no-follow source handle to the scanned identity
+/// and validates it again before publishing the backup. Never move the
+/// visible original: fetch/preservation may still fail before commit.
 async fn copy_local_backup(
     destination_root: &Path,
     relative: &RelativePath,
     backup_abs: &Path,
-) -> std::result::Result<(), std::io::Error> {
-    let source_abs = destination_root.join(relative.as_path());
-    let source_meta = tokio::fs::symlink_metadata(&source_abs).await?;
-    if source_meta.file_type().is_symlink() {
-        // Preserve the link itself in the backup, matching the push side's
-        // symlink-no-backup semantics: remove proceeds, the link is recreated
-        // from the scanned target if a later sync wants it.
-        let target = tokio::fs::read_link(&source_abs).await?;
-        #[cfg(unix)]
-        {
-            tokio::fs::symlink(&target, backup_abs).await?;
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = target;
-            return Ok(());
-        }
-    }
-    if !source_meta.is_file() {
-        return Ok(());
-    }
-    // Rename is atomic and cannot be interrupted into a partial backup; the
-    // source is about to be replaced or deleted, so moving is the correct
-    // preservation. A cross-device backup dir falls back to a copy.
-    if tokio::fs::rename(&source_abs, backup_abs).await.is_ok() {
-        return Ok(());
-    }
-    tokio::fs::copy(&source_abs, backup_abs).await?;
-    Ok(())
+    expected: EntryIdentity,
+) -> crate::rooted_fs::Result<()> {
+    let rooted = crate::rooted_fs::RootedFs::open(destination_root.to_path_buf()).await?;
+    let relative = relative.clone();
+    let backup_abs = backup_abs.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        rooted.backup_file_blocking(&relative, &backup_abs, expected)
+    })
+    .await
+    .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
 }
 
 /// Stage a hardlink beside the destination and replace it only if the scanned
