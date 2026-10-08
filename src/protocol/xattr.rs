@@ -220,6 +220,11 @@ impl WireXattrRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if self.kind == WireEntryKind::Directory && self.mode == XattrMode::Write {
+            return Err(ProtocolError::InvalidMessage(
+                "directory mutations require observed finalization",
+            ));
+        }
         if self.mode == XattrMode::Read && !self.entries.is_empty() {
             return Err(ProtocolError::InvalidField {
                 field: "xattr_entries",
@@ -406,7 +411,7 @@ mod tests {
     fn write_request_round_trips_attributes_including_empty_values() {
         let request = WireXattrRequest::write(
             path(),
-            WireEntryKind::Directory,
+            WireEntryKind::File,
             vec![
                 xattr(b"user.empty", b""),
                 xattr(b"user.binary", &[0, 1, 2, 255]),

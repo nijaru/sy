@@ -334,9 +334,9 @@ mod tests {
                     .unwrap();
             let scan = session.scan_handler();
             let file = session.file_handler();
-            // dest scan, source scan, three file transfers (create + update +
-            // directory descendants), and no more.
-            for _ in 0..5 {
+            // Destination scan, directory creation, three file transfers,
+            // then observed directory finalization.
+            for _ in 0..6 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {
@@ -344,6 +344,9 @@ mod tests {
                     }
                     IncomingRequest::Mutation(incoming) => {
                         session.mutation_handler().serve(incoming).await.unwrap();
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        session.metadata_handler().serve(incoming).await.unwrap();
                     }
                     _ => panic!("unexpected remove-source v3 adapter request"),
                 }
@@ -434,7 +437,7 @@ mod tests {
             let hash = session.hash_handler();
             let file = session.file_handler();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..7 {
+            for _ in 0..8 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         let scan = scan.clone();
@@ -465,6 +468,15 @@ mod tests {
                         let mutation = session.mutation_handler();
                         tasks.spawn(async move {
                             mutation
+                                .serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    IncomingRequest::Metadata(incoming) => {
+                        let metadata = session.metadata_handler();
+                        tasks.spawn(async move {
+                            metadata
                                 .serve(incoming)
                                 .await
                                 .map_err(|error| error.to_string())

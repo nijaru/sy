@@ -1,6 +1,11 @@
 mod acl;
 mod bsdflags;
 mod codec;
+mod directory;
+pub use directory::{
+    WireDirectoryAction, WireDirectoryMetadata, WireDirectoryPreservation, DIRECTORY_FINALIZE,
+    DIRECTORY_READ,
+};
 mod entry;
 mod fetch;
 mod frame;

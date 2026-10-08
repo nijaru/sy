@@ -307,25 +307,40 @@ impl ClientRemoteHandle {
         .map_err(Into::into)
     }
 
+    pub async fn read_directory_preservation(
+        &self,
+        path: &RelativePath,
+        expected: EntryIdentity,
+        request: crate::rooted_fs::DirectoryPreservationRequest,
+    ) -> Result<crate::rooted_fs::DirectoryPreservation> {
+        super::directory::read(&self.sender, path, expected, request, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn finalize_directory_metadata(
         &self,
         path: &RelativePath,
+        expected: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
+        preservation: &crate::rooted_fs::DirectoryPreservation,
     ) -> Result<()> {
         self.require_push(FrameKind::Metadata)?;
-        super::metadata::request_directory_finalize(
+        super::directory::finalize(
             &self.sender,
             path,
+            expected,
             unix_mode,
             modified,
+            preservation,
             self.peer,
         )
         .await
         .map_err(Into::into)
     }
 
-    pub async fn create_directory(&self, path: &RelativePath) -> Result<()> {
+    pub async fn create_directory(&self, path: &RelativePath) -> Result<EntryIdentity> {
         self.require_push(FrameKind::Mutation)?;
         request_create_directory(&self.sender, path, self.peer)
             .await

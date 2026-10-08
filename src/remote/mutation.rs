@@ -75,13 +75,18 @@ pub async fn request_create_directory(
     sender: &RouterSender,
     path: &RelativePath,
     peer: PlatformOs,
-) -> Result<()> {
+) -> Result<EntryIdentity> {
     ensure_compatible_path_encoding(peer)?;
-    request_mutation(
+    let bytes = request_mutation_payload(
         sender,
         WireMutation::create_directory(encode_relative_path(path.as_path())?),
     )
-    .await
+    .await?;
+    let identity = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| RemoteMutationError::InvalidAck)?;
+    Ok(EntryIdentity::from_bytes(identity))
 }
 
 pub async fn request_replace_symlink(
@@ -157,6 +162,13 @@ pub async fn request_hardlink(
 }
 
 async fn request_mutation(sender: &RouterSender, mutation: WireMutation) -> Result<()> {
+    if !request_mutation_payload(sender, mutation).await?.is_empty() {
+        return Err(RemoteMutationError::InvalidAck);
+    }
+    Ok(())
+}
+
+async fn request_mutation_payload(sender: &RouterSender, mutation: WireMutation) -> Result<Bytes> {
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     sender
@@ -223,7 +235,7 @@ pub async fn serve_incoming_mutation_rooted(
         })?;
     drop(first);
 
-    tokio::task::spawn_blocking(move || {
+    let payload = tokio::task::spawn_blocking(move || {
         apply_mutation(
             &rooted,
             relative,
@@ -242,7 +254,7 @@ pub async fn serve_incoming_mutation_rooted(
             FrameKind::Ack,
             FrameFlags::empty(),
             stream_id,
-            Bytes::new(),
+            payload,
         )?)
         .await?;
     Ok(())
@@ -256,9 +268,12 @@ fn apply_mutation(
     copy_source: Option<RelativePath>,
     expected_identity: Option<EntryIdentity>,
     modified: Option<Timestamp>,
-) -> Result<()> {
+) -> Result<Bytes> {
     match kind {
-        WireMutationKind::CreateDirectory => rooted.create_directory_blocking(&path)?,
+        WireMutationKind::CreateDirectory => {
+            let identity = rooted.create_directory_blocking(&path)?;
+            return Ok(Bytes::copy_from_slice(identity.as_bytes()));
+        }
         WireMutationKind::ReplaceSymlink => {
             let target = target.ok_or(RemoteMutationError::MissingSymlinkTarget)?;
             let expected = expected_identity.map_or(
@@ -284,10 +299,10 @@ fn apply_mutation(
             rooted.create_hardlink_blocking(&source, &path)?;
         }
     }
-    Ok(())
+    Ok(Bytes::new())
 }
 
-async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
+async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<Bytes> {
     let routed = inbox
         .recv()
         .await?
@@ -296,10 +311,10 @@ async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()>
         })?;
     let frame = routed.frame();
     require_stream(frame, stream_id)?;
-    if frame.kind() != FrameKind::Ack || !frame.flags().is_empty() || !frame.payload().is_empty() {
+    if frame.kind() != FrameKind::Ack || !frame.flags().is_empty() {
         return Err(RemoteMutationError::InvalidAck);
     }
-    Ok(())
+    Ok(frame.payload().clone())
 }
 
 fn require_stream(frame: &Frame, stream_id: StreamId) -> Result<()> {

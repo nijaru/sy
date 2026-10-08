@@ -77,24 +77,6 @@ pub async fn request_metadata(
     .await
 }
 
-pub async fn request_directory_finalize(
-    sender: &RouterSender,
-    path: &RelativePath,
-    unix_mode: Option<u32>,
-    modified: Option<Timestamp>,
-    peer: PlatformOs,
-) -> Result<()> {
-    request_metadata_update(
-        sender,
-        path,
-        WireMetadataTarget::DirectoryFinalize,
-        unix_mode,
-        modified,
-        peer,
-    )
-    .await
-}
-
 async fn request_metadata_update(
     sender: &RouterSender,
     path: &RelativePath,
@@ -130,6 +112,11 @@ pub async fn serve_incoming_metadata_rooted(
     peer: PlatformOs,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
+    if incoming.first.frame().payload().first().is_some_and(|tag| {
+        *tag == crate::protocol::DIRECTORY_READ || *tag == crate::protocol::DIRECTORY_FINALIZE
+    }) {
+        return super::directory::serve(rooted, incoming, sender, peer).await;
+    }
     let IncomingStream { first, inbox: _ } = incoming;
     let stream_id = first.frame().stream_id();
     let frame = first.frame();
@@ -164,9 +151,6 @@ pub async fn serve_incoming_metadata_rooted(
             unix_mode,
             modified,
         ),
-        WireMetadataTarget::DirectoryFinalize => {
-            rooted.finalize_directory_metadata_blocking(&relative, unix_mode, modified)
-        }
     })
     .await
     .map_err(|error| RemoteMetadataError::Worker(error.to_string()))??;

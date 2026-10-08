@@ -222,6 +222,11 @@ impl WireAclRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if self.kind == WireEntryKind::Directory && self.mode == AclMode::Write {
+            return Err(ProtocolError::InvalidMessage(
+                "directory mutations require observed finalization",
+            ));
+        }
         match (self.mode, &self.acl) {
             (AclMode::Read, None) | (AclMode::Write, Some(_)) => Ok(()),
             (AclMode::Read, Some(_)) => Err(ProtocolError::InvalidField {
@@ -323,7 +328,7 @@ mod tests {
         for text in ["", "allow::user:nick:read\n"] {
             let request = WireAclRequest::write(
                 path(),
-                WireEntryKind::Directory,
+                WireEntryKind::File,
                 WireAcl::new(text.to_string()).unwrap(),
             )
             .unwrap();

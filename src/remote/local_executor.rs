@@ -397,42 +397,37 @@ impl LocalSyncExecutor {
     async fn execute(
         &self,
         item: WorkItem<LocalSyncAction>,
-    ) -> Result<Option<crate::engine::work::TransferSummary>> {
+    ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
             LocalSyncAction::CreateDirectory { source } => {
-                // Read the source's attributes before creating anything so a
-                // source metadata failure cannot leave a partial entry.
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
-                let bsd_flags = self.read_source_bsd_flags(&source).await?;
+                let source_root =
+                    crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+                let expected = source.identity.ok_or_else(|| {
+                    crate::rooted_fs::RootedFsError::DestinationChanged(
+                        source.path.as_path().to_path_buf(),
+                    )
+                })?;
                 let rooted = self.metadata_authority().await?.clone();
                 let relative = source.path.clone();
-                tokio::task::spawn_blocking(move || rooted.create_directory_blocking(&relative))
-                    .await
-                    .map_err(|error| {
-                        crate::rooted_fs::RootedFsError::Worker(error.to_string())
-                    })??;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                }
+                let identity = tokio::task::spawn_blocking(move || {
+                    source_root.read_directory_preservation_blocking(
+                        &relative,
+                        expected,
+                        Default::default(),
+                    )?;
+                    rooted.create_directory_blocking(&relative)
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::DirectoryPrepared(identity))
             }
             LocalSyncAction::TransferFile {
                 source,
@@ -446,7 +441,7 @@ impl LocalSyncExecutor {
                         return self
                             .execute_grouped_file(source, destination, metadata, group)
                             .await
-                            .map(Some);
+                            .map(crate::engine::work::WorkResult::Transfer);
                     }
                 }
                 let is_update = destination.is_some();
@@ -481,7 +476,7 @@ impl LocalSyncExecutor {
                     crate::sync::output::ItemizeOp::Create
                 };
                 self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
-                Ok(Some(transfer))
+                Ok(crate::engine::work::WorkResult::Transfer(transfer))
             }
             LocalSyncAction::ReplaceSymlink {
                 source,
@@ -511,7 +506,7 @@ impl LocalSyncExecutor {
                     crate::sync::output::ItemizeKind::Symlink,
                     &source.path,
                 );
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
             LocalSyncAction::ApplyMetadata {
                 source,
@@ -548,7 +543,7 @@ impl LocalSyncExecutor {
                     self.write_destination_bsd_flags(&source.path, source.kind, flags)
                         .await?;
                 }
-                Ok(None)
+                Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
     }
@@ -878,11 +873,35 @@ impl LocalSyncExecutor {
             })
             .await?;
         let rooted = self.metadata_authority().await?.clone();
+        let source = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let request = crate::rooted_fs::DirectoryPreservationRequest {
+            xattrs: self.xattrs,
+            acl: self.acls,
+            bsd_flags: self.bsd_flags,
+        };
         tokio::task::spawn_blocking(move || {
-            rooted.finalize_directory_metadata_blocking(
+            let crate::engine::finalize_journal::DirectoryTarget::Observed(expected) =
+                metadata.target
+            else {
+                return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
+                    metadata.path.as_path().to_path_buf(),
+                ));
+            };
+            let preservation = if metadata.preserve_source {
+                source.read_directory_preservation_blocking(
+                    &metadata.path,
+                    metadata.source_identity,
+                    request,
+                )?
+            } else {
+                Default::default()
+            };
+            rooted.finalize_directory_blocking(
                 &metadata.path,
+                expected,
                 metadata.unix_mode,
                 metadata.modified,
+                &preservation,
             )
         })
         .await
@@ -964,7 +983,7 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
     async fn execute(
         &self,
         item: WorkItem<LocalSyncAction>,
-    ) -> std::result::Result<Option<crate::engine::work::TransferSummary>, LocalSyncError> {
+    ) -> std::result::Result<crate::engine::work::WorkResult, LocalSyncError> {
         LocalSyncExecutor::execute(self, item).await
     }
 
@@ -1304,7 +1323,10 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), b"old");
             } else {
-                assert_eq!(result.unwrap().unwrap().reused_bytes, 3);
+                let crate::engine::work::WorkResult::Transfer(transfer) = result.unwrap() else {
+                    panic!("expected transfer receipt")
+                };
+                assert_eq!(transfer.reused_bytes, 3);
                 assert_eq!(
                     std::fs::metadata(dest_root.path().join("a")).unwrap().ino(),
                     std::fs::metadata(dest_root.path().join("b")).unwrap().ino()
