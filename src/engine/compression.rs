@@ -1,7 +1,7 @@
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
-/// Initial zstd profile selected by the v3 chunk benchmark.
+/// Initial zstd profile for v3 data chunks.
 ///
 /// This is an implementation profile, not a user-facing quality setting.
 /// `auto` may still choose no compression when that is faster end to end.
@@ -11,7 +11,8 @@ pub const ZSTD_FAST_LEVEL: i32 = -5;
 ///
 /// `Auto` samples the first chunk and compresses only when the wall-clock
 /// model (`choose_for_min_elapsed`) predicts a win at the current link rate.
-/// `Always` compresses every chunk unconditionally. The legacy extension-
+/// `Always` attempts every chunk, keeping raw bytes when compression would
+/// expand them. The legacy extension-
 /// only detection mode has no 0.5 meaning (the model is sample-based) and maps
 /// to `Auto` at the v3 boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,9 +21,8 @@ pub enum CompressionPolicy {
     Always,
 }
 
-/// Link rate used by the `Auto` timing model when no rate is known. Chosen
-/// from the v3 chunk benchmark: below ~125 MB/s the zstd-fast pipeline wins
-/// on compressible data, and slower links only widen that win.
+/// Fallback link-rate estimate when this session has no measured rate.
+/// This is an input to the `Auto` model, not a throughput guarantee.
 pub const DEFAULT_LINK_RATE_BYTES_PER_SEC: u64 = 125 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,6 +5,7 @@ use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireData, WireDeltaCopy,
     WireFileBasis, WireFileBegin, WireFileEnd, MAX_TRANSFER_DATA_SIZE,
 };
+use crate::remote::data::DataChunk;
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
 };
@@ -225,7 +226,7 @@ pub(crate) enum ProducerItem {
 }
 
 enum ReconstructionOp {
-    Data(Bytes),
+    Data(DataChunk),
     Copy(WireDeltaCopy),
     Xattrs(Vec<(OsString, Vec<u8>)>),
     Acls(String),
@@ -422,7 +423,7 @@ pub async fn request_file_transfer_with_stream_policy(
         )?)
         .await?;
 
-    let (producer_tx, mut producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
+    let (producer_tx, producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
         produce_source(
             source_file,
@@ -434,35 +435,7 @@ pub async fn request_file_transfer_with_stream_policy(
         )
     });
 
-    while let Some(item) = producer_rx.recv().await {
-        let frame = match item {
-            ProducerItem::Data(bytes) => Frame::new(
-                FrameKind::Data,
-                FrameFlags::empty(),
-                stream_id,
-                WireData::new(bytes)?.into_bytes(),
-            )?,
-            // The COMPRESSED flag appears only on frames whose payload is
-            // actually zstd-compressed, per the protocol contract.
-            ProducerItem::CompressedData(bytes) => Frame::new(
-                FrameKind::Data,
-                FrameFlags::COMPRESSED,
-                stream_id,
-                WireData::new(bytes)?.into_bytes(),
-            )?,
-            ProducerItem::Copy(copy) => Frame::new(
-                FrameKind::DeltaCopy,
-                FrameFlags::empty(),
-                stream_id,
-                copy.encode(),
-            )?,
-        };
-        sender.send(frame).await?;
-    }
-
-    let summary = producer
-        .await
-        .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    let summary = send_produced_file(sender, stream_id, producer_rx, producer).await?;
     // Preservation rides the transfer stream so the server can apply it to
     // private staging before commit; a failure there aborts the replacement.
     if let Some(xattrs) = &metadata.xattrs {
@@ -508,6 +481,52 @@ pub async fn request_file_transfer_with_stream_policy(
     Ok(summary)
 }
 
+/// Own the bounded producer queue and join its blocking worker on every send
+/// outcome. Closing the receiver before joining wakes a backpressured producer
+/// when the transport fails instead of leaving it detached.
+pub(super) async fn send_produced_file(
+    sender: &RouterSender,
+    stream_id: StreamId,
+    mut producer_rx: mpsc::Receiver<ProducerItem>,
+    producer: tokio::task::JoinHandle<Result<TransferSummary>>,
+) -> Result<TransferSummary> {
+    let sent: Result<()> = async {
+        while let Some(item) = producer_rx.recv().await {
+            let frame = match item {
+                ProducerItem::Data(bytes) => Frame::new(
+                    FrameKind::Data,
+                    FrameFlags::empty(),
+                    stream_id,
+                    WireData::new(bytes)?.into_bytes(),
+                )?,
+                // The COMPRESSED flag appears only on frames whose payload is
+                // actually zstd-compressed, per the protocol contract.
+                ProducerItem::CompressedData(bytes) => Frame::new(
+                    FrameKind::Data,
+                    FrameFlags::COMPRESSED,
+                    stream_id,
+                    WireData::new(bytes)?.into_bytes(),
+                )?,
+                ProducerItem::Copy(copy) => Frame::new(
+                    FrameKind::DeltaCopy,
+                    FrameFlags::empty(),
+                    stream_id,
+                    copy.encode(),
+                )?,
+            };
+            sender.send(frame).await?;
+        }
+        Ok(())
+    }
+    .await;
+    drop(producer_rx);
+    let produced = producer
+        .await
+        .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))?;
+    sent?;
+    produced
+}
+
 /// Reconstruct one peer-opened file stream beneath the root pinned when the v3
 /// session was opened. FileBegin may securely reopen a destination basis through
 /// that descriptor, but the session root pathname is never resolved again.
@@ -540,9 +559,46 @@ pub async fn serve_incoming_file_rooted(
 
     let (reconstruction_tx, reconstruction_rx) = mpsc::channel(RECONSTRUCTION_QUEUE_DEPTH);
     let begin_for_worker = begin.clone();
-    let mut worker = Some(tokio::task::spawn_blocking(move || {
+    let mut worker = tokio::task::spawn_blocking(move || {
         reconstruct_file(prepared, begin_for_worker, reconstruction_rx)
-    }));
+    });
+
+    // A malformed frame closes admission and joins the staging owner before
+    // returning. Also observe worker failure while waiting for peer input: a
+    // rejected chunk must not require another frame to wake the receiver.
+    let summary = tokio::select! {
+        received = receive_reconstruction(&mut inbox, &begin, &reconstruction_tx) => {
+            drop(reconstruction_tx);
+            let reconstructed = await_reconstruction(worker).await;
+            match (received, reconstructed) {
+                (Ok(()), result) => result?,
+                (Err(RemoteTransferError::ReconstructionStopped), Err(error)) => return Err(error),
+                (Err(error), _) => return Err(error),
+            }
+        }
+        reconstructed = &mut worker => {
+            drop(reconstruction_tx);
+            reconstructed
+                .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??
+        }
+    };
+    sender
+        .send(Frame::new(
+            FrameKind::Ack,
+            FrameFlags::empty(),
+            stream_id,
+            Bytes::new(),
+        )?)
+        .await?;
+    Ok(summary)
+}
+
+async fn receive_reconstruction(
+    inbox: &mut StreamInbox,
+    begin: &WireFileBegin,
+    reconstruction_tx: &mpsc::Sender<ReconstructionOp>,
+) -> Result<()> {
+    let stream_id = inbox.stream_id();
     let mut seen_xattrs = false;
     let mut seen_acls = false;
 
@@ -557,21 +613,7 @@ pub async fn serve_incoming_file_rooted(
         require_stream(frame, stream_id)?;
 
         let op = match frame.kind() {
-            FrameKind::Data => {
-                // A compressed payload is only accepted because this session
-                // advertised the ZSTD capability in its handshake. The flag
-                // must reflect the actual payload, so an uncompressed Data
-                // frame must not carry it and vice versa.
-                if frame.flags() == FrameFlags::COMPRESSED {
-                    let compressed = WireData::decode(frame.payload())?.into_bytes();
-                    let decompressed = zstd::stream::decode_all(compressed.as_ref())
-                        .map_err(|error| RemoteTransferError::Decompression(error.to_string()))?;
-                    ReconstructionOp::Data(Bytes::from(decompressed))
-                } else {
-                    require_empty_flags(frame)?;
-                    ReconstructionOp::Data(WireData::decode(frame.payload())?.into_bytes())
-                }
-            }
+            FrameKind::Data => ReconstructionOp::Data(DataChunk::from_frame(frame)?),
             FrameKind::DeltaCopy => {
                 require_empty_flags(frame)?;
                 if begin.basis().is_none() {
@@ -628,32 +670,13 @@ pub async fn serve_incoming_file_rooted(
             }
         };
         let is_end = matches!(op, ReconstructionOp::End(_));
-        if reconstruction_tx.send(op).await.is_err() {
-            let worker = worker
-                .take()
-                .ok_or(RemoteTransferError::ReconstructionStopped)?;
-            return match await_reconstruction(worker).await {
-                Ok(_) => Err(RemoteTransferError::ReconstructionStopped),
-                Err(error) => Err(error),
-            };
-        }
+        reconstruction_tx
+            .send(op)
+            .await
+            .map_err(|_| RemoteTransferError::ReconstructionStopped)?;
         drop(routed);
-
         if is_end {
-            drop(reconstruction_tx);
-            let worker = worker
-                .take()
-                .ok_or(RemoteTransferError::ReconstructionStopped)?;
-            let summary = await_reconstruction(worker).await?;
-            sender
-                .send(Frame::new(
-                    FrameKind::Ack,
-                    FrameFlags::empty(),
-                    stream_id,
-                    Bytes::new(),
-                )?)
-                .await?;
-            return Ok(summary);
+            return Ok(());
         }
     }
 }
@@ -700,7 +723,7 @@ fn produce_source(
             reused_bytes: delta.reused_bytes,
         }
     } else {
-        produce_whole(&mut file, sender, compression.as_ref())?
+        produce_whole(&mut file, expected_size, sender, compression.as_ref())?
     };
 
     validate_source(&file, expected_identity, expected_size)?;
@@ -713,11 +736,8 @@ fn produce_source(
     Ok(summary)
 }
 
-/// Compress one chunk with the profile from the v3 chunk benchmark. The
-/// compressed size stays under the wire cap because chunk reads are bounded
-/// by `MAX_TRANSFER_DATA_SIZE` and zstd never expands past a small header
-/// overhead on incompressible input; the caller still validates via
-/// `WireData::new` before send.
+/// Compress a bounded source chunk. Incompressible input can expand beyond
+/// the wire limit; the producer must then send the original bytes instead.
 fn compress_chunk(bytes: &[u8]) -> Result<Bytes> {
     let compressed = zstd::bulk::compress(bytes, crate::engine::compression::ZSTD_FAST_LEVEL)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -726,6 +746,7 @@ fn compress_chunk(bytes: &[u8]) -> Result<Bytes> {
 
 pub(crate) fn produce_whole(
     file: &mut File,
+    expected_size: u64,
     sender: mpsc::Sender<ProducerItem>,
     compression: Option<&crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
@@ -738,11 +759,8 @@ pub(crate) fn produce_whole(
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
 
-    // Auto mode samples the first chunk and lets the wall-clock model decide
-    // whether compression wins for the remaining bulk; Always compresses every
-    // chunk. The first chunk of Auto is always sent compressed because the
-    // sample measurement requires a compressed observation anyway and a single
-    // chunk of wrong choice cannot dominate a transfer.
+    // Auto samples once to choose whether later chunks are worth attempting.
+    // Even Always sends raw bytes when a particular chunk would expand.
     let mut decision = match compression {
         Some(CompressionPolicy::Always) | Some(CompressionPolicy::Auto) => {
             CompressionChoice::ZstdFast
@@ -768,56 +786,40 @@ pub(crate) fn produce_whole(
             .checked_add(u64::try_from(read).map_err(|_| RemoteTransferError::ByteCountOverflow)?)
             .ok_or(RemoteTransferError::ByteCountOverflow)?;
 
+        let compressed = if decision == CompressionChoice::ZstdFast {
+            Some(compress_chunk(bytes)?)
+        } else {
+            None
+        };
         if first_chunk {
             first_chunk = false;
-            let compressed = compress_chunk(bytes)?;
+            let compressed = compressed.as_ref().expect("Auto samples the first chunk");
             let sample = CompressionSample::new(read as u64, compressed.len() as u64)
                 .expect("chunk read is non-zero");
             let timing = CompressionTiming::new(
                 ByteRate::new(DEFAULT_LINK_RATE_BYTES_PER_SEC).expect("constant is non-zero"),
-                // Encode/decode rates from the v3 chunk benchmark: zstd -5
-                // encodes at ~800 MB/s and decodes at ~1.6 GB/s on the
-                // reference hardware; slower CPUs only make compression
-                // *less* attractive, so the defaults are the optimistic end.
+                // Initial codec-rate estimates, not measurements of this host.
+                // The model selects representation; it does not provide a
+                // throughput guarantee or change transfer integrity.
                 ByteRate::new(800 * 1024 * 1024).unwrap(),
                 ByteRate::new(1600 * 1024 * 1024).unwrap(),
                 std::num::NonZeroU32::new(MAX_TRANSFER_DATA_SIZE as u32)
                     .expect("chunk size is non-zero"),
             );
-            decision = choose_for_min_elapsed(file_size.max(read as u64), sample, timing);
-            if decision == CompressionChoice::ZstdFast {
-                sender
-                    .blocking_send(ProducerItem::CompressedData(compressed))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
-                    })?;
-            } else {
-                sender
-                    .blocking_send(ProducerItem::Data(Bytes::copy_from_slice(bytes)))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
-                    })?;
-            }
-            continue;
+            decision = choose_for_min_elapsed(expected_size, sample, timing);
         }
 
-        match decision {
-            CompressionChoice::ZstdFast => {
-                let compressed = compress_chunk(bytes)?;
-                sender
-                    .blocking_send(ProducerItem::CompressedData(compressed))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
-                    })?;
+        let item = match compressed {
+            Some(compressed)
+                if decision == CompressionChoice::ZstdFast && compressed.len() < read =>
+            {
+                ProducerItem::CompressedData(compressed)
             }
-            CompressionChoice::None => {
-                sender
-                    .blocking_send(ProducerItem::Data(Bytes::copy_from_slice(bytes)))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
-                    })?;
-            }
-        }
+            _ => ProducerItem::Data(Bytes::copy_from_slice(bytes)),
+        };
+        sender.blocking_send(item).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
+        })?;
     }
 
     Ok(TransferSummary {
@@ -885,7 +887,8 @@ fn reconstruct_file(
 
     while let Some(op) = receiver.blocking_recv() {
         match op {
-            ReconstructionOp::Data(bytes) => {
+            ReconstructionOp::Data(chunk) => {
+                let bytes = chunk.decode_blocking()?;
                 file_size = checked_output_size(file_size, bytes.len(), begin.file_size())?;
                 prepared.staged.file_mut().write_all(&bytes)?;
                 hasher.update(&bytes);
@@ -1154,6 +1157,139 @@ mod tests {
         BasisIndex::new(block_size as u32, blocks, BasisIndexLimits::default()).unwrap()
     }
 
+    #[test]
+    fn compression_keeps_every_encoded_and_decoded_chunk_within_the_wire_limit() {
+        use crate::engine::compression::CompressionPolicy;
+
+        let mut data = vec![b'x'; MAX_TRANSFER_DATA_SIZE];
+        // Deterministic high-entropy input, not a repeating byte ramp which
+        // would compress well and fail to exercise zstd header expansion.
+        let mut state = 0x8d12_e3a5_6b7c_90f1_u64;
+        for _ in 0..MAX_TRANSFER_DATA_SIZE {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.push(state as u8);
+        }
+        for policy in [
+            None,
+            Some(CompressionPolicy::Auto),
+            Some(CompressionPolicy::Always),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&data).unwrap();
+            file.rewind().unwrap();
+            // The fixture has only two chunks; it fits the production queue.
+            let (tx, mut rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
+            let summary = produce_whole(&mut file, data.len() as u64, tx, policy.as_ref()).unwrap();
+            let mut received = Vec::new();
+            let mut compressed_chunks = 0;
+            while let Ok(item) = rx.try_recv() {
+                let chunk = match item {
+                    ProducerItem::Data(bytes) => {
+                        assert!(bytes.len() <= MAX_TRANSFER_DATA_SIZE);
+                        DataChunk::Plain(bytes)
+                    }
+                    ProducerItem::CompressedData(bytes) => {
+                        assert!(bytes.len() < MAX_TRANSFER_DATA_SIZE);
+                        compressed_chunks += 1;
+                        DataChunk::Zstd(bytes)
+                    }
+                    ProducerItem::Copy(_) => panic!("whole transfer emitted a basis copy"),
+                };
+                let decoded = chunk.decode_blocking().unwrap();
+                assert!(decoded.len() <= MAX_TRANSFER_DATA_SIZE);
+                received.extend_from_slice(&decoded);
+            }
+            assert_eq!(received, data);
+            assert_eq!(summary.digest, *blake3::hash(&data).as_bytes());
+            assert_eq!(compressed_chunks, usize::from(policy.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_receive_drains_staging_without_waiting_for_another_frame() {
+        let compressed =
+            zstd::bulk::compress(&vec![b'x'; MAX_TRANSFER_DATA_SIZE * 32], -5).unwrap();
+        for (flags, payload) in [
+            (FrameFlags::COMPRESSED, Bytes::from(compressed)),
+            (FrameFlags::COMPRESSED, Bytes::from_static(b"invalid zstd")),
+            (FrameFlags::FINAL, Bytes::from_static(b"invalid flags")),
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            std::fs::write(root.path().join("file"), b"old").unwrap();
+            let destination = file_entry(root.path(), "file");
+            let basis =
+                WireFileBasis::new(destination.size, *destination.identity.unwrap().as_bytes());
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (client_reader, client_writer) = tokio::io::split(client_io);
+            let (server_reader, server_writer) = tokio::io::split(server_io);
+            let client = FrameRouter::start(
+                client_reader,
+                client_writer,
+                RouterRole::Client,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let mut server_router = FrameRouter::start(
+                server_reader,
+                server_writer,
+                RouterRole::Server,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let incoming = server_router.incoming().recv().await.unwrap().unwrap();
+                serve_incoming_file_rooted(
+                    rooted,
+                    incoming,
+                    &server_router.sender(),
+                    crate::protocol::Platform::current().os,
+                )
+                .await
+            });
+            let sender = client.sender();
+            let inbox = sender.open_stream().unwrap();
+            let id = inbox.stream_id();
+            let path = encode_relative_path(Path::new("file")).unwrap();
+            sender
+                .send(
+                    Frame::new(
+                        FrameKind::FileBegin,
+                        FrameFlags::empty(),
+                        id,
+                        WireFileBegin::delta(path, (MAX_TRANSFER_DATA_SIZE * 32) as u64, basis)
+                            .encode(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            sender
+                .send(Frame::new(FrameKind::Data, flags, id, payload).unwrap())
+                .await
+                .unwrap();
+            // Keep the transport open but send no FileEnd. Neither malformed
+            // input nor worker failure may wait for the peer to send more data.
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("failed transfer waited for more peer input")
+                .unwrap();
+            assert!(matches!(
+                result,
+                Err(RemoteTransferError::Decompression(_))
+                    | Err(RemoteTransferError::FrameFlags { .. })
+            ));
+            assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+            assert_eq!(
+                std::fs::read_dir(root.path()).unwrap().count(),
+                1,
+                "receive returned before private staging was removed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn whole_file_stream_commits_only_after_verified_file_end() {
         let source_root = tempfile::TempDir::new().unwrap();
@@ -1388,9 +1524,11 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
-        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
-            .await
-            .unwrap();
+        tx.send(ReconstructionOp::Data(DataChunk::Plain(
+            Bytes::from_static(b"new"),
+        )))
+        .await
+        .unwrap();
         tx.send(ReconstructionOp::End(WireFileEnd::new(3, [0; 32])))
             .await
             .unwrap();
@@ -1483,9 +1621,11 @@ mod tests {
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
-        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
-            .await
-            .unwrap();
+        tx.send(ReconstructionOp::Data(DataChunk::Plain(
+            Bytes::from_static(b"new"),
+        )))
+        .await
+        .unwrap();
 
         // A concurrent writer replaces the destination while bytes are staged.
         std::fs::write(root.path().join("file"), b"RACED").unwrap();
@@ -1529,9 +1669,11 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::channel(4);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
-        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
-            .await
-            .unwrap();
+        tx.send(ReconstructionOp::Data(DataChunk::Plain(
+            Bytes::from_static(b"new"),
+        )))
+        .await
+        .unwrap();
         tx.send(ReconstructionOp::Xattrs(vec![(
             OsString::from("user.sy_test"),
             b"v".to_vec(),
@@ -1573,9 +1715,11 @@ mod tests {
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(4);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
-        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
-            .await
-            .unwrap();
+        tx.send(ReconstructionOp::Data(DataChunk::Plain(
+            Bytes::from_static(b"new"),
+        )))
+        .await
+        .unwrap();
         tx.send(ReconstructionOp::Acls("not an acl entry".to_string()))
             .await
             .unwrap();
@@ -1619,9 +1763,11 @@ mod tests {
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
-        tx.send(ReconstructionOp::Data(Bytes::from_static(b"new")))
-            .await
-            .unwrap();
+        tx.send(ReconstructionOp::Data(DataChunk::Plain(
+            Bytes::from_static(b"new"),
+        )))
+        .await
+        .unwrap();
         let digest = blake3::hash(b"new");
         tx.send(ReconstructionOp::End(WireFileEnd::new(
             3,
