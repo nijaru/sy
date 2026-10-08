@@ -297,6 +297,52 @@ mod tests {
         assert_eq!(first.ino(), second.ino());
     }
 
+    #[tokio::test]
+    async fn hardlink_remove_source_files_removes_group_after_publication_locally() {
+        let source_root = TempDir::new().unwrap();
+        let destination_root = TempDir::new().unwrap();
+        std::fs::write(source_root.path().join("first"), b"shared-bytes").unwrap();
+        std::fs::hard_link(
+            source_root.path().join("first"),
+            source_root.path().join("second"),
+        )
+        .unwrap();
+        std::fs::hard_link(
+            source_root.path().join("first"),
+            source_root.path().join("third"),
+        )
+        .unwrap();
+
+        let mut config = SyncConfig::test_default();
+        config.preserve.hardlinks = true;
+        config.remove_source_files = true;
+        let stats = run(
+            source_root.path(),
+            destination_root.path(),
+            &config,
+            ScanOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_created, 3);
+        assert!(!source_root.path().join("first").exists());
+        assert!(!source_root.path().join("second").exists());
+        assert!(!source_root.path().join("third").exists());
+        assert_eq!(
+            std::fs::read(destination_root.path().join("first")).unwrap(),
+            b"shared-bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("second")).unwrap(),
+            b"shared-bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("third")).unwrap(),
+            b"shared-bytes"
+        );
+    }
+
     /// -X/--preserve-xattrs locally: source attributes are mirrored onto the
     /// destination after the transfer, and a later pass clears values the
     /// source dropped.

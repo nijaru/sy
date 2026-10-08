@@ -6,6 +6,7 @@ pub mod delete_plan;
 pub mod domain;
 pub mod finalize_journal;
 pub(crate) mod hardlink_groups;
+pub(crate) mod hardlink_removals;
 pub mod ignore_scope;
 pub mod namespace;
 pub(crate) mod native_path;

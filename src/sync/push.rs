@@ -643,9 +643,10 @@ mod tests {
     /// -H/--preserve-hardlinks over v3: members of one scanned group share
     /// a single transferred representative; the rest become server-side
     /// links to it. One file's bytes move; both destination paths share one
-    /// inode. The server sees exactly scan + transfer + hardlink mutation.
+    /// inode. With --remove-source-files, local source names are removed only
+    /// after the whole group has published.
     #[tokio::test]
-    async fn hardlink_group_shares_one_transfer_over_v3() {
+    async fn hardlink_group_shares_one_transfer_and_removes_sources_over_v3() {
         let source_root = TempDir::new().unwrap();
         let destination_root = TempDir::new().unwrap();
         std::fs::write(source_root.path().join("first"), b"shared-bytes").unwrap();
@@ -693,6 +694,7 @@ mod tests {
         .unwrap();
         let mut config = supported_config();
         config.preserve.hardlinks = true;
+        config.remove_source_files = true;
         let stats = execute_with_handle(
             source_root.path(),
             destination_root.path(),
@@ -706,6 +708,8 @@ mod tests {
         server.await.unwrap();
         assert_eq!(stats.files_created, 2);
         assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
+        assert!(!source_root.path().join("first").exists());
+        assert!(!source_root.path().join("second").exists());
         assert_eq!(
             std::fs::read(destination_root.path().join("first")).unwrap(),
             b"shared-bytes"

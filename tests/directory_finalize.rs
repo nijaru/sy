@@ -84,6 +84,9 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
         }
         self.inner.execute_finalize(metadata).await
     }
+    async fn finish_deferred_source_removals(&self) -> Result<(), E::Error> {
+        self.inner.finish_deferred_source_removals().await
+    }
     async fn remove_unchanged_source(
         &self,
         source: &Entry,
