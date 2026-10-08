@@ -1,7 +1,7 @@
 use super::RootedFs;
 use crate::endpoint::local_identity::metadata_identity;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
-use crate::engine::reconcile::BoxError;
+use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::ScanRequest;
 use crate::engine::scan_sort::{read_name, NameSpool, SortBudget};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -11,9 +11,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-
-mod stream;
-use stream::RootedEntryStream;
 
 const CHANNEL_CAPACITY: usize = 256;
 const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
@@ -71,8 +68,11 @@ pub(crate) enum RootedScanError {
 impl RootedFs {
     /// Produce a strictly ordered metadata stream rooted at the directory inode
     /// pinned by this `RootedFs`. The root pathname is never consulted.
-    pub(crate) fn entry_stream(&self, request: ScanRequest) -> RootedEntryStream {
-        RootedEntryStream::spawn(self.clone(), request)
+    pub(crate) fn entry_stream(&self, request: ScanRequest) -> EntryStream {
+        let rooted = self.clone();
+        EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
+            scan_worker(rooted, request, sender)
+        })
     }
 }
 
@@ -80,24 +80,22 @@ fn scan_worker(
     rooted: RootedFs,
     request: ScanRequest,
     sender: tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
-) {
+) -> Result<(), BoxError> {
     if request.respect_gitignore {
-        send_error(&sender, RootedScanError::GitignoreUnsupported);
-        return;
+        return Err(Box::new(RootedScanError::GitignoreUnsupported));
     }
     if request.max_depth == Some(0) {
-        return;
+        return Ok(());
     }
-
-    if let Err(error) = walk_tree(&rooted, request, &sender, SortBudget::default()) {
-        if !sender.is_closed() {
-            send_error(&sender, error);
+    match walk_tree(&rooted, request, &sender, SortBudget::default()) {
+        Ok(()) => Ok(()),
+        Err(RootedScanError::Scratch(error))
+            if sender.is_closed() && error.kind() == io::ErrorKind::Interrupted =>
+        {
+            Ok(())
         }
+        Err(error) => Err(Box::new(error)),
     }
-}
-
-fn send_error(sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>, error: RootedScanError) {
-    let _ = sender.blocking_send(Err(Box::new(error) as BoxError));
 }
 
 // Fixed-size continuation records keep both ancestor identities and sorted-run

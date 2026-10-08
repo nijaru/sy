@@ -157,38 +157,57 @@ impl SyncSession {
         );
         let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
 
-        while let Some(item) = reconciler.next().await.map_err(map_engine_error)? {
-            match item {
-                ReconcileItem::SourceOnly(entry) => {
-                    result
-                        .files_only_in_source
-                        .push(source.join(entry.path.as_path()));
-                }
-                ReconcileItem::DestinationOnly(entry) => {
-                    result
-                        .files_only_in_dest
-                        .push(dest.join(entry.path.as_path()));
-                }
-                ReconcileItem::Matched {
-                    source: source_entry,
-                    destination: dest_entry,
-                } => {
-                    let relative = source_entry.path.as_path();
-                    match entries_match(source_endpoint, dest_endpoint, &source_entry, &dest_entry)
+        let scanned = async {
+            while let Some(item) = reconciler.next().await? {
+                match item {
+                    ReconcileItem::SourceOnly(entry) => {
+                        result
+                            .files_only_in_source
+                            .push(source.join(entry.path.as_path()));
+                    }
+                    ReconcileItem::DestinationOnly(entry) => {
+                        result
+                            .files_only_in_dest
+                            .push(dest.join(entry.path.as_path()));
+                    }
+                    ReconcileItem::Matched {
+                        source: source_entry,
+                        destination: dest_entry,
+                    } => {
+                        let relative = source_entry.path.as_path();
+                        match entries_match(
+                            source_endpoint,
+                            dest_endpoint,
+                            &source_entry,
+                            &dest_entry,
+                        )
                         .await
-                    {
-                        Ok(true) => result.files_matched += 1,
-                        Ok(false) => result.files_mismatched.push(source.join(relative)),
-                        Err(error) => result.errors.push(StatError {
-                            path: source.join(relative),
-                            error: error.to_string(),
-                            action: "verify".to_string(),
-                        }),
+                        {
+                            Ok(true) => result.files_matched += 1,
+                            Ok(false) => result.files_mismatched.push(source.join(relative)),
+                            Err(error) => result.errors.push(StatError {
+                                path: source.join(relative),
+                                error: error.to_string(),
+                                action: "verify".to_string(),
+                            }),
+                        }
                     }
                 }
             }
-        }
 
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        let drained = reconciler.close().await;
+        match (scanned, drained) {
+            (Err(operation), Err(drain)) => {
+                return Err(SyncError::Io(std::io::Error::other(format!(
+                    "verification failed ({operation}) and scan draining failed ({drain})"
+                ))))
+            }
+            (Err(error), _) | (_, Err(error)) => return Err(map_engine_error(error)),
+            (Ok(()), Ok(())) => {}
+        }
         result.duration = started.elapsed();
         Ok(result)
     }

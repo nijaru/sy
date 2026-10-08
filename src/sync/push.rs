@@ -1175,10 +1175,10 @@ mod tests {
             Ok(file_entry("skip.tmp")),
             Err(Box::new(std::io::Error::other("source scan failed"))),
         ];
-        let source: EntryStream = Box::pin(stream::iter(source_items));
-        let destination: EntryStream = Box::pin(stream::iter(vec![Ok::<Entry, BoxError>(
-            file_entry("remove"),
-        )]));
+        let source = EntryStream::new(stream::iter(source_items));
+        let destination = EntryStream::new(stream::iter(vec![Ok::<Entry, BoxError>(file_entry(
+            "remove",
+        ))]));
         let delete_filter = filter.clone();
 
         let result = preflight_sync(

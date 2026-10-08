@@ -203,7 +203,7 @@ async fn run_case(
         .await
         .unwrap();
     let stream = |entries: Vec<Entry>| -> sy::engine::reconcile::EntryStream {
-        Box::pin(futures::stream::iter(entries.into_iter().map(Ok)))
+        sy::engine::reconcile::EntryStream::new(futures::stream::iter(entries.into_iter().map(Ok)))
     };
     let plan = preflight_sync(
         stream(source_entries),

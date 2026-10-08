@@ -12,7 +12,7 @@ use crate::filter::FilterEngine;
 use crate::sync::config::{DeleteMode, SyncConfig};
 use crate::sync::scanner::ScanOptions;
 use crate::sync::stats::SyncStats;
-use futures::{future, StreamExt};
+use futures::future;
 use sy::engine::compression::CompressionPolicy;
 use sy::engine::controller::{ControllerError, PreviewOp, SyncPreview, SyncSummary};
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
@@ -59,13 +59,13 @@ pub(crate) fn filtered_source_stream(source: EntryStream, filter: FilterEngine) 
     }
 
     let mut selection = SourceFilterSelection::new(filter);
-    Box::pin(source.filter_map(move |item| {
+    source.filter_map(move |item| {
         let keep = match item.as_ref() {
             Ok(entry) => selection.includes(entry),
             Err(_) => true,
         };
         future::ready(keep.then_some(item))
-    }))
+    })
 }
 
 pub(crate) fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {

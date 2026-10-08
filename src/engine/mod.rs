@@ -4,6 +4,7 @@ pub mod controller;
 pub mod delete_journal;
 pub mod delete_plan;
 pub mod domain;
+mod entry_stream;
 pub mod finalize_journal;
 pub(crate) mod hardlink_groups;
 pub(crate) mod hardlink_removals;
