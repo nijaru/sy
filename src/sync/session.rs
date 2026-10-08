@@ -1,8 +1,7 @@
 //! v0.5 sync session orchestration.
 //!
-//! Local synchronization delegates to the ordered, bounded reconciler. Remote
-//! synchronization keeps the existing SSH streaming protocol until its v0.5
-//! protocol migration is ready.
+//! Local, push, and pull entry points use the shared ordered controller;
+//! remote sessions carry endpoint operations over the v3 protocol.
 
 use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::local::LocalEndpoint;
@@ -294,7 +293,7 @@ impl SyncSession {
                 return Err(SyncError::Config(reason.to_string()));
             }
             super::pull::run(
-                &source_root.to_string_lossy(),
+                source_root,
                 self.dest.root(),
                 host,
                 user,
