@@ -453,6 +453,10 @@ mod tests {
         std::fs::create_dir(source_root.path().join("dir")).unwrap();
         std::fs::write(source_root.path().join("file"), b"same").unwrap();
 
+        let source_file = source_root.path().join("file");
+        let source_dir = source_root.path().join("dir");
+        let base_file_acl = exacl::getfacl(&source_file, None).unwrap();
+        let base_dir_acl = exacl::getfacl(&source_dir, None).unwrap();
         // SAFETY: `getuid` has no pointer arguments or other preconditions.
         let uid = unsafe { libc::getuid() };
         let add_acl = |path: &std::path::Path| {
@@ -465,8 +469,8 @@ mod tests {
             exacl::setfacl(&[path], &acl, None).unwrap();
             exacl::to_string(&exacl::getfacl(path, None).unwrap()).unwrap()
         };
-        let source_file_acl = add_acl(&source_root.path().join("file"));
-        let source_dir_acl = add_acl(&source_root.path().join("dir"));
+        let source_file_acl = add_acl(&source_file);
+        let source_dir_acl = add_acl(&source_dir);
 
         let mut config = SyncConfig::test_default();
         config.preserve.acls = true;
@@ -481,10 +485,8 @@ mod tests {
 
         let destination_file = destination_root.path().join("file");
         let destination_dir = destination_root.path().join("dir");
-        let base_file = exacl::from_str("").unwrap();
-        exacl::setfacl(&[destination_file.as_path()], &base_file, None).unwrap();
-        let base_dir = exacl::from_str("").unwrap();
-        exacl::setfacl(&[destination_dir.as_path()], &base_dir, None).unwrap();
+        exacl::setfacl(&[destination_file.as_path()], &base_file_acl, None).unwrap();
+        exacl::setfacl(&[destination_dir.as_path()], &base_dir_acl, None).unwrap();
 
         run(
             source_root.path(),
