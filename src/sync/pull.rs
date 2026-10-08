@@ -23,8 +23,6 @@ use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 
-/// Whether a pull must fall back to the legacy v2 stack.
-///
 /// Pull-specific option refusals.
 ///
 /// Refuses operations not yet supported over pull (server-side source removal,
@@ -43,7 +41,7 @@ pub(super) fn pull_unsupported_reason(config: &SyncConfig) -> Option<&'static st
 }
 
 pub(super) async fn run(
-    source_root: &str,
+    source_root: &Path,
     destination_root: &Path,
     host: &str,
     user: &Option<String>,
@@ -70,11 +68,10 @@ pub(super) async fn run(
     // The pull session root is the remote SOURCE root. The server refuses to
     // create a missing pull root, which is the data-safe direction: a typo'd
     // source path fails loudly instead of scanning an empty new tree.
-    let source_root_path = std::path::PathBuf::from(source_root);
     let session = SshRemoteSession::connect_with_options(
         &target,
         Operation::Pull,
-        &source_root_path,
+        source_root,
         router_config,
         launch,
     )
@@ -84,7 +81,9 @@ pub(super) async fn run(
     let sender = session.remote().sender();
     // The display source keeps the host qualifier so output surfaces match
     // what the user typed; the scan itself goes through the session root.
-    let display_source = format!("{host}:{source_root}");
+    let mut display_source = std::ffi::OsString::from(format!("{host}:"));
+    display_source.push(source_root);
+    let display_source = std::path::PathBuf::from(display_source);
     let mut stats = execute_with_handle(
         &display_source,
         destination_root,
@@ -99,7 +98,7 @@ pub(super) async fn run(
 }
 
 async fn execute_with_handle(
-    source_root: &str,
+    source_root: &Path,
     destination_root: &Path,
     remote: ClientRemoteHandle,
     sender: sy::remote::router::RouterSender,
@@ -120,7 +119,7 @@ async fn execute_with_handle(
         .scan(source_scan_request(config, scan_options))
         .await
         .map_err(map_io)?;
-    reporter.start(Path::new(source_root), destination_root);
+    reporter.start(source_root, destination_root);
     // A first pull into a fresh directory is the common case; the local
     // engine creates a missing destination root, and the pull must match.
     // Dry-run never mutates, so it reports against the tree as-is.
@@ -320,7 +319,7 @@ mod tests {
         .unwrap();
         let config = supported_config();
         let stats = execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -398,7 +397,7 @@ mod tests {
         .await
         .unwrap();
         let error = execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -478,7 +477,7 @@ mod tests {
         let mut config = supported_config();
         config.preserve.xattrs = true;
         execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -551,7 +550,7 @@ mod tests {
         let mut config = supported_config();
         config.preserve.xattrs = true;
         execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -568,7 +567,7 @@ mod tests {
         xattr::remove(source_root.path().join("dir"), name).unwrap();
         xattr::set(&destination_dir, name, b"remove-dir").unwrap();
         execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -652,7 +651,7 @@ mod tests {
         let mut config = supported_config();
         config.preserve.acls = true;
         execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -737,7 +736,7 @@ mod tests {
         let mut config = supported_config();
         config.preserve.flags = true;
         execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -810,7 +809,7 @@ mod tests {
         let mut config = supported_config();
         config.compression_detection = crate::compress::CompressionDetection::Always;
         let stats = execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -898,7 +897,7 @@ mod tests {
         let mut config = supported_config();
         config.preserve.hardlinks = true;
         let stats = execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),
@@ -1021,7 +1020,7 @@ mod tests {
         .unwrap();
         let config = supported_config();
         let result = execute_with_handle(
-            &source_root.path().to_string_lossy(),
+            source_root.path(),
             destination_root.path(),
             session.request_handle(),
             session.sender(),

@@ -384,13 +384,12 @@ impl LocalSyncExecutor {
     /// with the tree shape preserved (GNU rsync semantics). Always
     /// destination-anchored — never relative to the process CWD.
     fn backup_destination_for(&self, relative: &RelativePath) -> Result<PathBuf> {
-        let file_name = relative
+        let mut backup_name = relative
             .as_path()
             .file_name()
             .ok_or_else(|| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
-            .to_string_lossy()
-            .into_owned();
-        let backup_name = format!("{file_name}{}", self.backup_suffix);
+            .to_os_string();
+        backup_name.push(&self.backup_suffix);
         match &self.backup_dir {
             Some(dir) => {
                 let mut backup = dir.join(relative.as_path());

@@ -353,33 +353,14 @@ impl RemoteBackupPlan {
         &self,
         path: &crate::engine::domain::RelativePath,
     ) -> Option<crate::engine::domain::RelativePath> {
-        let mut components: Vec<std::ffi::OsString> = Vec::new();
-        if let Some(dir) = &self.dir {
-            components.extend(dir.as_path().components().filter_map(|c| match c {
-                std::path::Component::Normal(name) => Some(name.to_os_string()),
-                _ => None,
-            }));
-        } else {
-            // Beside the file: parent components, then the suffixed name.
-            components.extend(
-                path.as_path()
-                    .parent()?
-                    .components()
-                    .filter_map(|c| match c {
-                        std::path::Component::Normal(name) => Some(name.to_os_string()),
-                        _ => None,
-                    }),
-            );
-        }
-        let name = path.as_path().file_name()?.to_string_lossy().into_owned();
-        components.push(format!("{name}{}", self.suffix).into());
-        crate::engine::domain::RelativePath::new(
-            components
-                .iter()
-                .map(|c| c.as_os_str())
-                .collect::<std::path::PathBuf>(),
-        )
-        .ok()
+        let mut backup = match &self.dir {
+            Some(dir) => dir.as_path().join(path.as_path()),
+            None => path.as_path().to_path_buf(),
+        };
+        let mut name = path.as_path().file_name()?.to_os_string();
+        name.push(&self.suffix);
+        backup.set_file_name(name);
+        crate::engine::domain::RelativePath::new(backup).ok()
     }
 }
 
