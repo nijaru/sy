@@ -140,8 +140,8 @@ name = "sync_edge_cases"
 path = "tests/sync/edge_cases.rs"
 
 [[test]]
-name = "sync_performance"
-path = "tests/sync/performance.rs"
+name = "sync_scale"
+path = "tests/sync/scale.rs"
 
 
 [[test]]
