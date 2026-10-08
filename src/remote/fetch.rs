@@ -16,8 +16,9 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::work::TransferSummary;
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolVersion, StreamId, WireAcl, WireAclResult,
-    WireData, WireFileEnd, WireFileFetchRequest, WireXattr, WireXattrResult, PROTOCOL_V3_2,
+    WireFileEnd, WireFileFetchRequest, WireXattr, WireXattrResult, PROTOCOL_V3_2,
 };
+use crate::remote::data::DataChunk;
 use crate::remote::path::{decode_relative_path, ensure_compatible_path_encoding};
 use crate::remote::router::{IncomingStream, RouterSender, StreamInbox};
 use crate::rooted_fs::RootedFs;
@@ -177,7 +178,7 @@ pub async fn fetch_file(
                 }
                 FrameKind::Data => {
                     data_started = true;
-                    let bytes = decode_data_frame(frame)?;
+                    let bytes = DataChunk::from_frame(frame)?.decode().await?;
                     file_size = file_size
                         .checked_add(
                             u64::try_from(bytes.len())
@@ -305,22 +306,6 @@ pub async fn acknowledge_fetch(
         .map_err(RemoteTransferError::Router)
 }
 
-fn decode_data_frame(frame: &Frame) -> std::result::Result<Bytes, RemoteTransferError> {
-    if frame.flags() == FrameFlags::COMPRESSED {
-        let compressed = WireData::decode(frame.payload())?.into_bytes();
-        let decompressed = zstd::stream::decode_all(compressed.as_ref())
-            .map_err(|error| RemoteTransferError::Decompression(error.to_string()))?;
-        Ok(Bytes::from(decompressed))
-    } else if frame.flags().is_empty() {
-        Ok(WireData::decode(frame.payload())?.into_bytes())
-    } else {
-        Err(RemoteTransferError::FrameFlags {
-            kind: frame.kind(),
-            flags: frame.flags().bits(),
-        })
-    }
-}
-
 /// Server side: serve one peer-opened file fetch stream.
 ///
 /// The source entry is validated against the scan identity before streaming;
@@ -428,11 +413,12 @@ pub async fn serve_incoming_file_fetch(
 
     // The producer applies the negotiated per-chunk compression policy; the
     // COMPRESSED flag is set only on frames whose payload is actually zstd.
-    let (producer_tx, mut producer_rx) =
+    let (producer_tx, producer_rx) =
         mpsc::channel::<crate::remote::transfer::ProducerItem>(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
         let summary = crate::remote::transfer::produce_whole(
             &mut source_file,
+            expected_size,
             producer_tx,
             compression.as_ref(),
         )?;
@@ -446,33 +432,9 @@ pub async fn serve_incoming_file_fetch(
         Ok(summary)
     });
 
-    while let Some(item) = producer_rx.recv().await {
-        let frame = match item {
-            crate::remote::transfer::ProducerItem::Data(bytes) => Frame::new(
-                FrameKind::Data,
-                FrameFlags::empty(),
-                stream_id,
-                WireData::new(bytes)?.into_bytes(),
-            )?,
-            crate::remote::transfer::ProducerItem::CompressedData(bytes) => Frame::new(
-                FrameKind::Data,
-                FrameFlags::COMPRESSED,
-                stream_id,
-                WireData::new(bytes)?.into_bytes(),
-            )?,
-            crate::remote::transfer::ProducerItem::Copy(_) => {
-                return Err(RemoteTransferError::InvalidBasis);
-            }
-        };
-        sender
-            .send(frame)
-            .await
-            .map_err(RemoteTransferError::Router)?;
-    }
-
-    let summary = producer
-        .await
-        .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    let summary =
+        crate::remote::transfer::send_produced_file(sender, stream_id, producer_rx, producer)
+            .await?;
     sender
         .send(Frame::new(
             FrameKind::FileEnd,
