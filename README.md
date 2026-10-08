@@ -15,6 +15,16 @@ track 0.5.
 cargo install sy
 ```
 
+For this 0.5 branch, build from source. ACL preservation is behind the `acl`
+feature and needs the platform ACL libraries (for example `libacl` on Linux):
+
+```bash
+cargo build --release --features acl
+```
+
+Static Linux/musl artifacts intentionally omit ACL support so they remain
+standalone remote-agent binaries.
+
 ## Quick Start
 
 ```bash
@@ -85,6 +95,10 @@ sy user@host:/remote /local
 sy /local user@host:/remote --timeout 30
 ```
 
+Remote-to-local pulls use the v3 engine, but `--delete`,
+`--remove-source-files`, and `--copy-links` are refused for pulls until their
+server-side confinement designs are complete.
+
 ### Filters
 
 ```bash
@@ -149,7 +163,7 @@ identity and root-confined filesystem operations are not implemented.
 | Symlinks | Stable | `--links=preserve/follow/skip` |
 | Backup mode (--backup) | Stable | Replacements and deletions |
 | Atomic writes | Stable | Private staging, verified, atomic replace |
-| Preservation (-X/-A/-F) | Stable | xattrs/ACLs/flags; applied to staging before commit |
+| Preservation (-X/-A/-F) | Stable | xattrs; ACLs with the `acl` feature; BSD flags on macOS. Unsupported combinations fail loudly rather than being silently skipped |
 | --bwlimit | Stable | Paced at the byte stream |
 | --checksum | Stable | BLAKE3 content comparison instead of mtime+size |
 | --update / --existing | Stable | Comparison modes for selective sync |
@@ -174,8 +188,9 @@ separate identity checks and rename/exchange syscalls, not atomic
 compare-and-swap; concurrent namespace writers can race those checks. Rename
 also does not promise power-loss durability or whole-run rollback.
 
-With `--remove-source-files`, transferred sources are removed only after commit
-and required preservation succeed. An unchanged regular file is eligible only
+With `--remove-source-files`, transferred local or push sources are removed only
+after commit and required preservation succeed. Remote-to-local pulls refuse
+`--remove-source-files`. An unchanged regular file is eligible only
 with `--checksum`: sy re-reads both files and checks requested permissions,
 mtime, xattrs, ACLs and flags against the observed identities before removing
 its source. A changed destination or preservation mismatch stops the operation
