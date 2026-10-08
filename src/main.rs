@@ -1,5 +1,4 @@
 use anyhow::{Context as _, Result};
-use clap::Parser;
 use colored::Colorize;
 use std::path::PathBuf;
 use sy::cli::{self, Cli, VerifyMode};
@@ -48,7 +47,7 @@ async fn main() {
         std::env::set_var("RUST_BACKTRACE", "0");
     }
 
-    // The private v3 SSH agent bypasses Clap and all normal CLI setup so stdout
+    // The private v3 SSH agent bypasses the parser and normal CLI setup so stdout
     // remains protocol-only from the first byte. The remote root is negotiated
     // in SessionOpen; it is deliberately not accepted as an argv pathname.
     let mut raw_args = std::env::args_os();
