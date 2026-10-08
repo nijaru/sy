@@ -555,13 +555,12 @@ Or install from local source with: cargo install --path . --features acl"#
                 anyhow::bail!("Watch mode currently only supports local sources.");
             }
 
-            // Watch mode using SyncSession (v0.4)
-            let watch_session = sync::watch_session::WatchSession::from_paths(
-                source,
-                destination,
-                config.clone(),
-                std::time::Duration::from_millis(500), // 500ms debounce
-            )?;
+            // Reuse the configured session, including filters and scan options.
+            let watch_session = sync::watch_session::WatchSession::new(
+                session,
+                source.path().to_path_buf(),
+                std::time::Duration::from_millis(500),
+            );
 
             watch_session.watch().await?;
             return Ok(()); // Watch mode handles its own output
