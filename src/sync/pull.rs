@@ -779,7 +779,7 @@ mod tests {
                         .unwrap();
                     }
                     IncomingRequest::Hash(incoming) => {
-                        sy::remote::hash::serve_incoming_hash(
+                        sy::remote::hash::serve_incoming_hash_rooted(
                             rooted.clone(),
                             incoming,
                             &sender,
