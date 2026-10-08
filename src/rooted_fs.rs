@@ -744,18 +744,6 @@ impl RootedFs {
         &self.root_path
     }
 
-    /// Keep the remote scan API available on unsupported platforms so the
-    /// agent can reject the operation through the normal typed error stream.
-    #[cfg(not(unix))]
-    pub(crate) fn entry_stream(
-        &self,
-        _request: crate::engine::scan::ScanRequest,
-    ) -> crate::engine::reconcile::EntryStream {
-        Box::pin(futures::stream::once(async {
-            Err(Box::new(RootedFsError::UnsupportedPlatform) as crate::engine::reconcile::BoxError)
-        }))
-    }
-
     /// Open one regular file relative to the pinned root without following any
     /// peer-controlled symlink component.
     ///
