@@ -1,71 +1,37 @@
-//! Source-derived ignore evaluation for deletion scope.
+//! One owner for source-walk ignore semantics and conservative deletion scope.
 //!
-//! The destination scan stays complete; whether a destination-only entry
-//! may be deleted is decided by asking whether the SOURCE tree's ignore
-//! rules would exclude that path. This module answers that question for
-//! arbitrary destination paths — including paths the source walk never
-//! emitted — with parity to the source walk's own ignore decisions, biased
-//! toward protection: where evaluation and the walk could disagree, this
-//! module over-ignores (protects) rather than under-ignores (deletes).
-//!
-//! Chaining mirrors the `ignore` crate's tested semantics: per-directory
-//! `.ignore` and `.gitignore` files consulted deepest-first with the first
-//! matching file deciding, the last matching pattern winning within one
-//! file, `.ignore` ahead of `.gitignore` at the same level, then
-//! `.git/info/exclude`, then global excludes, with git rules gated on
-//! repository presence (`require_git` default). An ignored directory
-//! prunes all descendants: negations in deeper files cannot re-include
-//! them, matching `gitignore(5)`.
-//!
-//! The crate's own chaining (`ignore::dir::Ignore`) is private, so the
-//! per-file `Gitignore` matchers are chained here by hand. One deliberate
-//! divergence: the walker anchors the explicit non-repository root
-//! fallback and global excludes to the process working directory; this
-//! scope anchors them to the source root, which is the semantic a sync
-//! tool wants regardless of invocation directory.
-
+//! Source matching follows ignore 0.4's category precedence, not a per-directory
+//! interleaving: all `.ignore`, then `.gitignore`, exclude, global, explicit.
+//! Only the original root's external parents are canonical; internal ancestry
+//! stays lexical even when a followed symlink points outside the source tree.
 use crate::engine::domain::Entry;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-const GITIGNORE_FILE: &str = ".gitignore";
-const DOT_IGNORE_FILE: &str = ".ignore";
-const EXCLUDE_PATH: &str = "info/exclude";
 const DIRECTORY_RULE_CACHE_CAPACITY: usize = 64;
+// These are configuration limits, not tree-size/depth limits. Both byte count
+// and pattern count matter: millions of short globs also consume compiler RAM.
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
+const MAX_RULES: usize = 4096;
 
-/// Compiled rule files for one directory, loaded on first visit.
-#[derive(Clone, Default)]
-struct DirectoryRules {
-    dot_ignore: Option<Gitignore>,
-    gitignore: Option<Gitignore>,
+struct RuleFile {
+    matcher: Gitignore,
+    malformed: bool,
 }
 
-/// Evaluator answering "would the source tree's ignore rules exclude this
-/// path?" for destination-side deletion scope.
-///
-/// Matchers are compiled lazily into a bounded LRU cache. Wide trees do not
-/// retain one cache entry per directory; eviction only causes recomputation. I/O and parse failures degrade to an empty matcher
-/// with a warning, matching the walker's policy of ignoring unreadable
-/// ignore files rather than failing the sync.
+type RuleCache = VecDeque<(PathBuf, PathBuf, RuleFile)>;
+
 pub struct SourceIgnoreScope {
     root: PathBuf,
-    /// When false, only the always-active `.ignore` chain is consulted,
-    /// mirroring the walker's unconditional `.ignore` support.
     respect_gitignore: bool,
-    /// Repo presence, probed once: `.git` (directory or worktree pointer
-    /// file) or `.jj` at the source root, mirroring the walker's
-    /// `require_git` discovery.
-    has_git: Option<bool>,
-    git_dir: Option<PathBuf>,
-    /// Explicit root `.gitignore` fallback, applied only for non-repository
-    /// trees (the walker's `add_ignore` of the root file).
-    explicit_root: Option<Option<Gitignore>>,
-    /// Most-recently-used first. A short deque keeps the common same-directory
-    /// lookup at the front without a second index or cloning compiled matchers.
-    dir_rules: VecDeque<(PathBuf, DirectoryRules)>,
-    exclude_matcher: Option<Option<Gitignore>>,
-    global_matcher: Option<Gitignore>,
+    canonical_root: Option<PathBuf>,
+    initialized: bool,
+    source_initialized: bool,
+    cwd: Option<PathBuf>,
+    global_file: Option<PathBuf>,
+    dir_rules: RuleCache,
 }
 
 impl SourceIgnoreScope {
@@ -73,240 +39,502 @@ impl SourceIgnoreScope {
         Self {
             root: root.to_path_buf(),
             respect_gitignore,
-            has_git: None,
-            git_dir: None,
-            explicit_root: None,
+            canonical_root: None,
+            initialized: false,
+            source_initialized: false,
+            cwd: std::env::current_dir().ok(),
+            global_file: None,
             dir_rules: VecDeque::new(),
-            exclude_matcher: None,
-            global_matcher: None,
         }
     }
 
-    /// Would the source's ignore rules exclude this path?
-    ///
-    /// `path` is relative to the source root; `is_dir` reflects the entry
-    /// being evaluated. An ignored ancestor directory prunes the path
-    /// regardless of deeper negations.
-    pub fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        let absolute = self.root.join(path);
+    fn initialize(&mut self) -> io::Result<()> {
+        if !self.initialized {
+            self.canonical_root = self.root.canonicalize().ok();
+            if self.respect_gitignore {
+                self.global_file = global_excludes()?;
+            }
+            self.initialized = true;
+        }
+        Ok(())
+    }
 
-        // Every ancestor must be considered: a deeper whitelist cannot
-        // reinclude a child of an ignored directory. Iterate borrowed paths
-        // rather than materializing the full ancestor chain on each lookup.
-        for ancestor in absolute.ancestors().skip(1) {
-            if ancestor == self.root || !ancestor.starts_with(&self.root) {
+    /// Load root/parent policy before enumeration, including empty roots.
+    /// Upstream reports malformed external-parent rules as walk errors, but
+    /// attaches malformed internal rules to otherwise usable directory entries.
+    pub(crate) fn prepare_source(&mut self) -> io::Result<()> {
+        self.initialize()?;
+        if self.source_initialized {
+            return Ok(());
+        }
+        if let Some(root) = self.canonical_root.clone() {
+            for directory in root.ancestors().skip(1) {
+                for name in [".ignore", ".gitignore"] {
+                    if name == ".gitignore" && !self.respect_gitignore {
+                        continue;
+                    }
+                    let file = directory.join(name);
+                    if self.load_file(directory, &file)?.malformed {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("malformed parent ignore configuration: {}", file.display()),
+                        ));
+                    }
+                }
+                if self.respect_gitignore {
+                    if let Some(git) = resolve_git_dir(directory)? {
+                        let file = git.join("info/exclude");
+                        if self.load_file(directory, &file)?.malformed {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "malformed parent ignore configuration: {}",
+                                    file.display()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let root = self.root.clone();
+        self.load_file(&root, &root.join(".ignore"))?;
+        if self.respect_gitignore {
+            self.load_file(&root, &root.join(".gitignore"))?;
+            if let Some(git) = resolve_git_dir(&root)? {
+                self.load_file(&root, &git.join("info/exclude"))?;
+            }
+        }
+        self.source_initialized = true;
+        Ok(())
+    }
+
+    /// Match one entry exactly as the original WalkBuilder does. The caller
+    /// owns directory pruning; rules inside an entry's own directory are not
+    /// used to decide whether to visit that directory.
+    pub(crate) fn source_match(&mut self, relative: &Path, is_dir: bool) -> io::Result<bool> {
+        self.prepare_source()?;
+        let lexical = self.root.join(relative);
+        let canonical = self.canonical_root.as_ref().map(|root| root.join(relative));
+        let mut any_git = false;
+        if self.respect_gitignore {
+            for directory in lexical.ancestors().skip(1) {
+                if !directory.starts_with(&self.root) {
+                    break;
+                }
+                any_git |= has_git(directory);
+            }
+            if let Some(root) = &self.canonical_root {
+                any_git |= root.ancestors().skip(1).any(has_git);
+            }
+        }
+        let mut decisions = [None; 3];
+        let mut saw_git = false;
+        for directory in lexical.ancestors().skip(1) {
+            if !directory.starts_with(&self.root) {
                 break;
             }
-            if self.chain_decision(ancestor, true) == Some(true) {
-                return true;
+            self.match_directory(
+                directory,
+                &lexical,
+                is_dir,
+                any_git && !saw_git,
+                &mut decisions,
+            )?;
+            saw_git |= self.respect_gitignore && has_git(directory);
+        }
+        // Do not canonicalize a followed descendant: its lexical source rules
+        // must remain in the chain. Canonical parents are appended once only.
+        if let (Some(root), Some(candidate)) = (self.canonical_root.clone(), canonical) {
+            for directory in root.ancestors().skip(1) {
+                self.match_directory(
+                    directory,
+                    &candidate,
+                    is_dir,
+                    any_git && !saw_git,
+                    &mut decisions,
+                )?;
+                saw_git |= self.respect_gitignore && has_git(directory);
             }
         }
-
-        self.chain_decision(&absolute, is_dir).unwrap_or(false)
-            || self.fallback_decision(&absolute, is_dir).unwrap_or(false)
+        if let Some(decision) = decisions.into_iter().flatten().next() {
+            return Ok(decision);
+        }
+        if self.respect_gitignore {
+            if let Some(cwd) = self.cwd.clone() {
+                if any_git {
+                    if let Some(file) = self.global_file.clone() {
+                        if let Some(decision) = self.match_file(&cwd, &file, &lexical, is_dir)? {
+                            return Ok(decision);
+                        }
+                    }
+                }
+                // add_ignore(root/.gitignore) is always explicit, including in
+                // repositories; upstream anchors it at CWD, not source root.
+                let file = self.root.join(".gitignore");
+                if let Some(decision) = self.match_file(&cwd, &file, &lexical, is_dir)? {
+                    return Ok(decision);
+                }
+            }
+        }
+        Ok(false)
     }
 
-    /// Whether a destination-only entry is out of deletion scope.
+    fn match_directory(
+        &mut self,
+        directory: &Path,
+        candidate: &Path,
+        is_dir: bool,
+        git_active: bool,
+        decisions: &mut [Option<bool>; 3],
+    ) -> io::Result<()> {
+        if decisions[0].is_none() {
+            decisions[0] =
+                self.match_file(directory, &directory.join(".ignore"), candidate, is_dir)?;
+        }
+        if git_active {
+            if decisions[1].is_none() {
+                decisions[1] =
+                    self.match_file(directory, &directory.join(".gitignore"), candidate, is_dir)?;
+            }
+            if decisions[2].is_none() {
+                if let Some(git_dir) = resolve_git_dir(directory)? {
+                    decisions[2] = self.match_file(
+                        directory,
+                        &git_dir.join("info/exclude"),
+                        candidate,
+                        is_dir,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletion also prunes ignored ancestors and retains the earlier
+    /// source-root-anchored fallback and conservative per-directory checks.
+    /// Exact source matching must not reduce established deletion protection.
+    pub fn is_ignored(&mut self, relative: &Path, is_dir: bool) -> bool {
+        match self.deletion_ignored(relative, is_dir) {
+            Ok(ignored) => ignored,
+            Err(error) => {
+                tracing::warn!("source ignore scope protects on failure: {error}");
+                true
+            }
+        }
+    }
+
+    fn deletion_ignored(&mut self, relative: &Path, is_dir: bool) -> io::Result<bool> {
+        for ancestor in relative
+            .ancestors()
+            .skip(1)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            if self.source_match(ancestor, true)? || self.legacy_match(ancestor, true)? {
+                return Ok(true);
+            }
+        }
+        Ok(self.source_match(relative, is_dir)? || self.legacy_match(relative, is_dir)?)
+    }
+
     pub fn protects(&mut self, entry: &Entry) -> bool {
         self.is_ignored(entry.path.as_path(), entry.is_directory())
     }
 
-    /// Consult per-directory rule files deepest-first. The first file
-    /// yielding a match decides; `.ignore` precedes `.gitignore` at the
-    /// same level, mirroring the walker's per-directory matcher order.
-    fn chain_decision(&mut self, absolute: &Path, is_dir: bool) -> Option<bool> {
-        let respect_gitignore = self.respect_gitignore;
+    fn legacy_match(&mut self, relative: &Path, is_dir: bool) -> io::Result<bool> {
+        let absolute = self.root.join(relative);
+        let mut chain = None;
         for directory in absolute.ancestors().skip(1) {
             if !directory.starts_with(&self.root) {
                 break;
             }
-            let rules = self.rules_for(directory);
-            let mut files = [rules.dot_ignore.as_ref(), rules.gitignore.as_ref()];
-            if !respect_gitignore {
-                files[1] = None;
-            }
-            for matcher in files.into_iter().flatten() {
-                if let Some(decision) = Self::match_one(matcher, absolute, is_dir) {
-                    return Some(decision);
+            for name in [".ignore", ".gitignore"] {
+                if name == ".gitignore" && !self.respect_gitignore {
+                    continue;
+                }
+                chain = self.match_file(directory, &directory.join(name), &absolute, is_dir)?;
+                if chain.is_some() {
+                    break;
                 }
             }
+            if chain.is_some() {
+                break;
+            }
         }
-        None
-    }
-
-    /// Repository-gated fallbacks: `.git/info/exclude`, then global
-    /// excludes. For non-repository trees, the explicit root `.gitignore`
-    /// takes their place.
-    fn fallback_decision(&mut self, absolute: &Path, is_dir: bool) -> Option<bool> {
+        if chain == Some(true) {
+            return Ok(true);
+        }
         if !self.respect_gitignore {
-            return None;
+            return Ok(false);
         }
-        if self.git_rules_active() {
-            if let Some(exclude) = self.exclude_matcher() {
-                if let Some(decision) = Self::match_one(exclude, absolute, is_dir) {
-                    return Some(decision);
+        let root = self.root.clone();
+        if has_git(&root) {
+            if let Some(git_dir) = resolve_legacy_git_dir(&root)? {
+                if let Some(decision) =
+                    self.match_file(&root, &git_dir.join("info/exclude"), &absolute, is_dir)?
+                {
+                    return Ok(decision);
                 }
             }
-            if let Some(global) = self.global_matcher() {
-                if let Some(decision) = Self::match_one(global, absolute, is_dir) {
-                    return Some(decision);
-                }
+            if let Some(file) = self.global_file.clone() {
+                return Ok(self
+                    .match_file(&root, &file, &absolute, is_dir)?
+                    .unwrap_or(false));
             }
-            None
+            Ok(false)
         } else {
-            let explicit = self.explicit_root_matcher()?;
-            Self::match_one(explicit, absolute, is_dir)
+            Ok(self
+                .match_file(&root, &root.join(".gitignore"), &absolute, is_dir)?
+                .unwrap_or(false))
         }
     }
 
-    fn match_one(matcher: &Gitignore, absolute: &Path, is_dir: bool) -> Option<bool> {
-        match matcher.matched(absolute, is_dir) {
-            ignore::Match::None => None,
-            ignore::Match::Ignore(_) => Some(true),
-            ignore::Match::Whitelist(_) => Some(false),
-        }
+    fn match_file(
+        &mut self,
+        root: &Path,
+        file: &Path,
+        candidate: &Path,
+        is_dir: bool,
+    ) -> io::Result<Option<bool>> {
+        Ok(
+            match self
+                .load_file(root, file)?
+                .matcher
+                .matched(candidate, is_dir)
+            {
+                ignore::Match::None => None,
+                ignore::Match::Ignore(_) => Some(true),
+                ignore::Match::Whitelist(_) => Some(false),
+            },
+        )
     }
 
-    fn rules_for(&mut self, directory: &Path) -> &DirectoryRules {
-        if let Some(index) = self
+    fn load_file(&mut self, root: &Path, file: &Path) -> io::Result<&RuleFile> {
+        let index = self
             .dir_rules
             .iter()
-            .position(|(path, _)| path == directory)
-        {
-            // The index came from this deque, so remove must return an entry.
+            .position(|(anchor, path, _)| anchor == root && path == file);
+        if let Some(index) = index {
             if let Some(cached) = self.dir_rules.remove(index) {
                 self.dir_rules.push_front(cached);
             }
         } else {
-            let rules = DirectoryRules {
-                dot_ignore: compile_matcher(directory, DOT_IGNORE_FILE),
-                gitignore: compile_matcher(directory, GITIGNORE_FILE),
-            };
+            let matcher = compile_matcher(root, file)?;
             if self.dir_rules.len() == DIRECTORY_RULE_CACHE_CAPACITY {
                 self.dir_rules.pop_back();
             }
-            self.dir_rules.push_front((directory.to_path_buf(), rules));
+            // Missing files are cached too. There are no tree-sized maps.
+            self.dir_rules
+                .push_front((root.to_path_buf(), file.to_path_buf(), matcher));
         }
-        // Either branch installs the requested entry at the front.
-        &self.dir_rules[0].1
-    }
-
-    fn git_rules_active(&mut self) -> bool {
-        if self.has_git.is_none() {
-            let dot_git = self.root.join(".git");
-            let has_git = dot_git.exists() || self.root.join(".jj").exists();
-            if has_git {
-                self.git_dir = Some(resolve_git_dir(&dot_git));
-            }
-            self.has_git = Some(has_git);
-        }
-        self.has_git.unwrap_or(false)
-    }
-
-    fn exclude_matcher(&mut self) -> Option<&Gitignore> {
-        if self.exclude_matcher.is_none() {
-            self.exclude_matcher = Some(self.git_dir.as_ref().and_then(|git_dir| {
-                let exclude = git_dir.join(EXCLUDE_PATH);
-                if exclude.exists() {
-                    Some(compile_matcher_rooted(&self.root, &exclude))
-                } else {
-                    None
-                }
-            }));
-        }
-        self.exclude_matcher.as_ref().and_then(Option::as_ref)
-    }
-
-    fn global_matcher(&mut self) -> Option<&Gitignore> {
-        if self.global_matcher.is_none() {
-            let (matcher, error) = GitignoreBuilder::new(&self.root).build_global();
-            if let Some(error) = error {
-                tracing::warn!("source ignore scope: global excludes: {}", error);
-            }
-            self.global_matcher = Some(matcher);
-        }
-        self.global_matcher.as_ref()
-    }
-
-    fn explicit_root_matcher(&mut self) -> Option<&Gitignore> {
-        if self.explicit_root.is_none() {
-            let root_gitignore = self.root.join(GITIGNORE_FILE);
-            self.explicit_root = Some(
-                root_gitignore
-                    .exists()
-                    .then(|| compile_matcher_rooted(&self.root, &root_gitignore)),
-            );
-        }
-        self.explicit_root.as_ref().and_then(Option::as_ref)
+        Ok(&self.dir_rules[0].2)
     }
 }
 
-/// Load an optional per-directory rule file.
-fn compile_matcher(directory: &Path, file_name: &str) -> Option<Gitignore> {
-    let rule_file = directory.join(file_name);
-    if !rule_file.exists() {
-        return None;
-    }
-    Some(compile_matcher_rooted(directory, &rule_file))
+fn has_git(directory: &Path) -> bool {
+    directory.join(".git").exists() || directory.join(".jj").exists()
 }
 
-/// Compile one rule file anchored at `root`. Failures degrade to an empty
-/// matcher; the walker likewise continues past unreadable ignore files.
-fn compile_matcher_rooted(root: &Path, rule_file: &Path) -> Gitignore {
+fn read_config(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A config path may be an adversarial FIFO; inspect without blocking.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // Upstream ignores unreadable rule/config files.
+        Err(_) => return Ok(None),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ignore configuration is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ignore configuration exceeds {MAX_CONFIG_BYTES} bytes: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn compile_matcher(root: &Path, file: &Path) -> io::Result<RuleFile> {
+    let Some(bytes) = read_config(file)? else {
+        return Ok(RuleFile {
+            matcher: Gitignore::empty(),
+            malformed: false,
+        });
+    };
     let mut builder = GitignoreBuilder::new(root);
-    if let Some(error) = builder.add(rule_file) {
-        tracing::warn!(
-            "source ignore scope: failed to read {}: {}",
-            rule_file.display(),
-            error
-        );
-        return Gitignore::empty();
+    let mut malformed = false;
+    // split_inclusive reproduces BufRead::lines (including CRLF and no final
+    // newline), but cannot allocate an unbounded individual line.
+    for (index, bytes) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if index >= MAX_RULES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ignore configuration exceeds {MAX_RULES} lines: {}",
+                    file.display()
+                ),
+            ));
+        }
+        let Ok(line) = std::str::from_utf8(bytes) else {
+            malformed = true;
+            break;
+        };
+        let line = line
+            .strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or(line);
+        let line = if index == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        if let Err(error) = builder.add_line(Some(file.to_path_buf()), line) {
+            // A partial parse error must not discard valid preceding/following
+            // rules. WalkBuilder attaches these errors to the directory entry.
+            tracing::warn!("source ignore scope: {}: {error}", file.display());
+            malformed = true;
+        }
     }
     match builder.build() {
-        Ok(matcher) => matcher,
+        Ok(matcher) => Ok(RuleFile { matcher, malformed }),
         Err(error) => {
-            tracing::warn!(
-                "source ignore scope: failed to compile {}: {}",
-                rule_file.display(),
-                error
-            );
-            Gitignore::empty()
+            tracing::warn!("source ignore scope: {}: {error}", file.display());
+            Ok(RuleFile {
+                matcher: Gitignore::empty(),
+                malformed: true,
+            })
         }
     }
 }
 
-/// Resolve the repository directory, following the `gitdir:` indirection
-/// where `.git` is a file (linked worktrees, submodules), mirroring the
-/// walker's `resolve_git_commondir`.
-fn resolve_git_dir(dot_git: &Path) -> PathBuf {
-    let Ok(metadata) = std::fs::metadata(dot_git) else {
-        return dot_git.to_path_buf();
-    };
-    if !metadata.is_file() {
-        return dot_git.to_path_buf();
+// Keep upstream's first-line gitdir/commondir interpretation, including its
+// CWD-relative gitdir behavior. It intentionally does not use git's env vars.
+fn resolve_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
+    let dot_git = directory.join(".git");
+    if !std::fs::metadata(&dot_git).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(Some(dot_git));
     }
-    let Ok(contents) = std::fs::read_to_string(dot_git) else {
-        return dot_git.to_path_buf();
+    let Some(bytes) = read_config(&dot_git)? else {
+        return Ok(None);
+    };
+    let Some(line) = first_line(&bytes) else {
+        return Ok(None);
+    };
+    let Some(gitdir) = line.strip_prefix("gitdir: ") else {
+        return Ok(None);
+    };
+    let gitdir = PathBuf::from(gitdir);
+    let Some(bytes) = read_config(&gitdir.join("commondir"))? else {
+        return Ok(None);
+    };
+    let Some(common) = first_line(&bytes) else {
+        return Ok(None);
+    };
+    Ok(Some(if common.starts_with('.') {
+        gitdir.join(common)
+    } else {
+        PathBuf::from(common)
+    }))
+}
+
+fn resolve_legacy_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
+    let dot_git = directory.join(".git");
+    if !std::fs::metadata(&dot_git).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(Some(dot_git));
+    }
+    let Some(bytes) = read_config(&dot_git)? else {
+        return Ok(Some(dot_git));
+    };
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return Ok(Some(dot_git));
     };
     let Some(gitdir) = contents.strip_prefix("gitdir: ") else {
-        return dot_git.to_path_buf();
+        return Ok(Some(dot_git));
     };
     let gitdir = PathBuf::from(gitdir.trim());
-    let commondir = gitdir.join("commondir");
-    if let Ok(common) = std::fs::read_to_string(&commondir) {
-        let common = common.trim();
-        if !common.is_empty() {
-            let candidate = if common.starts_with('.') {
-                gitdir.join(common)
-            } else {
-                PathBuf::from(common)
-            };
-            if let Ok(resolved) = candidate.canonicalize() {
-                return resolved;
+    if let Some(bytes) = read_config(&gitdir.join("commondir"))? {
+        if let Ok(contents) = std::str::from_utf8(&bytes) {
+            let common = contents.trim();
+            if !common.is_empty() {
+                let candidate = if common.starts_with('.') {
+                    gitdir.join(common)
+                } else {
+                    PathBuf::from(common)
+                };
+                if let Ok(resolved) = candidate.canonicalize() {
+                    return Ok(Some(resolved));
+                }
             }
         }
     }
-    gitdir
+    // The earlier deletion owner fell back to gitdir when commondir was
+    // missing/unresolvable. Retain that extra protection, unlike source matching.
+    Ok(Some(gitdir))
+}
+
+fn first_line(bytes: &[u8]) -> Option<&str> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let line = bytes.split_inclusive(|byte| *byte == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?;
+    Some(
+        line.strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or(line),
+    )
+}
+
+fn global_excludes() -> io::Result<Option<PathBuf>> {
+    // This deliberately duplicates the public ignore crate resolver's small
+    // policy, not its unbounded reads. Feed the exact upstream regex bounded
+    // bytes; HOME config takes precedence over XDG config, then XDG ignore.
+    #[allow(deprecated)]
+    let home = std::env::home_dir();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".config")));
+    let re = regex::bytes::Regex::new(r#"(?im-u)^\s*excludesfile\s*=\s*"?\s*(\S+?)\s*"?\s*$"#)
+        .map_err(io::Error::other)?;
+    for path in [
+        home.as_ref().map(|path| path.join(".gitconfig")),
+        xdg.as_ref().map(|path| path.join("git/config")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(bytes) = read_config(&path)? {
+            if let Some(capture) = re.captures(&bytes).and_then(|captures| captures.get(1)) {
+                if let Ok(path) = std::str::from_utf8(capture.as_bytes()) {
+                    return Ok(Some(PathBuf::from(match &home {
+                        Some(home) => path.replace('~', &home.to_string_lossy()),
+                        None => path.to_owned(),
+                    })));
+                }
+            }
+        }
+    }
+    Ok(xdg.map(|path| path.join("git/ignore")))
 }
 
 #[cfg(test)]
@@ -322,6 +550,26 @@ mod tests {
 
     fn scope(root: &Path) -> SourceIgnoreScope {
         SourceIgnoreScope::new(root, true)
+    }
+
+    #[test]
+    fn source_precedence_does_not_reduce_conservative_deletion_protection() {
+        let root = repo_root();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join(".ignore"), b"hidden\n!kept\n").unwrap();
+        std::fs::write(root.path().join("sub/.gitignore"), b"!hidden\nkept\n").unwrap();
+        let mut scope = scope(root.path());
+        assert!(scope.source_match(Path::new("sub/hidden"), false).unwrap());
+        assert!(!scope.source_match(Path::new("sub/kept"), false).unwrap());
+        // Previous deletion scope protected the deeper .gitignore match;
+        // source parity is not authorization to delete previously shielded data.
+        assert!(scope.is_ignored(Path::new("sub/kept"), false));
+
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join(".gitignore"), b"/root-only\n").unwrap();
+        let mut scope = SourceIgnoreScope::new(root.path(), true);
+        assert!(!scope.source_match(Path::new("root-only"), false).unwrap());
+        assert!(scope.is_ignored(Path::new("root-only"), false));
     }
 
     #[test]
@@ -423,7 +671,7 @@ mod tests {
         assert!(!scope
             .dir_rules
             .iter()
-            .any(|(path, _)| path == &root.path().join("dir-0")));
+            .any(|(path, _, _)| path == &root.path().join("dir-0")));
         assert!(scope.is_ignored(Path::new("dir-0/drop.private"), false));
         assert!(!scope.is_ignored(Path::new("dir-0/keep.private"), false));
         assert!(scope.is_ignored(Path::new("dir-0/root-only"), false));
@@ -495,14 +743,15 @@ mod tests {
     }
 
     proptest! {
-        /// Walker/scope parity: every path the walker emits after ignore
-        /// filtering must evaluate not-ignored. This is the invariant that
-        /// keeps deletion scope from deleting a file the source walk would
-        /// have shielded.
+        /// Exercise real wildcard/negation/pruning rules, not just parser
+        /// errors. Exact source matching must agree with emitted paths;
+        /// conservative deletion protection is tested separately.
         #[test]
         fn proptest_matches_walk_selection(
-            root_rules in proptest::collection::vec("[!\\n\\r]{1,8}", 0..4),
-            nested_rules in proptest::collection::vec("[!\\n\\r]{1,8}", 0..4),
+            root_rules in proptest::collection::vec(
+                prop::sample::select(vec!["a", "b", "a*", "!ab", "sub/*", "!sub/a", "**/b", "sub/"]), 0..4),
+            nested_rules in proptest::collection::vec(
+                prop::sample::select(vec!["a", "a*", "!a", "b", "!b", "*", "!*", "c/"]), 0..4),
             names in proptest::collection::vec("[a-c]{1,3}", 2..6),
         ) {
             let root = repo_root();
@@ -555,8 +804,8 @@ mod tests {
             for path in &walker_paths {
                 let is_dir = root.path().join(path).is_dir();
                 prop_assert!(
-                    !scope.is_ignored(path, is_dir),
-                    "walker emitted {} but scope ignores it",
+                    !scope.source_match(path, is_dir).unwrap(),
+                    "walker emitted {} but source matcher ignores it",
                     path.display()
                 );
             }

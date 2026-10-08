@@ -1,5 +1,6 @@
 use crate::endpoint::local_identity::metadata_identity;
-use ignore::WalkBuilder;
+#[path = "local_entry_scan/traversal.rs"]
+mod traversal;
 use std::path::{Path, PathBuf};
 use sy::engine::domain::{
     Entry, EntryIdentity, EntryKind, InvalidRelativePath, InvalidTimestamp, RelativePath, Timestamp,
@@ -15,7 +16,20 @@ const CHANNEL_CAPACITY: usize = 256;
 #[derive(Debug, thiserror::Error)]
 enum LocalScanError {
     #[error("failed to walk local tree: {0}")]
-    Walk(String),
+    Walk(#[from] std::io::Error),
+
+    #[error("local scan directory changed: {0}")]
+    DirectoryChanged(PathBuf),
+
+    #[error("local scan symlink loop: {0}")]
+    SymlinkLoop(PathBuf),
+
+    #[error("local scan scratch cleanup failed (scan error: {operation:?}): {source}")]
+    Cleanup {
+        operation: Option<Box<LocalScanError>>,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("failed to read metadata for {path}: {source}")]
     Metadata {
@@ -61,9 +75,9 @@ enum LocalScanError {
 
 /// Scan a local endpoint into the engine's lean, strictly ordered entry stream.
 ///
-/// Directory walking and metadata syscalls run on a blocking worker. The bounded
-/// channel is the backpressure boundary: a slow reconciler cannot cause the
-/// scanner to accumulate an unbounded tree in memory.
+/// Blocking filesystem work runs on a blocking worker. Both the output channel
+/// and per-directory sort are bounded; inactive traversal continuations and
+/// ancestor identities live on disk, not in an in-memory depth stack.
 pub fn local_entry_stream(root: PathBuf, request: ScanRequest) -> EntryStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let join_sender = sender.clone();
@@ -86,55 +100,9 @@ fn scan_worker(
     request: ScanRequest,
     sender: tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
 ) {
-    let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(false)
-        .git_ignore(request.respect_gitignore)
-        .git_global(request.respect_gitignore)
-        .git_exclude(request.respect_gitignore)
-        // --copy-links: follow symlinks in the walk. `engine_entry` then
-        // classifies each link by its target's kind (a dangling link is a
-        // scan error, never a silently skipped entry).
-        .follow_links(request.follow_symlinks)
-        // The engine validates strict ordering again at the trust boundary. The
-        // local walker supplies that order without whole-tree materialization.
-        .sort_by_file_path(|left, right| left.cmp(right));
-
-    if !request.include_git_dir {
-        builder.filter_entry(|entry| entry.file_name() != ".git");
-    }
-    if request.respect_gitignore {
-        let gitignore = root.join(".gitignore");
-        if gitignore.exists() {
-            builder.add_ignore(&gitignore);
-        }
-    }
-    if let Some(max_depth) = request.max_depth {
-        builder.max_depth(Some(max_depth));
-    }
-
-    for result in builder.build() {
-        let dir_entry = match result {
-            Ok(entry) => entry,
-            Err(error) => {
-                send_error(&sender, LocalScanError::Walk(error.to_string()));
-                return;
-            }
-        };
-        if dir_entry.path() == root {
-            continue;
-        }
-
-        match engine_entry(&root, dir_entry.path(), request) {
-            Ok(entry) => {
-                if sender.blocking_send(Ok(entry)).is_err() {
-                    return;
-                }
-            }
-            Err(error) => {
-                send_error(&sender, error);
-                return;
-            }
+    if let Err(error) = traversal::walk_tree(&root, request, &sender, Default::default()) {
+        if !sender.is_closed() {
+            send_error(&sender, error);
         }
     }
 }
@@ -143,7 +111,7 @@ fn send_error(sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>, error
     let _ = sender.blocking_send(Err(Box::new(error)));
 }
 
-fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry, LocalScanError> {
+fn entry_metadata(path: &Path, request: ScanRequest) -> Result<std::fs::Metadata, LocalScanError> {
     let lstat = std::fs::symlink_metadata(path).map_err(|source| LocalScanError::Metadata {
         path: path.to_path_buf(),
         source,
@@ -151,14 +119,22 @@ fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry,
     // Under --copy-links the entry is its target, not the link: stat through
     // the link so kind/size/mtime describe what a transfer would copy. A
     // dangling link is a loud scan error.
-    let metadata = if request.follow_symlinks && lstat.file_type().is_symlink() {
+    if request.follow_symlinks && lstat.file_type().is_symlink() {
         std::fs::metadata(path).map_err(|source| LocalScanError::Metadata {
             path: path.to_path_buf(),
             source,
-        })?
+        })
     } else {
-        lstat
-    };
+        Ok(lstat)
+    }
+}
+
+fn engine_entry(
+    root: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    request: ScanRequest,
+) -> Result<Entry, LocalScanError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| LocalScanError::OutsideRoot {
@@ -170,7 +146,7 @@ fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry,
             path: relative,
             source,
         })?;
-    let modified = metadata_timestamp(path, &metadata)?;
+    let modified = metadata_timestamp(path, metadata)?;
     let file_type = metadata.file_type();
 
     #[cfg(unix)]
@@ -208,10 +184,10 @@ fn engine_entry(root: &Path, path: &Path, request: ScanRequest) -> Result<Entry,
     }
 
     if request.metadata.identity {
-        entry.identity = metadata_identity(&metadata, entry.kind);
+        entry.identity = metadata_identity(metadata, entry.kind);
     }
     if request.metadata.hardlink_group {
-        entry.hardlink_group = hardlink_group(&metadata, entry.kind);
+        entry.hardlink_group = hardlink_group(metadata, entry.kind);
     }
 
     Ok(entry)
@@ -320,6 +296,14 @@ fn hardlink_group(metadata: &std::fs::Metadata, kind: EntryKind) -> Option<Entry
 fn hardlink_group(_metadata: &std::fs::Metadata, _kind: EntryKind) -> Option<EntryIdentity> {
     None
 }
+
+#[cfg(test)]
+#[path = "local_entry_scan/resource_tests.rs"]
+mod resource_tests;
+
+#[cfg(test)]
+#[path = "local_entry_scan/differential.rs"]
+mod differential;
 
 #[cfg(test)]
 mod tests {
