@@ -153,6 +153,7 @@ pub async fn serve_incoming_scan(
     serve_incoming_scan_rooted(rooted, incoming, sender).await
 }
 
+#[cfg(unix)]
 async fn serve_scan(
     rooted: RootedFs,
     request: ScanRequest,
@@ -192,6 +193,19 @@ async fn serve_scan(
     )?;
     sender.send(end).await?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn serve_scan(
+    _rooted: RootedFs,
+    _request: ScanRequest,
+    _sender: &RouterSender,
+    stream_id: StreamId,
+) -> Result<()> {
+    require_data_stream(stream_id)?;
+    Err(RemoteScanError::LocalScan(Box::new(
+        crate::rooted_fs::RootedFsError::UnsupportedPlatform,
+    )))
 }
 
 async fn receive_scan_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
