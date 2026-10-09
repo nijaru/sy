@@ -187,6 +187,8 @@ pub struct RootedFs {
     mutation_admission: RootedMutationAdmission,
     #[cfg(all(test, unix))]
     mutation_pause: Arc<std::sync::Mutex<Option<(usize, PublicationPause)>>>,
+    #[cfg(all(test, unix))]
+    file_observation_pause: Arc<std::sync::Mutex<Option<FileObservationPause>>>,
     root_path: Arc<PathBuf>,
     #[cfg(unix)]
     root_fd: Arc<OwnedFd>,
@@ -392,6 +394,12 @@ pub(crate) struct PublicationPause {
     pub(crate) point: PublicationPausePoint,
     pub(crate) reached: tokio::sync::oneshot::Sender<()>,
     pub(crate) resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, unix))]
+struct FileObservationPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 /// Owns private staging and publication independently of regular-file bytes.
@@ -1080,6 +1088,92 @@ impl RootedFs {
         Ok(scanned)
     }
 
+    /// Revalidate a destination name using only exact own retirement records.
+    /// This does not turn the following cross-endpoint unlink into atomic CAS.
+    #[cfg(unix)]
+    pub(crate) fn verify_retired_destination_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        scanned: EntryIdentity,
+    ) -> Result<()> {
+        let mut lineage = self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let expected = lineage.resolve(scanned)?;
+        if self.path_identity_blocking(relative)? != Some((kind, expected)) {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn verify_retired_destination_blocking(
+        &self,
+        _relative: &RelativePath,
+        _kind: EntryKind,
+        _scanned: EntryIdentity,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Validate a held regular-file observation and its rooted name against only
+    /// recorded own retirements. Keep the short check under the same authority
+    /// lock as native retirement, without holding it while hashing file bytes.
+    #[cfg(unix)]
+    pub(crate) fn observed_regular_metadata_blocking(
+        &self,
+        file: &File,
+        relative: &RelativePath,
+        scanned: EntryIdentity,
+    ) -> Result<std::fs::Metadata> {
+        let mut lineage = self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let expected = lineage.resolve(scanned)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
+                != Some(expected)
+        {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        #[cfg(all(test, unix))]
+        {
+            let pause = self.file_observation_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause
+                    .resume
+                    .recv_timeout(std::time::Duration::from_secs(15));
+            }
+        }
+        // Compare the name with the same required version, not a fresh FD stat:
+        // a foreign edit between the checks must not be adopted as ownership.
+        if self.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        Ok(metadata)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn observed_regular_metadata_blocking(
+        &self,
+        _file: &File,
+        _relative: &RelativePath,
+        _scanned: EntryIdentity,
+    ) -> Result<std::fs::Metadata> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     /// Open one regular file relative to the pinned root without following any
     /// peer-controlled symlink component.
     ///
@@ -1532,6 +1626,11 @@ impl RootedFs {
         expected: EntryIdentity,
         read: impl FnOnce(&File) -> Result<T>,
     ) -> Result<T> {
+        let mut lineage = self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let expected = lineage.resolve(expected)?;
         let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
         let changed = || RootedFsError::SourceMetadataChanged(relative.as_path().to_path_buf());
         let validate = || -> Result<()> {
@@ -1746,6 +1845,8 @@ impl RootedFs {
             mutation_admission: RootedMutationAdmission::Unrestricted,
             #[cfg(test)]
             mutation_pause: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(all(test, unix))]
+            file_observation_pause: Arc::new(std::sync::Mutex::new(None)),
             root_path: Arc::new(root),
             root_fd: Arc::new(root_fd),
             retirement: Arc::new(std::sync::Mutex::new(RetirementLineage::default())),

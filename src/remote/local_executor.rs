@@ -1118,9 +1118,7 @@ impl LocalSyncExecutor {
         let source_rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
             .await
             .map_err(ExistingDestinationError::from)?;
-        let destination_rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let destination_rooted = self.metadata_authority().await?;
         let source_fingerprint =
             existing::fingerprint(source_rooted.clone(), source.clone(), options).await?;
         let destination_fingerprint =
@@ -1620,6 +1618,84 @@ mod tests {
             std::fs::read_link(destination_root.path().join("renamed")).unwrap(),
             Path::new("foreign")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_removal_reuses_the_executors_retirement_authority() {
+        use futures::TryStreamExt;
+        use xattr::FileExt;
+        for foreign_edit in [false, true] {
+            let source_root = tempfile::tempdir().unwrap();
+            let destination_root = tempfile::tempdir().unwrap();
+            std::fs::write(source_root.path().join("a"), b"new bytes").unwrap();
+            std::fs::write(source_root.path().join("b"), b"old bytes").unwrap();
+            std::fs::write(destination_root.path().join("a"), b"old bytes").unwrap();
+            std::fs::hard_link(
+                destination_root.path().join("a"),
+                destination_root.path().join("b"),
+            )
+            .unwrap();
+            let mut request = crate::engine::scan::ScanRequest::default();
+            request.metadata.unix_mode = true;
+            let sources: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                source_root.path().to_path_buf(),
+                request,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let destinations: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                destination_root.path().to_path_buf(),
+                request,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let executor = LocalSyncExecutor::new(
+                source_root.path().to_path_buf(),
+                destination_root.path().to_path_buf(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_remove_source_files(true);
+            let update = lower_local_op(
+                SyncOp::Update {
+                    source: sources[0].clone(),
+                    destination: destinations[0].clone(),
+                },
+                ExecutionPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
+            executor.execute(update).await.unwrap();
+            if foreign_edit {
+                std::fs::File::open(destination_root.path().join("b"))
+                    .unwrap()
+                    .set_xattr("user.sy-foreign", b"foreign")
+                    .unwrap();
+            }
+            let result = executor
+                .remove_unchanged_source(&sources[1], &destinations[1], ExecutionPolicy::default())
+                .await;
+            if foreign_edit {
+                assert!(result.is_err());
+                assert_eq!(
+                    std::fs::read(source_root.path().join("b")).unwrap(),
+                    b"old bytes"
+                );
+            } else {
+                result.unwrap();
+                assert!(!source_root.path().join("b").exists());
+            }
+            assert_eq!(
+                std::fs::read(destination_root.path().join("a")).unwrap(),
+                b"new bytes"
+            );
+            assert_eq!(
+                std::fs::read(destination_root.path().join("b")).unwrap(),
+                b"old bytes"
+            );
+        }
     }
 
     #[cfg(unix)]

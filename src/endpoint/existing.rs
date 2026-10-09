@@ -1,4 +1,5 @@
 //! Handle-bound proof for removing a source whose destination already exists.
+#[cfg(test)]
 use crate::endpoint::local_identity::metadata_identity;
 use crate::endpoint::receipt::VerifiedExistingDestinationReceipt;
 use crate::engine::domain::{Entry, EntryKind, RelativePath};
@@ -126,17 +127,24 @@ pub(crate) async fn fingerprint(
         .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
 }
 
-fn validate_file(file: &std::fs::File, entry: &Entry) -> Result<std::fs::Metadata> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || entry.kind != EntryKind::File
-        || entry.identity.is_none()
-        || metadata_identity(&metadata, EntryKind::File) != entry.identity
-        || metadata.len() != entry.size
-    {
-        return Err(ExistingDestinationError::ObservationChanged(
-            entry.path.clone(),
-        ));
+fn validate_file(
+    rooted: &RootedFs,
+    file: &std::fs::File,
+    entry: &Entry,
+) -> Result<std::fs::Metadata> {
+    let changed = || ExistingDestinationError::ObservationChanged(entry.path.clone());
+    if !entry.is_file() {
+        return Err(changed());
+    }
+    let expected = entry.identity.ok_or_else(changed)?;
+    let metadata = rooted
+        .observed_regular_metadata_blocking(file, &entry.path, expected)
+        .map_err(|error| match error {
+            RootedFsError::DestinationChanged(_) => changed(),
+            error => error.into(),
+        })?;
+    if metadata.len() != entry.size {
+        return Err(changed());
     }
     Ok(metadata)
 }
@@ -157,19 +165,17 @@ fn observed_xattrs_blocking(
     entry: &Entry,
 ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
     let file = rooted.open_regular_blocking(&entry.path)?;
-    validate_file(&file, entry)?;
+    validate_file(rooted, &file, entry)?;
     let attrs = rooted.read_open_file_xattrs_blocking(&file, &entry.path)?;
-    validate_file(&file, entry)?;
-    validate_path(rooted, entry)?;
+    validate_file(rooted, &file, entry)?;
     Ok(attrs)
 }
 
 fn observed_acl_blocking(rooted: &RootedFs, entry: &Entry) -> Result<Option<String>> {
     let file = rooted.open_regular_blocking(&entry.path)?;
-    validate_file(&file, entry)?;
+    validate_file(rooted, &file, entry)?;
     let acl = rooted.read_open_file_acl_blocking(&file, &entry.path)?;
-    validate_file(&file, entry)?;
-    validate_path(rooted, entry)?;
+    validate_file(rooted, &file, entry)?;
     Ok(acl)
 }
 
@@ -214,7 +220,7 @@ fn fingerprint_blocking(
     options: FingerprintOptions,
 ) -> Result<ExistingFingerprint> {
     let mut file = rooted.open_regular_blocking(&entry.path)?;
-    let metadata = validate_file(&file, entry)?;
+    let metadata = validate_file(rooted, &file, entry)?;
     #[cfg(not(unix))]
     let _ = &metadata;
     let content = hash_observed_bytes(&mut file, entry.size, &entry.path)?;
@@ -269,9 +275,9 @@ fn fingerprint_blocking(
         #[cfg(not(target_os = "macos"))]
         return Err(RootedFsError::UnsupportedPlatform.into());
     }
-    validate_file(&file, entry)?;
-    // A held handle proves the bytes, but not that its inode still owns the name.
-    validate_path(rooted, entry)?;
+    // The held handle and rooted name must still match the scan or its exact
+    // recorded own retirement. No fresh stat can advance this authority.
+    validate_file(rooted, &file, entry)?;
     Ok(ExistingFingerprint {
         content,
         preservation: *preservation.finalize().as_bytes(),
@@ -345,13 +351,20 @@ pub(crate) async fn remove_verified_source(
                     receipt.source_path().clone(),
                 ));
             }
-            if destination.path_identity_blocking(receipt.destination_path())?
-                != Some((EntryKind::File, receipt.destination_identity()))
-            {
-                return Err(ExistingDestinationError::ObservationChanged(
-                    receipt.destination_path().clone(),
-                ));
-            }
+            destination
+                .verify_retired_destination_blocking(
+                    receipt.destination_path(),
+                    EntryKind::File,
+                    receipt.destination_identity(),
+                )
+                .map_err(|error| match error {
+                    RootedFsError::DestinationChanged(_) => {
+                        ExistingDestinationError::ObservationChanged(
+                            receipt.destination_path().clone(),
+                        )
+                    }
+                    error => error.into(),
+                })?;
         }
         remove_observed_source_blocking(&rooted, &source)
     })
@@ -432,6 +445,104 @@ mod tests {
         );
         entry.identity = metadata_identity(&metadata, EntryKind::File);
         entry
+    }
+
+    fn retired_destination() -> (
+        tempfile::TempDir,
+        RootedFs,
+        Entry,
+        ExistingFingerprint,
+        std::fs::File,
+    ) {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a"), b"kept bytes").unwrap();
+        std::fs::hard_link(directory.path().join("a"), directory.path().join("b")).unwrap();
+        let rooted = RootedFs::open_blocking_for_worker(directory.path().to_path_buf()).unwrap();
+        let entry = observe_file(directory.path(), "b");
+        let held = rooted.open_regular_blocking(&entry.path).unwrap();
+        let before = fingerprint_blocking(&rooted, &entry, FingerprintOptions::default()).unwrap();
+        let mut replacement = rooted
+            .begin_staged_file_with_expectation_blocking(
+                &RelativePath::new("a").unwrap(),
+                crate::endpoint::ExpectedDestination::Unchanged(entry.identity.unwrap()),
+            )
+            .unwrap();
+        replacement.file_mut().write_all(b"new bytes").unwrap();
+        replacement
+            .commit()
+            .unwrap()
+            .finalize_blocking(None)
+            .unwrap();
+        (directory, rooted, entry, before, held)
+    }
+
+    #[test]
+    fn fingerprints_accept_own_retirement_but_not_foreign_held_inode_edits() {
+        use xattr::FileExt;
+        for foreign_edit in [false, true] {
+            let (_directory, rooted, entry, before, held) = retired_destination();
+            if foreign_edit {
+                held.set_xattr("user.sy-foreign", b"foreign").unwrap();
+            }
+            let after = fingerprint_blocking(&rooted, &entry, FingerprintOptions::default());
+            if foreign_edit {
+                assert!(matches!(
+                    after,
+                    Err(ExistingDestinationError::ObservationChanged(_))
+                ));
+            } else {
+                assert_eq!(after.unwrap(), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_existing_destination_check_uses_retirement_not_fresh_stat_authority() {
+        use xattr::FileExt;
+        for foreign_edit in [false, true] {
+            let (_directory, destination_rooted, destination, destination_fingerprint, held) =
+                retired_destination();
+            let source_directory = tempfile::tempdir().unwrap();
+            std::fs::write(source_directory.path().join("input"), b"kept bytes").unwrap();
+            let source = observe_file(source_directory.path(), "input");
+            let source_rooted = RootedFs::open(source_directory.path().to_path_buf())
+                .await
+                .unwrap();
+            let source_fingerprint = fingerprint(
+                source_rooted.clone(),
+                source.clone(),
+                FingerprintOptions::default(),
+            )
+            .await
+            .unwrap();
+            let receipt = receipt(
+                &source,
+                &destination,
+                source_fingerprint,
+                destination_fingerprint,
+            )
+            .unwrap();
+            if foreign_edit {
+                held.set_xattr("user.sy-foreign", b"foreign").unwrap();
+            }
+            let result =
+                remove_verified_source(source_rooted, source, receipt, Some(destination_rooted))
+                    .await;
+            if foreign_edit {
+                assert!(matches!(
+                    result,
+                    Err(ExistingDestinationError::ObservationChanged(_))
+                ));
+                assert_eq!(
+                    std::fs::read(source_directory.path().join("input")).unwrap(),
+                    b"kept bytes"
+                );
+            } else {
+                result.unwrap();
+                assert!(!source_directory.path().join("input").exists());
+            }
+        }
     }
 
     #[tokio::test]

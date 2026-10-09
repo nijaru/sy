@@ -84,6 +84,147 @@ fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits()
 }
 
 #[test]
+fn observed_metadata_uses_exact_retirements_without_adopting_foreign_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    for foreign_edit in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a"), b"retained bytes").unwrap();
+        std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+        let rooted = RootedFs::open_blocking_for_worker(root.path().to_path_buf()).unwrap();
+        let a = RelativePath::new("a").unwrap();
+        let b = RelativePath::new("b").unwrap();
+        let held = rooted.open_regular_blocking(&b).unwrap();
+        held.set_xattr("user.sy-retained", b"keep").unwrap();
+        let scanned = identity_from_stat(&stat_fd(held.as_raw_fd()).unwrap()).unwrap();
+        let mut replacement = rooted
+            .begin_staged_file_with_expectation_blocking(
+                &a,
+                ExpectedDestination::Unchanged(scanned),
+            )
+            .unwrap();
+        replacement.file_mut().write_all(b"replacement").unwrap();
+        replacement
+            .commit()
+            .unwrap()
+            .finalize_blocking(None)
+            .unwrap();
+        if foreign_edit {
+            held.set_xattr("user.sy-foreign", b"foreign").unwrap();
+        }
+        let proof = crate::engine::hardlink_removals::GroupDestinationProof::Existing {
+            path: b.clone(),
+            identity: scanned,
+        };
+        let parity = proof.revalidate_blocking(&rooted);
+        let attrs = rooted.read_observed_xattrs_blocking(&b, EntryKind::File, scanned);
+        #[cfg(target_os = "macos")]
+        let flags = rooted.read_observed_bsd_flags_blocking(&b, EntryKind::File, scanned);
+        let mode_before = held.metadata().unwrap().permissions().mode() & 0o7777;
+        let wanted_mode = if mode_before == 0o600 { 0o640 } else { 0o600 };
+        let applied = rooted.apply_observed_preservation_blocking(
+            &b,
+            EntryKind::File,
+            scanned,
+            Some(wanted_mode),
+            None,
+            &MetadataPreservation::default(),
+        );
+        if foreign_edit {
+            assert!(matches!(parity, Err(RootedFsError::DestinationChanged(_))));
+            assert!(matches!(
+                attrs,
+                Err(RootedFsError::SourceMetadataChanged(_))
+            ));
+            #[cfg(target_os = "macos")]
+            assert!(matches!(
+                flags,
+                Err(RootedFsError::SourceMetadataChanged(_))
+            ));
+            assert!(matches!(applied, Err(RootedFsError::DestinationChanged(_))));
+            assert_eq!(
+                held.metadata().unwrap().permissions().mode() & 0o7777,
+                mode_before
+            );
+        } else {
+            parity.unwrap();
+            assert!(attrs
+                .unwrap()
+                .iter()
+                .any(|(name, value)| name == "user.sy-retained" && value == b"keep"));
+            #[cfg(target_os = "macos")]
+            assert_eq!(flags.unwrap(), 0);
+            applied.unwrap();
+            assert_eq!(
+                held.metadata().unwrap().permissions().mode() & 0o7777,
+                wanted_mode
+            );
+            // A later metadata edit is not an old-inode retirement and cannot
+            // be adopted by replaying the original scanned parity proof.
+            assert!(matches!(
+                proof.revalidate_blocking(&rooted),
+                Err(RootedFsError::DestinationChanged(_))
+            ));
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("b")).unwrap(),
+            b"retained bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("a")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            held.get_xattr("user.sy-retained").unwrap(),
+            Some(b"keep".to_vec())
+        );
+    }
+}
+
+#[tokio::test]
+async fn held_file_validation_does_not_adopt_a_foreign_edit_before_name_check() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("file"), b"kept bytes").unwrap();
+    let rooted = RootedFs::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    let path = RelativePath::new("file").unwrap();
+    let held = rooted.open_regular_blocking(&path).unwrap();
+    let scanned = identity_from_stat(&stat_fd(held.as_raw_fd()).unwrap()).unwrap();
+    let worker_file = held.try_clone().unwrap();
+    let worker_root = rooted.clone();
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *rooted.file_observation_pause.lock().unwrap() = Some(FileObservationPause {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    let worker = tokio::task::spawn_blocking(move || {
+        worker_root.observed_regular_metadata_blocking(&worker_file, &path, scanned)
+    });
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
+    held.set_xattr("user.sy-between-checks", b"foreign")
+        .unwrap();
+    let _ = resume_tx.send(());
+    let result = worker.await.unwrap();
+    assert!(
+        matches!(reached, Ok(Ok(()))),
+        "observation never reached the name-check boundary"
+    );
+    assert!(
+        matches!(result, Err(RootedFsError::DestinationChanged(_))),
+        "foreign state was adopted: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("file")).unwrap(),
+        b"kept bytes"
+    );
+    assert_eq!(
+        held.get_xattr("user.sy-between-checks").unwrap(),
+        Some(b"foreign".to_vec())
+    );
+}
+
+#[test]
 fn retirement_index_keeps_exact_ancestry_across_distinct_inode_chains() {
     let mut lineage = RetirementLineage::default();
     let identity = |group: u8, phase: u8| {

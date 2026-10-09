@@ -132,7 +132,15 @@ impl RootedFs {
     ) -> Result<EntryIdentity> {
         #[cfg(unix)]
         {
+            self.require_writable()?;
             preservation.validate()?;
+            // Serialize validation and effects with own old-inode retirements.
+            // Translation cannot adopt a fresh stat or an unrelated ctime edit.
+            let mut lineage = self
+                .retirement
+                .lock()
+                .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+            let expected = lineage.resolve(expected)?;
             if kind == EntryKind::Symlink {
                 if preservation.xattrs.is_some() {
                     return Err(RootedFsError::UnsupportedSymlinkXattrs);
