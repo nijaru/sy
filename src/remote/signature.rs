@@ -36,6 +36,8 @@ pub struct BlockSignature {
 pub struct SignatureSummary {
     pub file_size: u64,
     pub block_count: u64,
+    /// Original observation backed by the held basis and exact session-owned
+    /// retirements, not a client-guessed or arbitrarily refreshed identity.
     pub basis_identity: EntryIdentity,
 }
 
@@ -301,6 +303,11 @@ fn produce_signatures(
     sender: mpsc::Sender<WireSignature>,
 ) -> std::result::Result<SignatureSummary, SignatureProducerError> {
     let mut file = rooted.open_regular_blocking(&relative)?;
+    let initial = file.metadata()?;
+    let initial_identity =
+        crate::endpoint::local_identity::metadata_identity(&initial, EntryKind::File)
+            .ok_or(SignatureProducerError::MissingBasisIdentity)?;
+    let basis_identity = rooted.original_destination_observation_blocking(initial_identity)?;
     let block_size = block_size.get() as usize;
     let mut buffer = vec![0_u8; block_size];
     let mut file_size = 0_u64;
@@ -349,9 +356,15 @@ fn produce_signatures(
     }
 
     let metadata = file.metadata()?;
-    let basis_identity =
+    let final_identity =
         crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
             .ok_or(SignatureProducerError::MissingBasisIdentity)?;
+    if rooted.retired_destination_identity_blocking(initial_identity)? != final_identity
+        || initial.len() != file_size
+        || metadata.len() != file_size
+    {
+        return Err(RootedFsError::DestinationChanged(relative.as_path().to_path_buf()).into());
+    }
 
     Ok(SignatureSummary {
         file_size,

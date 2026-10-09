@@ -250,11 +250,18 @@ fn validate_destination_state(
     relative: &RelativePath,
     expectation: Option<WireFileBasis>,
 ) -> Result<()> {
+    let expected_identity = expectation
+        .map(|expected| {
+            rooted.retired_destination_identity_blocking(EntryIdentity::from_bytes(
+                expected.identity(),
+            ))
+        })
+        .transpose()?;
     let observed = rooted.path_identity_blocking(relative)?;
     let path = relative.as_path().to_path_buf();
-    match expectation {
+    match expected_identity {
         Some(expected) => match observed {
-            Some((_, identity)) if identity.as_bytes() == &expected.identity() => Ok(()),
+            Some((_, identity)) if identity == expected => Ok(()),
             _ => Err(RemoteTransferError::DestinationChanged { path }),
         },
         None if observed.is_some() => Err(RemoteTransferError::UnexpectedDestination { path }),
@@ -853,9 +860,20 @@ fn prepare_reconstruction(
     relative: &RelativePath,
     expectation: Option<WireFileBasis>,
 ) -> Result<PreparedReconstruction> {
+    let current_expectation = expectation
+        .map(|expected| {
+            let identity = rooted.retired_destination_identity_blocking(
+                EntryIdentity::from_bytes(expected.identity()),
+            )?;
+            Ok::<_, RootedFsError>(WireFileBasis::new(
+                expected.file_size(),
+                *identity.as_bytes(),
+            ))
+        })
+        .transpose()?;
     let observed = rooted.path_identity_blocking(relative)?;
     let path = relative.as_path().to_path_buf();
-    let basis = match expectation {
+    let basis = match current_expectation {
         Some(expected) => match observed {
             Some((kind, identity)) if identity.as_bytes() == &expected.identity() => {
                 if kind == EntryKind::File {
@@ -879,7 +897,14 @@ fn prepare_reconstruction(
             None
         }
     };
-    let staged = rooted.begin_staged_file_blocking(relative)?;
+    let expected_destination =
+        expectation.map_or(crate::endpoint::ExpectedDestination::Absent, |expected| {
+            crate::endpoint::ExpectedDestination::Unchanged(EntryIdentity::from_bytes(
+                expected.identity(),
+            ))
+        });
+    let staged =
+        rooted.begin_staged_file_with_expectation_blocking(relative, expected_destination)?;
     Ok(PreparedReconstruction {
         staged,
         basis,

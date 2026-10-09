@@ -51,7 +51,7 @@ impl LocalEndpoint {
         self
     }
 
-    async fn rooted_fs(
+    pub(crate) async fn rooted_fs(
         &self,
         create_root: bool,
     ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
