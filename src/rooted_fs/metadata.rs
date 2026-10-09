@@ -9,7 +9,7 @@ pub(crate) struct MetadataPreservation<'a> {
 }
 
 impl MetadataPreservation<'_> {
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if let Some(xattrs) = self.xattrs {
             if xattrs.len() > crate::protocol::MAX_XATTR_ENTRIES {
                 return Err(RootedFsError::XattrTooManyEntries {
@@ -121,7 +121,7 @@ impl RootedFs {
     /// first field, even for flags-only work. This is an admitted in-place
     /// operation, not rollback or compare-and-swap: later hardlink creation and
     /// concurrent inode writers cannot be excluded by a link-count observation.
-    pub(crate) fn apply_preserved_metadata_blocking(
+    pub(crate) fn apply_observed_preservation_blocking(
         &self,
         relative: &RelativePath,
         kind: EntryKind,
@@ -129,7 +129,7 @@ impl RootedFs {
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
         preservation: &MetadataPreservation<'_>,
-    ) -> Result<()> {
+    ) -> Result<EntryIdentity> {
         #[cfg(unix)]
         {
             preservation.validate()?;
@@ -164,7 +164,21 @@ impl RootedFs {
                     // syscall, not an atomic identity-conditional mutation.
                     set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
                 }
-                return Ok(());
+                let current = stat_at_optional(parent.as_raw_fd(), &leaf)?
+                    .as_ref()
+                    .and_then(identity_from_stat)
+                    .ok_or_else(|| {
+                        RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+                    })?;
+                self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
+                // The no-follow time syscall cannot redirect to a link target;
+                // portable Unix still cannot offer identity-conditional mutation.
+                if self.path_identity_blocking(relative)? != Some((kind, current)) {
+                    return Err(RootedFsError::DestinationChanged(
+                        relative.as_path().to_path_buf(),
+                    ));
+                }
+                return Ok(current);
             }
             let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
             if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected) {
@@ -186,7 +200,7 @@ impl RootedFs {
                     relative.as_path().to_path_buf(),
                 ));
             }
-            Ok(())
+            Ok(current)
         }
         #[cfg(not(unix))]
         {

@@ -17,11 +17,12 @@ mod path;
 mod scan;
 mod session;
 mod signature;
+mod source_metadata;
 mod transfer;
 mod xattr;
 
-pub use acl::{AclMode, WireAcl, WireAclRequest, WireAclResult, MAX_ACL_TEXT_BYTES};
-pub use bsdflags::{BsdFlagsMode, WireBsdFlagsRequest, WireBsdFlagsResult};
+pub use acl::{WireAcl, WireAclResult, MAX_ACL_TEXT_BYTES};
+pub use bsdflags::WireBsdFlagsResult;
 pub use entry::{WireEntry, WireEntryKind};
 pub use fetch::WireFileFetchRequest;
 pub use frame::{
@@ -31,7 +32,7 @@ pub use frame::{
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1, PROTOCOL_V3_2,
-    PROTOCOL_V3_3, SUPPORTED_VERSIONS,
+    PROTOCOL_V3_3, PROTOCOL_V3_4, SUPPORTED_VERSIONS,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::{WireMetadata, WireMetadataTarget};
@@ -45,13 +46,13 @@ pub use signature::{
     SignatureBlockSize, WireSignature, WireSignatureEnd, WireSignatureRequest,
     MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,
 };
+pub use source_metadata::WireSourceMetadataRead;
 pub use transfer::{
     WireData, WireDeltaCopy, WireFileAck, WireFileBasis, WireFileBegin, WireFileEnd,
     MAX_DELTA_COPY_SIZE, MAX_TRANSFER_DATA_SIZE, TRANSFER_BASIS_IDENTITY_LEN, TRANSFER_DIGEST_LEN,
 };
 pub use xattr::{
-    WireXattr, WireXattrRequest, WireXattrResult, XattrMode, MAX_XATTR_ENTRIES,
-    MAX_XATTR_NAME_BYTES, MAX_XATTR_TOTAL_BYTES,
+    WireXattr, WireXattrResult, MAX_XATTR_ENTRIES, MAX_XATTR_NAME_BYTES, MAX_XATTR_TOTAL_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]

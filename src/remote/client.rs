@@ -22,7 +22,7 @@ use crate::remote::transfer::{
     request_file_transfer, request_file_transfer_with_stream_policy, TransferDestination,
     TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
 };
-use crate::remote::xattr::{request_read_xattrs, request_write_xattrs};
+use crate::remote::xattr::request_read_xattrs;
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
@@ -324,24 +324,12 @@ impl ClientRemoteHandle {
 
     pub async fn apply_metadata(
         &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        expected: EntryIdentity,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
+        metadata: crate::protocol::WireMetadata,
+    ) -> Result<EntryIdentity> {
         self.require_push(FrameKind::Metadata)?;
-        request_metadata(
-            &self.sender,
-            path,
-            kind,
-            expected,
-            unix_mode,
-            modified,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
+        request_metadata(&self.sender, metadata, self.peer)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn read_directory_preservation(
@@ -474,20 +462,6 @@ impl ClientRemoteHandle {
         expected: EntryIdentity,
     ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
         request_read_xattrs(&self.sender, path, kind, expected, self.peer)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Mirror an extended-attribute set onto the remote destination for one
-    /// entry (`-X`). Push-only: a Pull session's remote root is source-only.
-    pub async fn write_xattrs(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        xattrs: &[(std::ffi::OsString, Vec<u8>)],
-    ) -> Result<()> {
-        self.require_push(FrameKind::XattrRequest)?;
-        request_write_xattrs(&self.sender, path, kind, xattrs, self.peer)
             .await
             .map_err(Into::into)
     }

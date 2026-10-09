@@ -203,19 +203,8 @@ mod tests {
 
     #[test]
     fn unobserved_directory_mutations_are_rejected() {
-        use crate::protocol::{
-            WireAclRequest, WireBsdFlagsRequest, WireEntryKind, WireMetadata, WireMetadataTarget,
-            WireXattrRequest,
-        };
+        use crate::protocol::{WireEntryKind, WireMetadata, WireMetadataTarget};
         let path = RelativeWirePath::from_components([b"dir".as_slice()]).unwrap();
-        assert!(WireXattrRequest::write(path.clone(), WireEntryKind::Directory, vec![]).is_err());
-        assert!(WireAclRequest::write(
-            path.clone(),
-            WireEntryKind::Directory,
-            WireAcl::new(String::new()).unwrap()
-        )
-        .is_err());
-        assert!(WireBsdFlagsRequest::write(path.clone(), WireEntryKind::Directory, 0).is_err());
         let mut former = WireMetadata::new(
             path,
             WireMetadataTarget::Observed {
@@ -223,6 +212,9 @@ mod tests {
                 identity: [0; 32],
             },
             Some(0o755),
+            None,
+            None,
+            None,
             None,
         )
         .unwrap()

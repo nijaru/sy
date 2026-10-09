@@ -1,21 +1,10 @@
-//! Bounded BSD-flags read/write RPCs and the shared preservation step used
-//! by every v3 executor.
-//!
-//! `-F/--preserve-flags` is demand-driven and macOS-only: the scan never
-//! carries flag words, and the executor reads the source's flags only for
-//! entries it is already mutating. The value is a single `u32`, so one
-//! request/result pair per entry is fixed-size and needs no bound beyond the
-//! frame payload cap.
-//!
-//! Source reads carry the scan identity and validate a held descriptor before
-//! and after reading. Writes are Push-only; a Pull root is read-only.
+//! Fixed-size observation-bound source BSD-flags reads. Destination flags
+//! belong to the single observed metadata owner.
 
-use crate::endpoint::local::LocalEndpoint;
-use crate::endpoint::Endpoint;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
-    BsdFlagsMode, Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId,
-    WireBsdFlagsRequest, WireBsdFlagsResult,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireBsdFlagsResult,
+    WireSourceMetadataRead,
 };
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
@@ -64,16 +53,8 @@ pub enum RemoteBsdFlagsError {
     #[error("bsd flags acknowledgement must be an empty unflagged frame")]
     InvalidAck,
 
-    #[error(
-        "bsd flags write requests are refused in a {0:?} session: the remote root is source-only"
-    )]
-    WriteInSourceSession(Operation),
-
     #[error("source preservation requires a scanned identity for {0}")]
     MissingSourceIdentity(RelativePath),
-
-    #[error("local bsd flags access failed: {0}")]
-    Local(String),
 }
 
 impl From<SharedRouterError> for RemoteBsdFlagsError {
@@ -84,9 +65,7 @@ impl From<SharedRouterError> for RemoteBsdFlagsError {
 
 pub type Result<T> = std::result::Result<T, RemoteBsdFlagsError>;
 
-/// Where one side of a BSD-flags preservation step lives. Local roots are
-/// addressed through `LocalEndpoint`; a remote peer is addressed through the
-/// session's bounded request handle.
+/// Source-side rooted observation or bounded remote request handle.
 pub enum BsdFlagsLocation<'a> {
     Local(&'a Path),
     Remote(&'a ClientRemoteHandle),
@@ -101,7 +80,7 @@ pub async fn request_read_bsd_flags(
     peer: PlatformOs,
 ) -> Result<u32> {
     ensure_compatible_path_encoding(peer)?;
-    let request = WireBsdFlagsRequest::read(
+    let request = WireSourceMetadataRead::new(
         encode_relative_path(path.as_path())?,
         wire_kind(kind),
         *expected.as_bytes(),
@@ -146,40 +125,11 @@ pub async fn request_read_bsd_flags(
     Ok(result.flags())
 }
 
-/// Replace the peer's BSD-flags value for one entry (0 clears every flag).
-/// The acknowledgement is sent only after the mirror completes.
-pub async fn request_write_bsd_flags(
-    sender: &RouterSender,
-    path: &RelativePath,
-    kind: EntryKind,
-    flags: u32,
-    peer: PlatformOs,
-) -> Result<()> {
-    ensure_compatible_path_encoding(peer)?;
-    let request = WireBsdFlagsRequest::write(
-        encode_relative_path(path.as_path())?,
-        wire_kind(kind),
-        flags,
-    )?;
-    let mut inbox = sender.open_stream()?;
-    let stream_id = inbox.stream_id();
-    sender
-        .send(Frame::new(
-            FrameKind::BsdFlagsRequest,
-            FrameFlags::FINAL,
-            stream_id,
-            request.encode()?,
-        )?)
-        .await?;
-    receive_ack(&mut inbox, stream_id).await
-}
-
 pub async fn serve_incoming_bsd_flags_rooted(
     rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     let IncomingStream { first, mut inbox } = incoming;
@@ -193,53 +143,26 @@ pub async fn serve_incoming_bsd_flags_rooted(
             actual: frame.kind(),
         });
     }
-    let request = WireBsdFlagsRequest::decode(frame.payload())?;
+    let request = WireSourceMetadataRead::decode(frame.payload())?;
     let path = decode_relative_path(request.path().clone(), peer)?;
     let kind = domain_kind(request.kind());
-    let mode = request.mode();
-    let flags = request.flags().unwrap_or(0);
+    let expected = EntryIdentity::from_bytes(request.identity());
     drop(first);
-
-    if mode == BsdFlagsMode::Write && operation != Operation::Push {
-        return Err(RemoteBsdFlagsError::WriteInSourceSession(operation));
-    }
-
-    match mode {
-        BsdFlagsMode::Read => {
-            let expected = EntryIdentity::from_bytes(request.source_identity()?);
-            let flags = tokio::task::spawn_blocking(move || {
-                rooted.read_observed_bsd_flags_blocking(&path, kind, expected)
-            })
-            .await
-            .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))??;
-            let result = WireBsdFlagsResult::new(flags);
-            sender
-                .send(Frame::new(
-                    FrameKind::BsdFlagsResult,
-                    FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
-                    stream_id,
-                    result.encode()?,
-                )?)
-                .await?;
-            receive_ack(&mut inbox, stream_id).await
-        }
-        BsdFlagsMode::Write => {
-            tokio::task::spawn_blocking(move || {
-                rooted.write_bsd_flags_blocking(&path, kind, flags)
-            })
-            .await
-            .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))??;
-            sender
-                .send(Frame::new(
-                    FrameKind::Ack,
-                    FrameFlags::empty(),
-                    stream_id,
-                    Bytes::new(),
-                )?)
-                .await?;
-            Ok(())
-        }
-    }
+    let flags = tokio::task::spawn_blocking(move || {
+        rooted.read_observed_bsd_flags_blocking(&path, kind, expected)
+    })
+    .await
+    .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))??;
+    let result = WireBsdFlagsResult::new(flags);
+    sender
+        .send(Frame::new(
+            FrameKind::BsdFlagsResult,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            result.encode()?,
+        )?)
+        .await?;
+    receive_ack(&mut inbox, stream_id).await
 }
 
 /// Read the requested entry's BSD-flags value from the source side of one
@@ -273,28 +196,6 @@ pub async fn read_preserved_bsd_flags(
                 handle.peer_platform(),
             )
             .await
-        }
-    }
-}
-
-/// Mirror a previously read BSD-flags value onto the destination side.
-pub async fn apply_preserved_bsd_flags(
-    location: &BsdFlagsLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
-    flags: u32,
-) -> Result<()> {
-    match location {
-        BsdFlagsLocation::Local(root) => {
-            let root = root.to_path_buf();
-            LocalEndpoint::new(root)
-                .write_bsd_flags(path.as_path(), flags)
-                .await
-                .map_err(|error| RemoteBsdFlagsError::Local(error.to_string()))
-        }
-        BsdFlagsLocation::Remote(handle) => {
-            request_write_bsd_flags(&handle.sender(), path, kind, flags, handle.peer_platform())
-                .await
         }
     }
 }
@@ -373,14 +274,13 @@ mod tests {
         mut server: FrameRouter,
         rooted: RootedFs,
         peer: PlatformOs,
-        operation: Operation,
         requests: usize,
     ) -> tokio::task::JoinHandle<()> {
         let sender = server.sender();
         tokio::spawn(async move {
             for _ in 0..requests {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
-                serve_incoming_bsd_flags_rooted(rooted.clone(), incoming, &sender, peer, operation)
+                serve_incoming_bsd_flags_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
                     .unwrap();
             }
@@ -389,7 +289,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn bsd_flags_round_trip_reads_and_mirrors_write() {
+    async fn observed_flags_read_returns_native_flags() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
@@ -411,13 +311,13 @@ mod tests {
         )
         .unwrap();
         let peer = crate::protocol::Platform::current().os;
-        let server_task = serve(server, rooted, peer, Operation::Push, 2);
+        let server_task = serve(server, rooted.clone(), peer, 1);
 
         let path = RelativePath::new("file").unwrap();
         // UF_NODUMP (0x1) is visible in st_flags and has no side effects on
         // the test's own execution.
-        request_write_bsd_flags(&client.sender(), &path, EntryKind::File, 0x1, peer)
-            .await
+        rooted
+            .write_bsd_flags_blocking(&path, EntryKind::File, 1)
             .unwrap();
         let expected = crate::endpoint::local_identity::metadata_identity(
             &std::fs::metadata(root.path().join("file")).unwrap(),
@@ -466,7 +366,7 @@ mod tests {
         .unwrap();
         let sender = server.sender();
         let peer = crate::protocol::Platform::current().os;
-        let request = WireBsdFlagsRequest::read(
+        let request = WireSourceMetadataRead::new(
             encode_relative_path(path.as_path()).unwrap(),
             crate::protocol::WireEntryKind::File,
             *expected.as_bytes(),
@@ -496,7 +396,7 @@ mod tests {
             .unwrap();
         let task = tokio::spawn(async move {
             let incoming = server.incoming().recv().await.unwrap().unwrap();
-            serve_incoming_bsd_flags_rooted(rooted, incoming, &sender, peer, Operation::Pull).await
+            serve_incoming_bsd_flags_rooted(rooted, incoming, &sender, peer).await
         });
         let result = task.await.unwrap();
         std::fs::remove_file(root.path().join("nested/file")).unwrap();
@@ -516,76 +416,6 @@ mod tests {
                 RootedFsError::SourceMetadataChanged(_)
             ))
         ));
-    }
-
-    #[tokio::test]
-    async fn write_into_a_pull_session_is_refused() {
-        let root = tempfile::TempDir::new().unwrap();
-        std::fs::write(root.path().join("file"), b"data").unwrap();
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, server_writer) = tokio::io::split(server_io);
-        let client = FrameRouter::start(
-            client_reader,
-            client_writer,
-            RouterRole::Client,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let mut server = FrameRouter::start(
-            server_reader,
-            server_writer,
-            RouterRole::Server,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let sender = server.sender();
-        let peer = crate::protocol::Platform::current().os;
-        let server_task = tokio::spawn(async move {
-            let incoming = server.incoming().recv().await.unwrap().unwrap();
-            serve_incoming_bsd_flags_rooted(rooted, incoming, &sender, peer, Operation::Pull).await
-        });
-
-        let path = RelativePath::new("file").unwrap();
-        // Send a raw write request because the fallible server closes the
-        // stream without an acknowledgement, which the client surfaces as an
-        // unexpected end rather than a clean RPC result.
-        let request = WireBsdFlagsRequest::write(
-            encode_relative_path(path.as_path()).unwrap(),
-            crate::protocol::WireEntryKind::File,
-            0x1,
-        )
-        .unwrap();
-        let inbox = client.sender().open_stream().unwrap();
-        let stream_id = inbox.stream_id();
-        client
-            .sender()
-            .send(
-                Frame::new(
-                    FrameKind::BsdFlagsRequest,
-                    FrameFlags::FINAL,
-                    stream_id,
-                    request.encode().unwrap(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let error = server_task.await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            RemoteBsdFlagsError::WriteInSourceSession(Operation::Pull)
-        ));
-        // The source file was never mutated (on macOS the flag word is
-        // checked; elsewhere the refusal precedes any filesystem touch by
-        // construction, as the macOS case proves).
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            rooted_flags(root.path().join("file")),
-            0,
-            "pull-session write must not touch the source"
-        );
     }
 
     #[cfg(target_os = "macos")]

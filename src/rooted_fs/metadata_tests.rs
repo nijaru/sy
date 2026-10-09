@@ -116,7 +116,7 @@ async fn shared_inode_preservation_refuses_before_any_requested_field() {
     }
     for (mode, time, preservation) in requests {
         assert!(matches!(
-            rooted.apply_preserved_metadata_blocking(
+            rooted.apply_observed_preservation_blocking(
                 &relative(),
                 EntryKind::File,
                 before,
@@ -172,7 +172,7 @@ async fn preservation_keeps_observed_descriptor_after_foreign_namespace_substitu
             },
         );
         let worker = tokio::task::spawn_blocking(move || {
-            rooted.apply_preserved_metadata_blocking(
+            rooted.apply_observed_preservation_blocking(
                 &relative(),
                 EntryKind::File,
                 before,

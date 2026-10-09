@@ -1818,7 +1818,7 @@ impl RootedFs {
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
-        self.apply_preserved_metadata_blocking(
+        self.apply_observed_preservation_blocking(
             relative,
             kind,
             expected,
@@ -1826,6 +1826,7 @@ impl RootedFs {
             modified,
             &MetadataPreservation::default(),
         )
+        .map(|_| ())
     }
 
     #[cfg(unix)]

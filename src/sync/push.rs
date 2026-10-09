@@ -436,7 +436,9 @@ mod tests {
             let hash = session.hash_handler();
             let file = session.file_handler();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..11 {
+            // The verified-existing receipt is revalidated on the peer
+            // immediately before authorizing source removal.
+            for _ in 0..12 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         let scan = scan.clone();
@@ -820,7 +822,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn xattrs_are_reconciled_for_quick_unchanged_files_and_directories_over_push() {
+    async fn quick_unchanged_push_xattrs_retain_unequal_destination_payload_and_finalize_directories(
+    ) {
         let source_root = TempDir::new().unwrap();
         let destination_root = TempDir::new().unwrap();
         let name = "user.sy-unchanged-push";
@@ -884,9 +887,18 @@ mod tests {
         let destination_dir = destination_root.path().join("dir");
         xattr::set(&destination_file, name, b"wrong").unwrap();
         xattr::set(&destination_file, stale, b"remove").unwrap();
+        // Quick equality is deliberately weaker than byte equality. This
+        // preservation pass must not replace the remote payload from source.
+        std::fs::write(&destination_file, b"DEST").unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(source_root.path().join("file")).unwrap(),
+        );
+        filetime::set_file_mtime(&destination_file, mtime).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&destination_file).unwrap().ino();
         xattr::remove(source_root.path().join("dir"), name).unwrap();
         xattr::set(&destination_dir, name, b"remove-dir").unwrap();
-        execute_with_handle(
+        let stats = execute_with_handle(
             source_root.path(),
             destination_root.path(),
             session.request_handle(),
@@ -903,6 +915,10 @@ mod tests {
         );
         assert!(xattr::get(&destination_file, stale).unwrap().is_none());
         assert!(xattr::get(&destination_dir, name).unwrap().is_none());
+        assert_eq!(std::fs::read(&destination_file).unwrap(), b"DEST");
+        assert_eq!(std::fs::metadata(&destination_file).unwrap().ino(), inode);
+        assert_eq!(stats.bytes_transferred, 0);
+        assert_eq!(stats.files_updated, 0);
     }
 
     /// -A/--preserve-acls over v3: the local source's list is mirrored onto

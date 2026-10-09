@@ -10,15 +10,13 @@ use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
-use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
-use crate::remote::bsdflags::{apply_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError};
+use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
+use crate::remote::bsdflags::RemoteBsdFlagsError;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
 use crate::remote::transfer::{
     TransferDestination, TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
 };
-use crate::remote::xattr::{
-    apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
-};
+use crate::remote::xattr::{read_preserved_xattrs, RemoteXattrError, XattrLocation};
 use crate::transfer::delta::BasisIndexLimits;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -51,9 +49,10 @@ pub enum RemotePushAction {
     },
     ApplyMetadata {
         source: Entry,
-        expected_destination: EntryIdentity,
+        destination: Entry,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
+        policy: ExecutionPolicy,
     },
 }
 
@@ -266,15 +265,13 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    let expected_destination = destination.identity.ok_or_else(|| {
-        RemotePushLowerError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
-    })?;
     Ok(Some(metadata_work(
         source,
-        expected_destination,
+        destination,
         unix_mode,
         modified,
-    )))
+        policy,
+    )?))
 }
 
 fn requested_metadata(
@@ -329,16 +326,33 @@ fn mutation_work(action: RemotePushAction) -> WorkItem<RemotePushAction> {
 
 fn metadata_work(
     source: Entry,
-    expected_destination: EntryIdentity,
+    destination: Entry,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
-) -> WorkItem<RemotePushAction> {
-    mutation_work(RemotePushAction::ApplyMetadata {
-        source,
-        expected_destination,
-        unix_mode,
-        modified,
-    })
+    policy: ExecutionPolicy,
+) -> LowerResult<WorkItem<RemotePushAction>> {
+    if destination.identity.is_none() {
+        return Err(RemotePushLowerError::MissingDestinationIdentity(
+            destination.path.as_path().to_path_buf(),
+        ));
+    }
+    Ok(WorkItem::new(
+        RemotePushAction::ApplyMetadata {
+            source,
+            destination,
+            unix_mode,
+            modified,
+            policy,
+        },
+        ResourceRequest {
+            metadata_ops: 1,
+            network_writes: 1,
+            // Native source payload, wire fields and encoded/router payload are
+            // individually capped. No file bytes are read under this reservation.
+            buffered_bytes: 4 * crate::protocol::MAX_FRAME_PAYLOAD as u64,
+            ..ResourceRequest::default()
+        },
+    ))
 }
 
 /// Executes already-lowered v3 push work. The caller owns tree ordering,
@@ -424,10 +438,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
             destination,
-            comparison,
+            ..
         } = op
         {
-            return self.lower_unchanged_file_preservation(source, destination, policy, comparison);
+            return self.lower_unchanged_file_preservation(source, destination, policy);
         }
         lower_sync_op(op, policy).map_err(RemotePushError::from)
     }
@@ -561,35 +575,21 @@ impl RemotePushExecutor {
         source: Entry,
         destination: Entry,
         policy: ExecutionPolicy,
-        comparison: crate::engine::domain::ContentComparison,
     ) -> Result<Option<WorkItem<RemotePushAction>>> {
         if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
             return Ok(None);
         }
-        let mode = if policy.preserve_permissions {
-            source.unix_mode
-        } else {
-            destination.unix_mode
-        }
-        .ok_or_else(|| {
-            RemotePushLowerError::MissingFileMode(source.path.as_path().to_path_buf())
-        })?;
-        let metadata = TransferMetadata {
-            unix_mode: Some(mode),
-            modified: Some(if policy.preserve_times {
-                source.modified
-            } else {
-                destination.modified
-            }),
-            xattrs: None,
-            acls: None,
-        };
-        Ok(Some(file_work(RemotePushAction::TransferFile {
+        let (unix_mode, modified) =
+            requested_metadata(&source, &destination, policy)?.unwrap_or((None, None));
+        // Quick equality says nothing about byte equality. Preservation owns
+        // the observed destination inode; it must never copy source bytes.
+        Ok(Some(metadata_work(
             source,
-            destination: Some(destination),
-            metadata,
-            source_removal: comparison == crate::engine::domain::ContentComparison::Blake3,
-        })))
+            destination,
+            unix_mode,
+            modified,
+            policy,
+        )?))
     }
 
     pub async fn execute(
@@ -743,32 +743,41 @@ impl RemotePushExecutor {
             }
             RemotePushAction::ApplyMetadata {
                 source,
-                expected_destination,
+                mut destination,
                 unix_mode,
                 modified,
+                policy,
             } => {
+                let expected_destination = destination.identity.ok_or_else(|| {
+                    RemotePushError::MissingDestinationIdentity(
+                        destination.path.as_path().to_path_buf(),
+                    )
+                })?;
+                self.check_source_identity(&source).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                self.remote
-                    .apply_metadata(
-                        &source.path,
-                        source.kind,
-                        expected_destination,
-                        unix_mode,
-                        modified,
-                    )
-                    .await?;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
+                let metadata = crate::remote::runtime::metadata::observed_metadata(
+                    &source.path,
+                    source.kind,
+                    expected_destination,
+                    unix_mode,
+                    modified,
+                    &crate::rooted_fs::MetadataPreservation {
+                        xattrs: xattrs.as_deref(),
+                        acl: acls.as_deref(),
+                        bsd_flags,
+                    },
+                )
+                .map_err(RemoteSessionError::from)?;
+                self.check_source_identity(&source).await?;
+                let identity = self.remote.apply_metadata(metadata).await?;
+                // Release metadata admission before acquiring the separate
+                // file/hash budget for a fresh existing-destination receipt.
+                drop(_permit);
+                if self.remove_source_files && source.is_file() {
+                    destination.identity = Some(identity);
+                    self.remove_unchanged_source(&source, &destination, policy)
                         .await?;
                 }
                 Ok(crate::engine::work::WorkResult::Metadata)
@@ -1122,6 +1131,9 @@ impl RemotePushExecutor {
             source_fingerprint,
             destination_fingerprint,
         )?;
+        self.remote
+            .revalidate_existing_destination(&destination.path, receipt.destination_identity())
+            .await?;
         if self.hardlinks {
             if let Some(group) = source.hardlink_group {
                 self.check_source_identity(source).await?;
@@ -1223,18 +1235,6 @@ impl RemotePushExecutor {
         Ok(Some(xattrs))
     }
 
-    /// Mirror an already-read attribute set onto the remote destination.
-    async fn write_destination_xattrs(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        xattrs: &[(OsString, Vec<u8>)],
-    ) -> Result<()> {
-        let location = XattrLocation::Remote(&self.remote);
-        apply_preserved_xattrs(&location, path, kind, xattrs).await?;
-        Ok(())
-    }
-
     /// Read the local source's access-control list for one entry when `-A`
     /// requested it. Symlinks are skipped, like xattrs.
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
@@ -1253,20 +1253,6 @@ impl RemotePushExecutor {
         Ok(Some(acl.unwrap_or_default()))
     }
 
-    /// Mirror an already-read access-control list onto the remote
-    /// destination. Preservation ordering matches xattrs (read before the
-    /// first mutation, applied after commit).
-    async fn write_destination_acls(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        acl: &str,
-    ) -> Result<()> {
-        let location = AclLocation::Remote(&self.remote);
-        apply_preserved_acls(&location, path, kind, acl).await?;
-        Ok(())
-    }
-
     /// Read the source's BSD file flags for one entry when `-F` requested
     /// them (macOS only; elsewhere `-F` is refused up front). Symlinks are
     /// skipped, like xattrs.
@@ -1276,20 +1262,6 @@ impl RemotePushExecutor {
         }
         let flags = existing::observed_flags(self.source_root.clone(), source.clone()).await?;
         Ok(Some(flags))
-    }
-
-    /// Mirror already-read BSD file flags onto the remote destination.
-    /// Preservation ordering matches xattrs (read before the first
-    /// mutation, applied after commit).
-    async fn write_destination_bsd_flags(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        flags: u32,
-    ) -> Result<()> {
-        let location = BsdFlagsLocation::Remote(&self.remote);
-        apply_preserved_bsd_flags(&location, path, kind, flags).await?;
-        Ok(())
     }
 }
 
