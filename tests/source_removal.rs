@@ -186,7 +186,7 @@ async fn remote_parity_rechecks_identity_and_selected_metadata() {
             else {
                 panic!("expected destination verification");
             };
-            session.hash_handler().serve(incoming).await
+            session.hash_handler().unwrap().serve(incoming).await
         });
         let client = ClientRemoteSession::connect(
             client_reader,

@@ -224,22 +224,7 @@ async fn execute_with_handle(
         .map_err(map_controller_error)?;
         let mut stats = preview_stats(preview)?;
         stats.duration = scan_started.elapsed();
-        reporter.finish(
-            &sy::sync::output::SummaryCounts {
-                files_created: stats.files_created,
-                files_updated: stats.files_updated,
-                files_skipped: stats.files_skipped,
-                files_deleted: stats.files_deleted,
-                bytes_transferred: stats.bytes_transferred,
-                duration_secs: stats.duration.as_secs_f64(),
-                files_verified: stats.files_verified as u64,
-                verification_failures: stats.verification_failures,
-            },
-            sy::sync::output::SyncTimings {
-                scan: stats.duration,
-                transfer: std::time::Duration::ZERO,
-            },
-        );
+        finish_report(&reporter, &stats, stats.duration, std::time::Duration::ZERO);
         return Ok(stats);
     }
 
@@ -251,22 +236,7 @@ async fn execute_with_handle(
         .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;
     stats.duration = scan_elapsed + transfer_started.elapsed();
-    reporter.finish(
-        &sy::sync::output::SummaryCounts {
-            files_created: stats.files_created,
-            files_updated: stats.files_updated,
-            files_skipped: stats.files_skipped,
-            files_deleted: stats.files_deleted,
-            bytes_transferred: stats.bytes_transferred,
-            duration_secs: stats.duration.as_secs_f64(),
-            files_verified: stats.files_verified as u64,
-            verification_failures: stats.verification_failures,
-        },
-        sy::sync::output::SyncTimings {
-            scan: scan_elapsed,
-            transfer: transfer_started.elapsed(),
-        },
-    );
+    finish_report(&reporter, &stats, scan_elapsed, transfer_started.elapsed());
     Ok(stats)
 }
 
@@ -335,7 +305,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             // Scan, two fetches, and observed directory preparation/final read.
@@ -355,7 +325,12 @@ mod tests {
                         .unwrap();
                     }
                     IncomingRequest::Metadata(incoming) => {
-                        session.metadata_handler().serve(incoming).await.unwrap();
+                        session
+                            .metadata_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _other => panic!("unexpected v3 pull request variant"),
                 }
@@ -417,7 +392,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             for _ in 0..2 {
@@ -499,7 +474,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             // Remote scan, then one fetch carrying both file bytes and the
@@ -571,7 +546,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             for _ in 0..7 {
@@ -588,7 +563,12 @@ mod tests {
                         .unwrap();
                     }
                     IncomingRequest::Metadata(incoming) => {
-                        session.metadata_handler().serve(incoming).await.unwrap();
+                        session
+                            .metadata_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _other => panic!("unexpected unchanged xattr pull request variant"),
                 }
@@ -674,7 +654,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             // Remote scan, then one fetch carrying both file bytes and the
@@ -754,10 +734,10 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
-            let flags_handler = session.bsd_flags_handler();
+            let flags_handler = session.bsd_flags_handler().unwrap();
             // Remote scan, then the flags read and the whole-file fetch:
             // exactly three requests, so an extra round-trip regression
             // cannot hide.
@@ -834,7 +814,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             for _ in 0..2 {
@@ -910,7 +890,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             // One scan, one fetch, and validation of the later member.
@@ -1043,7 +1023,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted();
+            let rooted = session.scan_handler_rooted().unwrap();
             let sender = session.sender();
             let peer = session.client().platform.os;
             match session.next_request().await.unwrap().unwrap() {

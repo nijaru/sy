@@ -123,6 +123,14 @@ pub async fn serve_incoming_scan_rooted(
     incoming: IncomingStream,
     sender: &RouterSender,
 ) -> Result<()> {
+    serve_incoming_scan_session(super::SessionRoot::Present(rooted), incoming, sender).await
+}
+
+pub(super) async fn serve_incoming_scan_session(
+    root: super::SessionRoot,
+    incoming: IncomingStream,
+    sender: &RouterSender,
+) -> Result<()> {
     let IncomingStream { first, mut inbox } = incoming;
     let stream_id = inbox.stream_id();
     let first_frame = first.frame();
@@ -137,7 +145,21 @@ pub async fn serve_incoming_scan_rooted(
     }
     drop(first);
 
-    serve_scan(rooted, request, sender, stream_id).await?;
+    match root {
+        super::SessionRoot::Present(rooted) => {
+            serve_scan(rooted, request, sender, stream_id).await?
+        }
+        super::SessionRoot::AbsentPreview => {
+            sender
+                .send(Frame::new(
+                    FrameKind::EntryEnd,
+                    FrameFlags::ACK_REQUIRED,
+                    stream_id,
+                    bytes::Bytes::new(),
+                )?)
+                .await?;
+        }
+    }
     receive_scan_ack(&mut inbox, stream_id).await
 }
 

@@ -245,7 +245,7 @@ async fn session_cutoff_fences_rooted_mutations_and_cleans_owned_staging() {
             let root = tempfile::tempdir().unwrap();
             prepare(root.path(), mutation);
             let (client, mut server) = session(root.path(), Operation::Push).await;
-            let rooted = server.scan_handler_rooted();
+            let rooted = server.scan_handler_rooted().unwrap();
             let before = observe(&rooted).unwrap();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -347,7 +347,7 @@ async fn pull_root_refuses_native_mutations_and_private_staging() {
         let root = tempfile::tempdir().unwrap();
         prepare(root.path(), mutation);
         let (_client, mut server) = session(root.path(), Operation::Pull).await;
-        let rooted = server.scan_handler_rooted();
+        let rooted = server.scan_handler_rooted().unwrap();
         let before = observe(&rooted).unwrap();
         let worker_root = rooted.clone();
         let result = tokio::task::spawn_blocking(move || mutate(&worker_root, mutation))

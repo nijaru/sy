@@ -24,7 +24,7 @@ use crate::remote::router::{
     FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
     SharedRouterError,
 };
-use crate::remote::scan::{request_scan, serve_incoming_scan_rooted};
+use crate::remote::scan::{request_scan, serve_incoming_scan_session};
 use crate::remote::signature::{
     choose_signature_block_size, request_signatures, serve_incoming_signatures_rooted,
     RemoteSignatureError, SignatureEvent, SignatureStream,
@@ -33,7 +33,7 @@ use crate::remote::transfer::{
     request_file_transfer, serve_incoming_file_rooted, RemoteTransferError,
 };
 use crate::remote::xattr::{request_read_xattrs, serve_incoming_xattr_rooted, RemoteXattrError};
-use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
+use crate::remote::{client_handshake, server_handshake, OpenedServerSession, SessionRoot};
 use crate::rooted_fs::RootedFs;
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
@@ -66,6 +66,9 @@ pub enum RemoteSessionError {
         operation: Operation,
         kind: FrameKind,
     },
+
+    #[error("absent preview root has no filesystem authority")]
+    AbsentPreviewRoot,
 
     #[error("compression requested but the peer did not negotiate the ZSTD capability")]
     PeerLacksZstd,
@@ -424,13 +427,13 @@ pub enum IncomingRequest {
 
 #[derive(Clone)]
 pub struct ServerScanHandler {
-    rooted: RootedFs,
+    rooted: SessionRoot,
     sender: RouterSender,
 }
 
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
-        serve_incoming_scan_rooted(self.rooted.clone(), incoming, &self.sender).await
+        serve_incoming_scan_session(self.rooted.clone(), incoming, &self.sender).await
     }
 }
 
@@ -569,10 +572,12 @@ impl ServerRemoteSession {
     {
         let mut opened = server_handshake(&mut reader, &mut writer).await?;
         let router = FrameRouter::start(reader, writer, RouterRole::Server, config)?;
-        opened.rooted.bind_session_mutations(
-            router.sender().publication_admission(),
-            opened.operation == Operation::Pull,
-        );
+        if let SessionRoot::Present(rooted) = &mut opened.rooted {
+            rooted.bind_session_mutations(
+                router.sender().publication_admission(),
+                opened.operation != Operation::Push,
+            );
+        }
         Ok(Self { opened, router })
     }
 
@@ -603,73 +608,80 @@ impl ServerRemoteSession {
         }
     }
 
-    /// The pinned session root for pull-side source handlers (file fetch).
-    pub fn scan_handler_rooted(&self) -> crate::rooted_fs::RootedFs {
-        self.opened.rooted.clone()
+    pub(crate) fn has_root(&self) -> bool {
+        matches!(self.opened.rooted, SessionRoot::Present(_))
     }
 
-    pub fn hash_handler(&self) -> ServerHashHandler {
-        ServerHashHandler {
-            rooted: self.opened.rooted.clone(),
-            sender: self.router.sender(),
-            peer: self.opened.client.platform.os,
+    /// The pinned filesystem authority; absence never borrows a parent root.
+    pub fn scan_handler_rooted(&self) -> Result<RootedFs> {
+        match &self.opened.rooted {
+            SessionRoot::Present(rooted) => Ok(rooted.clone()),
+            SessionRoot::AbsentPreview => Err(RemoteSessionError::AbsentPreviewRoot),
         }
     }
 
-    pub fn signature_handler(&self) -> ServerSignatureHandler {
-        ServerSignatureHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn hash_handler(&self) -> Result<ServerHashHandler> {
+        Ok(ServerHashHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn file_handler(&self) -> ServerFileHandler {
-        ServerFileHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn signature_handler(&self) -> Result<ServerSignatureHandler> {
+        Ok(ServerSignatureHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn metadata_handler(&self) -> ServerMetadataHandler {
-        ServerMetadataHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn file_handler(&self) -> Result<ServerFileHandler> {
+        Ok(ServerFileHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn mutation_handler(&self) -> ServerMutationHandler {
-        ServerMutationHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn metadata_handler(&self) -> Result<ServerMetadataHandler> {
+        Ok(ServerMetadataHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn xattr_handler(&self) -> ServerXattrHandler {
-        ServerXattrHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn mutation_handler(&self) -> Result<ServerMutationHandler> {
+        Ok(ServerMutationHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn acl_handler(&self) -> ServerAclHandler {
-        ServerAclHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn xattr_handler(&self) -> Result<ServerXattrHandler> {
+        Ok(ServerXattrHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
     }
 
-    pub fn bsd_flags_handler(&self) -> ServerBsdFlagsHandler {
-        ServerBsdFlagsHandler {
-            rooted: self.opened.rooted.clone(),
+    pub fn acl_handler(&self) -> Result<ServerAclHandler> {
+        Ok(ServerAclHandler {
+            rooted: self.scan_handler_rooted()?,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-        }
+        })
+    }
+
+    pub fn bsd_flags_handler(&self) -> Result<ServerBsdFlagsHandler> {
+        Ok(ServerBsdFlagsHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
@@ -684,7 +696,14 @@ impl ServerRemoteSession {
             return Ok(None);
         };
 
-        match incoming.first.frame().kind() {
+        let kind = incoming.first.frame().kind();
+        if !self.has_root() && kind != FrameKind::ScanRequest {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation(),
+                kind,
+            });
+        }
+        match kind {
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
@@ -741,6 +760,98 @@ impl ServerRemoteSession {
                 kind: incoming.first.frame().kind(),
             }),
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn preview_requests_have_only_the_observed_read_authority() {
+    use crate::protocol::{Frame, FrameFlags};
+    use crate::rooted_fs::RootedFsError;
+    for present in [false, true] {
+        let kinds: &[FrameKind] = if present {
+            &[
+                FrameKind::FileBegin,
+                FrameKind::Metadata,
+                FrameKind::Mutation,
+                FrameKind::FileFetchRequest,
+            ]
+        } else {
+            &[
+                FrameKind::FileBegin,
+                FrameKind::Metadata,
+                FrameKind::Mutation,
+                FrameKind::FileFetchRequest,
+                FrameKind::HashRequest,
+                FrameKind::SignatureRequest,
+                FrameKind::XattrRequest,
+                FrameKind::AclRequest,
+                FrameKind::BsdFlagsRequest,
+            ]
+        };
+        for &kind in kinds {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("destination");
+            if present {
+                std::fs::create_dir(&root).unwrap();
+            }
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(server_io);
+            let server = tokio::spawn(async move {
+                let mut session =
+                    ServerRemoteSession::accept(reader, writer, RouterConfig::default())
+                        .await
+                        .unwrap();
+                match session.scan_handler_rooted() {
+                    Ok(rooted) => {
+                        assert!(present);
+                        assert!(matches!(
+                            rooted.create_directory_blocking(
+                                &RelativePath::new("forbidden").unwrap()
+                            ),
+                            Err(RootedFsError::ReadOnlyRoot)
+                        ));
+                    }
+                    Err(RemoteSessionError::AbsentPreviewRoot) => assert!(!present),
+                    Err(error) => panic!("{error}"),
+                }
+                assert!(matches!(session.next_request().await,
+                    Err(RemoteSessionError::OperationMismatch { operation: Operation::PreviewPush, kind: actual }) if actual == kind));
+                session.shutdown().await.unwrap();
+            });
+            let (reader, writer) = tokio::io::split(client_io);
+            let client = ClientRemoteSession::connect(
+                reader,
+                writer,
+                Operation::PreviewPush,
+                &root,
+                RouterConfig::default(),
+            )
+            .await
+            .unwrap();
+            let sender = client.sender();
+            let inbox = sender.open_stream().unwrap();
+            sender
+                .send(
+                    Frame::new(
+                        kind,
+                        FrameFlags::empty(),
+                        inbox.stream_id(),
+                        bytes::Bytes::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.exists(), present);
+            if present {
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
         }
     }
 }
@@ -884,7 +995,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan_handler = session.scan_handler();
-            let signature_handler = session.signature_handler();
+            let signature_handler = session.signature_handler().unwrap();
             let mut tasks = JoinSet::new();
 
             for _ in 0..2 {
@@ -985,7 +1096,7 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.file_handler();
+            let handler = session.file_handler().unwrap();
             let request = session.next_request().await.unwrap().unwrap();
             let IncomingRequest::File(incoming) = request else {
                 panic!("expected file request");
@@ -1037,7 +1148,7 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.metadata_handler();
+            let handler = session.metadata_handler().unwrap();
             let request = session.next_request().await.unwrap().unwrap();
             let IncomingRequest::Metadata(incoming) = request else {
                 panic!("expected metadata request");
@@ -1094,7 +1205,7 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.mutation_handler();
+            let handler = session.mutation_handler().unwrap();
             for _ in 0..4 {
                 let request = session.next_request().await.unwrap().unwrap();
                 let IncomingRequest::Mutation(incoming) = request else {
@@ -1166,7 +1277,7 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.file_handler();
+            let handler = session.file_handler().unwrap();
             ready_tx.send(()).unwrap();
             let request = session.next_request().await.unwrap().unwrap();
             let IncomingRequest::File(incoming) = request else {

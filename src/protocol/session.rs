@@ -8,6 +8,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub enum Operation {
     Push = 1,
     Pull = 2,
+    /// Read-only destination inspection, including an observed absent root.
+    PreviewPush = 3,
 }
 
 impl TryFrom<u8> for Operation {
@@ -17,6 +19,7 @@ impl TryFrom<u8> for Operation {
         match value {
             1 => Ok(Self::Push),
             2 => Ok(Self::Pull),
+            3 => Ok(Self::PreviewPush),
             _ => Err(ProtocolError::InvalidField {
                 field: "operation",
                 reason: "unknown operation value",
@@ -193,12 +196,14 @@ mod tests {
 
     #[test]
     fn session_open_round_trip_preserves_target_native_root() {
-        let open = SessionOpen::new(
-            Operation::Pull,
-            WirePath::new(Bytes::from_static(&[b'C', 0, b':', 0, b'\\', 0])).unwrap(),
-        );
-        let decoded = SessionOpen::decode(&open.encode().unwrap()).unwrap();
-        assert_eq!(decoded, open);
+        for operation in [Operation::Push, Operation::Pull, Operation::PreviewPush] {
+            let open = SessionOpen::new(
+                operation,
+                WirePath::new(Bytes::from_static(&[b'C', 0, b':', 0, b'\\', 0])).unwrap(),
+            );
+            let decoded = SessionOpen::decode(&open.encode().unwrap()).unwrap();
+            assert_eq!(decoded, open);
+        }
     }
 
     #[test]

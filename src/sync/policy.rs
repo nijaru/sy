@@ -22,6 +22,27 @@ use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 
+pub(crate) fn finish_report(
+    reporter: &sy::sync::output::SyncReporter,
+    stats: &SyncStats,
+    scan: std::time::Duration,
+    transfer: std::time::Duration,
+) {
+    reporter.finish(
+        &sy::sync::output::SummaryCounts {
+            files_created: stats.files_created,
+            files_updated: stats.files_updated,
+            files_skipped: stats.files_skipped,
+            files_deleted: stats.files_deleted,
+            bytes_transferred: stats.bytes_transferred,
+            duration_secs: stats.duration.as_secs_f64(),
+            files_verified: stats.files_verified as u64,
+            verification_failures: stats.verification_failures,
+        },
+        sy::sync::output::SyncTimings { scan, transfer },
+    );
+}
+
 pub(crate) struct SourceFilterSelection {
     filter: FilterEngine,
     excluded_subtree: Option<RelativePath>,

@@ -86,7 +86,7 @@ async fn delete_with_backup(
     let client = client.unwrap();
     let mut server = server.unwrap();
     let task = tokio::spawn(async move {
-        let handler = server.mutation_handler();
+        let handler = server.mutation_handler().unwrap();
         let sender = server.sender();
         while let Some(request) = server.next_request().await.unwrap() {
             let IncomingRequest::Mutation(incoming) = request else {

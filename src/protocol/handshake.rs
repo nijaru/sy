@@ -33,8 +33,11 @@ pub const PROTOCOL_V3_4: ProtocolVersion = ProtocolVersion { major: 3, minor: 4 
 /// Binds signature requests and responses to an explicit observed basis identity.
 pub const PROTOCOL_V3_5: ProtocolVersion = ProtocolVersion { major: 3, minor: 5 };
 
+/// Destination preview sessions can observe absence without creating a root.
+pub const PROTOCOL_V3_6: ProtocolVersion = ProtocolVersion { major: 3, minor: 6 };
+
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_5);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {

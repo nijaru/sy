@@ -93,11 +93,10 @@ async fn remote_roots_and_filenames_survive_cli_dispatch_in_both_directions() {
 }
 
 #[tokio::test]
-async fn pull_selection_checksum_and_absent_preview_follow_shared_cli_policy() {
+async fn remote_selection_checksum_and_absent_preview_follow_shared_cli_policy() {
     let fixture = tempfile::tempdir().unwrap();
     let search_path = ssh_path(fixture.path());
     let source = fixture.path().join("source");
-    let destination = fixture.path().join("destination");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("keep.bin"), b"original").unwrap();
     std::fs::write(source.join("small.bin"), b"x").unwrap();
@@ -106,8 +105,6 @@ async fn pull_selection_checksum_and_absent_preview_follow_shared_cli_policy() {
     std::fs::create_dir(source.join("ignored")).unwrap();
     std::fs::write(source.join("ignored/hidden.bin"), b"hidden").unwrap();
     std::os::unix::fs::symlink("keep.bin", source.join("link.bin")).unwrap();
-    let mut source_arg = OsString::from("test-peer:");
-    source_arg.push(&source);
     let flags = [
         "--include=*.bin",
         "--exclude=ignored/",
@@ -117,60 +114,85 @@ async fn pull_selection_checksum_and_absent_preview_follow_shared_cli_policy() {
         "--links=skip",
     ];
 
-    let mut preview_flags = flags.to_vec();
-    preview_flags.extend(["--dry-run", "--json"]);
-    let preview = copy(
-        &source_arg,
-        destination.as_os_str(),
-        &preview_flags,
-        &search_path,
-    )
-    .await;
-    let summary = std::str::from_utf8(&preview.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .find(|event| event["type"] == "summary")
-        .expect("dry-run JSON summary missing");
-    assert_eq!(summary["files_created"], 1);
-    assert!(!destination.exists());
-    assert_eq!(std::fs::read(source.join("keep.bin")).unwrap(), b"original");
+    for pull in [true, false] {
+        std::fs::write(source.join("keep.bin"), b"original").unwrap();
+        let destination = fixture
+            .path()
+            .join(if pull { "pull/nested" } else { "push/nested" });
+        let mut source_arg = source.as_os_str().to_os_string();
+        let mut destination_arg = destination.as_os_str().to_os_string();
+        let remote = if pull {
+            &mut source_arg
+        } else {
+            &mut destination_arg
+        };
+        let mut address = OsString::from("test-peer:");
+        address.push(&*remote);
+        *remote = address;
+        let mut preview_flags = flags.to_vec();
+        preview_flags.extend(["--dry-run", "--json"]);
+        let preview = copy(&source_arg, &destination_arg, &preview_flags, &search_path).await;
+        let summary = std::str::from_utf8(&preview.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["type"] == "summary")
+            .expect("dry-run JSON summary missing");
+        assert_eq!(summary["files_created"], 1);
+        assert!(!destination.parent().unwrap().exists());
+        assert_eq!(std::fs::read(source.join("keep.bin")).unwrap(), b"original");
 
-    copy(&source_arg, destination.as_os_str(), &flags, &search_path).await;
-    assert_eq!(
-        std::fs::read(destination.join("keep.bin")).unwrap(),
-        b"original"
-    );
-    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
-    // Same size AND timestamps: --checksum must compare content, not silently
-    // use quick equality or refuse an otherwise supported pull.
-    std::fs::write(source.join("keep.bin"), b"modified").unwrap();
-    let modified = std::fs::metadata(source.join("keep.bin"))
-        .unwrap()
-        .modified()
-        .unwrap();
-    std::fs::File::open(destination.join("keep.bin"))
-        .unwrap()
-        .set_modified(modified)
-        .unwrap();
-    let mut checksum_flags = flags.to_vec();
-    checksum_flags.push("--checksum");
-    copy(
-        &source_arg,
-        destination.as_os_str(),
-        &checksum_flags,
-        &search_path,
-    )
-    .await;
-    assert_eq!(
-        std::fs::read(destination.join("keep.bin")).unwrap(),
-        b"modified"
-    );
-    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
-    assert_eq!(
-        std::fs::read(source.join("ignored/hidden.bin")).unwrap(),
-        b"hidden"
-    );
+        copy(&source_arg, &destination_arg, &flags, &search_path).await;
+        assert_eq!(
+            std::fs::read(destination.join("keep.bin")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        let observed_time = std::fs::metadata(source.join("keep.bin"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::open(destination.join("keep.bin"))
+            .unwrap()
+            .set_modified(observed_time)
+            .unwrap();
+        let preview_existing =
+            copy(&source_arg, &destination_arg, &preview_flags, &search_path).await;
+        assert!(std::str::from_utf8(&preview_existing.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                event["type"] == "summary" && event["files_skipped"] == 1
+            }));
+        assert_eq!(
+            std::fs::read(destination.join("keep.bin")).unwrap(),
+            b"original"
+        );
+        // Same size AND timestamps: --checksum must compare content, not silently
+        // use quick equality or refuse an otherwise supported synchronization.
+        std::fs::write(source.join("keep.bin"), b"modified").unwrap();
+        let modified = std::fs::metadata(source.join("keep.bin"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::open(destination.join("keep.bin"))
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let mut checksum_flags = flags.to_vec();
+        checksum_flags.push("--checksum");
+        copy(&source_arg, &destination_arg, &checksum_flags, &search_path).await;
+        assert_eq!(
+            std::fs::read(destination.join("keep.bin")).unwrap(),
+            b"modified"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(source.join("ignored/hidden.bin")).unwrap(),
+            b"hidden"
+        );
+    }
 }
 
 fn ssh_path(root: &std::path::Path) -> OsString {
