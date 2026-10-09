@@ -16,6 +16,8 @@ pub enum WireMutationKind {
     /// link `path` to the existing `copy_source` inode). Both stay beneath
     /// the pinned root; the source must be a regular file.
     Hardlink = 6,
+    /// Revalidate a completed regular-file publication before source removal.
+    VerifyPublication = 7,
 }
 
 impl TryFrom<u8> for WireMutationKind {
@@ -29,6 +31,7 @@ impl TryFrom<u8> for WireMutationKind {
             4 => Ok(Self::RemoveDirectory),
             5 => Ok(Self::CopyFile),
             6 => Ok(Self::Hardlink),
+            7 => Ok(Self::VerifyPublication),
             _ => Err(ProtocolError::InvalidField {
                 field: "mutation_kind",
                 reason: "unknown mutation kind",
@@ -148,6 +151,17 @@ impl WireMutation {
         }
     }
 
+    pub const fn verify_publication(path: RelativeWirePath, identity: [u8; 32]) -> Self {
+        Self {
+            path,
+            kind: WireMutationKind::VerifyPublication,
+            symlink_target: None,
+            copy_source: None,
+            expected_identity: Some(identity),
+            modified: None,
+        }
+    }
+
     pub const fn kind(&self) -> WireMutationKind {
         self.kind
     }
@@ -227,6 +241,7 @@ impl WireMutation {
             || self.kind == WireMutationKind::RemoveDirectory
             || self.kind == WireMutationKind::ReplaceSymlink
             || self.kind == WireMutationKind::CopyFile
+            || self.kind == WireMutationKind::VerifyPublication
         {
             capacity = capacity
                 .checked_add(
@@ -257,6 +272,7 @@ impl WireMutation {
             || self.kind == WireMutationKind::RemoveDirectory
             || self.kind == WireMutationKind::ReplaceSymlink
             || self.kind == WireMutationKind::CopyFile
+            || self.kind == WireMutationKind::VerifyPublication
         {
             if let Some(identity) = self.expected_identity {
                 out.put_u8(1);
@@ -321,6 +337,7 @@ impl WireMutation {
             || kind == WireMutationKind::RemoveDirectory
             || kind == WireMutationKind::ReplaceSymlink
             || kind == WireMutationKind::CopyFile
+            || kind == WireMutationKind::VerifyPublication
         {
             match reader.u8()? {
                 0 => None,
@@ -389,7 +406,14 @@ impl WireMutation {
             | (WireMutationKind::Hardlink, false, true, false)
             | (WireMutationKind::CreateDirectory, false, false, false)
             | (WireMutationKind::RemoveFileLike, false, false, _)
-            | (WireMutationKind::RemoveDirectory, false, false, _) => Ok(()),
+            | (WireMutationKind::RemoveDirectory, false, false, _)
+            | (WireMutationKind::VerifyPublication, false, false, true) => Ok(()),
+            (WireMutationKind::VerifyPublication, false, false, false) => {
+                Err(ProtocolError::InvalidField {
+                    field: "expected_identity",
+                    reason: "publication verification requires identity",
+                })
+            }
             (WireMutationKind::ReplaceSymlink, false, _, _) => Err(ProtocolError::InvalidField {
                 field: "symlink_target",
                 reason: "replace-symlink mutation requires a target",

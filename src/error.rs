@@ -69,6 +69,9 @@ pub enum SyncError {
     #[error("destination was committed at {path}, but private staging cleanup failed: {reason}")]
     CommittedCleanupPending { path: PathBuf, reason: String },
 
+    #[error("destination was committed at {path}, but required finalization failed: {reason}; source retained")]
+    CommittedFinalizationFailed { path: PathBuf, reason: String },
+
     #[error("destination was committed at {destination}, but the configured root path {root} could not be verified after commit ({reason}); locate and verify the file before retrying")]
     CommittedRootChanged {
         destination: PathBuf,

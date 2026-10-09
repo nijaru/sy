@@ -334,9 +334,9 @@ mod tests {
                     .unwrap();
             let scan = session.scan_handler();
             let file = session.file_handler();
-            // Destination scan, directory creation, three file transfers,
-            // then observed directory finalization.
-            for _ in 0..6 {
+            // Scan, directory creation, three transfers with publication
+            // revalidation before source removal, then directory finalization.
+            for _ in 0..9 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {
@@ -437,7 +437,7 @@ mod tests {
             let hash = session.hash_handler();
             let file = session.file_handler();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..8 {
+            for _ in 0..11 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => {
                         let scan = scan.clone();
@@ -1041,16 +1041,13 @@ mod tests {
                     .unwrap();
             let scan = session.scan_handler();
             let file = session.file_handler();
-            let flags_handler = session.bsd_flags_handler();
-            // Two passes: destination scan + file transfer + flags mirror.
-            for _ in 0..6 {
+            // Two passes: flags are finalized on the file transaction's
+            // held descriptor before its ACK, not by a fresh-path RPC.
+            for _ in 0..4 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {
                         file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::BsdFlags(incoming) => {
-                        flags_handler.serve(incoming).await.unwrap();
                     }
                     _ => panic!("unexpected bsd flags v3 adapter request"),
                 }

@@ -8,6 +8,31 @@ pub const TRANSFER_BASIS_IDENTITY_LEN: usize = 32;
 pub const MAX_TRANSFER_DATA_SIZE: usize = 256 * 1024;
 pub const MAX_DELTA_COPY_SIZE: u32 = 1024 * 1024;
 
+/// Successful file publication ACK: identity of the original held staged inode
+/// after publication, cleanup and required finalization. Fixed size and typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireFileAck {
+    identity: [u8; 32],
+}
+
+impl WireFileAck {
+    pub const fn new(identity: [u8; 32]) -> Self {
+        Self { identity }
+    }
+    pub const fn identity(self) -> [u8; 32] {
+        self.identity
+    }
+    pub fn encode(self) -> Bytes {
+        Bytes::copy_from_slice(&self.identity)
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = SliceReader::new(payload);
+        let identity = reader.array::<32>()?;
+        reader.finish()?;
+        Ok(Self { identity })
+    }
+}
+
 const WHOLE_FILE_MODE: u8 = 0;
 const DELTA_FILE_MODE: u8 = 1;
 
@@ -16,6 +41,7 @@ bitflags! {
     struct FileMetadataFields: u8 {
         const UNIX_MODE = 1 << 0;
         const MODIFIED = 1 << 1;
+        const BSD_FLAGS = 1 << 2;
     }
 }
 
@@ -49,6 +75,7 @@ pub struct WireFileBegin {
     basis: Option<WireFileBasis>,
     unix_mode: Option<u32>,
     modified: Option<(i64, u32)>,
+    bsd_flags: Option<u32>,
 }
 
 impl WireFileBegin {
@@ -59,6 +86,7 @@ impl WireFileBegin {
             basis: None,
             unix_mode: None,
             modified: None,
+            bsd_flags: None,
         }
     }
 
@@ -69,6 +97,7 @@ impl WireFileBegin {
             basis: Some(basis),
             unix_mode: None,
             modified: None,
+            bsd_flags: None,
         }
     }
 
@@ -81,6 +110,15 @@ impl WireFileBegin {
         self.unix_mode = unix_mode;
         self.modified = modified;
         Ok(self)
+    }
+
+    pub fn with_bsd_flags(mut self, flags: Option<u32>) -> Self {
+        self.bsd_flags = flags;
+        self
+    }
+
+    pub const fn bsd_flags(&self) -> Option<u32> {
+        self.bsd_flags
     }
 
     pub const fn file_size(&self) -> u64 {
@@ -101,8 +139,9 @@ impl WireFileBegin {
 
     pub fn encode(&self) -> Bytes {
         let basis_len = self.basis.map_or(0, |_| 8 + TRANSFER_BASIS_IDENTITY_LEN);
-        let metadata_len =
-            usize::from(self.unix_mode.is_some()) * 4 + usize::from(self.modified.is_some()) * 12;
+        let metadata_len = usize::from(self.unix_mode.is_some()) * 4
+            + usize::from(self.modified.is_some()) * 12
+            + usize::from(self.bsd_flags.is_some()) * 4;
         let mut out = BytesMut::with_capacity(
             2 + 8 + basis_len + metadata_len + self.path.as_encoded().len(),
         );
@@ -123,6 +162,9 @@ impl WireFileBegin {
         if let Some((seconds, nanoseconds)) = self.modified {
             out.put_i64(seconds);
             out.put_u32(nanoseconds);
+        }
+        if let Some(flags) = self.bsd_flags {
+            out.put_u32(flags);
         }
         out.extend_from_slice(self.path.as_encoded());
         out.freeze()
@@ -162,6 +204,10 @@ impl WireFileBegin {
             None
         };
         validate_modified(modified)?;
+        let bsd_flags = metadata_fields
+            .contains(FileMetadataFields::BSD_FLAGS)
+            .then(|| reader.u32())
+            .transpose()?;
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take_remaining()?))?;
         reader.finish()?;
         Ok(Self {
@@ -170,6 +216,7 @@ impl WireFileBegin {
             basis,
             unix_mode,
             modified,
+            bsd_flags,
         })
     }
 
@@ -177,6 +224,7 @@ impl WireFileBegin {
         let mut fields = FileMetadataFields::empty();
         fields.set(FileMetadataFields::UNIX_MODE, self.unix_mode.is_some());
         fields.set(FileMetadataFields::MODIFIED, self.modified.is_some());
+        fields.set(FileMetadataFields::BSD_FLAGS, self.bsd_flags.is_some());
         fields
     }
 }
@@ -330,6 +378,25 @@ fn validate_data_len(len: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_ack_has_an_exact_bounded_identity_payload() {
+        let ack = WireFileAck::new([7; 32]);
+        assert_eq!(WireFileAck::decode(&ack.encode()).unwrap(), ack);
+        for length in [0, 1, 31, 33, 1024] {
+            assert!(WireFileAck::decode(&vec![7; length]).is_err());
+        }
+    }
+
+    #[test]
+    fn file_begin_preserves_flags_and_rejects_truncated_optional_fields() {
+        let path = RelativeWirePath::from_components([b"file".as_slice()]).unwrap();
+        let begin = WireFileBegin::whole(path, 10).with_bsd_flags(Some(1));
+        assert_eq!(WireFileBegin::decode(&begin.encode()).unwrap(), begin);
+        for length in 0..14 {
+            assert!(WireFileBegin::decode(&begin.encode()[..length]).is_err());
+        }
+    }
     use proptest::prelude::*;
 
     fn path() -> RelativeWirePath {

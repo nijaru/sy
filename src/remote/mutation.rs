@@ -161,6 +161,22 @@ pub async fn request_hardlink(
     request_mutation(sender, WireMutation::hardlink(source, destination)).await
 }
 
+pub(crate) async fn request_verify_publication(
+    sender: &RouterSender,
+    proof: &crate::rooted_fs::PublishedFileProof,
+    peer: PlatformOs,
+) -> Result<()> {
+    ensure_compatible_path_encoding(peer)?;
+    request_mutation(
+        sender,
+        WireMutation::verify_publication(
+            encode_relative_path(proof.path.as_path())?,
+            *proof.identity.as_bytes(),
+        ),
+    )
+    .await
+}
+
 async fn request_mutation(sender: &RouterSender, mutation: WireMutation) -> Result<()> {
     if !request_mutation_payload(sender, mutation).await?.is_empty() {
         return Err(RemoteMutationError::InvalidAck);
@@ -297,6 +313,15 @@ fn apply_mutation(
         WireMutationKind::Hardlink => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
             rooted.create_hardlink_blocking(&source, &path)?;
+        }
+        WireMutationKind::VerifyPublication => {
+            let identity = expected_identity.ok_or(RemoteMutationError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "expected_identity",
+                    reason: "publication verification requires identity",
+                },
+            ))?;
+            crate::rooted_fs::PublishedFileProof { path, identity }.revalidate_blocking(rooted)?;
         }
     }
     Ok(Bytes::new())

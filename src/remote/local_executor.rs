@@ -509,8 +509,7 @@ impl LocalSyncExecutor {
                 // BSD flags remain a post-commit phase; xattrs and ACLs are
                 // captured by the transfer layer from the held byte source.
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let pending_finalization = bsd_flags.is_some();
-                let (transfer, mut receipt) = self
+                let (transfer, receipt) = self
                     .transfer_source_file(
                         &source,
                         &destination,
@@ -519,17 +518,9 @@ impl LocalSyncExecutor {
                             xattrs: self.xattrs && !source.is_symlink(),
                             acl: self.acls && !source.is_symlink(),
                         },
-                        pending_finalization,
+                        bsd_flags,
                     )
                     .await?;
-                // Only rename-incompatible flags remain post-commit
-                // finalization; xattrs/ACLs ride into staging and a failure
-                // there aborts the replacement.
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                    receipt.mark_finalized();
-                }
                 if source_removal {
                     self.remove_committed_source(&receipt, &source).await?;
                 }
@@ -669,8 +660,7 @@ impl LocalSyncExecutor {
         // BSD flags remain a post-commit phase; xattrs and ACLs are captured
         // from the held source that supplies the representative's bytes.
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        let pending_finalization = bsd_flags.is_some();
-        let (transfer, mut receipt) = self
+        let (transfer, receipt) = self
             .transfer_source_file(
                 &source,
                 &destination,
@@ -679,15 +669,9 @@ impl LocalSyncExecutor {
                     xattrs: self.xattrs && !source.is_symlink(),
                     acl: self.acls && !source.is_symlink(),
                 },
-                pending_finalization,
+                bsd_flags,
             )
             .await?;
-        // Only rename-incompatible flags remain post-commit finalization.
-        if let Some(flags) = bsd_flags {
-            self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                .await?;
-            receipt.mark_finalized();
-        }
         groups
             .insert(
                 group,
@@ -758,7 +742,7 @@ impl LocalSyncExecutor {
         destination: &Option<Entry>,
         metadata: &crate::endpoint::transfer::TransferMetadata,
         preservation_request: crate::endpoint::io::PreservationRequest,
-        pending_finalization: bool,
+        final_flags: Option<u32>,
     ) -> Result<(
         crate::engine::work::TransferSummary,
         PublishedDestinationReceipt,
@@ -794,7 +778,7 @@ impl LocalSyncExecutor {
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
                 preservation_request,
-                pending_finalization,
+                final_flags,
                 metadata: Some(*metadata),
             },
             || async {
@@ -892,6 +876,24 @@ impl LocalSyncExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
+        if source.is_file() {
+            let rooted = self.metadata_authority().await?.clone();
+            let receipt = receipt.clone();
+            tokio::task::spawn_blocking(move || {
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(|error| crate::error::SyncError::Config(error.to_string()))?;
+                receipt.revalidate_destination_blocking(&rooted)
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
+            .map_err(|error| {
+                LocalSyncError::Source(
+                    self.source_path(&source.path),
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+        }
         self.remove_source_entry_on_disk(source).await
     }
 
@@ -1377,6 +1379,83 @@ mod tests {
 
     fn rel(path: &str) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_publication_cannot_authorize_source_removal() {
+        use futures::TryStreamExt;
+        let source_root = tempfile::tempdir().unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        std::fs::write(source_root.path().join("input"), b"published bytes").unwrap();
+        let source = crate::endpoint::local_entry_scan::local_entry_stream(
+            source_root.path().to_path_buf(),
+            crate::engine::scan::ScanRequest::default(),
+        )
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+        let source_endpoint =
+            crate::endpoint::local::LocalEndpoint::new(source_root.path().to_path_buf());
+        let destination_endpoint =
+            crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf());
+        let result = crate::endpoint::transfer::transfer_file(
+            &source_endpoint,
+            source.path.as_path(),
+            &destination_endpoint,
+            std::path::Path::new("renamed"),
+            TransferOptions {
+                update: false,
+                verify: false,
+                follow_symlinks: false,
+                rate_limiter: None,
+                identity: crate::endpoint::transfer::TransferIdentity {
+                    source: crate::endpoint::transfer::SourceExpectation::Scanned(
+                        source.identity.unwrap(),
+                    ),
+                    destination: crate::endpoint::ExpectedDestination::Absent,
+                },
+                preservation: crate::endpoint::io::Preservation::default(),
+                preservation_request: crate::endpoint::io::PreservationRequest::default(),
+                final_flags: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.verification,
+            crate::endpoint::io::VerificationStatus::NotRequested
+        );
+        let executor = LocalSyncExecutor::new(
+            source_root.path().to_path_buf(),
+            destination_root.path().to_path_buf(),
+            Scheduler::new(ResourceBudget::default()).unwrap(),
+        )
+        .with_remove_source_files(true);
+        std::fs::rename(
+            destination_root.path().join("renamed"),
+            destination_root.path().join("saved"),
+        )
+        .unwrap();
+        std::fs::write(
+            destination_root.path().join("renamed"),
+            b"foreign replacement",
+        )
+        .unwrap();
+        assert!(executor
+            .remove_committed_source(&result.receipt, &source)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(source_root.path().join("input")).unwrap(),
+            b"published bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("renamed")).unwrap(),
+            b"foreign replacement"
+        );
     }
 
     #[cfg(unix)]

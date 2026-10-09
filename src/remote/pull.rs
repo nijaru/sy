@@ -343,15 +343,8 @@ impl RemotePullExecutor {
                 // silently skipped.
                 self.backup_replacement(destination.as_ref()).await?;
                 let summary = self
-                    .fetch_into_staging(&source, expected_destination, &metadata)
+                    .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
                     .await?;
-                // Only rename-incompatible flags remain post-commit
-                // finalization; xattrs/ACLs ride into staging and a failure
-                // there aborts the replacement.
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                }
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
@@ -469,13 +462,8 @@ impl RemotePullExecutor {
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
         self.backup_replacement(destination.as_ref()).await?;
         let summary = self
-            .fetch_into_staging(&source, expected_destination, &metadata)
+            .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
             .await?;
-        // Only rename-incompatible flags remain post-commit finalization.
-        if let Some(flags) = bsd_flags {
-            self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                .await?;
-        }
         groups
             .insert(
                 group,
@@ -506,6 +494,7 @@ impl RemotePullExecutor {
         source: &Entry,
         expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
+        final_flags: Option<u32>,
     ) -> Result<crate::engine::work::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
@@ -539,6 +528,7 @@ impl RemotePullExecutor {
             &fetched.preservation,
             Some(blake3::Hash::from_bytes(fetched.summary.digest)),
             None,
+            final_flags,
         )
         .await;
         let verification = match verification {
@@ -549,8 +539,11 @@ impl RemotePullExecutor {
             }
         };
         match verification {
-            VerificationStatus::Verified => {}
-            VerificationStatus::Failed { expected, actual } => {
+            crate::endpoint::io::FinalizationOutcome::Published {
+                verification: VerificationStatus::Verified,
+                ..
+            } => {}
+            crate::endpoint::io::FinalizationOutcome::VerificationFailed { expected, actual } => {
                 self.cancel_staged_fetch(fetched.stream_id).await;
                 return Err(RemotePullError::StagedVerificationFailed {
                     path: dest,
@@ -558,7 +551,7 @@ impl RemotePullExecutor {
                     actual: actual.to_hex().to_string(),
                 });
             }
-            VerificationStatus::NotRequested => {
+            crate::endpoint::io::FinalizationOutcome::Published { .. } => {
                 self.cancel_staged_fetch(fetched.stream_id).await;
                 return Err(RemotePullError::Endpoint(crate::error::SyncError::Config(
                     "pull finalized without verifying staged bytes".into(),

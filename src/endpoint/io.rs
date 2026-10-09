@@ -173,7 +173,10 @@ pub trait StagedWriter: Send {
         Ok((source, destination_basis, None))
     }
 
-    async fn commit(self: Box<Self>) -> Result<()>;
+    async fn commit(
+        self: Box<Self>,
+        flags: Option<u32>,
+    ) -> Result<sy::rooted_fs::PublishedFileProof>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }
 
@@ -197,13 +200,42 @@ pub(crate) async fn abort_staged_writer(
 /// it to the endpoint's staged hash proves the bytes to be published are the
 /// bytes that were received, not merely that the incoming stream was valid.
 /// Any pre-commit failure aborts only this writer's private staging.
+#[derive(Debug)]
+pub(crate) enum FinalizationOutcome {
+    Published {
+        verification: VerificationStatus,
+        proof: sy::rooted_fs::PublishedFileProof,
+    },
+    VerificationFailed {
+        expected: blake3::Hash,
+        actual: blake3::Hash,
+    },
+}
+
+impl FinalizationOutcome {
+    pub(crate) fn into_publication(
+        self,
+    ) -> Result<(VerificationStatus, sy::rooted_fs::PublishedFileProof)> {
+        match self {
+            Self::Published {
+                verification,
+                proof,
+            } => Ok((verification, proof)),
+            Self::VerificationFailed { expected, actual } => Err(SyncError::Config(format!(
+                "staged content hash mismatch: expected {expected}, got {actual}"
+            ))),
+        }
+    }
+}
+
 pub(crate) async fn finalize_staged_writer(
     mut writer: Box<dyn StagedWriter>,
     metadata: &FileMetadata,
     preservation: &Preservation,
     expected_hash: Option<blake3::Hash>,
     pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
-) -> Result<VerificationStatus> {
+    flags: Option<u32>,
+) -> Result<FinalizationOutcome> {
     let prepared = async {
         writer.set_metadata(metadata).await?;
         writer
@@ -237,11 +269,14 @@ pub(crate) async fn finalize_staged_writer(
             // An abort failure means staging cleanup is uncertain and must not
             // be reported as an ordinary verification result.
             abort_staged_writer(writer, &cause).await?;
-            Ok(VerificationStatus::Failed { expected, actual })
+            Ok(FinalizationOutcome::VerificationFailed { expected, actual })
         }
         Ok(verification) => {
-            writer.commit().await?;
-            Ok(verification)
+            let proof = writer.commit(flags).await?;
+            Ok(FinalizationOutcome::Published {
+                verification,
+                proof,
+            })
         }
         Err(operation) => {
             abort_staged_writer(writer, &operation).await?;
@@ -251,10 +286,11 @@ pub(crate) async fn finalize_staged_writer(
 }
 
 /// Result of a bounded streaming copy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct StreamCopyResult {
     pub bytes_written: u64,
     pub verification: VerificationStatus,
+    pub publication: sy::rooted_fs::PublishedFileProof,
 }
 
 /// Inputs for one bounded streaming copy.
@@ -262,6 +298,7 @@ pub struct StreamCopyPolicy<'a> {
     /// Metadata observed for the selected source object (including a followed
     /// symlink target) and requested transfer overrides.
     pub metadata: &'a FileMetadata,
+    pub flags: Option<u32>,
     /// Hash bytes as they flow and verify the staged result before commit.
     pub verify: bool,
     /// Destination state required at staging and again at commit.
@@ -364,17 +401,20 @@ pub(crate) async fn copy_file_streaming_from_reader(
     }
 
     let expected_hash = hasher.map(|hasher| hasher.finalize());
-    let verification = finalize_staged_writer(
+    let (verification, publication) = finalize_staged_writer(
         writer,
         metadata,
         policy.preservation,
         expected_hash,
         policy.pre_commit,
+        policy.flags,
     )
-    .await?;
+    .await?
+    .into_publication()?;
     Ok(StreamCopyResult {
         bytes_written,
         verification,
+        publication,
     })
 }
 
@@ -433,9 +473,15 @@ mod tests {
             Ok(Some(self.hash))
         }
 
-        async fn commit(self: Box<Self>) -> Result<()> {
+        async fn commit(
+            self: Box<Self>,
+            _flags: Option<u32>,
+        ) -> Result<sy::rooted_fs::PublishedFileProof> {
             self.events.lock().unwrap().push("commit");
-            Ok(())
+            Ok(sy::rooted_fs::PublishedFileProof {
+                path: sy::engine::domain::RelativePath::new("file").unwrap(),
+                identity: EntryIdentity::from_bytes([1; 32]),
+            })
         }
 
         async fn abort(self: Box<Self>) -> Result<()> {
@@ -469,6 +515,7 @@ mod tests {
                 Path::new("file"),
                 &StreamCopyPolicy {
                     metadata: &metadata,
+                    flags: None,
                     verify: false,
                     expected_destination: ExpectedDestination::SnapshotAtOpen,
                     rate_limiter: None,
@@ -514,11 +561,18 @@ mod tests {
             &preservation,
             Some(expected),
             Some(&pre_commit),
+            None,
         )
         .await
         .unwrap();
 
-        assert_eq!(verification, VerificationStatus::Verified);
+        assert!(matches!(
+            verification,
+            FinalizationOutcome::Published {
+                verification: VerificationStatus::Verified,
+                ..
+            }
+        ));
         assert_eq!(
             *events.lock().unwrap(),
             [
