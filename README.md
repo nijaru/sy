@@ -151,6 +151,12 @@ category under a shared 64 KiB detail budget. Error messages are capped at
 `files_only_in_dest_count`, and `errors_count` fields are the totals; their
 corresponding arrays contain examples, not necessarily every finding.
 
+JSON paths are strings when valid Unicode. Otherwise they use
+`{"encoding":"unix_bytes","bytes":[...]}` on Unix, or
+`{"encoding":"windows_utf16","units":[...]}` on Windows, preserving the
+native name without replacement characters. This encoding applies to event
+paths and verification examples; it does not imply Windows sync support.
+
 ## Feature Status
 
 Linux and macOS are the sync platforms exercised by CI. Windows is compile-checked

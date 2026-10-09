@@ -63,28 +63,35 @@ pub enum SyncEvent {
     /// total-files field: local sync scans in bounded batches and never knows
     /// the tree size up front; `Summary` carries final counts.
     Start {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         source: PathBuf,
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         destination: PathBuf,
     },
     Create {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         size: u64,
         bytes_transferred: u64,
     },
     Update {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         size: u64,
         bytes_transferred: u64,
         delta_used: bool,
     },
     Skip {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         reason: String,
     },
     Delete {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
     },
     Error {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         error: String,
     },
@@ -105,8 +112,11 @@ pub enum SyncEvent {
         files_matched: usize,
         #[serde(flatten)]
         counts: crate::sync::VerificationCounts,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_mismatched: Vec<PathBuf>,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_only_in_source: Vec<PathBuf>,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_only_in_dest: Vec<PathBuf>,
         errors: Vec<VerificationError>,
         duration_secs: f64,
@@ -128,6 +138,7 @@ pub enum SyncEvent {
 
 #[derive(Debug, Serialize)]
 pub struct VerificationError {
+    #[serde(serialize_with = "super::json_path::serialize_path")]
     pub path: PathBuf,
     pub error: String,
     pub action: String,
@@ -437,6 +448,88 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"summary""#));
         assert!(json.contains(r#""files_deleted":1"#));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn json_paths_round_trip_native_names_in_operations_and_verification() {
+        #[cfg(unix)]
+        let (path, encoded) = {
+            use std::os::unix::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_vec(vec![b'f', 0xff])),
+                serde_json::json!({"encoding": "unix_bytes", "bytes": [102, 255]}),
+            )
+        };
+        #[cfg(windows)]
+        let (path, encoded) = {
+            use std::os::windows::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_wide(&[102, 0xdc00])),
+                serde_json::json!({"encoding": "windows_utf16", "units": [102, 0xdc00]}),
+            )
+        };
+        for event in [
+            SyncEvent::Create {
+                path: path.clone(),
+                size: 1,
+                bytes_transferred: 1,
+            },
+            SyncEvent::Update {
+                path: path.clone(),
+                size: 1,
+                bytes_transferred: 1,
+                delta_used: false,
+            },
+            SyncEvent::Skip {
+                path: path.clone(),
+                reason: "unchanged".into(),
+            },
+            SyncEvent::Delete { path: path.clone() },
+            SyncEvent::Error {
+                path: path.clone(),
+                error: "denied".into(),
+            },
+        ] {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["path"], encoded);
+        }
+        let value = serde_json::to_value(SyncEvent::Start {
+            source: path.clone(),
+            destination: "Unicode-日".into(),
+        })
+        .unwrap();
+        assert_eq!(value["source"], encoded);
+        assert_eq!(value["destination"], "Unicode-日");
+        let value = serde_json::to_value(SyncEvent::VerificationResult {
+            files_matched: 0,
+            counts: crate::sync::VerificationCounts {
+                files_mismatched: 1,
+                files_only_in_source: 1,
+                files_only_in_dest: 1,
+                errors: 1,
+            },
+            files_mismatched: vec![path.clone()],
+            files_only_in_source: vec![path.clone()],
+            files_only_in_dest: vec![path.clone()],
+            errors: vec![VerificationError {
+                path,
+                error: "denied".into(),
+                action: "verify".into(),
+            }],
+            duration_secs: 0.0,
+            exit_code: 2,
+        })
+        .unwrap();
+        for field in [
+            "files_mismatched",
+            "files_only_in_source",
+            "files_only_in_dest",
+        ] {
+            assert_eq!(value[field][0], encoded);
+        }
+        assert_eq!(value["errors"][0]["path"], encoded);
+        assert_eq!(value["errors_count"], 1);
     }
 
     #[test]
