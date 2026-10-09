@@ -62,21 +62,42 @@ fn test_basic_sync() {
 
 #[test]
 fn test_dry_run() {
-    let (source, dest) = setup_test_dir("dry_run");
+    let source = TempDir::new().unwrap();
+    let destination_parent = TempDir::new().unwrap();
+    fs::write(source.path().join("file.txt"), b"content").unwrap();
+    fs::create_dir(source.path().join("empty")).unwrap();
+    let mut operand = source.path().as_os_str().to_os_string();
+    operand.push("/");
 
-    fs::write(source.path().join("file.txt"), "content").unwrap();
-
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(!dest.path().join("file.txt").exists());
+    for destination in [
+        destination_parent.path().to_path_buf(),
+        destination_parent.path().join("absent/nested"),
+    ] {
+        let output = Command::new(sy_bin())
+            .arg(&operand)
+            .arg(&destination)
+            .args(["--dry-run", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "summary")
+            .unwrap();
+        assert_eq!(summary["files_created"], 1);
+        assert!(!destination.join("file.txt").exists());
+        assert!(!destination.join("empty").exists());
+        assert!(!destination_parent.path().join("absent").exists());
+        assert_eq!(
+            fs::read(source.path().join("file.txt")).unwrap(),
+            b"content"
+        );
+    }
 }
 
 #[test]

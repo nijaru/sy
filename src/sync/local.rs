@@ -45,14 +45,28 @@ pub(super) async fn run(
     let scan_started = Instant::now();
     reporter.start(source_root, destination_root);
 
-    // A fresh destination root is created BEFORE its scan so a first sync
-    // into a new directory sees an empty tree instead of a scan error,
-    // matching the legacy local path's ordering. Dry-run never mutates.
-    // Selected scans can represent an absent parent without mutation. Their
-    // destination endpoint creates it only when executing an admitted action.
-    if scope == SyncScope::Tree && !destination_root.exists() && !config.dry_run {
-        std::fs::create_dir_all(destination_root).map_err(map_io)?;
-    }
+    // A missing tree destination is an empty observation during dry-run, not
+    // an excuse to create it. Observe before admitting either scan so an early
+    // filesystem failure cannot detach a source scanner. Selected-leaf scans
+    // already represent missing parents without creating them.
+    let destination_absent = if scope == SyncScope::Tree {
+        let root = destination_root.to_path_buf();
+        let dry_run = config.dry_run;
+        tokio::task::spawn_blocking(move || match std::fs::metadata(&root) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && dry_run => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(root)?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        })
+        .await
+        .map_err(map_io)?
+        .map_err(map_io)?
+    } else {
+        false
+    };
 
     // Both scans are local. The source walk honors the ignore rules where
     // the files live; the destination scan stays COMPLETE (gitignore never
@@ -64,10 +78,14 @@ pub(super) async fn run(
                 source_root.to_path_buf(),
                 source_scan_request(config, scan_options),
             ),
-            sy::endpoint::local_entry_scan::local_entry_stream(
-                destination_root.to_path_buf(),
-                destination_scan_request(config),
-            ),
+            if destination_absent {
+                sy::engine::reconcile::EntryStream::new(futures::stream::empty())
+            } else {
+                sy::endpoint::local_entry_scan::local_entry_stream(
+                    destination_root.to_path_buf(),
+                    destination_scan_request(config),
+                )
+            },
         ),
         SyncScope::SelectedLeaf {
             source,
