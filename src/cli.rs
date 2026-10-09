@@ -1,4 +1,5 @@
 use crate::path::SyncPath;
+use anyhow::Context as _;
 use usage::ValueEnum;
 
 mod args;
@@ -488,9 +489,16 @@ impl Cli {
         if let Some(source) = &self.source {
             if source.is_local() {
                 let path = source.path();
-                if !path.exists() {
+                // Preserved/skipped dangling links are valid selected leaves.
+                // Copy-links target validation belongs to the scoped scanner.
+                let observation = std::fs::symlink_metadata(path);
+                if observation
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
                     anyhow::bail!("Source path does not exist: {}", source);
                 }
+                observation.with_context(|| format!("Cannot inspect source path: {source}"))?;
             }
         }
 
@@ -532,13 +540,6 @@ impl Cli {
             include_git_dir,
             dirs_only: self.dirs,
         }
-    }
-
-    /// Check if source is a file (not a directory)
-    pub fn is_single_file(&self) -> bool {
-        self.source
-            .as_ref()
-            .is_some_and(|s| s.is_local() && s.path().is_file())
     }
 
     pub fn log_level(&self) -> tracing::Level {
@@ -804,7 +805,6 @@ mod tests {
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
-        assert!(cli.is_single_file());
     }
 
     #[test]

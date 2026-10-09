@@ -3,7 +3,6 @@
 //! Local, push, and pull entry points use the shared ordered controller;
 //! remote sessions carry endpoint operations over the v3 protocol.
 
-use crate::endpoint::io::hash_file_streaming;
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
@@ -12,9 +11,8 @@ use crate::sync::scanner::ScanOptions;
 use crate::sync::stats::{SyncError as StatError, SyncStats, VerificationResult};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use sy::engine::domain::{Entry, EntryKind};
+use sy::engine::domain::{Entry, EntryKind, SyncScope};
 use sy::engine::reconcile::{EngineError, OrderedReconciler, ReconcileItem};
-use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 
 /// Endpoint description used for top-level strategy dispatch.
 pub enum EndpointPair {
@@ -77,6 +75,7 @@ pub struct SyncSession {
     dest: EndpointPair,
     config: SyncConfig,
     scan_options: ScanOptions,
+    scope: SyncScope,
 }
 
 impl SyncSession {
@@ -86,7 +85,31 @@ impl SyncSession {
             dest,
             config,
             scan_options: ScanOptions::default(),
+            scope: SyncScope::Tree,
         }
+    }
+
+    /// Bind user operands once for both synchronization and verification.
+    pub async fn for_local_paths(
+        source: &Path,
+        destination: &Path,
+        contents: bool,
+        config: SyncConfig,
+    ) -> Result<Self> {
+        let (source, destination, scope) = super::selected::resolve(
+            source.to_path_buf(),
+            destination.to_path_buf(),
+            contents,
+            config.preserve.symlink_mode,
+        )
+        .await?;
+        let mut session = Self::new(
+            EndpointPair::Local(Box::new(LocalEndpoint::new(source))),
+            EndpointPair::Local(Box::new(LocalEndpoint::new(destination))),
+            config,
+        );
+        session.scope = scope;
+        Ok(session)
     }
 
     pub fn with_scan_options(mut self, scan_options: ScanOptions) -> Self {
@@ -122,6 +145,7 @@ impl SyncSession {
             self.dest.root(),
             &self.config,
             self.scan_options,
+            self.scope.clone(),
         )
         .await
     }
@@ -129,7 +153,7 @@ impl SyncSession {
     /// Verify local source and destination trees through the same strict,
     /// bounded ordered merge used by synchronization. Regular files are
     /// compared with streaming BLAKE3 only after cheap kind/size checks.
-    pub async fn verify(&self, source: &Path, dest: &Path) -> Result<VerificationResult> {
+    pub async fn verify(&self) -> Result<VerificationResult> {
         let source_endpoint = self.source.as_endpoint().ok_or_else(|| {
             SyncError::Config("source must be local for verification".to_string())
         })?;
@@ -137,6 +161,8 @@ impl SyncSession {
             SyncError::Config("destination must be local for verification".to_string())
         })?;
 
+        let source = source_endpoint.root();
+        let dest = dest_endpoint.root();
         let started = Instant::now();
         let mut result = VerificationResult {
             files_matched: 0,
@@ -146,26 +172,64 @@ impl SyncSession {
             errors: Vec::new(),
             duration: std::time::Duration::ZERO,
         };
-        let request = verification_scan_request(self.scan_options);
-        let source_stream = crate::endpoint::local_entry_scan::local_entry_stream(
-            source_endpoint.root().to_path_buf(),
-            request,
-        );
-        let dest_stream = crate::endpoint::local_entry_scan::local_entry_stream(
-            dest_endpoint.root().to_path_buf(),
-            request,
-        );
-        let mut reconciler = OrderedReconciler::new(source_stream, dest_stream);
+        let source_request = super::policy::source_scan_request(&self.config, self.scan_options);
+        let destination_request = super::policy::destination_scan_request(&self.config);
+        let (source_stream, dest_stream) = match &self.scope {
+            SyncScope::Tree => (
+                crate::endpoint::local_entry_scan::local_entry_stream(
+                    source.to_path_buf(),
+                    source_request,
+                ),
+                crate::endpoint::local_entry_scan::local_entry_stream(
+                    dest.to_path_buf(),
+                    destination_request,
+                ),
+            ),
+            SyncScope::SelectedLeaf {
+                source: source_path,
+                destination,
+            } => (
+                crate::endpoint::local_entry_scan::selected_leaf_stream(
+                    source.to_path_buf(),
+                    source_path.clone(),
+                    source_request,
+                    false,
+                ),
+                crate::endpoint::local_entry_scan::selected_leaf_stream(
+                    dest.to_path_buf(),
+                    destination.clone(),
+                    destination_request,
+                    true,
+                ),
+            ),
+        };
+        let source_stream =
+            super::policy::filtered_source_stream(source_stream, self.config.filter_engine.clone());
+        let min_size = self.config.min_size;
+        let max_size = self.config.max_size;
+        let skip_symlinks = self.config.preserve.symlink_mode == crate::cli::SymlinkMode::Skip;
+        let source_stream = source_stream.filter_map(move |entry| {
+            let selected = entry.as_ref().map_or(true, |entry| {
+                super::policy::entry_in_size_scope(entry, min_size, max_size)
+                    && super::policy::entry_selected_by_symlink_mode(entry, skip_symlinks)
+            });
+            futures::future::ready(selected.then_some(entry))
+        });
+        let mut reconciler =
+            OrderedReconciler::with_scope(source_stream, dest_stream, self.scope.clone());
 
         let scanned = async {
             while let Some(item) = reconciler.next().await? {
                 match item {
-                    ReconcileItem::SourceOnly(entry) => {
+                    ReconcileItem::SourceOnly { source: entry, .. } => {
                         result
                             .files_only_in_source
                             .push(source.join(entry.path.as_path()));
                     }
                     ReconcileItem::DestinationOnly(entry) => {
+                        if self.scope != SyncScope::Tree {
+                            continue;
+                        }
                         result
                             .files_only_in_dest
                             .push(dest.join(entry.path.as_path()));
@@ -180,6 +244,7 @@ impl SyncSession {
                             dest_endpoint,
                             &source_entry,
                             &dest_entry,
+                            self.config.preserve.symlink_mode == crate::cli::SymlinkMode::Follow,
                         )
                         .await
                         {
@@ -210,75 +275,6 @@ impl SyncSession {
         }
         result.duration = started.elapsed();
         Ok(result)
-    }
-
-    /// Sync one local regular file through the same capability-driven transfer
-    /// layer as tree sync.
-    pub async fn sync_single_file(&self, source: &Path, dest: &Path) -> Result<SyncStats> {
-        let started = Instant::now();
-        let source_parent = source.parent().unwrap_or(Path::new("."));
-        let dest_parent = dest.parent().unwrap_or(Path::new("."));
-        let source_name = source.file_name().ok_or_else(|| SyncError::InvalidPath {
-            path: source.to_path_buf(),
-        })?;
-        let dest_name = dest.file_name().ok_or_else(|| SyncError::InvalidPath {
-            path: dest.to_path_buf(),
-        })?;
-        let source_endpoint = LocalEndpoint::new(source_parent.to_path_buf());
-        let dest_endpoint = LocalEndpoint::new(dest_parent.to_path_buf());
-        let existed = dest_endpoint.exists(Path::new(dest_name)).await?;
-
-        if self.config.dry_run {
-            return Ok(SyncStats {
-                files_scanned: 1,
-                files_created: u64::from(!existed),
-                files_updated: u64::from(existed),
-                duration: started.elapsed(),
-                ..Default::default()
-            });
-        }
-
-        let transfer = crate::endpoint::transfer::transfer_file(
-            &source_endpoint,
-            Path::new(source_name),
-            &dest_endpoint,
-            Path::new(dest_name),
-            crate::endpoint::transfer::TransferOptions {
-                update: existed,
-                verify: self.config.verification.verify_on_write,
-                follow_symlinks: self.config.preserve.symlink_mode
-                    == crate::cli::SymlinkMode::Follow,
-                rate_limiter: self.config.bwlimit.map(|limit| {
-                    std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::sync::ratelimit::RateLimiter::new(limit),
-                    ))
-                }),
-                identity: crate::endpoint::transfer::TransferIdentity {
-                    // Single-file copy has no scan: capture observations at
-                    // transfer start so mid-transfer edits still abort.
-                    source: crate::endpoint::transfer::SourceExpectation::SnapshotAtOpen,
-                    destination: if existed {
-                        crate::endpoint::io::ExpectedDestination::SnapshotAtOpen
-                    } else {
-                        crate::endpoint::io::ExpectedDestination::Absent
-                    },
-                },
-                preservation: crate::endpoint::io::Preservation::default(),
-                preservation_request: crate::endpoint::io::PreservationRequest::default(),
-                final_flags: None,
-                metadata: None,
-            },
-        )
-        .await?;
-
-        Ok(SyncStats {
-            files_scanned: 1,
-            files_created: u64::from(!existed),
-            files_updated: u64::from(existed),
-            bytes_transferred: transfer.bytes_written,
-            duration: started.elapsed(),
-            ..Default::default()
-        })
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
@@ -334,6 +330,7 @@ async fn entries_match(
     dest_endpoint: &dyn Endpoint,
     source: &Entry,
     dest: &Entry,
+    follow: bool,
 ) -> Result<bool> {
     if source.kind != dest.kind {
         return Ok(false);
@@ -347,24 +344,9 @@ async fn entries_match(
     if source.size != dest.size {
         return Ok(false);
     }
-    let source_hash = hash_file_streaming(source_endpoint, source.path.as_path()).await?;
-    let dest_hash = hash_file_streaming(dest_endpoint, dest.path.as_path()).await?;
+    let source_hash = super::policy::observed_hash(source_endpoint, source, follow).await?;
+    let dest_hash = super::policy::observed_hash(dest_endpoint, dest, false).await?;
     Ok(source_hash == dest_hash)
-}
-
-fn verification_scan_request(options: ScanOptions) -> ScanRequest {
-    ScanRequest {
-        respect_gitignore: options.respect_gitignore,
-        include_git_dir: options.include_git_dir,
-        follow_symlinks: false,
-        max_depth: options.dirs_only.then_some(1),
-        metadata: EntryMetadataRequest {
-            unix_mode: false,
-            symlink_target: true,
-            identity: false,
-            hardlink_group: false,
-        },
-    }
 }
 
 fn map_engine_error(error: EngineError) -> SyncError {
@@ -434,11 +416,11 @@ mod tests {
         std::fs::write(source.path().join("file"), b"same").unwrap();
         std::fs::write(dest.path().join("file"), b"same").unwrap();
         let session = local_session(&source, &dest, test_config());
-        let result = session.verify(source.path(), dest.path()).await.unwrap();
+        let result = session.verify().await.unwrap();
         assert_eq!(result.files_matched, 1);
 
         std::fs::write(dest.path().join("file"), b"diff").unwrap();
-        let result = session.verify(source.path(), dest.path()).await.unwrap();
+        let result = session.verify().await.unwrap();
         assert_eq!(result.files_mismatched.len(), 1);
     }
 }

@@ -320,6 +320,67 @@ pub(super) fn validate_scratch_location(root: &Path) -> io::Result<()> {
     Directory::root(root)?.scratch_parent().map(|_| ())
 }
 
+/// A selected observation never enumerates the operational parent. Keep the
+/// parent handle alive and validate its pathname binding around stat/readlink,
+/// just as tree traversal validates reopened ancestors.
+pub(super) fn selected_leaf(
+    root: &Path,
+    relative: &crate::engine::domain::RelativePath,
+    request: ScanRequest,
+    missing_allowed: bool,
+    sender: &Sender,
+) -> Result<(), LocalScanError> {
+    if relative.as_path().components().count() != 1 {
+        return Err(LocalScanError::OutsideRoot {
+            path: relative.as_path().to_path_buf(),
+        });
+    }
+    let directory = match Directory::root(root) {
+        Ok(directory) => directory,
+        Err(error) if missing_allowed && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let expected = directory.identity()?;
+    let absolute = root.join(relative.as_path());
+    let metadata = match entry_metadata(&absolute, request) {
+        Ok(metadata) => Some(metadata),
+        Err(LocalScanError::Metadata { source, .. })
+            if missing_allowed && source.kind() == io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let entry = match metadata {
+        Some(metadata) => {
+            let mut scope = SourceIgnoreScope::new(root, request.respect_gitignore);
+            if (!request.include_git_dir && relative.as_path() == Path::new(".git"))
+                || (!missing_allowed
+                    && scope.source_match(relative.as_path(), metadata.is_dir())?)
+            {
+                None
+            } else {
+                Some(engine_entry(root, &absolute, &metadata, request)?)
+            }
+        }
+        None => None,
+    };
+    if Directory::root(root)?.identity()? != expected {
+        return Err(LocalScanError::DirectoryChanged(root.to_path_buf()));
+    }
+    if let Some(entry) = entry {
+        // A directory requires a complete descendant view for transitions;
+        // selected leaves must not silently authorize recursive replacement.
+        if entry.is_directory() && !missing_allowed {
+            return Err(LocalScanError::Walk(io::Error::other(
+                "selected leaf is a directory; a tree scope is required",
+            )));
+        }
+        let _ = sender.blocking_send(Ok(entry));
+    }
+    Ok(())
+}
+
 pub(super) fn walk_tree(
     root: &Path,
     request: ScanRequest,

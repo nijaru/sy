@@ -88,20 +88,24 @@ pub type Result<T> = std::result::Result<T, LocalSyncError>;
 pub enum LocalSyncAction {
     CreateDirectory {
         source: Entry,
+        destination_path: RelativePath,
     },
     TransferFile {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: crate::endpoint::transfer::TransferMetadata,
         source_removal: bool,
     },
     ReplaceSymlink {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
     ApplyMetadata {
         source: Entry,
+        destination_path: RelativePath,
         expected_destination: EntryIdentity,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
@@ -251,6 +255,26 @@ impl LocalSyncExecutor {
         }
     }
 
+    fn report_transfer(
+        &self,
+        op: crate::sync::output::ItemizeOp,
+        path: &RelativePath,
+        size: u64,
+        bytes: u64,
+    ) {
+        if let Some(reporter) = &self.reporter {
+            match op {
+                crate::sync::output::ItemizeOp::Create => reporter.created(
+                    crate::sync::output::ItemizeKind::File,
+                    path.as_path(),
+                    size,
+                    bytes,
+                ),
+                _ => reporter.updated(path.as_path(), size, bytes, bytes < size),
+            }
+        }
+    }
+
     fn source_path(&self, relative: &RelativePath) -> PathBuf {
         self.source_root.join(relative.as_path())
     }
@@ -369,6 +393,7 @@ impl LocalSyncExecutor {
             destination.modified
         });
         Ok(Some(file_work(LocalSyncAction::TransferFile {
+            destination_path: destination.path.clone(),
             source,
             destination: Some(destination),
             metadata: LocalTransferMetadata {
@@ -384,24 +409,12 @@ impl LocalSyncExecutor {
     /// with the tree shape preserved (GNU rsync semantics). Always
     /// destination-anchored — never relative to the process CWD.
     fn backup_destination_for(&self, relative: &RelativePath) -> Result<PathBuf> {
-        let mut backup_name = relative
-            .as_path()
-            .file_name()
-            .ok_or_else(|| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
-            .to_os_string();
-        backup_name.push(&self.backup_suffix);
-        match &self.backup_dir {
-            Some(dir) => {
-                let mut backup = dir.join(relative.as_path());
-                backup.set_file_name(backup_name);
-                Ok(backup)
-            }
-            None => {
-                let mut backup = self.destination_path(relative);
-                backup.set_file_name(backup_name);
-                Ok(backup)
-            }
-        }
+        backup_destination_path(
+            &self.destination_root,
+            relative,
+            self.backup_dir.as_deref(),
+            &self.backup_suffix,
+        )
     }
 
     /// Preserve a to-be-replaced destination file. COPY semantics: the
@@ -456,7 +469,10 @@ impl LocalSyncExecutor {
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
-            LocalSyncAction::CreateDirectory { source } => {
+            LocalSyncAction::CreateDirectory {
+                source,
+                destination_path,
+            } => {
                 let source_root =
                     crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
                 let expected = source.identity.ok_or_else(|| {
@@ -472,7 +488,7 @@ impl LocalSyncExecutor {
                         expected,
                         Default::default(),
                     )?;
-                    rooted.create_directory_blocking(&relative)
+                    rooted.create_directory_blocking(&destination_path)
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -485,6 +501,7 @@ impl LocalSyncExecutor {
             }
             LocalSyncAction::TransferFile {
                 source,
+                destination_path,
                 destination,
                 metadata,
                 source_removal,
@@ -496,6 +513,7 @@ impl LocalSyncExecutor {
                         return self
                             .execute_grouped_file(
                                 source,
+                                destination_path,
                                 destination,
                                 metadata,
                                 group,
@@ -512,6 +530,7 @@ impl LocalSyncExecutor {
                 let (transfer, receipt) = self
                     .transfer_source_file(
                         &source,
+                        &destination_path,
                         &destination,
                         &metadata,
                         crate::endpoint::io::PreservationRequest {
@@ -529,17 +548,26 @@ impl LocalSyncExecutor {
                 } else {
                     crate::sync::output::ItemizeOp::Create
                 };
-                self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+                self.report_transfer(op, &destination_path, source.size, transfer.literal_bytes);
                 Ok(crate::engine::work::WorkResult::Transfer(transfer))
             }
             LocalSyncAction::ReplaceSymlink {
                 source,
+                destination_path,
                 destination,
                 modified,
             } => {
+                self.check_source_identity(&source).await?;
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     LocalSyncError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
+                if let Some(existing) = destination
+                    .as_ref()
+                    .filter(|entry| self.backup && entry.is_file())
+                {
+                    self.backup_replacement_file(&existing.path, existing.identity)
+                        .await?;
+                }
                 let expected = match destination {
                     None => crate::endpoint::ExpectedDestination::Absent,
                     Some(destination) => crate::endpoint::ExpectedDestination::Unchanged(
@@ -550,32 +578,34 @@ impl LocalSyncExecutor {
                         })?,
                     ),
                 };
-                self.replace_symlink(target, &source.path, expected, modified)
+                self.replace_symlink(target, &destination_path, expected, modified)
                     .await?;
                 let receipt = PublishedDestinationReceipt::for_symlink(
                     source.path.clone(),
-                    source.path.clone(),
+                    destination_path.clone(),
                     source.identity,
                 );
                 self.remove_committed_source(&receipt, &source).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
-                    &source.path,
+                    &destination_path,
                 );
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
             LocalSyncAction::ApplyMetadata {
                 source,
+                destination_path,
                 expected_destination,
                 unix_mode,
                 modified,
             } => {
+                self.check_source_identity(&source).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 let rooted = self.metadata_authority().await?.clone();
-                let relative = source.path.clone();
+                let relative = destination_path.clone();
                 let kind = source.kind;
                 tokio::task::spawn_blocking(move || {
                     rooted.apply_metadata_blocking(
@@ -589,15 +619,15 @@ impl LocalSyncExecutor {
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
+                    self.write_destination_xattrs(&destination_path, source.kind, xattrs)
                         .await?;
                 }
                 if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
+                    self.write_destination_acls(&destination_path, source.kind, acls)
                         .await?;
                 }
                 if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
+                    self.write_destination_bsd_flags(&destination_path, source.kind, flags)
                         .await?;
                 }
                 Ok(crate::engine::work::WorkResult::Metadata)
@@ -612,6 +642,7 @@ impl LocalSyncExecutor {
     async fn execute_grouped_file(
         &self,
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: LocalTransferMetadata,
         group: [u8; 32],
@@ -620,7 +651,7 @@ impl LocalSyncExecutor {
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
             self.check_source_identity(&source).await?;
-            let dest_abs = self.destination_path(&source.path);
+            let dest_abs = self.destination_path(&destination_path);
             first.validate_metadata(metadata.unix_mode, metadata.modified)?;
             let is_update = destination.is_some();
             if let Some(existing) = destination
@@ -636,7 +667,7 @@ impl LocalSyncExecutor {
                 .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
             let receipt = PublishedDestinationReceipt::for_hardlink(
                 source.path.clone(),
-                source.path.clone(),
+                destination_path.clone(),
                 source.identity,
             );
             if source_removal {
@@ -648,7 +679,7 @@ impl LocalSyncExecutor {
             } else {
                 crate::sync::output::ItemizeOp::Create
             };
-            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            self.report_transfer(op, &destination_path, source.size, 0);
             return Ok(crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
@@ -663,6 +694,7 @@ impl LocalSyncExecutor {
         let (transfer, receipt) = self
             .transfer_source_file(
                 &source,
+                &destination_path,
                 &destination,
                 &metadata,
                 crate::endpoint::io::PreservationRequest {
@@ -676,7 +708,7 @@ impl LocalSyncExecutor {
             .insert(
                 group,
                 HardlinkRepresentative {
-                    path: source.path.clone(),
+                    path: destination_path.clone(),
                     unix_mode: metadata.unix_mode,
                     modified: metadata.modified,
                 },
@@ -692,7 +724,7 @@ impl LocalSyncExecutor {
         } else {
             crate::sync::output::ItemizeOp::Create
         };
-        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        self.report_transfer(op, &destination_path, source.size, transfer.literal_bytes);
         Ok(transfer)
     }
 
@@ -726,6 +758,35 @@ impl LocalSyncExecutor {
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
+        if self.follow_symlinks && source.is_file() {
+            use crate::endpoint::Endpoint;
+            let file = self
+                .source_endpoint
+                .open_native_file_following(source.path.as_path())
+                .await
+                .map_err(|error| {
+                    LocalSyncError::Source(
+                        self.source_path(&source.path),
+                        std::io::Error::other(error),
+                    )
+                })?
+                .ok_or_else(|| ExistingDestinationError::MissingObservation(source.path.clone()))?;
+            let source = source.clone();
+            tokio::task::spawn_blocking(move || {
+                if source.identity.is_none()
+                    || crate::endpoint::local_identity::metadata_identity(
+                        &file.metadata()?,
+                        EntryKind::File,
+                    ) != source.identity
+                {
+                    return Err(ExistingDestinationError::ObservationChanged(source.path));
+                }
+                Ok::<(), ExistingDestinationError>(())
+            })
+            .await
+            .map_err(|error| ExistingDestinationError::Worker(error.to_string()))??;
+            return Ok(());
+        }
         let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
         let source = source.clone();
         tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
@@ -739,6 +800,7 @@ impl LocalSyncExecutor {
     async fn transfer_source_file(
         &self,
         source: &Entry,
+        destination_path: &RelativePath,
         destination: &Option<Entry>,
         metadata: &crate::endpoint::transfer::TransferMetadata,
         preservation_request: crate::endpoint::io::PreservationRequest,
@@ -754,7 +816,7 @@ impl LocalSyncExecutor {
             &self.source_endpoint,
             source.path.as_path(),
             &self.destination_endpoint,
-            source.path.as_path(),
+            destination_path.as_path(),
             TransferOptions {
                 // A type replacement (file over symlink, link over file)
                 // must not treat the mismatched destination as a delta
@@ -793,10 +855,10 @@ impl LocalSyncExecutor {
         .await
         .map_err(|error| match error {
             crate::error::SyncError::Io(io) => {
-                LocalSyncError::Destination(self.destination_path(&source.path), io)
+                LocalSyncError::Destination(self.destination_path(destination_path), io)
             }
             other => LocalSyncError::Destination(
-                self.destination_path(&source.path),
+                self.destination_path(destination_path),
                 std::io::Error::other(other.to_string()),
             ),
         })?;
@@ -807,7 +869,7 @@ impl LocalSyncExecutor {
             result.verification
         {
             return Err(LocalSyncError::VerificationFailed {
-                path: self.destination_path(&source.path),
+                path: self.destination_path(destination_path),
                 expected: expected.to_hex().to_string(),
                 actual: actual.to_hex().to_string(),
             });
@@ -1153,6 +1215,33 @@ async fn link_local_file(first: &Path, dest: &Path) -> std::result::Result<(), s
     }
 }
 
+/// One owner for backup effect addresses, shared by preflight and execution.
+pub fn backup_destination_path(
+    destination_root: &Path,
+    relative: &RelativePath,
+    dir: Option<&Path>,
+    suffix: &str,
+) -> Result<PathBuf> {
+    let mut backup_name = relative
+        .as_path()
+        .file_name()
+        .ok_or_else(|| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
+        .to_os_string();
+    backup_name.push(suffix);
+    match dir {
+        Some(dir) => {
+            let mut backup = dir.join(relative.as_path());
+            backup.set_file_name(backup_name);
+            Ok(backup)
+        }
+        None => {
+            let mut backup = destination_root.join(relative.as_path());
+            backup.set_file_name(backup_name);
+            Ok(backup)
+        }
+    }
+}
+
 pub fn action_resources(action: &LocalSyncAction) -> ResourceRequest {
     match action {
         LocalSyncAction::TransferFile { .. } => ResourceRequest {
@@ -1184,7 +1273,10 @@ pub fn lower_local_op(
     use crate::engine::domain::SyncOp;
 
     match op {
-        SyncOp::Create { source } => lower_create(source, policy),
+        SyncOp::Create {
+            source,
+            destination_path,
+        } => lower_create(source, destination_path, policy),
         SyncOp::Update {
             source,
             destination,
@@ -1205,11 +1297,13 @@ pub type RequestedMetadata = Option<(Option<u32>, Option<Timestamp>)>;
 
 fn lower_create(
     source: Entry,
+    destination_path: RelativePath,
     policy: ExecutionPolicy,
 ) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
     match source.kind {
         EntryKind::Directory => Ok(Some(mutation_work(LocalSyncAction::CreateDirectory {
             source,
+            destination_path,
         }))),
         EntryKind::File => {
             // Staged files are private at 0600, so a committed file always
@@ -1224,6 +1318,7 @@ fn lower_create(
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
+                destination_path,
                 destination: None,
                 metadata,
                 source_removal: true,
@@ -1232,6 +1327,7 @@ fn lower_create(
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path,
             destination: None,
         }))),
     }
@@ -1242,6 +1338,7 @@ fn lower_update(
     destination: Entry,
     policy: ExecutionPolicy,
 ) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
+    let destination_path = destination.path.clone();
     match source.kind {
         EntryKind::File => {
             let mode = if policy.preserve_permissions {
@@ -1258,6 +1355,7 @@ fn lower_update(
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
+                destination_path,
                 destination: Some(destination),
                 metadata,
                 source_removal: true,
@@ -1266,6 +1364,7 @@ fn lower_update(
         EntryKind::Directory => lower_metadata(source, destination, policy),
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
+            destination_path: destination.path.clone(),
             source,
             destination: Some(destination),
         }))),
@@ -1277,6 +1376,7 @@ fn lower_replace(
     destination: Entry,
     policy: ExecutionPolicy,
 ) -> std::result::Result<Option<WorkItem<LocalSyncAction>>, LocalSyncError> {
+    let destination_path = destination.path.clone();
     match source.kind {
         EntryKind::Directory => Err(LocalSyncError::Destination(
             source.path.as_path().to_path_buf(),
@@ -1292,6 +1392,7 @@ fn lower_replace(
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
+                destination_path,
                 destination: Some(destination),
                 metadata,
                 source_removal: true,
@@ -1299,6 +1400,7 @@ fn lower_replace(
         }
         EntryKind::Symlink => Ok(Some(mutation_work(LocalSyncAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
+            destination_path: destination.path.clone(),
             source,
             destination: Some(destination),
         }))),
@@ -1321,6 +1423,7 @@ fn lower_metadata(
     })?;
     Ok(Some(metadata_work(
         source,
+        destination.path,
         expected_destination,
         unix_mode,
         modified,
@@ -1332,7 +1435,10 @@ fn requested_metadata(
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> std::result::Result<RequestedMetadata, LocalSyncError> {
-    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
+    let unix_mode = if policy.preserve_permissions
+        && !source.is_symlink()
+        && destination.unix_mode != source.unix_mode
+    {
         Some(source.unix_mode.ok_or_else(|| {
             LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)
@@ -1358,12 +1464,14 @@ fn mutation_work(action: LocalSyncAction) -> WorkItem<LocalSyncAction> {
 
 fn metadata_work(
     source: Entry,
+    destination_path: RelativePath,
     expected_destination: EntryIdentity,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<LocalSyncAction> {
     mutation_work(LocalSyncAction::ApplyMetadata {
         source,
+        destination_path,
         expected_destination,
         unix_mode,
         modified,
@@ -1496,6 +1604,7 @@ mod tests {
             .with_hardlinks(true);
             let first = lower_local_op(
                 SyncOp::Create {
+                    destination_path: entries[0].path.clone(),
                     source: entries[0].clone(),
                 },
                 ExecutionPolicy::default(),
@@ -1563,9 +1672,15 @@ mod tests {
         .with_remove_source_files(true);
 
         for source in entries {
-            let work = lower_local_op(SyncOp::Create { source }, ExecutionPolicy::default())
-                .unwrap()
-                .unwrap();
+            let work = lower_local_op(
+                SyncOp::Create {
+                    destination_path: source.path.clone(),
+                    source,
+                },
+                ExecutionPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
             executor.execute(work).await.unwrap();
         }
         std::fs::remove_file(source_root.path().join("b")).unwrap();
@@ -1600,7 +1715,10 @@ mod tests {
                         destination,
                     }
                 } else {
-                    SyncOp::Create { source }
+                    SyncOp::Create {
+                        destination_path: source.path.clone(),
+                        source,
+                    }
                 };
                 let work = lower_local_op(op, ExecutionPolicy::default())
                     .unwrap()

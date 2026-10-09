@@ -1,4 +1,4 @@
-use super::domain::{Entry, RelativePath};
+use super::domain::{Entry, RelativePath, SyncScope};
 use futures::StreamExt;
 use std::error::Error as StdError;
 use std::fmt;
@@ -49,8 +49,14 @@ pub enum EngineError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileItem {
-    SourceOnly(Entry),
-    Matched { source: Entry, destination: Entry },
+    SourceOnly {
+        source: Entry,
+        destination_path: RelativePath,
+    },
+    Matched {
+        source: Entry,
+        destination: Entry,
+    },
     DestinationOnly(Entry),
 }
 
@@ -58,14 +64,16 @@ struct OrderedInput {
     side: Side,
     stream: EntryStream,
     previous: Option<RelativePath>,
+    selected: Option<RelativePath>,
 }
 
 impl OrderedInput {
-    fn new(side: Side, stream: EntryStream) -> Self {
+    fn new(side: Side, stream: EntryStream, selected: Option<RelativePath>) -> Self {
         Self {
             side,
             stream,
             previous: None,
+            selected,
         }
     }
 
@@ -78,6 +86,18 @@ impl OrderedInput {
             source,
         })?;
 
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| *selected != entry.path)
+        {
+            return Err(EngineError::Invariant("entry outside selected leaf scope"));
+        }
+        if self.selected.is_some() && self.side == Side::Source && entry.is_directory() {
+            return Err(EngineError::Invariant(
+                "directory entry requires a tree scope",
+            ));
+        }
         if let Some(previous) = self.previous.as_ref() {
             if entry.path <= *previous {
                 return Err(EngineError::EntryOrder {
@@ -104,18 +124,35 @@ pub struct OrderedReconciler {
     destination_head: Option<Entry>,
     source_finished: bool,
     destination_finished: bool,
+    scope: SyncScope,
 }
 
 impl OrderedReconciler {
     pub fn new(source: EntryStream, destination: EntryStream) -> Self {
+        Self::with_scope(source, destination, SyncScope::Tree)
+    }
+
+    pub fn with_scope(source: EntryStream, destination: EntryStream, scope: SyncScope) -> Self {
+        let (source_path, destination_path) = match &scope {
+            SyncScope::Tree => (None, None),
+            SyncScope::SelectedLeaf {
+                source,
+                destination,
+            } => (Some(source.clone()), Some(destination.clone())),
+        };
         Self {
-            source: OrderedInput::new(Side::Source, source),
-            destination: OrderedInput::new(Side::Destination, destination),
+            source: OrderedInput::new(Side::Source, source, source_path),
+            destination: OrderedInput::new(Side::Destination, destination, destination_path),
             source_head: None,
             destination_head: None,
             source_finished: false,
             destination_finished: false,
+            scope,
         }
+    }
+
+    pub(crate) fn is_selected_leaf(&self) -> bool {
+        matches!(self.scope, SyncScope::SelectedLeaf { .. })
     }
 
     pub async fn next(&mut self) -> Result<Option<ReconcileItem>, EngineError> {
@@ -123,34 +160,51 @@ impl OrderedReconciler {
 
         match (self.source_head.as_ref(), self.destination_head.as_ref()) {
             (None, None) => Ok(None),
-            (Some(_), None) => Ok(self.source_head.take().map(ReconcileItem::SourceOnly)),
+            (Some(_), None) => Ok(self.take_source_only()),
             (None, Some(_)) => Ok(self
                 .destination_head
                 .take()
                 .map(ReconcileItem::DestinationOnly)),
-            (Some(source), Some(destination)) => match source.path.cmp(&destination.path) {
-                std::cmp::Ordering::Less => {
-                    Ok(self.source_head.take().map(ReconcileItem::SourceOnly))
-                }
-                std::cmp::Ordering::Greater => Ok(self
-                    .destination_head
-                    .take()
-                    .map(ReconcileItem::DestinationOnly)),
-                std::cmp::Ordering::Equal => {
-                    let source = self.source_head.take().ok_or(EngineError::Invariant(
-                        "matched source head disappeared during reconciliation",
-                    ))?;
-                    let destination =
-                        self.destination_head.take().ok_or(EngineError::Invariant(
-                            "matched destination head disappeared during reconciliation",
+            (Some(source), Some(destination)) => {
+                match if matches!(self.scope, SyncScope::SelectedLeaf { .. }) {
+                    std::cmp::Ordering::Equal
+                } else {
+                    source.path.cmp(&destination.path)
+                } {
+                    std::cmp::Ordering::Less => Ok(self.take_source_only()),
+                    std::cmp::Ordering::Greater => Ok(self
+                        .destination_head
+                        .take()
+                        .map(ReconcileItem::DestinationOnly)),
+                    std::cmp::Ordering::Equal => {
+                        let source = self.source_head.take().ok_or(EngineError::Invariant(
+                            "matched source head disappeared during reconciliation",
                         ))?;
-                    Ok(Some(ReconcileItem::Matched {
-                        source,
-                        destination,
-                    }))
+                        let destination =
+                            self.destination_head.take().ok_or(EngineError::Invariant(
+                                "matched destination head disappeared during reconciliation",
+                            ))?;
+                        Ok(Some(ReconcileItem::Matched {
+                            source,
+                            destination,
+                        }))
+                    }
                 }
-            },
+            }
         }
+    }
+
+    fn take_source_only(&mut self) -> Option<ReconcileItem> {
+        self.source_head.take().map(|source| {
+            let destination_path = match &self.scope {
+                SyncScope::Tree => source.path.clone(),
+                SyncScope::SelectedLeaf { destination, .. } => destination.clone(),
+            };
+            ReconcileItem::SourceOnly {
+                source,
+                destination_path,
+            }
+        })
     }
 
     /// Stop both queues before awaiting either worker, including on early errors.
@@ -216,7 +270,7 @@ mod tests {
 
         assert!(matches!(
             reconciler.next().await.unwrap(),
-            Some(ReconcileItem::SourceOnly(value)) if value.path.as_path() == std::path::Path::new("a")
+            Some(ReconcileItem::SourceOnly { source: value, .. }) if value.path.as_path() == std::path::Path::new("a")
         ));
         assert!(matches!(
             reconciler.next().await.unwrap(),
@@ -230,7 +284,7 @@ mod tests {
         ));
         assert!(matches!(
             reconciler.next().await.unwrap(),
-            Some(ReconcileItem::SourceOnly(value)) if value.path.as_path() == std::path::Path::new("d")
+            Some(ReconcileItem::SourceOnly { source: value, .. }) if value.path.as_path() == std::path::Path::new("d")
         ));
         assert!(matches!(
             reconciler.next().await.unwrap(),
@@ -240,11 +294,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_leaf_matches_logical_keys_without_renaming_physical_entries() {
+        let scope = SyncScope::SelectedLeaf {
+            source: RelativePath::new("original").unwrap(),
+            destination: RelativePath::new("renamed").unwrap(),
+        };
+        let mut matched = OrderedReconciler::with_scope(
+            entries(&["original"]),
+            entries(&["renamed"]),
+            scope.clone(),
+        );
+        assert!(
+            matches!(matched.next().await.unwrap(), Some(ReconcileItem::Matched { source, destination }) if source.path.as_path() == std::path::Path::new("original") && destination.path.as_path() == std::path::Path::new("renamed"))
+        );
+        assert!(matched.next().await.unwrap().is_none());
+        let mut missing =
+            OrderedReconciler::with_scope(entries(&["original"]), entries(&[]), scope.clone());
+        assert!(
+            matches!(missing.next().await.unwrap(), Some(ReconcileItem::SourceOnly { source, destination_path }) if source.path.as_path() == std::path::Path::new("original") && destination_path.as_path() == std::path::Path::new("renamed"))
+        );
+        let mut neighbor =
+            OrderedReconciler::with_scope(entries(&["sibling"]), entries(&[]), scope.clone());
+        assert!(matches!(
+            neighbor.next().await,
+            Err(EngineError::Invariant(_))
+        ));
+        let mut duplicates =
+            OrderedReconciler::with_scope(entries(&["original", "original"]), entries(&[]), scope);
+        duplicates.next().await.unwrap();
+        assert!(matches!(
+            duplicates.next().await,
+            Err(EngineError::EntryOrder { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_duplicate_source_paths() {
         let mut reconciler = OrderedReconciler::new(entries(&["a", "a"]), entries(&[]));
         assert!(matches!(
             reconciler.next().await,
-            Ok(Some(ReconcileItem::SourceOnly(_)))
+            Ok(Some(ReconcileItem::SourceOnly { .. }))
         ));
         assert!(matches!(
             reconciler.next().await,

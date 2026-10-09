@@ -87,6 +87,60 @@ fn substitute(root: &Path, outside: &Path, race: Substitution) {
 /// Exercise actual lowerers/executors and the v3 server, not mocked chmod.
 /// Same-kind substitutions catch dropped destination tokens; symlink ancestors
 /// catch path-based setters even when the leaf itself is still a regular file.
+#[test]
+fn cross_platform_symlink_modes_are_ignored_without_losing_timestamp_preservation() {
+    use sy::engine::domain::{EntryIdentity, RelativePath, Timestamp};
+    use sy::remote::local_executor::LocalSyncAction;
+    use sy::remote::pull::RemotePullAction;
+    use sy::remote::push::RemotePushAction;
+
+    let path = RelativePath::new("link").unwrap();
+    let mut source = Entry::symlink(path.clone(), "target".into(), Timestamp::UNIX_EPOCH);
+    let mut destination = source.clone();
+    // The Mac source and Linux destination can report different link modes
+    // even immediately after a successful creation. Neither mode is writable.
+    source.unix_mode = Some(0o755);
+    destination.unix_mode = Some(0o777);
+    destination.identity = Some(EntryIdentity::from_bytes([1; 32]));
+    let comparison = ComparisonPolicy {
+        preserve_permissions: true,
+        preserve_times: true,
+        ..ComparisonPolicy::default()
+    };
+    assert!(matches!(
+        plan_entry(
+            source.clone(),
+            Some(destination.clone()),
+            path.clone(),
+            comparison
+        ),
+        PlanDecision::Ready(SyncOp::Unchanged { .. })
+    ));
+    source.modified = Timestamp::new(2, 0).unwrap();
+    let PlanDecision::Ready(operation @ SyncOp::Metadata { .. }) =
+        plan_entry(source, Some(destination), path, comparison)
+    else {
+        panic!("timestamp drift must still request metadata preservation");
+    };
+    let policy = ExecutionPolicy {
+        preserve_permissions: true,
+        preserve_times: true,
+    };
+    let modified = Some(Timestamp::new(2, 0).unwrap());
+    assert!(matches!(
+        lower_local_op(operation.clone(), policy).unwrap().unwrap().into_action(),
+        LocalSyncAction::ApplyMetadata { unix_mode: None, modified: actual, .. } if actual == modified
+    ));
+    assert!(matches!(
+        lower_sync_op(operation.clone(), policy).unwrap().unwrap().into_action(),
+        RemotePushAction::ApplyMetadata { unix_mode: None, modified: actual, .. } if actual == modified
+    ));
+    assert!(matches!(
+        lower_pull_op(operation, policy).unwrap().unwrap().into_action(),
+        RemotePullAction::ApplyMetadata { unix_mode: None, modified: actual, .. } if actual == modified
+    ));
+}
+
 #[tokio::test]
 async fn metadata_only_mutations_require_the_scanned_destination_in_all_directions() {
     for direction in [Direction::Local, Direction::Push, Direction::Pull] {
@@ -112,6 +166,7 @@ async fn metadata_only_mutations_require_the_scanned_destination_in_all_directio
             let decision = plan_entry(
                 source_entry,
                 Some(destination_entry),
+                sy::engine::domain::RelativePath::new("dir/file").unwrap(),
                 ComparisonPolicy {
                     mode: ComparisonMode::SizeOnly,
                     preserve_permissions: true,
@@ -282,7 +337,10 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
         .find(|entry| entry.path.as_path() == Path::new("dir/new"))
         .unwrap();
     let work = lower_local_op(
-        SyncOp::Create { source: observed },
+        SyncOp::Create {
+            destination_path: observed.path.clone(),
+            source: observed,
+        },
         ExecutionPolicy::default(),
     )
     .unwrap()

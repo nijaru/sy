@@ -248,11 +248,24 @@ pub enum ContentComparison {
     Blake3,
 }
 
+/// Semantic namespace observed by a synchronization. Endpoint roots are
+/// operational handles, not an implicit authorization to synchronize siblings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SyncScope {
+    #[default]
+    Tree,
+    SelectedLeaf {
+        source: RelativePath,
+        destination: RelativePath,
+    },
+}
+
 /// Semantic result of reconciliation. No byte-transfer strategy appears here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOp {
     Create {
         source: Entry,
+        destination_path: RelativePath,
     },
     Update {
         source: Entry,
@@ -278,14 +291,28 @@ pub enum SyncOp {
 }
 
 impl SyncOp {
-    pub fn path(&self) -> &RelativePath {
+    pub fn source(&self) -> &Entry {
         match self {
-            Self::Create { source }
+            Self::Create { source, .. }
             | Self::Update { source, .. }
             | Self::Replace { source, .. }
             | Self::Metadata { source, .. }
             | Self::Unchanged { source, .. }
-            | Self::Skip { source, .. } => &source.path,
+            | Self::Skip { source, .. } => source,
+        }
+    }
+
+    /// Physical destination effect address (or the source address for a skip).
+    pub fn path(&self) -> &RelativePath {
+        match self {
+            Self::Create {
+                destination_path, ..
+            } => destination_path,
+            Self::Update { destination, .. }
+            | Self::Replace { destination, .. }
+            | Self::Metadata { destination, .. }
+            | Self::Unchanged { destination, .. } => &destination.path,
+            Self::Skip { source, .. } => &source.path,
         }
     }
 }
@@ -345,7 +372,10 @@ mod tests {
     fn sync_operation_exposes_semantic_path() {
         let path = RelativePath::new("file").unwrap();
         let entry = Entry::file(path.clone(), 4, Timestamp::UNIX_EPOCH);
-        let operation = SyncOp::Create { source: entry };
+        let operation = SyncOp::Create {
+            source: entry,
+            destination_path: path.clone(),
+        };
         assert_eq!(operation.path(), &path);
     }
 }

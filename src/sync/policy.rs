@@ -68,6 +68,87 @@ pub(crate) fn filtered_source_stream(source: EntryStream, filter: FilterEngine) 
     })
 }
 
+/// Content comparisons retain the scanned physical address and opened-file
+/// identity, including explicit copy-links observations.
+pub(crate) async fn observed_hash(
+    endpoint: &dyn crate::endpoint::Endpoint,
+    entry: &Entry,
+    follow: bool,
+) -> Result<[u8; 32]> {
+    if !follow {
+        let rooted = sy::rooted_fs::RootedFs::open(endpoint.root().to_path_buf())
+            .await
+            .map_err(map_io)?;
+        return sy::endpoint::existing::fingerprint(rooted, entry.clone(), Default::default())
+            .await
+            .map(|fingerprint| fingerprint.content)
+            .map_err(map_io);
+    }
+    let file = endpoint
+        .open_native_file_following(entry.path.as_path())
+        .await?
+        .ok_or_else(|| {
+            SyncError::Config("endpoint cannot hash a followed source observation".into())
+        })?;
+    let entry = entry.clone();
+    let expected = entry.identity.ok_or_else(|| SyncError::SourceChanged {
+        path: entry.path.as_path().to_path_buf(),
+    })?;
+    let path = entry.path.clone();
+    let digest = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let validate = |file: &std::fs::File| -> Result<()> {
+            if crate::endpoint::local_identity::metadata_identity(
+                &file.metadata()?,
+                EntryKind::File,
+            ) != Some(expected)
+            {
+                return Err(SyncError::SourceChanged {
+                    path: entry.path.as_path().to_path_buf(),
+                });
+            }
+            Ok(())
+        };
+        let mut file = file;
+        validate(&file)?;
+        let mut buffer = vec![0; 1024 * 1024];
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        validate(&file)?;
+        Ok::<_, SyncError>(*hasher.finalize().as_bytes())
+    })
+    .await
+    .map_err(|error| SyncError::Io(std::io::Error::other(error)))??;
+    // Check the followed name still identifies the held observation; a retarget
+    // during comparison must not authorize an unchanged-file decision.
+    let reopened = endpoint
+        .open_native_file_following(path.as_path())
+        .await?
+        .ok_or_else(|| SyncError::SourceChanged {
+            path: path.as_path().to_path_buf(),
+        })?;
+    tokio::task::spawn_blocking(move || {
+        if crate::endpoint::local_identity::metadata_identity(
+            &reopened.metadata()?,
+            EntryKind::File,
+        ) != Some(expected)
+        {
+            return Err(SyncError::SourceChanged {
+                path: path.into_path_buf(),
+            });
+        }
+        Ok::<_, SyncError>(digest)
+    })
+    .await
+    .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+}
+
 pub(crate) fn source_scan_request(config: &SyncConfig, scan_options: ScanOptions) -> ScanRequest {
     ScanRequest {
         respect_gitignore: scan_options.respect_gitignore,
@@ -200,7 +281,7 @@ pub(crate) fn delete_policy(mode: &DeleteMode) -> Option<DeletePolicy> {
 /// mirroring the per-file format (`Would create: path (size)`).
 pub(crate) fn emit_diff_line(item: PreviewOp<'_>) {
     match item {
-        PreviewOp::Operation(SyncOp::Create { source }) => match source.kind {
+        PreviewOp::Operation(SyncOp::Create { source, .. }) => match source.kind {
             EntryKind::File => tracing::info!(
                 "Would create: {} ({})",
                 source.path,

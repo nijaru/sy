@@ -135,6 +135,25 @@ pub struct SyncPlan {
 }
 
 impl SyncPlan {
+    /// Validate backend-specific visible effects after the complete semantic
+    /// plan, before any execution. Replay stays bounded and retains the plan.
+    pub async fn validate_operations<F, Fut>(&mut self, mut validate: F) -> Result<()>
+    where
+        F: FnMut(SyncOp) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        while let Some(operation) = self.reader.next().await? {
+            validate(operation).await?;
+        }
+        self.reader
+            .rewind(
+                usize::try_from(self.operations)
+                    .map_err(|_| ControllerError::CounterOverflow("operation"))?,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub const fn operations(&self) -> u64 {
         self.operations
     }
@@ -206,8 +225,7 @@ pub async fn preflight_sync_scoped(
     delete_in_scope: impl FnMut(&Entry) -> bool,
 ) -> Result<SyncPlan> {
     preflight_sync_scoped_with_content(
-        source,
-        destination,
+        OrderedReconciler::new(source, destination),
         policy,
         delete_policy,
         plan_in_scope,
@@ -230,8 +248,7 @@ fn is_descendant_of(path: &RelativePath, ancestor: &RelativePath) -> bool {
 /// no-mutation phase. A comparison failure therefore prevents a plan,
 /// delete replay, and all namespace or file mutations.
 pub async fn preflight_sync_scoped_with_content<F, Fut>(
-    source: EntryStream,
-    destination: EntryStream,
+    mut reconciler: OrderedReconciler,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
@@ -242,7 +259,6 @@ where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    let mut reconciler = OrderedReconciler::new(source, destination);
     let result = collect_preflight_plan(
         &mut reconciler,
         policy,
@@ -294,8 +310,10 @@ where
 
     while let Some(item) = reconciler.next().await? {
         let item_path = match &item {
-            ReconcileItem::SourceOnly(source) => &source.path,
-            ReconcileItem::Matched { source, .. } => &source.path,
+            ReconcileItem::SourceOnly {
+                destination_path, ..
+            } => destination_path,
+            ReconcileItem::Matched { destination, .. } => &destination.path,
             ReconcileItem::DestinationOnly(destination) => &destination.path,
         };
 
@@ -338,7 +356,8 @@ where
                     collision_detector.record(&destination.path).await?;
                     continue;
                 }
-                ReconcileItem::SourceOnly(source) | ReconcileItem::Matched { source, .. } => {
+                ReconcileItem::SourceOnly { source, .. }
+                | ReconcileItem::Matched { source, .. } => {
                     return Err(ControllerError::UnsupportedTypeTransition {
                         path: source.path,
                         source_kind: source.kind,
@@ -349,18 +368,21 @@ where
         }
 
         let decision = match item {
-            ReconcileItem::SourceOnly(source) => {
+            ReconcileItem::SourceOnly {
+                source,
+                destination_path,
+            } => {
                 if let Some(delete) = &mut delete {
                     delete.observe_source_only(&source).await?;
                 }
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.record(&source.path).await?;
+                collision_detector.record(&destination_path).await?;
                 if !policy.existing_only {
                     append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 }
-                plan_entry(source, None, policy)
+                plan_entry(source, None, destination_path, policy)
             }
             ReconcileItem::Matched {
                 source,
@@ -373,10 +395,11 @@ where
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.record(&source.path).await?;
+                collision_detector.record(&destination.path).await?;
                 append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
                     .await?;
-                plan_entry(source, Some(destination), policy)
+                let destination_path = destination.path.clone();
+                plan_entry(source, Some(destination), destination_path, policy)
             }
             ReconcileItem::DestinationOnly(destination) => {
                 let in_scope = delete_in_scope(&destination);
@@ -412,6 +435,15 @@ where
                 });
             }
             if destination.is_directory() {
+                // A leaf observation does not contain descendant deletion or
+                // protection proof. Never infer an empty target from that EOF.
+                if reconciler.is_selected_leaf() {
+                    return Err(ControllerError::UnsupportedTypeTransition {
+                        path: destination.path.clone(),
+                        source_kind: source.kind,
+                        destination_kind: destination.kind,
+                    });
+                }
                 if !delete_in_scope(destination) {
                     return Err(
                         ControllerError::CannotReplaceDirectoryWithProtectedDescendant {
@@ -899,7 +931,7 @@ fn record_transfer(summary: &mut SyncSummary, transfer: TransferSummary) -> Resu
 
 fn record_preview_operation(preview: &mut SyncPreview, operation: &SyncOp) -> Result<()> {
     match operation {
-        SyncOp::Create { source } => match source.kind {
+        SyncOp::Create { source, .. } => match source.kind {
             EntryKind::File => {
                 preview.files_created =
                     checked_add(preview.files_created, 1, "preview created file")?;
@@ -943,7 +975,7 @@ fn record_preview_operation(preview: &mut SyncPreview, operation: &SyncOp) -> Re
 
 fn record_semantic_operation(summary: &mut SyncSummary, operation: &SyncOp) -> Result<()> {
     match operation {
-        SyncOp::Create { source } => match source.kind {
+        SyncOp::Create { source, .. } => match source.kind {
             EntryKind::File => {
                 summary.files_created = checked_add(summary.files_created, 1, "created file")?;
             }
@@ -1111,7 +1143,9 @@ mod tests {
             _policy: ExecutionPolicy,
         ) -> std::io::Result<Option<WorkItem<Entry>>> {
             match op {
-                SyncOp::Create { source } => Ok(Some(WorkItem::new(source, Default::default()))),
+                SyncOp::Create { source, .. } => {
+                    Ok(Some(WorkItem::new(source, Default::default())))
+                }
                 _ => Ok(None),
             }
         }
@@ -1229,7 +1263,7 @@ mod tests {
         assert_eq!(plan.operations(), 2);
         assert!(matches!(
             plan.reader.next().await.unwrap(),
-            Some(SyncOp::Create { source }) if source.path == path("a")
+            Some(SyncOp::Create { source, .. }) if source.path == path("a")
         ));
         assert!(matches!(
             plan.reader.next().await.unwrap(),
@@ -1358,8 +1392,10 @@ mod tests {
             ..ComparisonPolicy::default()
         };
         let mut equal = preflight_sync_scoped_with_content(
-            entries(vec![file("a", 4, 1)]),
-            entries(vec![file("a", 4, 2)]),
+            OrderedReconciler::new(
+                entries(vec![file("a", 4, 1)]),
+                entries(vec![file("a", 4, 2)]),
+            ),
             policy,
             None,
             |_| true,
@@ -1374,8 +1410,10 @@ mod tests {
         ));
 
         let mut changed = preflight_sync_scoped_with_content(
-            entries(vec![file("b", 4, 1)]),
-            entries(vec![file("b", 4, 2)]),
+            OrderedReconciler::new(
+                entries(vec![file("b", 4, 1)]),
+                entries(vec![file("b", 4, 2)]),
+            ),
             policy,
             None,
             |_| true,

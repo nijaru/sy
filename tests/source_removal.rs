@@ -33,8 +33,10 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
     let source_rooted = RootedFs::open(source.path().to_path_buf()).await.unwrap();
     let dest_rooted = RootedFs::open(dest.path().to_path_buf()).await.unwrap();
     let plan = preflight_sync_scoped_with_content(
-        local_entry_stream(source.path().to_path_buf(), ScanRequest::default()),
-        local_entry_stream(dest.path().to_path_buf(), ScanRequest::default()),
+        sy::engine::reconcile::OrderedReconciler::new(
+            local_entry_stream(source.path().to_path_buf(), ScanRequest::default()),
+            local_entry_stream(dest.path().to_path_buf(), ScanRequest::default()),
+        ),
         ComparisonPolicy {
             mode: ComparisonMode::Checksum,
             ..ComparisonPolicy::default()

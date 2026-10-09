@@ -40,6 +40,8 @@ pub const REMOTE_FETCH_WORKING_SET: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePullError {
+    #[error("selected-leaf destination binding is not supported over SSH")]
+    DestinationAddressUnsupported,
     #[error("hardlink bookkeeping failed: {0}")]
     HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
@@ -1053,6 +1055,9 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<RemotePullAction>>, RemotePullError> {
+        if op.path() != &op.source().path {
+            return Err(RemotePullError::DestinationAddressUnsupported);
+        }
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
             destination,
@@ -1171,6 +1176,7 @@ mod tests {
             .with_hardlinks(true);
             let first = crate::remote::pull_lower::lower_pull_op(
                 SyncOp::Create {
+                    destination_path: entries[0].clone().path.clone(),
                     source: entries[0].clone(),
                 },
                 ExecutionPolicy::default(),
