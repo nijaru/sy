@@ -172,7 +172,7 @@ identity and root-confined filesystem operations are not implemented.
 | Filters (--exclude/--include) | Stable | rsync-style patterns, `--filter`, templates |
 | Delete mode (--delete) | Stable | Local/push, with `--max-delete` safety threshold; pull `--delete` is refused |
 | Compression (-z) | Stable | zstd, auto/always/never |
-| Hard links (-H) | Stable | Preserved on local sync |
+| Hard links (-H) | Limited | Local/push/pull transfer groups; complete-group metadata isolation and restoration of retained destination topology remain incomplete |
 | Symlinks | Stable | `--links=preserve/follow/skip` |
 | Backup mode (--backup) | Stable | Replacements and deletions |
 | Atomic writes | Stable | Private staging, verified, atomic replace |
@@ -219,6 +219,13 @@ old destination. An admitted native commit may finish afterward; cancellation
 cannot interrupt it or undo publication. A lost acknowledgement leaves completion
 uncertain. This cutoff does not yet cover every directory, link, backup or
 in-place metadata operation.
+
+With `-H`, quick-equal files retain their old destination bytes. Before file
+writes, sy rejects selected groups whose retained bytes disagree with each other
+or with a planned source-byte update. `--checksum` compares content and can
+turn a quick-equal file into a source-byte update. Excluded and policy-skipped
+names are not members to coalesce. This preflight does not provide a snapshot;
+execution still has to revalidate its observations.
 
 In-place metadata writes to regular files with multiple hardlinks are refused,
 locally and over SSH: an alias may belong to the source, even an excluded file.
