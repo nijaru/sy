@@ -44,6 +44,12 @@ pub enum RemoteMetadataError {
 
     #[error("metadata acknowledgement must be an unflagged observed identity")]
     InvalidAck,
+
+    #[error("metadata source lacks an observation for {0}")]
+    MissingObservation(RelativePath),
+
+    #[error("observed source entry changed at {0}")]
+    ObservationChanged(RelativePath),
 }
 
 impl From<SharedRouterError> for RemoteMetadataError {
@@ -111,6 +117,38 @@ pub async fn request_metadata(
     receive_ack(&mut inbox, stream_id).await
 }
 
+/// Validate scan-derived scalar values without reading any file payload or
+/// unrequested preservation fields. The ACK echoes only the requested token.
+pub(crate) async fn request_observation(
+    sender: &RouterSender,
+    entry: &crate::engine::domain::Entry,
+    peer: PlatformOs,
+) -> Result<()> {
+    ensure_compatible_path_encoding(peer)?;
+    let identity = entry
+        .identity
+        .ok_or_else(|| RemoteMetadataError::MissingObservation(entry.path.clone()))?;
+    let request = crate::protocol::WireObservationRead {
+        path: encode_relative_path(entry.path.as_path())?,
+        kind: wire_kind(entry.kind),
+        identity: *identity.as_bytes(),
+    };
+    let mut inbox = sender.open_stream()?;
+    let stream_id = inbox.stream_id();
+    sender
+        .send(Frame::new(
+            FrameKind::Metadata,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            request.encode()?,
+        )?)
+        .await?;
+    if receive_ack(&mut inbox, stream_id).await? != identity {
+        return Err(RemoteMetadataError::ObservationChanged(entry.path.clone()));
+    }
+    Ok(())
+}
+
 pub async fn serve_incoming_metadata_rooted(
     rooted: RootedFs,
     incoming: IncomingStream,
@@ -133,6 +171,31 @@ pub async fn serve_incoming_metadata_rooted(
             expected: FrameKind::Metadata,
             actual: frame.kind(),
         });
+    }
+
+    if frame.payload().first() == Some(&crate::protocol::OBSERVATION_READ) {
+        let request = crate::protocol::WireObservationRead::decode(frame.payload())?;
+        let relative = decode_relative_path(request.path, peer)?;
+        let kind = domain_kind(request.kind);
+        let identity = EntryIdentity::from_bytes(request.identity);
+        drop(first);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if rooted.path_identity_blocking(&relative)? != Some((kind, identity)) {
+                return Err(RemoteMetadataError::ObservationChanged(relative));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| RemoteMetadataError::Worker(error.to_string()))??;
+        sender
+            .send(Frame::new(
+                FrameKind::Ack,
+                FrameFlags::empty(),
+                stream_id,
+                Bytes::copy_from_slice(identity.as_bytes()),
+            )?)
+            .await?;
+        return Ok(());
     }
 
     let metadata = WireMetadata::decode(frame.payload())?;

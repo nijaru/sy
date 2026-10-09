@@ -332,6 +332,15 @@ impl ClientRemoteHandle {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn validate_observation(
+        &self,
+        entry: &crate::engine::domain::Entry,
+    ) -> Result<()> {
+        super::metadata::request_observation(&self.sender, entry, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn read_directory_preservation(
         &self,
         path: &RelativePath,

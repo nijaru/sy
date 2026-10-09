@@ -731,8 +731,11 @@ impl ServerRemoteSession {
             }
             FrameKind::Metadata
                 if self.opened.operation == Operation::Push
-                    || incoming.first.frame().payload().first()
-                        == Some(&crate::protocol::DIRECTORY_READ) =>
+                    || matches!(
+                        incoming.first.frame().payload().first(),
+                        Some(&crate::protocol::DIRECTORY_READ)
+                            | Some(&crate::protocol::OBSERVATION_READ)
+                    ) =>
             {
                 Ok(Some(IncomingRequest::Metadata(incoming)))
             }

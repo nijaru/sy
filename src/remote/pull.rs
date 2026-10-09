@@ -466,9 +466,11 @@ impl RemotePullExecutor {
                 unix_mode,
                 modified,
             } => {
+                self.remote.validate_observation(&source).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
+                self.remote.validate_observation(&source).await?;
                 let rooted = self.metadata_authority().await?.clone();
                 let relative = source.path.clone();
                 let kind = source.kind;
@@ -488,6 +490,9 @@ impl RemotePullExecutor {
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+                // A failure here is post-mutation, not rollback. It cannot
+                // become a successful completion of stale preservation work.
+                self.remote.validate_observation(&source).await?;
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }

@@ -553,6 +553,7 @@ impl LocalSyncExecutor {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
+                self.check_source_identity(&source).await?;
                 let rooted = self.metadata_authority().await?;
                 let relative = destination.path.clone();
                 let kind = source.kind;
@@ -572,6 +573,7 @@ impl LocalSyncExecutor {
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+                self.check_source_identity(&source).await?;
                 destination.identity = Some(identity);
                 if let Some(mode) = unix_mode {
                     destination.unix_mode = Some(mode);

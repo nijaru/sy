@@ -36,8 +36,11 @@ pub const PROTOCOL_V3_5: ProtocolVersion = ProtocolVersion { major: 3, minor: 5 
 /// Destination preview sessions can observe absence without creating a root.
 pub const PROTOCOL_V3_6: ProtocolVersion = ProtocolVersion { major: 3, minor: 6 };
 
+/// Adds cheap observation-bound reads for scalar source metadata validation.
+pub const PROTOCOL_V3_7: ProtocolVersion = ProtocolVersion { major: 3, minor: 7 };
+
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_6);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_7);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {

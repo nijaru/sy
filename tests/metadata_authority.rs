@@ -35,6 +35,7 @@ enum Substitution {
     LeafSymlink,
     AncestorSymlink,
     AncestorDirectory,
+    SourceMetadata,
 }
 
 fn metadata(path: &Path) -> (u32, i64, i64) {
@@ -44,8 +45,8 @@ fn metadata(path: &Path) -> (u32, i64, i64) {
 
 fn seed(path: &Path, mode: u32, seconds: i64) {
     std::fs::write(path, b"unchanged bytes").unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 123)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
 async fn file_entry(root: &Path) -> Entry {
@@ -54,6 +55,7 @@ async fn file_entry(root: &Path) -> Entry {
     let mut stream = local_entry_stream(root.to_path_buf(), request);
     while let Some(entry) = stream.try_next().await.unwrap() {
         if entry.is_file() {
+            stream.close().await.unwrap();
             return entry;
         }
     }
@@ -62,7 +64,7 @@ async fn file_entry(root: &Path) -> Entry {
 
 fn substitute(root: &Path, outside: &Path, race: Substitution) {
     match race {
-        Substitution::None => {}
+        Substitution::None | Substitution::SourceMetadata => {}
         Substitution::File => {
             // Keep the scanned inode alive to rule out inode-number reuse.
             std::fs::rename(root.join("dir/file"), root.join("held-file")).unwrap();
@@ -142,7 +144,7 @@ fn cross_platform_symlink_modes_are_ignored_without_losing_timestamp_preservatio
 }
 
 #[tokio::test]
-async fn metadata_only_mutations_require_the_scanned_destination_in_all_directions() {
+async fn metadata_only_mutations_require_both_scanned_observations_in_all_directions() {
     for direction in [Direction::Local, Direction::Push, Direction::Pull] {
         for race in [
             Substitution::None,
@@ -150,19 +152,29 @@ async fn metadata_only_mutations_require_the_scanned_destination_in_all_directio
             Substitution::LeafSymlink,
             Substitution::AncestorSymlink,
             Substitution::AncestorDirectory,
+            Substitution::SourceMetadata,
         ] {
             let source = tempfile::tempdir().unwrap();
             let destination = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             std::fs::create_dir(source.path().join("dir")).unwrap();
             std::fs::create_dir(destination.path().join("dir")).unwrap();
-            seed(&source.path().join("dir/file"), 0o600, 1_600_000_000);
+            // Scalar preservation must not open/hash source payloads. A
+            // metadata-readable but content-unreadable file is sufficient.
+            seed(&source.path().join("dir/file"), 0o000, 1_600_000_000);
             seed(&destination.path().join("dir/file"), 0o644, 1_650_000_000);
             seed(&outside.path().join("file"), 0o640, 1_700_000_000);
             let outside_before = metadata(&outside.path().join("file"));
-            let source_before = metadata(&source.path().join("dir/file"));
             let source_entry = file_entry(source.path()).await;
             let destination_entry = file_entry(destination.path()).await;
+            if matches!(race, Substitution::SourceMetadata) {
+                std::fs::set_permissions(
+                    source.path().join("dir/file"),
+                    std::fs::Permissions::from_mode(0o620),
+                )
+                .unwrap();
+            }
+            let source_before = metadata(&source.path().join("dir/file"));
             let decision = plan_entry(
                 source_entry,
                 Some(destination_entry),
@@ -274,7 +286,10 @@ async fn metadata_only_mutations_require_the_scanned_destination_in_all_directio
                     metadata(&destination.path().join("dir/file")),
                     source_before
                 );
-            } else if matches!(race, Substitution::File | Substitution::AncestorDirectory) {
+            } else if matches!(
+                race,
+                Substitution::File | Substitution::AncestorDirectory | Substitution::SourceMetadata
+            ) {
                 assert_eq!(
                     metadata(&destination.path().join("dir/file")),
                     (0o644, 1_650_000_000, 123)
