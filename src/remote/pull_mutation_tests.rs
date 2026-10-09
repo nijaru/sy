@@ -115,6 +115,12 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                         *source.hardlink_group.unwrap().as_bytes(),
                         HardlinkRepresentative {
                             path: RelativePath::new("representative").unwrap(),
+                            publication: crate::endpoint::local_identity::metadata_identity(
+                                &std::fs::metadata(destination_root.path().join("representative"))
+                                    .unwrap(),
+                                EntryKind::File,
+                            )
+                            .unwrap(),
                             unix_mode: Some(0o600),
                             modified: None,
                         },
