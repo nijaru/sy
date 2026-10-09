@@ -76,6 +76,9 @@ impl RootedFs {
     }
 
     /// In-place canonical finalization, not rollback-capable replacement.
+    /// Admission covers this multi-field operation, not atomicity: after it
+    /// starts, cancellation cannot interrupt it and failures may leave some
+    /// fields applied. Directory link counts are not regular-file sharing.
     /// ACLs precede chmod so the requested POSIX mask/mode wins; immutable
     /// flags are last, after children, deletion and every other required field.
     pub fn finalize_directory_blocking(
@@ -118,6 +121,7 @@ impl RootedFs {
                 }
             }
             let file = self.observed_directory(path, expected)?;
+            let _permit = self.admit_mutation_blocking()?;
             if let Some(xattrs) = &preservation.xattrs {
                 for (name, value) in xattrs {
                     file.set_xattr(name, value)?;

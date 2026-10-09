@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const CLOSED: usize = 1 << (usize::BITS - 1);
 const COUNT: usize = CLOSED - 1;
 
-/// Linearizes staged publication admission against cancellation without holding
+/// Linearizes endpoint mutation admission against cancellation without holding
 /// a lock across native I/O. Closing never waits for admitted work: its completion
 /// can remain uncertain to a disconnected peer or a dropped awaiting future.
 #[derive(Debug, Default)]

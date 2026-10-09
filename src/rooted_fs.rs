@@ -1,4 +1,6 @@
 mod directory;
+#[cfg(all(test, unix))]
+mod mutation_tests;
 #[cfg(unix)]
 mod scan;
 pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
@@ -129,11 +131,14 @@ pub enum RootedFsError {
     #[error("nonempty directory replacement is not authorized at {0}")]
     NonEmptyDirectoryReplacement(PathBuf),
 
-    #[error("staged commit was cancelled before publication admission")]
+    #[error("rooted mutation was cancelled before admission")]
     CommitCancelled,
 
-    #[error("staged publication admission count exhausted")]
+    #[error("rooted mutation admission count exhausted")]
     CommitAdmissionExhausted,
+
+    #[error("mutations are forbidden on a read-only session root")]
+    ReadOnlyRoot,
 
     #[error("held-root filesystem confinement is unsupported on this platform")]
     UnsupportedPlatform,
@@ -151,11 +156,27 @@ pub type Result<T> = std::result::Result<T, RootedFsError>;
 /// path itself is operator/session-selected and is resolved exactly once when
 /// this handle is opened; later renames or symlink swaps of that pathname cannot
 /// redirect operations performed through the held directory descriptor.
+///
+/// A server session binds this authority to its mutation admission state (or
+/// makes a pull source read-only). Private file/symlink staging and owned abort
+/// cleanup do not publish user data; namespace commits admit only after final
+/// validation. Existing-inode metadata instead admits one in-place operation:
+/// failures can leave fields partially applied, with no interruption or rollback.
 #[derive(Clone)]
 pub struct RootedFs {
+    mutation_admission: RootedMutationAdmission,
+    #[cfg(all(test, unix))]
+    mutation_pause: Arc<std::sync::Mutex<Option<(usize, PublicationPause)>>>,
     root_path: Arc<PathBuf>,
     #[cfg(unix)]
     root_fd: Arc<OwnedFd>,
+}
+
+#[derive(Clone)]
+enum RootedMutationAdmission {
+    Unrestricted,
+    Session(Arc<PublicationAdmission>),
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,7 +588,14 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn commit_blocking(&mut self, admission: Option<&PublicationAdmission>) -> Result<()> {
-        let _permit = self.publish_blocking(admission)?;
+        self.rooted.require_writable()?;
+        // Own the session reference outside `self`: the permit covers cleanup
+        // too, without borrowing the transaction that native publication mutates.
+        let session_admission = match &self.rooted.mutation_admission {
+            RootedMutationAdmission::Session(admission) => Some(Arc::clone(admission)),
+            _ => None,
+        };
+        let _permit = self.publish_blocking(session_admission.as_deref().or(admission))?;
         self.finish_commit_blocking()
     }
 
@@ -609,13 +637,13 @@ impl RootedNamespaceTransaction {
         // blocking validation. A later close cannot interrupt or roll it back.
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::BeforeAdmission);
-        let permit = admission
-            .map(PublicationAdmission::admit)
-            .transpose()
-            .map_err(|error| match error {
-                AdmissionError::Closed => RootedFsError::CommitCancelled,
-                AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
-            })?;
+        #[cfg(test)]
+        self.rooted
+            .pause_mutation(PublicationPausePoint::BeforeAdmission);
+        let permit = admit_publication(admission)?;
+        #[cfg(test)]
+        self.rooted
+            .pause_mutation(PublicationPausePoint::AfterAdmission);
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::AfterAdmission);
 
@@ -746,6 +774,19 @@ impl RootedNamespaceTransaction {
     }
 }
 
+#[cfg(unix)]
+fn admit_publication(
+    admission: Option<&PublicationAdmission>,
+) -> Result<Option<PublicationPermit<'_>>> {
+    admission
+        .map(PublicationAdmission::admit)
+        .transpose()
+        .map_err(|error| match error {
+            AdmissionError::Closed => RootedFsError::CommitCancelled,
+            AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
+        })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeldDestinationExpectation {
     Unverified,
@@ -785,6 +826,71 @@ fn check_acl_text_bounded(text: String) -> Result<Option<String>> {
 }
 
 impl RootedFs {
+    /// Bind the namespace authority, not individual byte workers, to the same
+    /// atomic admission state that the router closes before terminal notification.
+    pub(crate) fn bind_session_mutations(
+        &mut self,
+        admission: Arc<PublicationAdmission>,
+        read_only: bool,
+    ) {
+        self.mutation_admission = if read_only {
+            RootedMutationAdmission::ReadOnly
+        } else {
+            RootedMutationAdmission::Session(admission)
+        };
+    }
+
+    fn require_writable(&self) -> Result<()> {
+        if matches!(self.mutation_admission, RootedMutationAdmission::ReadOnly) {
+            return Err(RootedFsError::ReadOnlyRoot);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn admit_mutation_blocking(&self) -> Result<Option<PublicationPermit<'_>>> {
+        self.require_writable()?;
+        let admission = match &self.mutation_admission {
+            RootedMutationAdmission::Session(admission) => Some(admission.as_ref()),
+            _ => None,
+        };
+        #[cfg(test)]
+        self.pause_mutation(PublicationPausePoint::BeforeAdmission);
+        let permit = admit_publication(admission)?;
+        #[cfg(test)]
+        self.pause_mutation(PublicationPausePoint::AfterAdmission);
+        Ok(permit)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_mutation_at(&self, skip: usize, pause: PublicationPause) {
+        *self.mutation_pause.lock().unwrap() = Some((skip, pause));
+    }
+
+    #[cfg(all(test, unix))]
+    fn pause_mutation(&self, point: PublicationPausePoint) {
+        let pause = {
+            let mut slot = self.mutation_pause.lock().unwrap();
+            match slot.as_mut() {
+                Some((skip, pause)) if pause.point == point => {
+                    if *skip == 0 {
+                        slot.take().map(|(_, pause)| pause)
+                    } else {
+                        *skip -= 1;
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(15));
+        }
+    }
+
     /// Open and pin a root directory without blocking a Tokio worker thread.
     pub async fn open(root: PathBuf) -> Result<Self> {
         tokio::task::spawn_blocking(move || Self::open_blocking(root))
@@ -963,6 +1069,8 @@ impl RootedFs {
     ) -> Result<HardlinkSourceState> {
         let (member, before) =
             self.open_hardlink_source_member(relative.as_path(), scanned, expected)?;
+        self.verify_parent_binding_blocking(relative.as_path(), &member.parent)?;
+        let _permit = self.admit_mutation_blocking()?;
         unlink_at(member.parent.as_raw_fd(), &member.leaf, false)?;
         let after =
             hardlink_state_from_stat(&stat_fd(member.file.as_raw_fd())?, relative.as_path())?;
@@ -997,10 +1105,10 @@ impl RootedFs {
     /// Link one root-relative path to an existing root-relative regular file
     /// (`-H/--preserve-hardlinks`). The source is verified as a regular file
     /// through its no-follow parent before linking; a symlink source is
-    /// refused. The link is staged under a temporary name in the held
-    /// destination parent and renamed over the destination, so replacing a
-    /// file/symlink is atomic and a directory destination fails loudly
-    /// instead of being recursed into. Destination parents are created
+    /// refused. The link is staged privately and published through the common
+    /// namespace transaction, so replacing a file/symlink is atomic. A directory
+    /// destination remains unsupported rather than being recursed into.
+    /// Destination parents are created
     /// root-confined, matching copy semantics.
     ///
     /// This is a blocking syscall API and must run on a blocking worker.
@@ -1044,6 +1152,7 @@ impl RootedFs {
     ) -> Result<()> {
         #[cfg(unix)]
         {
+            self.require_writable()?;
             let source = self.bind_copy_source(source.as_path(), expected_source_identity)?;
             let parent = destination
                 .parent()
@@ -1375,6 +1484,9 @@ impl RootedFs {
         };
 
         Ok(Self {
+            mutation_admission: RootedMutationAdmission::Unrestricted,
+            #[cfg(test)]
+            mutation_pause: Arc::new(std::sync::Mutex::new(None)),
             root_path: Arc::new(root),
             root_fd: Arc::new(root_fd),
         })
@@ -1426,6 +1538,9 @@ impl RootedFs {
         relative: &Path,
         expected: ExpectedDestination,
     ) -> Result<RootedNamespaceTransaction> {
+        // Private scratch may be prepared after cancellation, but never on a
+        // pull source. Publication itself must still obtain late admission.
+        self.require_writable()?;
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
         let expected_destination = capture_destination_expectation(
             parent_fd.as_raw_fd(),
@@ -1475,45 +1590,64 @@ impl RootedFs {
 
     #[cfg(unix)]
     fn create_hardlink_path_blocking(&self, source: &Path, destination: &Path) -> Result<()> {
-        if let Some(parent) = destination.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.ensure_directories_blocking(parent)?;
-            }
-        }
-        // Resolve both parents without following peer-controlled symlinks.
-        // The source leaf is opened O_NOFOLLOW and required to be a regular
-        // file so a symlink source can never be linked through.
+        self.require_writable()?;
         let (source_parent, source_leaf) = self.open_parent_blocking(source)?;
         let source_file = open_file_at(source_parent.as_raw_fd(), &source_leaf)?;
         if !source_file.metadata()?.file_type().is_file() {
             return Err(RootedFsError::NotRegularFile(source.to_path_buf()));
         }
+        if let Some(parent) = destination.parent() {
+            self.ensure_directories_blocking(parent)?;
+        }
         let (destination_parent, destination_leaf) = self.open_parent_blocking(destination)?;
-        let destination_parent_fd = destination_parent.as_raw_fd();
-        for _ in 0..TEMP_CREATE_ATTEMPTS {
-            let temp_name = next_temp_name();
-            match link_at(
-                source_parent.as_raw_fd(),
-                &source_leaf,
-                destination_parent_fd,
-                &temp_name,
-            ) {
-                Ok(()) => {
-                    return match rename_at(destination_parent_fd, &temp_name, &destination_leaf) {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            let _ = unlink_at(destination_parent_fd, &temp_name, false);
-                            Err(error)
-                        }
-                    };
-                }
-                Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-                    continue;
-                }
-                Err(error) => return Err(error),
+        if let Some(dest) = stat_at_optional(destination_parent.as_raw_fd(), &destination_leaf)? {
+            if dest.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                return Err(RootedFsError::EntryKindMismatch {
+                    path: destination.to_path_buf(),
+                    expected: EntryKind::File,
+                });
+            }
+            let source_stat = stat_fd(source_file.as_raw_fd())?;
+            // An existing group member already has the required topology.
+            // Do not invalidate its captured ctime by staging another link.
+            if dest.st_dev == source_stat.st_dev && dest.st_ino == source_stat.st_ino {
+                return Ok(());
             }
         }
-        Err(RootedFsError::StagingNameExhausted(TEMP_CREATE_ATTEMPTS))
+        let mut namespace =
+            self.begin_namespace_blocking(destination, ExpectedDestination::SnapshotAtOpen)?;
+        let prepare = || -> Result<()> {
+            self.verify_parent_binding_blocking(source, &source_parent)?;
+            let held = stat_fd(source_file.as_raw_fd())?;
+            let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?
+                .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
+            if identity_from_stat(&held) != identity_from_stat(&named) {
+                return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+            }
+            // Even a private hardlink changes the visible source inode's nlink
+            // and ctime. Admit that syscall separately; it does not authorize
+            // the later destination publication after cancellation.
+            {
+                let _permit = self.admit_mutation_blocking()?;
+                link_at(
+                    source_parent.as_raw_fd(),
+                    &source_leaf,
+                    namespace.staging_dir_fd.as_raw_fd(),
+                    &namespace.temp_name,
+                )?;
+            }
+            let staged =
+                stat_at_optional(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name)?
+                    .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
+            if staged.st_dev != held.st_dev || staged.st_ino != held.st_ino {
+                return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+            }
+            self.verify_parent_binding_blocking(source, &source_parent)
+        };
+        if let Err(error) = prepare() {
+            return Err(namespace.abort_after(error));
+        }
+        namespace.commit()
     }
 
     #[cfg(not(unix))]
@@ -1601,15 +1735,20 @@ impl RootedFs {
     /// directories are accepted; other leaf kinds are errors.
     #[cfg(unix)]
     fn ensure_directories_blocking(&self, relative: &Path) -> Result<()> {
+        self.require_writable()?;
         let mut current_fd = self.root_fd.try_clone()?;
+        let mut prefix = PathBuf::new();
         for component in relative.components() {
             let Component::Normal(name) = component else {
                 return Err(RootedFsError::InvalidRelativePath);
             };
+            prefix.push(name);
             current_fd = match open_dir_at(current_fd.as_raw_fd(), name) {
                 Ok(fd) => fd,
                 Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
                     let name_c = component_cstring(name)?;
+                    self.verify_parent_binding_blocking(&prefix, &current_fd)?;
+                    let _permit = self.admit_mutation_blocking()?;
                     let result = unsafe {
                         // SAFETY: `current_fd` remains open and `name_c` is a
                         // live single component. mkdirat creates only beneath
@@ -1636,6 +1775,8 @@ impl RootedFs {
     fn create_directory_path_blocking(&self, relative: &Path) -> Result<EntryIdentity> {
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let leaf_c = component_cstring(&leaf)?;
+        self.verify_parent_binding_blocking(relative, &parent)?;
+        let _permit = self.admit_mutation_blocking()?;
         let result = unsafe {
             // SAFETY: `parent` remains open and `leaf_c` is a live single
             // component. mkdirat creates only beneath the already-resolved
@@ -1716,6 +1857,8 @@ impl RootedFs {
             }
         }
 
+        self.verify_parent_binding_blocking(relative, &parent)?;
+        let _permit = self.admit_mutation_blocking()?;
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
             Ok(()) => Ok(()),
             // A vanished entry is idempotent success.
@@ -1776,6 +1919,8 @@ impl RootedFs {
                 if unix_mode.is_some() || modified.is_some() {
                     require_exclusive_file_metadata(&file, relative)?;
                 }
+                self.verify_metadata_binding_blocking(relative, &file, kind)?;
+                let _permit = self.admit_mutation_blocking()?;
                 apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)
             }
             EntryKind::Symlink => {
@@ -1791,6 +1936,8 @@ impl RootedFs {
                     return Err(changed());
                 }
                 if let Some(modified) = modified {
+                    self.verify_parent_binding_blocking(relative, &parent)?;
+                    let _permit = self.admit_mutation_blocking()?;
                     set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
                 }
                 Ok(())
@@ -1856,6 +2003,8 @@ impl RootedFs {
 
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
+        self.verify_metadata_binding_blocking(relative, &file, kind)?;
+        let _permit = self.admit_mutation_blocking()?;
         for (name, value) in xattrs {
             file.set_xattr(name, value)?;
         }
@@ -1914,6 +2063,8 @@ impl RootedFs {
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
+        self.verify_metadata_binding_blocking(relative, &file, kind)?;
+        let _permit = self.admit_mutation_blocking()?;
         apply_acl_fd(&file, acl)
     }
 
@@ -1941,6 +2092,8 @@ impl RootedFs {
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
+        self.verify_metadata_binding_blocking(relative, &file, kind)?;
+        let _permit = self.admit_mutation_blocking()?;
         apply_acl_fd(&file, acl)
     }
 
@@ -2054,6 +2207,8 @@ impl RootedFs {
     ) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
+        self.verify_metadata_binding_blocking(relative, &file, kind)?;
+        let _permit = self.admit_mutation_blocking()?;
         // SAFETY: `file` is a live held descriptor; `fchflags` only mutates
         // flags on the open file description.
         let ret = unsafe { libc::fchflags(file.as_raw_fd(), flags) };
@@ -2097,6 +2252,34 @@ impl RootedFs {
             EntryKind::Symlink => return Err(RootedFsError::UnsupportedSymlinkXattrs),
         };
         Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn verify_metadata_binding_blocking(
+        &self,
+        relative: &Path,
+        file: &File,
+        kind: EntryKind,
+    ) -> Result<()> {
+        let path = RelativePath::new(relative.to_path_buf())
+            .map_err(|_| RootedFsError::InvalidRelativePath)?;
+        let held = identity_from_stat(&stat_fd(file.as_raw_fd())?)
+            .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
+        if self.path_identity_blocking(&path)? != Some((kind, held)) {
+            return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn verify_parent_binding_blocking(&self, relative: &Path, held: &OwnedFd) -> Result<()> {
+        let (current, _) = self.open_parent_blocking(relative)?;
+        let current = stat_fd(current.as_raw_fd())?;
+        let held = stat_fd(held.as_raw_fd())?;
+        if held.st_dev != current.st_dev || held.st_ino != current.st_ino {
+            return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2839,11 +3022,6 @@ fn link_at(
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn rename_at(parent: RawFd, from: &OsStr, to: &OsStr) -> Result<()> {
-    rename_between_at(parent, from, parent, to)
 }
 
 #[cfg(unix)]

@@ -301,17 +301,28 @@ mod tests {
             let client = client.unwrap();
             let mut server = server.unwrap();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let rooted = server.scan_handler_rooted();
+            rooted.pause_mutation_at(
+                0,
+                crate::rooted_fs::PublicationPause {
+                    point: crate::rooted_fs::PublicationPausePoint::AfterAdmission,
+                    reached: reached_tx,
+                    resume: release_rx,
+                },
+            );
             let finished = Arc::new(AtomicBool::new(false));
             let worker_finished = Arc::clone(&finished);
             let worker = tokio::task::spawn_blocking(move || {
-                release_rx.recv().unwrap();
+                let result = rooted.create_directory_blocking(
+                    &crate::engine::domain::RelativePath::new("admitted").unwrap(),
+                );
                 worker_finished.store(true, Ordering::SeqCst);
+                result.map(|_| ()).map_err(|error| error.to_string())
             });
+            let paused = tokio::time::timeout(Duration::from_secs(5), reached_rx).await;
             let mut tasks = JoinSet::new();
-            tasks.spawn(async move {
-                worker.await.map_err(|error| error.to_string())?;
-                Ok(())
-            });
+            tasks.spawn(async move { worker.await.map_err(|error| error.to_string())? });
             match cause {
                 "request" => {
                     tasks.spawn(async { Err("handler failed".to_string()) });
@@ -347,18 +358,25 @@ mod tests {
                 tokio::spawn(async move { serve_requests(&mut server, &mut tasks, 8).await });
             // Returning here would detach the blocking worker and abort its
             // handler, exactly the old error-path JoinSet-drop defect.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), &mut serving)
+            let early = tokio::time::timeout(Duration::from_millis(30), &mut serving).await;
+            let draining = early.is_err();
+            // Release before assertions; the native gate also bounds failed-test
+            // cleanup. Ordinary failure must drain this actual admitted mkdir.
+            let _ = release_tx.send(());
+            let result = match early {
+                Ok(result) => result.unwrap(),
+                Err(_) => tokio::time::timeout(Duration::from_secs(1), serving)
                     .await
-                    .is_err(),
-                "{cause} returned before drainage"
+                    .unwrap()
+                    .unwrap(),
+            };
+            assert!(
+                matches!(paused, Ok(Ok(()))),
+                "{cause} missed admission gate"
             );
-            release_tx.send(()).unwrap();
-            let result = tokio::time::timeout(Duration::from_secs(1), serving)
-                .await
-                .unwrap()
-                .unwrap();
+            assert!(draining, "{cause} returned before drainage");
             assert!(finished.load(Ordering::SeqCst));
+            assert!(root.path().join("admitted").is_dir());
             match cause {
                 "request" => assert!(
                     matches!(result, Err(ServeError::Request(error)) if error == "handler failed")
