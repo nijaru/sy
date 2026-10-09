@@ -1,22 +1,9 @@
-//! Bounded extended-attribute read/write RPCs and the shared preservation
-//! step used by every v3 executor.
-//!
-//! `-X/--preserve-xattrs` is demand-driven: the scan never carries attribute
-//! bytes, and the executor reads the source's attributes only for entries it is
-//! already mutating (a create/update/replace or a metadata-only update). The
-//! wire request carries a whole bounded set in one frame so mirror semantics
-//! (set the desired attributes, remove the rest) stay atomic per entry, and an
-//! oversized set is refused loudly rather than truncated.
-//!
-//! Source reads carry the scan identity and validate a held descriptor before
-//! and after reading. Writes are Push-only; a Pull root is read-only.
-
-use crate::endpoint::local::LocalEndpoint;
-use crate::endpoint::Endpoint;
+//! Bounded demand-driven source xattr reads, bound to scanned observations.
+//! Destination writes belong to the single observed metadata owner.
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
-    Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId, WireEntryKind,
-    WireXattr, WireXattrRequest, WireXattrResult, XattrMode,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireEntryKind,
+    WireSourceMetadataRead, WireXattr, WireXattrResult,
 };
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
@@ -66,14 +53,8 @@ pub enum RemoteXattrError {
     #[error("xattr acknowledgement must be an empty unflagged frame")]
     InvalidAck,
 
-    #[error("xattr write requests are refused in a {0:?} session: the remote root is source-only")]
-    WriteInSourceSession(Operation),
-
     #[error("source preservation requires a scanned identity for {0}")]
     MissingSourceIdentity(RelativePath),
-
-    #[error("local extended-attribute access failed: {0}")]
-    Local(String),
 }
 
 impl From<SharedRouterError> for RemoteXattrError {
@@ -84,9 +65,7 @@ impl From<SharedRouterError> for RemoteXattrError {
 
 pub type Result<T> = std::result::Result<T, RemoteXattrError>;
 
-/// Where one side of an xattr preservation step lives. Local roots are
-/// addressed through `LocalEndpoint`; a remote peer is addressed through the
-/// session's bounded request handle.
+/// Source-side rooted observation or bounded remote request handle.
 pub enum XattrLocation<'a> {
     Local(&'a Path),
     Remote(&'a ClientRemoteHandle),
@@ -101,7 +80,7 @@ pub async fn request_read_xattrs(
     peer: PlatformOs,
 ) -> Result<Vec<(OsString, Vec<u8>)>> {
     ensure_compatible_path_encoding(peer)?;
-    let request = WireXattrRequest::read(
+    let request = WireSourceMetadataRead::new(
         encode_relative_path(path.as_path())?,
         wire_kind(kind),
         *expected.as_bytes(),
@@ -151,45 +130,11 @@ pub async fn request_read_xattrs(
     Ok(entries)
 }
 
-/// Replace the peer's attributes for one entry with `xattrs` (an empty set
-/// clears every attribute). The acknowledgement is sent only after the mirror
-/// completes.
-pub async fn request_write_xattrs(
-    sender: &RouterSender,
-    path: &RelativePath,
-    kind: EntryKind,
-    xattrs: &[(OsString, Vec<u8>)],
-    peer: PlatformOs,
-) -> Result<()> {
-    ensure_compatible_path_encoding(peer)?;
-    let entries = xattrs
-        .iter()
-        .map(|(name, value)| WireXattr::new(name_bytes(name), value.clone()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let request = WireXattrRequest::write(
-        encode_relative_path(path.as_path())?,
-        wire_kind(kind),
-        entries,
-    )?;
-    let mut inbox = sender.open_stream()?;
-    let stream_id = inbox.stream_id();
-    sender
-        .send(Frame::new(
-            FrameKind::XattrRequest,
-            FrameFlags::FINAL,
-            stream_id,
-            request.encode()?,
-        )?)
-        .await?;
-    receive_ack(&mut inbox, stream_id).await
-}
-
 pub async fn serve_incoming_xattr_rooted(
     rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     let IncomingStream { first, mut inbox } = incoming;
@@ -203,59 +148,30 @@ pub async fn serve_incoming_xattr_rooted(
             actual: frame.kind(),
         });
     }
-    let request = WireXattrRequest::decode(frame.payload())?;
+    let request = WireSourceMetadataRead::decode(frame.payload())?;
     let path = decode_relative_path(request.path().clone(), peer)?;
     let kind = domain_kind(request.kind());
-    let mode = request.mode();
-    let entries = request.entries().to_vec();
+    let expected = EntryIdentity::from_bytes(request.identity());
     drop(first);
-
-    if mode == XattrMode::Write && operation != Operation::Push {
-        return Err(RemoteXattrError::WriteInSourceSession(operation));
-    }
-
-    match mode {
-        XattrMode::Read => {
-            let expected = EntryIdentity::from_bytes(request.source_identity()?);
-            let xattrs = tokio::task::spawn_blocking(move || {
-                rooted.read_observed_xattrs_blocking(&path, kind, expected)
-            })
-            .await
-            .map_err(|error| RemoteXattrError::Worker(error.to_string()))??;
-            let wire = xattrs
-                .iter()
-                .map(|(name, value)| WireXattr::new(name_bytes(name), value.clone()))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let result = WireXattrResult::new(wire)?;
-            sender
-                .send(Frame::new(
-                    FrameKind::XattrResult,
-                    FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
-                    stream_id,
-                    result.encode()?,
-                )?)
-                .await?;
-            receive_ack(&mut inbox, stream_id).await
-        }
-        XattrMode::Write => {
-            let xattrs = entries
-                .iter()
-                .map(|entry| (os_string_from_name(entry.name()), entry.value().to_vec()))
-                .collect::<Vec<_>>();
-            tokio::task::spawn_blocking(move || rooted.write_xattrs_blocking(&path, kind, &xattrs))
-                .await
-                .map_err(|error| RemoteXattrError::Worker(error.to_string()))??;
-            sender
-                .send(Frame::new(
-                    FrameKind::Ack,
-                    FrameFlags::empty(),
-                    stream_id,
-                    Bytes::new(),
-                )?)
-                .await?;
-            Ok(())
-        }
-    }
+    let xattrs = tokio::task::spawn_blocking(move || {
+        rooted.read_observed_xattrs_blocking(&path, kind, expected)
+    })
+    .await
+    .map_err(|error| RemoteXattrError::Worker(error.to_string()))??;
+    let wire = xattrs
+        .iter()
+        .map(|(name, value)| WireXattr::new(name_bytes(name), value.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let result = WireXattrResult::new(wire)?;
+    sender
+        .send(Frame::new(
+            FrameKind::XattrResult,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            result.encode()?,
+        )?)
+        .await?;
+    receive_ack(&mut inbox, stream_id).await
 }
 
 /// Read the requested entry's attributes from the source side of one sync.
@@ -295,28 +211,6 @@ pub async fn read_preserved_xattrs(
     };
     check_xattr_set_bounded(&xattrs)?;
     Ok(xattrs)
-}
-
-/// Mirror a previously read attribute set onto the destination side.
-pub async fn apply_preserved_xattrs(
-    location: &XattrLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
-    xattrs: &[(OsString, Vec<u8>)],
-) -> Result<()> {
-    check_xattr_set_bounded(xattrs)?;
-    match location {
-        XattrLocation::Local(root) => {
-            let root = root.to_path_buf();
-            LocalEndpoint::new(root)
-                .write_xattrs(path.as_path(), xattrs)
-                .await
-                .map_err(|error| RemoteXattrError::Local(error.to_string()))
-        }
-        XattrLocation::Remote(handle) => {
-            request_write_xattrs(&handle.sender(), path, kind, xattrs, handle.peer_platform()).await
-        }
-    }
 }
 
 fn check_xattr_set_bounded(xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
@@ -448,14 +342,13 @@ mod tests {
         mut server: FrameRouter,
         rooted: RootedFs,
         peer: PlatformOs,
-        operation: Operation,
         requests: usize,
     ) -> tokio::task::JoinHandle<()> {
         let sender = server.sender();
         tokio::spawn(async move {
             for _ in 0..requests {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
-                serve_incoming_xattr_rooted(rooted.clone(), incoming, &sender, peer, operation)
+                serve_incoming_xattr_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
                     .unwrap();
             }
@@ -463,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xattr_round_trip_reads_and_mirrors_write() {
+    async fn observed_xattr_read_returns_native_attributes() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
@@ -485,19 +378,11 @@ mod tests {
         )
         .unwrap();
         let peer = crate::protocol::Platform::current().os;
-        let server_task = serve(server, rooted, peer, Operation::Push, 2);
+        let server_task = serve(server, rooted, peer, 1);
 
         let path = RelativePath::new("file").unwrap();
         let name = OsString::from("user.sy-test");
-        request_write_xattrs(
-            &client.sender(),
-            &path,
-            EntryKind::File,
-            &[(name.clone(), b"wire".to_vec())],
-            peer,
-        )
-        .await
-        .unwrap();
+        xattr::set(root.path().join("file"), &name, b"wire").unwrap();
         let expected = crate::endpoint::local_identity::metadata_identity(
             &std::fs::metadata(root.path().join("file")).unwrap(),
             EntryKind::File,
@@ -509,74 +394,5 @@ mod tests {
         server_task.await.unwrap();
 
         assert_eq!(user_xattrs(read), vec![(name, b"wire".to_vec())]);
-    }
-
-    #[tokio::test]
-    async fn write_into_a_pull_session_is_refused() {
-        let root = tempfile::TempDir::new().unwrap();
-        std::fs::write(root.path().join("file"), b"data").unwrap();
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, server_writer) = tokio::io::split(server_io);
-        let client = FrameRouter::start(
-            client_reader,
-            client_writer,
-            RouterRole::Client,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let mut server = FrameRouter::start(
-            server_reader,
-            server_writer,
-            RouterRole::Server,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let sender = server.sender();
-        let peer = crate::protocol::Platform::current().os;
-        let server_task = tokio::spawn(async move {
-            let incoming = server.incoming().recv().await.unwrap().unwrap();
-            serve_incoming_xattr_rooted(rooted, incoming, &sender, peer, Operation::Pull).await
-        });
-
-        let path = RelativePath::new("file").unwrap();
-        // Send a raw write request because the fallible server closes the
-        // stream without an acknowledgement, which the client surfaces as an
-        // unexpected end rather than a clean RPC result.
-        let request = WireXattrRequest::write(
-            encode_relative_path(path.as_path()).unwrap(),
-            WireEntryKind::File,
-            vec![WireXattr::new(
-                Bytes::from_static(b"user.sy-test"),
-                Bytes::from_static(b"x"),
-            )
-            .unwrap()],
-        )
-        .unwrap();
-        let inbox = client.sender().open_stream().unwrap();
-        let stream_id = inbox.stream_id();
-        client
-            .sender()
-            .send(
-                Frame::new(
-                    FrameKind::XattrRequest,
-                    FrameFlags::FINAL,
-                    stream_id,
-                    request.encode().unwrap(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let error = server_task.await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            RemoteXattrError::WriteInSourceSession(Operation::Pull)
-        ));
-        // The source file was never mutated.
-        assert!(xattr::get(root.path().join("file"), "user.sy-test")
-            .unwrap()
-            .is_none());
     }
 }

@@ -3,7 +3,7 @@ mod client;
 #[path = "directory.rs"]
 mod directory;
 #[path = "metadata.rs"]
-mod metadata;
+pub(crate) mod metadata;
 #[path = "mutation.rs"]
 mod mutation;
 pub use client::ClientRemoteHandle;
@@ -32,9 +32,7 @@ use crate::remote::signature::{
 use crate::remote::transfer::{
     request_file_transfer, serve_incoming_file_rooted, RemoteTransferError,
 };
-use crate::remote::xattr::{
-    request_read_xattrs, request_write_xattrs, serve_incoming_xattr_rooted, RemoteXattrError,
-};
+use crate::remote::xattr::{request_read_xattrs, serve_incoming_xattr_rooted, RemoteXattrError};
 use crate::remote::{client_handshake, server_handshake, OpenedServerSession};
 use crate::rooted_fs::RootedFs;
 use crate::transfer::delta::{
@@ -285,24 +283,12 @@ impl ClientRemoteSession {
 
     pub async fn apply_metadata(
         &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        expected: EntryIdentity,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
+        metadata: crate::protocol::WireMetadata,
+    ) -> Result<EntryIdentity> {
         self.require_push(FrameKind::Metadata)?;
-        request_metadata(
-            &self.router.sender(),
-            path,
-            kind,
-            expected,
-            unix_mode,
-            modified,
-            self.server.platform.os,
-        )
-        .await
-        .map_err(Into::into)
+        request_metadata(&self.router.sender(), metadata, self.server.platform.os)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn create_directory(&self, path: &RelativePath) -> Result<EntryIdentity> {
@@ -405,26 +391,6 @@ impl ClientRemoteSession {
             path,
             kind,
             expected,
-            self.server.platform.os,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Mirror an extended-attribute set onto the remote destination for one
-    /// entry (`-X`). Push-only: a Pull session's remote root is source-only.
-    pub async fn write_xattrs(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        xattrs: &[(std::ffi::OsString, Vec<u8>)],
-    ) -> Result<()> {
-        self.require_push(FrameKind::XattrRequest)?;
-        request_write_xattrs(
-            &self.router.sender(),
-            path,
-            kind,
-            xattrs,
             self.server.platform.os,
         )
         .await
@@ -547,75 +513,46 @@ impl ServerMutationHandler {
     }
 }
 
-/// Extended-attribute read/write requests use the same session-pinned root
-/// descriptor. The session direction is carried so a write request in a Pull
-/// session is refused: the remote root is the read-only source there.
+/// Observation-bound source xattr reads use the session-pinned root.
 #[derive(Clone)]
 pub struct ServerXattrHandler {
     rooted: RootedFs,
     sender: RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 }
 
 impl ServerXattrHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::xattr::Result<()> {
-        serve_incoming_xattr_rooted(
-            self.rooted.clone(),
-            incoming,
-            &self.sender,
-            self.peer,
-            self.operation,
-        )
-        .await
+        serve_incoming_xattr_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
-/// Access-control read/write requests use the same session-pinned root
-/// descriptor, with the same Pull-session write refusal as xattrs: the
-/// remote root is the read-only source there.
+/// Observation-bound source ACL reads use the session-pinned root.
 #[derive(Clone)]
 pub struct ServerAclHandler {
     rooted: RootedFs,
     sender: RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 }
 
 impl ServerAclHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::acl::Result<()> {
-        serve_incoming_acl_rooted(
-            self.rooted.clone(),
-            incoming,
-            &self.sender,
-            self.peer,
-            self.operation,
-        )
-        .await
+        serve_incoming_acl_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
-/// BSD-flags read/write requests use the same session-pinned root
-/// descriptor, with the same Pull-session write refusal as xattrs and ACLs:
-/// the remote root is the read-only source there.
+/// Observation-bound source flag reads use the session-pinned root.
 #[derive(Clone)]
 pub struct ServerBsdFlagsHandler {
     rooted: RootedFs,
     sender: RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 }
 
 impl ServerBsdFlagsHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::bsdflags::Result<()> {
-        serve_incoming_bsd_flags_rooted(
-            self.rooted.clone(),
-            incoming,
-            &self.sender,
-            self.peer,
-            self.operation,
-        )
-        .await
+        serve_incoming_bsd_flags_rooted(self.rooted.clone(), incoming, &self.sender, self.peer)
+            .await
     }
 }
 
@@ -716,7 +653,6 @@ impl ServerRemoteSession {
             rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-            operation: self.opened.operation,
         }
     }
 
@@ -725,7 +661,6 @@ impl ServerRemoteSession {
             rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-            operation: self.opened.operation,
         }
     }
 
@@ -734,7 +669,6 @@ impl ServerRemoteSession {
             rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
-            operation: self.opened.operation,
         }
     }
 
@@ -1123,15 +1057,19 @@ mod tests {
         let modified = Timestamp::new(1_600_000_020, 0).unwrap();
         session
             .apply_metadata(
-                &RelativePath::new("file").unwrap(),
-                EntryKind::File,
-                crate::endpoint::local_identity::metadata_identity(
-                    &std::fs::symlink_metadata(destination_root.path().join("file")).unwrap(),
+                metadata::observed_metadata(
+                    &RelativePath::new("file").unwrap(),
                     EntryKind::File,
+                    crate::endpoint::local_identity::metadata_identity(
+                        &std::fs::symlink_metadata(destination_root.path().join("file")).unwrap(),
+                        EntryKind::File,
+                    )
+                    .unwrap(),
+                    Some(0o640),
+                    Some(modified),
+                    &crate::rooted_fs::MetadataPreservation::default(),
                 )
                 .unwrap(),
-                Some(0o640),
-                Some(modified),
             )
             .await
             .unwrap();

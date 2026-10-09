@@ -1,22 +1,10 @@
-//! Bounded access-control read/write RPCs and the shared preservation step
-//! used by every v3 executor.
-//!
-//! `-A/--preserve-acls` is demand-driven: the scan never carries ACL bytes,
-//! and the executor reads the source's list only for entries it is already
-//! mutating (a create/update/replace or a metadata-only update). The wire
-//! request carries the whole exacl unified-entries text in one frame so
-//! mirror semantics (set the desired list, clear when empty) stay atomic per
-//! entry, and an oversized list is refused loudly rather than truncated.
-//!
-//! Source reads carry the scan identity and validate a held descriptor before
-//! and after reading. Writes are Push-only; a Pull root is read-only.
+//! Bounded observation-bound source ACL reads. Destination preservation
+//! belongs to the single observed metadata owner, never a path-only write.
 
-use crate::endpoint::local::LocalEndpoint;
-use crate::endpoint::Endpoint;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
-    AclMode, Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId, WireAcl,
-    WireAclRequest, WireAclResult, MAX_ACL_TEXT_BYTES,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireAcl, WireAclResult,
+    WireSourceMetadataRead, MAX_ACL_TEXT_BYTES,
 };
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
@@ -65,14 +53,8 @@ pub enum RemoteAclError {
     #[error("acl acknowledgement must be an empty unflagged frame")]
     InvalidAck,
 
-    #[error("acl write requests are refused in a {0:?} session: the remote root is source-only")]
-    WriteInSourceSession(Operation),
-
     #[error("source preservation requires a scanned identity for {0}")]
     MissingSourceIdentity(RelativePath),
-
-    #[error("local access-control access failed: {0}")]
-    Local(String),
 }
 
 impl From<SharedRouterError> for RemoteAclError {
@@ -83,9 +65,7 @@ impl From<SharedRouterError> for RemoteAclError {
 
 pub type Result<T> = std::result::Result<T, RemoteAclError>;
 
-/// Where one side of an ACL preservation step lives. Local roots are
-/// addressed through `LocalEndpoint`; a remote peer is addressed through the
-/// session's bounded request handle.
+/// Source-side rooted observation or bounded remote request handle.
 pub enum AclLocation<'a> {
     Local(&'a Path),
     Remote(&'a ClientRemoteHandle),
@@ -101,7 +81,7 @@ pub async fn request_read_acls(
     peer: PlatformOs,
 ) -> Result<Option<String>> {
     ensure_compatible_path_encoding(peer)?;
-    let request = WireAclRequest::read(
+    let request = WireSourceMetadataRead::new(
         encode_relative_path(path.as_path())?,
         wire_kind(kind),
         *expected.as_bytes(),
@@ -147,41 +127,11 @@ pub async fn request_read_acls(
     Ok(if text.is_empty() { None } else { Some(text) })
 }
 
-/// Replace the peer's access-control list for one entry with `acl` (an empty
-/// string clears the list). The acknowledgement is sent only after the mirror
-/// completes.
-pub async fn request_write_acls(
-    sender: &RouterSender,
-    path: &RelativePath,
-    kind: EntryKind,
-    acl: &str,
-    peer: PlatformOs,
-) -> Result<()> {
-    ensure_compatible_path_encoding(peer)?;
-    let request = WireAclRequest::write(
-        encode_relative_path(path.as_path())?,
-        wire_kind(kind),
-        WireAcl::new(acl.to_string())?,
-    )?;
-    let mut inbox = sender.open_stream()?;
-    let stream_id = inbox.stream_id();
-    sender
-        .send(Frame::new(
-            FrameKind::AclRequest,
-            FrameFlags::FINAL,
-            stream_id,
-            request.encode()?,
-        )?)
-        .await?;
-    receive_ack(&mut inbox, stream_id).await
-}
-
 pub async fn serve_incoming_acl_rooted(
     rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
-    operation: Operation,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     let IncomingStream { first, mut inbox } = incoming;
@@ -195,54 +145,26 @@ pub async fn serve_incoming_acl_rooted(
             actual: frame.kind(),
         });
     }
-    let request = WireAclRequest::decode(frame.payload())?;
+    let request = WireSourceMetadataRead::decode(frame.payload())?;
     let path = decode_relative_path(request.path().clone(), peer)?;
     let kind = domain_kind(request.kind());
-    let mode = request.mode();
-    let text = request
-        .acl()
-        .map(|acl| acl.text().to_string())
-        .unwrap_or_default();
+    let expected = EntryIdentity::from_bytes(request.identity());
     drop(first);
-
-    if mode == AclMode::Write && operation != Operation::Push {
-        return Err(RemoteAclError::WriteInSourceSession(operation));
-    }
-
-    match mode {
-        AclMode::Read => {
-            let expected = EntryIdentity::from_bytes(request.source_identity()?);
-            let acl = tokio::task::spawn_blocking(move || {
-                rooted.read_observed_acl_blocking(&path, kind, expected)
-            })
-            .await
-            .map_err(|error| RemoteAclError::Worker(error.to_string()))??;
-            let result = WireAclResult::new(WireAcl::new(acl.unwrap_or_default())?);
-            sender
-                .send(Frame::new(
-                    FrameKind::AclResult,
-                    FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
-                    stream_id,
-                    result.encode()?,
-                )?)
-                .await?;
-            receive_ack(&mut inbox, stream_id).await
-        }
-        AclMode::Write => {
-            tokio::task::spawn_blocking(move || rooted.write_acl_blocking(&path, kind, &text))
-                .await
-                .map_err(|error| RemoteAclError::Worker(error.to_string()))??;
-            sender
-                .send(Frame::new(
-                    FrameKind::Ack,
-                    FrameFlags::empty(),
-                    stream_id,
-                    Bytes::new(),
-                )?)
-                .await?;
-            Ok(())
-        }
-    }
+    let acl = tokio::task::spawn_blocking(move || {
+        rooted.read_observed_acl_blocking(&path, kind, expected)
+    })
+    .await
+    .map_err(|error| RemoteAclError::Worker(error.to_string()))??;
+    let result = WireAclResult::new(WireAcl::new(acl.unwrap_or_default())?);
+    sender
+        .send(Frame::new(
+            FrameKind::AclResult,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            result.encode()?,
+        )?)
+        .await?;
+    receive_ack(&mut inbox, stream_id).await
 }
 
 /// Read the requested entry's access-control list from the source side of one
@@ -283,31 +205,6 @@ pub async fn read_preserved_acls(
     };
     check_acl_text_bounded(acl.as_deref().unwrap_or(""))?;
     Ok(acl)
-}
-
-/// Mirror a previously read access-control list onto the destination side. An
-/// empty string clears the destination list (on Linux the mode-derived base
-/// entries are restored, matching `LocalEndpoint::write_acl` and the legacy
-/// executor's `unwrap_or_default`).
-pub async fn apply_preserved_acls(
-    location: &AclLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
-    acl: &str,
-) -> Result<()> {
-    check_acl_text_bounded(acl)?;
-    match location {
-        AclLocation::Local(root) => {
-            let root = root.to_path_buf();
-            LocalEndpoint::new(root)
-                .write_acl(path.as_path(), acl)
-                .await
-                .map_err(|error| RemoteAclError::Local(error.to_string()))
-        }
-        AclLocation::Remote(handle) => {
-            request_write_acls(&handle.sender(), path, kind, acl, handle.peer_platform()).await
-        }
-    }
 }
 
 fn check_acl_text_bounded(acl: &str) -> Result<()> {
@@ -394,14 +291,13 @@ mod tests {
         mut server: FrameRouter,
         rooted: RootedFs,
         peer: PlatformOs,
-        operation: Operation,
         requests: usize,
     ) -> tokio::task::JoinHandle<()> {
         let sender = server.sender();
         tokio::spawn(async move {
             for _ in 0..requests {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
-                serve_incoming_acl_rooted(rooted.clone(), incoming, &sender, peer, operation)
+                serve_incoming_acl_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
                     .unwrap();
             }
@@ -409,6 +305,7 @@ mod tests {
     }
 
     fn planted_text(file: &std::path::Path) -> String {
+        // SAFETY: getuid has no arguments or caller obligations.
         let uid = unsafe { libc::getuid() };
         let mut entries = exacl::getfacl(file, None).unwrap();
         entries.push(exacl::AclEntry::allow_user(
@@ -420,7 +317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acl_round_trip_reads_and_mirrors_write() {
+    async fn observed_acl_read_returns_native_access_list() {
         let root = tempfile::TempDir::new().unwrap();
         let file_path = root.path().join("file");
         std::fs::write(&file_path, b"data").unwrap();
@@ -443,13 +340,12 @@ mod tests {
         )
         .unwrap();
         let peer = crate::protocol::Platform::current().os;
-        let server_task = serve(server, rooted, peer, Operation::Push, 2);
+        let server_task = serve(server, rooted, peer, 1);
 
         let path = RelativePath::new("file").unwrap();
         let text = planted_text(&file_path);
-        request_write_acls(&client.sender(), &path, EntryKind::File, &text, peer)
-            .await
-            .unwrap();
+        let entries = exacl::from_str(&text).unwrap();
+        exacl::setfacl(&[&file_path], &entries, None).unwrap();
         let expected = crate::endpoint::local_identity::metadata_identity(
             &std::fs::metadata(&file_path).unwrap(),
             EntryKind::File,
@@ -467,72 +363,5 @@ mod tests {
             exacl::to_string(&exacl::getfacl(root.path().join("file"), None).unwrap()).unwrap();
         assert!(!via_path.is_empty());
         assert_eq!(read.as_deref(), Some(via_path.as_str()));
-    }
-
-    #[tokio::test]
-    async fn write_into_a_pull_session_is_refused() {
-        let root = tempfile::TempDir::new().unwrap();
-        std::fs::write(root.path().join("file"), b"data").unwrap();
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, server_writer) = tokio::io::split(server_io);
-        let client = FrameRouter::start(
-            client_reader,
-            client_writer,
-            RouterRole::Client,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let mut server = FrameRouter::start(
-            server_reader,
-            server_writer,
-            RouterRole::Server,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let sender = server.sender();
-        let peer = crate::protocol::Platform::current().os;
-        let server_task = tokio::spawn(async move {
-            let incoming = server.incoming().recv().await.unwrap().unwrap();
-            serve_incoming_acl_rooted(rooted, incoming, &sender, peer, Operation::Pull).await
-        });
-
-        let path = RelativePath::new("file").unwrap();
-        // Send a raw write request because the fallible server closes the
-        // stream without an acknowledgement, which the client surfaces as an
-        // unexpected end rather than a clean RPC result.
-        let request = WireAclRequest::write(
-            encode_relative_path(path.as_path()).unwrap(),
-            crate::protocol::WireEntryKind::File,
-            WireAcl::new(String::new()).unwrap(),
-        )
-        .unwrap();
-        let inbox = client.sender().open_stream().unwrap();
-        let stream_id = inbox.stream_id();
-        client
-            .sender()
-            .send(
-                Frame::new(
-                    FrameKind::AclRequest,
-                    FrameFlags::FINAL,
-                    stream_id,
-                    request.encode().unwrap(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let initial_acl = exacl::getfacl(root.path().join("file"), None).unwrap();
-        let error = server_task.await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            RemoteAclError::WriteInSourceSession(Operation::Pull)
-        ));
-        // The source file keeps whatever list it had (the write never ran).
-        assert_eq!(
-            exacl::getfacl(root.path().join("file"), None).unwrap(),
-            initial_acl
-        );
     }
 }

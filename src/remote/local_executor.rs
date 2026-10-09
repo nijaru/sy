@@ -572,7 +572,7 @@ impl LocalSyncExecutor {
                 let relative = destination_path.clone();
                 let kind = source.kind;
                 tokio::task::spawn_blocking(move || {
-                    rooted.apply_preserved_metadata_blocking(
+                    rooted.apply_observed_preservation_blocking(
                         &relative,
                         kind,
                         expected_destination,
