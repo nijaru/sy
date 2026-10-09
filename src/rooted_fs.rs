@@ -663,8 +663,9 @@ impl RootedNamespaceTransaction {
         let mut lineage = retirement
             .lock()
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-        let _permit = self.publish_blocking(
-            session_admission.as_deref().or(admission),
+        let _permits = self.publish_blocking(
+            session_admission.as_deref(),
+            admission,
             &mut lineage,
             validate_source,
         )?;
@@ -674,10 +675,11 @@ impl RootedNamespaceTransaction {
     #[cfg(unix)]
     fn publish_blocking<'a>(
         &mut self,
-        admission: Option<&'a PublicationAdmission>,
+        session_admission: Option<&'a PublicationAdmission>,
+        transaction_admission: Option<&'a PublicationAdmission>,
         lineage: &mut RetirementLineage,
         validate_source: impl FnOnce() -> Result<()>,
-    ) -> Result<Option<PublicationPermit<'a>>> {
+    ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
         self.verify_parent_binding()?;
         self.verify_expected_destination_with_lineage(lineage)?;
 
@@ -728,7 +730,7 @@ impl RootedNamespaceTransaction {
         // Check the hardlink's exact post-preparation source last, after all
         // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
-        let permit = admit_publication(admission)?;
+        let permits = admit_publication(session_admission, transaction_admission)?;
         #[cfg(test)]
         self.rooted
             .pause_mutation(PublicationPausePoint::AfterAdmission);
@@ -791,7 +793,7 @@ impl RootedNamespaceTransaction {
             // Never retain old inode descriptors across file work or tree lifetime.
             self.retired_destination = None;
         }
-        Ok(permit)
+        Ok(permits)
     }
 
     #[cfg(unix)]
@@ -906,16 +908,26 @@ impl RootedNamespaceTransaction {
 }
 
 #[cfg(unix)]
-fn admit_publication(
-    admission: Option<&PublicationAdmission>,
-) -> Result<Option<PublicationPermit<'_>>> {
-    admission
-        .map(PublicationAdmission::admit)
-        .transpose()
-        .map_err(|error| match error {
-            AdmissionError::Closed => RootedFsError::CommitCancelled,
-            AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
-        })
+fn admit_publication<'a>(
+    session: Option<&'a PublicationAdmission>,
+    transaction: Option<&'a PublicationAdmission>,
+) -> Result<[Option<PublicationPermit<'a>>; 2]> {
+    // Each distinct authority must admit before any native effect. These are
+    // separate atomic admissions, not a combined CAS: closure cannot revoke an
+    // acquired permit, and failure of the second releases the first. A writer's
+    // cancellation must not close the session or be masked by its open state.
+    let transaction = transaction
+        .filter(|transaction| !session.is_some_and(|session| std::ptr::eq(session, *transaction)));
+    let admit = |admission: Option<&'a PublicationAdmission>| {
+        admission
+            .map(PublicationAdmission::admit)
+            .transpose()
+            .map_err(|error| match error {
+                AdmissionError::Closed => RootedFsError::CommitCancelled,
+                AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
+            })
+    };
+    Ok([admit(session)?, admit(transaction)?])
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -979,26 +991,26 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn admit_mutation_blocking(&self) -> Result<Option<PublicationPermit<'_>>> {
-        self.admit_mutation_with_fallback_blocking(None)
+    fn admit_mutation_blocking(&self) -> Result<[Option<PublicationPermit<'_>>; 2]> {
+        self.admit_mutation_with_transaction_blocking(None)
     }
 
     #[cfg(unix)]
-    fn admit_mutation_with_fallback_blocking<'a>(
+    fn admit_mutation_with_transaction_blocking<'a>(
         &'a self,
-        fallback: Option<&'a PublicationAdmission>,
-    ) -> Result<Option<PublicationPermit<'a>>> {
+        transaction: Option<&'a PublicationAdmission>,
+    ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
         self.require_writable()?;
-        let admission = match &self.mutation_admission {
+        let session = match &self.mutation_admission {
             RootedMutationAdmission::Session(admission) => Some(admission.as_ref()),
-            _ => fallback,
+            _ => None,
         };
         #[cfg(test)]
         self.pause_mutation(PublicationPausePoint::BeforeAdmission);
-        let permit = admit_publication(admission)?;
+        let permits = admit_publication(session, transaction)?;
         #[cfg(test)]
         self.pause_mutation(PublicationPausePoint::AfterAdmission);
-        Ok(permit)
+        Ok(permits)
     }
 
     #[cfg(all(test, unix))]
@@ -4775,7 +4787,7 @@ mod tests {
                 open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
             let mut lineage = rooted.retirement.lock().unwrap();
             staged
-                .publish_blocking(None, &mut lineage, || Ok(()))
+                .publish_blocking(None, None, &mut lineage, || Ok(()))
                 .unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =

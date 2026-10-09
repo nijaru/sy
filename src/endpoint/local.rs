@@ -1553,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_queued_commit_preserves_destination() {
+    fn cancelling_root_bound_queued_commit_preserves_destination_and_session() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1565,10 +1565,14 @@ mod tests {
 
         runtime.block_on(async {
             let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-            let rooted = endpoint.rooted_fs(true).await.unwrap();
+            let session =
+                std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+            let mut rooted = (*endpoint.rooted_fs(true).await.unwrap()).clone();
+            rooted.bind_session_mutations(session, false);
+            let rooted = std::sync::Arc::new(rooted);
             let relative = sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap();
             let mut writer = LocalStagedWriter::new(
-                rooted,
+                std::sync::Arc::clone(&rooted),
                 relative,
                 ExpectedDestination::SnapshotAtOpen,
                 dir.path().to_path_buf(),
@@ -1608,6 +1612,29 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
+
+            // Cancellation belongs to this writer, not the shared session.
+            let mut independent = LocalStagedWriter::new(
+                rooted,
+                sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
+                ExpectedDestination::Absent,
+                dir.path().to_path_buf(),
+                dir.path().join("independent"),
+            )
+            .await
+            .unwrap();
+            independent.write(b"independent").await.unwrap();
+            Box::new(independent)
+                .commit()
+                .await
+                .unwrap()
+                .finalize(None)
+                .await
+                .unwrap();
+            assert_eq!(
+                fs::read(dir.path().join("independent")).unwrap(),
+                b"independent"
+            );
         });
     }
 
@@ -1648,8 +1675,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file"), b"old").unwrap();
         let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut rooted = (*endpoint.rooted_fs(true).await.unwrap()).clone();
+        rooted.bind_session_mutations(
+            std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
+            false,
+        );
+        let rooted = std::sync::Arc::new(rooted);
         let mut writer = LocalStagedWriter::new(
-            endpoint.rooted_fs(true).await.unwrap(),
+            std::sync::Arc::clone(&rooted),
             sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
             ExpectedDestination::SnapshotAtOpen,
             dir.path().to_path_buf(),
@@ -1693,6 +1726,28 @@ mod tests {
         assert!(still_private);
         assert!(completed.is_ok());
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"new");
+
+        let mut independent = LocalStagedWriter::new(
+            rooted,
+            sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
+            ExpectedDestination::Absent,
+            dir.path().to_path_buf(),
+            dir.path().join("independent"),
+        )
+        .await
+        .unwrap();
+        independent.write(b"independent").await.unwrap();
+        Box::new(independent)
+            .commit()
+            .await
+            .unwrap()
+            .finalize(None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("independent")).unwrap(),
+            b"independent"
+        );
     }
 
     #[tokio::test]
@@ -1781,19 +1836,39 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            for (point, expected_flags) in [
-                (PublicationPausePoint::BeforeAdmission, 0),
-                (PublicationPausePoint::AfterAdmission, libc::UF_NODUMP),
+            for (session_bound, point, expected_flags) in [
+                (false, PublicationPausePoint::BeforeAdmission, 0),
+                (
+                    false,
+                    PublicationPausePoint::AfterAdmission,
+                    libc::UF_NODUMP,
+                ),
+                (true, PublicationPausePoint::BeforeAdmission, 0),
+                (true, PublicationPausePoint::AfterAdmission, libc::UF_NODUMP),
             ] {
                 let dir = TempDir::new().unwrap();
                 let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
-                let mut writer = endpoint
-                    .begin_write(Path::new("file"), ExpectedDestination::Absent)
-                    .await
-                    .unwrap();
+                let mut rooted = (*endpoint.rooted_fs(true).await.unwrap()).clone();
+                if session_bound {
+                    rooted.bind_session_mutations(
+                        std::sync::Arc::new(
+                            crate::endpoint::publication::PublicationAdmission::default(),
+                        ),
+                        false,
+                    );
+                }
+                let rooted = std::sync::Arc::new(rooted);
+                let mut writer = LocalStagedWriter::new(
+                    std::sync::Arc::clone(&rooted),
+                    sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
+                    ExpectedDestination::Absent,
+                    dir.path().to_path_buf(),
+                    dir.path().join("file"),
+                )
+                .await
+                .unwrap();
                 writer.write(b"published").await.unwrap();
-                let pending = writer.commit().await.unwrap();
-                let rooted = endpoint.rooted_fs(false).await.unwrap();
+                let pending = Box::new(writer).commit().await.unwrap();
                 let (reached, paused) = tokio::sync::oneshot::channel();
                 let (resume, wait) = std::sync::mpsc::channel();
                 rooted.pause_mutation_at(
@@ -1827,6 +1902,34 @@ mod tests {
                     expected_flags
                 );
                 assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+                let mut independent = LocalStagedWriter::new(
+                    rooted,
+                    sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
+                    ExpectedDestination::Absent,
+                    dir.path().to_path_buf(),
+                    dir.path().join("independent"),
+                )
+                .await
+                .unwrap();
+                independent.write(b"independent").await.unwrap();
+                Box::new(independent)
+                    .commit()
+                    .await
+                    .unwrap()
+                    .finalize(Some(libc::UF_NODUMP))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs::read(dir.path().join("independent")).unwrap(),
+                    b"independent"
+                );
+                assert_eq!(
+                    fs::metadata(dir.path().join("independent"))
+                        .unwrap()
+                        .st_flags(),
+                    libc::UF_NODUMP
+                );
             }
         });
     }
@@ -1839,14 +1942,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let admission =
             std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default());
-        let endpoint = LocalEndpoint::new(dir.path().to_path_buf())
-            .with_publication_admission(std::sync::Arc::clone(&admission));
-        let mut writer = endpoint
-            .begin_write(Path::new("file"), ExpectedDestination::Absent)
-            .await
-            .unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut rooted = (*endpoint.rooted_fs(true).await.unwrap()).clone();
+        rooted.bind_session_mutations(std::sync::Arc::clone(&admission), false);
+        let mut writer = LocalStagedWriter::new(
+            std::sync::Arc::new(rooted),
+            sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
+            ExpectedDestination::Absent,
+            dir.path().to_path_buf(),
+            dir.path().join("file"),
+        )
+        .await
+        .unwrap();
         writer.write(b"published").await.unwrap();
-        let pending = writer.commit().await.unwrap();
+        let pending = Box::new(writer).commit().await.unwrap();
         admission.close();
 
         assert!(matches!(
