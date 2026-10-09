@@ -14,7 +14,10 @@ use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
-use sy::engine::controller::{preflight_sync_scoped, preview_sync, SyncController, SyncSummary};
+use sy::engine::controller::{
+    preflight_sync_scoped_with_content, preview_sync, ControllerError, SyncController, SyncSummary,
+};
+use sy::engine::reconcile::OrderedReconciler;
 use sy::engine::scan::ScanRequest;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
@@ -112,54 +115,6 @@ async fn execute_with_handle(
         config.perf,
     ));
     let scan_started = Instant::now();
-    // Source scan runs remotely (gitignore honored where the files live);
-    // destination scan is local and complete so reconciliation sees every
-    // destination entry.
-    let source = remote
-        .scan(source_scan_request(config, scan_options))
-        .await
-        .map_err(map_io)?;
-    reporter.start(source_root, destination_root);
-    // A first pull into a fresh directory is the common case; the local
-    // engine creates a missing destination root, and the pull must match.
-    // Dry-run never mutates, so it reports against the tree as-is.
-    if !destination_root.exists() && !config.dry_run {
-        std::fs::create_dir_all(destination_root).map_err(map_io)?;
-    }
-    let destination = sy::endpoint::local_entry_scan::local_entry_stream(
-        destination_root.to_path_buf(),
-        destination_scan_request(config),
-    );
-
-    // The remote source walk is no-follow under root confinement, so no
-    // follow selection exists; symlinks reconcile by target. Delete stays
-    // disabled on v3 pull until the server-side ignore-scope design lands.
-    let plan = preflight_sync_scoped(
-        source,
-        destination,
-        comparison_policy(
-            config,
-            crate::fs_util::namespace_semantics(destination_root),
-        ),
-        delete_policy(&config.delete),
-        |_entry| true,
-        |_entry| false,
-    )
-    .await
-    .map_err(map_controller_error)?;
-
-    if config.dry_run {
-        let diff_mode = config.diff_mode;
-        let preview = preview_sync(plan, |item| {
-            if diff_mode {
-                emit_diff_line(item);
-            }
-        })
-        .await
-        .map_err(map_controller_error)?;
-        return preview_stats(preview);
-    }
-
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
         SyncError::Config("parallel transfer count must be greater than zero".to_string())
     })?;
@@ -176,18 +131,117 @@ async fn execute_with_handle(
             sy::sync::ratelimit::RateLimiter::new(limit),
         ))
     });
-    let executor =
-        RemotePullExecutor::new(destination_root.to_path_buf(), remote, sender, scheduler)
-            .with_backup_enabled(config.backup.is_some())
-            .with_backup(pull_backup_dir(config, destination_root))
-            .with_backup_suffix(config.suffix.clone())
-            .with_reporter(Some(reporter.clone()))
-            .with_compression(compression_policy(config))
-            .with_hardlinks(config.preserve.hardlinks)
-            .with_xattrs(config.preserve.xattrs)
-            .with_acls(config.preserve.acls)
-            .with_bsd_flags(config.preserve.flags)
-            .with_rate_limiter(rate_limiter);
+    let executor = RemotePullExecutor::new(
+        destination_root.to_path_buf(),
+        remote.clone(),
+        sender,
+        scheduler,
+    )
+    .with_backup_enabled(config.backup.is_some())
+    .with_backup(pull_backup_dir(config, destination_root))
+    .with_backup_suffix(config.suffix.clone())
+    .with_reporter(Some(reporter.clone()))
+    .with_compression(compression_policy(config))
+    .with_hardlinks(config.preserve.hardlinks)
+    .with_xattrs(config.preserve.xattrs)
+    .with_acls(config.preserve.acls)
+    .with_bsd_flags(config.preserve.flags)
+    .with_rate_limiter(rate_limiter);
+    reporter.start(source_root, destination_root);
+    // Pin local destination authority before admitting the remote producer.
+    // Its complete scan never inherits source selection rules.
+    let mut destination = executor
+        .destination_entries(destination_scan_request(config), config.dry_run)
+        .await
+        .map_err(map_io)?;
+    let source = match remote.scan(source_scan_request(config, scan_options)).await {
+        Ok(source) => source,
+        Err(error) => {
+            let operation = ControllerError::backend("source scan preparation", error);
+            let error = match destination.close().await {
+                Ok(()) => operation,
+                Err(source) => ControllerError::PreflightDrain {
+                    operation: Box::new(operation),
+                    drain: sy::engine::reconcile::EngineError::Endpoint {
+                        side: sy::engine::reconcile::Side::Destination,
+                        source,
+                    },
+                },
+            };
+            return Err(map_controller_error(error));
+        }
+    };
+    let source = filtered_source_stream(source, config.filter_engine.clone());
+    let min_size = config.min_size;
+    let max_size = config.max_size;
+    let skip_symlinks = config.preserve.symlink_mode == SymlinkMode::Skip;
+
+    // The remote source walk is no-follow under root confinement, so no
+    // follow selection exists; symlinks reconcile by target. Delete stays
+    // disabled on v3 pull until the server-side ignore-scope design lands.
+    let plan = preflight_sync_scoped_with_content(
+        OrderedReconciler::new(source, destination),
+        comparison_policy(
+            config,
+            crate::fs_util::namespace_semantics(destination_root),
+        ),
+        delete_policy(&config.delete),
+        move |entry| {
+            entry_in_size_scope(entry, min_size, max_size)
+                && entry_selected_by_symlink_mode(entry, skip_symlinks)
+        },
+        |_entry| false,
+        |source, destination| {
+            let remote = remote.clone();
+            let executor = &executor;
+            async move {
+                // Sequential awaits retain ordinary-error ownership of native
+                // hashing work instead of canceling one side of a try_join.
+                let source_hash = remote.content_hash(&source).await.map_err(|error| {
+                    ControllerError::backend("source content comparison", error)
+                })?;
+                let destination_hash = executor
+                    .destination_content_hash(destination)
+                    .await
+                    .map_err(|error| {
+                        ControllerError::backend("destination content comparison", error)
+                    })?;
+                Ok(source_hash == destination_hash)
+            }
+        },
+    )
+    .await
+    .map_err(map_controller_error)?;
+
+    if config.dry_run {
+        let diff_mode = config.diff_mode;
+        let preview = preview_sync(plan, |item| {
+            if diff_mode {
+                emit_diff_line(item);
+            }
+        })
+        .await
+        .map_err(map_controller_error)?;
+        let mut stats = preview_stats(preview)?;
+        stats.duration = scan_started.elapsed();
+        reporter.finish(
+            &sy::sync::output::SummaryCounts {
+                files_created: stats.files_created,
+                files_updated: stats.files_updated,
+                files_skipped: stats.files_skipped,
+                files_deleted: stats.files_deleted,
+                bytes_transferred: stats.bytes_transferred,
+                duration_secs: stats.duration.as_secs_f64(),
+                files_verified: stats.files_verified as u64,
+                verification_failures: stats.verification_failures,
+            },
+            sy::sync::output::SyncTimings {
+                scan: stats.duration,
+                transfer: std::time::Duration::ZERO,
+            },
+        );
+        return Ok(stats);
+    }
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();

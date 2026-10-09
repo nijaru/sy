@@ -59,7 +59,10 @@ pub enum RemotePullError {
     LocalMutation(PathBuf, std::io::Error),
 
     #[error(transparent)]
-    DeleteBackup(#[from] crate::rooted_fs::RootedFsError),
+    Rooted(#[from] crate::rooted_fs::RootedFsError),
+
+    #[error(transparent)]
+    Existing(#[from] crate::endpoint::existing::ExistingDestinationError),
 
     #[error("regular-file pull requires Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
@@ -297,6 +300,64 @@ impl RemotePullExecutor {
             })
             .await
             .map_err(Into::into)
+    }
+
+    /// Observe and pin the destination before admitting the remote source scan.
+    /// An absent preview root is empty, never a writable substitute root.
+    pub async fn destination_entries(
+        &self,
+        request: crate::engine::scan::ScanRequest,
+        dry_run: bool,
+    ) -> Result<crate::engine::reconcile::EntryStream> {
+        #[cfg(unix)]
+        {
+            let root = self.destination_root.clone();
+            let admission = self.sender.publication_admission();
+            let absent = tokio::task::spawn_blocking(move || -> crate::rooted_fs::Result<bool> {
+                match std::fs::metadata(&root) {
+                    Ok(_) => Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && dry_run => {
+                        Ok(true)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let _permit = admission.admit().map_err(|error| match error {
+                            crate::endpoint::publication::AdmissionError::Closed => {
+                                crate::rooted_fs::RootedFsError::CommitCancelled
+                            }
+                            crate::endpoint::publication::AdmissionError::Exhausted => {
+                                crate::rooted_fs::RootedFsError::CommitAdmissionExhausted
+                            }
+                        })?;
+                        std::fs::create_dir_all(root)?;
+                        Ok(false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            if absent {
+                return Ok(crate::engine::reconcile::EntryStream::new(
+                    futures::stream::empty(),
+                ));
+            }
+            Ok(self.metadata_authority().await?.entry_stream(request))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (request, dry_run);
+            Err(crate::rooted_fs::RootedFsError::UnsupportedPlatform.into())
+        }
+    }
+
+    pub async fn destination_content_hash(&self, entry: Entry) -> Result<[u8; 32]> {
+        Ok(crate::endpoint::existing::fingerprint(
+            self.metadata_authority().await?.clone(),
+            entry,
+            Default::default(),
+        )
+        .await?
+        .content)
     }
 
     fn dest_path(&self, relative: &RelativePath) -> PathBuf {

@@ -11,16 +11,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn remote_roots_and_filenames_survive_cli_dispatch_in_both_directions() {
     let fixture = tempfile::TempDir::new().unwrap();
-    let bin = fixture.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let ssh = bin.join("ssh");
-    // Execute the real agent over process pipes, without requiring credentials
-    // or an SSH daemon. The shell never sees any endpoint filesystem path.
-    std::fs::write(&ssh, b"#!/bin/sh\nexec \"$SY_TEST_AGENT\" __serve\n").unwrap();
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut search_path = vec![bin];
-    search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let search_path = std::env::join_paths(search_path).unwrap();
+    let search_path = ssh_path(fixture.path());
     // APFS rejects non-UTF-8 names; Linux exercises the raw-byte contract.
     let name = if cfg!(target_os = "linux") {
         OsString::from_vec(b"file-\xff".to_vec())
@@ -101,7 +92,105 @@ async fn remote_roots_and_filenames_survive_cli_dispatch_in_both_directions() {
     }
 }
 
-async fn copy(source: &OsStr, destination: &OsStr, flags: &[&str], search_path: &OsStr) {
+#[tokio::test]
+async fn pull_selection_checksum_and_absent_preview_follow_shared_cli_policy() {
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    let source = fixture.path().join("source");
+    let destination = fixture.path().join("destination");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("keep.bin"), b"original").unwrap();
+    std::fs::write(source.join("small.bin"), b"x").unwrap();
+    std::fs::write(source.join("large.bin"), [b'x'; 17]).unwrap();
+    std::fs::write(source.join("excluded.tmp"), b"excluded").unwrap();
+    std::fs::create_dir(source.join("ignored")).unwrap();
+    std::fs::write(source.join("ignored/hidden.bin"), b"hidden").unwrap();
+    std::os::unix::fs::symlink("keep.bin", source.join("link.bin")).unwrap();
+    let mut source_arg = OsString::from("test-peer:");
+    source_arg.push(&source);
+    let flags = [
+        "--include=*.bin",
+        "--exclude=ignored/",
+        "--exclude=*.tmp",
+        "--min-size=4",
+        "--max-size=16",
+        "--links=skip",
+    ];
+
+    let mut preview_flags = flags.to_vec();
+    preview_flags.extend(["--dry-run", "--json"]);
+    let preview = copy(
+        &source_arg,
+        destination.as_os_str(),
+        &preview_flags,
+        &search_path,
+    )
+    .await;
+    let summary = std::str::from_utf8(&preview.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["type"] == "summary")
+        .expect("dry-run JSON summary missing");
+    assert_eq!(summary["files_created"], 1);
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(source.join("keep.bin")).unwrap(), b"original");
+
+    copy(&source_arg, destination.as_os_str(), &flags, &search_path).await;
+    assert_eq!(
+        std::fs::read(destination.join("keep.bin")).unwrap(),
+        b"original"
+    );
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+    // Same size AND timestamps: --checksum must compare content, not silently
+    // use quick equality or refuse an otherwise supported pull.
+    std::fs::write(source.join("keep.bin"), b"modified").unwrap();
+    let modified = std::fs::metadata(source.join("keep.bin"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::File::open(destination.join("keep.bin"))
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let mut checksum_flags = flags.to_vec();
+    checksum_flags.push("--checksum");
+    copy(
+        &source_arg,
+        destination.as_os_str(),
+        &checksum_flags,
+        &search_path,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(destination.join("keep.bin")).unwrap(),
+        b"modified"
+    );
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(source.join("ignored/hidden.bin")).unwrap(),
+        b"hidden"
+    );
+}
+
+fn ssh_path(root: &std::path::Path) -> OsString {
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    // Only transport is substituted; paths remain real protocol data.
+    std::fs::write(&ssh, b"#!/bin/sh\nexec \"$SY_TEST_AGENT\" __serve\n").unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut search_path = vec![bin];
+    search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    std::env::join_paths(search_path).unwrap()
+}
+
+async fn copy(
+    source: &OsStr,
+    destination: &OsStr,
+    flags: &[&str],
+    search_path: &OsStr,
+) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sy"));
     command
         .args([source, destination])
@@ -119,4 +208,5 @@ async fn copy(source: &OsStr, destination: &OsStr, flags: &[&str], search_path: 
         "remote copy failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output
 }

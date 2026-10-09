@@ -208,7 +208,7 @@ async fn pull_raced_destination_refuses_to_replace_existing_backup() {
         }
         assert!(matches!(
             pull.replace(None, "~").await,
-            Err(RemotePullError::DeleteBackup(_))
+            Err(RemotePullError::Rooted(_))
         ));
         assert_eq!(std::fs::read(&backup).unwrap(), b"previous backup");
         if symlink {
@@ -231,7 +231,7 @@ async fn pull_backup_publication_failure_aborts_replacement() {
     std::fs::write(backup.join("child"), b"existing backup child").unwrap();
     assert!(matches!(
         pull.replace(None, "~").await,
-        Err(RemotePullError::DeleteBackup(_))
+        Err(RemotePullError::Rooted(_))
     ));
     pull.assert_original_intact().await;
     assert_eq!(
