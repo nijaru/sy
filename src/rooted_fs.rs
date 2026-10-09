@@ -1167,28 +1167,6 @@ impl RootedFs {
         Ok(scanned)
     }
 
-    /// Bind an exact current held-inode identity back to its original scan
-    /// observation, if and only if this root owns its full retirement lineage.
-    #[cfg(unix)]
-    pub(crate) fn original_destination_observation_blocking(
-        &self,
-        current: EntryIdentity,
-    ) -> Result<EntryIdentity> {
-        Ok(self
-            .retirement
-            .lock()
-            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?
-            .original_observation(current)?)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn original_destination_observation_blocking(
-        &self,
-        current: EntryIdentity,
-    ) -> Result<EntryIdentity> {
-        Ok(current)
-    }
-
     /// Open one regular file relative to the pinned root without following any
     /// peer-controlled symlink component.
     ///

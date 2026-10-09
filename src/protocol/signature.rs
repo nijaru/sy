@@ -54,12 +54,15 @@ impl TryFrom<usize> for SignatureBlockSize {
 pub struct WireSignatureRequest {
     pub path: RelativeWirePath,
     pub block_size: SignatureBlockSize,
+    pub expected_identity: [u8; BASIS_IDENTITY_LEN],
 }
 
 impl WireSignatureRequest {
     pub fn encode(&self) -> Bytes {
-        let mut out = BytesMut::with_capacity(4 + self.path.as_encoded().len());
+        let mut out =
+            BytesMut::with_capacity(4 + BASIS_IDENTITY_LEN + self.path.as_encoded().len());
         out.put_u32(self.block_size.get());
+        out.extend_from_slice(&self.expected_identity);
         out.extend_from_slice(self.path.as_encoded());
         out.freeze()
     }
@@ -67,9 +70,14 @@ impl WireSignatureRequest {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let block_size = SignatureBlockSize::new(reader.u32()?)?;
+        let expected_identity = reader.array()?;
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take_remaining()?))?;
         reader.finish()?;
-        Ok(Self { path, block_size })
+        Ok(Self {
+            path,
+            block_size,
+            expected_identity,
+        })
     }
 }
 
@@ -207,7 +215,11 @@ mod tests {
         let request = WireSignatureRequest {
             path: path(),
             block_size: SignatureBlockSize::new(64 * 1024).unwrap(),
+            expected_identity: [0x5a; BASIS_IDENTITY_LEN],
         };
+        for length in 0..4 + BASIS_IDENTITY_LEN {
+            assert!(WireSignatureRequest::decode(&request.encode()[..length]).is_err());
+        }
         assert_eq!(
             WireSignatureRequest::decode(&request.encode()).unwrap(),
             request
@@ -218,8 +230,9 @@ mod tests {
     fn signature_request_rejects_invalid_block_sizes() {
         let encoded_path = path().into_encoded();
         for block_size in [0_u32, 1024, 6000, 2 * 1024 * 1024] {
-            let mut payload = BytesMut::with_capacity(4 + encoded_path.len());
+            let mut payload = BytesMut::with_capacity(4 + BASIS_IDENTITY_LEN + encoded_path.len());
             payload.put_u32(block_size);
+            payload.extend_from_slice(&[0x5a; BASIS_IDENTITY_LEN]);
             payload.extend_from_slice(&encoded_path);
             assert!(WireSignatureRequest::decode(&payload).is_err());
         }

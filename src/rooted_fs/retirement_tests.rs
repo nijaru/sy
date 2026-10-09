@@ -44,9 +44,9 @@ fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits()
         let current = identity_from_stat(&stat_fd(held_old.as_raw_fd()).unwrap()).unwrap();
         assert_eq!(
             rooted
-                .original_destination_observation_blocking(current)
+                .retired_destination_identity_blocking(scanned)
                 .unwrap(),
-            scanned
+            current
         );
         if foreign_edit {
             // Xattrs leave all quick-check properties intact. This unrelated
@@ -58,12 +58,6 @@ fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits()
             let foreign = identity_from_stat(&stat_fd(held_old.as_raw_fd()).unwrap()).unwrap();
             assert_ne!(
                 rooted.retirement.lock().unwrap().resolve(scanned).unwrap(),
-                foreign
-            );
-            assert_eq!(
-                rooted
-                    .original_destination_observation_blocking(foreign)
-                    .unwrap(),
                 foreign
             );
             assert!(matches!(
@@ -119,10 +113,5 @@ fn retirement_index_keeps_exact_ancestry_across_distinct_inode_chains() {
             lineage.resolve(identity(group, 3)).unwrap(),
             identity(group, 3)
         );
-        assert_eq!(
-            lineage.original_observation(identity(group, 2)).unwrap(),
-            identity(group, 0)
-        );
-        assert!(lineage.original_observation(identity(group, 1)).is_err());
     }
 }

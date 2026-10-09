@@ -36,8 +36,8 @@ pub struct BlockSignature {
 pub struct SignatureSummary {
     pub file_size: u64,
     pub block_count: u64,
-    /// Original observation backed by the held basis and exact session-owned
-    /// retirements, not a client-guessed or arbitrarily refreshed identity.
+    /// Requested observation, validated against the held basis through exact
+    /// session-owned retirements; not necessarily its current physical token.
     pub basis_identity: EntryIdentity,
 }
 
@@ -188,6 +188,7 @@ pub async fn request_signatures(
     let request = WireSignatureRequest {
         path: encode_relative_path(path.as_path())?,
         block_size: block_size_wire,
+        expected_identity: *expected_identity.as_bytes(),
     };
     sender
         .send(Frame::new(
@@ -226,11 +227,12 @@ pub async fn serve_incoming_signatures_rooted(
     let request = decode_signature_request(first_frame)?;
     let relative = decode_relative_path(request.path, peer)?;
     let block_size = request.block_size;
+    let expected_identity = EntryIdentity::from_bytes(request.expected_identity);
     drop(first);
 
     let (producer_tx, producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
-        produce_signatures(rooted, relative, block_size, producer_tx)
+        produce_signatures(rooted, relative, block_size, expected_identity, producer_tx)
     });
 
     let summary = send_produced_signatures(sender, stream_id, producer_rx, producer).await?;
@@ -300,6 +302,7 @@ fn produce_signatures(
     rooted: RootedFs,
     relative: RelativePath,
     block_size: SignatureBlockSize,
+    expected_identity: EntryIdentity,
     sender: mpsc::Sender<WireSignature>,
 ) -> std::result::Result<SignatureSummary, SignatureProducerError> {
     let mut file = rooted.open_regular_blocking(&relative)?;
@@ -307,7 +310,11 @@ fn produce_signatures(
     let initial_identity =
         crate::endpoint::local_identity::metadata_identity(&initial, EntryKind::File)
             .ok_or(SignatureProducerError::MissingBasisIdentity)?;
-    let basis_identity = rooted.original_destination_observation_blocking(initial_identity)?;
+    if rooted.retired_destination_identity_blocking(expected_identity)? != initial_identity
+        || rooted.path_identity_blocking(&relative)? != Some((EntryKind::File, initial_identity))
+    {
+        return Err(RootedFsError::DestinationChanged(relative.as_path().to_path_buf()).into());
+    }
     let block_size = block_size.get() as usize;
     let mut buffer = vec![0_u8; block_size];
     let mut file_size = 0_u64;
@@ -359,7 +366,8 @@ fn produce_signatures(
     let final_identity =
         crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
             .ok_or(SignatureProducerError::MissingBasisIdentity)?;
-    if rooted.retired_destination_identity_blocking(initial_identity)? != final_identity
+    if rooted.retired_destination_identity_blocking(expected_identity)? != final_identity
+        || rooted.path_identity_blocking(&relative)? != Some((EntryKind::File, final_identity))
         || initial.len() != file_size
         || metadata.len() != file_size
     {
@@ -369,7 +377,7 @@ fn produce_signatures(
     Ok(SignatureSummary {
         file_size,
         block_count,
-        basis_identity,
+        basis_identity: expected_identity,
     })
 }
 
@@ -762,74 +770,72 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let expected_identity = file_identity(&path);
         std::fs::write(&path, b"modified").unwrap();
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
-        let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
-
-        let server = tokio::spawn(async move {
-            let opened = server_handshake(&mut server_reader, &mut server_writer)
-                .await
-                .unwrap();
-            let mut router = FrameRouter::start(
-                server_reader,
-                server_writer,
-                RouterRole::Server,
-                RouterConfig::default(),
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let relative = RelativePath::new("data.bin").unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let error = tokio::task::spawn_blocking(move || {
+            produce_signatures(
+                rooted,
+                relative,
+                SignatureBlockSize::new(4096).unwrap(),
+                expected_identity,
+                sender,
             )
-            .unwrap();
-            let incoming = router.incoming().recv().await.unwrap().unwrap();
-            let sender = router.sender();
-            serve_incoming_signatures(&opened.root, incoming, &sender, opened.client.platform.os)
-                .await
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SignatureProducerError::RootedFs(RootedFsError::DestinationChanged(_))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"modified");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signatures_bind_the_requested_owned_observation_after_retirement() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a"), b"old bytes").unwrap();
+        std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+        let scanned = file_identity(&root.path().join("b"));
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut staged = rooted
+                .begin_staged_file_with_expectation_blocking(
+                    &RelativePath::new("a").unwrap(),
+                    crate::endpoint::ExpectedDestination::Unchanged(scanned),
+                )
                 .unwrap();
-        });
-
-        let session = client_handshake(
-            &mut client_reader,
-            &mut client_writer,
-            Operation::Push,
-            root.path(),
-        )
-        .await
-        .unwrap();
-        let router = FrameRouter::start(
-            client_reader,
-            client_writer,
-            RouterRole::Client,
-            RouterConfig::default(),
-        )
-        .unwrap();
-        let sender = router.sender();
-        let relative = RelativePath::new(PathBuf::from("data.bin")).unwrap();
-        let (_, mut signatures) = request_signatures(
-            &sender,
-            &relative,
-            8,
-            expected_identity,
-            session.server.platform.os,
-        )
-        .await
-        .unwrap();
-
-        let mut changed = false;
-        while let Some(event) = signatures.next().await {
-            match event {
-                Ok(_) => {}
-                Err(error) => {
-                    changed = matches!(
-                        error.downcast_ref::<RemoteSignatureError>(),
-                        Some(RemoteSignatureError::BasisChanged {
-                            expected_size: 8,
-                            actual_size: 8,
-                        })
-                    );
-                    break;
-                }
+            staged.file_mut().write_all(b"new bytes").unwrap();
+            staged.commit().unwrap().finalize_blocking(None).unwrap();
+            let current = file_identity(&root.path().join("b"));
+            assert_ne!(scanned, current);
+            // A rescan in the same session requests CURRENT, not the canonical
+            // ancestor. Both explicit observations bind to the same OLD bytes.
+            for requested in [scanned, current] {
+                let (sender, mut receiver) = mpsc::channel(1);
+                let summary = produce_signatures(
+                    rooted.clone(),
+                    RelativePath::new("b").unwrap(),
+                    SignatureBlockSize::new(4096).unwrap(),
+                    requested,
+                    sender,
+                )
+                .unwrap();
+                assert_eq!(summary.basis_identity, requested);
+                assert_eq!(summary.file_size, 9);
+                assert_eq!(summary.block_count, 1);
+                let block = receiver.blocking_recv().unwrap();
+                assert_eq!(
+                    block.strong(),
+                    blake3::hash(b"old bytes").as_bytes()[..STRONG_SIGNATURE_LEN]
+                );
             }
-        }
-        server.await.unwrap();
-        assert!(changed);
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -845,7 +851,13 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
 
         let error = tokio::task::spawn_blocking(move || {
-            produce_signatures(rooted, relative, block_size, sender)
+            produce_signatures(
+                rooted,
+                relative,
+                block_size,
+                EntryIdentity::from_bytes([0; 32]),
+                sender,
+            )
         })
         .await
         .unwrap()
