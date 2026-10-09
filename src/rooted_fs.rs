@@ -665,15 +665,24 @@ impl RootedNamespaceTransaction {
     }
 
     fn commit(self) -> Result<()> {
-        self.commit_prepared(None)
+        self.commit_prepared(None, || Ok(()))
     }
 
     fn commit_with_admission(self, admission: &PublicationAdmission) -> Result<()> {
-        self.commit_prepared(Some(admission))
+        self.commit_prepared(Some(admission), || Ok(()))
     }
 
-    fn commit_prepared(mut self, admission: Option<&PublicationAdmission>) -> Result<()> {
-        match self.commit_blocking(admission) {
+    #[cfg(unix)]
+    fn commit_checked(self, validate_source: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.commit_prepared(None, validate_source)
+    }
+
+    fn commit_prepared(
+        mut self,
+        admission: Option<&PublicationAdmission>,
+        validate_source: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        match self.commit_blocking(admission, validate_source) {
             Err(operation) if !self.committed => Err(self.abort_after(operation)),
             result => result,
         }
@@ -722,7 +731,11 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(unix)]
-    fn commit_blocking(&mut self, admission: Option<&PublicationAdmission>) -> Result<()> {
+    fn commit_blocking(
+        &mut self,
+        admission: Option<&PublicationAdmission>,
+        validate_source: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.rooted.require_writable()?;
         // Own the session reference outside `self`: the permit covers cleanup
         // too, without borrowing the transaction that native publication mutates.
@@ -730,7 +743,8 @@ impl RootedNamespaceTransaction {
             RootedMutationAdmission::Session(admission) => Some(Arc::clone(admission)),
             _ => None,
         };
-        let _permit = self.publish_blocking(session_admission.as_deref().or(admission))?;
+        let _permit =
+            self.publish_blocking(session_admission.as_deref().or(admission), validate_source)?;
         self.finish_commit_blocking()
     }
 
@@ -738,6 +752,7 @@ impl RootedNamespaceTransaction {
     fn publish_blocking<'a>(
         &mut self,
         admission: Option<&'a PublicationAdmission>,
+        validate_source: impl FnOnce() -> Result<()>,
     ) -> Result<Option<PublicationPermit<'a>>> {
         self.verify_parent_binding()?;
         self.verify_expected_destination()?;
@@ -775,6 +790,10 @@ impl RootedNamespaceTransaction {
         #[cfg(test)]
         self.rooted
             .pause_mutation(PublicationPausePoint::BeforeAdmission);
+        // Revalidate an owned hardlink's exact post-preparation observation at
+        // the same late publication boundary. Its ctime cannot be refreshed
+        // from arbitrary changes that happened while namespace checks ran.
+        validate_source()?;
         let permit = admit_publication(admission)?;
         #[cfg(test)]
         self.rooted
@@ -858,7 +877,11 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(not(unix))]
-    fn commit_blocking(&mut self, _admission: Option<&PublicationAdmission>) -> Result<()> {
+    fn commit_blocking(
+        &mut self,
+        _admission: Option<&PublicationAdmission>,
+        _validate_source: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1851,7 +1874,7 @@ impl RootedFs {
                 return Ok(proof);
             }
         }
-        let prepare = || -> Result<()> {
+        let prepare = || -> Result<EntryIdentity> {
             self.verify_parent_binding_blocking(source, &source_parent)?;
             let held = stat_fd(source_file.as_raw_fd())?;
             let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?
@@ -1879,19 +1902,33 @@ impl RootedFs {
             if staged.st_dev != held.st_dev || staged.st_ino != held.st_ino {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
-            let after = hardlink_state_from_stat(&stat_fd(source_file.as_raw_fd())?, source)?;
+            let prepared = stat_fd(source_file.as_raw_fd())?;
+            let after = hardlink_state_from_stat(&prepared, source)?;
+            let prepared_identity = identity_from_stat(&prepared)
+                .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
             if !after_own_link(before, after)
-                || identity_from_stat(&staged)
-                    != identity_from_stat(&stat_fd(source_file.as_raw_fd())?)
+                || identity_from_stat(&staged) != Some(prepared_identity)
             {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
-            self.verify_parent_binding_blocking(source, &source_parent)
+            self.verify_parent_binding_blocking(source, &source_parent)?;
+            Ok(prepared_identity)
         };
-        if let Err(error) = prepare() {
-            return Err(namespace.abort_after(error));
-        }
-        namespace.commit()?;
+        let prepared_identity = match prepare() {
+            Ok(identity) => identity,
+            Err(error) => return Err(namespace.abort_after(error)),
+        };
+        namespace.commit_checked(|| {
+            self.verify_parent_binding_blocking(source, &source_parent)?;
+            let held = stat_fd(source_file.as_raw_fd())?;
+            let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?;
+            if identity_from_stat(&held) != Some(prepared_identity)
+                || named.as_ref().and_then(identity_from_stat) != Some(prepared_identity)
+            {
+                return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+            }
+            Ok(())
+        })?;
         let final_stat = stat_fd(source_file.as_raw_fd())?;
         let after = hardlink_state_from_stat(&final_stat, source)?;
         if !after_own_link(before, after) {
@@ -3840,6 +3877,57 @@ mod tests {
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardlink_publication_rejects_foreign_metadata_after_private_preparation() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let representative = root.path().join("a");
+        std::fs::write(&representative, b"owned bytes").unwrap();
+        xattr::set(&representative, "user.sy-owned", b"good").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let expected = rooted
+            .path_identity_blocking(&relative("a"))
+            .unwrap()
+            .unwrap()
+            .1;
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        // Skip private linkat admission; pause actual namespace publication.
+        rooted.pause_mutation_at(
+            1,
+            PublicationPause {
+                point: PublicationPausePoint::BeforeAdmission,
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            rooted.publish_hardlink_blocking(
+                &relative("a"),
+                &relative("b"),
+                expected,
+                ExpectedDestination::Absent,
+            )
+        });
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
+        let mutation = xattr::set(&representative, "user.sy-owned", b"bad");
+        // Release and join before assertions, including a failed fixture edit.
+        let _ = resume_tx.send(());
+        let result = worker.await.unwrap();
+        reached.unwrap().unwrap();
+        mutation.unwrap();
+        assert!(matches!(result, Err(RootedFsError::DestinationChanged(_))));
+        assert!(!root.path().join("b").exists());
+        assert_eq!(std::fs::metadata(&representative).unwrap().nlink(), 1);
+        assert_eq!(std::fs::read(&representative).unwrap(), b"owned bytes");
+        assert_eq!(
+            xattr::get(&representative, "user.sy-owned").unwrap(),
+            Some(b"bad".to_vec())
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
     #[tokio::test]
     async fn finalized_publication_uses_the_original_inode_and_rejects_foreign_replacement() {
         use std::io::Write;
@@ -4599,7 +4687,7 @@ mod tests {
             let old = private.join(&staged.temp_name);
             let held_directory =
                 open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
-            staged.publish_blocking(None).unwrap();
+            staged.publish_blocking(None, || Ok(())).unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =
                 create_staging_file_at(held_directory.as_raw_fd(), OsStr::new("child")).unwrap();
