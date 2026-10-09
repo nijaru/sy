@@ -94,6 +94,20 @@ pub fn local_entry_stream(root: PathBuf, request: ScanRequest) -> EntryStream {
     })
 }
 
+/// Observe only one physical endpoint name, with the same owned producer and
+/// ignore semantics as a tree scan. Missing source observations remain errors.
+pub fn selected_leaf_stream(
+    root: PathBuf,
+    path: RelativePath,
+    request: ScanRequest,
+    missing_allowed: bool,
+) -> EntryStream {
+    EntryStream::spawn_blocking(1, move |sender| {
+        traversal::selected_leaf(&root, &path, request, missing_allowed, &sender)
+            .map_err(|error| Box::new(error) as BoxError)
+    })
+}
+
 fn scan_worker(
     root: PathBuf,
     request: ScanRequest,

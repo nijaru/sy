@@ -59,6 +59,8 @@ pub enum RemotePushAction {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushLowerError {
+    #[error("selected-leaf destination binding is not supported over SSH")]
+    DestinationAddressUnsupported,
     #[error("regular-file commit requires Unix mode metadata for {0}")]
     MissingFileMode(PathBuf),
 
@@ -123,8 +125,11 @@ pub fn lower_sync_op(
     op: SyncOp,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
+    if op.path() != &op.source().path {
+        return Err(RemotePushLowerError::DestinationAddressUnsupported);
+    }
     match op {
-        SyncOp::Create { source } => lower_create(source, policy),
+        SyncOp::Create { source, .. } => lower_create(source, policy),
         SyncOp::Update {
             source,
             destination,
@@ -277,7 +282,10 @@ fn requested_metadata(
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
+    let unix_mode = if policy.preserve_permissions
+        && !source.is_symlink()
+        && destination.unix_mode != source.unix_mode
+    {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
         })?)
@@ -410,6 +418,9 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<RemotePushAction>>, RemotePushError> {
+        if op.path() != &op.source().path {
+            return Err(RemotePushLowerError::DestinationAddressUnsupported.into());
+        }
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
             destination,
@@ -1256,6 +1267,7 @@ mod tests {
         let source = file("file", 1, 0o640);
         let lowered = lower_sync_op(
             SyncOp::Create {
+                destination_path: source.clone().path.clone(),
                 source: source.clone(),
             },
             ExecutionPolicy::default(),
@@ -1314,7 +1326,10 @@ mod tests {
         let mut source = directory("dir", 0o750);
         source.modified = Timestamp::new(42, 0).unwrap();
         let lowered = lower_sync_op(
-            SyncOp::Create { source },
+            SyncOp::Create {
+                destination_path: source.path.clone(),
+                source,
+            },
             ExecutionPolicy {
                 preserve_permissions: true,
                 preserve_times: true,
@@ -1366,7 +1381,14 @@ mod tests {
     #[test]
     fn file_resource_reservation_is_bounded_independent_of_file_size() {
         let source = file("huge", 80 * 1024 * 1024 * 1024, 0o644);
-        let lowered = lower_sync_op(SyncOp::Create { source }, ExecutionPolicy::default()).unwrap();
+        let lowered = lower_sync_op(
+            SyncOp::Create {
+                destination_path: source.path.clone(),
+                source,
+            },
+            ExecutionPolicy::default(),
+        )
+        .unwrap();
         let resources = lowered.unwrap().resources();
         assert_eq!(resources.active_files, 1);
         assert_eq!(resources.buffered_bytes, REMOTE_FILE_WORKING_SET);
@@ -1410,6 +1432,7 @@ mod tests {
         ] {
             let op = match &destination {
                 None => SyncOp::Create {
+                    destination_path: source.clone().path.clone(),
                     source: source.clone(),
                 },
                 Some(destination) if destination.is_symlink() => SyncOp::Update {

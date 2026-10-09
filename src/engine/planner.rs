@@ -49,6 +49,7 @@ pub enum PlanDecision {
 pub fn plan_entry(
     source: Entry,
     destination: Option<Entry>,
+    destination_path: super::domain::RelativePath,
     policy: ComparisonPolicy,
 ) -> PlanDecision {
     let Some(destination) = destination else {
@@ -58,7 +59,10 @@ pub fn plan_entry(
                 reason: SkipReason::MissingDestination,
             }
         } else {
-            SyncOp::Create { source }
+            SyncOp::Create {
+                source,
+                destination_path,
+            }
         });
     };
 
@@ -186,8 +190,11 @@ fn metadata_or_skip(
     policy: ComparisonPolicy,
     comparison: ContentComparison,
 ) -> SyncOp {
-    let permission_change =
-        policy.preserve_permissions && source.unix_mode != destination.unix_mode;
+    // Symlink modes differ between Unix platforms and are not portable mutable
+    // metadata. Permission preservation applies to regular files/directories.
+    let permission_change = policy.preserve_permissions
+        && !source.is_symlink()
+        && source.unix_mode != destination.unix_mode;
     let time_change = policy.preserve_times && source.modified != destination.modified;
 
     if permission_change || time_change {
@@ -221,7 +228,12 @@ mod tests {
     #[test]
     fn missing_destination_creates_without_extra_io() {
         assert!(matches!(
-            plan_entry(file("a", 3, 1), None, ComparisonPolicy::default()),
+            plan_entry(
+                file("a", 3, 1),
+                None,
+                RelativePath::new("a").unwrap(),
+                ComparisonPolicy::default()
+            ),
             PlanDecision::Ready(SyncOp::Create { .. })
         ));
     }
@@ -234,14 +246,24 @@ mod tests {
             ..ComparisonPolicy::default()
         };
         assert!(matches!(
-            plan_entry(file("missing", 8, 1), None, policy),
+            plan_entry(
+                file("missing", 8, 1),
+                None,
+                RelativePath::new("missing").unwrap(),
+                policy
+            ),
             PlanDecision::Ready(SyncOp::Skip {
                 reason: SkipReason::MissingDestination,
                 ..
             })
         ));
         assert!(matches!(
-            plan_entry(file("a", 8, 1), Some(file("a", 9, 2)), policy),
+            plan_entry(
+                file("a", 8, 1),
+                Some(file("a", 9, 2)),
+                RelativePath::new("a").unwrap(),
+                policy
+            ),
             PlanDecision::Ready(SyncOp::Update { .. })
         ));
     }
@@ -255,7 +277,12 @@ mod tests {
         );
         let destination = file("entry", 6, 1);
         assert!(matches!(
-            plan_entry(source, Some(destination), ComparisonPolicy::default()),
+            plan_entry(
+                source,
+                Some(destination),
+                RelativePath::new("entry").unwrap(),
+                ComparisonPolicy::default()
+            ),
             PlanDecision::Ready(SyncOp::Replace { .. })
         ));
     }
@@ -267,11 +294,21 @@ mod tests {
             ..ComparisonPolicy::default()
         };
         assert!(matches!(
-            plan_entry(file("a", 8, 1), Some(file("a", 8, 2)), policy),
+            plan_entry(
+                file("a", 8, 1),
+                Some(file("a", 8, 2)),
+                RelativePath::new("a").unwrap(),
+                policy
+            ),
             PlanDecision::NeedContentComparison { .. }
         ));
         assert!(matches!(
-            plan_entry(file("a", 8, 1), Some(file("a", 9, 2)), policy),
+            plan_entry(
+                file("a", 8, 1),
+                Some(file("a", 9, 2)),
+                RelativePath::new("a").unwrap(),
+                policy
+            ),
             PlanDecision::Ready(SyncOp::Update { .. })
         ));
     }
@@ -302,7 +339,12 @@ mod tests {
             ..ComparisonPolicy::default()
         };
         assert!(matches!(
-            plan_entry(file("a", 8, 1), Some(file("a", 9, 2)), policy),
+            plan_entry(
+                file("a", 8, 1),
+                Some(file("a", 9, 2)),
+                RelativePath::new("a").unwrap(),
+                policy
+            ),
             PlanDecision::Ready(SyncOp::Skip {
                 reason: SkipReason::DestinationNewer,
                 ..

@@ -111,6 +111,12 @@ pub struct PlanJournalReader {
 }
 
 impl PlanJournalReader {
+    pub(crate) async fn rewind(&mut self, records: usize) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0)).await?;
+        self.remaining = records;
+        Ok(())
+    }
+
     pub async fn next(&mut self) -> Result<Option<SyncOp>> {
         if self.remaining == 0 {
             self.reject_trailing_data().await?;
@@ -157,9 +163,13 @@ impl PlanJournalReader {
 fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     match operation {
-        SyncOp::Create { source } => {
+        SyncOp::Create {
+            source,
+            destination_path,
+        } => {
             payload.push(0);
             encode_entry(&mut payload, source)?;
+            encode_relative_path(&mut payload, destination_path)?;
         }
         SyncOp::Update {
             source,
@@ -217,6 +227,7 @@ fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
     let operation = match reader.u8()? {
         0 => SyncOp::Create {
             source: decode_entry(&mut reader)?,
+            destination_path: decode_relative_path(&mut reader)?,
         },
         1 => SyncOp::Update {
             source: decode_entry(&mut reader)?,
@@ -478,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_operations_round_trip_in_forward_order() {
         let source = file("dir/file", 12, 1);
-        let destination = file("dir/file", 8, 2);
+        let destination = file("renamed/file", 8, 2);
         let mut link = Entry::symlink(
             path("link"),
             PathBuf::from("../target"),
@@ -490,6 +501,7 @@ mod tests {
         let operations = vec![
             SyncOp::Create {
                 source: source.clone(),
+                destination_path: path("renamed/file"),
             },
             SyncOp::Update {
                 source: source.clone(),
@@ -560,7 +572,10 @@ mod tests {
         entry.identity = Some(EntryIdentity::from_bytes([4; 32]));
         let mut journal = PlanJournal::new().await.unwrap();
         let error = journal
-            .append(&SyncOp::Create { source: entry })
+            .append(&SyncOp::Create {
+                source: entry,
+                destination_path: path("link"),
+            })
             .await
             .unwrap_err();
         assert!(matches!(error, PlanJournalError::RecordTooLarge { .. }));

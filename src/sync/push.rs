@@ -118,8 +118,7 @@ async fn execute_with_handle(
             .map_err(map_io)?;
         let hash_remote = remote.clone();
         preflight_sync_scoped_with_content(
-            source,
-            destination,
+            sy::engine::reconcile::OrderedReconciler::new(source, destination),
             comparison_policy(config, namespace_semantics),
             delete_policy(&config.delete),
             move |entry| {

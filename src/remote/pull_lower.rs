@@ -16,8 +16,11 @@ pub fn lower_pull_op(
     op: SyncOp,
     policy: ExecutionPolicy,
 ) -> Result<Option<WorkItem<RemotePullAction>>> {
+    if op.path() != &op.source().path {
+        return Err(RemotePullError::DestinationAddressUnsupported);
+    }
     match op {
-        SyncOp::Create { source } => lower_create(source, policy),
+        SyncOp::Create { source, .. } => lower_create(source, policy),
         SyncOp::Update {
             source,
             destination,
@@ -159,7 +162,10 @@ fn requested_metadata(
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> Result<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions && destination.unix_mode != source.unix_mode {
+    let unix_mode = if policy.preserve_permissions
+        && !source.is_symlink()
+        && destination.unix_mode != source.unix_mode
+    {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePullError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)

@@ -8,6 +8,7 @@ mod pull;
 mod push;
 pub mod ratelimit;
 pub mod scanner;
+mod selected;
 pub mod session;
 pub mod stats;
 #[cfg(feature = "watch")]

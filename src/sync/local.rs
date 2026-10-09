@@ -15,10 +15,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use sy::engine::controller::{
-    preflight_sync_scoped, preflight_sync_scoped_with_content, preview_sync, ControllerError,
-    SyncController, SyncSummary,
+    preflight_sync_scoped_with_content, preview_sync, ControllerError, SyncController, SyncSummary,
 };
-use sy::engine::domain::Entry;
+use sy::engine::domain::{Entry, SyncScope};
+use sy::engine::reconcile::OrderedReconciler;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::remote::local_executor::LocalSyncExecutor;
 
@@ -27,12 +27,15 @@ pub(super) async fn run(
     destination_root: &Path,
     config: &SyncConfig,
     scan_options: ScanOptions,
+    scope: SyncScope,
 ) -> Result<SyncStats> {
     // Controller journals are created before either entry stream is polled.
     // Refuse unsafe scratch configuration before spawning even the dest scan.
-    sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
-        .await
-        .map_err(map_io)?;
+    if scope == SyncScope::Tree {
+        sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
+            .await
+            .map_err(map_io)?;
+    }
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -45,7 +48,9 @@ pub(super) async fn run(
     // A fresh destination root is created BEFORE its scan so a first sync
     // into a new directory sees an empty tree instead of a scan error,
     // matching the legacy local path's ordering. Dry-run never mutates.
-    if !destination_root.exists() && !config.dry_run {
+    // Selected scans can represent an absent parent without mutation. Their
+    // destination endpoint creates it only when executing an admitted action.
+    if scope == SyncScope::Tree && !destination_root.exists() && !config.dry_run {
         std::fs::create_dir_all(destination_root).map_err(map_io)?;
     }
 
@@ -53,17 +58,37 @@ pub(super) async fn run(
     // the files live; the destination scan stays COMPLETE (gitignore never
     // narrows what reconciliation sees) — the same boundary as every other
     // direction.
-    let source = filtered_source_stream(
-        sy::endpoint::local_entry_scan::local_entry_stream(
-            source_root.to_path_buf(),
-            source_scan_request(config, scan_options),
+    let (source, destination) = match &scope {
+        SyncScope::Tree => (
+            sy::endpoint::local_entry_scan::local_entry_stream(
+                source_root.to_path_buf(),
+                source_scan_request(config, scan_options),
+            ),
+            sy::endpoint::local_entry_scan::local_entry_stream(
+                destination_root.to_path_buf(),
+                destination_scan_request(config),
+            ),
         ),
-        config.filter_engine.clone(),
-    );
-    let destination = sy::endpoint::local_entry_scan::local_entry_stream(
-        destination_root.to_path_buf(),
-        destination_scan_request(config),
-    );
+        SyncScope::SelectedLeaf {
+            source,
+            destination,
+        } => (
+            sy::endpoint::local_entry_scan::selected_leaf_stream(
+                source_root.to_path_buf(),
+                source.clone(),
+                source_scan_request(config, scan_options),
+                false,
+            ),
+            sy::endpoint::local_entry_scan::selected_leaf_stream(
+                destination_root.to_path_buf(),
+                destination.clone(),
+                destination_scan_request(config),
+                true,
+            ),
+        ),
+    };
+    let source = filtered_source_stream(source, config.filter_engine.clone());
+    let tree_scope = scope == SyncScope::Tree;
 
     let min_size = config.min_size;
     let max_size = config.max_size;
@@ -80,12 +105,11 @@ pub(super) async fn run(
         ),
     ));
 
-    let plan = if config.comparison.checksum {
+    let mut plan = {
         let source_root_owned = source_root.to_path_buf();
         let destination_root_owned = destination_root.to_path_buf();
         preflight_sync_scoped_with_content(
-            source,
-            destination,
+            OrderedReconciler::with_scope(source, destination, scope.clone()),
             comparison_policy(
                 config,
                 crate::fs_util::namespace_semantics(destination_root),
@@ -96,7 +120,8 @@ pub(super) async fn run(
                     && entry_selected_by_symlink_mode(entry, skip_symlinks)
             },
             move |entry| {
-                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                tree_scope
+                    && delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
                     && entry_in_vcs_scope(entry, include_git_dir)
                     && entry_not_source_ignored(&ignore_scope, entry)
@@ -105,57 +130,34 @@ pub(super) async fn run(
                 let source_root = source_root_owned.clone();
                 let destination_root = destination_root_owned.clone();
                 async move {
-                    let source_rooted = sy::rooted_fs::RootedFs::open(source_root)
-                        .await
-                        .map_err(|error| ControllerError::backend("content comparison", error))?;
-                    let destination_rooted = sy::rooted_fs::RootedFs::open(destination_root)
-                        .await
-                        .map_err(|error| ControllerError::backend("content comparison", error))?;
-                    // Comparison is bound to the scan observations, not merely to
-                    // whichever files happen to occupy these names when opened.
-                    let source_hash = sy::endpoint::existing::fingerprint(
-                        source_rooted,
-                        source,
-                        sy::endpoint::existing::FingerprintOptions::default(),
+                    let source_endpoint = sy::endpoint::local::LocalEndpoint::new(source_root);
+                    let destination_endpoint =
+                        sy::endpoint::local::LocalEndpoint::new(destination_root);
+                    let source_hash = observed_hash(
+                        &source_endpoint,
+                        &source,
+                        config.preserve.symlink_mode == SymlinkMode::Follow,
                     )
                     .await
                     .map_err(|error| ControllerError::backend("content comparison", error))?;
-                    let destination_hash = sy::endpoint::existing::fingerprint(
-                        destination_rooted,
-                        destination,
-                        sy::endpoint::existing::FingerprintOptions::default(),
-                    )
-                    .await
-                    .map_err(|error| ControllerError::backend("content comparison", error))?;
-                    Ok(source_hash.content == destination_hash.content)
+                    let destination_hash =
+                        observed_hash(&destination_endpoint, &destination, false)
+                            .await
+                            .map_err(|error| {
+                                ControllerError::backend("content comparison", error)
+                            })?;
+                    Ok(source_hash == destination_hash)
                 }
             },
         )
         .await
         .map_err(map_controller_error)?
-    } else {
-        preflight_sync_scoped(
-            source,
-            destination,
-            comparison_policy(
-                config,
-                crate::fs_util::namespace_semantics(destination_root),
-            ),
-            delete_policy(&config.delete),
-            move |entry| {
-                entry_in_size_scope(entry, min_size, max_size)
-                    && entry_selected_by_symlink_mode(entry, skip_symlinks)
-            },
-            move |entry| {
-                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-                    && entry_in_depth_scope(entry, max_depth)
-                    && entry_in_vcs_scope(entry, include_git_dir)
-                    && entry_not_source_ignored(&ignore_scope, entry)
-            },
-        )
-        .await
-        .map_err(map_controller_error)?
     };
+
+    if let SyncScope::SelectedLeaf { source, .. } = &scope {
+        super::selected::validate_effects(&mut plan, source_root, source, destination_root, config)
+            .await?;
+    }
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
@@ -166,7 +168,24 @@ pub(super) async fn run(
         })
         .await
         .map_err(map_controller_error)?;
-        return preview_stats(preview);
+        let stats = preview_stats(preview)?;
+        reporter.finish(
+            &sy::sync::output::SummaryCounts {
+                files_created: stats.files_created,
+                files_updated: stats.files_updated,
+                files_skipped: stats.files_skipped,
+                files_deleted: stats.files_deleted,
+                bytes_transferred: 0,
+                duration_secs: stats.duration.as_secs_f64(),
+                files_verified: 0,
+                verification_failures: 0,
+            },
+            sy::sync::output::SyncTimings {
+                scan: scan_started.elapsed(),
+                transfer: std::time::Duration::ZERO,
+            },
+        );
+        return Ok(stats);
     }
 
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
@@ -241,7 +260,7 @@ pub(super) async fn run(
 
 /// --backup-dir is local: absolute honored as-is (the local engine's rule);
 /// relative anchored to the destination root.
-fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option<PathBuf> {
+pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option<PathBuf> {
     let dir = config.backup_dir.as_ref()?;
     if dir.is_absolute() {
         Some(dir.clone())
@@ -277,6 +296,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -321,6 +341,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -365,6 +386,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -387,6 +409,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -417,6 +440,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -433,6 +457,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -479,6 +504,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -493,6 +519,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -546,6 +573,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -596,6 +624,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -612,6 +641,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -651,6 +681,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -668,6 +699,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -700,6 +732,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();
@@ -742,6 +775,7 @@ mod tests {
             destination_root.path(),
             &config,
             ScanOptions::default(),
+            SyncScope::Tree,
         )
         .await
         .unwrap();

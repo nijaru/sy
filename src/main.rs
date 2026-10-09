@@ -1,6 +1,5 @@
 use anyhow::{Context as _, Result};
 use colored::Colorize;
-use std::path::PathBuf;
 use sy::cli::{self, Cli, VerifyMode};
 use sy::config::Config;
 use sy::filter::FilterEngine;
@@ -10,35 +9,6 @@ use sy::resource::format_bytes;
 use sy::sync;
 use sy::sync::session::{EndpointPair, SyncSession};
 use tracing_subscriber::{fmt, EnvFilter};
-
-/// Compute effective destination path based on rsync trailing slash semantics
-///
-/// Trailing slash behavior (applies to directories):
-/// - Source without trailing slash (`/a/dir`): Copy directory itself → `dest/dir/`
-/// - Source with trailing slash (`/a/dir/`): Copy contents only → `dest/`
-///
-/// For files, trailing slash semantics don't apply - the sync engine handles them
-/// by using the destination path directly or appending the filename as needed.
-///
-/// Note: This function works with path strings and doesn't check the filesystem,
-/// so it works correctly for local, remote (SSH), and S3 sources.
-fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBuf {
-    let source_path = source.path();
-
-    // For sources with trailing slash, use destination as-is (copy contents)
-    if source.has_trailing_slash() {
-        return destination.path().to_path_buf();
-    }
-
-    // For sources without trailing slash, append source name to destination
-    // (copies the directory/file itself)
-    if let Some(name) = source_path.file_name() {
-        destination.path().join(name)
-    } else {
-        // Fallback: use destination as-is (e.g., root paths)
-        destination.path().to_path_buf()
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -323,11 +293,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
 
     // Load .syignore from source directory (if local)
     if source.is_local() {
-        let source_dir = if source.path().is_file() {
-            source.path().parent().unwrap_or(source.path())
-        } else {
-            source.path()
-        };
+        let source_dir =
+            if std::fs::symlink_metadata(source.path()).is_ok_and(|metadata| !metadata.is_dir()) {
+                source.path().parent().unwrap_or(source.path())
+            } else {
+                source.path()
+            };
 
         match filter_engine.add_syignore_if_exists(source_dir) {
             Ok(true) => {
@@ -426,11 +397,22 @@ Or install from local source with: cargo install --path . --features acl"#
         stats: cli.stats,
     };
 
-    // Create SyncSession for strategy dispatch
-    let source_endpoint = EndpointPair::from_sync_path(source)?;
-    let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-    let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-        .with_scan_options(cli.scan_options());
+    let session = if source.is_local() && destination.is_local() {
+        SyncSession::for_local_paths(
+            source.path(),
+            destination.path(),
+            source.has_trailing_slash(),
+            config.clone(),
+        )
+        .await?
+    } else {
+        SyncSession::new(
+            EndpointPair::from_sync_path(source)?,
+            EndpointPair::from_sync_path(destination)?,
+            config.clone(),
+        )
+    }
+    .with_scan_options(cli.scan_options());
 
     // Execute pre-sync hook
     if let Some(ref executor) = hook_executor {
@@ -460,7 +442,7 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("Verifying {} ↔ {}\n", source, destination);
         }
 
-        let result = session.verify(source.path(), destination.path()).await?;
+        let result = session.verify().await?;
 
         // Determine exit code
         let exit_code = if !result.errors.is_empty() {
@@ -573,58 +555,10 @@ Or install from local source with: cargo install --path . --features acl"#
         }
     }
 
-    // Run sync (single file or directory)
-    // Bidirectional sync was removed before 0.5; unidirectional sync only.
-    let stats = if source.is_local() && destination.is_remote() {
-        // Use SyncSession for local → remote SSH push
-        if !cli.quiet && !cli.json {
-            println!("Mode: Streaming push\n");
-        }
-        let source_endpoint = EndpointPair::from_sync_path(source)?;
-        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-            .with_scan_options(cli.scan_options());
-        session.sync().await?
-    } else if source.is_remote() && destination.is_local() {
-        // Use SyncSession for remote → local SSH pull
-        if !cli.quiet && !cli.json {
-            println!("Mode: Streaming pull\n");
-        }
-        let source_endpoint = EndpointPair::from_sync_path(source)?;
-        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-            .with_scan_options(cli.scan_options());
-        session.sync().await?
-    } else if cli.is_single_file() {
-        if !cli.quiet && !cli.json {
-            println!("Mode: Single file sync\n");
-        }
-        // For single files, trailing slash doesn't apply - use destination as-is
-        session
-            .sync_single_file(source.path(), destination.path())
-            .await?
-    } else {
-        // Use SyncSession for strategy dispatch
-        let effective_dest = compute_destination_path(source, destination);
-
-        // Update session with effective destination
-        let dest_endpoint = EndpointPair::from_sync_path(&SyncPath::Local {
-            path: effective_dest.clone(),
-            has_trailing_slash: false,
-        })?;
-        let session = SyncSession::new(
-            EndpointPair::from_sync_path(source)?,
-            dest_endpoint,
-            config.clone(),
-        )
-        .with_scan_options(cli.scan_options());
-
-        if !cli.quiet && !cli.json && !cli.dry_run {
-            println!("Mode: {:?}\n", session.select_strategy());
-        }
-
-        session.sync().await?
-    };
+    if !cli.quiet && !cli.json && !cli.dry_run {
+        println!("Mode: {:?}\n", session.select_strategy());
+    }
+    let stats = session.sync().await?;
 
     // Execute post-sync hook
     if let Some(ref executor) = hook_executor {
