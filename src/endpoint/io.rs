@@ -109,9 +109,10 @@ impl FileMetadata {
 /// Implementations write into endpoint-private staging state. The writer must
 /// honor the `ExpectedDestination` passed to `Endpoint::begin_write` both when
 /// staging begins and immediately before commit. `commit` makes the staged
-/// object visible at the destination path; dropping or aborting a writer must
-/// leave the previous destination intact whenever the endpoint can provide
-/// atomic replacement semantics.
+/// object visible at the destination path and returns its pending original
+/// publication owner, not a completion proof. Dropping or aborting a writer
+/// before commit must leave the previous destination intact whenever the
+/// endpoint can provide atomic replacement semantics.
 #[async_trait]
 pub trait StagedWriter: Send {
     async fn write(&mut self, data: &[u8]) -> Result<()>;
@@ -173,11 +174,22 @@ pub trait StagedWriter: Send {
         Ok((source, destination_basis, None))
     }
 
-    async fn commit(
+    async fn commit(self: Box<Self>) -> Result<Box<dyn PendingPublication>>;
+    async fn abort(self: Box<Self>) -> Result<()>;
+}
+
+/// Owns an already-visible replacement until required finalization succeeds.
+///
+/// The endpoint retains the original staging authority across this boundary;
+/// it must not reopen the published path to acquire mutation ownership. Only
+/// `finalize` returns a completion proof. Dropping this owner cannot roll back
+/// publication and does not authorize source removal.
+#[async_trait]
+pub trait PendingPublication: Send + std::fmt::Debug {
+    async fn finalize(
         self: Box<Self>,
         flags: Option<u32>,
     ) -> Result<sy::rooted_fs::PublishedFileProof>;
-    async fn abort(self: Box<Self>) -> Result<()>;
 }
 
 /// Abort owned staging while retaining both the operation and cleanup failures.
@@ -272,7 +284,7 @@ pub(crate) async fn finalize_staged_writer(
             Ok(FinalizationOutcome::VerificationFailed { expected, actual })
         }
         Ok(verification) => {
-            let proof = writer.commit(flags).await?;
+            let proof = writer.commit().await?.finalize(flags).await?;
             Ok(FinalizationOutcome::Published {
                 verification,
                 proof,
@@ -440,55 +452,8 @@ pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
     use std::time::SystemTime;
-
-    struct RecordingWriter {
-        events: Arc<Mutex<Vec<&'static str>>>,
-        hash: blake3::Hash,
-    }
-
-    #[async_trait::async_trait]
-    impl StagedWriter for RecordingWriter {
-        async fn write(&mut self, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        async fn set_metadata(&mut self, _metadata: &FileMetadata) -> Result<()> {
-            self.events.lock().unwrap().push("metadata");
-            Ok(())
-        }
-
-        async fn apply_preservation(
-            &mut self,
-            _preservation: &Preservation,
-            _expected_mode: Option<u32>,
-        ) -> Result<()> {
-            self.events.lock().unwrap().push("preservation");
-            Ok(())
-        }
-
-        async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
-            self.events.lock().unwrap().push("verification");
-            Ok(Some(self.hash))
-        }
-
-        async fn commit(
-            self: Box<Self>,
-            _flags: Option<u32>,
-        ) -> Result<sy::rooted_fs::PublishedFileProof> {
-            self.events.lock().unwrap().push("commit");
-            Ok(sy::rooted_fs::PublishedFileProof {
-                path: sy::engine::domain::RelativePath::new("file").unwrap(),
-                identity: EntryIdentity::from_bytes([1; 32]),
-            })
-        }
-
-        async fn abort(self: Box<Self>) -> Result<()> {
-            self.events.lock().unwrap().push("abort");
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn streaming_length_mismatch_aborts_before_publication() {
@@ -533,13 +498,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalization_applies_metadata_before_verifying_and_committing() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let expected = blake3::hash(b"bytes");
-        let writer = Box::new(RecordingWriter {
-            events: Arc::clone(&events),
-            hash: expected,
-        });
+    async fn source_validation_failure_aborts_real_staging_before_publication() {
+        use crate::endpoint::local::LocalEndpoint;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"old").unwrap();
+        let endpoint = LocalEndpoint::new(root.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
+        writer.write(b"bytes").await.unwrap();
         let metadata = FileMetadata {
             size: 5,
             modified: SystemTime::UNIX_EPOCH,
@@ -549,39 +519,26 @@ mod tests {
             mode: 0o640,
         };
         let preservation = Preservation::default();
-        let pre_commit_events = Arc::clone(&events);
-        let pre_commit = move || {
-            pre_commit_events.lock().unwrap().push("pre-commit");
-            Ok(())
+        let pre_commit = || {
+            assert_eq!(std::fs::read(&path).unwrap(), b"old");
+            Err(SyncError::SourceChanged {
+                path: PathBuf::from("source"),
+            })
         };
 
-        let verification = finalize_staged_writer(
+        let error = finalize_staged_writer(
             writer,
             &metadata,
             &preservation,
-            Some(expected),
+            Some(blake3::hash(b"bytes")),
             Some(&pre_commit),
             None,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(matches!(
-            verification,
-            FinalizationOutcome::Published {
-                verification: VerificationStatus::Verified,
-                ..
-            }
-        ));
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                "metadata",
-                "preservation",
-                "verification",
-                "pre-commit",
-                "commit"
-            ]
-        );
+        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

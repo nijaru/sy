@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub use io::{BoxReader, ExpectedDestination, StagedWriter};
+pub use io::{BoxReader, ExpectedDestination, PendingPublication, StagedWriter};
 #[allow(unused_imports)]
 pub use receipt::{PublishedDestinationReceipt, VerifiedExistingDestinationReceipt};
 

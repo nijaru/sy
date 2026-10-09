@@ -1,6 +1,6 @@
 use crate::endpoint::{
     BoxReader, Capabilities, Endpoint, EndpointType, ExpectedDestination, FileMetadata,
-    StagedWriter,
+    PendingPublication, StagedWriter,
 };
 use crate::error::{Result, SyncError};
 use async_trait::async_trait;
@@ -214,11 +214,12 @@ struct LocalStagedWriter {
     commit_queued: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-struct CommitCancellationGuard {
+#[derive(Debug)]
+struct PublicationCancellationGuard {
     admission: Option<std::sync::Arc<crate::endpoint::publication::PublicationAdmission>>,
 }
 
-impl CommitCancellationGuard {
+impl PublicationCancellationGuard {
     fn new(admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>) -> Self {
         Self {
             admission: Some(admission),
@@ -230,11 +231,66 @@ impl CommitCancellationGuard {
     }
 }
 
-impl Drop for CommitCancellationGuard {
+impl Drop for PublicationCancellationGuard {
     fn drop(&mut self) {
         if let Some(admission) = &self.admission {
             admission.close();
         }
+    }
+}
+
+/// Retains the original published descriptor and cancellation authority, not
+/// just the name/identity in a finalized receipt.
+#[derive(Debug)]
+struct LocalPendingPublication {
+    published: sy::rooted_fs::RootedPublishedFile,
+    rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
+    root_path: PathBuf,
+    destination_path: PathBuf,
+    cancellation_guard: PublicationCancellationGuard,
+}
+
+#[async_trait]
+impl PendingPublication for LocalPendingPublication {
+    async fn finalize(
+        self: Box<Self>,
+        flags: Option<u32>,
+    ) -> Result<sy::rooted_fs::PublishedFileProof> {
+        let Self {
+            published,
+            rooted,
+            root_path,
+            destination_path,
+            mut cancellation_guard,
+        } = *self;
+        let finalization_path = destination_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let verify_root = || {
+                rooted.verify_root_path_blocking().map_err(|error| {
+                    SyncError::CommittedRootChanged {
+                        destination: destination_path.clone(),
+                        root: root_path.clone(),
+                        reason: error.to_string(),
+                    }
+                })
+            };
+            verify_root()?;
+            let proof = published
+                .finalize_blocking(flags)
+                .map_err(map_rooted_fs_error)?;
+            // A held root confines native effects even if its public name was
+            // replaced during admitted finalization. That is not successful
+            // completion at the operator's destination address.
+            verify_root()?;
+            Ok(proof)
+        })
+        .await
+        .map_err(|error| SyncError::CommittedFinalizationFailed {
+            path: finalization_path,
+            reason: format!("finalization worker failed: {error}"),
+        })?;
+        cancellation_guard.disarm();
+        result
     }
 }
 
@@ -828,10 +884,7 @@ impl StagedWriter for LocalStagedWriter {
         .await
     }
 
-    async fn commit(
-        mut self: Box<Self>,
-        flags: Option<u32>,
-    ) -> Result<sy::rooted_fs::PublishedFileProof> {
+    async fn commit(mut self: Box<Self>) -> Result<Box<dyn PendingPublication>> {
         if let Some(mut file) = self.file.take() {
             if let Err(operation) = file.flush().await {
                 drop(file);
@@ -853,10 +906,10 @@ impl StagedWriter for LocalStagedWriter {
         let rooted = std::sync::Arc::clone(&self.rooted);
         let root_path = self.root_path.clone();
         let destination_path = self.destination_path.clone();
-        let mut cancellation_guard =
-            CommitCancellationGuard::new(std::sync::Arc::clone(&self.admission));
+        let cancellation_guard =
+            PublicationCancellationGuard::new(std::sync::Arc::clone(&self.admission));
         let worker =
-            tokio::task::spawn_blocking(move || -> Result<sy::rooted_fs::PublishedFileProof> {
+            tokio::task::spawn_blocking(move || -> Result<sy::rooted_fs::RootedPublishedFile> {
                 if let Err(operation) = rooted.verify_root_path_blocking() {
                     let operation = map_rooted_fs_error(operation);
                     return match staged.abort() {
@@ -871,9 +924,7 @@ impl StagedWriter for LocalStagedWriter {
                     .commit_with_admission(&worker_admission)
                     .map_err(map_rooted_fs_error)?;
                 match rooted.verify_root_path_blocking() {
-                    Ok(()) => published
-                        .finalize_blocking(flags)
-                        .map_err(map_rooted_fs_error),
+                    Ok(()) => Ok(published),
                     Err(error) => Err(SyncError::CommittedRootChanged {
                         destination: destination_path,
                         root: root_path,
@@ -888,8 +939,16 @@ impl StagedWriter for LocalStagedWriter {
         let result = worker
             .await
             .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        cancellation_guard.disarm();
-        result
+        let published = result?;
+        // Transfer the guard without closing/reopening admission. Dropping the
+        // pending owner closes it too; publication itself is not rolled back.
+        Ok(Box::new(LocalPendingPublication {
+            published,
+            rooted: self.rooted,
+            root_path: self.root_path,
+            destination_path: self.destination_path,
+            cancellation_guard,
+        }))
     }
 
     async fn abort(mut self: Box<Self>) -> Result<()> {
@@ -1488,7 +1547,7 @@ mod tests {
             .await
             .unwrap();
         writer.write(b"content").await.unwrap();
-        writer.commit(None).await.unwrap();
+        writer.commit().await.unwrap().finalize(None).await.unwrap();
 
         assert_eq!(fs::read(root.join("nested/dir/file")).unwrap(), b"content");
     }
@@ -1531,7 +1590,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
 
-            let commit = tokio::spawn(async move { Box::new(writer).commit(None).await });
+            let commit = tokio::spawn(async move { Box::new(writer).commit().await });
             queued_rx.await.unwrap();
             commit.abort();
             assert!(commit.await.unwrap_err().is_cancelled());
@@ -1573,7 +1632,7 @@ mod tests {
         staged.write(b"new").await.unwrap();
         sender.fail(std::sync::Arc::new(RouterError::WriterClosed));
         sender.closed().await;
-        let result = staged.commit(None).await;
+        let result = staged.commit().await;
         router.shutdown().await.unwrap();
         assert!(matches!(result, Err(SyncError::Io(error))
             if matches!(error.get_ref().and_then(|e| e.downcast_ref()),
@@ -1610,7 +1669,7 @@ mod tests {
                 reached: reached_tx,
                 resume: resume_rx,
             });
-        let mut commit = tokio::spawn(async move { Box::new(writer).commit(None).await });
+        let mut commit = tokio::spawn(async move { Box::new(writer).commit().await });
         let paused = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
         commit.abort();
         let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit).await;
@@ -1653,7 +1712,7 @@ mod tests {
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
         assert!(matches!(
-            writer.commit(None).await,
+            writer.commit().await,
             Err(SyncError::DestinationChanged { .. })
         ));
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"old");
@@ -1665,6 +1724,199 @@ mod tests {
                 .await,
             Err(SyncError::DestinationChanged { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_publication_retains_original_inode_observation() {
+        for replace_name in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("file");
+            fs::write(&path, b"old").unwrap();
+            let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+            let mut writer = endpoint
+                .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+                .await
+                .unwrap();
+            writer.write(b"published").await.unwrap();
+            let pending = writer.commit().await.unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"published");
+
+            if replace_name {
+                fs::rename(&path, dir.path().join("owned")).unwrap();
+                fs::write(&path, b"foreign").unwrap();
+            } else {
+                // Same original inode, but no longer the publication's exact
+                // observation. Retaining an FD must not adopt this new state.
+                xattr::set(&path, "user.sy-foreign", b"changed").unwrap();
+            }
+            let result = pending.finalize(None).await;
+            assert!(matches!(
+                result,
+                Err(SyncError::CommittedFinalizationFailed { .. })
+            ));
+            if replace_name {
+                assert_eq!(fs::read(&path).unwrap(), b"foreign");
+                assert_eq!(fs::read(dir.path().join("owned")).unwrap(), b"published");
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), b"published");
+                assert_eq!(
+                    xattr::get(&path, "user.sy-foreign").unwrap(),
+                    Some(b"changed".to_vec())
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancelling_pending_flags_respects_native_admission() {
+        use crate::rooted_fs::{PublicationPause, PublicationPausePoint};
+        use std::os::macos::fs::MetadataExt;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (point, expected_flags) in [
+                (PublicationPausePoint::BeforeAdmission, 0),
+                (PublicationPausePoint::AfterAdmission, libc::UF_NODUMP),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+                let mut writer = endpoint
+                    .begin_write(Path::new("file"), ExpectedDestination::Absent)
+                    .await
+                    .unwrap();
+                writer.write(b"published").await.unwrap();
+                let pending = writer.commit().await.unwrap();
+                let rooted = endpoint.rooted_fs(false).await.unwrap();
+                let (reached, paused) = tokio::sync::oneshot::channel();
+                let (resume, wait) = std::sync::mpsc::channel();
+                rooted.pause_mutation_at(
+                    0,
+                    PublicationPause {
+                        point,
+                        reached,
+                        resume: wait,
+                    },
+                );
+                let mut completion =
+                    tokio::spawn(async move { pending.finalize(Some(libc::UF_NODUMP)).await });
+                let reached = tokio::time::timeout(std::time::Duration::from_secs(5), paused).await;
+                completion.abort();
+                // The awaiting future must cancel while native work is paused,
+                // without waiting for the syscall or claiming its revocation.
+                let cancelled =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut completion).await;
+                let _ = resume.send(());
+                if cancelled.is_err() {
+                    let _ = completion.await;
+                }
+                // The sole blocking worker finishes finalization before this
+                // queued barrier, including work whose awaiting future vanished.
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert!(matches!(reached, Ok(Ok(()))));
+                assert!(matches!(cancelled, Ok(Err(error)) if error.is_cancelled()));
+                assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"published");
+                assert_eq!(
+                    fs::metadata(dir.path().join("file")).unwrap().st_flags(),
+                    expected_flags
+                );
+                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn closed_session_refuses_pending_flags_without_rollback() {
+        use std::os::macos::fs::MetadataExt;
+
+        let dir = TempDir::new().unwrap();
+        let admission =
+            std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf())
+            .with_publication_admission(std::sync::Arc::clone(&admission));
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"published").await.unwrap();
+        let pending = writer.commit().await.unwrap();
+        admission.close();
+
+        assert!(matches!(
+            pending.finalize(Some(libc::UF_NODUMP)).await,
+            Err(SyncError::CommittedFinalizationFailed { .. })
+        ));
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"published");
+        assert_eq!(fs::metadata(dir.path().join("file")).unwrap().st_flags(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn finalization_rechecks_root_after_admitted_flags() {
+        use crate::rooted_fs::{PublicationPause, PublicationPausePoint};
+        use std::os::macos::fs::MetadataExt;
+
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("root");
+        let moved = parent.path().join("moved");
+        fs::create_dir(&root).unwrap();
+        let endpoint = LocalEndpoint::new(root.clone());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"content").await.unwrap();
+        let rooted = endpoint.rooted_fs(false).await.unwrap();
+        let (reached, paused) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        // Skip namespace admission; hold the subsequent native flag mutation.
+        rooted.pause_mutation_at(
+            1,
+            PublicationPause {
+                point: PublicationPausePoint::AfterAdmission,
+                reached,
+                resume: wait,
+            },
+        );
+        let completion = tokio::spawn(async move {
+            crate::endpoint::io::finalize_staged_writer(
+                writer,
+                &make_meta(),
+                &crate::endpoint::io::Preservation::default(),
+                Some(blake3::hash(b"content")),
+                None,
+                Some(libc::UF_NODUMP),
+            )
+            .await
+        });
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(5), paused).await;
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"foreign").unwrap();
+        let _ = resume.send(());
+        let result = completion.await.unwrap();
+
+        assert!(matches!(reached, Ok(Ok(()))));
+        assert!(matches!(
+            result,
+            Err(SyncError::CommittedRootChanged { .. })
+        ));
+        // Admitted native work may finish on the original inode. The error is
+        // a committed failure, not rollback or authority over the new root.
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"content");
+        assert_eq!(
+            fs::metadata(moved.join("file")).unwrap().st_flags(),
+            libc::UF_NODUMP
+        );
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"foreign");
+        assert_eq!(fs::metadata(root.join("file")).unwrap().st_flags(), 0);
     }
 
     #[tokio::test]
@@ -1804,7 +2056,7 @@ mod tests {
             .unwrap();
         writer.write(b"content").await.unwrap();
         writer.set_metadata(&make_meta()).await.unwrap();
-        writer.commit(None).await.unwrap();
+        writer.commit().await.unwrap().finalize(None).await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
     }
 
@@ -1824,7 +2076,7 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"concurrent edit").unwrap();
-        let error = match writer.commit(None).await {
+        let error = match writer.commit().await {
             Ok(_) => panic!("concurrent destination replacement must abort"),
             Err(error) => error,
         };
@@ -1846,7 +2098,7 @@ mod tests {
         writer.write(b"staged").await.unwrap();
 
         fs::write(&path, b"concurrent create").unwrap();
-        let error = match writer.commit(None).await {
+        let error = match writer.commit().await {
             Ok(_) => panic!("a path appearing after scan must abort"),
             Err(error) => error,
         };
