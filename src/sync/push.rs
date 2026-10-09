@@ -53,7 +53,11 @@ pub(super) async fn run(
     };
     let session = SshRemoteSession::connect_with_options(
         &target,
-        Operation::Push,
+        if config.dry_run {
+            Operation::PreviewPush
+        } else {
+            Operation::Push
+        },
         destination_root,
         router_config,
         launch,
@@ -83,6 +87,15 @@ async fn execute_with_handle(
     ));
     let scan_started = std::time::Instant::now();
     let source_request = source_scan_request(config, scan_options);
+    let source_rooted = if config.comparison.checksum {
+        Some(
+            RootedFs::open(source_root.to_path_buf())
+                .await
+                .map_err(map_io)?,
+        )
+    } else {
+        None
+    };
     let destination = remote
         .scan(destination_scan_request(config))
         .await
@@ -107,15 +120,12 @@ async fn execute_with_handle(
             scan_options.respect_gitignore,
         ),
     ));
-    // Preflight follows the destination root's negotiated name semantics; a
-    // 3.0 peer (no root-scoped answer) falls back to the OS approximation.
+    // Both exact-version peers report root semantics. Unknown filesystem
+    // semantics remain conservative, never an OS-derived aliasing guess.
     let namespace_semantics = remote
         .namespace_semantics()
-        .unwrap_or_else(|| NamespaceSemantics::for_platform(remote.peer_platform()));
-    let plan = if config.comparison.checksum {
-        let source_rooted = RootedFs::open(source_root.to_path_buf())
-            .await
-            .map_err(map_io)?;
+        .unwrap_or(NamespaceSemantics::UNSPECIFIED);
+    let plan = if let Some(source_rooted) = source_rooted {
         let hash_remote = remote.clone();
         preflight_sync_scoped_with_content(
             sy::engine::reconcile::OrderedReconciler::new(source, destination),
@@ -138,15 +148,16 @@ async fn execute_with_handle(
                     let source_identity = source
                         .identity
                         .ok_or(RemoteHashError::MissingBasisIdentity)?;
+                    // Finish admitted native hashing before starting the peer
+                    // request; sibling failure must not drop an owned job.
                     let source_hash = hash_rooted_file(
                         source_rooted,
                         source.path.clone(),
                         source.size,
                         source_identity,
-                    );
-                    let destination_hash = hash_remote.content_hash(&destination);
-                    let (source_hash, destination_hash) =
-                        tokio::try_join!(source_hash, destination_hash)?;
+                    )
+                    .await?;
+                    let destination_hash = hash_remote.content_hash(&destination).await?;
                     Ok(source_hash == destination_hash)
                 }
             },
@@ -183,7 +194,10 @@ async fn execute_with_handle(
         })
         .await
         .map_err(map_controller_error)?;
-        return preview_stats(preview);
+        let mut stats = preview_stats(preview)?;
+        stats.duration = scan_started.elapsed();
+        finish_report(&reporter, &stats, stats.duration, std::time::Duration::ZERO);
+        return Ok(stats);
     }
 
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
@@ -243,22 +257,7 @@ async fn execute_with_handle(
         .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;
     stats.duration = scan_elapsed + transfer_started.elapsed();
-    reporter.finish(
-        &sy::sync::output::SummaryCounts {
-            files_created: stats.files_created,
-            files_updated: stats.files_updated,
-            files_skipped: stats.files_skipped,
-            files_deleted: stats.files_deleted,
-            bytes_transferred: stats.bytes_transferred,
-            duration_secs: stats.duration.as_secs_f64(),
-            files_verified: stats.files_verified as u64,
-            verification_failures: stats.verification_failures,
-        },
-        sy::sync::output::SyncTimings {
-            scan: scan_elapsed,
-            transfer: transfer_started.elapsed(),
-        },
-    );
+    finish_report(&reporter, &stats, scan_elapsed, transfer_started.elapsed());
     Ok(stats)
 }
 
@@ -332,7 +331,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             // Scan, directory creation, three transfers with publication
             // revalidation before source removal, then directory finalization.
             for _ in 0..9 {
@@ -342,10 +341,20 @@ mod tests {
                         file.serve(incoming).await.unwrap();
                     }
                     IncomingRequest::Mutation(incoming) => {
-                        session.mutation_handler().serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Metadata(incoming) => {
-                        session.metadata_handler().serve(incoming).await.unwrap();
+                        session
+                            .metadata_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _ => panic!("unexpected remove-source v3 adapter request"),
                 }
@@ -433,8 +442,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let hash = session.hash_handler();
-            let file = session.file_handler();
+            let hash = session.hash_handler().unwrap();
+            let file = session.file_handler().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
             // The verified-existing receipt is revalidated on the peer
             // immediately before authorizing source removal.
@@ -466,7 +475,7 @@ mod tests {
                         });
                     }
                     IncomingRequest::Mutation(incoming) => {
-                        let mutation = session.mutation_handler();
+                        let mutation = session.mutation_handler().unwrap();
                         tasks.spawn(async move {
                             mutation
                                 .serve(incoming)
@@ -475,7 +484,7 @@ mod tests {
                         });
                     }
                     IncomingRequest::Metadata(incoming) => {
-                        let metadata = session.metadata_handler();
+                        let metadata = session.metadata_handler().unwrap();
                         tasks.spawn(async move {
                             metadata
                                 .serve(incoming)
@@ -568,8 +577,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let mutation = session.mutation_handler();
+            let file = session.file_handler().unwrap();
+            let mutation = session.mutation_handler().unwrap();
             // destination scan, backup copy (updated), two file transfers,
             // delete-backup copy, file remove, directory remove. The source
             // scan is local and produces no request.
@@ -666,8 +675,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let mutation = session.mutation_handler();
+            let file = session.file_handler().unwrap();
+            let mutation = session.mutation_handler().unwrap();
             // Destination scan, representative transfer, member publication,
             // and both final destination proofs before grouped source removal.
             for _ in 0..5 {
@@ -752,7 +761,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             // Two passes of destination scan + file transfer each; xattr
             // preservation rides the transfer stream into staging.
             for _ in 0..4 {
@@ -842,8 +851,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let xattr = session.xattr_handler();
+            let file = session.file_handler().unwrap();
+            let xattr = session.xattr_handler().unwrap();
             for _ in 0..7 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -851,10 +860,20 @@ mod tests {
                         file.serve(incoming).await.unwrap();
                     }
                     IncomingRequest::Mutation(incoming) => {
-                        session.mutation_handler().serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Metadata(incoming) => {
-                        session.metadata_handler().serve(incoming).await.unwrap();
+                        session
+                            .metadata_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Xattr(incoming) => xattr.serve(incoming).await.unwrap(),
                     _ => panic!("unexpected unchanged xattr push request"),
@@ -957,7 +976,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             // Two passes of destination scan + file transfer each; ACL
             // preservation rides the transfer stream into staging.
             for _ in 0..4 {
@@ -1055,7 +1074,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             // Two passes: flags are finalized on the file transaction's
             // held descriptor before its ACK, not by a fresh-path RPC.
             for _ in 0..4 {
@@ -1138,7 +1157,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1290,7 +1309,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let mutation = session.mutation_handler();
+            let mutation = session.mutation_handler().unwrap();
             let mut mutations = 0_usize;
             for _ in 0..3 {
                 match session.next_request().await.unwrap().unwrap() {
@@ -1363,8 +1382,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let mutation = session.mutation_handler();
+            let file = session.file_handler().unwrap();
+            let mutation = session.mutation_handler().unwrap();
             let mut mutations = 0_usize;
             for _ in 0..4 {
                 match session.next_request().await.unwrap().unwrap() {
@@ -1471,8 +1490,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let mutation = session.mutation_handler();
+            let file = session.file_handler().unwrap();
+            let mutation = session.mutation_handler().unwrap();
             let mut mutations = 0_usize;
             for _ in 0..3 {
                 match session.next_request().await.unwrap().unwrap() {
@@ -1549,7 +1568,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let mutation = session.mutation_handler();
+            let mutation = session.mutation_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1611,7 +1630,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let mutation = session.mutation_handler();
+            let mutation = session.mutation_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1677,7 +1696,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let mutation = session.mutation_handler();
+            let mutation = session.mutation_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1742,8 +1761,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
-            let mutation = session.mutation_handler();
+            let file = session.file_handler().unwrap();
+            let mutation = session.mutation_handler().unwrap();
             for _ in 0..3 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1816,7 +1835,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
@@ -1943,8 +1962,8 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let hash = session.hash_handler();
-            let file = session.file_handler();
+            let hash = session.hash_handler().unwrap();
+            let file = session.file_handler().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
             let mut hashes = 0;
             let mut files = 0;
@@ -2037,7 +2056,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let hash = session.hash_handler();
+            let hash = session.hash_handler().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
@@ -2112,7 +2131,7 @@ mod tests {
                     .await
                     .unwrap();
             let scan = session.scan_handler();
-            let file = session.file_handler();
+            let file = session.file_handler().unwrap();
             for _ in 0..2 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),

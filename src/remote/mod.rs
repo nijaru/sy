@@ -43,6 +43,9 @@ pub enum RemoteError {
     #[error(transparent)]
     RootedFs(#[from] RootedFsError),
 
+    #[error("root preparation worker failed: {0}")]
+    Worker(#[from] tokio::task::JoinError),
+
     #[error("expected control frame {expected:?}, got {actual:?}")]
     UnexpectedFrame {
         expected: FrameKind,
@@ -72,12 +75,18 @@ struct ClientSession {
 }
 
 #[derive(Debug, Clone)]
+enum SessionRoot {
+    Present(RootedFs),
+    AbsentPreview,
+}
+
+#[derive(Debug, Clone)]
 struct OpenedServerSession {
     client: ClientHello,
     version: crate::protocol::ProtocolVersion,
     operation: Operation,
     root: PathBuf,
-    rooted: RootedFs,
+    rooted: SessionRoot,
     ready: SessionReady,
 }
 
@@ -155,11 +164,7 @@ where
     expect_control(&frame, FrameKind::SessionOpen)?;
     let open = SessionOpen::decode(frame.payload())?;
     let root = expand_tilde(decode_native_root(open.root)?);
-    prepare_root(open.operation, &root).await?;
-    // Linux/macOS v0.5 data-plane authority is descriptor-backed. Open the
-    // trusted session root exactly once so later pathname swaps cannot redirect
-    // signatures, file reconstruction, or namespace mutations.
-    let rooted = RootedFs::open(root.clone()).await?;
+    let rooted = prepare_root(open.operation, &root).await?;
 
     let endpoint = crate::endpoint::local::LocalEndpoint::new(root.clone());
     let capabilities = negotiated_capabilities(client.capabilities);
@@ -167,7 +172,11 @@ where
     let modtime_precision_ns = u64::try_from(precision).unwrap_or(u64::MAX);
     // Root-scoped name semantics: the client's alias preflight must follow the
     // opened filesystem, not the peer OS name.
-    let namespace_semantics = crate::fs_util::namespace_semantics(&root).into();
+    let semantics_root = root.clone();
+    let namespace_semantics = tokio::task::spawn_blocking(move || {
+        crate::fs_util::namespace_semantics(&semantics_root).into()
+    })
+    .await?;
     let ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
     let frame = Frame::control(FrameKind::SessionReady, ready.encode(version))?;
     write_frame(writer, &frame).await?;
@@ -308,19 +317,21 @@ const fn acl_advertised_for(os: PlatformOs) -> bool {
     }
 }
 
-async fn prepare_root(operation: Operation, root: &Path) -> Result<()> {
+async fn prepare_root(operation: Operation, root: &Path) -> Result<SessionRoot> {
     if root.as_os_str().is_empty() {
         return Err(RemoteError::InvalidRoot("root path is empty"));
     }
 
     match tokio::fs::try_exists(root).await? {
-        true => Ok(()),
-        false if operation == Operation::Push => {
-            tokio::fs::create_dir_all(root).await?;
-            Ok(())
-        }
-        false => Err(RemoteError::InvalidRoot("pull root does not exist")),
+        true => {}
+        false if operation == Operation::PreviewPush => return Ok(SessionRoot::AbsentPreview),
+        false if operation == Operation::Push => tokio::fs::create_dir_all(root).await?,
+        false => return Err(RemoteError::InvalidRoot("pull root does not exist")),
     }
+    // Never substitute an ancestor descriptor for an absent preview root.
+    Ok(SessionRoot::Present(
+        RootedFs::open(root.to_path_buf()).await?,
+    ))
 }
 
 #[cfg(unix)]
@@ -479,7 +490,10 @@ mod tests {
         );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
-        assert_eq!(opened.rooted.root_path(), root.path());
+        let SessionRoot::Present(rooted) = opened.rooted else {
+            panic!("missing root authority")
+        };
+        assert_eq!(rooted.root_path(), root.path());
         let capabilities = &client.capabilities;
         assert!(capabilities.blake3);
         assert!(capabilities.raw_paths);
@@ -636,7 +650,7 @@ mod tests {
     async fn incompatible_client_is_rejected_before_root_creation() {
         let parent = tempfile::TempDir::new().unwrap();
         let root = parent.path().join("must-not-be-created");
-        let old = VersionRange::new(crate::protocol::PROTOCOL_V3, crate::protocol::PROTOCOL_V3_4)
+        let old = VersionRange::new(crate::protocol::PROTOCOL_V3, crate::protocol::PROTOCOL_V3_5)
             .unwrap();
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(server_io);
@@ -681,7 +695,7 @@ mod tests {
                 SUPPORTED_VERSIONS
             );
             let response = ServerHello::new(
-                crate::protocol::PROTOCOL_V3_4,
+                crate::protocol::PROTOCOL_V3_5,
                 process_capabilities(),
                 Platform::current(),
                 "old",

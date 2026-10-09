@@ -1575,9 +1575,9 @@ mod tests {
                     .await
                     .unwrap();
             let scan_handler = session.scan_handler();
-            let file_handler = session.file_handler();
-            let mutation_handler = session.mutation_handler();
-            let metadata_handler = session.metadata_handler();
+            let file_handler = session.file_handler().unwrap();
+            let mutation_handler = session.mutation_handler().unwrap();
+            let metadata_handler = session.metadata_handler().unwrap();
             let mut order = Vec::new();
 
             for _ in 0..4 {

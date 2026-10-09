@@ -27,6 +27,11 @@ type RequestResult = std::result::Result<(), String>;
 #[derive(Clone)]
 struct RequestHandlers {
     scan: ServerScanHandler,
+    native: Option<NativeRequestHandlers>,
+}
+
+#[derive(Clone)]
+struct NativeRequestHandlers {
     hash: ServerHashHandler,
     signatures: ServerSignatureHandler,
     file: ServerFileHandler,
@@ -72,15 +77,21 @@ async fn serve_requests(
 ) -> Result<()> {
     let handlers = RequestHandlers {
         scan: session.scan_handler(),
-        hash: session.hash_handler(),
-        signatures: session.signature_handler(),
-        file: session.file_handler(),
-        metadata: session.metadata_handler(),
-        mutation: session.mutation_handler(),
-        xattr: session.xattr_handler(),
-        acl: session.acl_handler(),
-        bsd_flags: session.bsd_flags_handler(),
-        fetch: fetch_handler(session),
+        native: if session.has_root() {
+            Some(NativeRequestHandlers {
+                hash: session.hash_handler()?,
+                signatures: session.signature_handler()?,
+                file: session.file_handler()?,
+                metadata: session.metadata_handler()?,
+                mutation: session.mutation_handler()?,
+                xattr: session.xattr_handler()?,
+                acl: session.acl_handler()?,
+                bsd_flags: session.bsd_flags_handler()?,
+                fetch: fetch_handler(session)?,
+            })
+        } else {
+            None
+        },
     };
     let mut accepting = true;
     let mut failure = None;
@@ -94,8 +105,7 @@ async fn serve_requests(
                 joined = tasks.join_next(), if !tasks.is_empty() => check_joined(joined),
                 request = session.next_request() => match request {
                     Ok(Some(request)) => {
-                        spawn_request(tasks, &handlers, request);
-                        Ok(())
+                        spawn_request(tasks, &handlers, request)
                     }
                     Ok(None) => {
                         accepting = false;
@@ -147,11 +157,19 @@ pub async fn run_stdio() -> Result<()> {
 /// ZSTD capability was negotiated at handshake, so a client requesting
 /// compression with a peer lacking it is rejected loudly on the client side
 /// before any request is sent.
-fn fetch_handler(session: &ServerRemoteSession) -> ServerFetchHandler {
-    ServerFetchHandler {
-        rooted: session.scan_handler_rooted(),
+fn fetch_handler(session: &ServerRemoteSession) -> Result<ServerFetchHandler> {
+    Ok(ServerFetchHandler {
+        rooted: session.scan_handler_rooted()?,
         sender: session.sender(),
         peer: session.client().platform.os,
+    })
+}
+
+impl RequestHandlers {
+    fn native(&self) -> Result<&NativeRequestHandlers> {
+        self.native
+            .as_ref()
+            .ok_or_else(|| RemoteSessionError::AbsentPreviewRoot.into())
     }
 }
 
@@ -159,7 +177,7 @@ fn spawn_request(
     tasks: &mut JoinSet<RequestResult>,
     handlers: &RequestHandlers,
     request: IncomingRequest,
-) {
+) -> Result<()> {
     match request {
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
@@ -171,7 +189,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Hash(incoming) => {
-            let handler = handlers.hash.clone();
+            let handler = handlers.native()?.hash.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -180,7 +198,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Signatures(incoming) => {
-            let handler = handlers.signatures.clone();
+            let handler = handlers.native()?.signatures.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -189,7 +207,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::File(incoming) => {
-            let handler = handlers.file.clone();
+            let handler = handlers.native()?.file.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -199,7 +217,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Metadata(incoming) => {
-            let handler = handlers.metadata.clone();
+            let handler = handlers.native()?.metadata.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -208,7 +226,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::FileFetch(incoming) => {
-            let handler = handlers.fetch.clone();
+            let handler = handlers.native()?.fetch.clone();
             tasks.spawn(async move {
                 serve_incoming_file_fetch(
                     handler.rooted.clone(),
@@ -222,7 +240,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Mutation(incoming) => {
-            let handler = handlers.mutation.clone();
+            let handler = handlers.native()?.mutation.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -231,7 +249,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Xattr(incoming) => {
-            let handler = handlers.xattr.clone();
+            let handler = handlers.native()?.xattr.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -240,7 +258,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::Acl(incoming) => {
-            let handler = handlers.acl.clone();
+            let handler = handlers.native()?.acl.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -249,7 +267,7 @@ fn spawn_request(
             });
         }
         IncomingRequest::BsdFlags(incoming) => {
-            let handler = handlers.bsd_flags.clone();
+            let handler = handlers.native()?.bsd_flags.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)
@@ -258,6 +276,7 @@ fn spawn_request(
             });
         }
     }
+    Ok(())
 }
 
 fn check_joined(
@@ -302,7 +321,7 @@ mod tests {
             let mut server = server.unwrap();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-            let rooted = server.scan_handler_rooted();
+            let rooted = server.scan_handler_rooted().unwrap();
             rooted.pause_mutation_at(
                 0,
                 crate::rooted_fs::PublicationPause {

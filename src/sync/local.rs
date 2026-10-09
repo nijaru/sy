@@ -187,21 +187,11 @@ pub(super) async fn run(
         .await
         .map_err(map_controller_error)?;
         let stats = preview_stats(preview)?;
-        reporter.finish(
-            &sy::sync::output::SummaryCounts {
-                files_created: stats.files_created,
-                files_updated: stats.files_updated,
-                files_skipped: stats.files_skipped,
-                files_deleted: stats.files_deleted,
-                bytes_transferred: 0,
-                duration_secs: stats.duration.as_secs_f64(),
-                files_verified: 0,
-                verification_failures: 0,
-            },
-            sy::sync::output::SyncTimings {
-                scan: scan_started.elapsed(),
-                transfer: std::time::Duration::ZERO,
-            },
+        finish_report(
+            &reporter,
+            &stats,
+            scan_started.elapsed(),
+            std::time::Duration::ZERO,
         );
         return Ok(stats);
     }
@@ -257,22 +247,7 @@ pub(super) async fn run(
         })?;
     }
     stats.duration = scan_elapsed + transfer_started.elapsed();
-    reporter.finish(
-        &sy::sync::output::SummaryCounts {
-            files_created: stats.files_created,
-            files_updated: stats.files_updated,
-            files_skipped: stats.files_skipped,
-            files_deleted: stats.files_deleted,
-            bytes_transferred: stats.bytes_transferred,
-            duration_secs: stats.duration.as_secs_f64(),
-            files_verified: stats.files_verified as u64,
-            verification_failures: stats.verification_failures,
-        },
-        sy::sync::output::SyncTimings {
-            scan: scan_elapsed,
-            transfer: transfer_started.elapsed(),
-        },
-    );
+    finish_report(&reporter, &stats, scan_elapsed, transfer_started.elapsed());
     Ok(stats)
 }
 
