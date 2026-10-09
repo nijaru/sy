@@ -845,6 +845,7 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (complete, completed) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut session =
                 ServerRemoteSession::accept(server_reader, server_writer, Default::default())
@@ -883,6 +884,9 @@ mod tests {
                     _other => panic!("unexpected v3 pull request variant"),
                 }
             }
+            // Closing transport before the admitted local link completes is
+            // cancellation, not a successful remote-session lifecycle.
+            completed.await.unwrap();
         });
 
         let session = sy::remote::runtime::ClientRemoteSession::connect(
@@ -907,6 +911,7 @@ mod tests {
         .await
         .unwrap();
 
+        complete.send(()).unwrap();
         server.await.unwrap();
         assert_eq!(stats.files_created, 2);
         assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);

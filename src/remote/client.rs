@@ -297,12 +297,29 @@ impl ClientRemoteHandle {
 
     pub(crate) async fn revalidate_publication(
         &self,
-        proof: &crate::rooted_fs::PublishedFileProof,
+        proof: &crate::rooted_fs::PublishedEntryProof,
     ) -> Result<()> {
         self.require_push(FrameKind::Mutation)?;
         super::mutation::request_verify_publication(&self.sender, proof, self.peer)
             .await
             .map_err(Into::into)
+    }
+
+    pub(crate) async fn revalidate_existing_destination(
+        &self,
+        path: &RelativePath,
+        identity: EntryIdentity,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        super::mutation::request_verify_destination(
+            &self.sender,
+            path,
+            EntryKind::File,
+            identity,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn apply_metadata(
@@ -373,7 +390,7 @@ impl ClientRemoteHandle {
         target: &Path,
         expected_identity: Option<EntryIdentity>,
         modified: Option<Timestamp>,
-    ) -> Result<()> {
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
         self.require_push(FrameKind::Mutation)?;
         request_replace_symlink(
             &self.sender,
@@ -428,11 +445,24 @@ impl ClientRemoteHandle {
 
     /// Server-side hardlink beneath the pinned root (`-H`). Links
     /// `destination` to the existing `source` inode without moving bytes.
-    pub async fn hardlink(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+    pub async fn hardlink(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        source_identity: EntryIdentity,
+        expected_destination: Option<EntryIdentity>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
         self.require_push(FrameKind::Mutation)?;
-        request_hardlink(&self.sender, source, destination, self.peer)
-            .await
-            .map_err(Into::into)
+        request_hardlink(
+            &self.sender,
+            source,
+            destination,
+            source_identity,
+            expected_destination,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Read the remote peer's extended attributes for one entry (`-X`). Used

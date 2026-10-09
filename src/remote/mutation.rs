@@ -1,6 +1,6 @@
-use crate::engine::domain::{EntryIdentity, RelativePath, Timestamp};
+use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::protocol::{
-    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireMutation,
+    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireEntryKind, WireMutation,
     WireMutationKind, WirePath,
 };
 use crate::remote::path::{
@@ -44,7 +44,7 @@ pub enum RemoteMutationError {
     #[error("Mutation must use FINAL|ACK_REQUIRED and no other flags, got 0x{flags:02x}")]
     MutationFlags { flags: u8 },
 
-    #[error("namespace mutation acknowledgement must be an empty unflagged frame")]
+    #[error("namespace mutation acknowledgement has invalid payload kind, size, or flags")]
     InvalidAck,
 
     #[error("replace-symlink mutation is missing its target")]
@@ -53,7 +53,7 @@ pub enum RemoteMutationError {
     #[error("copy-file mutation is missing its source path")]
     MissingCopySource,
 
-    #[error("copy-file mutation is missing its source identity")]
+    #[error("copy/hardlink mutation is missing its source identity")]
     MissingCopySourceIdentity,
 
     #[error("native symlink target encoding is unsupported for peer platform {0:?}")]
@@ -96,9 +96,9 @@ pub async fn request_replace_symlink(
     expected_identity: Option<EntryIdentity>,
     modified: Option<Timestamp>,
     peer: PlatformOs,
-) -> Result<()> {
+) -> Result<crate::rooted_fs::PublishedEntryProof> {
     ensure_compatible_path_encoding(peer)?;
-    request_mutation(
+    let payload = request_mutation_payload(
         sender,
         WireMutation::replace_symlink(
             encode_relative_path(path.as_path())?,
@@ -107,7 +107,8 @@ pub async fn request_replace_symlink(
             modified.map(|time| (time.seconds(), time.nanoseconds())),
         ),
     )
-    .await
+    .await?;
+    decode_publication_ack(path, EntryKind::Symlink, &payload)
 }
 
 pub async fn request_remove(
@@ -153,25 +154,46 @@ pub async fn request_hardlink(
     sender: &RouterSender,
     source: &RelativePath,
     destination: &RelativePath,
+    source_identity: EntryIdentity,
+    expected_destination: Option<EntryIdentity>,
     peer: PlatformOs,
-) -> Result<()> {
+) -> Result<crate::rooted_fs::PublishedEntryProof> {
     ensure_compatible_path_encoding(peer)?;
-    let source = encode_relative_path(source.as_path())?;
-    let destination = encode_relative_path(destination.as_path())?;
-    request_mutation(sender, WireMutation::hardlink(source, destination)).await
+    let payload = request_mutation_payload(
+        sender,
+        WireMutation::hardlink(
+            encode_relative_path(source.as_path())?,
+            encode_relative_path(destination.as_path())?,
+            *source_identity.as_bytes(),
+            expected_destination.map(|id| *id.as_bytes()),
+        ),
+    )
+    .await?;
+    decode_publication_ack(destination, EntryKind::File, &payload)
 }
 
 pub(crate) async fn request_verify_publication(
     sender: &RouterSender,
-    proof: &crate::rooted_fs::PublishedFileProof,
+    proof: &crate::rooted_fs::PublishedEntryProof,
+    peer: PlatformOs,
+) -> Result<()> {
+    request_verify_destination(sender, &proof.path, proof.kind, proof.identity, peer).await
+}
+
+pub(crate) async fn request_verify_destination(
+    sender: &RouterSender,
+    path: &RelativePath,
+    kind: EntryKind,
+    identity: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<()> {
     ensure_compatible_path_encoding(peer)?;
     request_mutation(
         sender,
         WireMutation::verify_publication(
-            encode_relative_path(proof.path.as_path())?,
-            *proof.identity.as_bytes(),
+            encode_relative_path(path.as_path())?,
+            *identity.as_bytes(),
+            wire_kind(kind),
         ),
     )
     .await
@@ -241,6 +263,8 @@ pub async fn serve_incoming_mutation_rooted(
         .expected_identity()
         .copied()
         .map(EntryIdentity::from_bytes);
+    let source_identity = mutation.source_identity().map(EntryIdentity::from_bytes);
+    let entry_kind = mutation.entry_kind().map(domain_kind);
     let modified = mutation
         .modified()
         .map(|(seconds, nanos)| Timestamp::new(seconds, nanos))
@@ -260,6 +284,8 @@ pub async fn serve_incoming_mutation_rooted(
             copy_source,
             expected_identity,
             modified,
+            source_identity,
+            entry_kind,
         )
     })
     .await
@@ -276,6 +302,7 @@ pub async fn serve_incoming_mutation_rooted(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_mutation(
     rooted: &RootedFs,
     path: RelativePath,
@@ -284,6 +311,8 @@ fn apply_mutation(
     copy_source: Option<RelativePath>,
     expected_identity: Option<EntryIdentity>,
     modified: Option<Timestamp>,
+    source_identity: Option<EntryIdentity>,
+    entry_kind: Option<EntryKind>,
 ) -> Result<Bytes> {
     match kind {
         WireMutationKind::CreateDirectory => {
@@ -296,7 +325,9 @@ fn apply_mutation(
                 crate::endpoint::ExpectedDestination::Absent,
                 crate::endpoint::ExpectedDestination::Unchanged,
             );
-            rooted.replace_symlink_blocking(&path, &target, expected, modified)?;
+            return encode_publication_ack(
+                rooted.publish_symlink_blocking(&path, &target, expected, modified)?,
+            );
         }
         WireMutationKind::RemoveFileLike => {
             rooted.remove_blocking(&path, false, expected_identity)?
@@ -312,7 +343,14 @@ fn apply_mutation(
         }
         WireMutationKind::Hardlink => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
-            rooted.create_hardlink_blocking(&source, &path)?;
+            let identity = source_identity.ok_or(RemoteMutationError::MissingCopySourceIdentity)?;
+            let expected = expected_identity.map_or(
+                crate::endpoint::ExpectedDestination::Absent,
+                crate::endpoint::ExpectedDestination::Unchanged,
+            );
+            return encode_publication_ack(
+                rooted.publish_hardlink_blocking(&source, &path, identity, expected)?,
+            );
         }
         WireMutationKind::VerifyPublication => {
             let identity = expected_identity.ok_or(RemoteMutationError::Protocol(
@@ -321,10 +359,59 @@ fn apply_mutation(
                     reason: "publication verification requires identity",
                 },
             ))?;
-            crate::rooted_fs::PublishedFileProof { path, identity }.revalidate_blocking(rooted)?;
+            let kind = entry_kind.ok_or(RemoteMutationError::InvalidAck)?;
+            crate::rooted_fs::PublishedEntryProof {
+                path,
+                kind,
+                identity,
+            }
+            .revalidate_blocking(rooted)?;
         }
     }
     Ok(Bytes::new())
+}
+
+fn wire_kind(kind: EntryKind) -> WireEntryKind {
+    match kind {
+        EntryKind::File => WireEntryKind::File,
+        EntryKind::Symlink => WireEntryKind::Symlink,
+        EntryKind::Directory => WireEntryKind::Directory,
+    }
+}
+
+fn domain_kind(kind: WireEntryKind) -> EntryKind {
+    match kind {
+        WireEntryKind::File => EntryKind::File,
+        WireEntryKind::Symlink => EntryKind::Symlink,
+        WireEntryKind::Directory => EntryKind::Directory,
+    }
+}
+
+// Publication acknowledgements are fixed-size typed proofs; the request binds
+// their physical address. No path lookup on the requester can mint authority.
+fn encode_publication_ack(proof: crate::rooted_fs::PublishedEntryProof) -> Result<Bytes> {
+    let mut bytes = Vec::with_capacity(33);
+    bytes.push(wire_kind(proof.kind) as u8);
+    bytes.extend_from_slice(proof.identity.as_bytes());
+    Ok(Bytes::from(bytes))
+}
+
+fn decode_publication_ack(
+    path: &RelativePath,
+    kind: EntryKind,
+    bytes: &[u8],
+) -> Result<crate::rooted_fs::PublishedEntryProof> {
+    if bytes.len() != 33 || domain_kind(WireEntryKind::try_from(bytes[0])?) != kind {
+        return Err(RemoteMutationError::InvalidAck);
+    }
+    let identity = bytes[1..]
+        .try_into()
+        .map_err(|_| RemoteMutationError::InvalidAck)?;
+    Ok(crate::rooted_fs::PublishedEntryProof {
+        path: path.clone(),
+        kind,
+        identity: EntryIdentity::from_bytes(identity),
+    })
 }
 
 async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<Bytes> {
@@ -530,7 +617,12 @@ mod tests {
         std::fs::write(root.path().join("basis"), b"basis").unwrap();
         let basis = RelativePath::new("basis").unwrap();
         let linked = RelativePath::new("linked").unwrap();
-        request_hardlink(&client.sender(), &basis, &linked, peer)
+        let basis_id = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::symlink_metadata(root.path().join("basis")).unwrap(),
+            EntryKind::File,
+        )
+        .unwrap();
+        request_hardlink(&client.sender(), &basis, &linked, basis_id, None, peer)
             .await
             .unwrap();
         let dir_meta = std::fs::symlink_metadata(root.path().join("dir")).unwrap();

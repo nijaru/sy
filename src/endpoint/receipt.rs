@@ -11,7 +11,7 @@ pub struct PublishedDestinationReceipt {
     destination_path: RelativePath,
     source_identity: Option<EntryIdentity>,
     verification: VerificationStatus,
-    publication: Option<sy::rooted_fs::PublishedFileProof>,
+    publication: sy::rooted_fs::PublishedEntryProof,
 }
 
 impl PublishedDestinationReceipt {
@@ -27,7 +27,7 @@ impl PublishedDestinationReceipt {
             destination_path,
             source_identity,
             verification: *verification,
-            publication: Some(publication),
+            publication: publication.into(),
         }
     }
 
@@ -35,13 +35,14 @@ impl PublishedDestinationReceipt {
         source_path: RelativePath,
         destination_path: RelativePath,
         source_identity: Option<EntryIdentity>,
+        publication: sy::rooted_fs::PublishedEntryProof,
     ) -> Self {
         Self {
             source_path,
             destination_path,
             source_identity,
             verification: VerificationStatus::NotRequested,
-            publication: None,
+            publication,
         }
     }
 
@@ -49,8 +50,9 @@ impl PublishedDestinationReceipt {
         source_path: RelativePath,
         destination_path: RelativePath,
         source_identity: Option<EntryIdentity>,
+        publication: sy::rooted_fs::PublishedEntryProof,
     ) -> Self {
-        Self::for_symlink(source_path, destination_path, source_identity)
+        Self::for_symlink(source_path, destination_path, source_identity, publication)
     }
 
     pub fn source_path(&self) -> &RelativePath {
@@ -66,10 +68,8 @@ impl PublishedDestinationReceipt {
         !matches!(self.verification, VerificationStatus::Failed { .. })
     }
 
-    pub(crate) fn publication(&self) -> Result<&sy::rooted_fs::PublishedFileProof> {
-        let proof = self.publication.as_ref().ok_or_else(|| {
-            SyncError::Config("publication does not carry a regular-file destination proof".into())
-        })?;
+    pub(crate) fn publication(&self) -> Result<&sy::rooted_fs::PublishedEntryProof> {
+        let proof = &self.publication;
         if proof.path != self.destination_path {
             return Err(SyncError::Config(
                 "publication proof destination address mismatch".into(),
@@ -99,12 +99,11 @@ impl PublishedDestinationReceipt {
         if !self.required_verification_completed() {
             return Err(SyncError::Config("destination verification failed".into()));
         }
-        if let Some(proof) = &self.publication {
-            if proof.path != self.destination_path {
-                return Err(SyncError::Config(
-                    "publication proof destination address mismatch".into(),
-                ));
-            }
+        let proof = self.publication()?;
+        if proof.kind != source.kind {
+            return Err(SyncError::Config(
+                "publication proof entry kind mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -176,7 +175,7 @@ mod tests {
                 proof.clone(),
             );
             assert!(receipt.validate_source_removal(&source).is_ok());
-            assert_eq!(receipt.publication().unwrap(), &proof);
+            assert_eq!(receipt.publication().unwrap(), &proof.clone().into());
             let mut changed = source.clone();
             changed.identity = Some(EntryIdentity::from_bytes([3; 32]));
             assert!(receipt.validate_source_removal(&changed).is_err());

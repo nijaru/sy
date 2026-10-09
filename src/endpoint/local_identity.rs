@@ -19,7 +19,7 @@ pub(crate) fn metadata_identity(
     kind: EntryKind,
 ) -> Option<EntryIdentity> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sy-entry-identity-v1\0");
+    hasher.update(b"sy-entry-identity-v2\0");
     hasher.update(&metadata.dev().to_le_bytes());
     hasher.update(&metadata.ino().to_le_bytes());
     if kind == EntryKind::Directory {
@@ -27,6 +27,7 @@ pub(crate) fn metadata_identity(
         hasher.update(&[entry_kind_tag(kind)]);
         return Some(EntryIdentity::from_bytes(*hasher.finalize().as_bytes()));
     }
+    hasher.update(&metadata.nlink().to_le_bytes());
     hasher.update(&metadata.len().to_le_bytes());
     hasher.update(&metadata.mode().to_le_bytes());
     hasher.update(&metadata.mtime().to_le_bytes());
@@ -45,7 +46,7 @@ pub(crate) fn stat_identity(stat: &libc::stat, kind: EntryKind) -> Option<EntryI
     let mode = stat.st_mode as u32;
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sy-entry-identity-v1\0");
+    hasher.update(b"sy-entry-identity-v2\0");
     hasher.update(&dev.to_le_bytes());
     hasher.update(&ino.to_le_bytes());
     if kind == EntryKind::Directory {
@@ -59,6 +60,7 @@ pub(crate) fn stat_identity(stat: &libc::stat, kind: EntryKind) -> Option<EntryI
     let ctime = stat.st_ctime as i64;
     let ctime_nsec = stat.st_ctime_nsec as i64;
 
+    hasher.update(&(stat.st_nlink as u64).to_le_bytes());
     hasher.update(&len.to_le_bytes());
     hasher.update(&mode.to_le_bytes());
     hasher.update(&mtime.to_le_bytes());

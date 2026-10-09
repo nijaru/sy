@@ -600,6 +600,35 @@ impl RootedPublishedFile {
     }
 }
 
+/// Finalized publication of an entry, bound to the original staging authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedEntryProof {
+    pub path: RelativePath,
+    pub kind: EntryKind,
+    pub identity: EntryIdentity,
+}
+
+impl From<PublishedFileProof> for PublishedEntryProof {
+    fn from(proof: PublishedFileProof) -> Self {
+        Self {
+            path: proof.path,
+            kind: EntryKind::File,
+            identity: proof.identity,
+        }
+    }
+}
+
+impl PublishedEntryProof {
+    pub fn revalidate_blocking(&self, rooted: &RootedFs) -> Result<()> {
+        if rooted.path_identity_blocking(&self.path)? != Some((self.kind, self.identity)) {
+            return Err(RootedFsError::DestinationChanged(
+                self.path.as_path().to_path_buf(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PublishedFileProof {
     /// Observational revalidation, not a filesystem compare-and-swap. A concurrent
     /// namespace writer can still race the later source unlink; exclusive access
@@ -1219,7 +1248,33 @@ impl RootedFs {
         source: &RelativePath,
         destination: &RelativePath,
     ) -> Result<()> {
-        self.create_hardlink_path_blocking(source.as_path(), destination.as_path())
+        let (_, identity) = self
+            .path_identity_blocking(source)?
+            .ok_or_else(|| RootedFsError::DestinationChanged(source.as_path().to_path_buf()))?;
+        self.publish_hardlink_blocking(
+            source,
+            destination,
+            identity,
+            ExpectedDestination::SnapshotAtOpen,
+        )
+        .map(|_| ())
+    }
+
+    /// Observed group work must carry both the owned representative and scanned
+    /// destination expectation. SnapshotAtOpen is not authority for such work.
+    pub fn publish_hardlink_blocking(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        expected_source: EntryIdentity,
+        expected_destination: ExpectedDestination,
+    ) -> Result<PublishedEntryProof> {
+        self.create_hardlink_path_blocking(
+            source.as_path(),
+            destination.as_path(),
+            expected_source,
+            expected_destination,
+        )
     }
 
     /// Copy one regular file to another root-relative path (`--backup`). The
@@ -1286,8 +1341,42 @@ impl RootedFs {
         expected: ExpectedDestination,
         modified: Option<Timestamp>,
     ) -> Result<()> {
-        let staged = self.begin_staged_symlink_blocking(relative, target, expected, modified)?;
-        staged.commit()
+        self.publish_symlink_blocking(relative, target, expected, modified)
+            .map(|_| ())
+    }
+
+    pub fn publish_symlink_blocking(
+        &self,
+        relative: &RelativePath,
+        target: &Path,
+        expected: ExpectedDestination,
+        modified: Option<Timestamp>,
+    ) -> Result<PublishedEntryProof> {
+        #[cfg(unix)]
+        {
+            let mut staged =
+                self.begin_staged_symlink_blocking(relative, target, expected, modified)?;
+            let held = match open_symlink_at(staged.staging_dir_fd.as_raw_fd(), &staged.temp_name) {
+                Ok(file) => file,
+                Err(error) => return Err(staged.abort_after(error)),
+            };
+            staged.commit()?;
+            let identity = identity_from_stat(&stat_fd(held.as_raw_fd())?).ok_or_else(|| {
+                RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+            })?;
+            let proof = PublishedEntryProof {
+                path: relative.clone(),
+                kind: EntryKind::Symlink,
+                identity,
+            };
+            proof.revalidate_blocking(self)?;
+            Ok(proof)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, target, expected, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     fn begin_staged_symlink_blocking(
@@ -1693,7 +1782,13 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn create_hardlink_path_blocking(&self, source: &Path, destination: &Path) -> Result<()> {
+    fn create_hardlink_path_blocking(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected_source: EntryIdentity,
+        expected_destination: ExpectedDestination,
+    ) -> Result<PublishedEntryProof> {
         self.require_writable()?;
         let (source_parent, source_leaf) = self.open_parent_blocking(source)?;
         let source_file = open_file_at(source_parent.as_raw_fd(), &source_leaf)?;
@@ -1703,8 +1798,16 @@ impl RootedFs {
         if let Some(parent) = destination.parent() {
             self.ensure_directories_blocking(parent)?;
         }
-        let (destination_parent, destination_leaf) = self.open_parent_blocking(destination)?;
-        if let Some(dest) = stat_at_optional(destination_parent.as_raw_fd(), &destination_leaf)? {
+        let initial = stat_fd(source_file.as_raw_fd())?;
+        if identity_from_stat(&initial) != Some(expected_source) {
+            return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+        }
+        let before = hardlink_state_from_stat(&initial, source)?;
+        let mut namespace = self.begin_namespace_blocking(destination, expected_destination)?;
+        namespace.verify_expected_destination()?;
+        if let Some(dest) =
+            stat_at_optional(namespace.parent_fd.as_raw_fd(), &namespace.destination_name)?
+        {
             if dest.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 return Err(RootedFsError::EntryKindMismatch {
                     path: destination.to_path_buf(),
@@ -1715,17 +1818,25 @@ impl RootedFs {
             // An existing group member already has the required topology.
             // Do not invalidate its captured ctime by staging another link.
             if dest.st_dev == source_stat.st_dev && dest.st_ino == source_stat.st_ino {
-                return Ok(());
+                namespace.abort()?;
+                let proof = PublishedEntryProof {
+                    path: RelativePath::new(destination.to_path_buf())
+                        .map_err(|_| RootedFsError::InvalidRelativePath)?,
+                    kind: EntryKind::File,
+                    identity: expected_source,
+                };
+                proof.revalidate_blocking(self)?;
+                return Ok(proof);
             }
         }
-        let mut namespace =
-            self.begin_namespace_blocking(destination, ExpectedDestination::SnapshotAtOpen)?;
         let prepare = || -> Result<()> {
             self.verify_parent_binding_blocking(source, &source_parent)?;
             let held = stat_fd(source_file.as_raw_fd())?;
             let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?
                 .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
-            if identity_from_stat(&held) != identity_from_stat(&named) {
+            if identity_from_stat(&held) != Some(expected_source)
+                || identity_from_stat(&named) != Some(expected_source)
+            {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
             // Even a private hardlink changes the visible source inode's nlink
@@ -1746,16 +1857,43 @@ impl RootedFs {
             if staged.st_dev != held.st_dev || staged.st_ino != held.st_ino {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
+            let after = hardlink_state_from_stat(&stat_fd(source_file.as_raw_fd())?, source)?;
+            if !after_own_link(before, after)
+                || identity_from_stat(&staged)
+                    != identity_from_stat(&stat_fd(source_file.as_raw_fd())?)
+            {
+                return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+            }
             self.verify_parent_binding_blocking(source, &source_parent)
         };
         if let Err(error) = prepare() {
             return Err(namespace.abort_after(error));
         }
-        namespace.commit()
+        namespace.commit()?;
+        let final_stat = stat_fd(source_file.as_raw_fd())?;
+        let after = hardlink_state_from_stat(&final_stat, source)?;
+        if !after_own_link(before, after) {
+            return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+        }
+        let proof = PublishedEntryProof {
+            path: RelativePath::new(destination.to_path_buf())
+                .map_err(|_| RootedFsError::InvalidRelativePath)?,
+            kind: EntryKind::File,
+            identity: identity_from_stat(&final_stat)
+                .ok_or_else(|| RootedFsError::DestinationChanged(destination.to_path_buf()))?,
+        };
+        proof.revalidate_blocking(self)?;
+        Ok(proof)
     }
 
     #[cfg(not(unix))]
-    fn create_hardlink_path_blocking(&self, _source: &Path, _destination: &Path) -> Result<()> {
+    fn create_hardlink_path_blocking(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+        _expected_source: EntryIdentity,
+        _expected_destination: ExpectedDestination,
+    ) -> Result<PublishedEntryProof> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -2556,6 +2694,46 @@ fn hardlink_state_from_stat(metadata: &libc::stat, path: &Path) -> Result<Hardli
         ctime_nsec: metadata.st_ctime_nsec as i64,
         nlink: metadata.st_nlink as u64,
     })
+}
+
+#[cfg(unix)]
+fn after_own_link(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
+    before.dev == after.dev
+        && before.ino == after.ino
+        && before.size == after.size
+        && before.mode == after.mode
+        && before.mtime == after.mtime
+        && before.mtime_nsec == after.mtime_nsec
+        && before.nlink.checked_add(1) == Some(after.nlink)
+}
+
+#[cfg(unix)]
+fn open_symlink_at(parent: RawFd, component: &OsStr) -> Result<File> {
+    let name = component_cstring(component)?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_SYMLINK | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(RootedFsError::UnsupportedPlatform);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: the parent and NUL-terminated name are live; these native flags
+        // hold the symlink inode itself, never its target.
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: successful openat transferred one owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if stat_fd(file.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(RootedFsError::EntryKindMismatch {
+                path: PathBuf::from(component),
+                expected: EntryKind::Symlink,
+            });
+        }
+        Ok(file)
+    }
 }
 
 #[cfg(unix)]
