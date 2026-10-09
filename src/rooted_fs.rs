@@ -230,10 +230,13 @@ pub(crate) struct HardlinkSourceState {
     pub(crate) ctime: i64,
     pub(crate) ctime_nsec: i64,
     pub(crate) nlink: u64,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) flags: u32,
 }
 
 impl HardlinkSourceState {
-    pub(crate) const ENCODED_BYTES: usize = 68;
+    pub(crate) const ENCODED_BYTES: usize = 80;
 
     pub(crate) fn encode(self) -> [u8; Self::ENCODED_BYTES] {
         let mut bytes = [0; Self::ENCODED_BYTES];
@@ -246,6 +249,9 @@ impl HardlinkSourceState {
         bytes[44..52].copy_from_slice(&self.ctime.to_le_bytes());
         bytes[52..60].copy_from_slice(&self.ctime_nsec.to_le_bytes());
         bytes[60..68].copy_from_slice(&self.nlink.to_le_bytes());
+        bytes[68..72].copy_from_slice(&self.uid.to_le_bytes());
+        bytes[72..76].copy_from_slice(&self.gid.to_le_bytes());
+        bytes[76..80].copy_from_slice(&self.flags.to_le_bytes());
         bytes
     }
 
@@ -266,6 +272,9 @@ impl HardlinkSourceState {
             ctime: i64::from_le_bytes(bytes[44..52].try_into().map_err(|_| invalid_state())?),
             ctime_nsec: i64::from_le_bytes(bytes[52..60].try_into().map_err(|_| invalid_state())?),
             nlink: u64::from_le_bytes(bytes[60..68].try_into().map_err(|_| invalid_state())?),
+            uid: u32::from_le_bytes(bytes[68..72].try_into().map_err(|_| invalid_state())?),
+            gid: u32::from_le_bytes(bytes[72..76].try_into().map_err(|_| invalid_state())?),
+            flags: u32::from_le_bytes(bytes[76..80].try_into().map_err(|_| invalid_state())?),
         })
     }
 }
@@ -3008,18 +3017,30 @@ fn hardlink_state_from_stat(metadata: &libc::stat, path: &Path) -> Result<Hardli
         ctime: metadata.st_ctime as i64,
         ctime_nsec: metadata.st_ctime_nsec as i64,
         nlink: metadata.st_nlink as u64,
+        uid: metadata.st_uid as u32,
+        gid: metadata.st_gid as u32,
+        #[cfg(target_os = "macos")]
+        flags: metadata.st_flags,
+        #[cfg(not(target_os = "macos"))]
+        flags: 0,
     })
 }
 
 #[cfg(unix)]
+fn same_hardlink_preserved_state(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
+    // An owned namespace effect may advance ctime/nlink, never ownership,
+    // bytes, permissions, timestamps, or cheap native stat flags.
+    HardlinkSourceState {
+        ctime: after.ctime,
+        ctime_nsec: after.ctime_nsec,
+        nlink: after.nlink,
+        ..before
+    } == after
+}
+
+#[cfg(unix)]
 fn after_own_link(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
-    before.dev == after.dev
-        && before.ino == after.ino
-        && before.size == after.size
-        && before.mode == after.mode
-        && before.mtime == after.mtime
-        && before.mtime_nsec == after.mtime_nsec
-        && before.nlink.checked_add(1) == Some(after.nlink)
+    same_hardlink_preserved_state(before, after) && before.nlink.checked_add(1) == Some(after.nlink)
 }
 
 #[cfg(unix)]
@@ -3053,13 +3074,7 @@ fn open_symlink_at(parent: RawFd, component: &OsStr) -> Result<File> {
 
 #[cfg(unix)]
 fn after_own_unlink(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
-    before.dev == after.dev
-        && before.ino == after.ino
-        && before.size == after.size
-        && before.mode == after.mode
-        && before.mtime == after.mtime
-        && before.mtime_nsec == after.mtime_nsec
-        && before.nlink == after.nlink.saturating_add(1)
+    same_hardlink_preserved_state(before, after) && before.nlink.checked_sub(1) == Some(after.nlink)
 }
 
 #[cfg(unix)]
@@ -3686,6 +3701,52 @@ mod tests {
             .into_iter()
             .filter(|(name, _)| name.to_string_lossy().starts_with("user."))
             .collect()
+    }
+
+    #[test]
+    fn owned_hardlink_effects_preserve_ownership_and_native_stat_flags() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let alias = root.path().join("alias");
+        std::fs::write(&source, b"bytes").unwrap();
+        let held = File::open(&source).unwrap();
+        let before =
+            hardlink_state_from_stat(&stat_fd(held.as_raw_fd()).unwrap(), &source).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let linked =
+            hardlink_state_from_stat(&stat_fd(held.as_raw_fd()).unwrap(), &source).unwrap();
+        assert!(after_own_link(before, linked));
+        std::fs::remove_file(&alias).unwrap();
+        let unlinked =
+            hardlink_state_from_stat(&stat_fd(held.as_raw_fd()).unwrap(), &source).unwrap();
+        assert!(after_own_unlink(linked, unlinked));
+        for (original, effect, is_link) in [(before, linked, true), (linked, unlinked, false)] {
+            // Scratch encoding must retain the same ownership authority too.
+            assert_eq!(
+                HardlinkSourceState::decode(&effect.encode()).unwrap(),
+                effect
+            );
+            for changed in [
+                HardlinkSourceState {
+                    uid: effect.uid ^ 1,
+                    ..effect
+                },
+                HardlinkSourceState {
+                    gid: effect.gid ^ 1,
+                    ..effect
+                },
+                HardlinkSourceState {
+                    flags: effect.flags ^ 1,
+                    ..effect
+                },
+            ] {
+                assert!(!if is_link {
+                    after_own_link(original, changed)
+                } else {
+                    after_own_unlink(original, changed)
+                });
+            }
+        }
     }
 
     #[tokio::test]
