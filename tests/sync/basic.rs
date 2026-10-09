@@ -5,12 +5,14 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 
 fn sy_bin() -> String {
     env!("CARGO_BIN_EXE_sy").to_string()
+}
+
+fn set_mtime(path: impl AsRef<std::path::Path>, seconds: i64) {
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
 }
 
 fn setup_test_dir(_name: &str) -> (TempDir, TempDir) {
@@ -165,10 +167,10 @@ fn test_update_existing_files() {
         "original"
     );
 
-    // Wait to ensure mtime changes
-    thread::sleep(Duration::from_secs(2));
-
-    fs::write(source.path().join("file.txt"), "updated").unwrap();
+    // Equal lengths make this an mtime-driven update, not a size mismatch.
+    set_mtime(dest.path().join("file.txt"), 1_700_000_000);
+    fs::write(source.path().join("file.txt"), "modified").unwrap();
+    set_mtime(source.path().join("file.txt"), 1_700_000_002);
 
     let output = Command::new(sy_bin())
         .args([
@@ -181,7 +183,7 @@ fn test_update_existing_files() {
     assert!(output.status.success());
     assert_eq!(
         fs::read_to_string(dest.path().join("file.txt")).unwrap(),
-        "updated"
+        "modified"
     );
 }
 
@@ -336,11 +338,14 @@ fn test_update_shows_correct_stats() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Files created:     2"));
 
-    // Wait to ensure mtime changes
-    thread::sleep(Duration::from_secs(2));
-
+    for name in ["file1.txt", "file2.txt"] {
+        set_mtime(dest.path().join(name), 1_700_000_000);
+    }
     fs::write(source.path().join("file1.txt"), "updated content v1").unwrap();
     fs::write(source.path().join("file2.txt"), "updated content v2").unwrap();
+    for name in ["file1.txt", "file2.txt"] {
+        set_mtime(source.path().join(name), 1_700_000_002);
+    }
 
     let output = Command::new(sy_bin())
         .args([
@@ -352,7 +357,16 @@ fn test_update_shows_correct_stats() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Files updated:     2") || stdout.contains("Files updated:     1"));
+    assert!(stdout.contains("Files updated:     2"), "{stdout}");
+    for (name, expected) in [
+        ("file1.txt", "updated content v1"),
+        ("file2.txt", "updated content v2"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(dest.path().join(name)).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -380,12 +394,18 @@ fn test_gitignore_support() {
 }
 
 #[test]
-fn test_large_file_update_with_delta_sync() {
-    let (source, dest) = setup_test_dir("large_delta");
-
-    // Create large file in source (10MB)
-    let large_content = vec![0u8; 10 * 1024 * 1024];
-    fs::write(source.path().join("large.bin"), &large_content).unwrap();
+fn test_large_file_partial_update_preserves_unmodified_blocks() {
+    use std::io::{Read, Write};
+    let (source, dest) = setup_test_dir("large_partial_update");
+    let path = source.path().join("large.bin");
+    let mut block = [0_u8; 64 * 1024];
+    {
+        let mut file = fs::File::create(&path).unwrap();
+        for index in 0..160_u8 {
+            block.fill(index);
+            file.write_all(&block).unwrap();
+        }
+    }
 
     // Initial sync
     let output = Command::new(sy_bin())
@@ -398,17 +418,14 @@ fn test_large_file_update_with_delta_sync() {
         .unwrap();
     assert!(output.status.success());
 
-    // Sleep to ensure mtime differs (need >2s because mtime tolerance is 1s and as_secs() truncates)
-    std::thread::sleep(std::time::Duration::from_millis(2100));
-
-    // Modify part of the file
-    let mut modified = large_content;
-    for byte in &mut modified[..1024] {
-        *byte = 1;
+    set_mtime(dest.path().join("large.bin"), 1_700_000_000);
+    {
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(&[255_u8; 1024]).unwrap();
     }
-    fs::write(source.path().join("large.bin"), &modified).unwrap();
+    set_mtime(&path, 1_700_000_002);
 
-    // Second sync should use delta
+    // Assert payload correctness, not a platform-dependent byte strategy.
     let output = Command::new(sy_bin())
         .args([
             &format!("{}/", source.path().display()),
@@ -418,7 +435,19 @@ fn test_large_file_update_with_delta_sync() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(fs::read(dest.path().join("large.bin")).unwrap(), modified);
+    for path in [path, dest.path().join("large.bin")] {
+        let mut file = fs::File::open(path).unwrap();
+        let mut actual = [0_u8; 64 * 1024];
+        for index in 0..160_u8 {
+            block.fill(index);
+            if index == 0 {
+                block[..1024].fill(255);
+            }
+            file.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, block, "block {index}");
+        }
+        assert_eq!(file.read(&mut actual).unwrap(), 0);
+    }
 }
 
 #[test]
@@ -600,15 +629,10 @@ fn test_stats_flag() {
 #[test]
 fn test_backup_flag() {
     let (source, dest) = setup_test_dir("backup");
-
-    // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-
-    // Wait to ensure source is newer
-    thread::sleep(Duration::from_secs(2));
-
-    // Create updated file in source
+    set_mtime(dest.path().join("file.txt"), 1_700_000_000);
     fs::write(source.path().join("file.txt"), "new content").unwrap();
+    set_mtime(source.path().join("file.txt"), 1_700_000_002);
 
     let output = Command::new(sy_bin())
         .args([
@@ -626,6 +650,10 @@ fn test_backup_flag() {
     assert!(
         dest.path().join("file.txt~").exists(),
         "Backup file should exist"
+    );
+    assert_eq!(
+        fs::read(dest.path().join("file.txt~")).unwrap(),
+        b"old content"
     );
     assert_eq!(
         fs::read_to_string(dest.path().join("file.txt")).unwrap(),
@@ -1131,15 +1159,10 @@ fn test_concurrent_sync_safety() {
 #[test]
 fn test_backup_dir_flag() {
     let (source, dest) = setup_test_dir("backup_dir");
-
-    // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-
-    // Wait to ensure source is newer
-    thread::sleep(Duration::from_secs(2));
-
-    // Create updated file in source
+    set_mtime(dest.path().join("file.txt"), 1_700_000_000);
     fs::write(source.path().join("file.txt"), "new content").unwrap();
+    set_mtime(source.path().join("file.txt"), 1_700_000_002);
 
     let backup_dir = dest.path().join("backups");
     let output = Command::new(sy_bin())
@@ -1269,14 +1292,15 @@ fn test_backup_readonly_dir() {
     // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
 
-    // Make dest read-only
-    let mut perms = fs::metadata(dest.path()).unwrap().permissions();
+    set_mtime(dest.path().join("file.txt"), 1_700_000_000);
+    // Preserve the original directory search permissions for cleanup.
+    let original_permissions = fs::metadata(dest.path()).unwrap().permissions();
+    let mut perms = original_permissions.clone();
     perms.set_readonly(true);
     fs::set_permissions(dest.path(), perms).unwrap();
 
-    // Create updated file in source
-    thread::sleep(Duration::from_secs(2));
     fs::write(source.path().join("file.txt"), "new content").unwrap();
+    set_mtime(source.path().join("file.txt"), 1_700_000_002);
 
     let output = Command::new(sy_bin())
         .args([
@@ -1302,23 +1326,24 @@ fn test_backup_readonly_dir() {
         stderr
     );
 
-    // Restore permissions for cleanup
-    let perms = fs::Permissions::from_mode(0o644);
-    fs::set_permissions(dest.path(), perms).unwrap();
+    fs::set_permissions(dest.path(), original_permissions).unwrap();
+    assert_eq!(
+        fs::read(dest.path().join("file.txt")).unwrap(),
+        b"old content"
+    );
+    assert_eq!(
+        fs::read(source.path().join("file.txt")).unwrap(),
+        b"new content"
+    );
 }
 
 #[test]
 fn test_backup_dir_nonexistent() {
     let (source, dest) = setup_test_dir("backup_dir_nonexistent");
-
-    // Create initial file in dest
     fs::write(dest.path().join("file.txt"), "old content").unwrap();
-
-    // Wait to ensure source is newer
-    thread::sleep(Duration::from_secs(2));
-
-    // Create updated file in source
+    set_mtime(dest.path().join("file.txt"), 1_700_000_000);
     fs::write(source.path().join("file.txt"), "new content").unwrap();
+    set_mtime(source.path().join("file.txt"), 1_700_000_002);
 
     // Use a non-existent backup dir (should be created automatically)
     let backup_dir = dest.path().join("nonexistent").join("backups");
@@ -1344,43 +1369,6 @@ fn test_backup_dir_nonexistent() {
     assert_eq!(
         fs::read_to_string(dest.path().join("file.txt")).unwrap(),
         "new content"
-    );
-}
-
-#[test]
-fn test_backup_preserves_original() {
-    let (source, dest) = setup_test_dir("backup_preserves");
-
-    // Create initial file in dest with specific content
-    fs::write(dest.path().join("file.txt"), "original content").unwrap();
-
-    // Wait to ensure source is newer
-    thread::sleep(Duration::from_secs(2));
-
-    // Create updated file in source
-    fs::write(source.path().join("file.txt"), "updated content").unwrap();
-
-    let output = Command::new(sy_bin())
-        .args([
-            &format!("{}/", source.path().display()),
-            dest.path().to_str().unwrap(),
-            "--exclude-vcs",
-            "--backup",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    // Check backup file contains original content
-    assert_eq!(
-        fs::read_to_string(dest.path().join("file.txt~")).unwrap(),
-        "original content"
-    );
-    // Check main file contains updated content
-    assert_eq!(
-        fs::read_to_string(dest.path().join("file.txt")).unwrap(),
-        "updated content"
     );
 }
 
