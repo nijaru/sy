@@ -179,7 +179,7 @@ async fn execute_with_handle(
     // The remote source walk is no-follow under root confinement, so no
     // follow selection exists; symlinks reconcile by target. Delete stays
     // disabled on v3 pull until the server-side ignore-scope design lands.
-    let plan = preflight_sync_scoped_with_content(
+    let mut plan = preflight_sync_scoped_with_content(
         OrderedReconciler::new(source, destination),
         comparison_policy(
             config,
@@ -212,6 +212,30 @@ async fn execute_with_handle(
     )
     .await
     .map_err(map_controller_error)?;
+
+    if config.preserve.hardlinks {
+        plan.validate_hardlink_bytes(|commitment| {
+            let remote = remote.clone();
+            let executor = &executor;
+            async move {
+                match commitment {
+                    sy::engine::hardlink_preflight::ByteCommitment::Source(entry) => {
+                        remote.content_hash(&entry).await.map_err(|error| {
+                            ControllerError::backend("source hardlink byte commitment", error)
+                        })
+                    }
+                    sy::engine::hardlink_preflight::ByteCommitment::Destination(entry) => executor
+                        .destination_content_hash(entry)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::backend("destination hardlink byte commitment", error)
+                        }),
+                }
+            }
+        })
+        .await
+        .map_err(map_controller_error)?;
+    }
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
@@ -273,6 +297,31 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hardlink_preflight_byte_commitments() {
+        super::super::hardlink_tests::assert_byte_commitments(
+            |source, destination, config| async move {
+                let (client, server) = super::super::hardlink_tests::remote_session(
+                    sy::protocol::Operation::Pull,
+                    &source,
+                )
+                .await;
+                let result = execute_with_handle(
+                    &source,
+                    &destination,
+                    client.request_handle(),
+                    client.sender(),
+                    &config,
+                    ScanOptions::default(),
+                )
+                .await;
+                super::super::hardlink_tests::finish_session(client, server).await;
+                result
+            },
+        )
+        .await;
+    }
     use crate::sync::scanner::ScanOptions;
     use sy::protocol::Operation;
     use sy::remote::runtime::{IncomingRequest, ServerRemoteSession};

@@ -1,10 +1,7 @@
 //! Exact session-local hardlink representatives without a tree-sized cache.
-//!
-//! A compressed binary radix index and its variable-length records share one
-//! anonymous scratch file. Lookup visits at most 256 branches, retaining one
-//! record; neither group count nor path ordering increases RAM or descriptors.
-//! Executors serialize publication and insertion with their async group lock.
-
+//! The shared disk radix index stores offsets into bounded native-path records;
+//! neither group count nor path ordering increases RAM or descriptors.
+use super::disk_radix::DiskRadix;
 use super::domain::{EntryIdentity, RelativePath, Timestamp};
 use super::native_path;
 use std::fs::File;
@@ -12,7 +9,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
 const MAX_PATH_BYTES: usize = 1024 * 1024;
-const BRANCH_BYTES: usize = 19;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HardlinkRepresentative {
@@ -40,7 +36,7 @@ impl HardlinkRepresentative {
 }
 
 /// Lazily creates scratch state only when a grouped transfer actually runs.
-/// The blocking lock protects file seeks inside workers, never across `.await`;
+/// The blocking lock protects file seeks inside workers, never across await;
 /// the executor's async lock separately protects the publication protocol.
 #[derive(Default)]
 pub(crate) struct HardlinkGroups {
@@ -78,7 +74,7 @@ impl HardlinkGroups {
             if state.is_none() {
                 *state = Some(DiskIndex {
                     file: tempfile::tempfile()?,
-                    root: None,
+                    index: DiskRadix::new()?,
                     healthy: true,
                 });
             }
@@ -95,74 +91,29 @@ impl HardlinkGroups {
 
 struct DiskIndex {
     file: File,
-    root: Option<u64>,
-    // A partial scratch write must fail the session, not look like a missing
-    // representative and authorize an independent transfer of a group member.
+    index: DiskRadix,
+    // A partial observation write must not become fresh publication authority.
     healthy: bool,
-}
-
-enum Node {
-    Branch { bit: u16, children: [u64; 2] },
-    Leaf([u8; 32]),
 }
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn side(key: &[u8; 32], bit: u16) -> usize {
-    usize::from((key[usize::from(bit / 8)] >> (7 - bit % 8)) & 1)
-}
-
 impl DiskIndex {
-    fn node(&mut self, offset: u64) -> io::Result<Node> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut tag = [0];
-        self.file.read_exact(&mut tag)?;
-        match tag[0] {
-            0 => {
-                let mut bytes = [0; BRANCH_BYTES - 1];
-                self.file.read_exact(&mut bytes)?;
-                let bit = u16::from_le_bytes([bytes[0], bytes[1]]);
-                if bit >= 256 {
-                    return Err(invalid("invalid hardlink branch bit"));
-                }
-                let mut children = [0; 2];
-                for (child, bytes) in children.iter_mut().zip(bytes[2..].as_chunks::<8>().0) {
-                    *child = u64::from_le_bytes(*bytes);
-                }
-                Ok(Node::Branch { bit, children })
-            }
-            1 => {
-                let mut key = [0; 32];
-                self.file.read_exact(&mut key)?;
-                Ok(Node::Leaf(key))
-            }
-            _ => Err(invalid("invalid hardlink node tag")),
-        }
-    }
-
-    fn get(&mut self, key: [u8; 32]) -> io::Result<Option<HardlinkRepresentative>> {
+    fn offset(&mut self, key: [u8; 32]) -> io::Result<Option<u64>> {
         if !self.healthy {
             return Err(invalid("hardlink scratch index is incomplete"));
         }
-        let Some(mut cursor) = self.root else {
+        self.index.get(key)
+    }
+
+    fn get(&mut self, key: [u8; 32]) -> io::Result<Option<HardlinkRepresentative>> {
+        let Some(offset) = self.offset(key)? else {
             return Ok(None);
         };
-        let mut previous_bit = None;
-        loop {
-            match self.node(cursor)? {
-                Node::Branch { bit, children } => {
-                    if previous_bit.is_some_and(|previous| bit <= previous) {
-                        return Err(invalid("unordered hardlink branch bits"));
-                    }
-                    previous_bit = Some(bit);
-                    cursor = children[side(&key, bit)];
-                }
-                Node::Leaf(found) if found == key => return self.read_representative().map(Some),
-                Node::Leaf(_) => return Ok(None),
-            }
-        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.read_representative().map(Some)
     }
 
     fn read_representative(&mut self) -> io::Result<HardlinkRepresentative> {
@@ -206,34 +157,18 @@ impl DiskIndex {
     }
 
     fn advance(&mut self, key: [u8; 32], identity: EntryIdentity) -> io::Result<()> {
-        if !self.healthy {
-            return Err(invalid("hardlink scratch index is incomplete"));
-        }
-        let mut cursor = self.root.ok_or_else(|| invalid("missing hardlink group"))?;
-        let mut previous_bit = None;
-        loop {
-            match self.node(cursor)? {
-                Node::Branch { bit, children } => {
-                    if previous_bit.is_some_and(|previous| bit <= previous) {
-                        return Err(invalid("unordered hardlink branch bits"));
-                    }
-                    previous_bit = Some(bit);
-                    cursor = children[side(&key, bit)];
-                }
-                Node::Leaf(found) if found == key => {
-                    self.healthy = false;
-                    self.file.seek(SeekFrom::Start(cursor + 1 + 32 + 21))?;
-                    self.file.write_all(identity.as_bytes())?;
-                    self.healthy = true;
-                    return Ok(());
-                }
-                Node::Leaf(_) => return Err(invalid("missing hardlink group")),
-            }
-        }
+        let offset = self
+            .offset(key)?
+            .ok_or_else(|| invalid("missing hardlink group"))?;
+        self.healthy = false;
+        self.file.seek(SeekFrom::Start(offset + 21))?;
+        self.file.write_all(identity.as_bytes())?;
+        self.healthy = true;
+        Ok(())
     }
 
     fn insert(&mut self, key: [u8; 32], value: HardlinkRepresentative) -> io::Result<()> {
-        if self.get(key)?.is_some() {
+        if self.offset(key)?.is_some() {
             return Err(invalid("hardlink representative already published"));
         }
         let path = native_path::encode(value.path.as_path().as_os_str());
@@ -241,9 +176,7 @@ impl DiskIndex {
             return Err(invalid("hardlink path exceeds scratch record limit"));
         }
         self.healthy = false;
-        let leaf = self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&[1])?;
-        self.file.write_all(&key)?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&(path.len() as u32).to_le_bytes())?;
         self.file.write_all(&[
             u8::from(value.unix_mode.is_some()) | (u8::from(value.modified.is_some()) << 1)
@@ -255,58 +188,7 @@ impl DiskIndex {
         self.file.write_all(&modified.nanoseconds().to_le_bytes())?;
         self.file.write_all(value.publication.as_bytes())?;
         self.file.write_all(&path)?;
-
-        if let Some(root) = self.root {
-            let mut cursor = root;
-            let found = loop {
-                match self.node(cursor)? {
-                    Node::Branch { bit, children } => cursor = children[side(&key, bit)],
-                    Node::Leaf(found) => break found,
-                }
-            };
-            let bit = key
-                .iter()
-                .zip(found)
-                .enumerate()
-                .find_map(|(index, (a, b))| {
-                    let difference = a ^ b;
-                    (difference != 0)
-                        .then(|| (index * 8 + difference.leading_zeros() as usize) as u16)
-                })
-                .ok_or_else(|| invalid("duplicate hardlink key"))?;
-
-            cursor = root;
-            let mut parent_slot = None;
-            loop {
-                match self.node(cursor)? {
-                    Node::Branch {
-                        bit: branch_bit,
-                        children,
-                    } if branch_bit < bit => {
-                        let child = side(&key, branch_bit);
-                        parent_slot = Some(cursor + 3 + child as u64 * 8);
-                        cursor = children[child];
-                    }
-                    _ => break,
-                }
-            }
-            let branch = self.file.seek(SeekFrom::End(0))?;
-            let mut children = [cursor; 2];
-            children[side(&key, bit)] = leaf;
-            self.file.write_all(&[0])?;
-            self.file.write_all(&bit.to_le_bytes())?;
-            for child in children {
-                self.file.write_all(&child.to_le_bytes())?;
-            }
-            if let Some(slot) = parent_slot {
-                self.file.seek(SeekFrom::Start(slot))?;
-                self.file.write_all(&branch.to_le_bytes())?;
-            } else {
-                self.root = Some(branch);
-            }
-        } else {
-            self.root = Some(leaf);
-        }
+        self.index.insert(key, offset)?;
         self.healthy = true;
         Ok(())
     }
@@ -428,29 +310,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_corruption_fails_without_unbounded_allocation_or_cycles() {
+    async fn scratch_corruption_fails_without_unbounded_allocation() {
         let groups = HardlinkGroups::default();
         groups.insert([0; 32], representative(0)).await.unwrap();
         groups
             .with_disk(|disk| {
-                disk.file.seek(SeekFrom::Start(33))?;
+                disk.file.seek(SeekFrom::Start(0))?;
                 disk.file.write_all(&u32::MAX.to_le_bytes())
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            groups.get([0; 32]).await.unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let groups = HardlinkGroups::default();
-        groups.insert([0; 32], representative(0)).await.unwrap();
-        groups.insert([255; 32], representative(1)).await.unwrap();
-        groups
-            .with_disk(|disk| {
-                let root = disk.root.unwrap();
-                disk.file.seek(SeekFrom::Start(root + 3))?;
-                disk.file.write_all(&root.to_le_bytes())
             })
             .await
             .unwrap();

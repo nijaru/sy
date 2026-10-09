@@ -177,6 +177,28 @@ pub(super) async fn run(
             .await?;
     }
 
+    if config.preserve.hardlinks {
+        plan.validate_hardlink_bytes(|commitment| {
+            let (root, follow) = match &commitment {
+                sy::engine::hardlink_preflight::ByteCommitment::Source(_) => (
+                    source_root,
+                    config.preserve.symlink_mode == SymlinkMode::Follow,
+                ),
+                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => {
+                    (destination_root, false)
+                }
+            };
+            async move {
+                let endpoint = sy::endpoint::local::LocalEndpoint::new(root.to_path_buf());
+                observed_hash(&endpoint, commitment.entry(), follow)
+                    .await
+                    .map_err(|error| ControllerError::backend("hardlink byte commitment", error))
+            }
+        })
+        .await
+        .map_err(map_controller_error)?;
+    }
+
     if config.dry_run {
         let diff_mode = config.diff_mode;
         let preview = preview_sync(plan, |item| {
@@ -265,6 +287,23 @@ pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hardlink_preflight_byte_commitments() {
+        super::super::hardlink_tests::assert_byte_commitments(
+            |source, destination, config| async move {
+                run(
+                    &source,
+                    &destination,
+                    &config,
+                    ScanOptions::default(),
+                    SyncScope::Tree,
+                )
+                .await
+            },
+        )
+        .await;
+    }
     use crate::sync::scanner::ScanOptions;
     use tempfile::TempDir;
 

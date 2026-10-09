@@ -3,10 +3,12 @@ pub mod controller;
 #[doc(hidden)]
 pub mod delete_journal;
 pub mod delete_plan;
+pub(crate) mod disk_radix;
 pub mod domain;
 mod entry_stream;
 pub mod finalize_journal;
 pub(crate) mod hardlink_groups;
+pub mod hardlink_preflight;
 pub(crate) mod hardlink_removals;
 pub mod ignore_scope;
 pub mod namespace;
