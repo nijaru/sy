@@ -346,6 +346,7 @@ fn metadata_work(
         },
         ResourceRequest {
             metadata_ops: 1,
+            cpu_tasks: 1,
             network_writes: 1,
             // Native source payload, wire fields and encoded/router payload are
             // individually capped. No file bytes are read under this reservation.

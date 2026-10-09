@@ -42,7 +42,7 @@ fn lower_create(
     policy: ExecutionPolicy,
 ) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
-        EntryKind::Directory => Ok(Some(mutation_work(RemotePullAction::CreateDirectory {
+        EntryKind::Directory => Ok(Some(work_item(RemotePullAction::CreateDirectory {
             source,
         }))),
         EntryKind::File => {
@@ -56,13 +56,13 @@ fn lower_create(
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(Some(file_work(RemotePullAction::FetchFile {
+            Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
                 destination: None,
                 metadata,
             })))
         }
-        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+        EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
             destination: None,
@@ -89,14 +89,14 @@ fn lower_update(
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(Some(file_work(RemotePullAction::FetchFile {
+            Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
                 destination: Some(destination),
                 metadata,
             })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
-        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+        EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
             destination: Some(destination),
@@ -121,13 +121,13 @@ fn lower_replace(
                 unix_mode: Some(mode),
                 modified: policy.preserve_times.then_some(source.modified),
             };
-            Ok(Some(file_work(RemotePullAction::FetchFile {
+            Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
                 destination: Some(destination),
                 metadata,
             })))
         }
-        EntryKind::Symlink => Ok(Some(mutation_work(RemotePullAction::ReplaceSymlink {
+        EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
             destination: Some(destination),
@@ -188,6 +188,13 @@ pub fn action_resources(action: &RemotePullAction) -> crate::engine::scheduler::
             cpu_tasks: 1,
             network_writes: 1,
         },
+        RemotePullAction::ApplyMetadata { .. } => ResourceRequest {
+            active_files: 0,
+            buffered_bytes: 4 * crate::protocol::MAX_FRAME_PAYLOAD as u64,
+            metadata_ops: 1,
+            cpu_tasks: 1,
+            network_writes: 1,
+        },
         _ => crate::engine::scheduler::ResourceRequest {
             active_files: 0,
             buffered_bytes: 0,
@@ -198,32 +205,9 @@ pub fn action_resources(action: &RemotePullAction) -> crate::engine::scheduler::
     }
 }
 
-fn file_work(action: RemotePullAction) -> WorkItem<RemotePullAction> {
-    WorkItem::new(
-        action,
-        ResourceRequest {
-            active_files: 1,
-            // Mirrors the push side's per-file working set so the scheduler
-            // byte budget stays direction-symmetric.
-            buffered_bytes: crate::remote::pull::REMOTE_FETCH_WORKING_SET,
-            metadata_ops: 0,
-            cpu_tasks: 1,
-            network_writes: 1,
-        },
-    )
-}
-
-fn mutation_work(action: RemotePullAction) -> WorkItem<RemotePullAction> {
-    WorkItem::new(
-        action,
-        ResourceRequest {
-            active_files: 0,
-            buffered_bytes: 0,
-            metadata_ops: 1,
-            cpu_tasks: 0,
-            network_writes: 0,
-        },
-    )
+fn work_item(action: RemotePullAction) -> WorkItem<RemotePullAction> {
+    let resources = action_resources(&action);
+    WorkItem::new(action, resources)
 }
 
 fn metadata_work(
@@ -232,7 +216,7 @@ fn metadata_work(
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<RemotePullAction> {
-    mutation_work(RemotePullAction::ApplyMetadata {
+    work_item(RemotePullAction::ApplyMetadata {
         source,
         expected_destination,
         unix_mode,

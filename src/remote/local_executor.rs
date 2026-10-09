@@ -14,7 +14,7 @@
 use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptions};
 use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
-use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
@@ -53,9 +53,6 @@ pub enum LocalSyncError {
 
     #[error("regular-file transfer requires scanned Unix mode metadata for {0}")]
     MissingScannedMode(PathBuf),
-
-    #[error("unchanged regular-file BSD flag reconciliation requires an expected-identity finalization path and is not implemented for {0}")]
-    UnchangedBsdFlags(PathBuf),
 
     #[error("--backup location for {0} is not representable")]
     InvalidBackupPath(PathBuf),
@@ -106,10 +103,10 @@ pub enum LocalSyncAction {
     },
     ApplyMetadata {
         source: Entry,
-        destination_path: RelativePath,
-        expected_destination: EntryIdentity,
+        destination: Entry,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
+        policy: ExecutionPolicy,
     },
 }
 
@@ -333,37 +330,20 @@ impl LocalSyncExecutor {
         source: Entry,
         destination: Entry,
         policy: ExecutionPolicy,
-        comparison: crate::engine::domain::ContentComparison,
     ) -> Result<Option<WorkItem<LocalSyncAction>>> {
         if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
             return Ok(None);
         }
-        if self.bsd_flags {
-            return Err(LocalSyncError::UnchangedBsdFlags(
-                source.path.as_path().to_path_buf(),
-            ));
-        }
-        let mode = if policy.preserve_permissions {
-            source.unix_mode
-        } else {
-            destination.unix_mode
-        }
-        .ok_or_else(|| LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf()))?;
-        let modified = Some(if policy.preserve_times {
-            source.modified
-        } else {
-            destination.modified
-        });
-        Ok(Some(file_work(LocalSyncAction::TransferFile {
-            destination_path: destination.path.clone(),
+        let (unix_mode, modified) =
+            requested_metadata(&source, &destination, policy)?.unwrap_or((None, None));
+        // Quick equality is not byte equality: keep the observed destination.
+        Ok(Some(metadata_work(
             source,
-            destination: Some(destination),
-            metadata: LocalTransferMetadata {
-                unix_mode: Some(mode),
-                modified,
-            },
-            source_removal: comparison == crate::engine::domain::ContentComparison::Blake3,
-        })))
+            destination,
+            unix_mode,
+            modified,
+            policy,
+        )?))
     }
 
     /// Backup location for one destination-relative path, matching the
@@ -428,7 +408,7 @@ impl LocalSyncExecutor {
         item: WorkItem<LocalSyncAction>,
     ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
-        let _permit = self.scheduler.acquire(resources).await?;
+        let permit = self.scheduler.acquire(resources).await?;
 
         match action {
             LocalSyncAction::CreateDirectory {
@@ -559,19 +539,24 @@ impl LocalSyncExecutor {
             }
             LocalSyncAction::ApplyMetadata {
                 source,
-                destination_path,
-                expected_destination,
+                mut destination,
                 unix_mode,
                 modified,
+                policy,
             } => {
+                let expected_destination = destination.identity.ok_or_else(|| {
+                    LocalSyncError::MissingDestinationIdentity(
+                        destination.path.as_path().to_path_buf(),
+                    )
+                })?;
                 self.check_source_identity(&source).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 let rooted = self.metadata_authority().await?;
-                let relative = destination_path.clone();
+                let relative = destination.path.clone();
                 let kind = source.kind;
-                tokio::task::spawn_blocking(move || {
+                let identity = tokio::task::spawn_blocking(move || {
                     rooted.apply_observed_preservation_blocking(
                         &relative,
                         kind,
@@ -587,6 +572,19 @@ impl LocalSyncExecutor {
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+                destination.identity = Some(identity);
+                if let Some(mode) = unix_mode {
+                    destination.unix_mode = Some(mode);
+                }
+                if let Some(time) = modified {
+                    destination.modified = time;
+                }
+                // Fingerprinting has its own file/byte/CPU admission.
+                drop(permit);
+                if source.is_file() {
+                    self.remove_unchanged_source(&source, &destination, policy)
+                        .await?;
+                }
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
@@ -1163,10 +1161,10 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
             destination,
-            comparison,
+            ..
         } = op
         {
-            return self.lower_unchanged_file_preservation(source, destination, policy, comparison);
+            return self.lower_unchanged_file_preservation(source, destination, policy);
         }
         lower_local_op(op, policy)
     }
@@ -1243,6 +1241,13 @@ pub fn action_resources(action: &LocalSyncAction) -> ResourceRequest {
             active_files: 1,
             buffered_bytes: LOCAL_FILE_WORKING_SET,
             metadata_ops: 0,
+            cpu_tasks: 1,
+            network_writes: 0,
+        },
+        LocalSyncAction::ApplyMetadata { .. } => ResourceRequest {
+            active_files: 0,
+            buffered_bytes: 4 * crate::protocol::MAX_FRAME_PAYLOAD as u64,
+            metadata_ops: 1,
             cpu_tasks: 1,
             network_writes: 0,
         },
@@ -1413,16 +1418,13 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    let expected_destination = destination.identity.ok_or_else(|| {
-        LocalSyncError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
-    })?;
     Ok(Some(metadata_work(
         source,
-        destination.path,
-        expected_destination,
+        destination,
         unix_mode,
         modified,
-    )))
+        policy,
+    )?))
 }
 
 fn requested_metadata(
@@ -1459,18 +1461,23 @@ fn mutation_work(action: LocalSyncAction) -> WorkItem<LocalSyncAction> {
 
 fn metadata_work(
     source: Entry,
-    destination_path: RelativePath,
-    expected_destination: EntryIdentity,
+    destination: Entry,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
-) -> WorkItem<LocalSyncAction> {
-    mutation_work(LocalSyncAction::ApplyMetadata {
+    policy: ExecutionPolicy,
+) -> Result<WorkItem<LocalSyncAction>> {
+    if destination.identity.is_none() {
+        return Err(LocalSyncError::MissingDestinationIdentity(
+            destination.path.as_path().to_path_buf(),
+        ));
+    }
+    Ok(mutation_work(LocalSyncAction::ApplyMetadata {
         source,
-        destination_path,
-        expected_destination,
+        destination,
         unix_mode,
         modified,
-    })
+        policy,
+    }))
 }
 
 #[cfg(test)]
