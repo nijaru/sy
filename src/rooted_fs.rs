@@ -2152,25 +2152,6 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn read_xattrs_path_blocking(
-        &self,
-        relative: &Path,
-        kind: EntryKind,
-    ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        read_xattrs_from_file(&file)
-    }
-
-    #[cfg(not(unix))]
-    fn read_xattrs_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-    ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
     fn write_xattrs_path_blocking(
         &self,
         relative: &Path,
