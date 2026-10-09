@@ -150,26 +150,6 @@ impl RetirementLineage {
             .ok_or_else(|| invalid("retirement ancestry has no current identity"))
     }
 
-    /// Return the original observation only for the exact currently recorded
-    /// held-inode state. An unrecorded foreign state remains itself, so it can
-    /// never claim an earlier scan's authority.
-    pub(super) fn original_observation(
-        &mut self,
-        current: EntryIdentity,
-    ) -> io::Result<EntryIdentity> {
-        self.check()?;
-        let Some(disk) = self.disk.as_mut() else {
-            return Ok(current);
-        };
-        let Some(origin) = disk.get(0, *current.as_bytes())? else {
-            return Ok(current);
-        };
-        if disk.get(1, origin)? != Some(*current.as_bytes()) {
-            return Err(invalid("held retirement observation is not current"));
-        }
-        Ok(EntryIdentity::from_bytes(origin))
-    }
-
     pub(super) fn record(&mut self, before: EntryIdentity, after: EntryIdentity) -> io::Result<()> {
         self.check()?;
         if self.disk.is_none() {

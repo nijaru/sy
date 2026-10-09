@@ -30,8 +30,11 @@ pub const PROTOCOL_V3_3: ProtocolVersion = ProtocolVersion { major: 3, minor: 3 
 /// Even 3.3 peers lack this authority contract and must fail before opening roots.
 pub const PROTOCOL_V3_4: ProtocolVersion = ProtocolVersion { major: 3, minor: 4 };
 
+/// Binds signature requests and responses to an explicit observed basis identity.
+pub const PROTOCOL_V3_5: ProtocolVersion = ProtocolVersion { major: 3, minor: 5 };
+
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_4);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {
