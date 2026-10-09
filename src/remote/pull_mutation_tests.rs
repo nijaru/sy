@@ -257,9 +257,8 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                 assert!(
                     matches!(
                         result,
-                        Err(RemotePullError::DeleteBackup(
-                            RootedFsError::CommitCancelled
-                        )) | Err(RemotePullError::Endpoint(_))
+                        Err(RemotePullError::Rooted(RootedFsError::CommitCancelled))
+                            | Err(RemotePullError::Endpoint(_))
                     ),
                     "{mutation:?}: {result:?}"
                 );
@@ -277,6 +276,22 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                 );
                 assert!(!destination_root.path().join("file~").exists());
                 assert!(!external_backup.path().join("new-directory").exists());
+                if matches!(mutation, Mutation::Directory) {
+                    // Initial root creation is authority too, not just mkdir
+                    // beneath an already pinned root.
+                    let absent_root = destination_root.path().join("absent/nested");
+                    let fresh = RemotePullExecutor::new(
+                        absent_root.clone(),
+                        client.request_handle(),
+                        client.sender(),
+                        Scheduler::new(ResourceBudget::default()).unwrap(),
+                    );
+                    assert!(matches!(
+                        fresh.destination_entries(Default::default(), false).await,
+                        Err(RemotePullError::Rooted(RootedFsError::CommitCancelled))
+                    ));
+                    assert!(!destination_root.path().join("absent").exists());
+                }
                 assert_eq!(
                     destination_root.path().join("directory").exists(),
                     !matches!(mutation, Mutation::Directory)
@@ -312,9 +327,7 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                     Mutation::Backup => {
                         assert!(matches!(
                             result,
-                            Err(RemotePullError::DeleteBackup(
-                                RootedFsError::CommitCancelled
-                            ))
+                            Err(RemotePullError::Rooted(RootedFsError::CommitCancelled))
                         ));
                         assert_eq!(
                             std::fs::read(destination_root.path().join("file~")).unwrap(),
