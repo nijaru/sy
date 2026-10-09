@@ -32,13 +32,3 @@ pub struct SyncError {
     pub error: String,
     pub action: String,
 }
-
-#[derive(Debug)]
-pub struct VerificationResult {
-    pub files_matched: usize,
-    pub files_mismatched: Vec<PathBuf>,
-    pub files_only_in_source: Vec<PathBuf>,
-    pub files_only_in_dest: Vec<PathBuf>,
-    pub errors: Vec<SyncError>,
-    pub duration: Duration,
-}

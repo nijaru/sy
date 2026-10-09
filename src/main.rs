@@ -444,17 +444,7 @@ Or install from local source with: cargo install --path . --features acl"#
 
         let result = session.verify().await?;
 
-        // Determine exit code
-        let exit_code = if !result.errors.is_empty() {
-            2 // Errors occurred
-        } else if !result.files_mismatched.is_empty()
-            || !result.files_only_in_source.is_empty()
-            || !result.files_only_in_dest.is_empty()
-        {
-            1 // Mismatches found
-        } else {
-            0 // All matched
-        };
+        let exit_code = result.exit_code();
 
         // JSON output
         if cli.json {
@@ -462,19 +452,20 @@ Or install from local source with: cargo install --path . --features acl"#
 
             let errors_json: Vec<VerificationError> = result
                 .errors
-                .iter()
+                .into_iter()
                 .map(|e| VerificationError {
-                    path: e.path.clone(),
-                    error: e.error.clone(),
-                    action: e.action.clone(),
+                    path: e.path,
+                    error: e.error,
+                    action: e.action,
                 })
                 .collect();
 
             let event = SyncEvent::VerificationResult {
                 files_matched: result.files_matched,
-                files_mismatched: result.files_mismatched.clone(),
-                files_only_in_source: result.files_only_in_source.clone(),
-                files_only_in_dest: result.files_only_in_dest.clone(),
+                counts: result.counts,
+                files_mismatched: result.files_mismatched,
+                files_only_in_source: result.files_only_in_source,
+                files_only_in_dest: result.files_only_in_dest,
                 errors: errors_json,
                 duration_secs: result.duration.as_secs_f64(),
                 exit_code,
@@ -485,42 +476,58 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("\n✓ Verification complete\n");
             println!("  Files matched:        {}", result.files_matched);
 
-            if !result.files_mismatched.is_empty() {
+            if result.counts.files_mismatched > 0 {
                 println!(
                     "  Files mismatched:     {} ✗",
-                    result.files_mismatched.len()
+                    result.counts.files_mismatched
                 );
                 for path in &result.files_mismatched {
                     println!("    - {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_mismatched,
+                    result.files_mismatched.len(),
+                );
             }
 
-            if !result.files_only_in_source.is_empty() {
+            if result.counts.files_only_in_source > 0 {
                 println!(
                     "  Only in source:       {}",
-                    result.files_only_in_source.len()
+                    result.counts.files_only_in_source
                 );
                 for path in &result.files_only_in_source {
                     println!("    → {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_only_in_source,
+                    result.files_only_in_source.len(),
+                );
             }
 
-            if !result.files_only_in_dest.is_empty() {
+            if result.counts.files_only_in_dest > 0 {
                 println!(
                     "  Only in destination:  {}",
-                    result.files_only_in_dest.len()
+                    result.counts.files_only_in_dest
                 );
                 for path in &result.files_only_in_dest {
                     println!("    ← {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_only_in_dest,
+                    result.files_only_in_dest.len(),
+                );
             }
 
-            if !result.errors.is_empty() {
-                println!("\n⚠️  Errors occurred during verification:\n");
+            if result.counts.errors > 0 {
+                println!(
+                    "\n⚠️  {} errors occurred during verification:\n",
+                    result.counts.errors
+                );
                 for (i, error) in result.errors.iter().enumerate() {
                     println!("{}. [{}] {}", i + 1, error.action, error.path.display());
                     println!("   {}", error.error);
                 }
+                print_omitted(result.counts.errors, result.errors.len());
             }
 
             println!("\n  Duration:             {:?}", result.duration);
@@ -747,6 +754,12 @@ Or install from local source with: cargo install --path . --features acl"#
     }
 
     Ok(())
+}
+
+fn print_omitted(total: usize, shown: usize) {
+    if total > shown {
+        println!("    … {} additional entries not shown", total - shown);
+    }
 }
 
 fn format_duration(duration: std::time::Duration) -> String {

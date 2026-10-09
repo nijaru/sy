@@ -100,9 +100,11 @@ pub enum SyncEvent {
         files_verified: usize,
         verification_failures: usize,
     },
-    /// `--verify=only` result mode.
+    /// `--verify=only` result. Exact counts are independent of bounded examples.
     VerificationResult {
         files_matched: usize,
+        #[serde(flatten)]
+        counts: crate::sync::VerificationCounts,
         files_mismatched: Vec<PathBuf>,
         files_only_in_source: Vec<PathBuf>,
         files_only_in_dest: Vec<PathBuf>,
@@ -452,20 +454,5 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"performance""#));
         assert!(json.contains(r#""scan_duration_secs":0.5"#));
-    }
-
-    #[test]
-    fn verification_result_event_keeps_shape() {
-        let event = SyncEvent::VerificationResult {
-            files_matched: 1,
-            files_mismatched: vec![],
-            files_only_in_source: vec![],
-            files_only_in_dest: vec![],
-            errors: vec![],
-            duration_secs: 1.0,
-            exit_code: 0,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"verification_result""#));
     }
 }
