@@ -8,7 +8,8 @@ use crate::endpoint::Endpoint;
 use crate::error::{Result, SyncError};
 use crate::sync::config::SyncConfig;
 use crate::sync::scanner::ScanOptions;
-use crate::sync::stats::{SyncError as StatError, SyncStats, VerificationResult};
+use crate::sync::stats::SyncStats;
+use crate::sync::verification::{Difference, VerificationResult};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use sy::engine::domain::{Entry, EntryKind, SyncScope};
@@ -164,14 +165,7 @@ impl SyncSession {
         let source = source_endpoint.root();
         let dest = dest_endpoint.root();
         let started = Instant::now();
-        let mut result = VerificationResult {
-            files_matched: 0,
-            files_mismatched: Vec::new(),
-            files_only_in_source: Vec::new(),
-            files_only_in_dest: Vec::new(),
-            errors: Vec::new(),
-            duration: std::time::Duration::ZERO,
-        };
+        let mut result = VerificationResult::default();
         let source_request = super::policy::source_scan_request(&self.config, self.scan_options);
         let destination_request = super::policy::destination_scan_request(&self.config);
         let (source_stream, dest_stream) = match &self.scope {
@@ -222,17 +216,21 @@ impl SyncSession {
             while let Some(item) = reconciler.next().await? {
                 match item {
                     ReconcileItem::SourceOnly { source: entry, .. } => {
-                        result
-                            .files_only_in_source
-                            .push(source.join(entry.path.as_path()));
+                        result.record_difference(
+                            Difference::SourceOnly,
+                            source,
+                            entry.path.as_path(),
+                        );
                     }
                     ReconcileItem::DestinationOnly(entry) => {
                         if self.scope != SyncScope::Tree {
                             continue;
                         }
-                        result
-                            .files_only_in_dest
-                            .push(dest.join(entry.path.as_path()));
+                        result.record_difference(
+                            Difference::DestinationOnly,
+                            dest,
+                            entry.path.as_path(),
+                        );
                     }
                     ReconcileItem::Matched {
                         source: source_entry,
@@ -249,12 +247,10 @@ impl SyncSession {
                         .await
                         {
                             Ok(true) => result.files_matched += 1,
-                            Ok(false) => result.files_mismatched.push(source.join(relative)),
-                            Err(error) => result.errors.push(StatError {
-                                path: source.join(relative),
-                                error: error.to_string(),
-                                action: "verify".to_string(),
-                            }),
+                            Ok(false) => {
+                                result.record_difference(Difference::Mismatch, source, relative)
+                            }
+                            Err(error) => result.record_error(source, relative, &error),
                         }
                     }
                 }

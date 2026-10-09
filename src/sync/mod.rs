@@ -11,6 +11,7 @@ pub mod scanner;
 mod selected;
 pub mod session;
 pub mod stats;
+mod verification;
 #[cfg(feature = "watch")]
 pub mod watch_session;
 
@@ -19,4 +20,5 @@ pub use config::{
     VerificationConfig,
 };
 #[allow(unused_imports)]
-pub use stats::{SyncError, SyncStats, VerificationResult};
+pub use stats::{SyncError, SyncStats};
+pub use verification::{VerificationCounts, VerificationResult};

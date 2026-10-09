@@ -144,6 +144,13 @@ sy /source /dest --itemize-changes
 Remote transfers are always BLAKE3-verified against the source before the
 destination commit; `--verify` adds staged verification on local copies.
 
+`--verify=only` reports exact totals, but retains at most 32 examples per
+category under a shared 64 KiB detail budget. Error messages are capped at
+2 KiB and marked when shortened. Human output notes omitted entries. With
+`--json`, the `files_mismatched_count`, `files_only_in_source_count`,
+`files_only_in_dest_count`, and `errors_count` fields are the totals; their
+corresponding arrays contain examples, not necessarily every finding.
+
 ## Feature Status
 
 Linux and macOS are the sync platforms exercised by CI. Windows is compile-checked
