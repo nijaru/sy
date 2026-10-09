@@ -31,6 +31,7 @@ pub use frame::{
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1, PROTOCOL_V3_2,
+    PROTOCOL_V3_3, SUPPORTED_VERSIONS,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::{WireMetadata, WireMetadataTarget};

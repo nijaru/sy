@@ -85,7 +85,7 @@ impl TryFrom<u8> for AclMode {
 
 /// One bounded access-control request for an existing entry.
 ///
-/// `Read` carries no text and the server answers with [`WireAclResult`];
+/// `Read` carries the required source observation, no text, and answers with [`WireAclResult`];
 /// `Write` carries the full desired text (possibly empty, which clears the
 /// list) and the server answers with an empty acknowledgement frame.
 /// Symlinks are rejected: their ACLs are not a portable mutable property and
@@ -95,15 +95,17 @@ pub struct WireAclRequest {
     path: RelativeWirePath,
     kind: WireEntryKind,
     mode: AclMode,
+    source_identity: Option<[u8; 32]>,
     acl: Option<WireAcl>,
 }
 
 impl WireAclRequest {
-    pub fn read(path: RelativeWirePath, kind: WireEntryKind) -> Result<Self> {
+    pub fn read(path: RelativeWirePath, kind: WireEntryKind, identity: [u8; 32]) -> Result<Self> {
         let request = Self {
             path,
             kind,
             mode: AclMode::Read,
+            source_identity: Some(identity),
             acl: None,
         };
         request.validate()?;
@@ -115,6 +117,7 @@ impl WireAclRequest {
             path,
             kind,
             mode: AclMode::Write,
+            source_identity: None,
             acl: Some(acl),
         };
         request.validate()?;
@@ -131,6 +134,12 @@ impl WireAclRequest {
 
     pub const fn mode(&self) -> AclMode {
         self.mode
+    }
+
+    /// Required observation for a source read; destination writes have no source authority.
+    pub fn source_identity(&self) -> Result<[u8; 32]> {
+        self.source_identity
+            .ok_or(ProtocolError::InvalidMessage("not a source metadata read"))
     }
 
     pub const fn acl(&self) -> Option<&WireAcl> {
@@ -153,6 +162,9 @@ impl WireAclRequest {
             .ok_or(ProtocolError::InvalidMessage(
                 "acl request payload length overflow",
             ))?;
+        if self.mode == AclMode::Read {
+            capacity += 32;
+        }
         if self.mode == AclMode::Write {
             capacity = capacity
                 .checked_add(4)
@@ -167,6 +179,9 @@ impl WireAclRequest {
         out.put_u8(self.mode as u8);
         out.put_u32(path_len);
         out.extend_from_slice(self.path.as_encoded());
+        if self.mode == AclMode::Read {
+            out.extend_from_slice(&self.source_identity()?);
+        }
         if let Some(acl) = &self.acl {
             out.put_u32(u32::try_from(acl.text.len()).map_err(|_| {
                 ProtocolError::AclTextTooLarge {
@@ -191,6 +206,11 @@ impl WireAclRequest {
             });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
+        let source_identity = if mode == AclMode::Read {
+            Some(super::entry::read_identity(&mut reader)?)
+        } else {
+            None
+        };
         let acl = if mode == AclMode::Write {
             let text_len = reader.u32()? as usize;
             if text_len > MAX_ACL_TEXT_BYTES {
@@ -214,6 +234,7 @@ impl WireAclRequest {
             path,
             kind,
             mode,
+            source_identity,
             acl,
         }
         .validated()
@@ -222,6 +243,11 @@ impl WireAclRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if (self.mode == AclMode::Read) != self.source_identity.is_some() {
+            return Err(ProtocolError::InvalidMessage(
+                "source reads require an observed identity",
+            ));
+        }
         if self.kind == WireEntryKind::Directory && self.mode == AclMode::Write {
             return Err(ProtocolError::InvalidMessage(
                 "directory mutations require observed finalization",
@@ -316,8 +342,12 @@ mod tests {
 
     #[test]
     fn read_request_round_trips_without_text() {
-        let request = WireAclRequest::read(path(), WireEntryKind::File).unwrap();
-        let decoded = WireAclRequest::decode(&request.encode().unwrap()).unwrap();
+        let request = WireAclRequest::read(path(), WireEntryKind::File, [7; 32]).unwrap();
+        let encoded = request.encode().unwrap();
+        for len in [encoded.len() - 32, encoded.len() - 1] {
+            assert!(WireAclRequest::decode(&encoded[..len]).is_err());
+        }
+        let decoded = WireAclRequest::decode(&encoded).unwrap();
         assert_eq!(decoded, request);
         assert_eq!(decoded.mode(), AclMode::Read);
         assert!(decoded.acl().is_none());
@@ -349,7 +379,7 @@ mod tests {
 
     #[test]
     fn symlink_kind_is_rejected_before_encoding() {
-        assert!(WireAclRequest::read(path(), WireEntryKind::Symlink).is_err());
+        assert!(WireAclRequest::read(path(), WireEntryKind::Symlink, [7; 32]).is_err());
     }
 
     #[test]

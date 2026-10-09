@@ -8,13 +8,12 @@
 //! (set the desired attributes, remove the rest) stay atomic per entry, and an
 //! oversized set is refused loudly rather than truncated.
 //!
-//! Holds: the server serves xattr requests only in a Push session. In a Pull
-//! session the remote root is the read-only source, so a write request is
-//! rejected before it can mutate source data.
+//! Source reads carry the scan identity and validate a held descriptor before
+//! and after reading. Writes are Push-only; a Pull root is read-only.
 
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
-use crate::engine::domain::{EntryKind, RelativePath};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId, WireEntryKind,
     WireXattr, WireXattrRequest, WireXattrResult, XattrMode,
@@ -70,6 +69,9 @@ pub enum RemoteXattrError {
     #[error("xattr write requests are refused in a {0:?} session: the remote root is source-only")]
     WriteInSourceSession(Operation),
 
+    #[error("source preservation requires a scanned identity for {0}")]
+    MissingSourceIdentity(RelativePath),
+
     #[error("local extended-attribute access failed: {0}")]
     Local(String),
 }
@@ -95,10 +97,15 @@ pub async fn request_read_xattrs(
     sender: &RouterSender,
     path: &RelativePath,
     kind: EntryKind,
+    expected: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<Vec<(OsString, Vec<u8>)>> {
     ensure_compatible_path_encoding(peer)?;
-    let request = WireXattrRequest::read(encode_relative_path(path.as_path())?, wire_kind(kind))?;
+    let request = WireXattrRequest::read(
+        encode_relative_path(path.as_path())?,
+        wire_kind(kind),
+        *expected.as_bytes(),
+    )?;
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     sender
@@ -209,10 +216,12 @@ pub async fn serve_incoming_xattr_rooted(
 
     match mode {
         XattrMode::Read => {
-            let xattrs =
-                tokio::task::spawn_blocking(move || rooted.read_xattrs_blocking(&path, kind))
-                    .await
-                    .map_err(|error| RemoteXattrError::Worker(error.to_string()))??;
+            let expected = EntryIdentity::from_bytes(request.source_identity()?);
+            let xattrs = tokio::task::spawn_blocking(move || {
+                rooted.read_observed_xattrs_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteXattrError::Worker(error.to_string()))??;
             let wire = xattrs
                 .iter()
                 .map(|(name, value)| WireXattr::new(name_bytes(name), value.clone()))
@@ -256,19 +265,32 @@ pub async fn serve_incoming_xattr_rooted(
 /// set instead of allocating without limit.
 pub async fn read_preserved_xattrs(
     location: &XattrLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
+    source: &Entry,
 ) -> Result<Vec<(OsString, Vec<u8>)>> {
+    let expected = source
+        .identity
+        .ok_or_else(|| RemoteXattrError::MissingSourceIdentity(source.path.clone()))?;
     let xattrs = match location {
         XattrLocation::Local(root) => {
             let root = root.to_path_buf();
-            LocalEndpoint::new(root)
-                .read_xattrs(path.as_path())
-                .await
-                .map_err(|error| RemoteXattrError::Local(error.to_string()))?
+            let path = source.path.clone();
+            let kind = source.kind;
+            tokio::task::spawn_blocking(move || {
+                RootedFs::open_blocking_for_worker(root)?
+                    .read_observed_xattrs_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteXattrError::Worker(error.to_string()))??
         }
         XattrLocation::Remote(handle) => {
-            request_read_xattrs(&handle.sender(), path, kind, handle.peer_platform()).await?
+            request_read_xattrs(
+                &handle.sender(),
+                &source.path,
+                source.kind,
+                expected,
+                handle.peer_platform(),
+            )
+            .await?
         }
     };
     check_xattr_set_bounded(&xattrs)?;
@@ -476,7 +498,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let read = request_read_xattrs(&client.sender(), &path, EntryKind::File, peer)
+        let expected = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::metadata(root.path().join("file")).unwrap(),
+            EntryKind::File,
+        )
+        .unwrap();
+        let read = request_read_xattrs(&client.sender(), &path, EntryKind::File, expected, peer)
             .await
             .unwrap();
         server_task.await.unwrap();

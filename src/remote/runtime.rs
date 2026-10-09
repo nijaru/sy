@@ -385,16 +385,22 @@ impl ClientRemoteSession {
         .map_err(Into::into)
     }
 
-    /// Read the remote destination's extended attributes for one entry
-    /// (`-X`). Used by the pull executor, whose remote root is the source.
+    /// Read the remote source's attributes for the required observation (`-X`).
     pub async fn read_xattrs(
         &self,
         path: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
     ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
-        request_read_xattrs(&self.router.sender(), path, kind, self.server.platform.os)
-            .await
-            .map_err(Into::into)
+        request_read_xattrs(
+            &self.router.sender(),
+            path,
+            kind,
+            expected,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Mirror an extended-attribute set onto the remote destination for one

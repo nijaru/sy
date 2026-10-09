@@ -201,8 +201,8 @@ fn observe(rooted: &RootedFs) -> Result<Observation> {
         None
     };
     let mut xattrs = match identity {
-        Some((kind @ (EntryKind::File | EntryKind::Directory), _)) => {
-            rooted.read_xattrs_blocking(&relative("target"), kind)?
+        Some((kind @ (EntryKind::File | EntryKind::Directory), expected)) => {
+            rooted.read_observed_xattrs_blocking(&relative("target"), kind, expected)?
         }
         _ => Vec::new(),
     };
