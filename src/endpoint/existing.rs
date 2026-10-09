@@ -173,6 +173,41 @@ fn observed_acl_blocking(rooted: &RootedFs, entry: &Entry) -> Result<Option<Stri
     Ok(acl)
 }
 
+/// Hash exactly the observed byte count and reject either truncation or growth.
+/// The caller owns initial/final handle and namespace observation validation.
+/// A growing file cannot turn this into an unbounded read-until-EOF workload.
+pub(crate) fn hash_observed_bytes(
+    reader: &mut impl Read,
+    size: u64,
+    path: &RelativePath,
+) -> Result<[u8; 32]> {
+    let mut content = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = size;
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| ExistingDestinationError::ObservationChanged(path.clone()))?;
+        let read = match reader.read(&mut buffer[..limit]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Err(ExistingDestinationError::ObservationChanged(path.clone()));
+        }
+        content.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0];
+    loop {
+        match reader.read(&mut extra) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(0) => return Ok(*content.finalize().as_bytes()),
+            Ok(_) => return Err(ExistingDestinationError::ObservationChanged(path.clone())),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn fingerprint_blocking(
     rooted: &RootedFs,
     entry: &Entry,
@@ -182,38 +217,7 @@ fn fingerprint_blocking(
     let metadata = validate_file(&file, entry)?;
     #[cfg(not(unix))]
     let _ = &metadata;
-    let mut content = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut remaining = entry.size;
-    // Read exactly the observed length, not an unbounded concurrently growing file.
-    while remaining != 0 {
-        let limit = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| ExistingDestinationError::ObservationChanged(entry.path.clone()))?;
-        let read = match file.read(&mut buffer[..limit]) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if read == 0 {
-            return Err(ExistingDestinationError::ObservationChanged(
-                entry.path.clone(),
-            ));
-        }
-        content.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    let mut extra = [0];
-    loop {
-        match file.read(&mut extra) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(0) => break,
-            Ok(_) => {
-                return Err(ExistingDestinationError::ObservationChanged(
-                    entry.path.clone(),
-                ))
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let content = hash_observed_bytes(&mut file, entry.size, &entry.path)?;
 
     let mut preservation = blake3::Hasher::new();
     preservation.update(b"sy-existing-preservation-v1\0");
@@ -269,7 +273,7 @@ fn fingerprint_blocking(
     // A held handle proves the bytes, but not that its inode still owns the name.
     validate_path(rooted, entry)?;
     Ok(ExistingFingerprint {
-        content: *content.finalize().as_bytes(),
+        content,
         preservation: *preservation.finalize().as_bytes(),
         binding: rooted.entry_binding_blocking(&entry.path)?,
     })
@@ -375,6 +379,49 @@ fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<
 mod tests {
     use super::*;
     use crate::engine::domain::Timestamp;
+
+    #[test]
+    fn observed_byte_hash_rejects_truncation_and_unbounded_growth() {
+        let path = RelativePath::new("file").unwrap();
+        for (payload, size, valid) in [
+            (&b""[..], 0, true),
+            (&b"bytes"[..], 5, true),
+            (&b"bytes"[..], 4, false),
+            (&b"bytes"[..], 6, false),
+        ] {
+            let result = hash_observed_bytes(&mut std::io::Cursor::new(payload), size, &path);
+            if valid {
+                assert_eq!(result.unwrap(), *blake3::hash(payload).as_bytes());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ExistingDestinationError::ObservationChanged(_))
+                ));
+            }
+        }
+        struct GrowingReader {
+            bytes: u64,
+        }
+        impl std::io::Read for GrowingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.bytes += buffer.len() as u64;
+                // Bound failed-test cleanup too: a read-until-EOF regression
+                // fails this assertion instead of stranding a worker forever.
+                assert!(
+                    self.bytes <= 1024 * 1024 + 1,
+                    "hashing chased growth beyond the observed extent"
+                );
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+        let mut growing = GrowingReader { bytes: 0 };
+        assert!(matches!(
+            hash_observed_bytes(&mut growing, 1024 * 1024, &path),
+            Err(ExistingDestinationError::ObservationChanged(_))
+        ));
+        assert_eq!(growing.bytes, 1024 * 1024 + 1);
+    }
 
     fn observe_file(root: &std::path::Path, name: &str) -> Entry {
         let metadata = std::fs::metadata(root.join(name)).unwrap();

@@ -117,7 +117,6 @@ pub(crate) async fn observed_hash(
     })?;
     let path = entry.path.clone();
     let digest = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
         let validate = |file: &std::fs::File| -> Result<()> {
             if crate::endpoint::local_identity::metadata_identity(
                 &file.metadata()?,
@@ -132,17 +131,21 @@ pub(crate) async fn observed_hash(
         };
         let mut file = file;
         validate(&file)?;
-        let mut buffer = vec![0; 1024 * 1024];
-        let mut hasher = blake3::Hasher::new();
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
+        let digest =
+            crate::endpoint::existing::hash_observed_bytes(&mut file, entry.size, &entry.path)
+                .map_err(|error| match error {
+                    crate::endpoint::existing::ExistingDestinationError::ObservationChanged(
+                        path,
+                    ) => SyncError::SourceChanged {
+                        path: path.into_path_buf(),
+                    },
+                    crate::endpoint::existing::ExistingDestinationError::Io(error) => {
+                        SyncError::Io(error)
+                    }
+                    error => map_io(error),
+                })?;
         validate(&file)?;
-        Ok::<_, SyncError>(*hasher.finalize().as_bytes())
+        Ok::<_, SyncError>(digest)
     })
     .await
     .map_err(|error| SyncError::Io(std::io::Error::other(error)))??;
