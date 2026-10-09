@@ -7,6 +7,7 @@
 //! disk-backed per-group inode state. Memory and descriptor use do not scale
 //! with source tree size.
 
+use super::disk_radix::DiskRadix;
 use super::domain::{Entry, EntryIdentity, RelativePath};
 use super::native_path;
 use crate::rooted_fs::{HardlinkSourceState, RootedFs};
@@ -273,7 +274,7 @@ impl DiskJournal<'_> {
                     expected.as_ref(),
                 )
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            states.append(record.group, updated)?;
+            states.set(record.group, updated)?;
         }
         Ok(())
     }
@@ -327,38 +328,71 @@ impl DiskJournal<'_> {
     }
 }
 
+/// One exact current observation per source group, not a replay-length history.
+/// Radix lookup visits at most 256 ordered branch bits regardless of how many
+/// aliases have already been removed. Partial scratch I/O cannot grant authority
+/// to another unlink after a successfully completed native effect.
 struct StateIndex {
     file: File,
+    index: DiskRadix,
+    healthy: bool,
 }
 
 impl StateIndex {
     fn new() -> io::Result<Self> {
         Ok(Self {
             file: tempfile::tempfile()?,
+            index: DiskRadix::new()?,
+            healthy: true,
         })
     }
 
-    fn get(&mut self, group: [u8; 32]) -> io::Result<Option<HardlinkSourceState>> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut found = None;
-        let mut record = [0; STATE_RECORD_BYTES];
-        loop {
-            match self.file.read_exact(&mut record) {
-                Ok(()) => {
-                    if record[..32] == group {
-                        found = Some(HardlinkSourceState::decode(&record[32..])?);
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(found),
-                Err(error) => return Err(error),
-            }
+    fn read(&mut self, group: [u8; 32]) -> io::Result<Option<(u64, HardlinkSourceState)>> {
+        if !self.healthy {
+            return Err(invalid("incomplete hardlink source state scratch"));
         }
+        self.healthy = false;
+        let Some(offset) = self.index.get(group)? else {
+            self.healthy = true;
+            return Ok(None);
+        };
+        if offset % STATE_RECORD_BYTES as u64 != 0 {
+            return Err(invalid("invalid hardlink source state offset"));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut record = [0; STATE_RECORD_BYTES];
+        self.file.read_exact(&mut record)?;
+        if record[..32] != group {
+            return Err(invalid("hardlink source state group mismatch"));
+        }
+        let state = HardlinkSourceState::decode(&record[32..])?;
+        self.healthy = true;
+        Ok(Some((offset, state)))
     }
 
-    fn append(&mut self, group: [u8; 32], state: HardlinkSourceState) -> io::Result<()> {
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&group)?;
-        self.file.write_all(&state.encode())?;
+    fn get(&mut self, group: [u8; 32]) -> io::Result<Option<HardlinkSourceState>> {
+        Ok(self.read(group)?.map(|(_, state)| state))
+    }
+
+    fn set(&mut self, group: [u8; 32], state: HardlinkSourceState) -> io::Result<()> {
+        let existing = self.read(group)?;
+        self.healthy = false;
+        match existing {
+            Some((offset, _)) => {
+                self.file.seek(SeekFrom::Start(offset + 32))?;
+                self.file.write_all(&state.encode())?;
+            }
+            None => {
+                let offset = self.file.seek(SeekFrom::End(0))?;
+                if offset % STATE_RECORD_BYTES as u64 != 0 {
+                    return Err(invalid("truncated hardlink source state scratch"));
+                }
+                self.file.write_all(&group)?;
+                self.file.write_all(&state.encode())?;
+                self.index.insert(group, offset)?;
+            }
+        }
+        self.healthy = true;
         Ok(())
     }
 }
@@ -390,6 +424,85 @@ mod tests {
             .finalize_blocking(None)
             .unwrap()
             .into()
+    }
+
+    fn state(ino: u64, nlink: u64) -> HardlinkSourceState {
+        HardlinkSourceState {
+            dev: 1,
+            ino,
+            size: 4,
+            mode: 0o100640,
+            mtime: 1,
+            mtime_nsec: 2,
+            ctime: 3,
+            ctime_nsec: 4,
+            nlink,
+            uid: 5,
+            gid: 6,
+            flags: 7,
+        }
+    }
+
+    #[test]
+    fn interleaved_source_groups_keep_one_exact_current_state_each() {
+        const GROUPS: u64 = 2_048;
+        let mut states = StateIndex::new().unwrap();
+        for remaining in (0..8).rev() {
+            for ino in (0..GROUPS).rev() {
+                let mut group = [0; 32];
+                group[24..].copy_from_slice(&ino.to_be_bytes());
+                let expected = (remaining != 7).then_some(state(ino, remaining + 1));
+                assert_eq!(states.get(group).unwrap(), expected);
+                states.set(group, state(ino, remaining)).unwrap();
+            }
+            // Scratch space follows groups, not the number of preceding unlinks.
+            assert_eq!(
+                states.file.metadata().unwrap().len(),
+                GROUPS * STATE_RECORD_BYTES as u64
+            );
+        }
+        for ino in 0..GROUPS {
+            let mut group = [0; 32];
+            group[24..].copy_from_slice(&ino.to_be_bytes());
+            assert_eq!(states.get(group).unwrap(), Some(state(ino, 0)));
+        }
+        assert_eq!(states.get([255; 32]).unwrap(), None);
+    }
+
+    #[test]
+    fn corrupt_source_state_cannot_fall_back_to_missing_or_previous_authority() {
+        for substitute_group in [false, true] {
+            let mut states = StateIndex::new().unwrap();
+            states.set([1; 32], state(1, 2)).unwrap();
+            states.set([2; 32], state(2, 3)).unwrap();
+            if substitute_group {
+                states.file.seek(SeekFrom::Start(0)).unwrap();
+                states.file.write_all(&[2; 32]).unwrap();
+            } else {
+                states.file.set_len(STATE_RECORD_BYTES as u64 - 1).unwrap();
+            }
+            assert!(states.get([1; 32]).is_err());
+            // Failed scratch reads poison the whole authority, including a
+            // different group and apparently absent groups, before more unlinks.
+            assert!(states.get([2; 32]).is_err());
+            assert!(states.get([3; 32]).is_err());
+            assert!(states.set([1; 32], state(1, 1)).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_source_state_write_poison_cannot_authorize_later_unlinks() {
+        let mut states = StateIndex::new().unwrap();
+        states.set([1; 32], state(1, 2)).unwrap();
+        let read_only = tempfile::NamedTempFile::new().unwrap();
+        states.file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        states.file.read_to_end(&mut contents).unwrap();
+        std::fs::write(read_only.path(), contents).unwrap();
+        states.file = File::open(read_only.path()).unwrap();
+        assert!(states.set([1; 32], state(1, 1)).is_err());
+        assert!(states.get([1; 32]).is_err());
+        assert!(states.set([2; 32], state(2, 1)).is_err());
     }
 
     #[cfg(unix)]
