@@ -7,6 +7,76 @@ fn relative(path: &str) -> RelativePath {
 }
 
 #[test]
+fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
+    const CHILD: &str = "SY_STAGING_DUPLICATION_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rooted_fs::staging_tests::failed_staging_descriptor_duplication_does_not_authorize_cleanup",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Isolate descriptor exhaustion from the parallel test harness.
+    let root = tempfile::tempdir().unwrap();
+    let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
+    let mut namespace = rooted
+        .begin_namespace_blocking(Path::new("target"), ExpectedDestination::Absent)
+        .unwrap();
+    let contents = root
+        .path()
+        .join(&namespace.staging_dir_name)
+        .join("contents");
+    std::os::unix::fs::symlink("owned", &contents).unwrap();
+    let held = open_symlink_at(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name).unwrap();
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limits is writable storage; the child changes only its own soft
+    // descriptor limit and exits without affecting the parent test process.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+        0
+    );
+    limits.rlim_cur = limits.rlim_cur.min(64);
+    // SAFETY: the initialized limit retains the existing hard limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+    let mut occupied = Vec::new();
+    loop {
+        match File::open("/dev/null") {
+            Ok(file) => occupied.push(file),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                break;
+            }
+        }
+    }
+    assert!(
+        matches!(namespace.register_staging(&held), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
+    );
+    drop(occupied);
+    drop(held);
+    // Even if the cached inode numbers still match, no retained descriptor
+    // pins their identity. Refuse cleanup rather than assume no inode reuse.
+    assert!(matches!(
+        namespace.abort(),
+        Err(RootedFsError::StagingAbortFailed { .. })
+    ));
+    assert_eq!(std::fs::read_link(&contents).unwrap(), Path::new("owned"));
+}
+
+#[test]
 fn staged_verification_and_unverified_preparation_cannot_adopt_later_fd_edits() {
     for verify in [true, false] {
         let root = tempfile::tempdir().unwrap();

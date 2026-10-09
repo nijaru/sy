@@ -56,11 +56,14 @@ impl RootedNamespaceTransaction {
     #[cfg(unix)]
     pub(super) fn register_staging(&mut self, file: &File) -> Result<()> {
         let created = stat_fd(file.as_raw_fd())?;
-        self.cleanup_owned = Some(created);
+        // Cached inode numbers authorize cleanup only while a descriptor pins
+        // that inode against reuse, including descriptor-exhaustion failures.
+        let retained = file.try_clone()?;
         self.staged = Some(OwnedStagingEntry {
-            file: file.try_clone()?,
+            file: retained,
             created,
         });
+        self.cleanup_owned = Some(created);
         self.observe_staging()?;
         Ok(())
     }
