@@ -837,42 +837,9 @@ impl RemotePullExecutor {
         &self,
         source: Entry,
         destination: Entry,
-        policy: crate::engine::planner::ExecutionPolicy,
     ) -> Result<Option<WorkItem<RemotePullAction>>> {
         if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
             return Ok(None);
-        }
-        if self.xattrs || self.acls {
-            let mode = if policy.preserve_permissions {
-                source.unix_mode
-            } else {
-                destination.unix_mode
-            }
-            .ok_or_else(|| {
-                RemotePullError::MissingScannedMode(source.path.as_path().to_path_buf())
-            })?;
-            let modified = Some(if policy.preserve_times {
-                source.modified
-            } else {
-                destination.modified
-            });
-            return Ok(Some(WorkItem::new(
-                RemotePullAction::FetchFile {
-                    source,
-                    destination: Some(destination),
-                    metadata: PullTransferMetadata {
-                        unix_mode: Some(mode),
-                        modified,
-                    },
-                },
-                ResourceRequest {
-                    active_files: 1,
-                    buffered_bytes: REMOTE_FETCH_WORKING_SET,
-                    metadata_ops: 0,
-                    cpu_tasks: 1,
-                    network_writes: 1,
-                },
-            )));
         }
         let expected_destination = destination.identity.ok_or_else(|| {
             RemotePullError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
@@ -886,10 +853,10 @@ impl RemotePullExecutor {
             },
             ResourceRequest {
                 active_files: 0,
-                buffered_bytes: 0,
+                buffered_bytes: 4 * crate::protocol::MAX_FRAME_PAYLOAD as u64,
                 metadata_ops: 1,
-                cpu_tasks: 0,
-                network_writes: 0,
+                cpu_tasks: 1,
+                network_writes: 1,
             },
         )))
     }
@@ -1008,7 +975,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
             ..
         } = op
         {
-            return self.lower_unchanged_file_preservation(source, destination, policy);
+            return self.lower_unchanged_file_preservation(source, destination);
         }
         crate::remote::pull_lower::lower_pull_op(op, policy)
     }
