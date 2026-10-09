@@ -84,13 +84,20 @@ pub enum ExistingDestinationError {
 
 pub type Result<T> = std::result::Result<T, ExistingDestinationError>;
 
-pub(crate) async fn observed_flags(root: std::path::PathBuf, source: Entry) -> Result<u32> {
+pub(crate) async fn observed_flags(
+    root: super::source_root::SourceRoot,
+    source: Entry,
+) -> Result<u32> {
     let expected = source
         .identity
         .ok_or_else(|| ExistingDestinationError::MissingObservation(source.path.clone()))?;
-    let rooted = RootedFs::open(root).await?;
     tokio::task::spawn_blocking(move || {
-        rooted.read_observed_bsd_flags_blocking(&source.path, source.kind, expected)
+        root.validate_blocking()?;
+        let value =
+            root.rooted()
+                .read_observed_bsd_flags_blocking(&source.path, source.kind, expected)?;
+        root.validate_blocking()?;
+        Ok::<_, RootedFsError>(value)
     })
     .await
     .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
@@ -98,23 +105,31 @@ pub(crate) async fn observed_flags(root: std::path::PathBuf, source: Entry) -> R
 }
 
 pub(crate) async fn observed_xattrs(
-    root: std::path::PathBuf,
+    root: super::source_root::SourceRoot,
     source: Entry,
 ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
-    let rooted = RootedFs::open(root).await?;
-    tokio::task::spawn_blocking(move || observed_xattrs_blocking(&rooted, &source))
-        .await
-        .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        root.validate_blocking()?;
+        let value = observed_xattrs_blocking(&root.rooted(), &source)?;
+        root.validate_blocking()?;
+        Ok(value)
+    })
+    .await
+    .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
 }
 
 pub(crate) async fn observed_acl(
-    root: std::path::PathBuf,
+    root: super::source_root::SourceRoot,
     source: Entry,
 ) -> Result<Option<String>> {
-    let rooted = RootedFs::open(root).await?;
-    tokio::task::spawn_blocking(move || observed_acl_blocking(&rooted, &source))
-        .await
-        .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        root.validate_blocking()?;
+        let value = observed_acl_blocking(&root.rooted(), &source)?;
+        root.validate_blocking()?;
+        Ok(value)
+    })
+    .await
+    .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
 }
 
 pub(crate) async fn fingerprint(
@@ -150,6 +165,7 @@ fn validate_file(
 }
 
 pub(crate) fn validate_path(rooted: &RootedFs, entry: &Entry) -> Result<()> {
+    rooted.verify_source_root_path_blocking()?;
     if entry.identity.is_none()
         || rooted.path_identity_blocking(&entry.path)? != entry.identity.map(|id| (entry.kind, id))
     {
@@ -219,6 +235,7 @@ fn fingerprint_blocking(
     entry: &Entry,
     options: FingerprintOptions,
 ) -> Result<ExistingFingerprint> {
+    rooted.verify_source_root_path_blocking()?;
     let mut file = rooted.open_regular_blocking(&entry.path)?;
     let metadata = validate_file(rooted, &file, entry)?;
     #[cfg(not(unix))]
@@ -278,6 +295,7 @@ fn fingerprint_blocking(
     // The held handle and rooted name must still match the scan or its exact
     // recorded own retirement. No fresh stat can advance this authority.
     validate_file(rooted, &file, entry)?;
+    rooted.verify_source_root_path_blocking()?;
     Ok(ExistingFingerprint {
         content,
         preservation: *preservation.finalize().as_bytes(),

@@ -4,6 +4,7 @@ use super::mutation::{
     request_replace_symlink,
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
+use crate::endpoint::source_root::SourceRoot;
 use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
@@ -27,7 +28,7 @@ use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
 };
 use futures::StreamExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Cloneable v3 request authority for one already-negotiated remote session.
 ///
@@ -193,7 +194,7 @@ impl ClientRemoteHandle {
 
     pub async fn transfer_file(
         &self,
-        source_root: PathBuf,
+        source_root: SourceRoot,
         source: Entry,
         destination: Option<TransferDestination>,
     ) -> Result<TransferSummary> {
@@ -205,7 +206,7 @@ impl ClientRemoteHandle {
 
     pub async fn transfer_file_with_metadata(
         &self,
-        source_root: PathBuf,
+        source_root: SourceRoot,
         source: Entry,
         destination: Option<TransferDestination>,
         metadata: TransferMetadata,
@@ -220,7 +221,7 @@ impl ClientRemoteHandle {
     /// the ZSTD capability.
     pub async fn transfer_file_with_policy(
         &self,
-        source_root: PathBuf,
+        source_root: SourceRoot,
         source: Entry,
         destination: Option<TransferDestination>,
         metadata: TransferMetadata,
@@ -243,7 +244,7 @@ impl ClientRemoteHandle {
 
     pub async fn transfer_file_with_stream_policy(
         &self,
-        source_root: PathBuf,
+        source_root: SourceRoot,
         source: Entry,
         destination: Option<TransferDestination>,
         metadata: TransferMetadata,

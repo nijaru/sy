@@ -71,6 +71,50 @@ impl LocalEndpoint {
         Ok(std::sync::Arc::clone(rooted))
     }
 
+    fn relative_path(&self, path: &Path) -> Result<sy::engine::domain::RelativePath> {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.root)
+                .map_err(|error| SyncError::Config(error.to_string()))?
+        } else {
+            path
+        };
+        sy::engine::domain::RelativePath::new(relative.to_path_buf())
+            .map_err(|error| SyncError::Config(error.to_string()))
+    }
+
+    async fn read_preservation_metadata<T: Send + 'static>(
+        &self,
+        path: &Path,
+        read: impl FnOnce(
+                &sy::rooted_fs::RootedFs,
+                &sy::engine::domain::RelativePath,
+                sy::engine::domain::EntryKind,
+                sy::engine::domain::EntryIdentity,
+            ) -> sy::rooted_fs::Result<T>
+            + Send
+            + 'static,
+    ) -> Result<T> {
+        let relative = self.relative_path(path)?;
+        let rooted = self.rooted_fs(false).await?;
+        tokio::task::spawn_blocking(move || {
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            let (kind, identity) = rooted
+                .path_identity_blocking(&relative)
+                .map_err(|error| map_rooted_read_error(&rooted, error))?
+                .ok_or_else(|| SyncError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+            let value = read(&rooted, &relative, kind, identity)
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            Ok(value)
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+    }
+
     fn resolve(&self, relative: &Path) -> PathBuf {
         if relative.is_absolute() {
             relative.to_path_buf()
@@ -120,6 +164,19 @@ fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
         }
         sy::rooted_fs::RootedFsError::RootChanged(path) => SyncError::DestinationChanged { path },
         error => SyncError::Io(std::io::Error::other(error)),
+    }
+}
+
+fn map_rooted_read_error(
+    rooted: &sy::rooted_fs::RootedFs,
+    error: sy::rooted_fs::RootedFsError,
+) -> SyncError {
+    if rooted.is_local_source_authority()
+        && matches!(error, sy::rooted_fs::RootedFsError::RootChanged(_))
+    {
+        SyncError::Io(std::io::Error::other(error))
+    } else {
+        map_rooted_fs_error(error)
     }
 }
 
@@ -991,39 +1048,68 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
-        match tokio::fs::symlink_metadata(self.resolve(path)).await {
+        match self.metadata(path).await {
             Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata> {
-        let meta = tokio::fs::symlink_metadata(self.resolve(path)).await?;
-        Ok(file_metadata_from_fs(&meta))
+        #[cfg(unix)]
+        {
+            let relative = self.relative_path(path)?;
+            let rooted = self.rooted_fs(false).await?;
+            tokio::task::spawn_blocking(move || {
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
+                let metadata = rooted
+                    .file_metadata_blocking(&relative)
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
+                Ok(metadata)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+        }
+        #[cfg(not(unix))]
+        {
+            let meta = tokio::fs::symlink_metadata(self.resolve(path)).await?;
+            Ok(file_metadata_from_fs(&meta))
+        }
     }
 
     async fn metadata_following(&self, path: &Path) -> Result<FileMetadata> {
-        // std::fs::metadata follows links; a dangling target errors loudly.
-        let meta = tokio::fs::metadata(self.resolve(path)).await?;
-        Ok(file_metadata_from_fs(&meta))
+        // Following is an explicit local --copy-links contract. Retain the
+        // original root around the external target observation as well.
+        let rooted = self.rooted_fs(false).await?;
+        let path = self.resolve(path);
+        tokio::task::spawn_blocking(move || {
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            let metadata = fs::metadata(path)?;
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            Ok(file_metadata_from_fs(&metadata))
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
     }
 
     async fn read_xattrs(&self, path: &Path) -> Result<Vec<(OsString, Vec<u8>)>> {
         #[cfg(unix)]
         {
-            let full_path = self.resolve(path);
-            return tokio::task::spawn_blocking(move || -> Result<Vec<(OsString, Vec<u8>)>> {
-                let mut result = Vec::new();
-                for name in xattr::list(&full_path)? {
-                    if let Some(value) = xattr::get(&full_path, &name)? {
-                        result.push((name, value));
-                    }
-                }
-                Ok(result)
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return self
+                .read_preservation_metadata(
+                    path,
+                    sy::rooted_fs::RootedFs::read_observed_xattrs_blocking,
+                )
+                .await;
         }
 
         #[cfg(not(unix))]
@@ -1057,23 +1143,12 @@ impl Endpoint for LocalEndpoint {
     async fn read_acl(&self, path: &Path) -> Result<Option<String>> {
         #[cfg(all(unix, feature = "acl"))]
         {
-            let full_path = self.resolve(path);
-            return tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-                let entries = exacl::getfacl(&full_path, None)?;
-                if entries.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(
-                        entries
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ))
-                }
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return self
+                .read_preservation_metadata(
+                    path,
+                    sy::rooted_fs::RootedFs::read_observed_acl_blocking,
+                )
+                .await;
         }
 
         #[cfg(not(all(unix, feature = "acl")))]
@@ -1107,13 +1182,13 @@ impl Endpoint for LocalEndpoint {
     async fn read_bsd_flags(&self, path: &Path) -> Result<Option<u32>> {
         #[cfg(target_os = "macos")]
         {
-            let full_path = self.resolve(path);
-            return tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
-                use std::os::macos::fs::MetadataExt;
-                Ok(Some(std::fs::symlink_metadata(full_path)?.st_flags()))
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return self
+                .read_preservation_metadata(
+                    path,
+                    sy::rooted_fs::RootedFs::read_observed_bsd_flags_blocking,
+                )
+                .await
+                .map(Some);
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1181,13 +1256,13 @@ impl Endpoint for LocalEndpoint {
             return tokio::task::spawn_blocking(move || {
                 rooted
                     .verify_root_path_blocking()
-                    .map_err(map_rooted_fs_error)?;
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 let file = rooted
                     .open_regular_blocking(&relative)
-                    .map_err(map_rooted_fs_error)?;
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 rooted
                     .verify_root_path_blocking()
-                    .map_err(map_rooted_fs_error)?;
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 Ok(Some(file))
             })
             .await
@@ -1201,6 +1276,10 @@ impl Endpoint for LocalEndpoint {
         }
     }
 
+    async fn source_rooted_authority(&self) -> Result<Option<crate::rooted_fs::RootedFs>> {
+        Ok(Some(self.rooted_fs(false).await?.as_ref().clone()))
+    }
+
     async fn open_native_file_following(&self, path: &Path) -> Result<Option<std::fs::File>> {
         #[cfg(unix)]
         {
@@ -1211,7 +1290,7 @@ impl Endpoint for LocalEndpoint {
             return tokio::task::spawn_blocking(move || {
                 rooted
                     .verify_root_path_blocking()
-                    .map_err(map_rooted_fs_error)?;
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 // --copy-links explicitly follows the leaf (and intermediate)
                 // symlinks. O_NONBLOCK prevents a raced FIFO replacement from
                 // pinning this worker before descriptor-type validation.
@@ -1235,7 +1314,7 @@ impl Endpoint for LocalEndpoint {
                 }
                 rooted
                     .verify_root_path_blocking()
-                    .map_err(map_rooted_fs_error)?;
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 Ok(Some(file))
             })
             .await
@@ -1265,18 +1344,21 @@ impl Endpoint for LocalEndpoint {
         tokio::task::spawn_blocking(move || {
             rooted
                 .verify_root_path_blocking()
-                .map_err(map_rooted_fs_error)?;
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
             let xattrs = request
                 .xattrs
                 .then(|| rooted.read_open_file_xattrs_blocking(&file, &relative))
                 .transpose()
-                .map_err(map_rooted_fs_error)?;
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
             let acl = request
                 .acl
                 .then(|| rooted.read_open_file_acl_blocking(&file, &relative))
                 .transpose()
-                .map_err(map_rooted_fs_error)?
+                .map_err(|error| map_rooted_read_error(&rooted, error))?
                 .map(|acl| acl.unwrap_or_default());
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
             Ok(crate::endpoint::io::Preservation { xattrs, acl })
         })
         .await
@@ -2155,10 +2237,11 @@ mod tests {
         let source_observation = crate::endpoint::local_identity::identity_for_metadata(
             &fs::metadata(dir.path().join("source")).unwrap(),
         );
-        let pre_commit = || {
+        let source_path = dir.path().join("source");
+        let pre_commit: crate::endpoint::io::PreCommit = std::sync::Arc::new(move || {
             assert_eq!(
                 crate::endpoint::local_identity::identity_for_metadata(&fs::metadata(
-                    dir.path().join("source")
+                    &source_path
                 )?),
                 source_observation
             );
@@ -2166,13 +2249,13 @@ mod tests {
             file.seek(SeekFrom::Start(0))?;
             file.write_all(b"changed")?;
             Ok(())
-        };
+        });
         let result = crate::endpoint::io::finalize_staged_writer(
             writer,
             &make_meta(),
             &crate::endpoint::io::Preservation::default(),
             Some(blake3::hash(b"content")),
-            Some(&pre_commit),
+            Some(pre_commit),
             None,
         )
         .await;

@@ -1561,7 +1561,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runtime_push_commits_delete_before_restoring_parent_metadata() {
-        use crate::endpoint::local_entry_scan::local_entry_stream;
         use crate::engine::scan::{EntryMetadataRequest, ScanRequest};
         use crate::engine::scheduler::{ResourceBudget, Scheduler};
         use crate::protocol::Operation;
@@ -1659,7 +1658,11 @@ mod tests {
             },
         };
         let destination = handle.scan(scan_request).await.unwrap();
-        let source = local_entry_stream(source_root.path().to_path_buf(), scan_request);
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority.entries(scan_request);
         let comparison = ComparisonPolicy {
             preserve_permissions: true,
             preserve_times: true,
@@ -1679,7 +1682,7 @@ mod tests {
         .unwrap();
 
         let executor = RemotePushExecutor::new(
-            source_root.path().to_path_buf(),
+            authority,
             handle,
             Scheduler::new(ResourceBudget::default()).unwrap(),
             BasisIndexLimits::default(),

@@ -6,7 +6,6 @@ use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
-use sy::endpoint::local_entry_scan::local_entry_stream;
 use sy::engine::controller::{
     preflight_sync_scoped, preflight_sync_scoped_with_content, preview_sync, SyncController,
 };
@@ -18,7 +17,6 @@ use sy::remote::push::{RemoteBackupPlan, RemotePushExecutor};
 use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
-use sy::rooted_fs::RootedFs;
 use sy::transfer::delta::BasisIndexLimits;
 
 pub(super) async fn run(
@@ -79,6 +77,9 @@ async fn execute_with_handle(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
+        .await
+        .map_err(map_io)?;
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -88,11 +89,7 @@ async fn execute_with_handle(
     let scan_started = std::time::Instant::now();
     let source_request = source_scan_request(config, scan_options);
     let source_rooted = if config.comparison.checksum {
-        Some(
-            RootedFs::open(source_root.to_path_buf())
-                .await
-                .map_err(map_io)?,
-        )
+        Some(source_authority.rooted())
     } else {
         None
     };
@@ -102,7 +99,7 @@ async fn execute_with_handle(
         .map_err(map_io)?;
     reporter.start(source_root, destination_root);
     let source = filtered_source_stream(
-        local_entry_stream(source_root.to_path_buf(), source_request),
+        source_authority.entries(source_request),
         config.filter_engine.clone(),
     );
     let min_size = config.min_size;
@@ -115,8 +112,8 @@ async fn execute_with_handle(
     // would ignore are protected from deletion instead of being filtered
     // out of the destination scan (see `engine::ignore_scope`).
     let ignore_scope = std::sync::Arc::new(std::sync::Mutex::new(
-        sy::engine::ignore_scope::SourceIgnoreScope::new(
-            source_root,
+        sy::engine::ignore_scope::SourceIgnoreScope::with_rooted_authority(
+            source_authority.rooted(),
             scan_options.respect_gitignore,
         ),
     ));
@@ -185,14 +182,15 @@ async fn execute_with_handle(
         .map_err(map_controller_error)?
     };
 
+    source_authority.validate().await.map_err(map_io)?;
     if config.preserve.hardlinks {
         plan.validate_hardlink_bytes(|commitment| {
             let remote = remote.clone();
+            let source_authority = source_authority.clone();
             async move {
                 match commitment {
                     sy::engine::hardlink_preflight::ByteCommitment::Source(entry) => {
-                        let endpoint =
-                            sy::endpoint::local::LocalEndpoint::new(source_root.to_path_buf());
+                        let endpoint = source_authority.endpoint();
                         observed_hash(
                             &endpoint,
                             &entry,
@@ -272,7 +270,7 @@ async fn execute_with_handle(
         None
     };
     let executor = RemotePushExecutor::new(
-        source_root.to_path_buf(),
+        source_authority,
         remote,
         scheduler,
         BasisIndexLimits::default(),
@@ -300,6 +298,46 @@ async fn execute_with_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_root_swap_preserves_original_and_out_of_scope_aliases() {
+        use super::super::hardlink_tests::{
+            is_original_root_change, SourceRootSwap, SwapBeforeSourceRemovals,
+        };
+        for (preserve_hardlinks, after_publication) in [(false, false), (true, false), (true, true)]
+        {
+            let mut fixture = SourceRootSwap::new().await;
+            let (client, server) = super::super::hardlink_tests::remote_session(
+                sy::protocol::Operation::Push,
+                fixture.destination.path(),
+            )
+            .await;
+            let inner = RemotePushExecutor::new(
+                fixture.source.clone(),
+                client.request_handle(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+                BasisIndexLimits::default(),
+            )
+            .with_hardlinks(preserve_hardlinks)
+            .with_remove_source_files(true);
+            if !after_publication {
+                fixture.swap();
+            }
+            let executor = SwapBeforeSourceRemovals {
+                inner,
+                paths: after_publication.then(|| fixture.paths()),
+            };
+            let result = SyncController::new(executor, NonZeroUsize::new(2).unwrap())
+                .execute(fixture.plan.take().unwrap())
+                .await;
+            super::super::hardlink_tests::finish_session(client, server).await;
+            let error = result.unwrap_err();
+            assert!(is_original_root_change(&error), "{error:?}");
+            fixture.assert_sources_intact();
+            fixture.assert_publications(after_publication);
+        }
+    }
 
     #[cfg(unix)]
     async fn execute_hardlink_fixture(

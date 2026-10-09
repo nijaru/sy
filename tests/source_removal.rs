@@ -12,12 +12,8 @@ use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::remote::local_executor::LocalSyncExecutor;
 use sy::rooted_fs::RootedFs;
 
-async fn observed(root: &Path) -> Entry {
-    local_entry_stream(root.to_path_buf(), ScanRequest::default())
-        .try_next()
-        .await
-        .unwrap()
-        .unwrap()
+async fn observed(stream: sy::engine::reconcile::EntryStream) -> Entry {
+    stream.try_collect::<Vec<_>>().await.unwrap().remove(0)
 }
 
 fn scheduler() -> Scheduler {
@@ -30,11 +26,14 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
     let dest = tempfile::TempDir::new().unwrap();
     std::fs::write(source.path().join("file"), b"original").unwrap();
     std::fs::write(dest.path().join("file"), b"original").unwrap();
-    let source_rooted = RootedFs::open(source.path().to_path_buf()).await.unwrap();
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+        .await
+        .unwrap();
+    let source_rooted = authority.rooted();
     let dest_rooted = RootedFs::open(dest.path().to_path_buf()).await.unwrap();
     let plan = preflight_sync_scoped_with_content(
         sy::engine::reconcile::OrderedReconciler::new(
-            local_entry_stream(source.path().to_path_buf(), ScanRequest::default()),
+            authority.entries(ScanRequest::default()),
             local_entry_stream(dest.path().to_path_buf(), ScanRequest::default()),
         ),
         ComparisonPolicy {
@@ -71,12 +70,8 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
     std::fs::rename(dest.path().join("file"), dest.path().join("old")).unwrap();
     std::fs::write(dest.path().join("file"), b"raced").unwrap();
     let controller = SyncController::new(
-        LocalSyncExecutor::new(
-            source.path().to_path_buf(),
-            dest.path().to_path_buf(),
-            scheduler(),
-        )
-        .with_remove_source_files(true),
+        LocalSyncExecutor::new(authority, dest.path().to_path_buf(), scheduler())
+            .with_remove_source_files(true),
         NonZeroUsize::new(2).unwrap(),
     );
     assert!(controller.execute(plan).await.is_err());
@@ -158,11 +153,18 @@ async fn remote_parity_rechecks_identity_and_selected_metadata() {
         if !replace && !same_entry {
             xattr::set(source.path().join("file"), "user.sy-preservation", b"keep").unwrap();
         }
-        let source_entry = observed(source.path()).await;
+        let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+            .await
+            .unwrap();
+        let source_entry = observed(authority.entries(ScanRequest::default())).await;
         let dest_entry = if same_entry {
             source_entry.clone()
         } else {
-            observed(dest.path()).await
+            observed(local_entry_stream(
+                dest.path().to_path_buf(),
+                ScanRequest::default(),
+            ))
+            .await
         };
         if replace {
             std::fs::rename(dest.path().join("file"), dest.path().join("old")).unwrap();
@@ -198,7 +200,7 @@ async fn remote_parity_rechecks_identity_and_selected_metadata() {
         .await
         .unwrap();
         let executor = RemotePushExecutor::new(
-            source.path().to_path_buf(),
+            authority,
             client.request_handle(),
             scheduler(),
             BasisIndexLimits::default(),
@@ -249,8 +251,11 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     let alias = destination.path().join("alias");
     std::fs::write(source.path().join("file"), b"only copy").unwrap();
     std::os::unix::fs::symlink(source.path(), &alias).unwrap();
-    let entry = observed(source.path()).await;
-    let executor = LocalSyncExecutor::new(source.path().to_path_buf(), alias, scheduler())
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+        .await
+        .unwrap();
+    let entry = observed(authority.entries(ScanRequest::default())).await;
+    let executor = LocalSyncExecutor::new(authority.clone(), alias, scheduler())
         .with_remove_source_files(true);
     assert!(SyncPlanExecutor::remove_unchanged_source(
         &executor,
@@ -263,7 +268,7 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     assert!(source.path().join("file").exists());
 
     std::fs::hard_link(source.path().join("file"), destination.path().join("file")).unwrap();
-    let source_entry = observed(source.path()).await;
+    let source_entry = observed(authority.entries(ScanRequest::default())).await;
     let mut dest_scan =
         local_entry_stream(destination.path().to_path_buf(), ScanRequest::default());
     let destination_entry = loop {
@@ -272,12 +277,8 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
             break entry;
         }
     };
-    let executor = LocalSyncExecutor::new(
-        source.path().to_path_buf(),
-        destination.path().to_path_buf(),
-        scheduler(),
-    )
-    .with_remove_source_files(true);
+    let executor = LocalSyncExecutor::new(authority, destination.path().to_path_buf(), scheduler())
+        .with_remove_source_files(true);
     SyncPlanExecutor::remove_unchanged_source(
         &executor,
         &source_entry,

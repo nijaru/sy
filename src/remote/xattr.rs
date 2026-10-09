@@ -1,5 +1,6 @@
 //! Bounded demand-driven source xattr reads, bound to scanned observations.
 //! Destination writes belong to the single observed metadata owner.
+use crate::endpoint::source_root::SourceRoot;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireEntryKind,
@@ -13,7 +14,6 @@ use crate::remote::runtime::ClientRemoteHandle;
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use bytes::Bytes;
 use std::ffi::OsString;
-use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteXattrError {
@@ -67,7 +67,7 @@ pub type Result<T> = std::result::Result<T, RemoteXattrError>;
 
 /// Source-side rooted observation or bounded remote request handle.
 pub enum XattrLocation<'a> {
-    Local(&'a Path),
+    Local(&'a SourceRoot),
     Remote(&'a ClientRemoteHandle),
 }
 
@@ -188,12 +188,16 @@ pub async fn read_preserved_xattrs(
         .ok_or_else(|| RemoteXattrError::MissingSourceIdentity(source.path.clone()))?;
     let xattrs = match location {
         XattrLocation::Local(root) => {
-            let root = root.to_path_buf();
+            let root = (*root).clone();
             let path = source.path.clone();
             let kind = source.kind;
             tokio::task::spawn_blocking(move || {
-                RootedFs::open_blocking_for_worker(root)?
-                    .read_observed_xattrs_blocking(&path, kind, expected)
+                root.validate_blocking()?;
+                let value = root
+                    .rooted()
+                    .read_observed_xattrs_blocking(&path, kind, expected)?;
+                root.validate_blocking()?;
+                Ok::<_, RootedFsError>(value)
             })
             .await
             .map_err(|error| RemoteXattrError::Worker(error.to_string()))??

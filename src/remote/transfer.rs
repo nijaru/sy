@@ -299,7 +299,7 @@ impl TransferDestination {
 
 pub async fn request_file_transfer(
     sender: &RouterSender,
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
     destination: Option<TransferDestination>,
     peer: PlatformOs,
@@ -317,7 +317,7 @@ pub async fn request_file_transfer(
 
 pub async fn request_file_transfer_with_metadata(
     sender: &RouterSender,
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
     destination: Option<TransferDestination>,
     metadata: TransferMetadata,
@@ -337,7 +337,7 @@ pub async fn request_file_transfer_with_metadata(
 
 pub async fn request_file_transfer_with_policy(
     sender: &RouterSender,
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
     destination: Option<TransferDestination>,
     metadata: TransferMetadata,
@@ -363,7 +363,7 @@ pub async fn request_file_transfer_with_policy(
 
 pub async fn request_file_transfer_with_stream_policy(
     sender: &RouterSender,
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
     destination: Option<TransferDestination>,
     metadata: TransferMetadata,
@@ -378,20 +378,25 @@ pub async fn request_file_transfer_with_stream_policy(
         .identity
         .ok_or(RemoteTransferError::MissingSourceIdentity)?;
 
-    let rooted = RootedFs::open(source_root).await?;
+    let opened_root = source_root.clone();
     let source_path = source.path.clone();
     let expected_size = source.size;
     let preservation_request = stream_policy.preservation;
     let compression = stream_policy.compression;
-    let (source_file, captured_preservation) = tokio::task::spawn_blocking(move || {
-        let file = rooted.open_regular_blocking(&source_path)?;
-        validate_source(&file, expected_identity, expected_size)?;
-        let preservation =
-            read_transfer_preservation(&rooted, &file, &source_path, preservation_request)?;
-        Ok::<_, RemoteTransferError>((file, preservation))
-    })
-    .await
-    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    let (source_file, final_source_file, captured_preservation) =
+        tokio::task::spawn_blocking(move || {
+            opened_root.validate_blocking()?;
+            let rooted = opened_root.rooted();
+            let file = rooted.open_regular_blocking(&source_path)?;
+            validate_source(&file, expected_identity, expected_size)?;
+            let preservation =
+                read_transfer_preservation(&rooted, &file, &source_path, preservation_request)?;
+            opened_root.validate_blocking()?;
+            let final_file = file.try_clone()?;
+            Ok::<_, RemoteTransferError>((file, final_file, preservation))
+        })
+        .await
+        .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
     let mut metadata = metadata;
     if preservation_request.xattrs {
         metadata.xattrs = captured_preservation.xattrs;
@@ -434,15 +439,30 @@ pub async fn request_file_transfer_with_stream_policy(
         .await?;
 
     let (producer_tx, producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
+    let producer_root = source_root.clone();
+    let producer_path = source.path.clone();
     let producer = tokio::task::spawn_blocking(move || {
-        produce_source(
+        producer_root.validate_blocking()?;
+        let summary = produce_source(
             source_file,
             expected_identity,
             expected_size,
             basis_index,
             producer_tx,
             compression,
-        )
+        )?;
+        producer_root.validate_blocking()?;
+        if producer_root
+            .rooted()
+            .path_identity_blocking(&producer_path)?
+            != Some((crate::engine::domain::EntryKind::File, expected_identity))
+        {
+            return Err(RemoteTransferError::SourceChanged {
+                expected_size,
+                actual_size: summary.file_size,
+            });
+        }
+        Ok(summary)
     });
 
     let summary = send_produced_file(sender, stream_id, producer_rx, producer).await?;
@@ -479,6 +499,24 @@ pub async fn request_file_transfer_with_stream_policy(
             )?)
             .await?;
     }
+    let final_root = source_root.clone();
+    let final_path = source.path;
+    tokio::task::spawn_blocking(move || {
+        final_root.validate_blocking()?;
+        validate_source(&final_source_file, expected_identity, expected_size)?;
+        if final_root.rooted().path_identity_blocking(&final_path)?
+            != Some((crate::engine::domain::EntryKind::File, expected_identity))
+        {
+            return Err(RemoteTransferError::SourceChanged {
+                expected_size,
+                actual_size: expected_size,
+            });
+        }
+        final_root.validate_blocking()?;
+        Ok::<_, RemoteTransferError>(())
+    })
+    .await
+    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
     sender
         .send(Frame::new(
             FrameKind::FileEnd,
@@ -1171,6 +1209,7 @@ mod tests {
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
     use crate::transfer::delta::{BasisBlock, BasisIndexLimits};
+    use futures::TryStreamExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -1388,7 +1427,16 @@ mod tests {
         let data = vec![0x5a_u8; MAX_TRANSFER_DATA_SIZE * 2 + 17];
         std::fs::write(source_root.path().join("file.bin"), &data).unwrap();
         std::fs::write(destination_root.path().join("file.bin"), b"old").unwrap();
-        let source = file_entry(source_root.path(), "file.bin");
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
@@ -1433,7 +1481,7 @@ mod tests {
             WireFileBasis::new(destination.size, *destination.identity.unwrap().as_bytes());
         let summary = request_file_transfer_with_metadata(
             &router.sender(),
-            source_root.path().to_path_buf(),
+            authority,
             source,
             Some(TransferDestination::whole(destination_expectation)),
             TransferMetadata {
@@ -1469,7 +1517,16 @@ mod tests {
         let source_data = b"Xabcdefghijkl";
         std::fs::write(source_root.path().join("file.bin"), source_data).unwrap();
         std::fs::write(destination_root.path().join("file.bin"), destination).unwrap();
-        let source = file_entry(source_root.path(), "file.bin");
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let basis_entry = file_entry(destination_root.path(), "file.bin");
         let expectation =
             WireFileBasis::new(basis_entry.size, *basis_entry.identity.unwrap().as_bytes());
@@ -1513,7 +1570,7 @@ mod tests {
         .unwrap();
         let summary = request_file_transfer(
             &router.sender(),
-            source_root.path().to_path_buf(),
+            authority,
             source,
             Some(TransferDestination::delta(expectation, delta_index)),
             session.server.platform.os,

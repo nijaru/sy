@@ -10,10 +10,10 @@
 use super::disk_radix::DiskRadix;
 use super::domain::{Entry, EntryIdentity, RelativePath};
 use super::native_path;
+use crate::endpoint::source_root::SourceRoot;
 use crate::rooted_fs::{HardlinkSourceState, RootedFs};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const MAX_PATH_BYTES: usize = 1024 * 1024;
@@ -155,7 +155,7 @@ impl HardlinkRemovalJournal {
 
     pub async fn replay<F, Fut>(
         &self,
-        source_root: PathBuf,
+        source_root: SourceRoot,
         groups: &super::hardlink_groups::HardlinkGroups,
         validate: F,
     ) -> io::Result<()>
@@ -172,8 +172,8 @@ impl HardlinkRemovalJournal {
             let Some(journal) = state.as_mut() else {
                 return Ok(());
             };
-            let rooted = RootedFs::open_blocking_for_worker(source_root)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            source_root.validate_blocking().map_err(io::Error::other)?;
+            let rooted = source_root.rooted();
             journal.sync_data()?;
             let mut journal = DiskJournal { file: journal };
             journal.validate_all(&rooted)?;
@@ -253,12 +253,18 @@ impl DiskJournal<'_> {
     }
 
     fn validate_all(&mut self, rooted: &RootedFs) -> io::Result<()> {
+        rooted
+            .verify_root_path_blocking()
+            .map_err(io::Error::other)?;
         self.file.seek(SeekFrom::Start(0))?;
         while let Some(record) = self.read_record()? {
             rooted
                 .validate_hardlink_source_member_blocking(&record.path, record.identity)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                .map_err(io::Error::other)?;
         }
+        rooted
+            .verify_root_path_blocking()
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -273,7 +279,7 @@ impl DiskJournal<'_> {
                     record.identity,
                     expected.as_ref(),
                 )
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                .map_err(io::Error::other)?;
             states.set(record.group, updated)?;
         }
         Ok(())
@@ -544,7 +550,8 @@ mod tests {
                 )
                 .unwrap();
             }
-            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let source_root = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
+            let rooted = source_root.rooted();
             let journal = HardlinkRemovalJournal::default();
             let destination = tempfile::tempdir().unwrap();
             let dest = RootedFs::open(destination.path().to_path_buf())
@@ -584,7 +591,7 @@ mod tests {
                 journal.append(group, &entry, &proof).await.unwrap();
             }
             journal
-                .replay(root.path().to_path_buf(), &groups, |proof| {
+                .replay(source_root, &groups, |proof| {
                     std::future::ready(proof.revalidate_blocking(&dest).map_err(io::Error::other))
                 })
                 .await
@@ -597,11 +604,99 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn replaced_root_with_preexisting_aliases_cannot_authorize_deferred_unlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("source");
+        let replacement = parent.path().join("replacement");
+        let held = parent.path().join("held-source");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(original.join("a"), b"x").unwrap();
+        // All aliases exist BEFORE scanning: root substitution cannot be
+        // detected by leaf ctime/nlink or content, only by original authority.
+        for path in [
+            original.join("b"),
+            replacement.join("a"),
+            replacement.join("b"),
+        ] {
+            std::fs::hard_link(original.join("a"), path).unwrap();
+        }
+        let source_root = SourceRoot::open(original.clone()).await.unwrap();
+        let entries: Vec<_> = {
+            use futures::StreamExt;
+            source_root
+                .entries(Default::default())
+                .map(|entry| entry.unwrap())
+                .collect()
+                .await
+        };
+        assert_eq!(entries.len(), 2);
+        let destination = tempfile::tempdir().unwrap();
+        let dest = RootedFs::open(destination.path().to_path_buf())
+            .await
+            .unwrap();
+        let first = publish(&dest, &rel("a"));
+        let second = dest
+            .publish_hardlink_blocking(
+                &rel("a"),
+                &rel("b"),
+                first.identity,
+                crate::endpoint::ExpectedDestination::Absent,
+            )
+            .unwrap();
+        let groups = super::super::hardlink_groups::HardlinkGroups::default();
+        let group = [7; 32];
+        groups
+            .insert(
+                group,
+                super::super::hardlink_groups::HardlinkRepresentative {
+                    path: first.path.clone(),
+                    publication: second.identity,
+                    unix_mode: None,
+                    modified: None,
+                },
+            )
+            .await
+            .unwrap();
+        let journal = HardlinkRemovalJournal::default();
+        journal.append(group, &entries[0], &first).await.unwrap();
+        journal.append(group, &entries[1], &second).await.unwrap();
+        std::fs::rename(&original, &held).unwrap();
+        std::fs::rename(&replacement, &original).unwrap();
+        for root in [&held, &original] {
+            for entry in &entries {
+                let metadata = std::fs::metadata(root.join(entry.path.as_path())).unwrap();
+                assert_eq!(
+                    crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File),
+                    entry.identity
+                );
+            }
+        }
+        let error = journal
+            .replay(source_root, &groups, |proof| {
+                std::future::ready(proof.revalidate_blocking(&dest).map_err(io::Error::other))
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.get_ref().and_then(|error| error.downcast_ref::<crate::rooted_fs::RootedFsError>()),
+            Some(crate::rooted_fs::RootedFsError::RootChanged(path)) if path == &original)
+        );
+        for root in [held.as_path(), original.as_path(), destination.path()] {
+            for name in ["a", "b"] {
+                assert!(root.join(name).exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn validates_all_members_before_unlinking() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a"), b"same").unwrap();
         std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let source_root = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
+        let rooted = source_root.rooted();
         let (_, a_identity) = rooted.path_identity_blocking(&rel("a")).unwrap().unwrap();
         let (_, b_identity) = rooted.path_identity_blocking(&rel("b")).unwrap().unwrap();
         let group = [1; 32];
@@ -643,7 +738,7 @@ mod tests {
         std::fs::write(root.path().join("b"), b"changed").unwrap();
 
         assert!(journal
-            .replay(root.path().to_path_buf(), &groups, |proof| {
+            .replay(source_root, &groups, |proof| {
                 std::future::ready(proof.revalidate_blocking(&dest).map_err(io::Error::other))
             })
             .await

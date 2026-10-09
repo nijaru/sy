@@ -194,6 +194,9 @@ pub type Result<T> = std::result::Result<T, RootedFsError>;
 #[derive(Clone)]
 pub struct RootedFs {
     mutation_admission: RootedMutationAdmission,
+    // Local source runs reject a divergent configured name as well as retaining
+    // the FD. Negotiated remote roots instead intentionally survive relocation.
+    source_path_continuity: bool,
     #[cfg(all(test, unix))]
     mutation_pause: Arc<std::sync::Mutex<Option<(usize, PublicationPause)>>>,
     #[cfg(all(test, unix))]
@@ -1187,8 +1190,138 @@ impl RootedFs {
         Self::open_blocking(root)
     }
 
+    pub(crate) fn into_local_source_authority(mut self) -> Self {
+        self.source_path_continuity = true;
+        self
+    }
+
+    pub(crate) fn is_local_source_authority(&self) -> bool {
+        self.source_path_continuity
+    }
+
+    pub(crate) fn verify_source_root_path_blocking(&self) -> Result<()> {
+        if self.source_path_continuity {
+            self.verify_root_path_blocking()?;
+        }
+        Ok(())
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Derive external ignore ancestry from the held directory, not a newly
+    /// resolved root operand (which may transiently point at another tree).
+    pub(crate) fn source_configuration_root_path_blocking(&self) -> Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                self.root_fd.as_raw_fd()
+            ))?)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut path = [0_u8; libc::PATH_MAX as usize];
+            // SAFETY: the held directory FD remains live, and F_GETPATH writes
+            // at most PATH_MAX bytes including its terminating NUL on success.
+            if unsafe { libc::fcntl(self.root_fd.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) }
+                < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let length = path
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| std::io::Error::other("unterminated held-root path"))?;
+            Ok(PathBuf::from(OsStr::from_bytes(&path[..length])))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+
+    /// Local source configuration follows user-selected repository/config
+    /// symlinks, unlike peer-controlled data paths. Anchor resolution to the
+    /// held root so replacing its pathname cannot select another rule file.
+    // Explicit configuration pointers may use '..' or symlinks outside this
+    // root. This readonly local API is not remote path-confinement authority.
+    #[cfg(unix)]
+    pub(crate) fn open_source_configuration_blocking(&self, relative: &Path) -> Result<File> {
+        if relative.is_absolute() {
+            return Err(RootedFsError::InvalidRelativePath);
+        }
+        self.verify_root_path_blocking()?;
+        let path = component_cstring(relative.as_os_str())?;
+        // SAFETY: the original root FD and relative NUL-terminated path remain
+        // live. This readonly local configuration API deliberately follows
+        // configuration symlinks; O_NONBLOCK prevents adversarial FIFO opens.
+        let fd = unsafe {
+            libc::openat(
+                self.root_fd.as_raw_fd(),
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: successful openat transferred one owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        self.verify_root_path_blocking()?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn open_source_configuration_blocking(&self, _relative: &Path) -> Result<File> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn source_configuration_is_file_blocking(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<bool>> {
+        if relative.is_absolute() {
+            return Err(RootedFsError::InvalidRelativePath);
+        }
+        self.verify_root_path_blocking()?;
+        let path = component_cstring(relative.as_os_str())?;
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: root FD/path are live and stat is writable. Following here
+        // matches local ignore configuration semantics, not remote data access.
+        let result = unsafe {
+            libc::fstatat(
+                self.root_fd.as_raw_fd(),
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            return if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: successful fstatat initialized the complete stat value.
+        let stat = unsafe { stat.assume_init() };
+        self.verify_root_path_blocking()?;
+        Ok(Some(stat.st_mode & libc::S_IFMT == libc::S_IFREG))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_configuration_is_file_blocking(
+        &self,
+        _relative: &Path,
+    ) -> Result<Option<bool>> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Translate only exact observations already advanced by this root's own
@@ -1260,7 +1393,13 @@ impl RootedFs {
             .retirement
             .lock()
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-        let expected = lineage.resolve(scanned)?;
+        // Source observations are always exact. Destination retirement is not
+        // permission to adopt a new source version, even on an aliasing inode.
+        let expected = if self.source_path_continuity {
+            scanned
+        } else {
+            lineage.resolve(scanned)?
+        };
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
@@ -1306,6 +1445,54 @@ impl RootedFs {
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn open_regular_blocking(&self, relative: &RelativePath) -> Result<File> {
         self.open_regular_path_blocking(relative.as_path())
+    }
+
+    /// A scanner's active directory starts at this held authority, not a fresh
+    /// resolution of the source pathname. Only its one active directory needs
+    /// a separate descriptor; traversal continuations remain disk-backed.
+    #[cfg(unix)]
+    pub(crate) fn clone_root_directory_blocking(&self) -> std::io::Result<File> {
+        Ok(self.root_fd.try_clone()?.into())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn clone_root_directory_blocking(&self) -> std::io::Result<File> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "rooted source scan unsupported",
+        ))
+    }
+
+    /// Read lean entry metadata through the held root without following links.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // libc integer widths differ by platform.
+    pub(crate) fn file_metadata_blocking(
+        &self,
+        relative: &RelativePath,
+    ) -> Result<crate::endpoint::FileMetadata> {
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        let stat = stat_at_no_follow(parent.as_raw_fd(), &leaf)?;
+        let seconds = stat.st_mtime as i64;
+        let nanoseconds = u32::try_from(stat.st_mtime_nsec).map_err(std::io::Error::other)?;
+        let duration = std::time::Duration::new(seconds.unsigned_abs(), nanoseconds);
+        let modified = if seconds >= 0 {
+            std::time::UNIX_EPOCH.checked_add(duration)
+        } else {
+            // POSIX negative seconds plus positive fractional nanoseconds.
+            std::time::UNIX_EPOCH
+                .checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
+                .and_then(|time| {
+                    time.checked_add(std::time::Duration::from_nanos(u64::from(nanoseconds)))
+                })
+        }
+        .ok_or_else(|| std::io::Error::other("entry timestamp out of range"))?;
+        Ok(crate::endpoint::FileMetadata {
+            size: u64::try_from(stat.st_size).map_err(std::io::Error::other)?,
+            modified,
+            is_dir: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            is_symlink: stat.st_mode & libc::S_IFMT == libc::S_IFLNK,
+            mode: stat.st_mode as u32,
+        })
     }
 
     /// Create a same-directory temporary file for one destination beneath the
@@ -1437,6 +1624,7 @@ impl RootedFs {
         relative: &RelativePath,
         expected: EntryIdentity,
     ) -> Result<()> {
+        self.verify_source_root_path_blocking()?;
         let (_, state) = self.open_hardlink_source_member(relative.as_path(), expected, None)?;
         let _ = state;
         Ok(())
@@ -1461,10 +1649,14 @@ impl RootedFs {
         scanned: EntryIdentity,
         expected: Option<&HardlinkSourceState>,
     ) -> Result<HardlinkSourceState> {
+        self.verify_source_root_path_blocking()?;
         let (member, before) =
             self.open_hardlink_source_member(relative.as_path(), scanned, expected)?;
         self.verify_parent_binding_blocking(relative.as_path(), &member.parent)?;
         let _permit = self.admit_mutation_blocking()?;
+        // The pathname guard detects divergence; the syscall still uses the
+        // original descriptor if the namespace changes after this check.
+        self.verify_source_root_path_blocking()?;
         unlink_at(member.parent.as_raw_fd(), &member.leaf, false)?;
         let after =
             hardlink_state_from_stat(&stat_fd(member.file.as_raw_fd())?, relative.as_path())?;
@@ -1748,6 +1940,7 @@ impl RootedFs {
     ) -> Result<()> {
         #[cfg(unix)]
         {
+            self.verify_source_root_path_blocking()?;
             self.remove_path_blocking(
                 relative.as_path(),
                 false,
@@ -1795,7 +1988,11 @@ impl RootedFs {
             .retirement
             .lock()
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-        let expected = lineage.resolve(expected)?;
+        let expected = if self.source_path_continuity {
+            expected
+        } else {
+            lineage.resolve(expected)?
+        };
         let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
         let changed = || RootedFsError::SourceMetadataChanged(relative.as_path().to_path_buf());
         let validate = || -> Result<()> {
@@ -2008,6 +2205,7 @@ impl RootedFs {
 
         Ok(Self {
             mutation_admission: RootedMutationAdmission::Unrestricted,
+            source_path_continuity: false,
             #[cfg(test)]
             mutation_pause: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(all(test, unix))]
@@ -2497,6 +2695,9 @@ impl RootedFs {
             )?,
         };
         let _permit = self.admit_mutation_blocking()?;
+        if matches!(authority, RemovalAuthority::Source(_)) {
+            self.verify_source_root_path_blocking()?;
+        }
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
             Ok(()) => {
                 if let Some(retired) = &mut retired {

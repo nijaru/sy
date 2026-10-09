@@ -96,10 +96,11 @@ pub(crate) async fn observed_hash(
     entry: &Entry,
     follow: bool,
 ) -> Result<[u8; 32]> {
+    let rooted = endpoint
+        .source_rooted_authority()
+        .await?
+        .ok_or_else(|| SyncError::Config("endpoint cannot bind an observed source hash".into()))?;
     if !follow {
-        let rooted = sy::rooted_fs::RootedFs::open(endpoint.root().to_path_buf())
-            .await
-            .map_err(map_io)?;
         return sy::endpoint::existing::fingerprint(rooted, entry.clone(), Default::default())
             .await
             .map(|fingerprint| fingerprint.content)
@@ -116,8 +117,10 @@ pub(crate) async fn observed_hash(
         path: entry.path.as_path().to_path_buf(),
     })?;
     let path = entry.path.clone();
+    let hashing_root = rooted.clone();
     let digest = tokio::task::spawn_blocking(move || {
         let validate = |file: &std::fs::File| -> Result<()> {
+            hashing_root.verify_root_path_blocking().map_err(map_io)?;
             if crate::endpoint::local_identity::metadata_identity(
                 &file.metadata()?,
                 EntryKind::File,
@@ -158,6 +161,7 @@ pub(crate) async fn observed_hash(
             path: path.as_path().to_path_buf(),
         })?;
     tokio::task::spawn_blocking(move || {
+        rooted.verify_root_path_blocking().map_err(map_io)?;
         if crate::endpoint::local_identity::metadata_identity(
             &reopened.metadata()?,
             EntryKind::File,
@@ -456,8 +460,8 @@ pub(crate) fn map_controller_error(error: ControllerError) -> SyncError {
     map_io(error)
 }
 
-pub(crate) fn map_io(error: impl std::fmt::Display) -> SyncError {
-    SyncError::Io(std::io::Error::other(error.to_string()))
+pub(crate) fn map_io(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SyncError {
+    SyncError::Io(std::io::Error::other(error))
 }
 
 #[cfg(test)]
@@ -486,6 +490,56 @@ mod tests {
 
     fn file_entry(value: &str) -> Entry {
         sized_file_entry(value, 1)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observed_hash_keeps_original_source_root_despite_identical_aliases() {
+        use futures::StreamExt;
+        use sy::endpoint::source_root::SourceRoot;
+        use sy::rooted_fs::RootedFsError;
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("source");
+        let replacement = parent.path().join("replacement");
+        let held = parent.path().join("held");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(original.join("file"), b"same inode and bytes").unwrap();
+        std::fs::hard_link(original.join("file"), replacement.join("file")).unwrap();
+        let source = SourceRoot::open(original.clone()).await.unwrap();
+        let endpoint = source.endpoint();
+        let entries: Vec<_> = source.entries(Default::default()).collect().await;
+        let entry = entries.into_iter().next().unwrap().unwrap();
+        std::fs::rename(&original, &held).unwrap();
+        std::fs::rename(&replacement, &original).unwrap();
+        for follow in [false, true] {
+            let error = observed_hash(&endpoint, &entry, follow).await.unwrap_err();
+            let SyncError::Io(error) = error else {
+                panic!("unexpected hash failure: {error:?}")
+            };
+            let cause = error.get_ref().unwrap();
+            assert!(
+                matches!(
+                    cause.downcast_ref::<RootedFsError>(),
+                    Some(RootedFsError::RootChanged(_))
+                ) || matches!(
+                    cause.downcast_ref::<sy::endpoint::existing::ExistingDestinationError>(),
+                    Some(sy::endpoint::existing::ExistingDestinationError::Rooted(
+                        RootedFsError::RootChanged(_)
+                    ))
+                )
+            );
+        }
+        for path in [original.join("file"), held.join("file")] {
+            assert_eq!(std::fs::read(&path).unwrap(), b"same inode and bytes");
+            assert_eq!(
+                crate::endpoint::local_identity::metadata_identity(
+                    &std::fs::metadata(path).unwrap(),
+                    EntryKind::File
+                ),
+                entry.identity
+            );
+        }
     }
 
     #[test]

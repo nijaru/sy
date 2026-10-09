@@ -25,6 +25,7 @@ type RuleCache = VecDeque<(PathBuf, PathBuf, RuleFile)>;
 
 pub struct SourceIgnoreScope {
     root: PathBuf,
+    authority: Option<crate::rooted_fs::RootedFs>,
     respect_gitignore: bool,
     canonical_root: Option<PathBuf>,
     initialized: bool,
@@ -38,6 +39,7 @@ impl SourceIgnoreScope {
     pub fn new(root: &Path, respect_gitignore: bool) -> Self {
         Self {
             root: root.to_path_buf(),
+            authority: None,
             respect_gitignore,
             canonical_root: None,
             initialized: false,
@@ -48,9 +50,88 @@ impl SourceIgnoreScope {
         }
     }
 
+    /// Internal rules use the original held root; lexical matcher anchors and
+    /// explicitly external parent/global/gitdir configuration keep their meaning.
+    pub fn with_rooted_authority(
+        rooted: crate::rooted_fs::RootedFs,
+        respect_gitignore: bool,
+    ) -> Self {
+        let mut scope = Self::new(rooted.root_path(), respect_gitignore);
+        scope.authority = Some(rooted);
+        scope
+    }
+
+    fn internal_relative<'a>(&self, file: &'a Path) -> Option<&'a Path> {
+        self.authority.as_ref()?;
+        file.strip_prefix(&self.root)
+            .ok()
+            .or_else(|| {
+                self.canonical_root
+                    .as_ref()
+                    .and_then(|root| file.strip_prefix(root).ok())
+            })
+            .filter(|relative| !relative.as_os_str().is_empty())
+    }
+
+    fn read_config(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        if let (Some(rooted), Some(relative)) = (&self.authority, self.internal_relative(path)) {
+            let file = match rooted.open_source_configuration_blocking(relative) {
+                Ok(file) => file,
+                Err(crate::rooted_fs::RootedFsError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::NotADirectory
+                            | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            };
+            return read_config_file(file, path);
+        }
+        read_config(path)
+    }
+
+    fn is_file(&self, path: &Path) -> io::Result<Option<bool>> {
+        if let (Some(rooted), Some(relative)) = (&self.authority, self.internal_relative(path)) {
+            return rooted
+                .source_configuration_is_file_blocking(relative)
+                .map_err(io::Error::other);
+        }
+        Ok(std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.is_file()))
+    }
+
+    fn has_git(&self, directory: &Path) -> io::Result<bool> {
+        Ok(self.is_file(&directory.join(".git"))?.is_some()
+            || self.is_file(&directory.join(".jj"))?.is_some())
+    }
+
+    fn canonical_config_path(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        if self.internal_relative(path).is_some() {
+            return Ok(self.is_file(path)?.is_some().then(|| path.to_path_buf()));
+        }
+        Ok(path.canonicalize().ok())
+    }
+
     fn initialize(&mut self) -> io::Result<()> {
+        if let Some(rooted) = &self.authority {
+            rooted
+                .verify_root_path_blocking()
+                .map_err(io::Error::other)?;
+        }
         if !self.initialized {
-            self.canonical_root = self.root.canonicalize().ok();
+            self.canonical_root = match &self.authority {
+                Some(rooted) => Some(
+                    rooted
+                        .source_configuration_root_path_blocking()
+                        .map_err(io::Error::other)?,
+                ),
+                None => self.root.canonicalize().ok(),
+            };
             if self.respect_gitignore {
                 self.global_file = global_excludes()?;
             }
@@ -82,7 +163,7 @@ impl SourceIgnoreScope {
                     }
                 }
                 if self.respect_gitignore {
-                    if let Some(git) = resolve_git_dir(directory)? {
+                    if let Some(git) = resolve_git_dir(directory, self)? {
                         let file = git.join("info/exclude");
                         if self.load_file(directory, &file)?.malformed {
                             return Err(io::Error::new(
@@ -101,7 +182,7 @@ impl SourceIgnoreScope {
         self.load_file(&root, &root.join(".ignore"))?;
         if self.respect_gitignore {
             self.load_file(&root, &root.join(".gitignore"))?;
-            if let Some(git) = resolve_git_dir(&root)? {
+            if let Some(git) = resolve_git_dir(&root, self)? {
                 self.load_file(&root, &git.join("info/exclude"))?;
             }
         }
@@ -122,10 +203,12 @@ impl SourceIgnoreScope {
                 if !directory.starts_with(&self.root) {
                     break;
                 }
-                any_git |= has_git(directory);
+                any_git |= self.has_git(directory)?;
             }
             if let Some(root) = &self.canonical_root {
-                any_git |= root.ancestors().skip(1).any(has_git);
+                for directory in root.ancestors().skip(1) {
+                    any_git |= self.has_git(directory)?;
+                }
             }
         }
         let mut decisions = [None; 3];
@@ -141,7 +224,7 @@ impl SourceIgnoreScope {
                 any_git && !saw_git,
                 &mut decisions,
             )?;
-            saw_git |= self.respect_gitignore && has_git(directory);
+            saw_git |= self.respect_gitignore && self.has_git(directory)?;
         }
         // Do not canonicalize a followed descendant: its lexical source rules
         // must remain in the chain. Canonical parents are appended once only.
@@ -154,7 +237,7 @@ impl SourceIgnoreScope {
                     any_git && !saw_git,
                     &mut decisions,
                 )?;
-                saw_git |= self.respect_gitignore && has_git(directory);
+                saw_git |= self.respect_gitignore && self.has_git(directory)?;
             }
         }
         if let Some(decision) = decisions.into_iter().flatten().next() {
@@ -198,7 +281,7 @@ impl SourceIgnoreScope {
                     self.match_file(directory, &directory.join(".gitignore"), candidate, is_dir)?;
             }
             if decisions[2].is_none() {
-                if let Some(git_dir) = resolve_git_dir(directory)? {
+                if let Some(git_dir) = resolve_git_dir(directory, self)? {
                     decisions[2] = self.match_file(
                         directory,
                         &git_dir.join("info/exclude"),
@@ -268,8 +351,8 @@ impl SourceIgnoreScope {
             return Ok(false);
         }
         let root = self.root.clone();
-        if has_git(&root) {
-            if let Some(git_dir) = resolve_legacy_git_dir(&root)? {
+        if self.has_git(&root)? {
+            if let Some(git_dir) = resolve_legacy_git_dir(&root, self)? {
                 if let Some(decision) =
                     self.match_file(&root, &git_dir.join("info/exclude"), &absolute, is_dir)?
                 {
@@ -319,7 +402,7 @@ impl SourceIgnoreScope {
                 self.dir_rules.push_front(cached);
             }
         } else {
-            let matcher = compile_matcher(root, file)?;
+            let matcher = compile_matcher(root, file, self.read_config(file)?)?;
             if self.dir_rules.len() == DIRECTORY_RULE_CACHE_CAPACITY {
                 self.dir_rules.pop_back();
             }
@@ -329,10 +412,6 @@ impl SourceIgnoreScope {
         }
         Ok(&self.dir_rules[0].2)
     }
-}
-
-fn has_git(directory: &Path) -> bool {
-    directory.join(".git").exists() || directory.join(".jj").exists()
 }
 
 fn read_config(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -349,6 +428,10 @@ fn read_config(path: &Path) -> io::Result<Option<Vec<u8>>> {
         // Upstream ignores unreadable rule/config files.
         Err(_) => return Ok(None),
     };
+    read_config_file(file, path)
+}
+
+fn read_config_file(file: std::fs::File, path: &Path) -> io::Result<Option<Vec<u8>>> {
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -373,8 +456,8 @@ fn read_config(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn compile_matcher(root: &Path, file: &Path) -> io::Result<RuleFile> {
-    let Some(bytes) = read_config(file)? else {
+fn compile_matcher(root: &Path, file: &Path, bytes: Option<Vec<u8>>) -> io::Result<RuleFile> {
+    let Some(bytes) = bytes else {
         return Ok(RuleFile {
             matcher: Gitignore::empty(),
             malformed: false,
@@ -428,12 +511,12 @@ fn compile_matcher(root: &Path, file: &Path) -> io::Result<RuleFile> {
 
 // Keep upstream's first-line gitdir/commondir interpretation, including its
 // CWD-relative gitdir behavior. It intentionally does not use git's env vars.
-fn resolve_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
+fn resolve_git_dir(directory: &Path, scope: &SourceIgnoreScope) -> io::Result<Option<PathBuf>> {
     let dot_git = directory.join(".git");
-    if !std::fs::metadata(&dot_git).is_ok_and(|metadata| metadata.is_file()) {
+    if scope.is_file(&dot_git)? != Some(true) {
         return Ok(Some(dot_git));
     }
-    let Some(bytes) = read_config(&dot_git)? else {
+    let Some(bytes) = scope.read_config(&dot_git)? else {
         return Ok(None);
     };
     let Some(line) = first_line(&bytes) else {
@@ -443,7 +526,7 @@ fn resolve_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
         return Ok(None);
     };
     let gitdir = PathBuf::from(gitdir);
-    let Some(bytes) = read_config(&gitdir.join("commondir"))? else {
+    let Some(bytes) = scope.read_config(&gitdir.join("commondir"))? else {
         return Ok(None);
     };
     let Some(common) = first_line(&bytes) else {
@@ -456,12 +539,15 @@ fn resolve_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
     }))
 }
 
-fn resolve_legacy_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
+fn resolve_legacy_git_dir(
+    directory: &Path,
+    scope: &SourceIgnoreScope,
+) -> io::Result<Option<PathBuf>> {
     let dot_git = directory.join(".git");
-    if !std::fs::metadata(&dot_git).is_ok_and(|metadata| metadata.is_file()) {
+    if scope.is_file(&dot_git)? != Some(true) {
         return Ok(Some(dot_git));
     }
-    let Some(bytes) = read_config(&dot_git)? else {
+    let Some(bytes) = scope.read_config(&dot_git)? else {
         return Ok(Some(dot_git));
     };
     let Ok(contents) = std::str::from_utf8(&bytes) else {
@@ -471,7 +557,7 @@ fn resolve_legacy_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
         return Ok(Some(dot_git));
     };
     let gitdir = PathBuf::from(gitdir.trim());
-    if let Some(bytes) = read_config(&gitdir.join("commondir"))? {
+    if let Some(bytes) = scope.read_config(&gitdir.join("commondir"))? {
         if let Ok(contents) = std::str::from_utf8(&bytes) {
             let common = contents.trim();
             if !common.is_empty() {
@@ -480,7 +566,7 @@ fn resolve_legacy_git_dir(directory: &Path) -> io::Result<Option<PathBuf>> {
                 } else {
                     PathBuf::from(common)
                 };
-                if let Ok(resolved) = candidate.canonicalize() {
+                if let Some(resolved) = scope.canonical_config_path(&candidate)? {
                     return Ok(Some(resolved));
                 }
             }
@@ -549,7 +635,66 @@ mod tests {
     }
 
     fn scope(root: &Path) -> SourceIgnoreScope {
-        SourceIgnoreScope::new(root, true)
+        #[cfg(unix)]
+        {
+            let root = crate::endpoint::source_root::SourceRoot::open_blocking(root.to_path_buf())
+                .unwrap();
+            SourceIgnoreScope::with_rooted_authority(root.rooted(), true)
+        }
+        #[cfg(not(unix))]
+        {
+            SourceIgnoreScope::new(root, true)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_ignore_ancestry_comes_from_held_root_not_retargeted_operand() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("original");
+        let replacement = parent.path().join("replacement");
+        let operand = parent.path().join("operand");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &operand).unwrap();
+        let root =
+            crate::endpoint::source_root::SourceRoot::open_blocking(operand.clone()).unwrap();
+        let expected = original.canonicalize().unwrap();
+        std::fs::remove_file(&operand).unwrap();
+        std::os::unix::fs::symlink(&replacement, &operand).unwrap();
+        // A transient retarget between validation and ancestry initialization
+        // cannot supply another tree's external parent rules.
+        assert_eq!(
+            root.rooted()
+                .source_configuration_root_path_blocking()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_root_rules_cannot_be_cached_as_original_deletion_protection() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("source");
+        let replacement = parent.path().join("replacement");
+        let held = parent.path().join("held");
+        for root in [&original, &replacement] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::create_dir(root.join("sub")).unwrap();
+        }
+        std::fs::write(original.join("sub/.ignore"), b"victim\n").unwrap();
+        let mut scope = scope(&original);
+        // The source producer has finished, but this destination-only rule
+        // lookup has not occurred yet. Missing replacement rules must not grant
+        // delete authority or poison the cache after the original root returns.
+        std::fs::rename(&original, &held).unwrap();
+        std::fs::rename(&replacement, &original).unwrap();
+        assert!(scope.is_ignored(Path::new("sub/victim"), false));
+        std::fs::rename(&original, &replacement).unwrap();
+        std::fs::rename(&held, &original).unwrap();
+        assert!(scope.is_ignored(Path::new("sub/victim"), false));
+        assert!(!scope.is_ignored(Path::new("sub/ordinary"), false));
     }
 
     #[test]
