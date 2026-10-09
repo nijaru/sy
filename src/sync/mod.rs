@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 pub mod config;
+mod json_path;
 mod local;
 pub mod output;
 pub mod policy;
