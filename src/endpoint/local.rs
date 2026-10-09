@@ -107,6 +107,9 @@ fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
         sy::rooted_fs::RootedFsError::CommittedParentChanged { path, reason } => {
             SyncError::CommittedParentChanged { path, reason }
         }
+        sy::rooted_fs::RootedFsError::CommittedFinalizationFailed { path, reason } => {
+            SyncError::CommittedFinalizationFailed { path, reason }
+        }
         sy::rooted_fs::RootedFsError::RootChanged(path) => SyncError::DestinationChanged { path },
         error => SyncError::Io(std::io::Error::other(error)),
     }
@@ -818,7 +821,10 @@ impl StagedWriter for LocalStagedWriter {
         .await
     }
 
-    async fn commit(mut self: Box<Self>) -> Result<()> {
+    async fn commit(
+        mut self: Box<Self>,
+        flags: Option<u32>,
+    ) -> Result<sy::rooted_fs::PublishedFileProof> {
         if let Some(mut file) = self.file.take() {
             if let Err(operation) = file.flush().await {
                 drop(file);
@@ -842,29 +848,32 @@ impl StagedWriter for LocalStagedWriter {
         let destination_path = self.destination_path.clone();
         let mut cancellation_guard =
             CommitCancellationGuard::new(std::sync::Arc::clone(&self.admission));
-        let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-            if let Err(operation) = rooted.verify_root_path_blocking() {
-                let operation = map_rooted_fs_error(operation);
-                return match staged.abort() {
-                    Ok(()) => Err(operation),
-                    Err(abort) => Err(SyncError::StagingAbortFailed {
-                        operation: operation.to_string(),
-                        abort: abort.to_string(),
+        let worker =
+            tokio::task::spawn_blocking(move || -> Result<sy::rooted_fs::PublishedFileProof> {
+                if let Err(operation) = rooted.verify_root_path_blocking() {
+                    let operation = map_rooted_fs_error(operation);
+                    return match staged.abort() {
+                        Ok(()) => Err(operation),
+                        Err(abort) => Err(SyncError::StagingAbortFailed {
+                            operation: operation.to_string(),
+                            abort: abort.to_string(),
+                        }),
+                    };
+                }
+                let published = staged
+                    .commit_with_admission(&worker_admission)
+                    .map_err(map_rooted_fs_error)?;
+                match rooted.verify_root_path_blocking() {
+                    Ok(()) => published
+                        .finalize_blocking(flags)
+                        .map_err(map_rooted_fs_error),
+                    Err(error) => Err(SyncError::CommittedRootChanged {
+                        destination: destination_path,
+                        root: root_path,
+                        reason: error.to_string(),
                     }),
-                };
-            }
-            staged
-                .commit_with_admission(&worker_admission)
-                .map_err(map_rooted_fs_error)?;
-            match rooted.verify_root_path_blocking() {
-                Ok(()) => Ok(()),
-                Err(error) => Err(SyncError::CommittedRootChanged {
-                    destination: destination_path,
-                    root: root_path,
-                    reason: error.to_string(),
-                }),
-            }
-        });
+                }
+            });
         #[cfg(test)]
         if let Some(queued) = self.commit_queued.take() {
             let _ = queued.send(());
@@ -1472,7 +1481,7 @@ mod tests {
             .await
             .unwrap();
         writer.write(b"content").await.unwrap();
-        writer.commit().await.unwrap();
+        writer.commit(None).await.unwrap();
 
         assert_eq!(fs::read(root.join("nested/dir/file")).unwrap(), b"content");
     }
@@ -1515,7 +1524,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
 
-            let commit = tokio::spawn(async move { Box::new(writer).commit().await });
+            let commit = tokio::spawn(async move { Box::new(writer).commit(None).await });
             queued_rx.await.unwrap();
             commit.abort();
             assert!(commit.await.unwrap_err().is_cancelled());
@@ -1557,7 +1566,7 @@ mod tests {
         staged.write(b"new").await.unwrap();
         sender.fail(std::sync::Arc::new(RouterError::WriterClosed));
         sender.closed().await;
-        let result = staged.commit().await;
+        let result = staged.commit(None).await;
         router.shutdown().await.unwrap();
         assert!(matches!(result, Err(SyncError::Io(error))
             if matches!(error.get_ref().and_then(|e| e.downcast_ref()),
@@ -1594,7 +1603,7 @@ mod tests {
                 reached: reached_tx,
                 resume: resume_rx,
             });
-        let mut commit = tokio::spawn(async move { Box::new(writer).commit().await });
+        let mut commit = tokio::spawn(async move { Box::new(writer).commit(None).await });
         let paused = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
         commit.abort();
         let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit).await;
@@ -1637,7 +1646,7 @@ mod tests {
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
         assert!(matches!(
-            writer.commit().await,
+            writer.commit(None).await,
             Err(SyncError::DestinationChanged { .. })
         ));
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"old");
@@ -1699,12 +1708,13 @@ mod tests {
             &preservation,
             Some(blake3::hash(b"different")),
             None,
+            None,
         )
         .await
         .unwrap();
         assert!(matches!(
             mismatch,
-            crate::endpoint::io::VerificationStatus::Failed { .. }
+            crate::endpoint::io::FinalizationOutcome::VerificationFailed { .. }
         ));
         assert_eq!(fs::read(dir.path().join("existing")).unwrap(), b"old");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -1720,10 +1730,17 @@ mod tests {
             &preservation,
             Some(blake3::hash(b"content")),
             None,
+            None,
         )
         .await
         .unwrap();
-        assert_eq!(verified, crate::endpoint::io::VerificationStatus::Verified);
+        assert!(matches!(
+            verified,
+            crate::endpoint::io::FinalizationOutcome::Published {
+                verification: crate::endpoint::io::VerificationStatus::Verified,
+                ..
+            }
+        ));
         assert_eq!(fs::read(dir.path().join("created")).unwrap(), b"content");
     }
 
@@ -1748,10 +1765,17 @@ mod tests {
             &crate::endpoint::io::Preservation::default(),
             Some(blake3::hash(b"private bytes")),
             None,
+            None,
         )
         .await
         .unwrap();
-        assert_eq!(result, crate::endpoint::io::VerificationStatus::Verified);
+        assert!(matches!(
+            result,
+            crate::endpoint::io::FinalizationOutcome::Published {
+                verification: crate::endpoint::io::VerificationStatus::Verified,
+                ..
+            }
+        ));
         let path = dir.path().join("private");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
@@ -1773,7 +1797,7 @@ mod tests {
             .unwrap();
         writer.write(b"content").await.unwrap();
         writer.set_metadata(&make_meta()).await.unwrap();
-        writer.commit().await.unwrap();
+        writer.commit(None).await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
     }
 
@@ -1793,8 +1817,8 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"concurrent edit").unwrap();
-        let error = match writer.commit().await {
-            Ok(()) => panic!("concurrent destination replacement must abort"),
+        let error = match writer.commit(None).await {
+            Ok(_) => panic!("concurrent destination replacement must abort"),
             Err(error) => error,
         };
 
@@ -1815,8 +1839,8 @@ mod tests {
         writer.write(b"staged").await.unwrap();
 
         fs::write(&path, b"concurrent create").unwrap();
-        let error = match writer.commit().await {
-            Ok(()) => panic!("a path appearing after scan must abort"),
+        let error = match writer.commit(None).await {
+            Ok(_) => panic!("a path appearing after scan must abort"),
             Err(error) => error,
         };
 

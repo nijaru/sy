@@ -234,9 +234,11 @@ impl ClientRemoteHandle {
             TransferStreamPolicy {
                 preservation: TransferPreservationRequest::default(),
                 compression,
+                final_flags: None,
             },
         )
         .await
+        .map(|(summary, _)| summary)
     }
 
     pub async fn transfer_file_with_stream_policy(
@@ -246,7 +248,7 @@ impl ClientRemoteHandle {
         destination: Option<TransferDestination>,
         metadata: TransferMetadata,
         stream_policy: TransferStreamPolicy,
-    ) -> Result<TransferSummary> {
+    ) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
         self.require_push(FrameKind::FileBegin)?;
         for (requested, supported, feature) in [
             (
@@ -269,6 +271,14 @@ impl ClientRemoteHandle {
                 );
             }
         }
+        if stream_policy.final_flags.is_some() && !self.capabilities.preserve_flags {
+            return Err(
+                crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
+                    feature: "BSD flags",
+                }
+                .into(),
+            );
+        }
         if stream_policy.compression.is_some() && !self.capabilities.zstd {
             return Err(RemoteSessionError::PeerLacksZstd);
         }
@@ -283,6 +293,16 @@ impl ClientRemoteHandle {
         )
         .await
         .map_err(Into::into)
+    }
+
+    pub(crate) async fn revalidate_publication(
+        &self,
+        proof: &crate::rooted_fs::PublishedFileProof,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        super::mutation::request_verify_publication(&self.sender, proof, self.peer)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn apply_metadata(

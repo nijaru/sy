@@ -35,6 +35,7 @@ pub struct TransferPreservationRequest {
 pub struct TransferStreamPolicy {
     pub preservation: TransferPreservationRequest,
     pub compression: Option<crate::engine::compression::CompressionPolicy>,
+    pub final_flags: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -167,9 +168,6 @@ pub enum RemoteTransferError {
 
     #[error("FileEnd must use FINAL|ACK_REQUIRED and no other flags, got 0x{flags:02x}")]
     FileEndFlags { flags: u8 },
-
-    #[error("file transfer acknowledgement payload must be empty")]
-    NonEmptyAck,
 
     #[error("delta copy was received for a whole-file transfer")]
     CopyWithoutBasis,
@@ -349,9 +347,11 @@ pub async fn request_file_transfer_with_policy(
         TransferStreamPolicy {
             preservation: TransferPreservationRequest::default(),
             compression,
+            final_flags: None,
         },
     )
     .await
+    .map(|(summary, _)| summary)
 }
 
 pub async fn request_file_transfer_with_stream_policy(
@@ -362,7 +362,7 @@ pub async fn request_file_transfer_with_stream_policy(
     metadata: TransferMetadata,
     peer: PlatformOs,
     stream_policy: TransferStreamPolicy,
-) -> Result<TransferSummary> {
+) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
     ensure_compatible_path_encoding(peer)?;
     if !source.is_file() {
         return Err(RemoteTransferError::InvalidSource);
@@ -405,12 +405,15 @@ pub async fn request_file_transfer_with_stream_policy(
         // A create: the receiver requires the path to remain absent.
         None => (WireFileBegin::whole(encoded_path, source.size), None),
     };
-    let begin = begin.with_metadata(
-        metadata.unix_mode,
-        metadata
-            .modified
-            .map(|value| (value.seconds(), value.nanoseconds())),
-    )?;
+    let begin = begin
+        .with_metadata(
+            metadata.unix_mode,
+            metadata
+                .modified
+                .map(|value| (value.seconds(), value.nanoseconds())),
+        )?
+        .with_bsd_flags(stream_policy.final_flags);
+    let published_path = source.path.clone();
 
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
@@ -477,8 +480,14 @@ pub async fn request_file_transfer_with_stream_policy(
             WireFileEnd::new(summary.file_size, summary.digest).encode(),
         )?)
         .await?;
-    receive_ack(&mut inbox, stream_id).await?;
-    Ok(summary)
+    let ack = receive_ack(&mut inbox, stream_id).await?;
+    Ok((
+        summary,
+        crate::rooted_fs::PublishedFileProof {
+            path: published_path,
+            identity: EntryIdentity::from_bytes(ack.identity()),
+        },
+    ))
 }
 
 /// Own the bounded producer queue and join its blocking worker on every send
@@ -551,6 +560,11 @@ pub async fn serve_incoming_file_rooted(
         });
     }
     let begin = WireFileBegin::decode(first_frame.payload())?;
+    if begin.bsd_flags().is_some() && !cfg!(target_os = "macos") {
+        return Err(RemoteTransferError::PreservationUnavailable {
+            feature: "BSD flags",
+        });
+    }
     let relative = decode_relative_path(begin.path.clone(), peer)?;
     drop(first);
 
@@ -570,7 +584,7 @@ pub async fn serve_incoming_file_rooted(
     // A malformed frame closes admission and joins the staging owner before
     // returning. Also observe worker failure while waiting for peer input: a
     // rejected chunk must not require another frame to wake the receiver.
-    let summary = tokio::select! {
+    let (summary, publication) = tokio::select! {
         received = receive_reconstruction(&mut inbox, &begin, &reconstruction_tx) => {
             drop(reconstruction_tx);
             let reconstructed = await_reconstruction(worker).await;
@@ -591,7 +605,7 @@ pub async fn serve_incoming_file_rooted(
             FrameKind::Ack,
             FrameFlags::empty(),
             stream_id,
-            Bytes::new(),
+            crate::protocol::WireFileAck::new(*publication.identity.as_bytes()).encode(),
         )?)
         .await?;
     Ok(summary)
@@ -880,7 +894,7 @@ fn reconstruct_file(
     begin: WireFileBegin,
     mut receiver: mpsc::Receiver<ReconstructionOp>,
     admission: &crate::endpoint::publication::PublicationAdmission,
-) -> Result<TransferSummary> {
+) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
     let mut literal_bytes = 0_u64;
@@ -967,13 +981,17 @@ fn reconstruct_file(
                 if let Some((basis, expected)) = prepared.basis.as_ref() {
                     validate_basis(basis, *expected)?;
                 }
-                prepared.staged.commit_with_admission(admission)?;
-                return Ok(TransferSummary {
-                    file_size,
-                    digest,
-                    literal_bytes,
-                    reused_bytes,
-                });
+                let published = prepared.staged.commit_with_admission(admission)?;
+                let proof = published.finalize_blocking(begin.bsd_flags())?;
+                return Ok((
+                    TransferSummary {
+                        file_size,
+                        digest,
+                        literal_bytes,
+                        reused_bytes,
+                    },
+                    proof,
+                ));
             }
         }
     }
@@ -1055,7 +1073,10 @@ fn opened_identity(metadata: &std::fs::Metadata) -> Result<EntryIdentity> {
         .ok_or(RemoteTransferError::MissingOpenedIdentity)
 }
 
-pub(crate) async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {
+pub(crate) async fn receive_ack(
+    inbox: &mut StreamInbox,
+    stream_id: StreamId,
+) -> Result<crate::protocol::WireFileAck> {
     let routed = inbox
         .recv()
         .await?
@@ -1071,15 +1092,14 @@ pub(crate) async fn receive_ack(inbox: &mut StreamInbox, stream_id: StreamId) ->
             actual: frame.kind(),
         });
     }
-    if !frame.payload().is_empty() {
-        return Err(RemoteTransferError::NonEmptyAck);
-    }
-    Ok(())
+    Ok(crate::protocol::WireFileAck::decode(frame.payload())?)
 }
 
 async fn await_reconstruction(
-    worker: tokio::task::JoinHandle<Result<TransferSummary>>,
-) -> Result<TransferSummary> {
+    worker: tokio::task::JoinHandle<
+        Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)>,
+    >,
+) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
     worker
         .await
         .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))?
@@ -1209,6 +1229,47 @@ mod tests {
             assert_eq!(received, data);
             assert_eq!(summary.digest, *blake3::hash(&data).as_bytes());
             assert_eq!(compressed_chunks, usize::from(policy.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn file_ack_rejects_malformed_proofs_and_flags_on_the_router_path() {
+        for (flags, payload) in [
+            (FrameFlags::empty(), Bytes::new()),
+            (FrameFlags::empty(), Bytes::from_static(&[1; 31])),
+            (FrameFlags::empty(), Bytes::from_static(&[1; 33])),
+            (FrameFlags::FINAL, Bytes::from_static(&[1; 32])),
+        ] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (cr, cw) = tokio::io::split(client_io);
+            let (sr, sw) = tokio::io::split(server_io);
+            let client =
+                FrameRouter::start(cr, cw, RouterRole::Client, RouterConfig::default()).unwrap();
+            let mut server =
+                FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
+            let mut inbox = client.sender().open_stream().unwrap();
+            let id = inbox.stream_id();
+            client
+                .sender()
+                .send(
+                    Frame::new(
+                        FrameKind::FileBegin,
+                        FrameFlags::empty(),
+                        id,
+                        WireFileBegin::whole(encode_relative_path(Path::new("file")).unwrap(), 0)
+                            .encode(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _incoming = server.incoming().recv().await.unwrap().unwrap();
+            server
+                .sender()
+                .send(Frame::new(FrameKind::Ack, flags, id, payload).unwrap())
+                .await
+                .unwrap();
+            assert!(receive_ack(&mut inbox, id).await.is_err());
         }
     }
 

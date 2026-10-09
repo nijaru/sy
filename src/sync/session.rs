@@ -265,7 +265,7 @@ impl SyncSession {
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
                 preservation_request: crate::endpoint::io::PreservationRequest::default(),
-                pending_finalization: false,
+                final_flags: None,
                 metadata: None,
             },
         )

@@ -664,8 +664,9 @@ impl RemotePushExecutor {
                         acls: self.acls,
                     },
                     compression: self.compression,
+                    final_flags: bsd_flags,
                 };
-                let summary = self
+                let (summary, publication) = self
                     .remote
                     .transfer_file_with_stream_policy(
                         self.source_root.clone(),
@@ -675,20 +676,13 @@ impl RemotePushExecutor {
                         stream_policy,
                     )
                     .await?;
-                let mut receipt = PublishedDestinationReceipt::for_file(
+                let receipt = PublishedDestinationReceipt::for_file(
                     source.path.clone(),
                     source.path.clone(),
                     source.identity,
                     &crate::endpoint::io::VerificationStatus::Verified,
-                    true,
-                    bsd_flags.is_none(),
+                    publication,
                 );
-                // Only rename-incompatible flags remain post-commit finalization.
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                    receipt.mark_finalized();
-                }
                 if source_removal {
                     self.remove_committed_source(&receipt, &source).await?;
                 }
@@ -837,13 +831,14 @@ impl RemotePushExecutor {
                 acls: self.acls,
             },
             compression: self.compression,
+            final_flags: bsd_flags,
         };
         let representative = HardlinkRepresentative {
             path: source.path.clone(),
             unix_mode: metadata.unix_mode,
             modified: metadata.modified,
         };
-        let summary = self
+        let (summary, publication) = self
             .remote
             .transfer_file_with_stream_policy(
                 self.source_root.clone(),
@@ -853,20 +848,13 @@ impl RemotePushExecutor {
                 stream_policy,
             )
             .await?;
-        let mut receipt = PublishedDestinationReceipt::for_file(
+        let receipt = PublishedDestinationReceipt::for_file(
             source.path.clone(),
             source.path.clone(),
             source.identity,
             &crate::endpoint::io::VerificationStatus::Verified,
-            true,
-            bsd_flags.is_none(),
+            publication,
         );
-        // Only rename-incompatible flags remain post-commit finalization.
-        if let Some(flags) = bsd_flags {
-            self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                .await?;
-            receipt.mark_finalized();
-        }
         groups.insert(group, representative).await?;
         if source_removal {
             self.defer_grouped_source_removal(group, &receipt, &source)
@@ -1087,6 +1075,17 @@ impl RemotePushExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
+        if source.is_file() {
+            let proof = receipt.publication().map_err(|error| {
+                RemotePushError::SourceRemoval(
+                    self.source_root.join(source.path.as_path()),
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+            self.remote.revalidate_publication(proof).await?;
+        }
+        // The remote acknowledgement and local unlink are not a distributed
+        // CAS: external namespace writers must be excluded for that guarantee.
         self.remove_source_entry_on_disk(source).await
     }
 

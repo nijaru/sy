@@ -65,6 +65,9 @@ pub enum RootedFsError {
     #[error("destination was committed at {path}, but its parent no longer matches the rooted path: {reason}")]
     CommittedParentChanged { path: PathBuf, reason: String },
 
+    #[error("destination was committed at {path}, but required finalization failed: {reason}")]
+    CommittedFinalizationFailed { path: PathBuf, reason: String },
+
     #[error("rooted filesystem path must contain only normal relative components")]
     InvalidRelativePath,
 
@@ -323,7 +326,8 @@ impl RootedCopySource<'_> {
         if let Err(operation) = prepare() {
             return Err(staged.namespace.abort_after(operation));
         }
-        staged.commit()
+        staged.commit()?.finalize_blocking(None)?;
+        Ok(())
     }
 }
 
@@ -496,19 +500,112 @@ impl RootedStagedFile {
 
     /// Publish atomically through the namespace owner. This is not a power-loss
     /// durability guarantee: no parent-directory persistence ordering is provided.
-    pub fn commit(self) -> Result<()> {
-        self.namespace.commit()
+    pub fn commit(self) -> Result<RootedPublishedFile> {
+        let Self { file, namespace } = self;
+        let rooted = namespace.rooted.clone();
+        let path = RelativePath::new(namespace.destination_path.clone())
+            .map_err(|_| RootedFsError::InvalidRelativePath)?;
+        namespace.commit()?;
+        Ok(RootedPublishedFile { file, rooted, path })
     }
 
     /// Cancellation may reject admission, but cannot revoke a native commit
     /// already admitted. The namespace owner acquires admission after validation.
-    pub(crate) fn commit_with_admission(self, admission: &PublicationAdmission) -> Result<()> {
-        self.namespace.commit_with_admission(admission)
+    pub(crate) fn commit_with_admission(
+        self,
+        admission: &PublicationAdmission,
+    ) -> Result<RootedPublishedFile> {
+        let Self { file, namespace } = self;
+        let rooted = namespace.rooted.clone();
+        let path = RelativePath::new(namespace.destination_path.clone())
+            .map_err(|_| RootedFsError::InvalidRelativePath)?;
+        namespace.commit_with_admission(admission)?;
+        Ok(RootedPublishedFile { file, rooted, path })
     }
 
     /// Explicitly abort and report cleanup failures rather than relying on Drop.
     pub fn abort(self) -> Result<()> {
         self.namespace.abort()
+    }
+}
+
+/// The original staging descriptor, retained across actual namespace publication.
+/// Never reopen a visible name to acquire authority for postcommit metadata.
+#[derive(Debug)]
+pub struct RootedPublishedFile {
+    file: File,
+    rooted: RootedFs,
+    path: RelativePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedFileProof {
+    pub path: RelativePath,
+    pub identity: EntryIdentity,
+}
+
+impl RootedPublishedFile {
+    pub fn finalize_blocking(self, flags: Option<u32>) -> Result<PublishedFileProof> {
+        let finalize = || {
+            self.verify_binding()?;
+            if let Some(flags) = flags {
+                #[cfg(target_os = "macos")]
+                {
+                    // SAFETY: the live descriptor is the original staged inode,
+                    // not a reopened path. fchflags cannot mutate a replacement.
+                    if unsafe { libc::fchflags(self.file.as_raw_fd(), flags) } != 0 {
+                        return Err(RootedFsError::Io(std::io::Error::last_os_error()));
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = flags;
+                    return Err(RootedFsError::UnsupportedPlatform);
+                }
+            }
+            let identity = self.verify_binding()?;
+            Ok(PublishedFileProof {
+                path: self.path.clone(),
+                identity,
+            })
+        };
+        finalize().map_err(|error| RootedFsError::CommittedFinalizationFailed {
+            path: self.path.as_path().to_path_buf(),
+            reason: error.to_string(),
+        })
+    }
+
+    fn verify_binding(&self) -> Result<EntryIdentity> {
+        #[cfg(unix)]
+        {
+            let identity = identity_from_stat(&stat_fd(self.file.as_raw_fd())?)
+                .ok_or_else(|| RootedFsError::NotRegularFile(self.path.as_path().to_path_buf()))?;
+            if self.rooted.path_identity_blocking(&self.path)? != Some((EntryKind::File, identity))
+            {
+                return Err(RootedFsError::DestinationChanged(
+                    self.path.as_path().to_path_buf(),
+                ));
+            }
+            Ok(identity)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+}
+
+impl PublishedFileProof {
+    /// Observational revalidation, not a filesystem compare-and-swap. A concurrent
+    /// namespace writer can still race the later source unlink; exclusive access
+    /// is required to exclude that residual interval.
+    pub fn revalidate_blocking(&self, rooted: &RootedFs) -> Result<()> {
+        if rooted.path_identity_blocking(&self.path)? != Some((EntryKind::File, self.identity)) {
+            return Err(RootedFsError::DestinationChanged(
+                self.path.as_path().to_path_buf(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -3677,6 +3774,50 @@ mod tests {
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
     }
 
+    #[tokio::test]
+    async fn finalized_publication_uses_the_original_inode_and_rejects_foreign_replacement() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let path = relative("file");
+        let mut staged = rooted.begin_staged_file_blocking(&path).unwrap();
+        staged.file_mut().write_all(b"published").unwrap();
+        let published = staged.commit().unwrap();
+        std::fs::rename(root.path().join("file"), root.path().join("owned")).unwrap();
+        std::fs::write(root.path().join("file"), b"foreign").unwrap();
+        #[cfg(target_os = "macos")]
+        let flags = Some(1); // UF_NODUMP is inert, but must not reach the foreign inode.
+        #[cfg(not(target_os = "macos"))]
+        let flags = None;
+        let error = published.finalize_blocking(flags).unwrap_err();
+        assert!(matches!(
+            error,
+            RootedFsError::CommittedFinalizationFailed { .. }
+        ));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"foreign");
+        assert_eq!(
+            std::fs::read(root.path().join("owned")).unwrap(),
+            b"published"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::macos::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(root.path().join("file"))
+                    .unwrap()
+                    .st_flags(),
+                0
+            );
+            assert_eq!(
+                std::fs::metadata(root.path().join("owned"))
+                    .unwrap()
+                    .st_flags(),
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn committed_stage_cleanup_failure_is_not_reported_as_rollback() {
         let root = tempfile::TempDir::new().unwrap();

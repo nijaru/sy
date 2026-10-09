@@ -49,9 +49,8 @@ pub struct TransferOptions {
     /// Attributes to capture from the same opened source file that supplies
     /// bytes. Requested fields replace the corresponding payload values.
     pub preservation_request: PreservationRequest,
-    /// When true, the resulting publication receipt remains unfinalized until
-    /// the caller executes required post-commit finalization.
-    pub pending_finalization: bool,
+    /// Rename-incompatible flags applied on the owner's held published inode.
+    pub final_flags: Option<u32>,
     /// Requested mode and mtime to apply to staging instead of source metadata.
     pub metadata: Option<TransferMetadata>,
 }
@@ -203,10 +202,11 @@ pub struct TransferResult {
     pub receipt: PublishedDestinationReceipt,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct NativeTransferResult {
     bytes_written: u64,
     verification: VerificationStatus,
+    publication: sy::rooted_fs::PublishedFileProof,
 }
 
 struct NativeStagedCopyPolicy {
@@ -215,6 +215,7 @@ struct NativeStagedCopyPolicy {
     verify: bool,
     checks: CommitChecks,
     preservation: Preservation,
+    final_flags: Option<u32>,
 }
 
 struct NativeReflinkPatchPolicy {
@@ -224,6 +225,7 @@ struct NativeReflinkPatchPolicy {
     verify: bool,
     checks: CommitChecks,
     preservation: Preservation,
+    final_flags: Option<u32>,
 }
 
 /// What the transfer must prove about the source before committing bytes.
@@ -577,7 +579,7 @@ where
         .map_err(|error| SyncError::Config(error.to_string()))?;
     let dest_relative = RelativePath::new(dest_path.to_path_buf())
         .map_err(|error| SyncError::Config(error.to_string()))?;
-    let pending_finalization = options.pending_finalization;
+    let final_flags = options.final_flags;
 
     let native_strategy = options.rate_limiter.is_none()
         && source_native.is_some()
@@ -639,14 +641,13 @@ where
     }
 
     let expected_source = checks.expected_source_identity();
-    let make_receipt = move |verification: &VerificationStatus| {
+    let make_receipt = move |verification: &VerificationStatus, publication| {
         PublishedDestinationReceipt::for_file(
             source_relative.clone(),
             dest_relative.clone(),
             expected_source,
             verification,
-            true,
-            !pending_finalization,
+            publication,
         )
     };
 
@@ -680,12 +681,13 @@ where
                         verify: options.verify,
                         checks: checks.clone(),
                         preservation: preservation.clone(),
+                        final_flags,
                     },
                 )
                 .await?;
                 source_file = returned_source;
                 if let Some(result) = result {
-                    let receipt = make_receipt(&result.verification);
+                    let receipt = make_receipt(&result.verification, result.publication);
                     return Ok(TransferResult {
                         bytes_written: result.bytes_written,
                         strategy: TransferStrategy::NativeSparseCopy,
@@ -716,12 +718,13 @@ where
                         verify: options.verify,
                         checks: checks.clone(),
                         preservation: preservation.clone(),
+                        final_flags,
                     },
                 )
                 .await?;
                 source_file = returned_source;
                 if let Some(result) = result {
-                    let receipt = make_receipt(&result.verification);
+                    let receipt = make_receipt(&result.verification, result.publication);
                     return Ok(TransferResult {
                         bytes_written: result.bytes_written,
                         strategy: TransferStrategy::ReflinkPatch,
@@ -742,10 +745,11 @@ where
                     verify: options.verify,
                     checks,
                     preservation,
+                    final_flags,
                 },
             )
             .await?;
-            let receipt = make_receipt(&result.verification);
+            let receipt = make_receipt(&result.verification, result.publication);
             return Ok(TransferResult {
                 bytes_written: result.bytes_written,
                 strategy: TransferStrategy::NativeWholeCopy,
@@ -795,10 +799,11 @@ where
                 rate_limiter: options.rate_limiter.as_ref(),
                 preservation: &preservation,
                 pre_commit: Some(&pre_commit),
+                flags: final_flags,
             },
         )
         .await?;
-        let receipt = make_receipt(&result.verification);
+        let receipt = make_receipt(&result.verification, result.publication);
         return Ok(TransferResult {
             bytes_written: result.bytes_written,
             strategy: TransferStrategy::Streaming,
@@ -857,18 +862,21 @@ async fn native_whole_staged_copy(
         verify_open_source_identity(&source_file, expected_source, source_path)?;
         verify_open_source_size(&source_file, policy.metadata.size, source_path)
     };
-    let verification = crate::endpoint::io::finalize_staged_writer(
+    let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &policy.metadata,
         &policy.preservation,
         expected_hash,
         Some(&pre_commit),
+        policy.final_flags,
     )
-    .await?;
+    .await?
+    .into_publication()?;
 
     Ok(NativeTransferResult {
         bytes_written,
         verification,
+        publication,
     })
 }
 
@@ -886,6 +894,7 @@ async fn reflink_patch(
         verify,
         checks,
         preservation,
+        final_flags,
     } = policy;
     let ExpectedDestination::Unchanged(expected_destination_identity) = expected_destination else {
         return Ok((source_file, None));
@@ -980,20 +989,23 @@ async fn reflink_patch(
         verify_open_source_identity(&source_file, expected_source, &source_path)?;
         verify_open_source_size(&source_file, metadata.size, &source_path)
     };
-    let verification = crate::endpoint::io::finalize_staged_writer(
+    let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &metadata,
         &preservation,
         expected_hash,
         Some(&pre_commit),
+        final_flags,
     )
-    .await?;
+    .await?
+    .into_publication()?;
 
     Ok((
         source_file,
         Some(NativeTransferResult {
             bytes_written,
             verification,
+            publication,
         }),
     ))
 }
@@ -1075,20 +1087,23 @@ async fn native_sparse_staged_copy(
         verify_open_source_identity(&source_file, expected_source, source_path)?;
         verify_open_source_size(&source_file, policy.metadata.size, source_path)
     };
-    let verification = crate::endpoint::io::finalize_staged_writer(
+    let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &policy.metadata,
         &policy.preservation,
         expected_hash,
         Some(&pre_commit),
+        policy.final_flags,
     )
-    .await?;
+    .await?
+    .into_publication()?;
 
     Ok((
         source_file,
         Some(NativeTransferResult {
             bytes_written,
             verification,
+            publication,
         }),
     ))
 }
@@ -1477,7 +1492,7 @@ mod tests {
             rate_limiter: None,
             preservation: Preservation::default(),
             preservation_request: PreservationRequest::default(),
-            pending_finalization: false,
+            final_flags: None,
             identity,
             metadata: None,
         }
