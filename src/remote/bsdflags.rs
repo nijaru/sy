@@ -264,12 +264,11 @@ fn require_result_flags(frame: &Frame) -> Result<()> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
 
-    #[cfg(target_os = "macos")]
     fn serve(
         mut server: FrameRouter,
         rooted: RootedFs,
@@ -287,7 +286,6 @@ mod tests {
         })
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn observed_flags_read_returns_native_flags() {
         let root = tempfile::TempDir::new().unwrap();
@@ -332,7 +330,6 @@ mod tests {
         assert_eq!(read, 0x1);
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn source_flags_rpc_rejects_an_ancestor_swap_without_minting_foreign_proof() {
         let root = tempfile::TempDir::new().unwrap();
