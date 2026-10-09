@@ -108,12 +108,60 @@ pub fn selected_leaf_stream(
     })
 }
 
+/// Source scans use the same owned worker as ordinary scans, but retain and
+/// validate the run's original root even for empty scans and failed drains.
+pub(crate) fn source_entry_stream(
+    root: super::source_root::SourceRoot,
+    request: ScanRequest,
+) -> EntryStream {
+    EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
+        root.validate_blocking()?;
+        let result = scan_result(
+            traversal::walk_tree_rooted(&root.rooted(), request, &sender, Default::default()),
+            &sender,
+        );
+        root.validate_blocking()?;
+        result
+    })
+}
+
+pub(crate) fn selected_source_stream(
+    root: super::source_root::SourceRoot,
+    path: RelativePath,
+    request: ScanRequest,
+    missing_allowed: bool,
+) -> EntryStream {
+    EntryStream::spawn_blocking(1, move |sender| {
+        root.validate_blocking()?;
+        let result = traversal::selected_leaf_rooted(
+            &root.rooted(),
+            &path,
+            request,
+            missing_allowed,
+            &sender,
+        )
+        .map_err(|error| Box::new(error) as BoxError);
+        root.validate_blocking()?;
+        result
+    })
+}
+
 fn scan_worker(
     root: PathBuf,
     request: ScanRequest,
     sender: tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
 ) -> Result<(), BoxError> {
-    match traversal::walk_tree(&root, request, &sender, Default::default()) {
+    scan_result(
+        traversal::walk_tree(&root, request, &sender, Default::default()),
+        &sender,
+    )
+}
+
+fn scan_result(
+    result: Result<(), LocalScanError>,
+    sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
+) -> Result<(), BoxError> {
+    match result {
         Ok(()) => Ok(()),
         Err(LocalScanError::Walk(error))
             if sender.is_closed() && error.kind() == std::io::ErrorKind::Interrupted =>

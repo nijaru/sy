@@ -44,7 +44,9 @@ use mutation::{
     request_copy_file, request_create_directory, request_hardlink, request_remove,
     request_replace_symlink, serve_incoming_mutation_rooted, RemoteMutationError,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Debug, thiserror::Error)]
@@ -268,7 +270,7 @@ impl ClientRemoteSession {
 
     pub async fn transfer_file(
         &self,
-        source_root: PathBuf,
+        source_root: crate::endpoint::source_root::SourceRoot,
         source: Entry,
         destination: Option<crate::remote::transfer::TransferDestination>,
     ) -> Result<TransferSummary> {
@@ -866,6 +868,7 @@ mod tests {
     use crate::engine::domain::{EntryKind, Timestamp};
     use crate::engine::scan::EntryMetadataRequest;
     use crate::transfer::delta::BasisIndexLimits;
+    use futures::TryStreamExt;
     use tokio::task::JoinSet;
 
     #[cfg(unix)]
@@ -1084,7 +1087,16 @@ mod tests {
         let data = b"runtime-transfer";
         std::fs::write(source_root.path().join("file.bin"), data).unwrap();
         std::fs::write(destination_root.path().join("file.bin"), b"old").unwrap();
-        let source = file_entry(source_root.path(), "file.bin");
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let destination = file_entry(destination_root.path(), "file.bin");
         let expectation = crate::protocol::WireFileBasis::new(
             destination.size,
@@ -1118,7 +1130,7 @@ mod tests {
         .unwrap();
         let sent = session
             .transfer_file(
-                source_root.path().to_path_buf(),
+                authority,
                 source,
                 Some(crate::remote::transfer::TransferDestination::whole(
                     expectation,
@@ -1263,7 +1275,16 @@ mod tests {
         std::fs::write(root_path.join("file.bin"), b"pinned-old").unwrap();
         std::fs::write(outside.path().join("file.bin"), b"outside").unwrap();
         std::fs::write(source_root.path().join("file.bin"), b"new").unwrap();
-        let source = file_entry(source_root.path(), "file.bin");
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let destination = file_entry(&root_path, "file.bin");
         let expectation = crate::protocol::WireFileBasis::new(
             destination.size,
@@ -1304,7 +1325,7 @@ mod tests {
 
         session
             .transfer_file(
-                source_root.path().to_path_buf(),
+                authority,
                 source,
                 Some(crate::remote::transfer::TransferDestination::whole(
                     expectation,

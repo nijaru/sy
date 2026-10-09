@@ -45,8 +45,10 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
         }
         let mut request = ScanRequest::default();
         request.metadata.unix_mode = true;
-        let mut source_entries =
-            sy::endpoint::local_entry_scan::local_entry_stream(source.path().into(), request);
+        let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
+            .await
+            .unwrap();
+        let mut source_entries = authority.entries(request);
         let source_entry = source_entries.try_next().await.unwrap().unwrap();
         source_entries.close().await.unwrap();
         let mut destination_entries =
@@ -106,11 +108,10 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
             let _closed = server.await.unwrap();
             result.map_err(|error| error.to_string())
         } else {
-            let executor =
-                LocalSyncExecutor::new(source.path().into(), destination.path().into(), scheduler)
-                    .with_xattrs(true)
-                    .with_bsd_flags(cfg!(target_os = "macos"))
-                    .with_remove_source_files(remove_source);
+            let executor = LocalSyncExecutor::new(authority, destination.path().into(), scheduler)
+                .with_xattrs(true)
+                .with_bsd_flags(cfg!(target_os = "macos"))
+                .with_remove_source_files(remove_source);
             let work = executor.lower(operation, policy).unwrap().unwrap();
             assert!(work.resources().buffered_bytes > 0);
             tokio::time::timeout(std::time::Duration::from_secs(10), executor.execute(work))

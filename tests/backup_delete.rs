@@ -50,7 +50,9 @@ async fn delete_with_backup(
     let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
     if matches!(direction, Direction::Local) {
         let executor = LocalSyncExecutor::new(
-            source.path().to_path_buf(),
+            sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                .await
+                .unwrap(),
             destination.to_path_buf(),
             scheduler,
         )
@@ -109,7 +111,9 @@ async fn delete_with_backup(
     let result = match direction {
         Direction::Push => {
             let executor = RemotePushExecutor::new(
-                source.path().to_path_buf(),
+                sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                    .await
+                    .unwrap(),
                 client.request_handle(),
                 scheduler,
                 BasisIndexLimits::default(),
@@ -300,7 +304,9 @@ async fn local_delete_cannot_follow_a_raced_ancestor_outside_the_root() {
         std::os::unix::fs::symlink(&moved, root.path().join("parent")).unwrap();
         let source = tempfile::tempdir().unwrap();
         let executor = LocalSyncExecutor::new(
-            source.path().to_path_buf(),
+            sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                .await
+                .unwrap(),
             root.path().to_path_buf(),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )

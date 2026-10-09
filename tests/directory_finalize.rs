@@ -194,7 +194,11 @@ async fn run_case(
     }
     let mut request = ScanRequest::default();
     request.metadata.unix_mode = true;
-    let source_entries = local_entry_stream(source.path().to_path_buf(), request)
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+        .await
+        .unwrap();
+    let source_entries = authority
+        .entries(request)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -229,14 +233,10 @@ async fn run_case(
         Direction::Local => {
             SyncController::new(
                 wrap(
-                    LocalSyncExecutor::new(
-                        source.path().to_path_buf(),
-                        destination.path().to_path_buf(),
-                        scheduler,
-                    )
-                    .with_xattrs(true)
-                    .with_acls(acl)
-                    .with_bsd_flags(flags),
+                    LocalSyncExecutor::new(authority, destination.path().to_path_buf(), scheduler)
+                        .with_xattrs(true)
+                        .with_acls(acl)
+                        .with_bsd_flags(flags),
                 ),
                 NonZeroUsize::new(2).unwrap(),
             )
@@ -263,7 +263,7 @@ async fn run_case(
                     .unwrap();
             let result = if matches!(direction, Direction::Push) {
                 let executor = RemotePushExecutor::new(
-                    source.path().to_path_buf(),
+                    authority,
                     client.request_handle(),
                     scheduler,
                     BasisIndexLimits::default(),

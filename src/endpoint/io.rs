@@ -244,12 +244,14 @@ impl FinalizationOutcome {
     }
 }
 
+pub(crate) type PreCommit = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 pub(crate) async fn finalize_staged_writer(
     mut writer: Box<dyn StagedWriter>,
     metadata: &FileMetadata,
     preservation: &Preservation,
     expected_hash: Option<blake3::Hash>,
-    pre_commit: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
+    pre_commit: Option<PreCommit>,
     flags: Option<u32>,
 ) -> Result<FinalizationOutcome> {
     let prepared = async {
@@ -272,7 +274,9 @@ pub(crate) async fn finalize_staged_writer(
 
         writer.prepare_publication().await?;
         if let Some(pre_commit) = pre_commit {
-            pre_commit()?;
+            tokio::task::spawn_blocking(move || pre_commit())
+                .await
+                .map_err(|error| SyncError::Io(std::io::Error::other(error)))??;
         }
         Ok(verification)
     }
@@ -327,7 +331,7 @@ pub struct StreamCopyPolicy<'a> {
     pub preservation: &'a Preservation,
     /// Last-moment source race validation before commit. The staged writer
     /// validates its expected destination state itself.
-    pub pre_commit: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
+    pub(crate) pre_commit: Option<PreCommit>,
 }
 
 /// Copy one file between endpoints without whole-file buffering.
@@ -423,7 +427,7 @@ pub(crate) async fn copy_file_streaming_from_reader(
         metadata,
         policy.preservation,
         expected_hash,
-        policy.pre_commit,
+        policy.pre_commit.clone(),
         policy.flags,
     )
     .await?
@@ -439,6 +443,7 @@ pub(crate) async fn copy_file_streaming_from_reader(
 pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result<blake3::Hash> {
     const BUFFER_SIZE: usize = 1024 * 1024;
 
+    let rooted = endpoint.source_rooted_authority().await?;
     let mut reader = endpoint.open_reader(path).await?;
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut hasher = blake3::Hasher::new();
@@ -451,6 +456,12 @@ pub async fn hash_file_streaming(endpoint: &dyn Endpoint, path: &Path) -> Result
         hasher.update(&buffer[..read]);
     }
 
+    if let Some(rooted) = rooted {
+        tokio::task::spawn_blocking(move || rooted.verify_root_path_blocking())
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?;
+    }
     Ok(hasher.finalize())
 }
 
@@ -524,19 +535,20 @@ mod tests {
             mode: 0o640,
         };
         let preservation = Preservation::default();
-        let pre_commit = || {
-            assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let checked_path = path.clone();
+        let pre_commit: PreCommit = std::sync::Arc::new(move || {
+            assert_eq!(std::fs::read(&checked_path).unwrap(), b"old");
             Err(SyncError::SourceChanged {
                 path: PathBuf::from("source"),
             })
-        };
+        });
 
         let error = finalize_staged_writer(
             writer,
             &metadata,
             &preservation,
             Some(blake3::hash(b"bytes")),
-            Some(&pre_commit),
+            Some(pre_commit),
             None,
         )
         .await

@@ -155,6 +155,14 @@ struct Directory {
     path: PathBuf,
 }
 impl Directory {
+    fn held(rooted: &crate::rooted_fs::RootedFs) -> io::Result<Self> {
+        Ok(Self {
+            file: rooted.clone_root_directory_blocking()?,
+            #[cfg(not(unix))]
+            path: rooted.root_path().to_path_buf(),
+        })
+    }
+
     fn root(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -330,12 +338,50 @@ pub(super) fn selected_leaf(
     missing_allowed: bool,
     sender: &Sender,
 ) -> Result<(), LocalScanError> {
+    selected_leaf_with_root(
+        root,
+        relative,
+        request,
+        missing_allowed,
+        sender,
+        SourceIgnoreScope::new(root, request.respect_gitignore),
+        || Directory::root(root),
+    )
+}
+
+pub(super) fn selected_leaf_rooted(
+    rooted: &crate::rooted_fs::RootedFs,
+    relative: &crate::engine::domain::RelativePath,
+    request: ScanRequest,
+    missing_allowed: bool,
+    sender: &Sender,
+) -> Result<(), LocalScanError> {
+    selected_leaf_with_root(
+        rooted.root_path(),
+        relative,
+        request,
+        missing_allowed,
+        sender,
+        SourceIgnoreScope::with_rooted_authority(rooted.clone(), request.respect_gitignore),
+        || Directory::held(rooted),
+    )
+}
+
+fn selected_leaf_with_root(
+    root: &Path,
+    relative: &crate::engine::domain::RelativePath,
+    request: ScanRequest,
+    missing_allowed: bool,
+    sender: &Sender,
+    mut scope: SourceIgnoreScope,
+    open_root: impl FnOnce() -> io::Result<Directory>,
+) -> Result<(), LocalScanError> {
     if relative.as_path().components().count() != 1 {
         return Err(LocalScanError::OutsideRoot {
             path: relative.as_path().to_path_buf(),
         });
     }
-    let directory = match Directory::root(root) {
+    let directory = match open_root() {
         Ok(directory) => directory,
         Err(error) if missing_allowed && error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -353,7 +399,6 @@ pub(super) fn selected_leaf(
     };
     let entry = match metadata {
         Some(metadata) => {
-            let mut scope = SourceIgnoreScope::new(root, request.respect_gitignore);
             if (!request.include_git_dir && relative.as_path() == Path::new(".git"))
                 || (!missing_allowed
                     && scope.source_match(relative.as_path(), metadata.is_dir())?)
@@ -387,8 +432,40 @@ pub(super) fn walk_tree(
     sender: &Sender,
     budget: SortBudget,
 ) -> Result<(), LocalScanError> {
-    let mut directory = Directory::root(root)?;
-    let mut scope = SourceIgnoreScope::new(root, request.respect_gitignore);
+    walk_tree_with_root(
+        root,
+        request,
+        sender,
+        budget,
+        Directory::root(root)?,
+        SourceIgnoreScope::new(root, request.respect_gitignore),
+    )
+}
+
+pub(super) fn walk_tree_rooted(
+    rooted: &crate::rooted_fs::RootedFs,
+    request: ScanRequest,
+    sender: &Sender,
+    budget: SortBudget,
+) -> Result<(), LocalScanError> {
+    walk_tree_with_root(
+        rooted.root_path(),
+        request,
+        sender,
+        budget,
+        Directory::held(rooted)?,
+        SourceIgnoreScope::with_rooted_authority(rooted.clone(), request.respect_gitignore),
+    )
+}
+
+fn walk_tree_with_root(
+    root: &Path,
+    request: ScanRequest,
+    sender: &Sender,
+    budget: SortBudget,
+    mut directory: Directory,
+    mut scope: SourceIgnoreScope,
+) -> Result<(), LocalScanError> {
     scope.prepare_source()?;
     if request.max_depth == Some(0) {
         return Ok(());

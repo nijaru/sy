@@ -2,7 +2,6 @@
 
 use futures::TryStreamExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
 use sy::endpoint::local_entry_scan::local_entry_stream;
 use sy::engine::controller::SyncPlanExecutor;
 use sy::engine::domain::{ContentComparison, Entry, SyncOp};
@@ -16,11 +15,8 @@ use sy::remote::router::RouterConfig;
 use sy::remote::runtime::ClientRemoteSession;
 use sy::transfer::delta::BasisIndexLimits;
 
-async fn scan_file(root: &Path) -> Entry {
-    let mut request = ScanRequest::default();
-    request.metadata.unix_mode = true;
-    let mut entries = local_entry_stream(root.to_path_buf(), request);
-    entries.try_next().await.unwrap().unwrap()
+async fn scan_file(entries: sy::engine::reconcile::EntryStream) -> Entry {
+    entries.try_collect::<Vec<_>>().await.unwrap().remove(0)
 }
 
 /// Quick checks do not imply byte equality. Test real lowering and the real
@@ -43,8 +39,17 @@ async fn quick_unchanged_push_preserves_destination_bytes_and_removes_source_onl
         }
         xattr::set(&source_path, "user.sy-observed-push", b"preserved").unwrap();
         xattr::set(&destination_path, "user.sy-stale", b"remove").unwrap();
-        let source_entry = scan_file(source.path()).await;
-        let destination_entry = scan_file(destination.path()).await;
+        let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut request = ScanRequest::default();
+        request.metadata.unix_mode = true;
+        let source_entry = scan_file(authority.entries(request)).await;
+        let destination_entry = scan_file(local_entry_stream(
+            destination.path().to_path_buf(),
+            request,
+        ))
+        .await;
         assert_eq!(source_entry.size, destination_entry.size);
         assert_eq!(source_entry.modified, destination_entry.modified);
         let before = std::fs::metadata(&destination_path).unwrap();
@@ -67,7 +72,7 @@ async fn quick_unchanged_push_preserves_destination_bytes_and_removes_source_onl
         .unwrap();
         let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
         let executor = RemotePushExecutor::new(
-            source.path().to_path_buf(),
+            authority,
             client.request_handle(),
             scheduler,
             BasisIndexLimits::default(),

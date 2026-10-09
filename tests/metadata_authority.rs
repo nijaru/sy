@@ -49,17 +49,14 @@ fn seed(path: &Path, mode: u32, seconds: i64) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-async fn file_entry(root: &Path) -> Entry {
-    let mut request = ScanRequest::default();
-    request.metadata.unix_mode = true;
-    let mut stream = local_entry_stream(root.to_path_buf(), request);
-    while let Some(entry) = stream.try_next().await.unwrap() {
-        if entry.is_file() {
-            stream.close().await.unwrap();
-            return entry;
-        }
-    }
-    panic!("fixture file missing");
+async fn file_entry(stream: sy::engine::reconcile::EntryStream) -> Entry {
+    stream
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(Entry::is_file)
+        .expect("fixture file missing")
 }
 
 fn substitute(root: &Path, outside: &Path, race: Substitution) {
@@ -165,8 +162,18 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
             seed(&destination.path().join("dir/file"), 0o644, 1_650_000_000);
             seed(&outside.path().join("file"), 0o640, 1_700_000_000);
             let outside_before = metadata(&outside.path().join("file"));
-            let source_entry = file_entry(source.path()).await;
-            let destination_entry = file_entry(destination.path()).await;
+            let authority =
+                sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let mut request = ScanRequest::default();
+            request.metadata.unix_mode = true;
+            let source_entry = file_entry(authority.entries(request)).await;
+            let destination_entry = file_entry(local_entry_stream(
+                destination.path().to_path_buf(),
+                request,
+            ))
+            .await;
             if matches!(race, Substitution::SourceMetadata) {
                 std::fs::set_permissions(
                     source.path().join("dir/file"),
@@ -197,7 +204,7 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
             let result = match direction {
                 Direction::Local => {
                     let executor = LocalSyncExecutor::new(
-                        source.path().to_path_buf(),
+                        authority,
                         destination.path().to_path_buf(),
                         scheduler,
                     );
@@ -235,7 +242,7 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
                     let result = match direction {
                         Direction::Push => {
                             let executor = RemotePushExecutor::new(
-                                source.path().to_path_buf(),
+                                authority,
                                 client.request_handle(),
                                 scheduler,
                                 BasisIndexLimits::default(),
@@ -331,8 +338,11 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
     std::fs::create_dir(destination.path().join("dir")).unwrap();
     std::fs::create_dir(outside.path().join("child")).unwrap();
     let before = metadata(&outside.path().join("child"));
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+        .await
+        .unwrap();
     let executor = LocalSyncExecutor::new(
-        source.path().to_path_buf(),
+        authority.clone(),
         destination.path().to_path_buf(),
         Scheduler::new(ResourceBudget::default()).unwrap(),
     );
@@ -343,7 +353,8 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
     .unwrap();
     std::os::unix::fs::symlink(outside.path(), destination.path().join("dir")).unwrap();
     std::fs::create_dir(source.path().join("dir/new")).unwrap();
-    let entries = local_entry_stream(source.path().to_path_buf(), ScanRequest::default())
+    let entries = authority
+        .entries(ScanRequest::default())
         .try_collect::<Vec<_>>()
         .await
         .unwrap();

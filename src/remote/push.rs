@@ -388,7 +388,7 @@ impl RemoteBackupPlan {
 }
 
 pub struct RemotePushExecutor {
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     remote: ClientRemoteHandle,
     scheduler: Scheduler,
     delta_limits: BasisIndexLimits,
@@ -488,7 +488,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
 
 impl RemotePushExecutor {
     pub fn new(
-        source_root: PathBuf,
+        source_root: crate::endpoint::source_root::SourceRoot,
         remote: ClientRemoteHandle,
         scheduler: Scheduler,
         delta_limits: BasisIndexLimits,
@@ -602,7 +602,7 @@ impl RemotePushExecutor {
 
         match action {
             RemotePushAction::CreateDirectory { source } => {
-                let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+                let rooted = self.source_root.rooted();
                 let expected = source.identity.ok_or_else(|| {
                     crate::rooted_fs::RootedFsError::DestinationChanged(
                         source.path.as_path().to_path_buf(),
@@ -610,7 +610,13 @@ impl RemotePushExecutor {
                 })?;
                 let path = source.path.clone();
                 tokio::task::spawn_blocking(move || {
-                    rooted.read_directory_preservation_blocking(&path, expected, Default::default())
+                    rooted.verify_root_path_blocking()?;
+                    rooted.read_directory_preservation_blocking(
+                        &path,
+                        expected,
+                        Default::default(),
+                    )?;
+                    rooted.verify_root_path_blocking()
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -936,7 +942,7 @@ impl RemotePushExecutor {
         }
         receipt.validate_source_removal(source).map_err(|error| {
             RemotePushError::SourceRemoval(
-                self.source_root.join(source.path.as_path()),
+                self.source_root.path().join(source.path.as_path()),
                 std::io::Error::other(error.to_string()),
             )
         })?;
@@ -978,9 +984,7 @@ impl RemotePushExecutor {
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
-        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let rooted = self.source_root.rooted();
         let source = source.clone();
         tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
             .await
@@ -1058,7 +1062,7 @@ impl RemotePushExecutor {
             )
             .into());
         };
-        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let rooted = self.source_root.rooted();
         let path = metadata.path.clone();
         let request = crate::rooted_fs::DirectoryPreservationRequest {
             xattrs: self.xattrs,
@@ -1067,11 +1071,14 @@ impl RemotePushExecutor {
         };
         let preservation = if metadata.preserve_source {
             tokio::task::spawn_blocking(move || {
-                rooted.read_directory_preservation_blocking(
+                rooted.verify_root_path_blocking()?;
+                let preservation = rooted.read_directory_preservation_blocking(
                     &path,
                     metadata.source_identity,
                     request,
-                )
+                )?;
+                rooted.verify_root_path_blocking()?;
+                Ok::<_, crate::rooted_fs::RootedFsError>(preservation)
             })
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??
@@ -1117,9 +1124,7 @@ impl RemotePushExecutor {
                 network_writes: 1,
             })
             .await?;
-        let source_rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let source_rooted = self.source_root.rooted();
         let source_fingerprint =
             existing::fingerprint(source_rooted.clone(), source.clone(), options).await?;
         let destination_fingerprint = self
@@ -1161,14 +1166,14 @@ impl RemotePushExecutor {
         }
         receipt.validate_source_removal(source).map_err(|error| {
             RemotePushError::SourceRemoval(
-                self.source_root.join(source.path.as_path()),
+                self.source_root.path().join(source.path.as_path()),
                 std::io::Error::other(error.to_string()),
             )
         })?;
         {
             let proof = receipt.publication().map_err(|error| {
                 RemotePushError::SourceRemoval(
-                    self.source_root.join(source.path.as_path()),
+                    self.source_root.path().join(source.path.as_path()),
                     std::io::Error::other(error.to_string()),
                 )
             })?;
@@ -1180,9 +1185,7 @@ impl RemotePushExecutor {
     }
 
     async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let rooted = self.source_root.rooted();
         existing::remove_observed_source(rooted, source.clone()).await?;
         Ok(())
     }
@@ -1232,7 +1235,7 @@ impl RemotePushExecutor {
                 existing::observed_xattrs(self.source_root.clone(), source.clone()).await?,
             ));
         }
-        let location = XattrLocation::Local(self.source_root.as_path());
+        let location = XattrLocation::Local(&self.source_root);
         let xattrs = read_preserved_xattrs(&location, source).await?;
         Ok(Some(xattrs))
     }
@@ -1250,7 +1253,7 @@ impl RemotePushExecutor {
                     .unwrap_or_default(),
             ));
         }
-        let location = AclLocation::Local(self.source_root.as_path());
+        let location = AclLocation::Local(&self.source_root);
         let acl = read_preserved_acls(&location, source).await?;
         Ok(Some(acl.unwrap_or_default()))
     }

@@ -113,7 +113,7 @@ pub enum LocalSyncAction {
 pub type LocalTransferMetadata = crate::endpoint::transfer::TransferMetadata;
 
 pub struct LocalSyncExecutor {
-    source_root: PathBuf,
+    source_root: crate::endpoint::source_root::SourceRoot,
     destination_root: PathBuf,
     source_endpoint: crate::endpoint::local::LocalEndpoint,
     destination_endpoint: crate::endpoint::local::LocalEndpoint,
@@ -155,8 +155,12 @@ pub struct LocalSyncExecutor {
 }
 
 impl LocalSyncExecutor {
-    pub fn new(source_root: PathBuf, destination_root: PathBuf, scheduler: Scheduler) -> Self {
-        let source_endpoint = crate::endpoint::local::LocalEndpoint::new(source_root.clone());
+    pub fn new(
+        source_root: crate::endpoint::source_root::SourceRoot,
+        destination_root: PathBuf,
+        scheduler: Scheduler,
+    ) -> Self {
+        let source_endpoint = source_root.endpoint();
         let destination_endpoint =
             crate::endpoint::local::LocalEndpoint::new(destination_root.clone());
         Self {
@@ -272,7 +276,7 @@ impl LocalSyncExecutor {
     }
 
     fn source_path(&self, relative: &RelativePath) -> PathBuf {
-        self.source_root.join(relative.as_path())
+        self.source_root.path().join(relative.as_path())
     }
 
     /// Read the source's extended attributes for one entry when `-X` requested
@@ -287,7 +291,7 @@ impl LocalSyncExecutor {
                 existing::observed_xattrs(self.source_root.clone(), source.clone()).await?,
             ));
         }
-        let location = XattrLocation::Local(self.source_root.as_path());
+        let location = XattrLocation::Local(&self.source_root);
         let xattrs = read_preserved_xattrs(&location, source).await?;
         Ok(Some(xattrs))
     }
@@ -305,7 +309,7 @@ impl LocalSyncExecutor {
                     .unwrap_or_default(),
             ));
         }
-        let location = AclLocation::Local(self.source_root.as_path());
+        let location = AclLocation::Local(&self.source_root);
         let acl = read_preserved_acls(&location, source).await?;
         Ok(Some(acl.unwrap_or_default()))
     }
@@ -415,8 +419,7 @@ impl LocalSyncExecutor {
                 source,
                 destination_path,
             } => {
-                let source_root =
-                    crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+                let source_root = self.source_root.rooted();
                 let expected = source.identity.ok_or_else(|| {
                     crate::rooted_fs::RootedFsError::DestinationChanged(
                         source.path.as_path().to_path_buf(),
@@ -425,11 +428,13 @@ impl LocalSyncExecutor {
                 let rooted = self.metadata_authority().await?;
                 let relative = source.path.clone();
                 let identity = tokio::task::spawn_blocking(move || {
+                    source_root.verify_root_path_blocking()?;
                     source_root.read_directory_preservation_blocking(
                         &relative,
                         expected,
                         Default::default(),
                     )?;
+                    source_root.verify_root_path_blocking()?;
                     rooted.create_directory_blocking(&destination_path)
                 })
                 .await
@@ -772,7 +777,9 @@ impl LocalSyncExecutor {
                 })?
                 .ok_or_else(|| ExistingDestinationError::MissingObservation(source.path.clone()))?;
             let source = source.clone();
+            let source_root = self.source_root.clone();
             tokio::task::spawn_blocking(move || {
+                source_root.validate_blocking()?;
                 if source.identity.is_none()
                     || crate::endpoint::local_identity::metadata_identity(
                         &file.metadata()?,
@@ -781,13 +788,14 @@ impl LocalSyncExecutor {
                 {
                     return Err(ExistingDestinationError::ObservationChanged(source.path));
                 }
+                source_root.validate_blocking()?;
                 Ok::<(), ExistingDestinationError>(())
             })
             .await
             .map_err(|error| ExistingDestinationError::Worker(error.to_string()))??;
             return Ok(());
         }
-        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let rooted = self.source_root.rooted();
         let source = source.clone();
         tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
             .await
@@ -843,10 +851,11 @@ impl LocalSyncExecutor {
                 follow_symlinks: self.follow_symlinks,
                 rate_limiter: self.rate_limiter.clone(),
                 identity: crate::endpoint::transfer::TransferIdentity {
-                    source: source
-                        .identity
-                        .map(crate::endpoint::transfer::SourceExpectation::Scanned)
-                        .unwrap_or(crate::endpoint::transfer::SourceExpectation::Unverified),
+                    source: crate::endpoint::transfer::SourceExpectation::Scanned(
+                        source.identity.ok_or_else(|| {
+                            ExistingDestinationError::MissingObservation(source.path.clone())
+                        })?,
+                    ),
                     destination: expected_destination,
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
@@ -868,10 +877,7 @@ impl LocalSyncExecutor {
             crate::error::SyncError::Io(io) => {
                 LocalSyncError::Destination(self.destination_path(destination_path), io)
             }
-            other => LocalSyncError::Destination(
-                self.destination_path(destination_path),
-                std::io::Error::other(other.to_string()),
-            ),
+            other => LocalSyncError::Endpoint(other),
         })?;
         // Fail-fast on staged verification mismatch: the previous
         // destination is intact (the transfer layer aborted staging), and
@@ -971,9 +977,7 @@ impl LocalSyncExecutor {
 
     /// Revalidate and unlink through a held root; never follow a raced ancestor.
     async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let rooted = self.source_root.rooted();
         existing::remove_observed_source(rooted, source.clone()).await?;
         Ok(())
     }
@@ -1042,7 +1046,7 @@ impl LocalSyncExecutor {
             })
             .await?;
         let rooted = self.metadata_authority().await?;
-        let source = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
+        let source = self.source_root.rooted();
         let request = crate::rooted_fs::DirectoryPreservationRequest {
             xattrs: self.xattrs,
             acl: self.acls,
@@ -1056,6 +1060,7 @@ impl LocalSyncExecutor {
                     metadata.path.as_path().to_path_buf(),
                 ));
             };
+            source.verify_root_path_blocking()?;
             let preservation = if metadata.preserve_source {
                 source.read_directory_preservation_blocking(
                     &metadata.path,
@@ -1065,6 +1070,7 @@ impl LocalSyncExecutor {
             } else {
                 Default::default()
             };
+            source.verify_root_path_blocking()?;
             rooted.finalize_directory_blocking(
                 &metadata.path,
                 expected,
@@ -1106,9 +1112,7 @@ impl LocalSyncExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
-        let source_rooted = crate::rooted_fs::RootedFs::open(self.source_root.clone())
-            .await
-            .map_err(ExistingDestinationError::from)?;
+        let source_rooted = self.source_root.rooted();
         let destination_rooted = self.metadata_authority().await?;
         let source_fingerprint =
             existing::fingerprint(source_rooted.clone(), source.clone(), options).await?;
@@ -1489,16 +1493,17 @@ mod tests {
         let source_root = tempfile::tempdir().unwrap();
         let destination_root = tempfile::tempdir().unwrap();
         std::fs::write(source_root.path().join("input"), b"published bytes").unwrap();
-        let source = crate::endpoint::local_entry_scan::local_entry_stream(
-            source_root.path().to_path_buf(),
-            crate::engine::scan::ScanRequest::default(),
-        )
-        .try_next()
-        .await
-        .unwrap()
-        .unwrap();
-        let source_endpoint =
-            crate::endpoint::local::LocalEndpoint::new(source_root.path().to_path_buf());
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        let source_endpoint = authority.endpoint();
         let destination_endpoint =
             crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf());
         let result = crate::endpoint::transfer::transfer_file(
@@ -1530,7 +1535,7 @@ mod tests {
             crate::endpoint::io::VerificationStatus::NotRequested
         );
         let executor = LocalSyncExecutor::new(
-            source_root.path().to_path_buf(),
+            authority,
             destination_root.path().to_path_buf(),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
@@ -1566,16 +1571,18 @@ mod tests {
         let source_root = tempfile::tempdir().unwrap();
         let destination_root = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("target", source_root.path().join("input")).unwrap();
-        let source = crate::endpoint::local_entry_scan::local_entry_stream(
-            source_root.path().to_path_buf(),
-            crate::engine::scan::ScanRequest::default(),
-        )
-        .try_next()
-        .await
-        .unwrap()
-        .unwrap();
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let executor = LocalSyncExecutor::new(
-            source_root.path().to_path_buf(),
+            authority,
             destination_root.path().to_path_buf(),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
@@ -1629,13 +1636,11 @@ mod tests {
             .unwrap();
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.unix_mode = true;
-            let sources: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-                source_root.path().to_path_buf(),
-                request,
-            )
-            .try_collect()
-            .await
-            .unwrap();
+            let authority =
+                crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let sources: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
             let destinations: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
                 destination_root.path().to_path_buf(),
                 request,
@@ -1644,7 +1649,7 @@ mod tests {
             .await
             .unwrap();
             let executor = LocalSyncExecutor::new(
-                source_root.path().to_path_buf(),
+                authority,
                 destination_root.path().to_path_buf(),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
@@ -1708,13 +1713,11 @@ mod tests {
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.hardlink_group = true;
             request.metadata.unix_mode = true;
-            let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-                source_root.path().to_path_buf(),
-                request,
-            )
-            .try_collect()
-            .await
-            .unwrap();
+            let authority =
+                crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let entries: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
             let destination = crate::endpoint::local_entry_scan::local_entry_stream(
                 dest_root.path().to_path_buf(),
                 request,
@@ -1723,7 +1726,7 @@ mod tests {
             .await
             .unwrap();
             let executor = LocalSyncExecutor::new(
-                source_root.path().to_path_buf(),
+                authority,
                 dest_root.path().to_path_buf(),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
@@ -1790,15 +1793,13 @@ mod tests {
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.hardlink_group = true;
             request.metadata.unix_mode = true;
-            let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-                source_root.path().to_path_buf(),
-                request,
-            )
-            .try_collect()
-            .await
-            .unwrap();
+            let authority =
+                crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let entries: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
             let executor = LocalSyncExecutor::new(
-                source_root.path().to_path_buf(),
+                authority,
                 dest_root.path().to_path_buf(),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
@@ -1845,13 +1846,11 @@ mod tests {
             }
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.hardlink_group = true;
-            let sources: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-                source_root.path().to_path_buf(),
-                request,
-            )
-            .try_collect()
-            .await
-            .unwrap();
+            let authority =
+                crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let sources: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
             let destinations: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
                 destination_root.path().to_path_buf(),
                 request,
@@ -1860,7 +1859,7 @@ mod tests {
             .await
             .unwrap();
             let executor = LocalSyncExecutor::new(
-                source_root.path().to_path_buf(),
+                authority,
                 destination_root.path().to_path_buf(),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
@@ -1926,7 +1925,11 @@ mod tests {
                     std::fs::write(&path, b"raced").unwrap();
                 }
                 let executor = LocalSyncExecutor::new(
-                    source_root.path().to_path_buf(),
+                    crate::endpoint::source_root::SourceRoot::open(
+                        source_root.path().to_path_buf(),
+                    )
+                    .await
+                    .unwrap(),
                     dest_root.path().to_path_buf(),
                     Scheduler::new(ResourceBudget::default()).unwrap(),
                 );
@@ -1960,7 +1963,9 @@ mod tests {
                 std::fs::write(&path, b"raced contents").unwrap();
             }
             let executor = LocalSyncExecutor::new(
-                source.path().to_path_buf(),
+                crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                    .await
+                    .unwrap(),
                 destination.path().to_path_buf(),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
@@ -1999,7 +2004,9 @@ mod tests {
 
         let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
         let executor = LocalSyncExecutor::new(
-            temp_src.path().to_path_buf(),
+            crate::endpoint::source_root::SourceRoot::open(temp_src.path().to_path_buf())
+                .await
+                .unwrap(),
             temp_dst.path().to_path_buf(),
             scheduler,
         );

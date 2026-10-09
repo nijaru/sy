@@ -36,6 +36,9 @@ pub(super) async fn run(
             .await
             .map_err(map_io)?;
     }
+    let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
+        .await
+        .map_err(map_io)?;
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -74,10 +77,7 @@ pub(super) async fn run(
     // direction.
     let (source, destination) = match &scope {
         SyncScope::Tree => (
-            sy::endpoint::local_entry_scan::local_entry_stream(
-                source_root.to_path_buf(),
-                source_scan_request(config, scan_options),
-            ),
+            source_authority.entries(source_scan_request(config, scan_options)),
             if destination_absent {
                 sy::engine::reconcile::EntryStream::new(futures::stream::empty())
             } else {
@@ -91,8 +91,7 @@ pub(super) async fn run(
             source,
             destination,
         } => (
-            sy::endpoint::local_entry_scan::selected_leaf_stream(
-                source_root.to_path_buf(),
+            source_authority.selected_entries(
                 source.clone(),
                 source_scan_request(config, scan_options),
                 false,
@@ -117,14 +116,14 @@ pub(super) async fn run(
     // Source-derived ignore scope: destination-only paths the source rules
     // would ignore are protected from deletion (see `engine::ignore_scope`).
     let ignore_scope = std::sync::Arc::new(std::sync::Mutex::new(
-        sy::engine::ignore_scope::SourceIgnoreScope::new(
-            source_root,
+        sy::engine::ignore_scope::SourceIgnoreScope::with_rooted_authority(
+            source_authority.rooted(),
             scan_options.respect_gitignore,
         ),
     ));
 
     let mut plan = {
-        let source_root_owned = source_root.to_path_buf();
+        let source_authority = source_authority.clone();
         let destination_root_owned = destination_root.to_path_buf();
         preflight_sync_scoped_with_content(
             OrderedReconciler::with_scope(source, destination, scope.clone()),
@@ -145,10 +144,10 @@ pub(super) async fn run(
                     && entry_not_source_ignored(&ignore_scope, entry)
             },
             move |source: Entry, destination: Entry| {
-                let source_root = source_root_owned.clone();
+                let source_authority = source_authority.clone();
                 let destination_root = destination_root_owned.clone();
                 async move {
-                    let source_endpoint = sy::endpoint::local::LocalEndpoint::new(source_root);
+                    let source_endpoint = source_authority.endpoint();
                     let destination_endpoint =
                         sy::endpoint::local::LocalEndpoint::new(destination_root);
                     let source_hash = observed_hash(
@@ -172,6 +171,7 @@ pub(super) async fn run(
         .map_err(map_controller_error)?
     };
 
+    source_authority.validate().await.map_err(map_io)?;
     if let SyncScope::SelectedLeaf { source, .. } = &scope {
         super::selected::validate_effects(&mut plan, source_root, source, destination_root, config)
             .await?;
@@ -179,17 +179,17 @@ pub(super) async fn run(
 
     if config.preserve.hardlinks {
         plan.validate_hardlink_bytes(|commitment| {
-            let (root, follow) = match &commitment {
+            let (endpoint, follow) = match &commitment {
                 sy::engine::hardlink_preflight::ByteCommitment::Source(_) => (
-                    source_root,
+                    source_authority.endpoint(),
                     config.preserve.symlink_mode == SymlinkMode::Follow,
                 ),
-                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => {
-                    (destination_root, false)
-                }
+                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => (
+                    sy::endpoint::local::LocalEndpoint::new(destination_root.to_path_buf()),
+                    false,
+                ),
             };
             async move {
-                let endpoint = sy::endpoint::local::LocalEndpoint::new(root.to_path_buf());
                 observed_hash(&endpoint, commitment.entry(), follow)
                     .await
                     .map_err(|error| ControllerError::backend("hardlink byte commitment", error))
@@ -234,25 +234,22 @@ pub(super) async fn run(
             sy::sync::ratelimit::RateLimiter::new(limit),
         ))
     });
-    let executor = LocalSyncExecutor::new(
-        source_root.to_path_buf(),
-        destination_root.to_path_buf(),
-        scheduler,
-    )
-    .with_backup(
-        config.backup.is_some(),
-        backup_dir(config, destination_root),
-        config.suffix.clone(),
-    )
-    .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
-    .with_rate_limiter(rate_limiter)
-    .with_remove_source_files(config.remove_source_files)
-    .with_verify_on_write(config.verification.verify_on_write)
-    .with_hardlinks(config.preserve.hardlinks)
-    .with_xattrs(config.preserve.xattrs)
-    .with_acls(config.preserve.acls)
-    .with_bsd_flags(config.preserve.flags)
-    .with_reporter(Some(reporter.clone()));
+    let executor =
+        LocalSyncExecutor::new(source_authority, destination_root.to_path_buf(), scheduler)
+            .with_backup(
+                config.backup.is_some(),
+                backup_dir(config, destination_root),
+                config.suffix.clone(),
+            )
+            .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
+            .with_rate_limiter(rate_limiter)
+            .with_remove_source_files(config.remove_source_files)
+            .with_verify_on_write(config.verification.verify_on_write)
+            .with_hardlinks(config.preserve.hardlinks)
+            .with_xattrs(config.preserve.xattrs)
+            .with_acls(config.preserve.acls)
+            .with_bsd_flags(config.preserve.flags)
+            .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
@@ -287,6 +284,38 @@ pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn source_root_swap_preserves_original_and_out_of_scope_aliases() {
+        use super::super::hardlink_tests::{
+            is_original_root_change, SourceRootSwap, SwapBeforeSourceRemovals,
+        };
+        for (preserve_hardlinks, after_publication) in [(false, false), (true, false), (true, true)]
+        {
+            let mut fixture = SourceRootSwap::new().await;
+            let inner = LocalSyncExecutor::new(
+                fixture.source.clone(),
+                fixture.destination.path().into(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_hardlinks(preserve_hardlinks)
+            .with_remove_source_files(true);
+            if !after_publication {
+                fixture.swap();
+            }
+            let executor = SwapBeforeSourceRemovals {
+                inner,
+                paths: after_publication.then(|| fixture.paths()),
+            };
+            let error = SyncController::new(executor, NonZeroUsize::new(2).unwrap())
+                .execute(fixture.plan.take().unwrap())
+                .await
+                .unwrap_err();
+            assert!(is_original_root_change(&error), "{error:?}");
+            fixture.assert_sources_intact();
+            fixture.assert_publications(after_publication);
+        }
+    }
 
     async fn execute_hardlink_fixture(
         source: std::path::PathBuf,

@@ -1,6 +1,7 @@
 //! Fixed-size observation-bound source BSD-flags reads. Destination flags
 //! belong to the single observed metadata owner.
 
+use crate::endpoint::source_root::SourceRoot;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireBsdFlagsResult,
@@ -13,7 +14,6 @@ use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, Str
 use crate::remote::runtime::ClientRemoteHandle;
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use bytes::Bytes;
-use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteBsdFlagsError {
@@ -67,7 +67,7 @@ pub type Result<T> = std::result::Result<T, RemoteBsdFlagsError>;
 
 /// Source-side rooted observation or bounded remote request handle.
 pub enum BsdFlagsLocation<'a> {
-    Local(&'a Path),
+    Local(&'a SourceRoot),
     Remote(&'a ClientRemoteHandle),
 }
 
@@ -176,12 +176,16 @@ pub async fn read_preserved_bsd_flags(
         .ok_or_else(|| RemoteBsdFlagsError::MissingSourceIdentity(source.path.clone()))?;
     match location {
         BsdFlagsLocation::Local(root) => {
-            let root = root.to_path_buf();
+            let root = (*root).clone();
             let path = source.path.clone();
             let kind = source.kind;
             tokio::task::spawn_blocking(move || {
-                RootedFs::open_blocking_for_worker(root)?
-                    .read_observed_bsd_flags_blocking(&path, kind, expected)
+                root.validate_blocking()?;
+                let value = root
+                    .rooted()
+                    .read_observed_bsd_flags_blocking(&path, kind, expected)?;
+                root.validate_blocking()?;
+                Ok::<_, RootedFsError>(value)
             })
             .await
             .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))?

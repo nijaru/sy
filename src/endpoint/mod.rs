@@ -6,6 +6,7 @@ pub mod local_entry_scan;
 pub(crate) mod local_identity;
 pub(crate) mod publication;
 pub mod receipt;
+pub mod source_root;
 pub mod transfer;
 
 use crate::error::{Result, SyncError};
@@ -184,6 +185,12 @@ pub trait Endpoint: Send + Sync {
     /// can safely expose one. Transfer policy must still consult capabilities.
     fn native_path(&self, _path: &Path) -> Option<PathBuf> {
         None
+    }
+
+    /// Retain a native source namespace through transfer completion. A local
+    /// source endpoint returns its held authority, not a new pathname open.
+    async fn source_rooted_authority(&self) -> Result<Option<crate::rooted_fs::RootedFs>> {
+        Ok(None)
     }
 
     /// Open a regular file for a same-host native transfer. Implementations

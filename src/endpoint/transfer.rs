@@ -327,6 +327,8 @@ enum CheckPoint {
 #[derive(Clone)]
 struct CommitChecks {
     source: Option<SourceCheck>,
+    source_rooted: Option<crate::rooted_fs::RootedFs>,
+    source_relative: RelativePath,
     destination: DestinationCheck,
     test_hook: Option<RaceHook>,
 }
@@ -342,6 +344,8 @@ fn require_native(path: Option<&Path>, role: &str) -> Result<PathBuf> {
 impl CommitChecks {
     fn resolve(
         identity: TransferIdentity,
+        source_rooted: Option<crate::rooted_fs::RootedFs>,
+        source_relative: RelativePath,
         source_native: Option<&Path>,
         dest_native: Option<&Path>,
         follow_symlinks: bool,
@@ -400,6 +404,8 @@ impl CommitChecks {
         };
         Ok(Self {
             source,
+            source_rooted,
+            source_relative,
             destination,
             test_hook,
         })
@@ -413,10 +419,35 @@ impl CommitChecks {
                 hook();
             }
         }
+        if let Some(rooted) = &self.source_rooted {
+            rooted.verify_root_path_blocking().map_err(|error| {
+                if matches!(error, crate::rooted_fs::RootedFsError::RootChanged(_)) {
+                    SyncError::SourceChanged {
+                        path: self.source.as_ref().map_or_else(
+                            || rooted.root_path().join(self.source_relative.as_path()),
+                            |source| source.path.clone(),
+                        ),
+                    }
+                } else {
+                    SyncError::Io(std::io::Error::other(error))
+                }
+            })?;
+        }
         if let Some(expected) = &self.source {
-            if observe(&expected.path, expected.follow_symlinks)?
-                != Observation::Identified(expected.identity)
+            let matches = if let Some(rooted) = self
+                .source_rooted
+                .as_ref()
+                .filter(|_| !expected.follow_symlinks)
             {
+                rooted
+                    .path_identity_blocking(&self.source_relative)
+                    .map_err(std::io::Error::other)?
+                    == Some((crate::engine::domain::EntryKind::File, expected.identity))
+            } else {
+                observe(&expected.path, expected.follow_symlinks)?
+                    == Observation::Identified(expected.identity)
+            };
+            if !matches {
                 return Err(SyncError::SourceChanged {
                     path: expected.path.clone(),
                 });
@@ -565,18 +596,29 @@ where
     // bytes to flow through this process when pacing is requested.
     let source_native = source.native_path(source_path);
     let dest_native = dest.native_path(dest_path);
-    let checks = CommitChecks::resolve(
-        options.identity,
-        source_native.as_deref(),
-        dest_native.as_deref(),
-        options.follow_symlinks,
-        test_hook,
-    )?;
-    checks.verify(CheckPoint::Open)?;
-    let expected_destination = checks.expected_destination();
-    let mut before_stage = Some(before_stage);
+    let source_rooted = source.source_rooted_authority().await?;
     let source_relative = RelativePath::new(source_path.to_path_buf())
         .map_err(|error| SyncError::Config(error.to_string()))?;
+    let source_for_checks = source_relative.clone();
+    let source_native_checks = source_native.clone();
+    let dest_native_checks = dest_native.clone();
+    let checks = tokio::task::spawn_blocking(move || {
+        let checks = CommitChecks::resolve(
+            options.identity,
+            source_rooted,
+            source_for_checks,
+            source_native_checks.as_deref(),
+            dest_native_checks.as_deref(),
+            options.follow_symlinks,
+            test_hook,
+        )?;
+        checks.verify(CheckPoint::Open)?;
+        Ok::<_, SyncError>(checks)
+    })
+    .await
+    .map_err(|error| SyncError::Io(std::io::Error::other(error)))??;
+    let expected_destination = checks.expected_destination();
+    let mut before_stage = Some(before_stage);
     let dest_relative = RelativePath::new(dest_path.to_path_buf())
         .map_err(|error| SyncError::Config(error.to_string()))?;
     let final_flags = options.final_flags;
@@ -776,14 +818,13 @@ where
         };
         let expected_identity = checks.expected_source_identity();
         let expected_size = metadata.size;
-        let pre_commit = || {
-            checks.verify_source(CheckPoint::Commit)?;
-            if let Some(file) = identity_file.as_ref() {
-                verify_open_source_identity(file, expected_identity, source_path)?;
-                verify_open_source_size(file, expected_size, source_path)?;
-            }
-            Ok(())
-        };
+        let pre_commit = source_pre_commit(
+            checks,
+            identity_file,
+            expected_identity,
+            expected_size,
+            source_path.to_path_buf(),
+        );
         if let Some(before_stage) = before_stage.take() {
             before_stage().await?;
         }
@@ -798,7 +839,7 @@ where
                 expected_destination,
                 rate_limiter: options.rate_limiter.as_ref(),
                 preservation: &preservation,
-                pre_commit: Some(&pre_commit),
+                pre_commit: Some(pre_commit),
                 flags: final_flags,
             },
         )
@@ -857,17 +898,19 @@ async fn native_whole_staged_copy(
     }
 
     let expected_source = policy.checks.expected_source_identity();
-    let pre_commit = || {
-        policy.checks.verify_source(CheckPoint::Commit)?;
-        verify_open_source_identity(&source_file, expected_source, source_path)?;
-        verify_open_source_size(&source_file, policy.metadata.size, source_path)
-    };
+    let pre_commit = source_pre_commit(
+        policy.checks,
+        Some(source_file),
+        expected_source,
+        policy.metadata.size,
+        source_path.to_path_buf(),
+    );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &policy.metadata,
         &policy.preservation,
         expected_hash,
-        Some(&pre_commit),
+        Some(pre_commit),
         policy.final_flags,
     )
     .await?
@@ -984,17 +1027,19 @@ async fn reflink_patch(
     };
 
     let expected_source = checks.expected_source_identity();
-    let pre_commit = || {
-        checks.verify_source(CheckPoint::Commit)?;
-        verify_open_source_identity(&source_file, expected_source, &source_path)?;
-        verify_open_source_size(&source_file, metadata.size, &source_path)
-    };
+    let pre_commit = source_pre_commit(
+        checks,
+        Some(source_file.try_clone()?),
+        expected_source,
+        metadata.size,
+        source_path,
+    );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &metadata,
         &preservation,
         expected_hash,
-        Some(&pre_commit),
+        Some(pre_commit),
         final_flags,
     )
     .await?
@@ -1082,17 +1127,19 @@ async fn native_sparse_staged_copy(
         return Err(operation);
     }
     let expected_source = policy.checks.expected_source_identity();
-    let pre_commit = || {
-        policy.checks.verify_source(CheckPoint::Commit)?;
-        verify_open_source_identity(&source_file, expected_source, source_path)?;
-        verify_open_source_size(&source_file, policy.metadata.size, source_path)
-    };
+    let pre_commit = source_pre_commit(
+        policy.checks,
+        Some(source_file.try_clone()?),
+        expected_source,
+        policy.metadata.size,
+        source_path.to_path_buf(),
+    );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
         &policy.metadata,
         &policy.preservation,
         expected_hash,
-        Some(&pre_commit),
+        Some(pre_commit),
         policy.final_flags,
     )
     .await?
@@ -1106,6 +1153,23 @@ async fn native_sparse_staged_copy(
             publication,
         }),
     ))
+}
+
+fn source_pre_commit(
+    checks: CommitChecks,
+    file: Option<std::fs::File>,
+    expected: Option<EntryIdentity>,
+    size: u64,
+    path: PathBuf,
+) -> crate::endpoint::io::PreCommit {
+    std::sync::Arc::new(move || {
+        checks.verify_source(CheckPoint::Commit)?;
+        if let Some(file) = &file {
+            verify_open_source_identity(file, expected, &path)?;
+            verify_open_source_size(file, size, &path)?;
+        }
+        Ok(())
+    })
 }
 
 fn verify_native_staging(
