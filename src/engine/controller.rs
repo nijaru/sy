@@ -33,6 +33,9 @@ pub enum ControllerError {
     FinalizeJournal(#[from] FinalizeJournalError),
 
     #[error(transparent)]
+    HardlinkPreflight(#[from] crate::engine::hardlink_preflight::HardlinkPreflightError),
+
+    #[error(transparent)]
     Namespace(#[from] crate::engine::namespace::NamespacePreflightError),
 
     #[error("sync {phase} failed: {source}")]
@@ -144,6 +147,30 @@ impl SyncPlan {
     {
         while let Some(operation) = self.reader.next().await? {
             validate(operation).await?;
+        }
+        self.reader
+            .rewind(
+                usize::try_from(self.operations)
+                    .map_err(|_| ControllerError::CounterOverflow("operation"))?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Check every selected regular hardlink member's byte commitment before
+    /// execution. Hash only distinct retained observations or mixed retained /
+    /// source commitments; ordinary new-source groups need no extra read.
+    /// This is complete preflight, not a snapshot or execution-time authority.
+    pub async fn validate_hardlink_bytes<F, Fut>(&mut self, mut hash: F) -> Result<()>
+    where
+        F: FnMut(crate::engine::hardlink_preflight::ByteCommitment) -> Fut,
+        Fut: Future<Output = Result<[u8; 32]>>,
+    {
+        let commitments = crate::engine::hardlink_preflight::HardlinkCommitments::default();
+        let scheduler = crate::engine::scheduler::Scheduler::new(Default::default())
+            .map_err(|error| ControllerError::backend("hardlink preflight resources", error))?;
+        while let Some(operation) = self.reader.next().await? {
+            commitments.check(operation, &scheduler, &mut hash).await?;
         }
         self.reader
             .rewind(

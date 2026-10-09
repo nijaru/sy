@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 pub mod config;
+#[cfg(all(test, unix))]
+mod hardlink_tests;
 mod json_path;
 mod local;
 pub mod output;

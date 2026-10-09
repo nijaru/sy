@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
+pub(crate) const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 const ENTRY_OPTION_MODE: u8 = 1 << 0;
 const ENTRY_OPTION_SYMLINK_TARGET: u8 = 1 << 1;
 const ENTRY_OPTION_IDENTITY: u8 = 1 << 2;
@@ -160,7 +160,7 @@ impl PlanJournalReader {
     }
 }
 
-fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
+pub(crate) fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     match operation {
         SyncOp::Create {
@@ -222,7 +222,7 @@ fn encode_operation(operation: &SyncOp) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
+pub(crate) fn decode_operation(payload: &[u8]) -> Result<SyncOp> {
     let mut reader = SliceReader::new(payload);
     let operation = match reader.u8()? {
         0 => SyncOp::Create {

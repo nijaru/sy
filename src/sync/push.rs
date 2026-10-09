@@ -125,7 +125,7 @@ async fn execute_with_handle(
     let namespace_semantics = remote
         .namespace_semantics()
         .unwrap_or(NamespaceSemantics::UNSPECIFIED);
-    let plan = if let Some(source_rooted) = source_rooted {
+    let mut plan = if let Some(source_rooted) = source_rooted {
         let hash_remote = remote.clone();
         preflight_sync_scoped_with_content(
             sy::engine::reconcile::OrderedReconciler::new(source, destination),
@@ -184,6 +184,42 @@ async fn execute_with_handle(
         .await
         .map_err(map_controller_error)?
     };
+
+    if config.preserve.hardlinks {
+        plan.validate_hardlink_bytes(|commitment| {
+            let remote = remote.clone();
+            async move {
+                match commitment {
+                    sy::engine::hardlink_preflight::ByteCommitment::Source(entry) => {
+                        let endpoint =
+                            sy::endpoint::local::LocalEndpoint::new(source_root.to_path_buf());
+                        observed_hash(
+                            &endpoint,
+                            &entry,
+                            config.preserve.symlink_mode == SymlinkMode::Follow,
+                        )
+                        .await
+                        .map_err(|error| {
+                            sy::engine::controller::ControllerError::backend(
+                                "source hardlink byte commitment",
+                                error,
+                            )
+                        })
+                    }
+                    sy::engine::hardlink_preflight::ByteCommitment::Destination(entry) => {
+                        remote.content_hash(&entry).await.map_err(|error| {
+                            sy::engine::controller::ControllerError::backend(
+                                "destination hardlink byte commitment",
+                                error,
+                            )
+                        })
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(map_controller_error)?;
+    }
 
     if config.dry_run {
         let diff_mode = config.diff_mode;
@@ -264,6 +300,33 @@ async fn execute_with_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardlink_preflight_byte_commitments() {
+        super::super::hardlink_tests::assert_byte_commitments(
+            |source, destination, config| async move {
+                let operation = if config.dry_run {
+                    sy::protocol::Operation::PreviewPush
+                } else {
+                    sy::protocol::Operation::Push
+                };
+                let (client, server) =
+                    super::super::hardlink_tests::remote_session(operation, &destination).await;
+                let result = execute_with_handle(
+                    &source,
+                    &destination,
+                    client.request_handle(),
+                    &config,
+                    ScanOptions::default(),
+                )
+                .await;
+                super::super::hardlink_tests::finish_session(client, server).await;
+                result
+            },
+        )
+        .await;
+    }
     use crate::compress::CompressionDetection;
     use crate::filter::FilterEngine;
     use crate::sync::DeleteMode;
