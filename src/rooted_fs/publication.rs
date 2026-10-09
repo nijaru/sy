@@ -74,9 +74,9 @@ impl RootedPublishedFile {
                 {
                     // Namespace admission ended with cleanup. This distinct
                     // metadata mutation needs late admission of its own.
-                    let _permit = self
+                    let _permits = self
                         .rooted
-                        .admit_mutation_with_fallback_blocking(self.admission.as_deref())?;
+                        .admit_mutation_with_transaction_blocking(self.admission.as_deref())?;
                     self.verify_binding()?;
                     // SAFETY: the live descriptor is the original staged inode,
                     // checked against its recorded publication state, not a reopen.
