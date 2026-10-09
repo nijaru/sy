@@ -384,7 +384,10 @@ pub(crate) async fn remove_observed_source(rooted: RootedFs, source: Entry) -> R
 
 fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<()> {
     validate_path(rooted, source)?;
-    rooted.remove_blocking(&source.path, false, source.identity)?;
+    let expected = source
+        .identity
+        .ok_or_else(|| ExistingDestinationError::MissingObservation(source.path.clone()))?;
+    rooted.remove_source_blocking(&source.path, expected)?;
     Ok(())
 }
 

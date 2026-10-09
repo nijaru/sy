@@ -203,6 +203,13 @@ enum RootedMutationAdmission {
     ReadOnly,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum RemovalAuthority {
+    Source(EntryIdentity),
+    Destination(Option<EntryIdentity>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HardlinkSourceState {
     pub(crate) dev: u64,
@@ -1582,18 +1589,50 @@ impl RootedFs {
     /// components are opened with no-follow semantics and `unlinkat` never
     /// follows the destination leaf.
     ///
-    /// If `expected_identity` is provided, the existing entry is inspected
-    /// through the held descriptor with no-follow semantics before removal,
-    /// and `RootedFsError::DestinationChanged` is returned on identity or type mismatch.
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn remove_blocking(
+    /// Destination expectations may follow only this root's exact own old-inode
+    /// retirements. A successful unlink records its held old observation before
+    /// another alias can use the advanced authority.
+    pub(crate) fn remove_destination_blocking(
         &self,
         relative: &RelativePath,
         is_directory: bool,
         expected_identity: Option<EntryIdentity>,
     ) -> Result<()> {
-        self.remove_path_blocking(relative.as_path(), is_directory, expected_identity)
+        #[cfg(unix)]
+        {
+            self.remove_path_blocking(
+                relative.as_path(),
+                is_directory,
+                RemovalAuthority::Destination(expected_identity),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, is_directory, expected_identity);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+
+    /// Source unlink requires the exact source observation; destination lineage
+    /// cannot relax it. The caller must supply completed destination authority.
+    pub(crate) fn remove_source_blocking(
+        &self,
+        relative: &RelativePath,
+        expected_identity: EntryIdentity,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.remove_path_blocking(
+                relative.as_path(),
+                false,
+                RemovalAuthority::Source(expected_identity),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, expected_identity);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     /// Read bounded metadata from the scanned observation on a blocking worker,
@@ -2240,8 +2279,19 @@ impl RootedFs {
         &self,
         relative: &Path,
         is_directory: bool,
-        expected_identity: Option<EntryIdentity>,
+        authority: RemovalAuthority,
     ) -> Result<()> {
+        self.require_writable()?;
+        let mut lineage = self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let expected_identity = match authority {
+            RemovalAuthority::Source(expected) => Some(expected),
+            RemovalAuthority::Destination(expected) => expected
+                .map(|identity| lineage.resolve(identity))
+                .transpose()?,
+        };
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let leaf_c = component_cstring(&leaf)?;
         let mut stat = MaybeUninit::<libc::stat>::zeroed();
@@ -2290,9 +2340,27 @@ impl RootedFs {
         }
 
         self.verify_parent_binding_blocking(relative, &parent)?;
+        let mut retired = match authority {
+            RemovalAuthority::Source(_) => None,
+            RemovalAuthority::Destination(expected) => RetiredDestinationObservation::capture(
+                parent.as_raw_fd(),
+                &leaf,
+                relative,
+                expected.map_or(
+                    HeldDestinationExpectation::Unverified,
+                    HeldDestinationExpectation::Unchanged,
+                ),
+                &mut lineage,
+            )?,
+        };
         let _permit = self.admit_mutation_blocking()?;
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(retired) = &mut retired {
+                    retired.record(&mut lineage, RetirementStep::Unlink, relative)?;
+                }
+                Ok(())
+            }
             // A vanished entry is idempotent success.
             Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             // A non-empty directory is kept, not an error: under --backup a
@@ -2307,16 +2375,6 @@ impl RootedFs {
             }
             Err(error) => Err(error),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn remove_path_blocking(
-        &self,
-        _relative: &Path,
-        _is_directory: bool,
-        _expected_identity: Option<EntryIdentity>,
-    ) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
     }
 
     #[cfg(unix)]
@@ -4611,7 +4669,7 @@ mod tests {
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
 
         assert!(rooted
-            .remove_blocking(&relative("escape/keep"), false, None)
+            .remove_destination_blocking(&relative("escape/keep"), false, None)
             .is_err());
         assert_eq!(
             std::fs::read(outside.path().join("keep")).unwrap(),
@@ -4627,17 +4685,17 @@ mod tests {
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
 
         rooted
-            .remove_blocking(&relative("file"), false, None)
+            .remove_destination_blocking(&relative("file"), false, None)
             .unwrap();
         rooted
-            .remove_blocking(&relative("dir"), true, None)
+            .remove_destination_blocking(&relative("dir"), true, None)
             .unwrap();
         assert!(!root.path().join("file").exists());
         assert!(!root.path().join("dir").exists());
         std::fs::create_dir(root.path().join("protected")).unwrap();
         std::fs::write(root.path().join("protected/child"), b"keep").unwrap();
         rooted
-            .remove_blocking(&relative("protected"), true, None)
+            .remove_destination_blocking(&relative("protected"), true, None)
             .unwrap();
         assert_eq!(
             std::fs::read(root.path().join("protected/child")).unwrap(),
@@ -4667,40 +4725,40 @@ mod tests {
 
         // Vanished entry is idempotent success.
         rooted
-            .remove_blocking(&relative("nonexistent"), false, Some(file_id))
+            .remove_destination_blocking(&relative("nonexistent"), false, Some(file_id))
             .unwrap();
 
         // Mismatched file identity fails and preserves the file.
         let wrong_id = EntryIdentity::from_bytes([99; 32]);
         let err = rooted
-            .remove_blocking(&relative("file"), false, Some(wrong_id))
+            .remove_destination_blocking(&relative("file"), false, Some(wrong_id))
             .unwrap_err();
         assert!(matches!(err, RootedFsError::DestinationChanged(_)));
         assert!(file_path.exists());
 
         // Type mismatch (file requested as directory) fails.
         let err = rooted
-            .remove_blocking(&relative("file"), true, None)
+            .remove_destination_blocking(&relative("file"), true, None)
             .unwrap_err();
         assert!(matches!(err, RootedFsError::DestinationChanged(_)));
         assert!(file_path.exists());
 
         // Matching file identity succeeds.
         rooted
-            .remove_blocking(&relative("file"), false, Some(file_id))
+            .remove_destination_blocking(&relative("file"), false, Some(file_id))
             .unwrap();
         assert!(!file_path.exists());
 
         // Mismatched directory identity fails and preserves the dir.
         let err = rooted
-            .remove_blocking(&relative("dir"), true, Some(wrong_id))
+            .remove_destination_blocking(&relative("dir"), true, Some(wrong_id))
             .unwrap_err();
         assert!(matches!(err, RootedFsError::DestinationChanged(_)));
         assert!(dir_path.exists());
 
         // Matching directory identity succeeds.
         rooted
-            .remove_blocking(&relative("dir"), true, Some(dir_id))
+            .remove_destination_blocking(&relative("dir"), true, Some(dir_id))
             .unwrap();
         assert!(!dir_path.exists());
     }

@@ -288,21 +288,30 @@ pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option
 mod tests {
     use super::*;
 
+    async fn execute_hardlink_fixture(
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        config: SyncConfig,
+    ) -> Result<SyncStats> {
+        run(
+            &source,
+            &destination,
+            &config,
+            ScanOptions::default(),
+            SyncScope::Tree,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn hardlink_preflight_byte_commitments() {
-        super::super::hardlink_tests::assert_byte_commitments(
-            |source, destination, config| async move {
-                run(
-                    &source,
-                    &destination,
-                    &config,
-                    ScanOptions::default(),
-                    SyncScope::Tree,
-                )
-                .await
-            },
-        )
-        .await;
+        super::super::hardlink_tests::assert_byte_commitments(execute_hardlink_fixture).await;
+    }
+
+    #[tokio::test]
+    async fn destination_alias_deletion() {
+        super::super::hardlink_tests::assert_destination_alias_deletion(execute_hardlink_fixture)
+            .await;
     }
     use crate::sync::scanner::ScanOptions;
     use tempfile::TempDir;
