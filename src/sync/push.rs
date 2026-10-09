@@ -302,30 +302,41 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn hardlink_preflight_byte_commitments() {
-        super::super::hardlink_tests::assert_byte_commitments(
-            |source, destination, config| async move {
-                let operation = if config.dry_run {
-                    sy::protocol::Operation::PreviewPush
-                } else {
-                    sy::protocol::Operation::Push
-                };
-                let (client, server) =
-                    super::super::hardlink_tests::remote_session(operation, &destination).await;
-                let result = execute_with_handle(
-                    &source,
-                    &destination,
-                    client.request_handle(),
-                    &config,
-                    ScanOptions::default(),
-                )
-                .await;
-                super::super::hardlink_tests::finish_session(client, server).await;
-                result
-            },
+    async fn execute_hardlink_fixture(
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        config: SyncConfig,
+    ) -> Result<SyncStats> {
+        let operation = if config.dry_run {
+            sy::protocol::Operation::PreviewPush
+        } else {
+            sy::protocol::Operation::Push
+        };
+        let (client, server) =
+            super::super::hardlink_tests::remote_session(operation, &destination).await;
+        let result = execute_with_handle(
+            &source,
+            &destination,
+            client.request_handle(),
+            &config,
+            ScanOptions::default(),
         )
         .await;
+        super::super::hardlink_tests::finish_session(client, server).await;
+        result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardlink_preflight_byte_commitments() {
+        super::super::hardlink_tests::assert_byte_commitments(execute_hardlink_fixture).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destination_alias_deletion() {
+        super::super::hardlink_tests::assert_destination_alias_deletion(execute_hardlink_fixture)
+            .await;
     }
     use crate::compress::CompressionDetection;
     use crate::filter::FilterEngine;

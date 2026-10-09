@@ -1,4 +1,4 @@
-//! The same byte-intent safety contract through each real direction adapter.
+//! Hardlink semantics through the real direction adapters.
 use super::{SyncConfig, SyncStats};
 use crate::error::{Result, SyncError};
 use std::future::Future;
@@ -45,6 +45,52 @@ pub(super) async fn finish_session(
         ) if matches!(error.as_ref(), sy::remote::router::RouterError::TransportEof)),
             "{error:?}"
         );
+    }
+}
+
+pub(super) async fn assert_destination_alias_deletion<F, Fut>(mut execute: F)
+where
+    F: FnMut(PathBuf, PathBuf, SyncConfig) -> Fut,
+    Fut: Future<Output = Result<SyncStats>>,
+{
+    for backup in [false, true] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(destination.path().join("a"), b"old bytes").unwrap();
+        for name in ["b", "c"] {
+            std::fs::hard_link(destination.path().join("a"), destination.path().join(name))
+                .unwrap();
+        }
+        let mut config = SyncConfig::test_default();
+        config.delete = super::DeleteMode::Enabled {
+            limit: crate::engine::delete_plan::DeleteLimit::Count(3),
+            force: false,
+        };
+        if backup {
+            config.backup = Some(String::new());
+        }
+        let stats = execute(source.path().into(), destination.path().into(), config)
+            .await
+            .unwrap();
+        assert_eq!(stats.files_deleted, 3);
+        for name in ["a", "b", "c"] {
+            assert!(
+                !destination.path().join(name).exists(),
+                "alias {name} survived deletion"
+            );
+            if backup {
+                assert_eq!(
+                    std::fs::read(destination.path().join(format!("{name}~"))).unwrap(),
+                    b"old bytes"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(destination.path()).unwrap().count(),
+            if backup { 3 } else { 0 },
+            "unexpected entries or private staging leaked"
+        );
+        assert!(std::fs::read_dir(source.path()).unwrap().next().is_none());
     }
 }
 

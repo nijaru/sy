@@ -113,7 +113,7 @@ fn mutate(rooted: &RootedFs, mutation: Mutation) -> Result<()> {
             &target,
             rooted.path_identity_blocking(&source)?.unwrap().1,
         ),
-        Mutation::RemoveFile | Mutation::RemoveDirectory => rooted.remove_blocking(
+        Mutation::RemoveFile | Mutation::RemoveDirectory => rooted.remove_destination_blocking(
             &target,
             matches!(mutation, Mutation::RemoveDirectory),
             Some(identity()?),

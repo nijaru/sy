@@ -818,7 +818,7 @@ impl RemotePullExecutor {
         let rooted = self.metadata_authority().await?.clone();
         let relative = action.path.clone();
         tokio::task::spawn_blocking(move || {
-            rooted.remove_blocking(
+            rooted.remove_destination_blocking(
                 &relative,
                 action.kind == EntryKind::Directory,
                 action.identity,

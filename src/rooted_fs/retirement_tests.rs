@@ -225,6 +225,52 @@ async fn held_file_validation_does_not_adopt_a_foreign_edit_before_name_check() 
 }
 
 #[test]
+fn destination_unlinks_advance_aliases_but_source_unlink_stays_exact() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("a"), b"kept bytes").unwrap();
+    for name in ["b", "c"] {
+        std::fs::hard_link(directory.path().join("a"), directory.path().join(name)).unwrap();
+    }
+    let rooted = RootedFs::open_blocking_for_worker(directory.path().to_path_buf()).unwrap();
+    let path = |name| RelativePath::new(name).unwrap();
+    let held = rooted.open_regular_blocking(&path("c")).unwrap();
+    let scanned = identity_from_stat(&stat_fd(held.as_raw_fd()).unwrap()).unwrap();
+    rooted
+        .remove_destination_blocking(&path("a"), false, Some(scanned))
+        .unwrap();
+    assert!(matches!(
+        rooted.remove_source_blocking(&path("b"), scanned),
+        Err(RootedFsError::DestinationChanged(_))
+    ));
+    assert_eq!(
+        std::fs::read(directory.path().join("b")).unwrap(),
+        b"kept bytes"
+    );
+    rooted
+        .remove_destination_blocking(&path("b"), false, Some(scanned))
+        .unwrap();
+    assert_eq!(
+        rooted
+            .retired_destination_identity_blocking(scanned)
+            .unwrap(),
+        identity_from_stat(&stat_fd(held.as_raw_fd()).unwrap()).unwrap()
+    );
+    held.set_xattr("user.sy-foreign", b"foreign").unwrap();
+    assert!(matches!(
+        rooted.remove_destination_blocking(&path("c"), false, Some(scanned)),
+        Err(RootedFsError::DestinationChanged(_))
+    ));
+    assert_eq!(
+        std::fs::read(directory.path().join("c")).unwrap(),
+        b"kept bytes"
+    );
+    assert_eq!(
+        held.get_xattr("user.sy-foreign").unwrap(),
+        Some(b"foreign".to_vec())
+    );
+}
+
+#[test]
 fn retirement_index_keeps_exact_ancestry_across_distinct_inode_chains() {
     let mut lineage = RetirementLineage::default();
     let identity = |group: u8, phase: u8| {

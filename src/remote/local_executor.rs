@@ -392,11 +392,11 @@ impl LocalSyncExecutor {
         expected: crate::engine::domain::EntryIdentity,
     ) -> Result<()> {
         let backup = self.backup_destination_for(relative)?;
-        let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+        let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
         tokio::task::spawn_blocking(move || {
             rooted.backup_file_blocking(&relative, &backup, expected)?;
-            rooted.remove_blocking(&relative, false, Some(expected))
+            rooted.remove_destination_blocking(&relative, false, Some(expected))
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -997,19 +997,10 @@ impl LocalSyncExecutor {
         if self.backup && action.kind == EntryKind::File {
             self.backup_deleted_entry(&action.path, expected).await?;
         } else {
-            let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+            let rooted = self.metadata_authority().await?;
             let action = action.clone();
             let result = tokio::task::spawn_blocking(move || {
-                match rooted.path_identity_blocking(&action.path)? {
-                    None => return Ok(()),
-                    Some(observation) if observation != (action.kind, expected) => {
-                        return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
-                            action.path.as_path().to_path_buf(),
-                        ));
-                    }
-                    Some(_) => {}
-                }
-                rooted.remove_blocking(
+                rooted.remove_destination_blocking(
                     &action.path,
                     action.kind == EntryKind::Directory,
                     Some(expected),
