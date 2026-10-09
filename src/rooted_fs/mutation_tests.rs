@@ -201,8 +201,12 @@ fn observe(rooted: &RootedFs) -> Result<Observation> {
         None
     };
     let mut xattrs = match identity {
-        Some((kind @ (EntryKind::File | EntryKind::Directory), expected)) => {
-            rooted.read_observed_xattrs_blocking(&relative("target"), kind, expected)?
+        Some((kind @ (EntryKind::File | EntryKind::Directory), _)) => {
+            // Inspect visible state independently of the paused transaction's
+            // retirement lock. This is a test observer, not scan authority or
+            // a preservation request waiting for a consistent owned version.
+            let file = rooted.open_xattr_entry_blocking(Path::new("target"), kind)?;
+            read_xattrs_from_file(&file)?
         }
         _ => Vec::new(),
     };

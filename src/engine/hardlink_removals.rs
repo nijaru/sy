@@ -32,16 +32,11 @@ impl GroupDestinationProof {
     pub fn revalidate_blocking(&self, rooted: &RootedFs) -> crate::rooted_fs::Result<()> {
         match self {
             Self::Published(proof) => proof.revalidate_blocking(rooted),
-            Self::Existing { path, identity } => {
-                if rooted.path_identity_blocking(path)?
-                    != Some((super::domain::EntryKind::File, *identity))
-                {
-                    return Err(crate::rooted_fs::RootedFsError::DestinationChanged(
-                        path.as_path().to_path_buf(),
-                    ));
-                }
-                Ok(())
-            }
+            Self::Existing { path, identity } => rooted.verify_retired_destination_blocking(
+                path,
+                super::domain::EntryKind::File,
+                *identity,
+            ),
         }
     }
 }
