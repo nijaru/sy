@@ -918,7 +918,7 @@ fn reconstruct_file(
     mut prepared: PreparedReconstruction,
     begin: WireFileBegin,
     mut receiver: mpsc::Receiver<ReconstructionOp>,
-    admission: &crate::endpoint::publication::PublicationAdmission,
+    admission: &std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
 ) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
@@ -1730,7 +1730,7 @@ mod tests {
                 prepared,
                 begin,
                 rx,
-                &crate::endpoint::publication::PublicationAdmission::default(),
+                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             )
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
@@ -1834,7 +1834,7 @@ mod tests {
                 prepared,
                 begin,
                 rx,
-                &crate::endpoint::publication::PublicationAdmission::default(),
+                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             )
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
@@ -1889,7 +1889,7 @@ mod tests {
                 prepared,
                 begin,
                 rx,
-                &crate::endpoint::publication::PublicationAdmission::default(),
+                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             )
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
@@ -1942,7 +1942,7 @@ mod tests {
                 prepared,
                 begin,
                 rx,
-                &crate::endpoint::publication::PublicationAdmission::default(),
+                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             )
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
@@ -1997,7 +1997,7 @@ mod tests {
                 prepared,
                 begin,
                 rx,
-                &crate::endpoint::publication::PublicationAdmission::default(),
+                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             )
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
