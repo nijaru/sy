@@ -633,7 +633,7 @@ impl RemotePullExecutor {
             return Ok(None);
         }
         let location = XattrLocation::Remote(&self.remote);
-        let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
+        let xattrs = read_preserved_xattrs(&location, source).await?;
         Ok(Some(xattrs))
     }
 
@@ -656,7 +656,7 @@ impl RemotePullExecutor {
             return Ok(None);
         }
         let location = AclLocation::Remote(&self.remote);
-        let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
+        let acl = read_preserved_acls(&location, source).await?;
         Ok(Some(acl.unwrap_or_default()))
     }
 
@@ -681,7 +681,7 @@ impl RemotePullExecutor {
             return Ok(None);
         }
         let location = BsdFlagsLocation::Remote(&self.remote);
-        let flags = read_preserved_bsd_flags(&location, &source.path, source.kind).await?;
+        let flags = read_preserved_bsd_flags(&location, source).await?;
         Ok(Some(flags))
     }
 

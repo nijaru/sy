@@ -441,8 +441,9 @@ impl ClientRemoteHandle {
         &self,
         path: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
     ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
-        request_read_xattrs(&self.sender, path, kind, self.peer)
+        request_read_xattrs(&self.sender, path, kind, expected, self.peer)
             .await
             .map_err(Into::into)
     }

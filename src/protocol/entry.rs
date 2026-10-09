@@ -250,7 +250,7 @@ impl WireEntry {
     }
 }
 
-fn read_identity(reader: &mut SliceReader<'_>) -> Result<[u8; IDENTITY_BYTES]> {
+pub(super) fn read_identity(reader: &mut SliceReader<'_>) -> Result<[u8; IDENTITY_BYTES]> {
     let bytes = reader.take(IDENTITY_BYTES)?;
     let mut identity = [0_u8; IDENTITY_BYTES];
     identity.copy_from_slice(bytes);

@@ -22,6 +22,13 @@ pub const PROTOCOL_V3_1: ProtocolVersion = ProtocolVersion { major: 3, minor: 1 
 /// Adds stream-bound source preservation metadata to pull file fetches.
 pub const PROTOCOL_V3_2: ProtocolVersion = ProtocolVersion { major: 3, minor: 2 };
 
+/// Clean-v3 contract with publication-proof acknowledgements, file flags,
+/// and observation-bound preservation reads. Earlier minors are incompatible.
+pub const PROTOCOL_V3_3: ProtocolVersion = ProtocolVersion { major: 3, minor: 3 };
+
+/// Both runtime handshake entrypoints must use this range before opening roots.
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_3);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {
     pub min: ProtocolVersion,

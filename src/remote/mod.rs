@@ -23,7 +23,7 @@ use crate::endpoint::{Capabilities as EndpointCapabilities, Endpoint};
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
-    VersionRange, WirePath, PROTOCOL_V3, PROTOCOL_V3_2,
+    VersionRange, WirePath, SUPPORTED_VERSIONS,
 };
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::ffi::OsString;
@@ -93,7 +93,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let versions = VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_2)?;
+    let versions = SUPPORTED_VERSIONS;
     let hello = ClientHello::new(
         versions,
         process_capabilities(),
@@ -140,10 +140,7 @@ where
     expect_control(&frame, FrameKind::ClientHello)?;
     let client = ClientHello::decode(frame.payload())?;
 
-    let version = negotiate_version(
-        client.versions,
-        VersionRange::new(PROTOCOL_V3, PROTOCOL_V3_2)?,
-    )?;
+    let version = negotiate_version(client.versions, SUPPORTED_VERSIONS)?;
     let server = ServerHello::new(
         version,
         process_capabilities(),
@@ -474,7 +471,7 @@ mod tests {
         .unwrap();
         let opened = server.await.unwrap().unwrap();
 
-        assert_eq!(client.server.version, PROTOCOL_V3_2);
+        assert_eq!(client.server.version, SUPPORTED_VERSIONS.max);
         // The client receives the probed root semantics, not an OS guess.
         assert_eq!(
             client.namespace_semantics,
@@ -636,12 +633,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incompatible_client_is_rejected_before_root_creation() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let root = parent.path().join("must-not-be-created");
+        let old = VersionRange::new(crate::protocol::PROTOCOL_V3, crate::protocol::PROTOCOL_V3_2)
+            .unwrap();
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut reader, mut writer) = tokio::io::split(server_io);
+        let hello =
+            ClientHello::new(old, process_capabilities(), Platform::current(), "old").unwrap();
+        write_frame(
+            &mut client_io,
+            &Frame::control(FrameKind::ClientHello, hello.encode().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Even a pipelined root-mutating request must not get past negotiation.
+        let open = SessionOpen::new(
+            Operation::Push,
+            encode_target_root(&root, Platform::current().os).unwrap(),
+        );
+        write_frame(
+            &mut client_io,
+            &Frame::control(FrameKind::SessionOpen, open.encode().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let error = server_handshake(&mut reader, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RemoteError::Protocol(ProtocolError::NoCompatibleVersion { client, server }) if client == old && server == SUPPORTED_VERSIONS)
+        );
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn incompatible_server_is_rejected_before_session_open() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
+        let (mut reader, mut writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let hello = read_frame(&mut reader).await.unwrap();
+            assert_eq!(
+                ClientHello::decode(hello.payload()).unwrap().versions,
+                SUPPORTED_VERSIONS
+            );
+            let response = ServerHello::new(
+                crate::protocol::PROTOCOL_V3_2,
+                process_capabilities(),
+                Platform::current(),
+                "old",
+            )
+            .unwrap();
+            write_frame(
+                &mut writer,
+                &Frame::control(FrameKind::ServerHello, response.encode().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap();
+            writer.flush().await.unwrap();
+            // EOF rather than SessionOpen: the old peer never receives a root.
+            use tokio::io::AsyncReadExt;
+            let mut byte = [0];
+            reader.read(&mut byte).await.unwrap()
+        });
+        let result = client_handshake(
+            &mut client_reader,
+            &mut client_writer,
+            Operation::Push,
+            root.path(),
+        )
+        .await;
+        drop(client_reader);
+        drop(client_writer);
+        let received = server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(RemoteError::Protocol(
+                ProtocolError::NoCompatibleVersion { .. }
+            ))
+        ));
+        assert_eq!(received, 0);
+    }
+
+    #[tokio::test]
     async fn rejects_non_control_hello() {
         let (client_io, server_io) = tokio::io::duplex(4096);
         let (_client_reader, mut client_writer) = tokio::io::split(client_io);
         let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
         let hello = ClientHello::new(
-            VersionRange::exact(PROTOCOL_V3),
+            SUPPORTED_VERSIONS,
             process_capabilities(),
             Platform::current(),
             BUILD_ID,

@@ -1154,7 +1154,7 @@ impl RemotePushExecutor {
             ));
         }
         let location = XattrLocation::Local(self.source_root.as_path());
-        let xattrs = read_preserved_xattrs(&location, &source.path, source.kind).await?;
+        let xattrs = read_preserved_xattrs(&location, source).await?;
         Ok(Some(xattrs))
     }
 
@@ -1184,7 +1184,7 @@ impl RemotePushExecutor {
             ));
         }
         let location = AclLocation::Local(self.source_root.as_path());
-        let acl = read_preserved_acls(&location, &source.path, source.kind).await?;
+        let acl = read_preserved_acls(&location, source).await?;
         Ok(Some(acl.unwrap_or_default()))
     }
 

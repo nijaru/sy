@@ -8,13 +8,12 @@
 //! mirror semantics (set the desired list, clear when empty) stay atomic per
 //! entry, and an oversized list is refused loudly rather than truncated.
 //!
-//! Holds: the server serves ACL requests only in a Push session. In a Pull
-//! session the remote root is the read-only source, so a write request is
-//! rejected before it can mutate source data.
+//! Source reads carry the scan identity and validate a held descriptor before
+//! and after reading. Writes are Push-only; a Pull root is read-only.
 
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
-use crate::engine::domain::{EntryKind, RelativePath};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     AclMode, Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId, WireAcl,
     WireAclRequest, WireAclResult, MAX_ACL_TEXT_BYTES,
@@ -69,6 +68,9 @@ pub enum RemoteAclError {
     #[error("acl write requests are refused in a {0:?} session: the remote root is source-only")]
     WriteInSourceSession(Operation),
 
+    #[error("source preservation requires a scanned identity for {0}")]
+    MissingSourceIdentity(RelativePath),
+
     #[error("local access-control access failed: {0}")]
     Local(String),
 }
@@ -95,10 +97,15 @@ pub async fn request_read_acls(
     sender: &RouterSender,
     path: &RelativePath,
     kind: EntryKind,
+    expected: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<Option<String>> {
     ensure_compatible_path_encoding(peer)?;
-    let request = WireAclRequest::read(encode_relative_path(path.as_path())?, wire_kind(kind))?;
+    let request = WireAclRequest::read(
+        encode_relative_path(path.as_path())?,
+        wire_kind(kind),
+        *expected.as_bytes(),
+    )?;
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     sender
@@ -204,9 +211,12 @@ pub async fn serve_incoming_acl_rooted(
 
     match mode {
         AclMode::Read => {
-            let acl = tokio::task::spawn_blocking(move || rooted.read_acl_blocking(&path, kind))
-                .await
-                .map_err(|error| RemoteAclError::Worker(error.to_string()))??;
+            let expected = EntryIdentity::from_bytes(request.source_identity()?);
+            let acl = tokio::task::spawn_blocking(move || {
+                rooted.read_observed_acl_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteAclError::Worker(error.to_string()))??;
             let result = WireAclResult::new(WireAcl::new(acl.unwrap_or_default())?);
             sender
                 .send(Frame::new(
@@ -243,19 +253,32 @@ pub async fn serve_incoming_acl_rooted(
 /// oversized list instead of allocating without limit.
 pub async fn read_preserved_acls(
     location: &AclLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
+    source: &Entry,
 ) -> Result<Option<String>> {
+    let expected = source
+        .identity
+        .ok_or_else(|| RemoteAclError::MissingSourceIdentity(source.path.clone()))?;
     let acl = match location {
         AclLocation::Local(root) => {
             let root = root.to_path_buf();
-            LocalEndpoint::new(root)
-                .read_acl(path.as_path())
-                .await
-                .map_err(|error| RemoteAclError::Local(error.to_string()))?
+            let path = source.path.clone();
+            let kind = source.kind;
+            tokio::task::spawn_blocking(move || {
+                RootedFs::open_blocking_for_worker(root)?
+                    .read_observed_acl_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteAclError::Worker(error.to_string()))??
         }
         AclLocation::Remote(handle) => {
-            request_read_acls(&handle.sender(), path, kind, handle.peer_platform()).await?
+            request_read_acls(
+                &handle.sender(),
+                &source.path,
+                source.kind,
+                expected,
+                handle.peer_platform(),
+            )
+            .await?
         }
     };
     check_acl_text_bounded(acl.as_deref().unwrap_or(""))?;
@@ -427,7 +450,12 @@ mod tests {
         request_write_acls(&client.sender(), &path, EntryKind::File, &text, peer)
             .await
             .unwrap();
-        let read = request_read_acls(&client.sender(), &path, EntryKind::File, peer)
+        let expected = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::metadata(&file_path).unwrap(),
+            EntryKind::File,
+        )
+        .unwrap();
+        let read = request_read_acls(&client.sender(), &path, EntryKind::File, expected, peer)
             .await
             .unwrap();
         server_task.await.unwrap();

@@ -7,13 +7,12 @@
 //! request/result pair per entry is fixed-size and needs no bound beyond the
 //! frame payload cap.
 //!
-//! Holds: the server serves flag requests only in a Push session. In a Pull
-//! session the remote root is the read-only source, so a write request is
-//! rejected before it can mutate source data.
+//! Source reads carry the scan identity and validate a held descriptor before
+//! and after reading. Writes are Push-only; a Pull root is read-only.
 
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
-use crate::engine::domain::{EntryKind, RelativePath};
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath};
 use crate::protocol::{
     BsdFlagsMode, Frame, FrameFlags, FrameKind, Operation, PlatformOs, ProtocolError, StreamId,
     WireBsdFlagsRequest, WireBsdFlagsResult,
@@ -70,6 +69,9 @@ pub enum RemoteBsdFlagsError {
     )]
     WriteInSourceSession(Operation),
 
+    #[error("source preservation requires a scanned identity for {0}")]
+    MissingSourceIdentity(RelativePath),
+
     #[error("local bsd flags access failed: {0}")]
     Local(String),
 }
@@ -95,11 +97,15 @@ pub async fn request_read_bsd_flags(
     sender: &RouterSender,
     path: &RelativePath,
     kind: EntryKind,
+    expected: EntryIdentity,
     peer: PlatformOs,
 ) -> Result<u32> {
     ensure_compatible_path_encoding(peer)?;
-    let request =
-        WireBsdFlagsRequest::read(encode_relative_path(path.as_path())?, wire_kind(kind))?;
+    let request = WireBsdFlagsRequest::read(
+        encode_relative_path(path.as_path())?,
+        wire_kind(kind),
+        *expected.as_bytes(),
+    )?;
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     sender
@@ -200,10 +206,12 @@ pub async fn serve_incoming_bsd_flags_rooted(
 
     match mode {
         BsdFlagsMode::Read => {
-            let flags =
-                tokio::task::spawn_blocking(move || rooted.read_bsd_flags_blocking(&path, kind))
-                    .await
-                    .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))??;
+            let expected = EntryIdentity::from_bytes(request.source_identity()?);
+            let flags = tokio::task::spawn_blocking(move || {
+                rooted.read_observed_bsd_flags_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))??;
             let result = WireBsdFlagsResult::new(flags);
             sender
                 .send(Frame::new(
@@ -235,23 +243,36 @@ pub async fn serve_incoming_bsd_flags_rooted(
 }
 
 /// Read the requested entry's BSD-flags value from the source side of one
-/// sync. A missing list reads as 0 (no flags), matching the local endpoint.
+/// sync. Unsupported platforms fail rather than silently returning no flags.
 pub async fn read_preserved_bsd_flags(
     location: &BsdFlagsLocation<'_>,
-    path: &RelativePath,
-    kind: EntryKind,
+    source: &Entry,
 ) -> Result<u32> {
+    let expected = source
+        .identity
+        .ok_or_else(|| RemoteBsdFlagsError::MissingSourceIdentity(source.path.clone()))?;
     match location {
         BsdFlagsLocation::Local(root) => {
             let root = root.to_path_buf();
-            Ok(LocalEndpoint::new(root)
-                .read_bsd_flags(path.as_path())
-                .await
-                .map_err(|error| RemoteBsdFlagsError::Local(error.to_string()))?
-                .unwrap_or(0))
+            let path = source.path.clone();
+            let kind = source.kind;
+            tokio::task::spawn_blocking(move || {
+                RootedFs::open_blocking_for_worker(root)?
+                    .read_observed_bsd_flags_blocking(&path, kind, expected)
+            })
+            .await
+            .map_err(|error| RemoteBsdFlagsError::Worker(error.to_string()))?
+            .map_err(Into::into)
         }
         BsdFlagsLocation::Remote(handle) => {
-            request_read_bsd_flags(&handle.sender(), path, kind, handle.peer_platform()).await
+            request_read_bsd_flags(
+                &handle.sender(),
+                &source.path,
+                source.kind,
+                expected,
+                handle.peer_platform(),
+            )
+            .await
         }
     }
 }
@@ -398,12 +419,103 @@ mod tests {
         request_write_bsd_flags(&client.sender(), &path, EntryKind::File, 0x1, peer)
             .await
             .unwrap();
-        let read = request_read_bsd_flags(&client.sender(), &path, EntryKind::File, peer)
+        let expected = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::metadata(root.path().join("file")).unwrap(),
+            EntryKind::File,
+        )
+        .unwrap();
+        let read = request_read_bsd_flags(&client.sender(), &path, EntryKind::File, expected, peer)
             .await
             .unwrap();
         server_task.await.unwrap();
 
         assert_eq!(read, 0x1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn source_flags_rpc_rejects_an_ancestor_swap_without_minting_foreign_proof() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/file"), b"A").unwrap();
+        let path = RelativePath::new("nested/file").unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let expected = rooted.path_identity_blocking(&path).unwrap().unwrap().1;
+        std::fs::rename(root.path().join("nested"), root.path().join("original")).unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/file"), b"B").unwrap();
+        rooted
+            .write_bsd_flags_blocking(&path, EntryKind::File, 1)
+            .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let client = FrameRouter::start(
+            client_reader,
+            client_writer,
+            RouterRole::Client,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let mut server = FrameRouter::start(
+            server_reader,
+            server_writer,
+            RouterRole::Server,
+            RouterConfig::default(),
+        )
+        .unwrap();
+        let sender = server.sender();
+        let peer = crate::protocol::Platform::current().os;
+        let request = WireBsdFlagsRequest::read(
+            encode_relative_path(path.as_path()).unwrap(),
+            crate::protocol::WireEntryKind::File,
+            *expected.as_bytes(),
+        )
+        .unwrap();
+        let inbox = client.sender().open_stream().unwrap();
+        let stream = inbox.stream_id();
+        client
+            .sender()
+            .send(
+                Frame::new(
+                    FrameKind::BsdFlagsRequest,
+                    FrameFlags::FINAL,
+                    stream,
+                    request.encode().unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Drain the legacy success path too, so a regression fails rather than
+        // hanging waiting for an acknowledgement after returning foreign flags.
+        client
+            .sender()
+            .send(Frame::new(FrameKind::Ack, FrameFlags::empty(), stream, Bytes::new()).unwrap())
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let incoming = server.incoming().recv().await.unwrap().unwrap();
+            serve_incoming_bsd_flags_rooted(rooted, incoming, &sender, peer, Operation::Pull).await
+        });
+        let result = task.await.unwrap();
+        std::fs::remove_file(root.path().join("nested/file")).unwrap();
+        std::fs::remove_dir(root.path().join("nested")).unwrap();
+        std::fs::rename(root.path().join("original"), root.path().join("nested")).unwrap();
+        assert_eq!(
+            crate::endpoint::local_identity::metadata_identity(
+                &std::fs::metadata(root.path().join("nested/file")).unwrap(),
+                EntryKind::File
+            ),
+            Some(expected)
+        );
+        assert_eq!(rooted_flags(root.path().join("nested/file")), 0);
+        assert!(matches!(
+            result,
+            Err(RemoteBsdFlagsError::RootedFs(
+                RootedFsError::SourceMetadataChanged(_)
+            ))
+        ));
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@ mod directory;
 mod mutation_tests;
 #[cfg(unix)]
 mod scan;
+#[cfg(all(test, unix))]
+mod source_metadata_tests;
 pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
 
 #[cfg(all(target_os = "macos", feature = "acl"))]
@@ -49,6 +51,9 @@ pub enum RootedFsError {
 
     #[error("backup source changed between observation and copy for {0}")]
     CopySourceChanged(PathBuf),
+
+    #[error("source changed between observation and preservation read for {0}")]
+    SourceMetadataChanged(PathBuf),
 
     #[error("backup destination aliases its source: {0}")]
     BackupAliasesSource(PathBuf),
@@ -1350,20 +1355,66 @@ impl RootedFs {
         self.remove_path_blocking(relative.as_path(), is_directory, expected_identity)
     }
 
-    /// Read every extended attribute of one file or directory beneath the
-    /// pinned root. The leaf is opened without following a symlink and the
-    /// attributes are read through that held descriptor, so a raced path swap
-    /// cannot redirect the read. The total set is bounded; an oversized set is
-    /// refused loudly rather than truncated. Symlinks are refused (their
-    /// attributes are not portable and reading them would resolve the target).
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn read_xattrs_blocking(
+    /// Read bounded metadata from the scanned observation on a blocking worker,
+    /// never minting source authority from a fresh pathname lookup.
+    pub(crate) fn read_observed_xattrs_blocking(
         &self,
         relative: &RelativePath,
         kind: EntryKind,
+        expected: EntryIdentity,
     ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        self.read_xattrs_path_blocking(relative.as_path(), kind)
+        self.read_observed_metadata_blocking(relative, kind, expected, read_xattrs_from_file)
+    }
+
+    pub(crate) fn read_observed_acl_blocking(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        expected: EntryIdentity,
+    ) -> Result<Option<String>> {
+        self.read_observed_metadata_blocking(relative, kind, expected, |file| {
+            self.read_acl_from_file(file)
+        })
+    }
+
+    #[cfg(unix)]
+    fn read_observed_metadata_blocking<T>(
+        &self,
+        relative: &RelativePath,
+        kind: EntryKind,
+        expected: EntryIdentity,
+        read: impl FnOnce(&File) -> Result<T>,
+    ) -> Result<T> {
+        let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
+        let changed = || RootedFsError::SourceMetadataChanged(relative.as_path().to_path_buf());
+        let validate = || -> Result<()> {
+            if crate::endpoint::local_identity::metadata_identity(&file.metadata()?, kind)
+                != Some(expected)
+            {
+                return Err(changed());
+            }
+            Ok(())
+        };
+        validate()?;
+        let value = read(&file)?;
+        validate()?;
+        // Resolve only to compare with the required observation, not to grant
+        // a new identity. The value came from the same held FD at both checks.
+        if self.path_identity_blocking(relative)? != Some((kind, expected)) {
+            return Err(changed());
+        }
+        Ok(value)
+    }
+
+    #[cfg(not(unix))]
+    fn read_observed_metadata_blocking<T>(
+        &self,
+        _relative: &RelativePath,
+        _kind: EntryKind,
+        _expected: EntryIdentity,
+        _read: impl FnOnce(&File) -> Result<T>,
+    ) -> Result<T> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Read preservation xattrs through a regular file handle opened beneath
@@ -1400,26 +1451,6 @@ impl RootedFs {
             return Err(RootedFsError::UnobservedDirectoryMutation);
         }
         self.write_xattrs_path_blocking(relative.as_path(), kind, xattrs)
-    }
-
-    /// Read the access-control list of one file or directory beneath the
-    /// pinned root, as exacl unified-entries text (`None` when the entry
-    /// carries no ACL). The leaf is opened without following a symlink and
-    /// every read goes through that held descriptor, so a raced path swap
-    /// cannot redirect the read. The text is bounded; an oversized list is
-    /// refused loudly rather than truncated. Symlinks are refused (their
-    /// ACLs are not portable and reading them would resolve the target).
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn read_acl_blocking(
-        &self,
-        relative: &RelativePath,
-        kind: EntryKind,
-    ) -> Result<Option<String>> {
-        if kind == EntryKind::Symlink {
-            return Err(RootedFsError::UnsupportedSymlinkAcls);
-        }
-        self.read_acl_path_blocking(relative.as_path(), kind)
     }
 
     /// Read a file's ACL through the already-open handle for its in-flight
@@ -1466,19 +1497,6 @@ impl RootedFs {
         self.write_acl_path_blocking(relative.as_path(), kind, acl)
     }
 
-    /// Read the BSD file flags of one file or directory beneath the pinned
-    /// root (macOS only). The leaf is opened without following a symlink and
-    /// the flags are read through that held descriptor. Symlinks are refused,
-    /// like xattrs and ACLs.
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn read_bsd_flags_blocking(&self, relative: &RelativePath, kind: EntryKind) -> Result<u32> {
-        if kind == EntryKind::Symlink {
-            return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
-        }
-        self.read_bsd_flags_path_blocking(relative.as_path(), kind)
-    }
-
     /// Demand-driven flags bound to the scanned inode, not an unchecked pathname.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_observed_bsd_flags_blocking(
@@ -1488,20 +1506,9 @@ impl RootedFs {
         expected: EntryIdentity,
     ) -> Result<u32> {
         use std::os::macos::fs::MetadataExt;
-        let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
-        let changed = || RootedFsError::DestinationChanged(relative.as_path().to_path_buf());
-        let before = file.metadata()?;
-        if crate::endpoint::local_identity::identity_for_metadata(&before) != Some(expected) {
-            return Err(changed());
-        }
-        let flags = before.st_flags();
-        if crate::endpoint::local_identity::identity_for_metadata(&file.metadata()?)
-            != Some(expected)
-            || self.path_identity_blocking(relative)? != Some((kind, expected))
-        {
-            return Err(changed());
-        }
-        Ok(flags)
+        self.read_observed_metadata_blocking(relative, kind, expected, |file| {
+            Ok(file.metadata()?.st_flags())
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2055,25 +2062,6 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn read_xattrs_path_blocking(
-        &self,
-        relative: &Path,
-        kind: EntryKind,
-    ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        read_xattrs_from_file(&file)
-    }
-
-    #[cfg(not(unix))]
-    fn read_xattrs_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-    ) -> Result<Vec<(OsString, Vec<u8>)>> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
     fn write_xattrs_path_blocking(
         &self,
         relative: &Path,
@@ -2151,12 +2139,6 @@ impl RootedFs {
     }
 
     #[cfg(all(target_os = "linux", feature = "acl"))]
-    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        self.read_acl_from_file(&file)
-    }
-
-    #[cfg(all(target_os = "linux", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
@@ -2180,12 +2162,6 @@ impl RootedFs {
     }
 
     #[cfg(all(target_os = "macos", feature = "acl"))]
-    fn read_acl_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<Option<String>> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        self.read_acl_from_file(&file)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "acl"))]
     fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
@@ -2202,13 +2178,6 @@ impl RootedFs {
     }
 
     #[cfg(all(unix, not(feature = "acl")))]
-    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
-        Err(RootedFsError::AclUnsupported(
-            "ACL preservation requires the acl feature; rebuild with --features acl",
-        ))
-    }
-
-    #[cfg(all(unix, not(feature = "acl")))]
     fn write_acl_path_blocking(
         &self,
         _relative: &Path,
@@ -2238,18 +2207,6 @@ impl RootedFs {
         not(target_os = "linux"),
         not(target_os = "macos")
     ))]
-    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
-        Err(RootedFsError::AclUnsupported(
-            "access control lists are only supported on Linux and macOS",
-        ))
-    }
-
-    #[cfg(all(
-        unix,
-        feature = "acl",
-        not(target_os = "linux"),
-        not(target_os = "macos")
-    ))]
     fn write_acl_path_blocking(
         &self,
         _relative: &Path,
@@ -2267,11 +2224,6 @@ impl RootedFs {
     }
 
     #[cfg(not(unix))]
-    fn read_acl_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<Option<String>> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(not(unix))]
     fn write_acl_path_blocking(
         &self,
         _relative: &Path,
@@ -2279,17 +2231,6 @@ impl RootedFs {
         _acl: &str,
     ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    /// macOS: read `st_flags` through the held no-follow leaf descriptor.
-    /// `fstat` on an `O_NOFOLLOW` open reports the leaf itself, so neither
-    /// parent nor leaf symlinks can redirect the read.
-    #[cfg(target_os = "macos")]
-    fn read_bsd_flags_path_blocking(&self, relative: &Path, kind: EntryKind) -> Result<u32> {
-        use std::os::macos::fs::MetadataExt;
-
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        Ok(file.metadata()?.st_flags())
     }
 
     /// macOS: `fchflags` on the held no-follow leaf descriptor replaces the
@@ -2313,11 +2254,6 @@ impl RootedFs {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn read_bsd_flags_path_blocking(&self, _relative: &Path, _kind: EntryKind) -> Result<u32> {
-        Err(RootedFsError::UnsupportedPlatform)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -4050,10 +3986,19 @@ mod tests {
                 &[(name.clone(), b"one".to_vec())],
             )
             .unwrap();
+        let written_identity = rooted
+            .path_identity_blocking(&relative("file"))
+            .unwrap()
+            .unwrap()
+            .1;
         assert_eq!(
             user_xattrs(
                 rooted
-                    .read_xattrs_blocking(&relative("file"), EntryKind::File)
+                    .read_observed_xattrs_blocking(
+                        &relative("file"),
+                        EntryKind::File,
+                        written_identity
+                    )
                     .unwrap()
             ),
             vec![(name.clone(), b"one".to_vec())]
@@ -4063,9 +4008,14 @@ mod tests {
         rooted
             .write_xattrs_blocking(&relative("file"), EntryKind::File, &[])
             .unwrap();
+        let cleared_identity = rooted
+            .path_identity_blocking(&relative("file"))
+            .unwrap()
+            .unwrap()
+            .1;
         assert!(user_xattrs(
             rooted
-                .read_xattrs_blocking(&relative("file"), EntryKind::File)
+                .read_observed_xattrs_blocking(&relative("file"), EntryKind::File, cleared_identity)
                 .unwrap()
         )
         .is_empty());
@@ -4090,7 +4040,11 @@ mod tests {
         assert_eq!(
             user_xattrs(
                 rooted
-                    .read_xattrs_blocking(&relative("dir"), EntryKind::Directory)
+                    .read_observed_xattrs_blocking(
+                        &relative("dir"),
+                        EntryKind::Directory,
+                        directory_identity
+                    )
                     .unwrap()
             ),
             vec![(name, b"dir".to_vec())]
@@ -4130,12 +4084,23 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("file"), root.path().join("leaf")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let name = OsString::from("user.sy-test");
+        // Match the escaped inode so identity rejection cannot mask a broken
+        // no-follow boundary in either the ancestor or leaf case.
+        let outside_identity = crate::endpoint::local_identity::metadata_identity(
+            &std::fs::metadata(outside.path().join("file")).unwrap(),
+            EntryKind::File,
+        )
+        .unwrap();
 
         assert!(rooted
-            .read_xattrs_blocking(&relative("escape/file"), EntryKind::File)
+            .read_observed_xattrs_blocking(
+                &relative("escape/file"),
+                EntryKind::File,
+                outside_identity
+            )
             .is_err());
         assert!(rooted
-            .read_xattrs_blocking(&relative("leaf"), EntryKind::File)
+            .read_observed_xattrs_blocking(&relative("leaf"), EntryKind::File, outside_identity)
             .is_err());
         assert!(rooted
             .write_xattrs_blocking(

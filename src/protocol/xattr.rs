@@ -64,7 +64,7 @@ impl WireXattr {
     }
 }
 
-/// Whether an xattr request reads the destination's current attributes or
+/// Whether an xattr request reads an observed source's attributes or
 /// replaces them with the carried set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -90,7 +90,7 @@ impl TryFrom<u8> for XattrMode {
 
 /// One bounded extended-attribute request for an existing entry.
 ///
-/// `Read` carries no attributes and the server answers with
+/// `Read` carries the required source observation, no attributes, and answers with
 /// [`WireXattrResult`]; `Write` carries the full desired set (possibly empty,
 /// which clears every attribute) and the server answers with an empty
 /// acknowledgement frame. Symlinks are rejected: Unix symlink attributes are
@@ -100,15 +100,17 @@ pub struct WireXattrRequest {
     path: RelativeWirePath,
     kind: WireEntryKind,
     mode: XattrMode,
+    source_identity: Option<[u8; 32]>,
     entries: Vec<WireXattr>,
 }
 
 impl WireXattrRequest {
-    pub fn read(path: RelativeWirePath, kind: WireEntryKind) -> Result<Self> {
+    pub fn read(path: RelativeWirePath, kind: WireEntryKind, identity: [u8; 32]) -> Result<Self> {
         let request = Self {
             path,
             kind,
             mode: XattrMode::Read,
+            source_identity: Some(identity),
             entries: Vec::new(),
         };
         request.validate()?;
@@ -124,6 +126,7 @@ impl WireXattrRequest {
             path,
             kind,
             mode: XattrMode::Write,
+            source_identity: None,
             entries,
         };
         request.validate()?;
@@ -140,6 +143,12 @@ impl WireXattrRequest {
 
     pub const fn mode(&self) -> XattrMode {
         self.mode
+    }
+
+    /// Required observation for a source read; destination writes have no source authority.
+    pub fn source_identity(&self) -> Result<[u8; 32]> {
+        self.source_identity
+            .ok_or(ProtocolError::InvalidMessage("not a source metadata read"))
     }
 
     pub fn entries(&self) -> &[WireXattr] {
@@ -162,6 +171,9 @@ impl WireXattrRequest {
             .ok_or(ProtocolError::InvalidMessage(
                 "xattr request payload length overflow",
             ))?;
+        if self.mode == XattrMode::Read {
+            capacity += 32;
+        }
         if self.mode == XattrMode::Write {
             capacity = capacity
                 .checked_add(2)
@@ -176,6 +188,9 @@ impl WireXattrRequest {
         out.put_u8(self.mode as u8);
         out.put_u32(path_len);
         out.extend_from_slice(self.path.as_encoded());
+        if self.mode == XattrMode::Read {
+            out.extend_from_slice(&self.source_identity()?);
+        }
         if self.mode == XattrMode::Write {
             out.put_u16(u16::try_from(self.entries.len()).map_err(|_| {
                 ProtocolError::TooManyXattrs {
@@ -202,6 +217,11 @@ impl WireXattrRequest {
             });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
+        let source_identity = if mode == XattrMode::Read {
+            Some(super::entry::read_identity(&mut reader)?)
+        } else {
+            None
+        };
         let entries = if mode == XattrMode::Write {
             read_entries(&mut reader)?
         } else {
@@ -212,6 +232,7 @@ impl WireXattrRequest {
             path,
             kind,
             mode,
+            source_identity,
             entries,
         }
         .validated()
@@ -220,6 +241,11 @@ impl WireXattrRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if (self.mode == XattrMode::Read) != self.source_identity.is_some() {
+            return Err(ProtocolError::InvalidMessage(
+                "source reads require an observed identity",
+            ));
+        }
         if self.kind == WireEntryKind::Directory && self.mode == XattrMode::Write {
             return Err(ProtocolError::InvalidMessage(
                 "directory mutations require observed finalization",
@@ -400,8 +426,13 @@ mod tests {
 
     #[test]
     fn read_request_round_trips_without_entries() {
-        let request = WireXattrRequest::read(path(), WireEntryKind::File).unwrap();
-        let decoded = WireXattrRequest::decode(&request.encode().unwrap()).unwrap();
+        let request = WireXattrRequest::read(path(), WireEntryKind::File, [7; 32]).unwrap();
+        let encoded = request.encode().unwrap();
+        // Neither the old identity-free request nor a partial identity is valid.
+        for len in [encoded.len() - 32, encoded.len() - 1] {
+            assert!(WireXattrRequest::decode(&encoded[..len]).is_err());
+        }
+        let decoded = WireXattrRequest::decode(&encoded).unwrap();
         assert_eq!(decoded, request);
         assert_eq!(decoded.mode(), XattrMode::Read);
         assert!(decoded.entries().is_empty());
@@ -444,7 +475,7 @@ mod tests {
 
     #[test]
     fn symlink_kind_is_rejected_before_encoding() {
-        assert!(WireXattrRequest::read(path(), WireEntryKind::Symlink).is_err());
+        assert!(WireXattrRequest::read(path(), WireEntryKind::Symlink, [7; 32]).is_err());
     }
 
     #[test]

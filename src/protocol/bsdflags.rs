@@ -28,7 +28,7 @@ impl TryFrom<u8> for BsdFlagsMode {
 
 /// One bounded BSD-flags request for an existing entry.
 ///
-/// `Read` carries no value and the server answers with [`WireBsdFlagsResult`];
+/// `Read` carries the required source observation, no value, and answers with [`WireBsdFlagsResult`];
 /// `Write` carries the full desired value (0 clears every flag) and the
 /// server answers with an empty acknowledgement frame. Symlinks are
 /// refused: like xattrs and ACLs, link-target resolution has no place in a
@@ -39,15 +39,17 @@ pub struct WireBsdFlagsRequest {
     path: RelativeWirePath,
     kind: WireEntryKind,
     mode: BsdFlagsMode,
+    source_identity: Option<[u8; 32]>,
     flags: Option<u32>,
 }
 
 impl WireBsdFlagsRequest {
-    pub fn read(path: RelativeWirePath, kind: WireEntryKind) -> Result<Self> {
+    pub fn read(path: RelativeWirePath, kind: WireEntryKind, identity: [u8; 32]) -> Result<Self> {
         let request = Self {
             path,
             kind,
             mode: BsdFlagsMode::Read,
+            source_identity: Some(identity),
             flags: None,
         };
         request.validate()?;
@@ -59,6 +61,7 @@ impl WireBsdFlagsRequest {
             path,
             kind,
             mode: BsdFlagsMode::Write,
+            source_identity: None,
             flags: Some(flags),
         };
         request.validate()?;
@@ -75,6 +78,12 @@ impl WireBsdFlagsRequest {
 
     pub const fn mode(&self) -> BsdFlagsMode {
         self.mode
+    }
+
+    /// Required observation for a source read; destination writes have no source authority.
+    pub fn source_identity(&self) -> Result<[u8; 32]> {
+        self.source_identity
+            .ok_or(ProtocolError::InvalidMessage("not a source metadata read"))
     }
 
     pub const fn flags(&self) -> Option<u32> {
@@ -96,6 +105,9 @@ impl WireBsdFlagsRequest {
             .ok_or(ProtocolError::InvalidMessage(
                 "bsd flags request payload length overflow",
             ))?;
+        if self.mode == BsdFlagsMode::Read {
+            capacity += 32;
+        }
         if self.mode == BsdFlagsMode::Write {
             capacity = capacity
                 .checked_add(4)
@@ -109,6 +121,9 @@ impl WireBsdFlagsRequest {
         out.put_u8(self.mode as u8);
         out.put_u32(path_len);
         out.extend_from_slice(self.path.as_encoded());
+        if self.mode == BsdFlagsMode::Read {
+            out.extend_from_slice(&self.source_identity()?);
+        }
         if let Some(flags) = self.flags {
             out.put_u32(flags);
         }
@@ -127,6 +142,11 @@ impl WireBsdFlagsRequest {
             });
         }
         let path = RelativeWirePath::decode(Bytes::copy_from_slice(reader.take(path_len)?))?;
+        let source_identity = if mode == BsdFlagsMode::Read {
+            Some(super::entry::read_identity(&mut reader)?)
+        } else {
+            None
+        };
         let flags = if mode == BsdFlagsMode::Write {
             Some(reader.u32()?)
         } else {
@@ -137,6 +157,7 @@ impl WireBsdFlagsRequest {
             path,
             kind,
             mode,
+            source_identity,
             flags,
         }
         .validated()
@@ -145,6 +166,11 @@ impl WireBsdFlagsRequest {
     /// Structural checks that do not depend on the wire encoding.
     fn validate(&self) -> Result<()> {
         validate_kind(self.kind)?;
+        if (self.mode == BsdFlagsMode::Read) != self.source_identity.is_some() {
+            return Err(ProtocolError::InvalidMessage(
+                "source reads require an observed identity",
+            ));
+        }
         if self.kind == WireEntryKind::Directory && self.mode == BsdFlagsMode::Write {
             return Err(ProtocolError::InvalidMessage(
                 "directory mutations require observed finalization",
@@ -219,8 +245,12 @@ mod tests {
 
     #[test]
     fn read_request_round_trips_without_value() {
-        let request = WireBsdFlagsRequest::read(path(), WireEntryKind::File).unwrap();
-        let decoded = WireBsdFlagsRequest::decode(&request.encode().unwrap()).unwrap();
+        let request = WireBsdFlagsRequest::read(path(), WireEntryKind::File, [7; 32]).unwrap();
+        let encoded = request.encode().unwrap();
+        for len in [encoded.len() - 32, encoded.len() - 1] {
+            assert!(WireBsdFlagsRequest::decode(&encoded[..len]).is_err());
+        }
+        let decoded = WireBsdFlagsRequest::decode(&encoded).unwrap();
         assert_eq!(decoded, request);
         assert_eq!(decoded.mode(), BsdFlagsMode::Read);
         assert!(decoded.flags().is_none());
@@ -246,7 +276,7 @@ mod tests {
 
     #[test]
     fn symlink_kind_is_rejected_before_encoding() {
-        assert!(WireBsdFlagsRequest::read(path(), WireEntryKind::Symlink).is_err());
+        assert!(WireBsdFlagsRequest::read(path(), WireEntryKind::Symlink, [7; 32]).is_err());
     }
 
     #[test]
