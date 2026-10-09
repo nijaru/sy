@@ -509,7 +509,8 @@ impl RemotePullExecutor {
     ) -> Result<crate::engine::work::TransferSummary> {
         let dest = self.dest_path(&source.path);
         let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
-        let endpoint = LocalEndpoint::new(self.destination_root.clone());
+        let endpoint = LocalEndpoint::new(self.destination_root.clone())
+            .with_publication_admission(self.sender.publication_admission());
         let mut staged = endpoint
             .begin_write(source.path.as_path(), expected_destination)
             .await?;

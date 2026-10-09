@@ -259,7 +259,7 @@ Only metadata inherently incompatible with commit belongs afterward, such as sel
 
 Directory metadata finalization remains journal-owned after descendant work and deletion. Metadata-only changes on existing inodes have explicit backend semantics, not a fictitious atomic replacement. Hardlink group metadata has one inode-level owner; group bookkeeping must also be bounded.
 
-Disconnect/cancellation before commit aborts owned staging. Lost acknowledgement after commit is an uncertain completion, not proof of abort: preserve the source and reconcile safely on retry. Strategies never commit independently of the endpoint transaction owner.
+The endpoint serializes publication admission against disconnect/cancellation, after commit-time validation and before native publication. Cancellation winning admission aborts owned staging. Closing admission must not block a runtime worker behind filesystem I/O. Already-admitted native work may finish after cancellation; neither interruption nor rollback is guaranteed. Lost acknowledgement or cancellation during admitted work leaves completion uncertain: preserve the source and reconcile safely on retry. Strategies never admit or commit publication independently of the endpoint transaction owner.
 
 ## Local transfer strategies
 

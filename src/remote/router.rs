@@ -205,6 +205,7 @@ struct RouterInner {
     // This lock serializes registry/admission changes with terminal publication.
     streams: Mutex<HashMap<StreamId, mpsc::UnboundedSender<RoutedFrame>>>,
     terminal: watch::Sender<Option<Terminal>>,
+    publication: Arc<crate::endpoint::publication::PublicationAdmission>,
     incoming_tx: mpsc::UnboundedSender<IncomingStream>,
     inbound_frames: Arc<Semaphore>,
     inbound_bytes: Arc<Semaphore>,
@@ -313,6 +314,12 @@ impl RouterSender {
     pub(crate) async fn closed(&self) -> SharedRouterError {
         let mut terminal = self.inner.terminal.subscribe();
         terminated(&mut terminal).await.error()
+    }
+
+    pub(crate) fn publication_admission(
+        &self,
+    ) -> Arc<crate::endpoint::publication::PublicationAdmission> {
+        Arc::clone(&self.inner.publication)
     }
 
     pub(crate) fn fail(&self, error: SharedRouterError) {
@@ -474,6 +481,7 @@ impl FrameRouter {
         let inner = Arc::new(RouterInner {
             streams: Mutex::new(HashMap::new()),
             terminal: terminal_tx,
+            publication: Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             incoming_tx,
             inbound_frames: Arc::new(Semaphore::new(config.max_inbound_frames as usize)),
             inbound_bytes: Arc::new(Semaphore::new(inbound_byte_units as usize)),
@@ -805,6 +813,9 @@ fn ensure_stream_capacity(
 }
 
 fn publish_terminal(inner: &Arc<RouterInner>, state: Terminal) {
+    // Cut off new native publications before notifying terminal observers.
+    // Admitted work remains owned by its worker and may finish after this point.
+    inner.publication.close();
     let Ok(mut streams) = inner.streams.lock() else {
         // Poisoning is itself terminal; still wake waiters and close budgets.
         inner.terminal.send_if_modified(|terminal| {
