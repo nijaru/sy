@@ -1,7 +1,11 @@
 mod directory;
 mod metadata;
 mod publication;
+mod staging;
 pub use publication::{PublishedEntryProof, PublishedFileProof, RootedPublishedFile};
+#[cfg(unix)]
+use staging::OwnedStagingEntry;
+use staging::VerifiedObservation;
 #[cfg(unix)]
 mod retirement;
 pub(crate) use metadata::MetadataPreservation;
@@ -17,6 +21,8 @@ mod retirement_tests;
 mod scan;
 #[cfg(all(test, unix))]
 mod source_metadata_tests;
+#[cfg(all(test, unix))]
+mod staging_tests;
 pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
 
 #[cfg(all(target_os = "macos", feature = "acl"))]
@@ -135,6 +141,9 @@ pub enum RootedFsError {
 
     #[error("staging directory identity changed; refusing to remove an unowned directory")]
     StagingDirectoryChanged,
+
+    #[error("private staging entry changed at {0}; refusing publication or unowned cleanup")]
+    StagingEntryChanged(PathBuf),
 
     #[error("staging preparation failed ({operation}) and cleanup also failed ({cleanup})")]
     StagingPreparationCleanupFailed { operation: String, cleanup: String },
@@ -357,6 +366,7 @@ impl RootedCopySource<'_> {
                 return Err(RootedFsError::CopySourceChanged(self.path.to_path_buf()));
             }
             staged.apply_metadata_blocking(Some(mode), Some(modified))?;
+            staged.prepare_publication_blocking()?;
             // Validate the same held file and path after copying, before
             // publishing over an existing backup. The final check/rename is
             // not an atomic compare-and-swap against concurrent writers.
@@ -429,6 +439,11 @@ struct RootedNamespaceTransaction {
     destination_path: PathBuf,
     #[cfg(unix)]
     retired_destination: Option<RetiredDestinationObservation>,
+    #[cfg(unix)]
+    staged: Option<OwnedStagingEntry>,
+    #[cfg(unix)]
+    cleanup_owned: Option<libc::stat>,
+    sealed: Option<VerifiedObservation>,
     committed: bool,
 }
 
@@ -458,23 +473,61 @@ impl RootedStagedFile {
         Ok(self.file.try_clone()?)
     }
 
+    #[cfg(unix)]
+    fn observe_original_file(&self) -> Result<VerifiedObservation> {
+        let observed = self.namespace.observe_staging()?;
+        if !staging::same_observation(&observed.stat, &stat_fd(self.file.as_raw_fd())?) {
+            return Err(RootedFsError::StagingEntryChanged(
+                self.namespace.destination_path.clone(),
+            ));
+        }
+        Ok(observed)
+    }
+
     /// Hash staged bytes through the already-open descriptor so restrictive
     /// final permissions do not prevent verification before commit.
     pub fn staged_hash_blocking(&mut self) -> Result<blake3::Hash> {
-        use std::io::{Read, Seek, SeekFrom};
-
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        let mut hasher = blake3::Hasher::new();
-        loop {
-            let read = self.file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
+        #[cfg(unix)]
+        {
+            use std::io::{Seek, SeekFrom};
+            let before = self.observe_original_file()?;
+            let size = u64::try_from(before.stat.st_size).map_err(|_| {
+                RootedFsError::StagingEntryChanged(self.namespace.destination_path.clone())
+            })?;
+            let path = RelativePath::new(self.namespace.destination_path.clone())
+                .map_err(|_| RootedFsError::InvalidRelativePath)?;
+            self.file.seek(SeekFrom::Start(0))?;
+            let hash = crate::endpoint::existing::hash_observed_bytes(&mut self.file, size, &path)
+                .map_err(|error| match error {
+                    crate::endpoint::existing::ExistingDestinationError::Io(error) => {
+                        RootedFsError::Io(error)
+                    }
+                    _ => {
+                        RootedFsError::StagingEntryChanged(self.namespace.destination_path.clone())
+                    }
+                })?;
+            self.namespace.sealed = Some(before);
+            self.observe_original_file()?;
+            self.file.seek(SeekFrom::End(0))?;
+            Ok(blake3::Hash::from_bytes(hash))
         }
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(hasher.finalize())
+        #[cfg(not(unix))]
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Retain the original FD/name observation after preparation, even when no
+    /// content hash was requested. A prior verification seal cannot be refreshed.
+    pub fn prepare_publication_blocking(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let observed = self.observe_original_file()?;
+            self.namespace.sealed.get_or_insert(observed);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(RootedFsError::UnsupportedPlatform)
+        }
     }
 
     /// Apply requested regular-file metadata to the still-private staging inode.
@@ -548,12 +601,7 @@ impl RootedStagedFile {
     /// Publish atomically through the namespace owner. This is not a power-loss
     /// durability guarantee: no parent-directory persistence ordering is provided.
     pub fn commit(self) -> Result<RootedPublishedFile> {
-        let Self { file, namespace } = self;
-        let rooted = namespace.rooted.clone();
-        let path = RelativePath::new(namespace.destination_path.clone())
-            .map_err(|_| RootedFsError::InvalidRelativePath)?;
-        namespace.commit()?;
-        RootedPublishedFile::from_committed(file, rooted, path, None)
+        self.commit_prepared(None, || Ok(()))
     }
 
     /// Cancellation may reject admission, but cannot revoke a native commit
@@ -562,12 +610,24 @@ impl RootedStagedFile {
         self,
         admission: &Arc<PublicationAdmission>,
     ) -> Result<RootedPublishedFile> {
+        self.commit_prepared(Some(Arc::clone(admission)), || Ok(()))
+    }
+
+    fn commit_prepared(
+        mut self,
+        admission: Option<Arc<PublicationAdmission>>,
+        validate_source: impl Fn() -> Result<()>,
+    ) -> Result<RootedPublishedFile> {
+        #[cfg(unix)]
+        if let Err(operation) = self.observe_original_file() {
+            return Err(self.namespace.abort_after(operation));
+        }
         let Self { file, namespace } = self;
         let rooted = namespace.rooted.clone();
         let path = RelativePath::new(namespace.destination_path.clone())
             .map_err(|_| RootedFsError::InvalidRelativePath)?;
-        namespace.commit_with_admission(admission)?;
-        RootedPublishedFile::from_committed(file, rooted, path, Some(Arc::clone(admission)))
+        let observed = namespace.commit_prepared(admission.as_deref(), validate_source)?;
+        RootedPublishedFile::from_committed(file, rooted, path, admission, observed)
     }
 
     /// Explicitly abort and report cleanup failures rather than relying on Drop.
@@ -593,27 +653,36 @@ impl RootedNamespaceTransaction {
         }
     }
 
-    fn commit(self) -> Result<()> {
+    fn commit(self) -> Result<VerifiedObservation> {
         self.commit_prepared(None, || Ok(()))
     }
 
-    fn commit_with_admission(self, admission: &PublicationAdmission) -> Result<()> {
-        self.commit_prepared(Some(admission), || Ok(()))
-    }
-
     #[cfg(unix)]
-    fn commit_checked(self, validate_source: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn commit_checked(
+        self,
+        validate_source: impl Fn() -> Result<()>,
+    ) -> Result<VerifiedObservation> {
         self.commit_prepared(None, validate_source)
     }
 
     fn commit_prepared(
         mut self,
         admission: Option<&PublicationAdmission>,
-        validate_source: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+        validate_source: impl Fn() -> Result<()>,
+    ) -> Result<VerifiedObservation> {
+        #[cfg(unix)]
+        if let Err(operation) = self.seal_staging() {
+            return Err(self.abort_after(operation));
+        }
         match self.commit_blocking(admission, validate_source) {
             Err(operation) if !self.committed => Err(self.abort_after(operation)),
-            result => result,
+            Err(operation) => Err(operation),
+            Ok(()) => self
+                .sealed
+                .ok_or_else(|| RootedFsError::CommittedFinalizationFailed {
+                    path: self.destination_path.clone(),
+                    reason: "publication lost its prepared staging observation".into(),
+                }),
         }
     }
 
@@ -633,11 +702,7 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn abort_blocking(&mut self) -> Result<()> {
-        let remove_file = match unlink_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name, false) {
-            Ok(()) => None,
-            Err(RootedFsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => Some(error),
-        };
+        let remove_file = self.remove_owned_contents().err();
         let remove_dir = remove_owned_staging_dir_at(
             self.parent_fd.as_raw_fd(),
             self.staging_dir_fd.as_raw_fd(),
@@ -663,7 +728,7 @@ impl RootedNamespaceTransaction {
     fn commit_blocking(
         &mut self,
         admission: Option<&PublicationAdmission>,
-        validate_source: impl FnOnce() -> Result<()>,
+        validate_source: impl Fn() -> Result<()>,
     ) -> Result<()> {
         self.rooted.require_writable()?;
         // Own the session reference outside `self`: the permit covers cleanup
@@ -693,7 +758,7 @@ impl RootedNamespaceTransaction {
         session_admission: Option<&'a PublicationAdmission>,
         transaction_admission: Option<&'a PublicationAdmission>,
         lineage: &mut RetirementLineage,
-        validate_source: impl FnOnce() -> Result<()>,
+        validate_source: impl Fn() -> Result<()>,
     ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
         self.verify_parent_binding()?;
         self.verify_expected_destination_with_lineage(lineage)?;
@@ -733,6 +798,7 @@ impl RootedNamespaceTransaction {
             .pause_mutation(PublicationPausePoint::BeforeAdmission);
         self.verify_parent_binding()?;
         self.verify_expected_destination_with_lineage(lineage)?;
+        let staging_check = self.observe_staging();
         // Capture OLD after preparation waits, before late admission; retain it
         // only for native publication/cleanup. This is still not portable CAS.
         self.retired_destination = RetiredDestinationObservation::capture(
@@ -745,12 +811,16 @@ impl RootedNamespaceTransaction {
         // Check the hardlink's exact post-preparation source last, after all
         // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
+        staging_check?;
         let permits = admit_publication(session_admission, transaction_admission)?;
         #[cfg(test)]
         self.rooted
             .pause_mutation(PublicationPausePoint::AfterAdmission);
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::AfterAdmission);
+        let staging_check = self.observe_staging();
+        validate_source()?;
+        staging_check?;
         if is_type_transition {
             rename_exchange_at(
                 self.staging_dir_fd.as_raw_fd(),
@@ -788,6 +858,34 @@ impl RootedNamespaceTransaction {
             self.committed = true;
         }
 
+        self.cleanup_owned = if is_type_transition {
+            self.retired_destination
+                .as_ref()
+                .map(|old| old.cleanup_identity())
+        } else if matches!(
+            self.expected_destination,
+            HeldDestinationExpectation::Absent
+        ) {
+            self.cleanup_owned
+        } else {
+            None
+        };
+        self.advance_staging(
+            if !is_type_transition
+                && matches!(
+                    self.expected_destination,
+                    HeldDestinationExpectation::Absent
+                )
+            {
+                1
+            } else {
+                0
+            },
+        )
+        .map_err(|error| RootedFsError::CommittedFinalizationFailed {
+            path: self.destination_path.clone(),
+            reason: error.to_string(),
+        })?;
         if let Some(observation) = self.retired_destination.as_mut() {
             observation
                 .record(
@@ -813,6 +911,7 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn finish_commit_blocking(&mut self, lineage: &mut RetirementLineage) -> Result<()> {
+        let mut staged_link_removed = false;
         let mut cleanup = || -> Result<()> {
             if let Some(stat) = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?
             {
@@ -821,13 +920,19 @@ impl RootedNamespaceTransaction {
                 if let Some(observation) = self.retired_destination.as_ref() {
                     observation.verify(&stat, &self.destination_path)?;
                 }
-                unlink_at(
-                    self.staging_dir_fd.as_raw_fd(),
-                    &self.temp_name,
-                    stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
-                )?;
-                if let Some(observation) = self.retired_destination.as_mut() {
-                    observation.record(lineage, RetirementStep::Unlink, &self.destination_path)?;
+                let removed = self.remove_owned_contents()?;
+                if removed {
+                    staged_link_removed = matches!(
+                        self.expected_destination,
+                        HeldDestinationExpectation::Absent
+                    );
+                    if let Some(observation) = self.retired_destination.as_mut() {
+                        observation.record(
+                            lineage,
+                            RetirementStep::Unlink,
+                            &self.destination_path,
+                        )?;
+                    }
                 }
                 self.retired_destination = None;
             }
@@ -837,7 +942,16 @@ impl RootedNamespaceTransaction {
                 &self.staging_dir_name,
             )
         };
-        cleanup().map_err(|error| RootedFsError::CommittedCleanupPending {
+        let cleanup_result = cleanup();
+        if staged_link_removed {
+            self.advance_staging(-1).map_err(|error| {
+                RootedFsError::CommittedFinalizationFailed {
+                    path: self.destination_path.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        cleanup_result.map_err(|error| RootedFsError::CommittedCleanupPending {
             path: self.destination_path.clone(),
             reason: format!(
                 "{error}; private staging entry: {}",
@@ -857,7 +971,7 @@ impl RootedNamespaceTransaction {
     fn commit_blocking(
         &mut self,
         _admission: Option<&PublicationAdmission>,
-        _validate_source: impl FnOnce() -> Result<()>,
+        _validate_source: impl Fn() -> Result<()>,
     ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
@@ -959,12 +1073,8 @@ impl Drop for RootedNamespaceTransaction {
         }
         #[cfg(unix)]
         {
-            let _ = unlink_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name, false);
-            let _ = remove_owned_staging_dir_at(
-                self.parent_fd.as_raw_fd(),
-                self.staging_dir_fd.as_raw_fd(),
-                &self.staging_dir_name,
-            );
+            // Drop cannot report failure; explicit abort reports retained artifacts.
+            let _ = self.abort_blocking();
         }
     }
 }
@@ -1513,22 +1623,26 @@ impl RootedFs {
     ) -> Result<PublishedEntryProof> {
         #[cfg(unix)]
         {
-            let mut staged =
+            let staged =
                 self.begin_staged_symlink_blocking(relative, target, expected, modified)?;
-            let held = match open_symlink_at(staged.staging_dir_fd.as_raw_fd(), &staged.temp_name) {
-                Ok(file) => file,
-                Err(error) => return Err(staged.abort_after(error)),
-            };
-            staged.commit()?;
-            let identity = identity_from_stat(&stat_fd(held.as_raw_fd())?).ok_or_else(|| {
-                RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+            let observed = staged.commit()?;
+            let identity = identity_from_stat(&observed.stat).ok_or_else(|| {
+                RootedFsError::CommittedFinalizationFailed {
+                    path: relative.as_path().to_path_buf(),
+                    reason: "published symlink has no identity".into(),
+                }
             })?;
             let proof = PublishedEntryProof {
                 path: relative.clone(),
                 kind: EntryKind::Symlink,
                 identity,
             };
-            proof.revalidate_blocking(self)?;
+            proof.revalidate_blocking(self).map_err(|error| {
+                RootedFsError::CommittedFinalizationFailed {
+                    path: relative.as_path().to_path_buf(),
+                    reason: error.to_string(),
+                }
+            })?;
             Ok(proof)
         }
         #[cfg(not(unix))]
@@ -1548,7 +1662,7 @@ impl RootedFs {
         #[cfg(unix)]
         {
             let mut namespace = self.begin_namespace_blocking(relative.as_path(), expected)?;
-            let prepare = || -> Result<()> {
+            let mut prepare = || -> Result<()> {
                 let target = CString::new(target.as_os_str().as_bytes())
                     .map_err(|_| RootedFsError::PathContainsNul)?;
                 let name = component_cstring(&namespace.temp_name)?;
@@ -1564,6 +1678,9 @@ impl RootedFs {
                 if result < 0 {
                     return Err(std::io::Error::last_os_error().into());
                 }
+                let held =
+                    open_symlink_at(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name)?;
+                namespace.register_staging(&held)?;
                 if let Some(modified) = modified {
                     set_symlink_mtime_at(
                         namespace.staging_dir_fd.as_raw_fd(),
@@ -1926,6 +2043,9 @@ impl RootedFs {
             Ok(file) => file,
             Err(error) => return Err(namespace.abort_after(error)),
         };
+        if let Err(error) = namespace.register_staging(&file) {
+            return Err(namespace.abort_after(error));
+        }
         if let Err(error) = verify_staging_file_group(namespace.parent_fd.as_raw_fd(), &file) {
             return Err(namespace.abort_after(error));
         }
@@ -1980,6 +2100,9 @@ impl RootedFs {
                 destination_name,
                 destination_path: relative.to_path_buf(),
                 retired_destination: None,
+                staged: None,
+                cleanup_owned: None,
+                sealed: None,
                 committed: false,
             });
         }
@@ -2044,7 +2167,7 @@ impl RootedFs {
                 return Ok(proof);
             }
         }
-        let prepare = || -> Result<EntryIdentity> {
+        let mut prepare = || -> Result<VerifiedObservation> {
             self.verify_parent_binding_blocking(source, &source_parent)?;
             let held = stat_fd(source_file.as_raw_fd())?;
             let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?
@@ -2066,6 +2189,7 @@ impl RootedFs {
                     &namespace.temp_name,
                 )?;
             }
+            namespace.register_staging(&source_file)?;
             let staged =
                 stat_at_optional(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name)?
                     .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
@@ -2074,45 +2198,55 @@ impl RootedFs {
             }
             let prepared = stat_fd(source_file.as_raw_fd())?;
             let after = hardlink_state_from_stat(&prepared, source)?;
-            let prepared_identity = identity_from_stat(&prepared)
-                .ok_or_else(|| RootedFsError::DestinationChanged(source.to_path_buf()))?;
             if !after_own_link(before, after)
-                || identity_from_stat(&staged) != Some(prepared_identity)
+                || !staging::same_preserved_state(&initial, &prepared)
+                || !staging::same_observation(&staged, &prepared)
             {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
+            namespace.sealed = Some(VerifiedObservation { stat: prepared });
             self.verify_parent_binding_blocking(source, &source_parent)?;
-            Ok(prepared_identity)
+            Ok(VerifiedObservation { stat: prepared })
         };
-        let prepared_identity = match prepare() {
-            Ok(identity) => identity,
+        let prepared = match prepare() {
+            Ok(observation) => observation,
             Err(error) => return Err(namespace.abort_after(error)),
         };
-        namespace.commit_checked(|| {
+        let observed = namespace.commit_checked(|| {
             self.verify_parent_binding_blocking(source, &source_parent)?;
             let held = stat_fd(source_file.as_raw_fd())?;
             let named = stat_at_optional(source_parent.as_raw_fd(), &source_leaf)?;
-            if identity_from_stat(&held) != Some(prepared_identity)
-                || named.as_ref().and_then(identity_from_stat) != Some(prepared_identity)
+            if !staging::same_observation(&prepared.stat, &held)
+                || !named
+                    .as_ref()
+                    .is_some_and(|named| staging::same_observation(&prepared.stat, named))
             {
                 return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
             }
             Ok(())
         })?;
-        let final_stat = stat_fd(source_file.as_raw_fd())?;
-        let after = hardlink_state_from_stat(&final_stat, source)?;
-        if !after_own_link(before, after) {
-            return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
-        }
-        let proof = PublishedEntryProof {
-            path: RelativePath::new(destination.to_path_buf())
-                .map_err(|_| RootedFsError::InvalidRelativePath)?,
-            kind: EntryKind::File,
-            identity: identity_from_stat(&final_stat)
-                .ok_or_else(|| RootedFsError::DestinationChanged(destination.to_path_buf()))?,
+        let finalize = || {
+            let final_stat = stat_fd(source_file.as_raw_fd())?;
+            let after = hardlink_state_from_stat(&final_stat, source)?;
+            if !after_own_link(before, after)
+                || !staging::same_observation(&observed.stat, &final_stat)
+            {
+                return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
+            }
+            let proof = PublishedEntryProof {
+                path: RelativePath::new(destination.to_path_buf())
+                    .map_err(|_| RootedFsError::InvalidRelativePath)?,
+                kind: EntryKind::File,
+                identity: identity_from_stat(&observed.stat)
+                    .ok_or_else(|| RootedFsError::DestinationChanged(destination.to_path_buf()))?,
+            };
+            proof.revalidate_blocking(self)?;
+            Ok(proof)
         };
-        proof.revalidate_blocking(self)?;
-        Ok(proof)
+        finalize().map_err(|error| RootedFsError::CommittedFinalizationFailed {
+            path: destination.to_path_buf(),
+            reason: error.to_string(),
+        })
     }
 
     #[cfg(not(unix))]
@@ -4944,6 +5078,7 @@ mod tests {
             let old = private.join(&staged.temp_name);
             let held_directory =
                 open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
+            staged.seal_staging().unwrap();
             let mut lineage = rooted.retirement.lock().unwrap();
             staged
                 .publish_blocking(None, None, &mut lineage, || Ok(()))
