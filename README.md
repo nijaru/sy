@@ -200,6 +200,13 @@ allowed. Remote files with indistinguishable inode and namespace identifiers
 are conservatively treated as aliases. These checks are not atomic with source
 unlink and do not provide isolation from concurrent namespace writers.
 
+For staged file replacements, cancellation or a remote session ending closes
+publication admission. A commit not yet admitted aborts staging and retains the
+old destination. An admitted native commit may finish afterward; cancellation
+cannot interrupt it or undo publication. A lost acknowledgement leaves completion
+uncertain. This cutoff does not yet cover every directory, link, backup or
+in-place metadata operation.
+
 In-place metadata writes to regular files with multiple hardlinks are refused,
 locally and over SSH: an alias may belong to the source, even an excluded file.
 This includes permissions, timestamps, xattrs, ACLs and BSD flags. Supporting

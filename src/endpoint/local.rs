@@ -17,6 +17,7 @@ use std::os::unix::fs::MetadataExt;
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
+    publication: Option<std::sync::Arc<crate::endpoint::publication::PublicationAdmission>>,
     rooted: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<sy::rooted_fs::RootedFs>>>,
 }
 
@@ -30,8 +31,17 @@ impl LocalEndpoint {
         Self {
             root,
             capabilities: Capabilities::local(),
+            publication: None,
             rooted: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    pub(crate) fn with_publication_admission(
+        mut self,
+        admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
+    ) -> Self {
+        self.publication = Some(admission);
+        self
     }
 
     async fn rooted_fs(
@@ -188,31 +198,32 @@ struct LocalStagedWriter {
     root_path: PathBuf,
     destination_path: PathBuf,
     staged: Option<sy::rooted_fs::RootedStagedFile>,
+    admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
     file: Option<tokio::fs::File>,
     #[cfg(test)]
     commit_queued: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct CommitCancellationGuard {
-    state: Option<std::sync::Arc<std::sync::Mutex<bool>>>,
+    admission: Option<std::sync::Arc<crate::endpoint::publication::PublicationAdmission>>,
 }
 
 impl CommitCancellationGuard {
-    fn new(state: std::sync::Arc<std::sync::Mutex<bool>>) -> Self {
-        Self { state: Some(state) }
+    fn new(admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>) -> Self {
+        Self {
+            admission: Some(admission),
+        }
     }
 
     fn disarm(&mut self) {
-        self.state = None;
+        self.admission = None;
     }
 }
 
 impl Drop for CommitCancellationGuard {
     fn drop(&mut self) {
-        if let Some(state) = &self.state {
-            *state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        if let Some(admission) = &self.admission {
+            admission.close();
         }
     }
 }
@@ -253,6 +264,9 @@ impl LocalStagedWriter {
             root_path,
             destination_path,
             staged: Some(staged),
+            admission: std::sync::Arc::new(
+                crate::endpoint::publication::PublicationAdmission::default(),
+            ),
             file: Some(tokio::fs::File::from_std(file)),
             #[cfg(test)]
             commit_queued: None,
@@ -822,12 +836,12 @@ impl StagedWriter for LocalStagedWriter {
             .staged
             .take()
             .ok_or_else(|| SyncError::Config("staged writer is already closed".to_string()))?;
-        let cancellation = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let worker_cancellation = std::sync::Arc::clone(&cancellation);
+        let worker_admission = std::sync::Arc::clone(&self.admission);
         let rooted = std::sync::Arc::clone(&self.rooted);
         let root_path = self.root_path.clone();
         let destination_path = self.destination_path.clone();
-        let mut cancellation_guard = CommitCancellationGuard::new(cancellation);
+        let mut cancellation_guard =
+            CommitCancellationGuard::new(std::sync::Arc::clone(&self.admission));
         let worker = tokio::task::spawn_blocking(move || -> Result<()> {
             if let Err(operation) = rooted.verify_root_path_blocking() {
                 let operation = map_rooted_fs_error(operation);
@@ -840,7 +854,7 @@ impl StagedWriter for LocalStagedWriter {
                 };
             }
             staged
-                .commit_cancellable(worker_cancellation)
+                .commit_with_admission(&worker_admission)
                 .map_err(map_rooted_fs_error)?;
             match rooted.verify_root_path_blocking() {
                 Ok(()) => Ok(()),
@@ -1219,16 +1233,18 @@ impl Endpoint for LocalEndpoint {
             .map_err(|error| SyncError::Config(error.to_string()))?;
         let rooted = self.rooted_fs(true).await?;
         let destination_path = self.root.join(relative.as_path());
-        Ok(Box::new(
-            LocalStagedWriter::new(
-                rooted,
-                relative,
-                expected_destination,
-                self.root.clone(),
-                destination_path,
-            )
-            .await?,
-        ))
+        let mut writer = LocalStagedWriter::new(
+            rooted,
+            relative,
+            expected_destination,
+            self.root.clone(),
+            destination_path,
+        )
+        .await?;
+        if let Some(admission) = &self.publication {
+            writer.admission = std::sync::Arc::clone(admission);
+        }
+        Ok(Box::new(writer))
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
@@ -1518,6 +1534,90 @@ mod tests {
             .unwrap();
             assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_closure_prevents_local_staged_writer_publication() {
+        use crate::remote::router::{FrameRouter, RouterConfig, RouterError, RouterRole};
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"old").unwrap();
+        let (router_io, _peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                .unwrap();
+        let sender = router.sender();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf())
+            .with_publication_admission(sender.publication_admission());
+        let mut staged = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
+        staged.write(b"new").await.unwrap();
+        sender.fail(std::sync::Arc::new(RouterError::WriterClosed));
+        sender.closed().await;
+        let result = staged.commit().await;
+        router.shutdown().await.unwrap();
+        assert!(matches!(result, Err(SyncError::Io(error))
+            if matches!(error.get_ref().and_then(|e| e.downcast_ref()),
+                Some(sy::rooted_fs::RootedFsError::CommitCancelled))));
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_admitted_commit_does_not_block_or_revoke_native_work() {
+        use crate::rooted_fs::{PublicationPause, PublicationPausePoint};
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = LocalStagedWriter::new(
+            endpoint.rooted_fs(true).await.unwrap(),
+            sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
+            ExpectedDestination::SnapshotAtOpen,
+            dir.path().to_path_buf(),
+            dir.path().join("file"),
+        )
+        .await
+        .unwrap();
+        writer.write(b"new").await.unwrap();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        writer
+            .staged
+            .as_mut()
+            .unwrap()
+            .pause_publication(PublicationPause {
+                point: PublicationPausePoint::AfterAdmission,
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+        let mut commit = tokio::spawn(async move { Box::new(writer).commit().await });
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
+        commit.abort();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit).await;
+        let still_private = fs::read(dir.path().join("file")).unwrap() == b"old";
+        // Cancellation must finish before releasing the admitted native commit.
+        let _ = resume_tx.send(());
+        if cancelled.is_err() {
+            let _ = commit.await;
+        }
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if fs::read_dir(dir.path()).unwrap().count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(matches!(paused, Ok(Ok(()))));
+        assert!(matches!(cancelled, Ok(Err(error)) if error.is_cancelled()));
+        assert!(still_private);
+        assert!(completed.is_ok());
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"new");
     }
 
     #[tokio::test]

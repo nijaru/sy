@@ -4,6 +4,7 @@ pub mod io;
 pub mod local;
 pub mod local_entry_scan;
 pub(crate) mod local_identity;
+pub(crate) mod publication;
 pub mod receipt;
 pub mod transfer;
 

@@ -6,6 +6,9 @@ pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
 #[cfg(all(target_os = "macos", feature = "acl"))]
 mod acl_macos;
 
+use crate::endpoint::publication::PublicationAdmission;
+#[cfg(unix)]
+use crate::endpoint::publication::{AdmissionError, PublicationPermit};
 use crate::endpoint::ExpectedDestination;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath, Timestamp};
 use bounded_xattrs::read_from_file as read_xattrs_from_file;
@@ -126,8 +129,11 @@ pub enum RootedFsError {
     #[error("nonempty directory replacement is not authorized at {0}")]
     NonEmptyDirectoryReplacement(PathBuf),
 
-    #[error("staged commit was cancelled before publication")]
+    #[error("staged commit was cancelled before publication admission")]
     CommitCancelled,
+
+    #[error("staged publication admission count exhausted")]
+    CommitAdmissionExhausted,
 
     #[error("held-root filesystem confinement is unsupported on this platform")]
     UnsupportedPlatform,
@@ -319,9 +325,25 @@ pub struct RootedStagedFile {
     namespace: RootedNamespaceTransaction,
 }
 
+#[cfg(all(test, unix))]
+#[derive(PartialEq, Eq)]
+pub(crate) enum PublicationPausePoint {
+    BeforeAdmission,
+    AfterAdmission,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct PublicationPause {
+    pub(crate) point: PublicationPausePoint,
+    pub(crate) reached: tokio::sync::oneshot::Sender<()>,
+    pub(crate) resume: std::sync::mpsc::Receiver<()>,
+}
+
 /// Owns private staging and publication independently of regular-file bytes.
 /// Symlinks and files use the same expected-state, parent binding and cleanup.
 struct RootedNamespaceTransaction {
+    #[cfg(all(test, unix))]
+    publication_pause: Option<PublicationPause>,
     rooted: RootedFs,
     expected_destination: HeldDestinationExpectation,
     #[cfg(unix)]
@@ -348,6 +370,11 @@ impl std::fmt::Debug for RootedStagedFile {
 }
 
 impl RootedStagedFile {
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_publication(&mut self, pause: PublicationPause) {
+        self.namespace.publication_pause = Some(pause);
+    }
+
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
@@ -452,10 +479,10 @@ impl RootedStagedFile {
         self.namespace.commit()
     }
 
-    /// Serialize cancellation against publication; set the shared state when
-    /// the awaiting future is dropped.
-    pub fn commit_cancellable(self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
-        self.namespace.commit_cancellable(cancellation)
+    /// Cancellation may reject admission, but cannot revoke a native commit
+    /// already admitted. The namespace owner acquires admission after validation.
+    pub(crate) fn commit_with_admission(self, admission: &PublicationAdmission) -> Result<()> {
+        self.namespace.commit_with_admission(admission)
     }
 
     /// Explicitly abort and report cleanup failures rather than relying on Drop.
@@ -465,23 +492,32 @@ impl RootedStagedFile {
 }
 
 impl RootedNamespaceTransaction {
-    fn commit(self) -> Result<()> {
-        self.commit_prepared()
-    }
-
-    fn commit_cancellable(mut self, cancellation: Arc<std::sync::Mutex<bool>>) -> Result<()> {
-        let state = cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *state {
-            drop(state);
-            return Err(self.abort_after(RootedFsError::CommitCancelled));
+    #[cfg(all(test, unix))]
+    fn pause_publication(&mut self, point: PublicationPausePoint) {
+        if self
+            .publication_pause
+            .as_ref()
+            .is_some_and(|pause| pause.point == point)
+        {
+            let pause = self.publication_pause.take().unwrap();
+            let _ = pause.reached.send(());
+            // Bound failed-test cleanup as well: never strand a native worker.
+            let _ = pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(15));
         }
-        self.commit_prepared()
     }
 
-    fn commit_prepared(mut self) -> Result<()> {
-        match self.commit_blocking() {
+    fn commit(self) -> Result<()> {
+        self.commit_prepared(None)
+    }
+
+    fn commit_with_admission(self, admission: &PublicationAdmission) -> Result<()> {
+        self.commit_prepared(Some(admission))
+    }
+
+    fn commit_prepared(mut self, admission: Option<&PublicationAdmission>) -> Result<()> {
+        match self.commit_blocking(admission) {
             Err(operation) if !self.committed => Err(self.abort_after(operation)),
             result => result,
         }
@@ -530,13 +566,16 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(unix)]
-    fn commit_blocking(&mut self) -> Result<()> {
-        self.publish_blocking()?;
+    fn commit_blocking(&mut self, admission: Option<&PublicationAdmission>) -> Result<()> {
+        let _permit = self.publish_blocking(admission)?;
         self.finish_commit_blocking()
     }
 
     #[cfg(unix)]
-    fn publish_blocking(&mut self) -> Result<()> {
+    fn publish_blocking<'a>(
+        &mut self,
+        admission: Option<&'a PublicationAdmission>,
+    ) -> Result<Option<PublicationPermit<'a>>> {
         self.verify_parent_binding()?;
         self.verify_expected_destination()?;
 
@@ -565,6 +604,20 @@ impl RootedNamespaceTransaction {
         // A child arriving after the empty check must never be recursively removed.
         self.verify_parent_binding()?;
         self.verify_expected_destination()?;
+
+        // Admission is the beginning of native publication, after potentially
+        // blocking validation. A later close cannot interrupt or roll it back.
+        #[cfg(test)]
+        self.pause_publication(PublicationPausePoint::BeforeAdmission);
+        let permit = admission
+            .map(PublicationAdmission::admit)
+            .transpose()
+            .map_err(|error| match error {
+                AdmissionError::Closed => RootedFsError::CommitCancelled,
+                AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
+            })?;
+        #[cfg(test)]
+        self.pause_publication(PublicationPausePoint::AfterAdmission);
 
         if is_type_transition {
             rename_exchange_at(
@@ -603,7 +656,7 @@ impl RootedNamespaceTransaction {
             self.committed = true;
         }
 
-        Ok(())
+        Ok(permit)
     }
 
     #[cfg(unix)]
@@ -642,7 +695,7 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(not(unix))]
-    fn commit_blocking(&mut self) -> Result<()> {
+    fn commit_blocking(&mut self, _admission: Option<&PublicationAdmission>) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1394,6 +1447,8 @@ impl RootedFs {
                 };
 
             return Ok(RootedNamespaceTransaction {
+                #[cfg(test)]
+                publication_pause: None,
                 rooted: self.clone(),
                 expected_destination,
                 parent_fd,
@@ -3258,7 +3313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_cancellable_commit_does_not_publish() {
+    async fn closed_publication_admission_aborts_staging() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"old").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
@@ -3266,10 +3321,11 @@ mod tests {
             .begin_staged_file_blocking(&relative("file"))
             .unwrap();
         staged.file_mut().write_all(b"new").unwrap();
-        let cancellation = Arc::new(std::sync::Mutex::new(true));
+        let admission = PublicationAdmission::default();
+        admission.close();
 
         assert!(matches!(
-            staged.commit_cancellable(cancellation),
+            staged.commit_with_admission(&admission),
             Err(RootedFsError::CommitCancelled)
         ));
         assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
@@ -4120,7 +4176,7 @@ mod tests {
             let old = private.join(&staged.temp_name);
             let held_directory =
                 open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
-            staged.publish_blocking().unwrap();
+            staged.publish_blocking(None).unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =
                 create_staging_file_at(held_directory.as_raw_fd(), OsStr::new("child")).unwrap();

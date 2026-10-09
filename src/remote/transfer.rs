@@ -562,8 +562,9 @@ pub async fn serve_incoming_file_rooted(
 
     let (reconstruction_tx, reconstruction_rx) = mpsc::channel(RECONSTRUCTION_QUEUE_DEPTH);
     let begin_for_worker = begin.clone();
+    let admission = sender.publication_admission();
     let mut worker = tokio::task::spawn_blocking(move || {
-        reconstruct_file(prepared, begin_for_worker, reconstruction_rx)
+        reconstruct_file(prepared, begin_for_worker, reconstruction_rx, &admission)
     });
 
     // A malformed frame closes admission and joins the staging owner before
@@ -878,6 +879,7 @@ fn reconstruct_file(
     mut prepared: PreparedReconstruction,
     begin: WireFileBegin,
     mut receiver: mpsc::Receiver<ReconstructionOp>,
+    admission: &crate::endpoint::publication::PublicationAdmission,
 ) -> Result<TransferSummary> {
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
@@ -965,7 +967,7 @@ fn reconstruct_file(
                 if let Some((basis, expected)) = prepared.basis.as_ref() {
                     validate_basis(basis, *expected)?;
                 }
-                prepared.staged.commit()?;
+                prepared.staged.commit_with_admission(admission)?;
                 return Ok(TransferSummary {
                     file_size,
                     digest,
@@ -1503,6 +1505,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_state_fences_file_end_unless_publication_was_admitted() {
+        use crate::remote::router::{FrameRouter, RouterConfig, RouterError, RouterRole};
+        use crate::rooted_fs::{PublicationPause, PublicationPausePoint};
+        use tokio::io::AsyncWriteExt;
+
+        for (eof, already_admitted) in [(true, false), (false, false), (false, true)] {
+            let root = tempfile::TempDir::new().unwrap();
+            let path = root.path().join("file");
+            std::fs::write(&path, b"old").unwrap();
+            let original = std::fs::metadata(&path).unwrap();
+            let original_inode = original.ino();
+            let identity =
+                crate::endpoint::local_identity::metadata_identity(&original, EntryKind::File)
+                    .unwrap();
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let relative = RelativePath::new(PathBuf::from("file")).unwrap();
+            let mut prepared = tokio::task::spawn_blocking({
+                let relative = relative.clone();
+                move || {
+                    prepare_reconstruction(
+                        rooted,
+                        &relative,
+                        Some(WireFileBasis::new(original.len(), *identity.as_bytes())),
+                    )
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            prepared.staged.pause_publication(PublicationPause {
+                point: if already_admitted {
+                    PublicationPausePoint::AfterAdmission
+                } else {
+                    PublicationPausePoint::BeforeAdmission
+                },
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+            let (router_io, mut peer) = tokio::io::duplex(4096);
+            let (reader, writer) = tokio::io::split(router_io);
+            let mut router =
+                FrameRouter::start(reader, writer, RouterRole::Server, RouterConfig::default())
+                    .unwrap();
+            let sender = router.sender();
+            let admission = sender.publication_admission();
+            let begin = WireFileBegin::whole(encode_relative_path(relative.as_path()).unwrap(), 3);
+            let (tx, rx) = mpsc::channel(2);
+            let worker = tokio::task::spawn_blocking(move || {
+                reconstruct_file(prepared, begin, rx, &admission)
+            });
+            tx.send(ReconstructionOp::Data(DataChunk::Plain(
+                Bytes::from_static(b"new"),
+            )))
+            .await
+            .unwrap();
+            tx.send(ReconstructionOp::End(WireFileEnd::new(
+                3,
+                *blake3::hash(b"new").as_bytes(),
+            )))
+            .await
+            .unwrap();
+            drop(tx);
+
+            let paused = tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await;
+            let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                if eof {
+                    peer.shutdown().await.unwrap();
+                } else {
+                    sender.fail(std::sync::Arc::new(RouterError::WriterClosed));
+                }
+                sender.closed().await
+            })
+            .await;
+            let remained_private = std::fs::read(&path).unwrap() == b"old";
+            let worker_still_owned = !worker.is_finished();
+            // Release before asserting so regressions cannot strand blocking work.
+            let _ = resume_tx.send(());
+            let result = worker.await.unwrap();
+            router.shutdown().await.unwrap();
+
+            assert!(matches!(paused, Ok(Ok(()))));
+            assert!(
+                terminal.is_ok(),
+                "terminal actor blocked behind native publication"
+            );
+            assert!(remained_private);
+            assert!(worker_still_owned);
+            if already_admitted {
+                assert!(
+                    result.is_ok(),
+                    "admitted native work may complete after closure"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RemoteTransferError::RootedFs(
+                        RootedFsError::CommitCancelled
+                    ))
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), b"old");
+                assert_eq!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+            }
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn bad_digest_drops_stage_and_preserves_destination() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"old").unwrap();
@@ -1526,7 +1639,14 @@ mod tests {
             .with_metadata(Some(0o600), Some((1_600_000_040, 0)))
             .unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        let worker = tokio::task::spawn_blocking(move || {
+            reconstruct_file(
+                prepared,
+                begin,
+                rx,
+                &crate::endpoint::publication::PublicationAdmission::default(),
+            )
+        });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
         )))
@@ -1623,7 +1743,14 @@ mod tests {
         let wire_path = encode_relative_path(relative.as_path()).unwrap();
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(2);
-        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        let worker = tokio::task::spawn_blocking(move || {
+            reconstruct_file(
+                prepared,
+                begin,
+                rx,
+                &crate::endpoint::publication::PublicationAdmission::default(),
+            )
+        });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
         )))
@@ -1671,7 +1798,14 @@ mod tests {
             .with_metadata(Some(0o640), None)
             .unwrap();
         let (tx, rx) = mpsc::channel(4);
-        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        let worker = tokio::task::spawn_blocking(move || {
+            reconstruct_file(
+                prepared,
+                begin,
+                rx,
+                &crate::endpoint::publication::PublicationAdmission::default(),
+            )
+        });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
         )))
@@ -1717,7 +1851,14 @@ mod tests {
         let wire_path = encode_relative_path(relative.as_path()).unwrap();
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(4);
-        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        let worker = tokio::task::spawn_blocking(move || {
+            reconstruct_file(
+                prepared,
+                begin,
+                rx,
+                &crate::endpoint::publication::PublicationAdmission::default(),
+            )
+        });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
         )))
@@ -1765,7 +1906,14 @@ mod tests {
         let wire_path = encode_relative_path(relative.as_path()).unwrap();
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(2);
-        let worker = tokio::task::spawn_blocking(move || reconstruct_file(prepared, begin, rx));
+        let worker = tokio::task::spawn_blocking(move || {
+            reconstruct_file(
+                prepared,
+                begin,
+                rx,
+                &crate::endpoint::publication::PublicationAdmission::default(),
+            )
+        });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
         )))
