@@ -1,4 +1,4 @@
-//! Actual pull executor cutoff: queued native work must use client admission.
+//! Pull source-completion checks and native mutation cutoff/drain contracts.
 use super::*;
 use crate::engine::scheduler::ResourceBudget;
 use crate::protocol::Operation;
@@ -8,6 +8,103 @@ use crate::rooted_fs::{PublicationPause, PublicationPausePoint, RootedFsError};
 use futures::TryStreamExt;
 use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
+
+/// A source race after admission cannot be converted into successful stale
+/// preservation, even though an admitted destination mutation may finish.
+#[tokio::test]
+async fn metadata_completion_rechecks_source_after_admitted_native_work() {
+    use std::os::unix::fs::PermissionsExt;
+    let source_root = tempfile::tempdir().unwrap();
+    let destination_root = tempfile::tempdir().unwrap();
+    let source_path = source_root.path().join("file");
+    let destination_path = destination_root.path().join("file");
+    std::fs::write(&source_path, b"new").unwrap();
+    std::fs::write(&destination_path, b"old").unwrap();
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&destination_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut request = crate::engine::scan::ScanRequest::default();
+    request.metadata.unix_mode = true;
+    let mut entries =
+        crate::endpoint::local_entry_scan::local_entry_stream(source_root.path().into(), request);
+    let source = entries.try_next().await.unwrap().unwrap();
+    entries.close().await.unwrap();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(server_io);
+    let server = tokio::spawn(crate::remote::serve::serve_transport(
+        reader,
+        writer,
+        RouterConfig::default(),
+    ));
+    let (reader, writer) = tokio::io::split(client_io);
+    let client = ClientRemoteSession::connect(
+        reader,
+        writer,
+        Operation::Pull,
+        source_root.path(),
+        RouterConfig::default(),
+    )
+    .await
+    .unwrap();
+    let executor = RemotePullExecutor::new(
+        destination_root.path().into(),
+        client.request_handle(),
+        client.sender(),
+        Scheduler::new(ResourceBudget {
+            metadata_ops: 1,
+            cpu_tasks: 1,
+            ..ResourceBudget::default()
+        })
+        .unwrap(),
+    );
+    let rooted = executor.metadata_authority().await.unwrap().clone();
+    let expected = rooted
+        .path_identity_blocking(&source.path)
+        .unwrap()
+        .unwrap()
+        .1;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    rooted.pause_mutation_at(
+        0,
+        PublicationPause {
+            point: PublicationPausePoint::AfterAdmission,
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+    );
+    let action = RemotePullAction::ApplyMetadata {
+        source,
+        expected_destination: expected,
+        unix_mode: Some(0o600),
+        modified: None,
+    };
+    let resources = crate::remote::pull_lower::action_resources(&action);
+    let worker =
+        tokio::spawn(async move { executor.execute(WorkItem::new(action, resources)).await });
+    let reached = tokio::time::timeout(Duration::from_secs(5), reached_rx).await;
+    // Release and join before assertions, including when reaching the native
+    // boundary failed. No admitted worker is left behind by a test assertion.
+    let changed = std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o620));
+    let resumed = resume_tx.send(());
+    let result = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    drop(client);
+    let _closed = server.await.unwrap();
+    assert!(matches!(reached, Ok(Ok(()))));
+    changed.unwrap();
+    resumed.unwrap();
+    assert!(result.unwrap().unwrap().is_err());
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&source_path).unwrap().mode() & 0o777,
+        0o620
+    );
+    assert_eq!(std::fs::read(&destination_path).unwrap(), b"old");
+    // Post-mutation failure is not a rollback claim.
+    assert_eq!(
+        std::fs::metadata(&destination_path).unwrap().mode() & 0o777,
+        0o600
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Mutation {
@@ -314,7 +411,21 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                         assert!(!destination_root.path().join("file").exists());
                     }
                     Mutation::Metadata | Mutation::Finalize => {
-                        assert!(result.is_ok(), "{result:?}");
+                        if matches!(mutation, Mutation::Metadata) {
+                            // Native admission won, but the closed transport
+                            // cannot confirm the source observation at completion.
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(RemotePullError::Remote(RemoteSessionError::Metadata(
+                                        crate::remote::runtime::metadata::RemoteMetadataError::Router(_)
+                                    )))
+                                ),
+                                "{result:?}"
+                            );
+                        } else {
+                            assert!(result.is_ok(), "{result:?}");
+                        }
                         let (path, mode) = if matches!(mutation, Mutation::Metadata) {
                             ("file", 0o600)
                         } else {

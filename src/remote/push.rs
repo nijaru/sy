@@ -773,6 +773,7 @@ impl RemotePushExecutor {
                 .map_err(RemoteSessionError::from)?;
                 self.check_source_identity(&source).await?;
                 let identity = self.remote.apply_metadata(metadata).await?;
+                self.check_source_identity(&source).await?;
                 // Release metadata admission before acquiring the separate
                 // file/hash budget for a fresh existing-destination receipt.
                 drop(_permit);
