@@ -174,6 +174,10 @@ pub trait StagedWriter: Send {
         Ok((source, destination_basis, None))
     }
 
+    /// Seal the original staging observation after bytes and preservation, before
+    /// the source pre-commit callback. A verification seal must not be refreshed.
+    async fn prepare_publication(&mut self) -> Result<()>;
+
     async fn commit(self: Box<Self>) -> Result<Box<dyn PendingPublication>>;
     async fn abort(self: Box<Self>) -> Result<()>;
 }
@@ -266,6 +270,7 @@ pub(crate) async fn finalize_staged_writer(
             VerificationStatus::NotRequested
         };
 
+        writer.prepare_publication().await?;
         if let Some(pre_commit) = pre_commit {
             pre_commit()?;
         }

@@ -105,7 +105,8 @@ fn rooted_expected_destination(expected: ExpectedDestination) -> sy::endpoint::E
 fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
     match error {
         sy::rooted_fs::RootedFsError::Io(error) => SyncError::Io(error),
-        sy::rooted_fs::RootedFsError::DestinationChanged(path) => {
+        sy::rooted_fs::RootedFsError::DestinationChanged(path)
+        | sy::rooted_fs::RootedFsError::StagingEntryChanged(path) => {
             SyncError::DestinationChanged { path }
         }
         sy::rooted_fs::RootedFsError::CommittedCleanupPending { path, reason } => {
@@ -882,6 +883,12 @@ impl StagedWriter for LocalStagedWriter {
             )
         })
         .await
+    }
+
+    async fn prepare_publication(&mut self) -> Result<()> {
+        self.file_mut()?.flush().await?;
+        self.with_staged(|staged| staged.prepare_publication_blocking())
+            .await
     }
 
     async fn commit(mut self: Box<Self>) -> Result<Box<dyn PendingPublication>> {
@@ -2110,6 +2117,69 @@ mod tests {
             }
         ));
         assert_eq!(fs::read(dir.path().join("created")).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalizer_cannot_issue_source_removal_proof_after_post_hash_staging_edit() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("source"), b"content").unwrap();
+        fs::write(dir.path().join("target"), b"old").unwrap();
+        let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("target"), ExpectedDestination::SnapshotAtOpen)
+            .await
+            .unwrap();
+        writer
+            .write(&fs::read(dir.path().join("source")).unwrap())
+            .await
+            .unwrap();
+        let private = fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sy-stage-")
+                    .then(|| entry.path())
+            })
+            .unwrap();
+        let duplicate = std::sync::Mutex::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(private.join("contents"))
+                .unwrap(),
+        );
+        let source_observation = crate::endpoint::local_identity::identity_for_metadata(
+            &fs::metadata(dir.path().join("source")).unwrap(),
+        );
+        let pre_commit = || {
+            assert_eq!(
+                crate::endpoint::local_identity::identity_for_metadata(&fs::metadata(
+                    dir.path().join("source")
+                )?),
+                source_observation
+            );
+            let mut file = duplicate.lock().unwrap();
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(b"changed")?;
+            Ok(())
+        };
+        let result = crate::endpoint::io::finalize_staged_writer(
+            writer,
+            &make_meta(),
+            &crate::endpoint::io::Preservation::default(),
+            Some(blake3::hash(b"content")),
+            Some(&pre_commit),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(SyncError::DestinationChanged { .. })));
+        assert_eq!(fs::read(dir.path().join("source")).unwrap(), b"content");
+        assert_eq!(fs::read(dir.path().join("target")).unwrap(), b"old");
+        assert!(!private.exists());
     }
 
     #[cfg(unix)]

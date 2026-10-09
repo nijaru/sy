@@ -26,6 +26,7 @@ pub(super) enum RetirementStep {
 pub(super) struct RetiredDestinationObservation {
     file: File,
     before: libc::stat,
+    tracks_lineage: bool,
 }
 
 impl RetiredDestinationObservation {
@@ -39,20 +40,15 @@ impl RetiredDestinationObservation {
         let Some(named) = stat_at_optional(parent, leaf)? else {
             return Ok(None);
         };
-        if named.st_mode & libc::S_IFMT == libc::S_IFDIR || named.st_nlink <= 1 {
-            return Ok(None);
-        }
         let name = super::component_cstring(leaf)?;
         #[cfg(target_os = "linux")]
         let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
+        let flags = libc::O_CLOEXEC
             | if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
                 libc::O_SYMLINK
             } else {
-                0
+                libc::O_EVTONLY | libc::O_NOFOLLOW
             };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
@@ -65,7 +61,14 @@ impl RetiredDestinationObservation {
         // SAFETY: successful openat returned one new owned descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
         let before = stat_fd(file.as_raw_fd())?;
-        let observation = Self { file, before };
+        // All old entries need exchange cleanup ownership. Only multiply-linked
+        // nondirectories need destination-alias retirement authority.
+        let tracks_lineage = before.st_mode & libc::S_IFMT != libc::S_IFDIR && before.st_nlink > 1;
+        let observation = Self {
+            file,
+            before,
+            tracks_lineage,
+        };
         observation.verify(&named, path)?;
         if let HeldDestinationExpectation::Unchanged(expected) = expected {
             if identity_from_stat(&before) != Some(lineage.resolve(expected)?) {
@@ -75,10 +78,14 @@ impl RetiredDestinationObservation {
         Ok(Some(observation))
     }
 
+    pub(super) fn cleanup_identity(&self) -> libc::stat {
+        self.before
+    }
+
     pub(super) fn verify(&self, named: &libc::stat, path: &Path) -> Result<()> {
         let held = stat_fd(self.file.as_raw_fd())?;
-        if identity_from_stat(&held) != identity_from_stat(&self.before)
-            || identity_from_stat(named) != identity_from_stat(&self.before)
+        if !super::staging::same_observation(&self.before, &held)
+            || !super::staging::same_observation(&self.before, named)
         {
             return Err(RootedFsError::DestinationChanged(path.to_path_buf()));
         }
@@ -91,6 +98,11 @@ impl RetiredDestinationObservation {
         step: RetirementStep,
         path: &Path,
     ) -> Result<()> {
+        // No surviving alias needs authority after unlink of an unshared entry.
+        // In particular macOS cannot fstat an unlinked directory descriptor.
+        if !self.tracks_lineage && matches!(step, RetirementStep::Unlink) {
+            return Ok(());
+        }
         let result = (|| {
             let after = stat_fd(self.file.as_raw_fd())?;
             let before = &self.before;
@@ -102,17 +114,7 @@ impl RetiredDestinationObservation {
             // authority. Other inode properties must survive exactly. As with
             // stat+rename itself, this is observational, not portable CAS or
             // isolation from foreign ctime-only edits during the native interval.
-            let unchanged = before.st_dev == after.st_dev
-                && before.st_ino == after.st_ino
-                && before.st_mode == after.st_mode
-                && before.st_uid == after.st_uid
-                && before.st_gid == after.st_gid
-                && before.st_rdev == after.st_rdev
-                && before.st_size == after.st_size
-                && before.st_mtime == after.st_mtime
-                && before.st_mtime_nsec == after.st_mtime_nsec;
-            #[cfg(target_os = "macos")]
-            let unchanged = unchanged && before.st_flags == after.st_flags;
+            let unchanged = super::staging::same_preserved_state(before, &after);
             if !links_match || !unchanged {
                 return Err(RootedFsError::DestinationChanged(path.to_path_buf()));
             }
@@ -120,11 +122,13 @@ impl RetiredDestinationObservation {
                 .ok_or_else(|| RootedFsError::DestinationChanged(path.to_path_buf()))?;
             let after_identity = identity_from_stat(&after)
                 .ok_or_else(|| RootedFsError::DestinationChanged(path.to_path_buf()))?;
-            lineage.record(before_identity, after_identity)?;
+            if self.tracks_lineage {
+                lineage.record(before_identity, after_identity)?;
+            }
             self.before = after;
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && self.tracks_lineage {
             lineage.invalidate();
         }
         result

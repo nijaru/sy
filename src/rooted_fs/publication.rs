@@ -1,5 +1,5 @@
 //! Original-descriptor publication authority and finalized observational proofs.
-use super::{Result, RootedFs, RootedFsError};
+use super::{staging::VerifiedObservation, Result, RootedFs, RootedFsError};
 use crate::endpoint::publication::PublicationAdmission;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath};
 use std::fs::File;
@@ -10,8 +10,9 @@ use {
     std::os::fd::AsRawFd,
 };
 
-/// Original staging descriptor and its observed state after namespace publication.
-/// A held descriptor alone must not adopt foreign edits to that same inode.
+/// Original staging descriptor and its verification/preparation observation,
+/// advanced only by our native namespace bookkeeping. A held descriptor alone
+/// must not adopt foreign edits to that same inode.
 pub struct RootedPublishedFile {
     file: File,
     rooted: RootedFs,
@@ -38,11 +39,11 @@ impl RootedPublishedFile {
         rooted: RootedFs,
         path: RelativePath,
         _admission: Option<Arc<PublicationAdmission>>,
+        observation: VerifiedObservation,
     ) -> Result<Self> {
         #[cfg(unix)]
         {
-            let observed = stat_fd(file.as_raw_fd())
-                .map_err(|error| Self::finalization_error(&path, error))?;
+            let observed = observation.stat;
             let published = Self {
                 file,
                 rooted,
@@ -58,7 +59,7 @@ impl RootedPublishedFile {
         }
         #[cfg(not(unix))]
         {
-            let _ = (file, rooted, _admission);
+            let _ = (file, rooted, _admission, observation);
             Err(Self::finalization_error(
                 &path,
                 RootedFsError::UnsupportedPlatform,
@@ -145,8 +146,12 @@ impl RootedPublishedFile {
     fn verify_observation_binding(&self, observation: &libc::stat) -> Result<EntryIdentity> {
         let identity = identity_from_stat(observation)
             .ok_or_else(|| RootedFsError::NotRegularFile(self.path.as_path().to_path_buf()))?;
-        if identity_from_stat(&stat_fd(self.file.as_raw_fd())?) != Some(identity)
-            || self.rooted.path_identity_blocking(&self.path)? != Some((EntryKind::File, identity))
+        let (parent, leaf) = self.rooted.open_parent_blocking(self.path.as_path())?;
+        let named = super::stat_at_optional(parent.as_raw_fd(), &leaf)?;
+        if !super::staging::same_observation(observation, &stat_fd(self.file.as_raw_fd())?)
+            || !named
+                .as_ref()
+                .is_some_and(|named| super::staging::same_observation(observation, named))
         {
             return Err(RootedFsError::DestinationChanged(
                 self.path.as_path().to_path_buf(),
