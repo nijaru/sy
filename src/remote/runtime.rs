@@ -616,8 +616,12 @@ impl ServerRemoteSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let opened = server_handshake(&mut reader, &mut writer).await?;
+        let mut opened = server_handshake(&mut reader, &mut writer).await?;
         let router = FrameRouter::start(reader, writer, RouterRole::Server, config)?;
+        opened.rooted.bind_session_mutations(
+            router.sender().publication_admission(),
+            opened.operation == Operation::Pull,
+        );
         Ok(Self { opened, router })
     }
 
