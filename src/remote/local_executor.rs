@@ -578,12 +578,14 @@ impl LocalSyncExecutor {
                         })?,
                     ),
                 };
-                self.replace_symlink(target, &destination_path, expected, modified)
+                let publication = self
+                    .replace_symlink(target, &destination_path, expected, modified)
                     .await?;
                 let receipt = PublishedDestinationReceipt::for_symlink(
                     source.path.clone(),
                     destination_path.clone(),
                     source.identity,
+                    publication,
                 );
                 self.remove_committed_source(&receipt, &source).await?;
                 self.report(
@@ -661,14 +663,33 @@ impl LocalSyncExecutor {
                 self.backup_replacement_file(&existing.path, existing.identity)
                     .await?;
             }
-            let first_abs = self.destination_path(&first.path);
-            link_local_file(&first_abs, &dest_abs)
-                .await
-                .map_err(|error| LocalSyncError::Destination(dest_abs.clone(), error))?;
+            let expected = match destination.as_ref() {
+                None => crate::endpoint::ExpectedDestination::Absent,
+                Some(entry) => {
+                    crate::endpoint::ExpectedDestination::Unchanged(entry.identity.ok_or_else(
+                        || LocalSyncError::MissingDestinationIdentity(dest_abs.clone()),
+                    )?)
+                }
+            };
+            let rooted = self.metadata_authority().await?.clone();
+            let first_path = first.path.clone();
+            let destination_path_for_worker = destination_path.clone();
+            let publication = tokio::task::spawn_blocking(move || {
+                rooted.publish_hardlink_blocking(
+                    &first_path,
+                    &destination_path_for_worker,
+                    first.publication,
+                    expected,
+                )
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            groups.advance(group, publication.identity).await?;
             let receipt = PublishedDestinationReceipt::for_hardlink(
                 source.path.clone(),
                 destination_path.clone(),
                 source.identity,
+                publication,
             );
             if source_removal {
                 self.defer_grouped_source_removal(group, &receipt, &source)
@@ -709,6 +730,10 @@ impl LocalSyncExecutor {
                 group,
                 HardlinkRepresentative {
                     path: destination_path.clone(),
+                    publication: receipt
+                        .publication()
+                        .map_err(std::io::Error::other)?
+                        .identity,
                     unix_mode: metadata.unix_mode,
                     modified: metadata.modified,
                 },
@@ -743,14 +768,34 @@ impl LocalSyncExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        self.hardlink_removals.append(group, source).await?;
+        self.check_source_identity(source).await?;
+        self.hardlink_removals
+            .append(
+                group,
+                source,
+                receipt.publication().map_err(std::io::Error::other)?,
+            )
+            .await?;
         Ok(())
     }
 
     async fn finish_deferred_source_removals(&self) -> Result<()> {
         if self.remove_source_files && self.hardlinks {
+            let groups = self.hardlink_groups.lock().await;
+            let rooted = self.metadata_authority().await?.clone();
             self.hardlink_removals
-                .replay(self.source_root.clone())
+                .replay(self.source_root.clone(), &groups, |proof| {
+                    let rooted = rooted.clone();
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            rooted.verify_root_path_blocking()?;
+                            proof.revalidate_blocking(&rooted)
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?
+                        .map_err(std::io::Error::other)
+                    }
+                })
                 .await?;
         }
         Ok(())
@@ -895,20 +940,15 @@ impl LocalSyncExecutor {
         relative: &RelativePath,
         expected: crate::endpoint::ExpectedDestination,
         modified: Option<Timestamp>,
-    ) -> Result<()> {
-        use crate::endpoint::Endpoint;
-        self.destination_endpoint
-            .replace_symlink(target, relative.as_path(), expected, modified)
-            .await
-            .map_err(|error| match error {
-                crate::error::SyncError::Io(io) => {
-                    LocalSyncError::Destination(self.destination_path(relative), io)
-                }
-                other => LocalSyncError::Destination(
-                    self.destination_path(relative),
-                    std::io::Error::other(other.to_string()),
-                ),
-            })
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
+        let rooted = self.metadata_authority().await?.clone();
+        let target = target.to_path_buf();
+        let relative = relative.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            rooted.publish_symlink_blocking(&relative, &target, expected, modified)
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??)
     }
 
     async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
@@ -938,7 +978,7 @@ impl LocalSyncExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        if source.is_file() {
+        {
             let rooted = self.metadata_authority().await?.clone();
             let receipt = receipt.clone();
             tokio::task::spawn_blocking(move || {
@@ -1121,6 +1161,15 @@ impl LocalSyncExecutor {
             source_fingerprint,
             destination_fingerprint,
         )?;
+        if self.hardlinks {
+            if let Some(group) = source.hardlink_group {
+                self.check_source_identity(source).await?;
+                self.hardlink_removals
+                    .append_existing(*group.as_bytes(), source, &receipt)
+                    .await?;
+                return Ok(());
+            }
+        }
         existing::remove_verified_source(
             source_rooted,
             source.clone(),
@@ -1188,30 +1237,6 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
         policy: ExecutionPolicy,
     ) -> std::result::Result<(), LocalSyncError> {
         LocalSyncExecutor::remove_unchanged_source(self, source, destination, policy).await
-    }
-}
-
-/// Atomically link `dest` to the existing `first` inode (`-H`): stage the
-/// link under a temporary name, then rename over the destination.
-async fn link_local_file(first: &Path, dest: &Path) -> std::result::Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let temp = crate::temp_file::TempFileGuard::temp_path_for(dest);
-        let guard = crate::temp_file::TempFileGuard::new(&temp);
-        tokio::fs::hard_link(first, &temp).await?;
-        tokio::fs::rename(&temp, dest).await?;
-        guard.defuse();
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (first, dest);
-        Err(std::io::Error::other(
-            "hardlink preservation is not supported on this platform",
-        ))
     }
 }
 
@@ -1568,16 +1593,72 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn replaced_symlink_publication_keeps_source() {
+        use futures::TryStreamExt;
+        let source_root = tempfile::tempdir().unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("target", source_root.path().join("input")).unwrap();
+        let source = crate::endpoint::local_entry_scan::local_entry_stream(
+            source_root.path().to_path_buf(),
+            crate::engine::scan::ScanRequest::default(),
+        )
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+        let executor = LocalSyncExecutor::new(
+            source_root.path().to_path_buf(),
+            destination_root.path().to_path_buf(),
+            Scheduler::new(ResourceBudget::default()).unwrap(),
+        )
+        .with_remove_source_files(true);
+        let publication = executor
+            .replace_symlink(
+                Path::new("target"),
+                &rel("renamed"),
+                crate::endpoint::ExpectedDestination::Absent,
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = PublishedDestinationReceipt::for_symlink(
+            source.path.clone(),
+            rel("renamed"),
+            source.identity,
+            publication,
+        );
+        std::fs::remove_file(destination_root.path().join("renamed")).unwrap();
+        std::os::unix::fs::symlink("foreign", destination_root.path().join("renamed")).unwrap();
+        assert!(executor
+            .remove_committed_source(&receipt, &source)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_link(source_root.path().join("input")).unwrap(),
+            Path::new("target")
+        );
+        assert_eq!(
+            std::fs::read_link(destination_root.path().join("renamed")).unwrap(),
+            Path::new("foreign")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn hardlink_members_preserve_group_fidelity_and_observed_entries() {
         use futures::TryStreamExt;
         use std::os::unix::fs::MetadataExt;
 
-        for race in [false, true] {
+        // Unchanged observations, source modification, observed-destination
+        // replacement, and a foreign name arriving after an Absent preflight.
+        for race in 0..4 {
             let source_root = tempfile::tempdir().unwrap();
             let dest_root = tempfile::tempdir().unwrap();
             std::fs::write(source_root.path().join("a"), b"new").unwrap();
             std::fs::hard_link(source_root.path().join("a"), source_root.path().join("b")).unwrap();
-            std::fs::write(dest_root.path().join("b"), b"old").unwrap();
+            if race != 3 {
+                std::fs::write(dest_root.path().join("b"), b"old").unwrap();
+            }
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.hardlink_group = true;
             request.metadata.unix_mode = true;
@@ -1594,7 +1675,6 @@ mod tests {
             )
             .try_next()
             .await
-            .unwrap()
             .unwrap();
             let executor = LocalSyncExecutor::new(
                 source_root.path().to_path_buf(),
@@ -1612,23 +1692,30 @@ mod tests {
             .unwrap()
             .unwrap();
             executor.execute(first).await.unwrap();
-            if race {
+            if race == 1 {
                 std::fs::write(source_root.path().join("b"), b"bad").unwrap();
+            } else if race >= 2 {
+                std::fs::write(dest_root.path().join("b"), b"foreign").unwrap();
             }
-            let member = lower_local_op(
-                SyncOp::Update {
+            let op = match destination {
+                Some(destination) => SyncOp::Update {
                     source: entries[1].clone(),
                     destination,
                 },
-                ExecutionPolicy::default(),
-            )
-            .unwrap()
-            .unwrap();
+                None => SyncOp::Create {
+                    source: entries[1].clone(),
+                    destination_path: entries[1].path.clone(),
+                },
+            };
+            let member = lower_local_op(op, ExecutionPolicy::default())
+                .unwrap()
+                .unwrap();
             let result = executor.execute(member).await;
             assert_eq!(std::fs::read(dest_root.path().join("a")).unwrap(), b"new");
-            if race {
+            if race != 0 {
                 assert!(result.is_err());
-                assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), b"old");
+                let expected: &[u8] = if race == 1 { b"old" } else { b"foreign" };
+                assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), expected);
             } else {
                 let crate::engine::work::WorkResult::Transfer(transfer) = result.unwrap() else {
                     panic!("expected transfer receipt")
@@ -1649,47 +1736,107 @@ mod tests {
     async fn deferred_hardlink_source_removal_failure_retains_group() {
         use futures::TryStreamExt;
 
-        let source_root = tempfile::tempdir().unwrap();
-        let dest_root = tempfile::tempdir().unwrap();
-        std::fs::write(source_root.path().join("a"), b"new").unwrap();
-        std::fs::hard_link(source_root.path().join("a"), source_root.path().join("b")).unwrap();
-        let mut request = crate::engine::scan::ScanRequest::default();
-        request.metadata.hardlink_group = true;
-        request.metadata.unix_mode = true;
-        let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-            source_root.path().to_path_buf(),
-            request,
-        )
-        .try_collect()
-        .await
-        .unwrap();
-        let executor = LocalSyncExecutor::new(
-            source_root.path().to_path_buf(),
-            dest_root.path().to_path_buf(),
-            Scheduler::new(ResourceBudget::default()).unwrap(),
-        )
-        .with_hardlinks(true)
-        .with_remove_source_files(true);
-
-        for source in entries {
-            let work = lower_local_op(
-                SyncOp::Create {
-                    destination_path: source.path.clone(),
-                    source,
-                },
-                ExecutionPolicy::default(),
+        for replace_destination in [false, true] {
+            let source_root = tempfile::tempdir().unwrap();
+            let dest_root = tempfile::tempdir().unwrap();
+            std::fs::write(source_root.path().join("a"), b"new").unwrap();
+            std::fs::hard_link(source_root.path().join("a"), source_root.path().join("b")).unwrap();
+            let mut request = crate::engine::scan::ScanRequest::default();
+            request.metadata.hardlink_group = true;
+            request.metadata.unix_mode = true;
+            let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                source_root.path().to_path_buf(),
+                request,
             )
-            .unwrap()
+            .try_collect()
+            .await
             .unwrap();
-            executor.execute(work).await.unwrap();
-        }
-        std::fs::remove_file(source_root.path().join("b")).unwrap();
-        std::fs::write(source_root.path().join("b"), b"bad").unwrap();
+            let executor = LocalSyncExecutor::new(
+                source_root.path().to_path_buf(),
+                dest_root.path().to_path_buf(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_hardlinks(true)
+            .with_remove_source_files(true);
 
-        assert!(executor.finish_deferred_source_removals().await.is_err());
-        assert!(source_root.path().join("a").exists());
-        assert!(source_root.path().join("b").exists());
-        assert_eq!(std::fs::read(source_root.path().join("b")).unwrap(), b"bad");
+            for source in entries {
+                let work = lower_local_op(
+                    SyncOp::Create {
+                        destination_path: source.path.clone(),
+                        source,
+                    },
+                    ExecutionPolicy::default(),
+                )
+                .unwrap()
+                .unwrap();
+                executor.execute(work).await.unwrap();
+            }
+            let raced_root = if replace_destination {
+                dest_root.path()
+            } else {
+                source_root.path()
+            };
+            std::fs::remove_file(raced_root.join("b")).unwrap();
+            std::fs::write(raced_root.join("b"), b"bad").unwrap();
+
+            assert!(executor.finish_deferred_source_removals().await.is_err());
+            assert!(source_root.path().join("a").exists());
+            assert!(source_root.path().join("b").exists());
+            assert_eq!(std::fs::read(raced_root.join("b")).unwrap(), b"bad");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_existing_hardlink_removal_waits_for_all_destination_proofs() {
+        use futures::TryStreamExt;
+        for race in [false, true] {
+            let source_root = tempfile::tempdir().unwrap();
+            let destination_root = tempfile::tempdir().unwrap();
+            for root in [source_root.path(), destination_root.path()] {
+                std::fs::write(root.join("a"), b"same").unwrap();
+                std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+            }
+            let mut request = crate::engine::scan::ScanRequest::default();
+            request.metadata.hardlink_group = true;
+            let sources: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                source_root.path().to_path_buf(),
+                request,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let destinations: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
+                destination_root.path().to_path_buf(),
+                request,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+            let executor = LocalSyncExecutor::new(
+                source_root.path().to_path_buf(),
+                destination_root.path().to_path_buf(),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_hardlinks(true)
+            .with_remove_source_files(true);
+            for (source, destination) in sources.iter().zip(&destinations) {
+                executor
+                    .remove_unchanged_source(source, destination, ExecutionPolicy::default())
+                    .await
+                    .unwrap();
+                assert!(source_root.path().join("a").exists());
+                assert!(source_root.path().join("b").exists());
+            }
+            if race {
+                std::fs::remove_file(destination_root.path().join("b")).unwrap();
+                std::fs::write(destination_root.path().join("b"), b"foreign").unwrap();
+            }
+            let result = executor.finish_deferred_source_removals().await;
+            assert_eq!(result.is_err(), race);
+            assert_eq!(source_root.path().join("a").exists(), race);
+            assert_eq!(source_root.path().join("b").exists(), race);
+        }
     }
 
     #[cfg(unix)]

@@ -344,7 +344,7 @@ impl RemotePullExecutor {
                 // failure aborts the fetch so the user's copy cannot be
                 // silently skipped.
                 self.backup_replacement(destination.as_ref()).await?;
-                let summary = self
+                let (summary, _) = self
                     .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
                     .await?;
                 let op = if is_update {
@@ -442,10 +442,21 @@ impl RemotePullExecutor {
 
             self.backup_replacement(destination.as_ref()).await?;
 
-            let first_abs = self.dest_path(&first.path);
-
-            let dest_abs = self.dest_path(&source.path);
-            link_local_file(&first_abs, &dest_abs, expected_destination).await?;
+            let mut rooted =
+                crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+            rooted.bind_session_mutations(self.sender.publication_admission(), false);
+            let path = source.path.clone();
+            let publication = tokio::task::spawn_blocking(move || {
+                rooted.publish_hardlink_blocking(
+                    &first.path,
+                    &path,
+                    first.publication,
+                    expected_destination,
+                )
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            groups.advance(group, publication.identity).await?;
             let op = if is_update {
                 crate::sync::output::ItemizeOp::Update
             } else {
@@ -463,7 +474,7 @@ impl RemotePullExecutor {
         self.validate_file_fetch_options()?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
         self.backup_replacement(destination.as_ref()).await?;
-        let summary = self
+        let (summary, publication) = self
             .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
             .await?;
         groups
@@ -471,6 +482,7 @@ impl RemotePullExecutor {
                 group,
                 HardlinkRepresentative {
                     path: source.path.clone(),
+                    publication: publication.identity,
                     unix_mode: metadata.unix_mode,
                     modified: metadata.modified,
                 },
@@ -497,7 +509,10 @@ impl RemotePullExecutor {
         expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
         final_flags: Option<u32>,
-    ) -> Result<crate::engine::work::TransferSummary> {
+    ) -> Result<(
+        crate::engine::work::TransferSummary,
+        crate::rooted_fs::PublishedFileProof,
+    )> {
         let dest = self.dest_path(&source.path);
         let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone())
@@ -540,11 +555,11 @@ impl RemotePullExecutor {
                 return Err(error.into());
             }
         };
-        match verification {
+        let publication = match verification {
             crate::endpoint::io::FinalizationOutcome::Published {
                 verification: VerificationStatus::Verified,
-                ..
-            } => {}
+                proof,
+            } => proof,
             crate::endpoint::io::FinalizationOutcome::VerificationFailed { expected, actual } => {
                 self.cancel_staged_fetch(fetched.stream_id).await;
                 return Err(RemotePullError::StagedVerificationFailed {
@@ -559,14 +574,14 @@ impl RemotePullExecutor {
                     "pull finalized without verifying staged bytes".into(),
                 )));
             }
-        }
+        };
         crate::remote::fetch::acknowledge_fetch(&self.sender, fetched.stream_id)
             .await
             .map_err(|error| RemotePullError::CommittedAckFailed {
                 path: source.path.as_path().to_path_buf(),
                 reason: error.to_string(),
             })?;
-        Ok(fetched.summary)
+        Ok((fetched.summary, publication))
     }
 
     async fn cancel_staged_fetch(&self, stream_id: crate::protocol::StreamId) {
@@ -897,46 +912,6 @@ async fn copy_local_backup(
     })
     .await
     .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
-}
-
-/// Stage a hardlink beside the destination and replace it only if the scanned
-/// destination state still holds. The final stat/rename pair is not an atomic
-/// compare-and-swap against arbitrary concurrent writers.
-async fn link_local_file(
-    first: &Path,
-    dest: &Path,
-    expected_destination: ExpectedDestination,
-) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let expected_destination =
-            crate::endpoint::local::capture_destination_expectation(dest, expected_destination)
-                .await?;
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| RemotePullError::LocalMutation(parent.to_path_buf(), error))?;
-        }
-        let temp = crate::temp_file::TempFileGuard::temp_path_for(dest);
-        let guard = crate::temp_file::TempFileGuard::new(&temp);
-        tokio::fs::hard_link(first, &temp)
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(temp.clone(), error))?;
-        crate::endpoint::local::verify_destination_expectation(dest, expected_destination).await?;
-        tokio::fs::rename(&temp, dest)
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(dest.to_path_buf(), error))?;
-        drop(guard);
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (first, expected_destination);
-        Err(RemotePullError::LocalMutation(
-            dest.to_path_buf(),
-            std::io::Error::other("hardlink preservation is not supported on this platform"),
-        ))
-    }
 }
 
 async fn remove_local_entry(

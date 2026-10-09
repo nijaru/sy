@@ -5,7 +5,7 @@
 //! record; neither group count nor path ordering increases RAM or descriptors.
 //! Executors serialize publication and insertion with their async group lock.
 
-use super::domain::{RelativePath, Timestamp};
+use super::domain::{EntryIdentity, RelativePath, Timestamp};
 use super::native_path;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -17,6 +17,7 @@ const BRANCH_BYTES: usize = 19;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HardlinkRepresentative {
     pub path: RelativePath,
+    pub publication: EntryIdentity,
     pub unix_mode: Option<u32>,
     pub modified: Option<Timestamp>,
 }
@@ -57,6 +58,11 @@ impl HardlinkGroups {
         representative: HardlinkRepresentative,
     ) -> io::Result<()> {
         self.with_disk(move |disk| disk.insert(key, representative))
+            .await
+    }
+
+    pub async fn advance(&self, key: [u8; 32], identity: EntryIdentity) -> io::Result<()> {
+        self.with_disk(move |disk| disk.advance(key, identity))
             .await
     }
 
@@ -185,15 +191,45 @@ impl DiskIndex {
         } else {
             None
         };
+        let mut publication = [0; 32];
+        self.file.read_exact(&mut publication)?;
         let mut path = vec![0; len];
         self.file.read_exact(&mut path)?;
         let path = RelativePath::new(native_path::decode(&path)?)
             .map_err(|_| invalid("invalid hardlink path"))?;
         Ok(HardlinkRepresentative {
             path,
+            publication: EntryIdentity::from_bytes(publication),
             unix_mode,
             modified,
         })
+    }
+
+    fn advance(&mut self, key: [u8; 32], identity: EntryIdentity) -> io::Result<()> {
+        if !self.healthy {
+            return Err(invalid("hardlink scratch index is incomplete"));
+        }
+        let mut cursor = self.root.ok_or_else(|| invalid("missing hardlink group"))?;
+        let mut previous_bit = None;
+        loop {
+            match self.node(cursor)? {
+                Node::Branch { bit, children } => {
+                    if previous_bit.is_some_and(|previous| bit <= previous) {
+                        return Err(invalid("unordered hardlink branch bits"));
+                    }
+                    previous_bit = Some(bit);
+                    cursor = children[side(&key, bit)];
+                }
+                Node::Leaf(found) if found == key => {
+                    self.healthy = false;
+                    self.file.seek(SeekFrom::Start(cursor + 1 + 32 + 21))?;
+                    self.file.write_all(identity.as_bytes())?;
+                    self.healthy = true;
+                    return Ok(());
+                }
+                Node::Leaf(_) => return Err(invalid("missing hardlink group")),
+            }
+        }
     }
 
     fn insert(&mut self, key: [u8; 32], value: HardlinkRepresentative) -> io::Result<()> {
@@ -217,6 +253,7 @@ impl DiskIndex {
         let modified = value.modified.unwrap_or(Timestamp::UNIX_EPOCH);
         self.file.write_all(&modified.seconds().to_le_bytes())?;
         self.file.write_all(&modified.nanoseconds().to_le_bytes())?;
+        self.file.write_all(value.publication.as_bytes())?;
         self.file.write_all(&path)?;
 
         if let Some(root) = self.root {
@@ -282,6 +319,7 @@ mod tests {
     fn representative(index: usize) -> HardlinkRepresentative {
         HardlinkRepresentative {
             path: RelativePath::new(format!("directory/{index}")).unwrap(),
+            publication: EntryIdentity::from_bytes([1; 32]),
             unix_mode: Some(0o640),
             modified: Some(Timestamp::new(-1, 999_999_999).unwrap()),
         }
@@ -366,6 +404,7 @@ mod tests {
                         key,
                         HardlinkRepresentative {
                             path: path.clone(),
+                            publication: EntryIdentity::from_bytes([1; 32]),
                             unix_mode: None,
                             modified: None,
                         },

@@ -666,9 +666,9 @@ mod tests {
             let scan = session.scan_handler();
             let file = session.file_handler();
             let mutation = session.mutation_handler();
-            // Destination scan, one file transfer (the representative),
-            // one hardlink mutation. The source scan is local.
-            for _ in 0..3 {
+            // Destination scan, representative transfer, member publication,
+            // and both final destination proofs before grouped source removal.
+            for _ in 0..5 {
                 match session.next_request().await.unwrap().unwrap() {
                     IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
                     IncomingRequest::File(incoming) => {

@@ -710,6 +710,7 @@ impl RemotePushExecutor {
                 destination,
                 modified,
             } => {
+                self.check_source_identity(&source).await?;
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     RemotePushError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
@@ -722,13 +723,15 @@ impl RemotePushExecutor {
                         })
                     })
                     .transpose()?;
-                self.remote
+                let publication = self
+                    .remote
                     .replace_symlink(&source.path, target, expected_identity, modified)
                     .await?;
                 let receipt = PublishedDestinationReceipt::for_symlink(
                     source.path.clone(),
                     source.path.clone(),
                     source.identity,
+                    publication,
                 );
                 self.remove_committed_source(&receipt, &source).await?;
                 self.report(
@@ -799,11 +802,31 @@ impl RemotePushExecutor {
                         .await?;
                 }
             }
-            self.remote.hardlink(&first.path, &source.path).await?;
+            let expected_destination = destination
+                .as_ref()
+                .map(|entry| {
+                    entry.identity.ok_or_else(|| {
+                        RemotePushError::MissingDestinationIdentity(
+                            entry.path.as_path().to_path_buf(),
+                        )
+                    })
+                })
+                .transpose()?;
+            let publication = self
+                .remote
+                .hardlink(
+                    &first.path,
+                    &source.path,
+                    first.publication,
+                    expected_destination,
+                )
+                .await?;
+            groups.advance(group, publication.identity).await?;
             let receipt = PublishedDestinationReceipt::for_hardlink(
                 source.path.clone(),
                 source.path.clone(),
                 source.identity,
+                publication,
             );
             if source_removal {
                 self.defer_grouped_source_removal(group, &receipt, &source)
@@ -844,11 +867,8 @@ impl RemotePushExecutor {
             compression: self.compression,
             final_flags: bsd_flags,
         };
-        let representative = HardlinkRepresentative {
-            path: source.path.clone(),
-            unix_mode: metadata.unix_mode,
-            modified: metadata.modified,
-        };
+        let representative_mode = metadata.unix_mode;
+        let representative_modified = metadata.modified;
         let (summary, publication) = self
             .remote
             .transfer_file_with_stream_policy(
@@ -866,7 +886,20 @@ impl RemotePushExecutor {
             &crate::endpoint::io::VerificationStatus::Verified,
             publication,
         );
-        groups.insert(group, representative).await?;
+        groups
+            .insert(
+                group,
+                HardlinkRepresentative {
+                    path: source.path.clone(),
+                    publication: receipt
+                        .publication()
+                        .map_err(std::io::Error::other)?
+                        .identity,
+                    unix_mode: representative_mode,
+                    modified: representative_modified,
+                },
+            )
+            .await?;
         if source_removal {
             self.defer_grouped_source_removal(group, &receipt, &source)
                 .await?;
@@ -896,14 +929,37 @@ impl RemotePushExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        self.hardlink_removals.append(group, source).await?;
+        self.check_source_identity(source).await?;
+        self.hardlink_removals
+            .append(
+                group,
+                source,
+                receipt.publication().map_err(std::io::Error::other)?,
+            )
+            .await?;
         Ok(())
     }
 
     async fn finish_deferred_source_removals(&self) -> Result<()> {
         if self.remove_source_files && self.hardlinks {
+            let groups = self.hardlink_groups.lock().await;
             self.hardlink_removals
-                .replay(self.source_root.clone())
+                .replay(self.source_root.clone(), &groups, |proof| async move {
+                    match proof {
+                        crate::engine::hardlink_removals::GroupDestinationProof::Published(
+                            proof,
+                        ) => self.remote.revalidate_publication(&proof).await,
+                        crate::engine::hardlink_removals::GroupDestinationProof::Existing {
+                            path,
+                            identity,
+                        } => {
+                            self.remote
+                                .revalidate_existing_destination(&path, identity)
+                                .await
+                        }
+                    }
+                    .map_err(std::io::Error::other)
+                })
                 .await?;
         }
         Ok(())
@@ -1066,6 +1122,15 @@ impl RemotePushExecutor {
             source_fingerprint,
             destination_fingerprint,
         )?;
+        if self.hardlinks {
+            if let Some(group) = source.hardlink_group {
+                self.check_source_identity(source).await?;
+                self.hardlink_removals
+                    .append_existing(*group.as_bytes(), source, &receipt)
+                    .await?;
+                return Ok(());
+            }
+        }
         existing::remove_verified_source(source_rooted, source.clone(), receipt, None).await?;
         Ok(())
     }
@@ -1086,7 +1151,7 @@ impl RemotePushExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        if source.is_file() {
+        {
             let proof = receipt.publication().map_err(|error| {
                 RemotePushError::SourceRemoval(
                     self.source_root.join(source.path.as_path()),

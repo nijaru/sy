@@ -318,7 +318,7 @@ impl ClientRemoteSession {
         target: &Path,
         expected_identity: Option<EntryIdentity>,
         modified: Option<Timestamp>,
-    ) -> Result<()> {
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
         self.require_push(FrameKind::Mutation)?;
         request_replace_symlink(
             &self.router.sender(),
@@ -373,12 +373,20 @@ impl ClientRemoteSession {
 
     /// Server-side hardlink beneath the pinned root (`-H`). Links
     /// `destination` to the existing `source` inode without moving bytes.
-    pub async fn hardlink(&self, source: &RelativePath, destination: &RelativePath) -> Result<()> {
+    pub async fn hardlink(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        source_identity: EntryIdentity,
+        expected_destination: Option<EntryIdentity>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
         self.require_push(FrameKind::Mutation)?;
         request_hardlink(
             &self.router.sender(),
             source,
             destination,
+            source_identity,
+            expected_destination,
             self.server.platform.os,
         )
         .await
