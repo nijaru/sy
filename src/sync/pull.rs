@@ -306,6 +306,9 @@ mod tests {
                     _other => panic!("unexpected v3 pull request variant"),
                 }
             }
+            // Keep transport owned in the join result until local finalization
+            // completes. Returning the last response is not session completion.
+            session
         });
 
         let session = sy::remote::runtime::ClientRemoteSession::connect(
@@ -536,6 +539,7 @@ mod tests {
                     _other => panic!("unexpected unchanged xattr pull request variant"),
                 }
             }
+            session // Retain transport until local directory finalization.
         });
 
         let session = sy::remote::runtime::ClientRemoteSession::connect(

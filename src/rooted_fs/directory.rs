@@ -91,83 +91,15 @@ impl RootedFs {
     ) -> Result<()> {
         #[cfg(unix)]
         {
-            use xattr::FileExt;
-            if let Some(xattrs) = &preservation.xattrs {
-                use std::os::unix::ffi::OsStrExt;
-                let total = xattrs
-                    .iter()
-                    .try_fold(0_usize, |total, (name, value)| {
-                        total
-                            .checked_add(name.as_bytes().len())
-                            .and_then(|total| total.checked_add(value.len()))
-                    })
-                    .ok_or(RootedFsError::XattrSetTooLarge {
-                        len: usize::MAX,
-                        max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-                    })?;
-                if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
-                    return Err(RootedFsError::XattrSetTooLarge {
-                        len: total,
-                        max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-                    });
-                }
-            }
-            if let Some(acl) = &preservation.acl {
-                if acl.len() > crate::protocol::MAX_ACL_TEXT_BYTES {
-                    return Err(RootedFsError::AclSetTooLarge {
-                        len: acl.len(),
-                        max: crate::protocol::MAX_ACL_TEXT_BYTES,
-                    });
-                }
-            }
+            let preservation = MetadataPreservation {
+                xattrs: preservation.xattrs.as_deref(),
+                acl: preservation.acl.as_deref(),
+                bsd_flags: preservation.bsd_flags,
+            };
+            preservation.validate()?;
             let file = self.observed_directory(path, expected)?;
             let _permit = self.admit_mutation_blocking()?;
-            if let Some(xattrs) = &preservation.xattrs {
-                for (name, value) in xattrs {
-                    file.set_xattr(name, value)?;
-                }
-                for name in file.list_xattr()? {
-                    if !xattrs.iter().any(|(wanted, _)| wanted == &name) {
-                        file.remove_xattr(&name)?;
-                    }
-                }
-            }
-            if let Some(acl) = &preservation.acl {
-                #[cfg(feature = "acl")]
-                apply_acl_fd(&file, acl)?;
-                #[cfg(not(feature = "acl"))]
-                {
-                    let _ = acl;
-                    return Err(RootedFsError::AclUnsupported(
-                        "ACL preservation requires the acl feature",
-                    ));
-                }
-            }
-            apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)?;
-            if let Some(expected_mode) = unix_mode {
-                use std::os::unix::fs::PermissionsExt;
-                let actual = file.metadata()?.permissions().mode() & 0o7777;
-                if actual != expected_mode & 0o7777 {
-                    return Err(RootedFsError::PreservationModeConflict {
-                        expected: expected_mode & 0o7777,
-                        actual,
-                    });
-                }
-            }
-            if let Some(flags) = preservation.bsd_flags {
-                #[cfg(target_os = "macos")]
-                {
-                    // SAFETY: file is the held, identity-validated directory FD.
-                    if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = flags;
-                    return Err(RootedFsError::UnsupportedPlatform);
-                }
-            }
+            preservation.apply(&file, unix_mode, modified)?;
             // chmod/ACL may change the mode included in directory tokens.
             // Revalidate the visible name against this held inode's new token,
             // never adopt the identity of a fresh pathname lookup.
