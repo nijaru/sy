@@ -63,6 +63,9 @@ pub enum LocalSyncError {
     #[error(transparent)]
     Rooted(#[from] crate::rooted_fs::RootedFsError),
 
+    #[error(transparent)]
+    Endpoint(#[from] crate::error::SyncError),
+
     #[error("staged verification failed for {path}: expected {expected}, got {actual}")]
     VerificationFailed {
         path: PathBuf,
@@ -117,7 +120,6 @@ pub struct LocalSyncExecutor {
     destination_root: PathBuf,
     source_endpoint: crate::endpoint::local::LocalEndpoint,
     destination_endpoint: crate::endpoint::local::LocalEndpoint,
-    metadata_authority: tokio::sync::OnceCell<crate::rooted_fs::RootedFs>,
     scheduler: Scheduler,
     /// --backup: enabled marker, backup directory (None = beside the file),
     /// and suffix, mirroring the other executors.
@@ -165,7 +167,6 @@ impl LocalSyncExecutor {
             destination_root,
             source_endpoint,
             destination_endpoint,
-            metadata_authority: tokio::sync::OnceCell::new(),
             scheduler,
             backup: false,
             backup_dir: None,
@@ -392,7 +393,7 @@ impl LocalSyncExecutor {
             LocalSyncError::MissingDestinationIdentity(self.destination_path(relative))
         })?;
         let backup = self.backup_destination_for(relative)?;
-        let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+        let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
         tokio::task::spawn_blocking(move || {
             rooted.backup_file_blocking(&relative, &backup, expected)
@@ -441,7 +442,7 @@ impl LocalSyncExecutor {
                         source.path.as_path().to_path_buf(),
                     )
                 })?;
-                let rooted = self.metadata_authority().await?.clone();
+                let rooted = self.metadata_authority().await?;
                 let relative = source.path.clone();
                 let identity = tokio::task::spawn_blocking(move || {
                     source_root.read_directory_preservation_blocking(
@@ -567,7 +568,7 @@ impl LocalSyncExecutor {
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let rooted = self.metadata_authority().await?.clone();
+                let rooted = self.metadata_authority().await?;
                 let relative = destination_path.clone();
                 let kind = source.kind;
                 tokio::task::spawn_blocking(move || {
@@ -625,7 +626,7 @@ impl LocalSyncExecutor {
                     )?)
                 }
             };
-            let rooted = self.metadata_authority().await?.clone();
+            let rooted = self.metadata_authority().await?;
             let first_path = first.path.clone();
             let destination_path_for_worker = destination_path.clone();
             let publication = tokio::task::spawn_blocking(move || {
@@ -736,7 +737,7 @@ impl LocalSyncExecutor {
     async fn finish_deferred_source_removals(&self) -> Result<()> {
         if self.remove_source_files && self.hardlinks {
             let groups = self.hardlink_groups.lock().await;
-            let rooted = self.metadata_authority().await?.clone();
+            let rooted = self.metadata_authority().await?;
             self.hardlink_removals
                 .replay(self.source_root.clone(), &groups, |proof| {
                     let rooted = rooted.clone();
@@ -811,6 +812,23 @@ impl LocalSyncExecutor {
         let backup = destination
             .as_ref()
             .filter(|entry| self.backup && entry.is_file());
+        let expected_destination = match destination {
+            Some(destination) => match destination.identity {
+                Some(scanned) => {
+                    let rooted = self.metadata_authority().await?;
+                    let current = tokio::task::spawn_blocking(move || {
+                        rooted.retired_destination_identity_blocking(scanned)
+                    })
+                    .await
+                    .map_err(|error| {
+                        crate::rooted_fs::RootedFsError::Worker(error.to_string())
+                    })??;
+                    crate::endpoint::io::ExpectedDestination::Unchanged(current)
+                }
+                None => crate::endpoint::io::ExpectedDestination::Unverified,
+            },
+            None => crate::endpoint::io::ExpectedDestination::Absent,
+        };
         let result: TransferResult = crate::endpoint::transfer::transfer_file_with_before_stage(
             &self.source_endpoint,
             source.path.as_path(),
@@ -829,13 +847,7 @@ impl LocalSyncExecutor {
                         .identity
                         .map(crate::endpoint::transfer::SourceExpectation::Scanned)
                         .unwrap_or(crate::endpoint::transfer::SourceExpectation::Unverified),
-                    destination: match destination {
-                        Some(destination) => destination
-                            .identity
-                            .map(crate::endpoint::io::ExpectedDestination::Unchanged)
-                            .unwrap_or(crate::endpoint::io::ExpectedDestination::Unverified),
-                        None => crate::endpoint::io::ExpectedDestination::Absent,
-                    },
+                    destination: expected_destination,
                 },
                 preservation: crate::endpoint::io::Preservation::default(),
                 preservation_request,
@@ -895,7 +907,7 @@ impl LocalSyncExecutor {
         expected: crate::endpoint::ExpectedDestination,
         modified: Option<Timestamp>,
     ) -> Result<crate::rooted_fs::PublishedEntryProof> {
-        let rooted = self.metadata_authority().await?.clone();
+        let rooted = self.metadata_authority().await?;
         let target = target.to_path_buf();
         let relative = relative.clone();
         Ok(tokio::task::spawn_blocking(move || {
@@ -905,11 +917,15 @@ impl LocalSyncExecutor {
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??)
     }
 
-    async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
-        self.metadata_authority
-            .get_or_try_init(|| crate::rooted_fs::RootedFs::open(self.destination_root.clone()))
-            .await
-            .map_err(Into::into)
+    async fn metadata_authority(&self) -> Result<crate::rooted_fs::RootedFs> {
+        // Byte staging and executor links must share one run-owned lineage;
+        // independently opening the same pathname creates distinct authority.
+        Ok(self
+            .destination_endpoint
+            .rooted_fs(false)
+            .await?
+            .as_ref()
+            .clone())
     }
 
     /// --remove-source-files: remove the source entry after the destination
@@ -933,7 +949,7 @@ impl LocalSyncExecutor {
             )
         })?;
         {
-            let rooted = self.metadata_authority().await?.clone();
+            let rooted = self.metadata_authority().await?;
             let receipt = receipt.clone();
             tokio::task::spawn_blocking(move || {
                 rooted
@@ -1034,7 +1050,7 @@ impl LocalSyncExecutor {
                 ..ResourceRequest::default()
             })
             .await?;
-        let rooted = self.metadata_authority().await?.clone();
+        let rooted = self.metadata_authority().await?;
         let source = crate::rooted_fs::RootedFs::open(self.source_root.clone()).await?;
         let request = crate::rooted_fs::DirectoryPreservationRequest {
             xattrs: self.xattrs,

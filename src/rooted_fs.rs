@@ -1,10 +1,16 @@
 mod directory;
 mod metadata;
+#[cfg(unix)]
+mod retirement;
 pub(crate) use metadata::MetadataPreservation;
+#[cfg(unix)]
+use retirement::{RetiredDestinationObservation, RetirementLineage, RetirementStep};
 #[cfg(all(test, unix))]
 mod metadata_tests;
 #[cfg(all(test, unix))]
 mod mutation_tests;
+#[cfg(all(test, unix))]
+mod retirement_tests;
 #[cfg(unix)]
 mod scan;
 #[cfg(all(test, unix))]
@@ -182,6 +188,8 @@ pub struct RootedFs {
     root_path: Arc<PathBuf>,
     #[cfg(unix)]
     root_fd: Arc<OwnedFd>,
+    #[cfg(unix)]
+    retirement: Arc<std::sync::Mutex<RetirementLineage>>,
 }
 
 #[derive(Clone)]
@@ -275,7 +283,10 @@ impl RootedCopySource<'_> {
         let actual = crate::endpoint::local_identity::identity_for_metadata(&self.file.metadata()?);
         let named = stat_at_optional(self.parent.as_raw_fd(), &self.leaf)?
             .and_then(|stat| identity_from_stat(&stat));
-        if actual != Some(self.expected) || named != Some(self.expected) {
+        let expected = self
+            .rooted
+            .retired_destination_identity_blocking(self.expected)?;
+        if actual != Some(expected) || named != Some(expected) {
             return Err(changed());
         }
         let (parent, _) = self
@@ -300,7 +311,12 @@ impl RootedCopySource<'_> {
         // hardlinks must not let a backup overwrite the held source inode.
         let destination_identity =
             stat_at_optional(parent.as_raw_fd(), &leaf)?.and_then(|stat| identity_from_stat(&stat));
-        if destination_identity == Some(self.expected) {
+        if destination_identity
+            == Some(
+                self.rooted
+                    .retired_destination_identity_blocking(self.expected)?,
+            )
+        {
             return Err(RootedFsError::BackupAliasesSource(
                 destination.to_path_buf(),
             ));
@@ -312,7 +328,10 @@ impl RootedCopySource<'_> {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let metadata = self.file.metadata()?;
             if crate::endpoint::local_identity::identity_for_metadata(&metadata)
-                != Some(self.expected)
+                != Some(
+                    self.rooted
+                        .retired_destination_identity_blocking(self.expected)?,
+                )
             {
                 return Err(RootedFsError::CopySourceChanged(self.path.to_path_buf()));
             }
@@ -391,6 +410,8 @@ struct RootedNamespaceTransaction {
     #[cfg(unix)]
     destination_name: OsString,
     destination_path: PathBuf,
+    #[cfg(unix)]
+    retired_destination: Option<RetiredDestinationObservation>,
     committed: bool,
 }
 
@@ -743,19 +764,29 @@ impl RootedNamespaceTransaction {
             RootedMutationAdmission::Session(admission) => Some(Arc::clone(admission)),
             _ => None,
         };
-        let _permit =
-            self.publish_blocking(session_admission.as_deref().or(admission), validate_source)?;
-        self.finish_commit_blocking()
+        let retirement = Arc::clone(&self.rooted.retirement);
+        // Only blocking workers acquire this lock; cancellation closes its
+        // independent atomic admission state without waiting for native I/O.
+        let mut lineage = retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let _permit = self.publish_blocking(
+            session_admission.as_deref().or(admission),
+            &mut lineage,
+            validate_source,
+        )?;
+        self.finish_commit_blocking(&mut lineage)
     }
 
     #[cfg(unix)]
     fn publish_blocking<'a>(
         &mut self,
         admission: Option<&'a PublicationAdmission>,
+        lineage: &mut RetirementLineage,
         validate_source: impl FnOnce() -> Result<()>,
     ) -> Result<Option<PublicationPermit<'a>>> {
         self.verify_parent_binding()?;
-        self.verify_expected_destination()?;
+        self.verify_expected_destination_with_lineage(lineage)?;
 
         let dest_stat = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?;
         let staged_stat = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
@@ -781,7 +812,7 @@ impl RootedNamespaceTransaction {
         // These checks detect observed races, not an atomic compare-and-swap.
         // A child arriving after the empty check must never be recursively removed.
         self.verify_parent_binding()?;
-        self.verify_expected_destination()?;
+        self.verify_expected_destination_with_lineage(lineage)?;
 
         // Admission is the beginning of native publication, after potentially
         // blocking validation. A later close cannot interrupt or roll it back.
@@ -790,9 +821,19 @@ impl RootedNamespaceTransaction {
         #[cfg(test)]
         self.rooted
             .pause_mutation(PublicationPausePoint::BeforeAdmission);
-        // Revalidate an owned hardlink's exact post-preparation observation at
-        // the same late publication boundary. Its ctime cannot be refreshed
-        // from arbitrary changes that happened while namespace checks ran.
+        self.verify_parent_binding()?;
+        self.verify_expected_destination_with_lineage(lineage)?;
+        // Capture OLD after preparation waits, before late admission; retain it
+        // only for native publication/cleanup. This is still not portable CAS.
+        self.retired_destination = RetiredDestinationObservation::capture(
+            self.parent_fd.as_raw_fd(),
+            &self.destination_name,
+            &self.destination_path,
+            self.expected_destination,
+            lineage,
+        )?;
+        // Check the hardlink's exact post-preparation source last, after all
+        // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
         let permit = admit_publication(admission)?;
         #[cfg(test)]
@@ -800,7 +841,6 @@ impl RootedNamespaceTransaction {
             .pause_mutation(PublicationPausePoint::AfterAdmission);
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::AfterAdmission);
-
         if is_type_transition {
             rename_exchange_at(
                 self.staging_dir_fd.as_raw_fd(),
@@ -838,21 +878,48 @@ impl RootedNamespaceTransaction {
             self.committed = true;
         }
 
+        if let Some(observation) = self.retired_destination.as_mut() {
+            observation
+                .record(
+                    lineage,
+                    if is_type_transition {
+                        RetirementStep::Exchange
+                    } else {
+                        RetirementStep::Unlink
+                    },
+                    &self.destination_path,
+                )
+                .map_err(|error| RootedFsError::CommittedFinalizationFailed {
+                    path: self.destination_path.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        if !is_type_transition {
+            // Never retain old inode descriptors across file work or tree lifetime.
+            self.retired_destination = None;
+        }
         Ok(permit)
     }
 
     #[cfg(unix)]
-    fn finish_commit_blocking(&mut self) -> Result<()> {
-        let cleanup = || -> Result<()> {
+    fn finish_commit_blocking(&mut self, lineage: &mut RetirementLineage) -> Result<()> {
+        let mut cleanup = || -> Result<()> {
             if let Some(stat) = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?
             {
                 // Only the old entry itself is authorized. New descendants are
                 // retained inside private staging if rmdir refuses them.
+                if let Some(observation) = self.retired_destination.as_ref() {
+                    observation.verify(&stat, &self.destination_path)?;
+                }
                 unlink_at(
                     self.staging_dir_fd.as_raw_fd(),
                     &self.temp_name,
                     stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
                 )?;
+                if let Some(observation) = self.retired_destination.as_mut() {
+                    observation.record(lineage, RetirementStep::Unlink, &self.destination_path)?;
+                }
+                self.retired_destination = None;
             }
             remove_owned_staging_dir_at(
                 self.parent_fd.as_raw_fd(),
@@ -906,6 +973,19 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn verify_expected_destination(&self) -> Result<()> {
+        let mut lineage = self
+            .rooted
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        self.verify_expected_destination_with_lineage(&mut lineage)
+    }
+
+    #[cfg(unix)]
+    fn verify_expected_destination_with_lineage(
+        &self,
+        lineage: &mut RetirementLineage,
+    ) -> Result<()> {
         match self.expected_destination {
             HeldDestinationExpectation::Unverified => Ok(()),
             HeldDestinationExpectation::Absent => {
@@ -920,7 +1000,7 @@ impl RootedNamespaceTransaction {
             HeldDestinationExpectation::Unchanged(expected) => {
                 let actual = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?
                     .and_then(|stat| identity_from_stat(&stat));
-                if actual == Some(expected) {
+                if actual == Some(lineage.resolve(expected)?) {
                     Ok(())
                 } else {
                     Err(RootedFsError::DestinationChanged(
@@ -1062,6 +1142,51 @@ impl RootedFs {
 
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Translate only exact observations already advanced by this root's own
+    /// native retirements. No filesystem stat can introduce a new identity here;
+    /// callers must still bind the result to their path/held basis observation.
+    #[cfg(unix)]
+    pub(crate) fn retired_destination_identity_blocking(
+        &self,
+        scanned: EntryIdentity,
+    ) -> Result<EntryIdentity> {
+        Ok(self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?
+            .resolve(scanned)?)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn retired_destination_identity_blocking(
+        &self,
+        scanned: EntryIdentity,
+    ) -> Result<EntryIdentity> {
+        Ok(scanned)
+    }
+
+    /// Bind an exact current held-inode identity back to its original scan
+    /// observation, if and only if this root owns its full retirement lineage.
+    #[cfg(unix)]
+    pub(crate) fn original_destination_observation_blocking(
+        &self,
+        current: EntryIdentity,
+    ) -> Result<EntryIdentity> {
+        Ok(self
+            .retirement
+            .lock()
+            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?
+            .original_observation(current)?)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn original_destination_observation_blocking(
+        &self,
+        current: EntryIdentity,
+    ) -> Result<EntryIdentity> {
+        Ok(current)
     }
 
     /// Open one regular file relative to the pinned root without following any
@@ -1357,6 +1482,10 @@ impl RootedFs {
             // An operator-selected external backup directory is another root,
             // not an exemption from the owning session's cancellation cutoff.
             backup_root.mutation_admission = self.mutation_admission.clone();
+            // An external backup can retire an inode with aliases beneath the
+            // destination root too; namespace confinement differs, run ownership
+            // of those exact native transitions does not.
+            backup_root.retirement = Arc::clone(&self.retirement);
             source.copy_to(&backup_root, Path::new(leaf))
         }
         #[cfg(not(unix))]
@@ -1727,6 +1856,7 @@ impl RootedFs {
             mutation_pause: Arc::new(std::sync::Mutex::new(None)),
             root_path: Arc::new(root),
             root_fd: Arc::new(root_fd),
+            retirement: Arc::new(std::sync::Mutex::new(RetirementLineage::default())),
         })
     }
 
@@ -1780,12 +1910,19 @@ impl RootedFs {
         // pull source. Publication itself must still obtain late admission.
         self.require_writable()?;
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
-        let expected_destination = capture_destination_expectation(
-            parent_fd.as_raw_fd(),
-            &destination_name,
-            relative,
-            expected,
-        )?;
+        let expected_destination = {
+            let mut lineage = self
+                .retirement
+                .lock()
+                .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+            capture_destination_expectation(
+                parent_fd.as_raw_fd(),
+                &destination_name,
+                relative,
+                expected,
+                &mut lineage,
+            )?
+        };
         let temp_name = OsString::from("contents");
 
         for _ in 0..TEMP_CREATE_ATTEMPTS {
@@ -1810,6 +1947,7 @@ impl RootedFs {
                 temp_name,
                 destination_name,
                 destination_path: relative.to_path_buf(),
+                retired_destination: None,
                 committed: false,
             });
         }
@@ -2603,6 +2741,7 @@ fn capture_destination_expectation(
     component: &OsStr,
     relative: &Path,
     expected: ExpectedDestination,
+    lineage: &mut RetirementLineage,
 ) -> Result<HeldDestinationExpectation> {
     if matches!(expected, ExpectedDestination::Unverified) {
         return Ok(HeldDestinationExpectation::Unverified);
@@ -2614,7 +2753,9 @@ fn capture_destination_expectation(
     match expected {
         ExpectedDestination::Absent if observed.is_none() => Ok(HeldDestinationExpectation::Absent),
         ExpectedDestination::Absent => Err(changed()),
-        ExpectedDestination::Unchanged(expected) if observed_identity == Some(expected) => {
+        ExpectedDestination::Unchanged(expected)
+            if observed_identity == Some(lineage.resolve(expected)?) =>
+        {
             Ok(HeldDestinationExpectation::Unchanged(expected))
         }
         ExpectedDestination::Unchanged(_) => Err(changed()),
@@ -4687,13 +4828,16 @@ mod tests {
             let old = private.join(&staged.temp_name);
             let held_directory =
                 open_dir_at(staged.parent_fd.as_raw_fd(), &staged.destination_name).unwrap();
-            staged.publish_blocking(None, || Ok(())).unwrap();
+            let mut lineage = rooted.retirement.lock().unwrap();
+            staged
+                .publish_blocking(None, &mut lineage, || Ok(()))
+                .unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =
                 create_staging_file_at(held_directory.as_raw_fd(), OsStr::new("child")).unwrap();
             child.write_all(b"keep").unwrap();
             assert!(matches!(
-                staged.finish_commit_blocking(),
+                staged.finish_commit_blocking(&mut lineage),
                 Err(RootedFsError::CommittedCleanupPending { .. })
             ));
             drop(staged);
