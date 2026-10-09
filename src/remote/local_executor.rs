@@ -19,11 +19,9 @@ use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
-use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
-use crate::remote::bsdflags::{apply_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError};
-use crate::remote::xattr::{
-    apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
-};
+use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
+use crate::remote::bsdflags::RemoteBsdFlagsError;
+use crate::remote::xattr::{read_preserved_xattrs, RemoteXattrError, XattrLocation};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -296,18 +294,6 @@ impl LocalSyncExecutor {
         Ok(Some(xattrs))
     }
 
-    /// Mirror an already-read attribute set onto the local destination.
-    async fn write_destination_xattrs(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        xattrs: &[(OsString, Vec<u8>)],
-    ) -> Result<()> {
-        let location = XattrLocation::Local(self.destination_root.as_path());
-        apply_preserved_xattrs(&location, path, kind, xattrs).await?;
-        Ok(())
-    }
-
     /// Read the source's access-control list for one entry when `-A`
     /// requested it. Symlinks are skipped, like xattrs.
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
@@ -326,19 +312,6 @@ impl LocalSyncExecutor {
         Ok(Some(acl.unwrap_or_default()))
     }
 
-    /// Mirror an already-read access-control list onto the local
-    /// destination.
-    async fn write_destination_acls(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        acl: &str,
-    ) -> Result<()> {
-        let location = AclLocation::Local(self.destination_root.as_path());
-        apply_preserved_acls(&location, path, kind, acl).await?;
-        Ok(())
-    }
-
     /// Read the source's BSD file flags for one entry when `-F` requested
     /// them (macOS only; elsewhere `-F` is refused up front). Symlinks are
     /// skipped, like xattrs.
@@ -348,18 +321,6 @@ impl LocalSyncExecutor {
         }
         let flags = existing::observed_flags(self.source_root.clone(), source.clone()).await?;
         Ok(Some(flags))
-    }
-
-    /// Mirror already-read BSD file flags onto the local destination.
-    async fn write_destination_bsd_flags(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        flags: u32,
-    ) -> Result<()> {
-        let location = BsdFlagsLocation::Local(self.destination_root.as_path());
-        apply_preserved_bsd_flags(&location, path, kind, flags).await?;
-        Ok(())
     }
 
     fn destination_path(&self, relative: &RelativePath) -> PathBuf {
@@ -610,28 +571,21 @@ impl LocalSyncExecutor {
                 let relative = destination_path.clone();
                 let kind = source.kind;
                 tokio::task::spawn_blocking(move || {
-                    rooted.apply_metadata_blocking(
+                    rooted.apply_preserved_metadata_blocking(
                         &relative,
                         kind,
                         expected_destination,
                         unix_mode,
                         modified,
+                        &crate::rooted_fs::MetadataPreservation {
+                            xattrs: xattrs.as_deref(),
+                            acl: acls.as_deref(),
+                            bsd_flags,
+                        },
                     )
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&destination_path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&destination_path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&destination_path, source.kind, flags)
-                        .await?;
-                }
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }

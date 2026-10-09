@@ -1,4 +1,8 @@
 mod directory;
+mod metadata;
+pub(crate) use metadata::MetadataPreservation;
+#[cfg(all(test, unix))]
+mod metadata_tests;
 #[cfg(all(test, unix))]
 mod mutation_tests;
 #[cfg(unix)]
@@ -1317,8 +1321,19 @@ impl RootedFs {
             let leaf = destination
                 .file_name()
                 .ok_or(RootedFsError::InvalidRelativePath)?;
-            std::fs::create_dir_all(parent)?;
-            let backup_root = Self::open_blocking(parent.to_path_buf())?;
+            if let Ok(relative) = destination.strip_prefix(self.root_path.as_path()) {
+                // In-root backups share the held namespace and its admission;
+                // reopening a pathname here would lose both authorities.
+                return source.copy_to(self, relative);
+            }
+            {
+                let _permit = self.admit_mutation_blocking()?;
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut backup_root = Self::open_blocking(parent.to_path_buf())?;
+            // An operator-selected external backup directory is another root,
+            // not an exemption from the owning session's cancellation cutoff.
+            backup_root.mutation_admission = self.mutation_admission.clone();
             source.copy_to(&backup_root, Path::new(leaf))
         }
         #[cfg(not(unix))]
@@ -1651,7 +1666,14 @@ impl RootedFs {
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
-        self.apply_metadata_path_blocking(relative.as_path(), kind, expected, unix_mode, modified)
+        self.apply_preserved_metadata_blocking(
+            relative,
+            kind,
+            expected,
+            unix_mode,
+            modified,
+            &MetadataPreservation::default(),
+        )
     }
 
     #[cfg(unix)]
@@ -2130,72 +2152,21 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn apply_metadata_path_blocking(
+    fn read_xattrs_path_blocking(
         &self,
         relative: &Path,
         kind: EntryKind,
-        expected: EntryIdentity,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
-        let (parent, leaf) = self.open_parent_blocking(relative)?;
-        let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
-        match kind {
-            EntryKind::File | EntryKind::Directory => {
-                let file = if kind == EntryKind::File {
-                    open_file_at(parent.as_raw_fd(), &leaf)?
-                } else {
-                    File::from(open_dir_at(parent.as_raw_fd(), &leaf)?)
-                };
-                let stat = stat_fd(file.as_raw_fd())?;
-                let expected_type = if kind == EntryKind::File {
-                    libc::S_IFREG
-                } else {
-                    libc::S_IFDIR
-                };
-                if stat.st_mode & libc::S_IFMT != expected_type
-                    || identity_from_stat(&stat) != Some(expected)
-                {
-                    return Err(changed());
-                }
-                if unix_mode.is_some() || modified.is_some() {
-                    require_exclusive_file_metadata(&file, relative)?;
-                }
-                self.verify_metadata_binding_blocking(relative, &file, kind)?;
-                let _permit = self.admit_mutation_blocking()?;
-                apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)
-            }
-            EntryKind::Symlink => {
-                if unix_mode.is_some() {
-                    return Err(RootedFsError::UnsupportedSymlinkMode);
-                }
-                ensure_symlink_at(parent.as_raw_fd(), &leaf, relative)?;
-                if stat_at_optional(parent.as_raw_fd(), &leaf)?
-                    .as_ref()
-                    .and_then(identity_from_stat)
-                    != Some(expected)
-                {
-                    return Err(changed());
-                }
-                if let Some(modified) = modified {
-                    self.verify_parent_binding_blocking(relative, &parent)?;
-                    let _permit = self.admit_mutation_blocking()?;
-                    set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
-                }
-                Ok(())
-            }
-        }
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
+        let file = self.open_xattr_entry_blocking(relative, kind)?;
+        read_xattrs_from_file(&file)
     }
 
     #[cfg(not(unix))]
-    fn apply_metadata_path_blocking(
+    fn read_xattrs_path_blocking(
         &self,
         _relative: &Path,
         _kind: EntryKind,
-        _expected: EntryIdentity,
-        _unix_mode: Option<u32>,
-        _modified: Option<Timestamp>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(OsString, Vec<u8>)>> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -4395,6 +4366,15 @@ mod tests {
             .unwrap();
         assert!(!root.path().join("file").exists());
         assert!(!root.path().join("dir").exists());
+        std::fs::create_dir(root.path().join("protected")).unwrap();
+        std::fs::write(root.path().join("protected/child"), b"keep").unwrap();
+        rooted
+            .remove_blocking(&relative("protected"), true, None)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("protected/child")).unwrap(),
+            b"keep"
+        );
     }
 
     #[tokio::test]

@@ -20,16 +20,12 @@ use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Times
 use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
-use crate::remote::acl::{apply_preserved_acls, read_preserved_acls, AclLocation, RemoteAclError};
-use crate::remote::bsdflags::{
-    apply_preserved_bsd_flags, read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError,
-};
+use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
+use crate::remote::bsdflags::{read_preserved_bsd_flags, BsdFlagsLocation, RemoteBsdFlagsError};
 use crate::remote::fetch::{fetch_file, FetchPolicy, FetchPreservationRequest};
 use crate::remote::router::RouterSender;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
-use crate::remote::xattr::{
-    apply_preserved_xattrs, read_preserved_xattrs, RemoteXattrError, XattrLocation,
-};
+use crate::remote::xattr::{read_preserved_xattrs, RemoteXattrError, XattrLocation};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +94,20 @@ pub enum RemotePullError {
 }
 
 pub type Result<T> = std::result::Result<T, RemotePullError>;
+
+fn rooted_destination_expectation(
+    expected: ExpectedDestination,
+) -> crate::endpoint::ExpectedDestination {
+    match expected {
+        ExpectedDestination::Absent => crate::endpoint::ExpectedDestination::Absent,
+        ExpectedDestination::Unchanged(identity) => {
+            crate::endpoint::ExpectedDestination::Unchanged(identity)
+        }
+        ExpectedDestination::SnapshotAtOpen | ExpectedDestination::Unverified => {
+            crate::endpoint::ExpectedDestination::SnapshotAtOpen
+        }
+    }
+}
 
 fn destination_expectation(destination: Option<&Entry>) -> Result<ExpectedDestination> {
     match destination {
@@ -279,7 +289,12 @@ impl RemotePullExecutor {
 
     async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
         self.metadata_authority
-            .get_or_try_init(|| crate::rooted_fs::RootedFs::open(self.destination_root.clone()))
+            .get_or_try_init(|| async {
+                let mut rooted =
+                    crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+                rooted.bind_session_mutations(self.sender.publication_admission(), false);
+                Ok::<_, crate::rooted_fs::RootedFsError>(rooted)
+            })
             .await
             .map_err(Into::into)
     }
@@ -364,9 +379,19 @@ impl RemotePullExecutor {
                     RemotePullError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
                 let expected = destination_expectation(destination.as_ref())?;
-                LocalEndpoint::new(self.destination_root.clone())
-                    .replace_symlink(target, source.path.as_path(), expected, modified)
-                    .await?;
+                let rooted = self.metadata_authority().await?.clone();
+                let relative = source.path.clone();
+                let target = target.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    rooted.replace_symlink_blocking(
+                        &relative,
+                        &target,
+                        rooted_destination_expectation(expected),
+                        modified,
+                    )
+                })
+                .await
+                .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
@@ -387,28 +412,21 @@ impl RemotePullExecutor {
                 let relative = source.path.clone();
                 let kind = source.kind;
                 tokio::task::spawn_blocking(move || {
-                    rooted.apply_metadata_blocking(
+                    rooted.apply_preserved_metadata_blocking(
                         &relative,
                         kind,
                         expected_destination,
                         unix_mode,
                         modified,
+                        &crate::rooted_fs::MetadataPreservation {
+                            xattrs: xattrs.as_deref(),
+                            acl: acls.as_deref(),
+                            bsd_flags,
+                        },
                     )
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-                if let Some(xattrs) = xattrs.as_deref() {
-                    self.write_destination_xattrs(&source.path, source.kind, xattrs)
-                        .await?;
-                }
-                if let Some(acls) = acls.as_deref() {
-                    self.write_destination_acls(&source.path, source.kind, acls)
-                        .await?;
-                }
-                if let Some(flags) = bsd_flags {
-                    self.write_destination_bsd_flags(&source.path, source.kind, flags)
-                        .await?;
-                }
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
@@ -442,16 +460,14 @@ impl RemotePullExecutor {
 
             self.backup_replacement(destination.as_ref()).await?;
 
-            let mut rooted =
-                crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
-            rooted.bind_session_mutations(self.sender.publication_admission(), false);
+            let rooted = self.metadata_authority().await?.clone();
             let path = source.path.clone();
             let publication = tokio::task::spawn_blocking(move || {
                 rooted.publish_hardlink_blocking(
                     &first.path,
                     &path,
                     first.publication,
-                    expected_destination,
+                    rooted_destination_expectation(expected_destination),
                 )
             })
             .await
@@ -516,6 +532,7 @@ impl RemotePullExecutor {
         let dest = self.dest_path(&source.path);
         let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone())
+            .with_rooted_authority(self.metadata_authority().await?.clone())
             .with_publication_admission(self.sender.publication_admission());
         let mut staged = endpoint
             .begin_write(source.path.as_path(), expected_destination)
@@ -622,13 +639,13 @@ impl RemotePullExecutor {
                 RemotePullError::MissingDestinationIdentity(existing.path.as_path().to_path_buf())
             })?;
             let backup_abs = self.backup_destination_for(&existing.path)?;
-            copy_local_backup(
-                &self.destination_root,
-                &existing.path,
-                &backup_abs,
-                expected,
-            )
-            .await?;
+            let rooted = self.metadata_authority().await?.clone();
+            let relative = existing.path.clone();
+            tokio::task::spawn_blocking(move || {
+                rooted.backup_file_blocking(&relative, &backup_abs, expected)
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         }
         Ok(())
     }
@@ -652,18 +669,6 @@ impl RemotePullExecutor {
         Ok(Some(xattrs))
     }
 
-    /// Mirror an already-read attribute set onto the local destination.
-    async fn write_destination_xattrs(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        xattrs: &[(OsString, Vec<u8>)],
-    ) -> Result<()> {
-        let location = XattrLocation::Local(self.destination_root.as_path());
-        apply_preserved_xattrs(&location, path, kind, xattrs).await?;
-        Ok(())
-    }
-
     /// Read the remote source's access-control list for one entry when `-A`
     /// requested it. Symlinks are skipped, like xattrs.
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
@@ -673,19 +678,6 @@ impl RemotePullExecutor {
         let location = AclLocation::Remote(&self.remote);
         let acl = read_preserved_acls(&location, source).await?;
         Ok(Some(acl.unwrap_or_default()))
-    }
-
-    /// Mirror an already-read access-control list onto the local
-    /// destination.
-    async fn write_destination_acls(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        acl: &str,
-    ) -> Result<()> {
-        let location = AclLocation::Local(self.destination_root.as_path());
-        apply_preserved_acls(&location, path, kind, acl).await?;
-        Ok(())
     }
 
     /// Read the remote source's BSD file flags for one entry when `-F`
@@ -698,18 +690,6 @@ impl RemotePullExecutor {
         let location = BsdFlagsLocation::Remote(&self.remote);
         let flags = read_preserved_bsd_flags(&location, source).await?;
         Ok(Some(flags))
-    }
-
-    /// Mirror already-read BSD file flags onto the local destination.
-    async fn write_destination_bsd_flags(
-        &self,
-        path: &RelativePath,
-        kind: EntryKind,
-        flags: u32,
-    ) -> Result<()> {
-        let location = BsdFlagsLocation::Local(self.destination_root.as_path());
-        apply_preserved_bsd_flags(&location, path, kind, flags).await?;
-        Ok(())
     }
 
     /// Backup location for one root-relative destination path, mirroring the
@@ -761,7 +741,7 @@ impl RemotePullExecutor {
                 .identity
                 .ok_or_else(|| RemotePullError::MissingDestinationIdentity(path.clone()))?;
             let backup_abs = self.backup_destination_for(&action.path)?;
-            let rooted = crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+            let rooted = self.metadata_authority().await?.clone();
             let relative = action.path.clone();
             tokio::task::spawn_blocking(move || {
                 rooted.backup_file_blocking(&relative, &backup_abs, expected)
@@ -769,9 +749,17 @@ impl RemotePullExecutor {
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         }
-        remove_local_entry(&path, action.kind == EntryKind::Directory, action.identity)
-            .await
-            .map_err(|error| RemotePullError::LocalMutation(path.clone(), error))?;
+        let rooted = self.metadata_authority().await?.clone();
+        let relative = action.path.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.remove_blocking(
+                &relative,
+                action.kind == EntryKind::Directory,
+                action.identity,
+            )
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         self.report(
             crate::sync::output::ItemizeOp::Delete,
             if action.kind == EntryKind::Directory {
@@ -894,86 +882,6 @@ impl RemotePullExecutor {
     }
 }
 
-/// Privately copy the scanned regular destination before replacement. The
-/// rooted helper binds the no-follow source handle to the scanned identity
-/// and validates it again before publishing the backup. Never move the
-/// visible original: fetch/preservation may still fail before commit.
-async fn copy_local_backup(
-    destination_root: &Path,
-    relative: &RelativePath,
-    backup_abs: &Path,
-    expected: EntryIdentity,
-) -> crate::rooted_fs::Result<()> {
-    let rooted = crate::rooted_fs::RootedFs::open(destination_root.to_path_buf()).await?;
-    let relative = relative.clone();
-    let backup_abs = backup_abs.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        rooted.backup_file_blocking(&relative, &backup_abs, expected)
-    })
-    .await
-    .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
-}
-
-async fn remove_local_entry(
-    path: &Path,
-    is_directory: bool,
-    expected_identity: Option<EntryIdentity>,
-) -> std::result::Result<(), std::io::Error> {
-    let meta = match tokio::fs::symlink_metadata(path).await {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let kind = if meta.file_type().is_symlink() {
-        EntryKind::Symlink
-    } else if meta.is_dir() {
-        EntryKind::Directory
-    } else {
-        EntryKind::File
-    };
-    if is_directory != (kind == EntryKind::Directory) {
-        return Err(std::io::Error::other(
-            "destination entry type changed since the scan",
-        ));
-    }
-    if let Some(expected) = expected_identity {
-        let current =
-            crate::endpoint::local_identity::metadata_identity(&meta, kind).ok_or_else(|| {
-                std::io::Error::other("destination entry changed between scan and removal")
-            })?;
-        if current != expected {
-            return Err(std::io::Error::other(
-                "destination entry changed between scan and removal",
-            ));
-        }
-    }
-    if is_directory {
-        match tokio::fs::remove_dir(path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                    || error.raw_os_error() == Some(66)
-                    || error.raw_os_error() == Some(39) =>
-            {
-                // Kept non-empty directory (e.g. holds protected descendant or --backup file)
-                tracing::debug!(
-                    path = %path.display(),
-                    "kept non-empty destination directory"
-                );
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    } else {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}
-
 #[cfg(unix)]
 fn staged_file_metadata(
     source: &Entry,
@@ -1083,6 +991,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "pull_mutation_tests.rs"]
+mod mutation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1288,92 +1200,5 @@ mod tests {
         assert_eq!(metadata.mtime(), modified.seconds());
         assert_eq!(metadata.mtime_nsec(), i64::from(modified.nanoseconds()));
         assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn pull_remove_local_entry_validates_identity() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file_path = temp.path().join("file");
-        let dir_path = temp.path().join("dir");
-        std::fs::write(&file_path, b"delete target").unwrap();
-        std::fs::create_dir(&dir_path).unwrap();
-
-        let file_meta = std::fs::symlink_metadata(&file_path).unwrap();
-        let file_id =
-            crate::endpoint::local_identity::metadata_identity(&file_meta, EntryKind::File)
-                .unwrap();
-
-        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
-        let dir_id =
-            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
-                .unwrap();
-
-        // Vanished entry is idempotent.
-        remove_local_entry(&temp.path().join("missing"), false, Some(file_id))
-            .await
-            .unwrap();
-
-        // Mismatched file identity fails.
-        let wrong_id = EntryIdentity::from_bytes([77; 32]);
-        let err = remove_local_entry(&file_path, false, Some(wrong_id))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "destination entry changed between scan and removal"
-        );
-        assert!(file_path.exists());
-
-        // Type mismatch fails.
-        let err = remove_local_entry(&file_path, true, None)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "destination entry type changed since the scan"
-        );
-        assert!(file_path.exists());
-
-        // Matching file identity succeeds.
-        remove_local_entry(&file_path, false, Some(file_id))
-            .await
-            .unwrap();
-        assert!(!file_path.exists());
-
-        // Mismatched directory identity fails.
-        let err = remove_local_entry(&dir_path, true, Some(wrong_id))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "destination entry changed between scan and removal"
-        );
-        assert!(dir_path.exists());
-
-        // Matching directory identity succeeds.
-        remove_local_entry(&dir_path, true, Some(dir_id))
-            .await
-            .unwrap();
-        assert!(!dir_path.exists());
-    }
-
-    #[tokio::test]
-    async fn pull_remove_local_entry_does_not_recursively_delete_non_empty_dir() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let dir_path = temp.path().join("dir");
-        std::fs::create_dir(&dir_path).unwrap();
-        std::fs::write(dir_path.join("surviving"), b"keep me").unwrap();
-
-        let dir_meta = std::fs::symlink_metadata(&dir_path).unwrap();
-        let dir_id =
-            crate::endpoint::local_identity::metadata_identity(&dir_meta, EntryKind::Directory)
-                .unwrap();
-
-        // Kept without an error when non-empty.
-        remove_local_entry(&dir_path, true, Some(dir_id))
-            .await
-            .unwrap();
-        assert!(dir_path.exists());
-        assert!(dir_path.join("surviving").exists());
     }
 }

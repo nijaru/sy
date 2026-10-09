@@ -44,6 +44,13 @@ impl LocalEndpoint {
         self
     }
 
+    pub(crate) fn with_rooted_authority(mut self, rooted: sy::rooted_fs::RootedFs) -> Self {
+        self.rooted = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
+            std::sync::Arc::new(rooted),
+        )));
+        self
+    }
+
     async fn rooted_fs(
         &self,
         create_root: bool,
