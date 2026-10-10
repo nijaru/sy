@@ -131,10 +131,36 @@ impl ControllerError {
 /// mutating either endpoint.
 pub struct SyncPlan {
     reader: PlanJournalReader,
+    hardlinks: HardlinkPreflight,
     finalize: FinalizeJournalReader,
     operations: u64,
     delete: Option<DeletePlan>,
     execution_policy: ExecutionPolicy,
+}
+
+enum HardlinkPreflight {
+    NotRequested,
+    Failed,
+    Ready(crate::engine::hardlink_preflight::HardlinkCatalogue),
+}
+
+impl HardlinkPreflight {
+    async fn revalidate(&mut self, reader: &PlanJournalReader) -> Result<()> {
+        match self {
+            Self::NotRequested => Ok(()),
+            Self::Failed => Err(ControllerError::HardlinkPreflight(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "incomplete hardlink preflight",
+                )
+                .into(),
+            )),
+            Self::Ready(catalogue) => {
+                catalogue.revalidate(reader).await?;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl SyncPlan {
@@ -148,12 +174,7 @@ impl SyncPlan {
         while let Some(operation) = self.reader.next().await? {
             validate(operation).await?;
         }
-        self.reader
-            .rewind(
-                usize::try_from(self.operations)
-                    .map_err(|_| ControllerError::CounterOverflow("operation"))?,
-            )
-            .await?;
+        self.reader.rewind()?;
         Ok(())
     }
 
@@ -166,18 +187,23 @@ impl SyncPlan {
         F: FnMut(crate::engine::hardlink_preflight::ByteCommitment) -> Fut,
         Fut: Future<Output = Result<[u8; 32]>>,
     {
-        let commitments = crate::engine::hardlink_preflight::HardlinkCommitments::default();
+        // Failed/cancelled validation is terminal. Never certify a remaining
+        // suffix with a fresh builder after the record cursor has advanced.
+        if matches!(self.hardlinks, HardlinkPreflight::Failed) {
+            return self.hardlinks.revalidate(&self.reader).await;
+        }
+        self.reader.rewind()?;
+        self.hardlinks = HardlinkPreflight::Failed;
+        let mut commitments = crate::engine::hardlink_preflight::HardlinkCommitments::default();
         let scheduler = crate::engine::scheduler::Scheduler::new(Default::default())
             .map_err(|error| ControllerError::backend("hardlink preflight resources", error))?;
-        while let Some(operation) = self.reader.next().await? {
-            commitments.check(operation, &scheduler, &mut hash).await?;
+        while let Some(record) = self.reader.next_record().await? {
+            commitments.check(record, &scheduler, &mut hash).await?;
         }
-        self.reader
-            .rewind(
-                usize::try_from(self.operations)
-                    .map_err(|_| ControllerError::CounterOverflow("operation"))?,
-            )
-            .await?;
+        self.reader.rewind()?;
+        let mut catalogue = commitments.seal().await?;
+        catalogue.revalidate(&self.reader).await?;
+        self.hardlinks = HardlinkPreflight::Ready(catalogue);
         Ok(())
     }
 
@@ -202,6 +228,15 @@ impl std::fmt::Debug for SyncPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncPlan")
             .field("operations", &self.operations)
+            .field(
+                "hardlink_membership",
+                &match &self.hardlinks {
+                    HardlinkPreflight::Ready(catalogue) => {
+                        Some((catalogue.groups(), catalogue.member_count()))
+                    }
+                    _ => None,
+                },
+            )
             .field(
                 "eligible_destination_entries",
                 &self.eligible_destination_entries(),
@@ -518,6 +553,7 @@ where
     }
     Ok(SyncPlan {
         reader: journal.seal().await?,
+        hardlinks: HardlinkPreflight::NotRequested,
         finalize: finalize.seal().await?,
         operations,
         delete,
@@ -561,10 +597,12 @@ pub async fn preview_sync(
 ) -> Result<SyncPreview> {
     let SyncPlan {
         mut reader,
+        mut hardlinks,
         operations,
         delete,
         ..
     } = plan;
+    hardlinks.revalidate(&reader).await?;
     let mut preview = SyncPreview {
         planned_operations: operations,
         delete_candidates: delete.as_ref().map_or(0, DeletePlan::delete_candidates),
@@ -676,11 +714,13 @@ impl<E: SyncPlanExecutor> SyncController<E> {
     pub async fn execute(&self, plan: SyncPlan) -> Result<SyncSummary> {
         let SyncPlan {
             mut reader,
+            mut hardlinks,
             mut finalize,
             operations,
             delete,
             execution_policy,
         } = plan;
+        hardlinks.revalidate(&reader).await?;
         let delete_candidates = delete.as_ref().map_or(0, DeletePlan::delete_candidates);
         let mut summary = SyncSummary {
             planned_operations: operations,
@@ -1150,6 +1190,86 @@ mod tests {
             scratch_paths.iter().all(|path| !path.exists()),
             "worker scratch survived preflight return"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_hardlink_preflight_cannot_retry_or_reach_execution() {
+        use crate::engine::domain::EntryIdentity;
+        use crate::engine::hardlink_preflight::ByteCommitment;
+        for (cancel, preview) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut a = file("a", 6, 0);
+            a.identity = Some(EntryIdentity::from_bytes([1; 32]));
+            a.hardlink_group = Some(EntryIdentity::from_bytes([1; 32]));
+            let mut b = a.clone();
+            b.path = path("b");
+            let mut old_a = a.clone();
+            old_a.identity = Some(EntryIdentity::from_bytes([9; 32]));
+            old_a.hardlink_group = None;
+            let mut old_b = old_a.clone();
+            old_b.path = path("b");
+            old_b.size = 1;
+            let mut plan = preflight_sync(
+                entries(vec![a, b]),
+                entries(vec![old_a, old_b]),
+                ComparisonPolicy::default(),
+                None,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            if cancel {
+                let (entered, mut receiving) = tokio::sync::mpsc::channel(1);
+                let mut hash = move |_| {
+                    let entered = entered.clone();
+                    async move {
+                        entered.send(()).await.unwrap();
+                        std::future::pending::<Result<[u8; 32]>>().await
+                    }
+                };
+                {
+                    let checking = plan.validate_hardlink_bytes(&mut hash);
+                    tokio::pin!(checking);
+                    tokio::select! {
+                        result = &mut checking => panic!("unexpected completion: {result:?}"),
+                        _ = receiving.recv() => {},
+                    }
+                }
+            } else {
+                assert!(plan
+                    .validate_hardlink_bytes(|commitment| async move {
+                        Ok(match commitment {
+                            ByteCommitment::Source(_) => [8; 32],
+                            ByteCommitment::Destination(_) => [7; 32],
+                        })
+                    })
+                    .await
+                    .is_err());
+            }
+            // The record cursor may now be at EOF or mid-group. Fresh validation
+            // must not certify that empty/suffix view as the completed plan.
+            assert!(plan
+                .validate_hardlink_bytes(|_| async { panic!("failed plan must be terminal") })
+                .await
+                .is_err());
+            let result = if preview {
+                preview_sync(plan, |_| panic!("failed preflight reached preview output"))
+                    .await
+                    .map(|_| ())
+            } else {
+                let executor = FailingExecutor {
+                    started: Arc::new(tokio::sync::Notify::new()),
+                    failed: Arc::new(tokio::sync::Notify::new()),
+                    release: Arc::new(tokio::sync::Notify::new()),
+                    completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tail_mutations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                };
+                SyncController::new(executor, NonZeroUsize::new(1).unwrap())
+                    .execute(plan)
+                    .await
+                    .map(|_| ())
+            };
+            assert!(matches!(result, Err(ControllerError::HardlinkPreflight(_))));
+        }
     }
 
     struct FailingExecutor {
