@@ -1210,6 +1210,27 @@ impl RootedFs {
         &self.root_path
     }
 
+    #[cfg(not(unix))]
+    pub(crate) fn entry_stream(
+        &self,
+        _request: crate::engine::scan::ScanRequest,
+    ) -> crate::engine::reconcile::EntryStream {
+        // Compile-only platforms must fail explicitly, never present an empty
+        // successful scan that could authorize deletion.
+        crate::engine::reconcile::EntryStream::new(futures::stream::once(async {
+            Err(Box::new(RootedFsError::UnsupportedPlatform) as crate::engine::reconcile::BoxError)
+        }))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn selected_entry_stream(
+        &self,
+        _path: RelativePath,
+        request: crate::engine::scan::ScanRequest,
+    ) -> crate::engine::reconcile::EntryStream {
+        self.entry_stream(request)
+    }
+
     /// Derive external ignore ancestry from the held directory, not a newly
     /// resolved root operand (which may transiently point at another tree).
     pub(crate) fn source_configuration_root_path_blocking(&self) -> Result<PathBuf> {
