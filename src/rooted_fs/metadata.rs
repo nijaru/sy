@@ -61,16 +61,8 @@ impl MetadataPreservation<'_> {
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     ) -> Result<()> {
-        use xattr::FileExt;
         if let Some(xattrs) = self.xattrs {
-            for (name, value) in xattrs {
-                file.set_xattr(name, value)?;
-            }
-            for name in file.list_xattr()? {
-                if !xattrs.iter().any(|(wanted, _)| wanted == &name) {
-                    file.remove_xattr(&name)?;
-                }
-            }
+            mirror_xattrs_fd(file, xattrs)?;
         }
         apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)?;
         apply_acl_and_verify_mode(file, self.acl, unix_mode)?;
@@ -92,6 +84,23 @@ impl MetadataPreservation<'_> {
         }
         Ok(())
     }
+}
+
+/// Apply a validated exact set through the held inode. Required removals are
+/// not best-effort: failure may leave earlier effects, but must never report
+/// successful preservation while a stale attribute survives.
+#[cfg(unix)]
+pub(super) fn mirror_xattrs_fd(file: &File, xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
+    use xattr::FileExt;
+    for (name, value) in xattrs {
+        file.set_xattr(name, value)?;
+    }
+    for name in file.list_xattr()? {
+        if !xattrs.iter().any(|(wanted, _)| wanted == &name) {
+            file.remove_xattr(&name)?;
+        }
+    }
+    Ok(())
 }
 
 /// ACL application can change mode bits. A requested mode is an independent

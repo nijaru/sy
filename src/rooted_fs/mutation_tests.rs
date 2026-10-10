@@ -139,21 +139,32 @@ fn mutate(rooted: &RootedFs, mutation: Mutation) -> Result<()> {
             Some(0o700),
             Some(Timestamp::new(1_600_000_001, 0).unwrap()),
         ),
-        Mutation::DirectoryFinalize => rooted.finalize_directory_blocking(
-            &target,
-            identity()?,
-            Some(0o700),
-            Some(Timestamp::new(1_600_000_001, 0).unwrap()),
-            &DirectoryPreservation {
-                xattrs: Some(vec![(OsString::from("user.sy-admission"), b"new".to_vec())]),
-                ..Default::default()
-            },
-        ),
-        Mutation::Xattrs => rooted.write_xattrs_blocking(
-            &target,
-            EntryKind::File,
-            &[(OsString::from("user.sy-admission"), b"new".to_vec())],
-        ),
+        Mutation::DirectoryFinalize | Mutation::Xattrs => {
+            let kind = if matches!(mutation, Mutation::DirectoryFinalize) {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            };
+            let file = rooted.open_xattr_entry_blocking(target.as_path(), kind)?;
+            // Reading the complete native set does not change the observation
+            // or bypass admission; only the requested user field is new.
+            let mut attrs = read_xattrs_from_file(&file)?;
+            attrs.push((OsString::from("user.sy-admission"), b"new".to_vec()));
+            if kind == EntryKind::Directory {
+                rooted.finalize_directory_blocking(
+                    &target,
+                    identity()?,
+                    Some(0o700),
+                    Some(Timestamp::new(1_600_000_001, 0).unwrap()),
+                    &DirectoryPreservation {
+                        xattrs: Some(attrs),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                rooted.write_xattrs_blocking(&target, kind, &attrs)
+            }
+        }
         #[cfg(feature = "acl")]
         Mutation::Acl => {
             let mut entries = exacl::getfacl(rooted.root_path().join("target"), None)?;

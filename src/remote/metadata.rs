@@ -318,28 +318,39 @@ mod tests {
     use super::*;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use std::os::unix::fs::MetadataExt;
-    #[cfg(feature = "acl")]
     use std::os::unix::fs::PermissionsExt;
+    use xattr::FileExt;
 
     #[tokio::test]
-    async fn observed_preservation_rpc_refuses_foreign_destination_and_closed_admission_before_any_field(
-    ) {
-        for close_admission in [false, true] {
+    async fn observed_preservation_rpc_refuses_invalid_authority_and_denied_removal_without_ack() {
+        for (close_admission, denied_removal) in [(false, false), (true, false), (false, true)] {
             let source = tempfile::tempdir().unwrap();
             let destination = tempfile::tempdir().unwrap();
             let source_path = source.path().join("file");
             let destination_path = destination.path().join("file");
             std::fs::write(&source_path, b"source").unwrap();
             std::fs::write(&destination_path, b"target").unwrap();
+            if denied_removal {
+                xattr::set(&destination_path, "user.sy-stale", b"old").unwrap();
+                std::fs::set_permissions(&destination_path, std::fs::Permissions::from_mode(0o444))
+                    .unwrap();
+            }
             let path = RelativePath::new("file").unwrap();
             let mut rooted = RootedFs::open(destination.path().to_path_buf())
                 .await
                 .unwrap();
             let expected = rooted.path_identity_blocking(&path).unwrap().unwrap().1;
-            let attrs = vec![(
+            let file = std::fs::File::open(&destination_path).unwrap();
+            let mut attrs = rooted.read_open_file_xattrs_blocking(&file, &path).unwrap();
+            attrs.push((
                 std::ffi::OsString::from("user.sy-owner"),
                 b"preserved".to_vec(),
-            )];
+            ));
+            if denied_removal {
+                // An intentionally impossible exact request exercises native
+                // removal failure, rather than failing while setting a value.
+                attrs.clear();
+            }
             #[cfg(feature = "acl")]
             let acl = Some(exacl::to_string(&exacl::getfacl(&source_path, None).unwrap()).unwrap());
             #[cfg(not(feature = "acl"))]
@@ -364,7 +375,7 @@ mod tests {
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (client_reader, client_writer) = tokio::io::split(client_io);
             let (server_reader, server_writer) = tokio::io::split(server_io);
-            let client = FrameRouter::start(
+            let mut client = FrameRouter::start(
                 client_reader,
                 client_writer,
                 RouterRole::Client,
@@ -388,9 +399,10 @@ mod tests {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
                 arrived_tx.send(()).unwrap();
                 resume_rx.await.unwrap();
-                serve_incoming_metadata_rooted(rooted, incoming, &sender, peer).await
+                let result = serve_incoming_metadata_rooted(rooted, incoming, &sender, peer).await;
+                (result, server)
             });
-            let inbox = client.sender().open_stream().unwrap();
+            let mut inbox = client.sender().open_stream().unwrap();
             client
                 .sender()
                 .send(
@@ -410,7 +422,7 @@ mod tests {
                 .unwrap();
             if close_admission {
                 admission.close();
-            } else {
+            } else if !denied_removal {
                 std::fs::rename(&destination_path, destination.path().join("observed")).unwrap();
                 std::fs::write(&destination_path, b"foreign").unwrap();
             }
@@ -419,7 +431,7 @@ mod tests {
                 EntryKind::File,
             );
             resume_tx.send(()).unwrap();
-            let result = task.await.unwrap();
+            let (result, mut server) = task.await.unwrap();
             assert!(
                 if close_admission {
                     matches!(
@@ -428,6 +440,10 @@ mod tests {
                             RootedFsError::CommitCancelled
                         ))
                     )
+                } else if denied_removal {
+                    matches!(result, Err(RemoteMetadataError::RootedFs(
+                        RootedFsError::Io(ref error)
+                    )) if error.kind() == std::io::ErrorKind::PermissionDenied)
                 } else {
                     matches!(
                         result,
@@ -438,6 +454,29 @@ mod tests {
                 },
                 "{result:?}"
             );
+            // Drain both writers before EOF so a mistakenly queued ACK cannot
+            // be hidden by aborting the router on the handler's error.
+            let (client_done, server_done) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(client.finish(), server.finish())
+                })
+                .await
+                .unwrap();
+            client_done.unwrap();
+            server_done.unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), inbox.recv())
+                .await
+                .expect("failed metadata worker must close without an ACK");
+            assert!(
+                matches!(response, Ok(None)),
+                "metadata failure must reach clean EOF without an ACK"
+            );
+            if denied_removal {
+                assert_eq!(
+                    file.get_xattr("user.sy-stale").unwrap(),
+                    Some(b"old".to_vec())
+                );
+            }
             assert_eq!(
                 crate::endpoint::local_identity::metadata_identity(
                     &std::fs::metadata(&destination_path).unwrap(),
@@ -447,7 +486,7 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read(&destination_path).unwrap(),
-                if close_admission {
+                if close_admission || denied_removal {
                     b"target".as_slice()
                 } else {
                     b"foreign".as_slice()
@@ -465,11 +504,13 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("file"), b"data").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let expected = rooted
-            .path_identity_blocking(&RelativePath::new("file").unwrap())
-            .unwrap()
-            .unwrap()
-            .1;
+        let path = RelativePath::new("file").unwrap();
+        let file = std::fs::File::open(root.path().join("file")).unwrap();
+        // Native fields are part of the exact request too, including labels
+        // automatically installed by an enforcing security policy.
+        let mut attrs = rooted.read_open_file_xattrs_blocking(&file, &path).unwrap();
+        attrs.push((std::ffi::OsString::from("user.sy-owner"), b"value".to_vec()));
+        let expected = rooted.path_identity_blocking(&path).unwrap().unwrap().1;
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
@@ -497,9 +538,7 @@ mod tests {
                 .unwrap();
         });
 
-        let path = RelativePath::new("file").unwrap();
         let modified = Timestamp::new(1_600_000_010, 0).unwrap();
-        let attrs = vec![(std::ffi::OsString::from("user.sy-owner"), b"value".to_vec())];
         #[cfg(feature = "acl")]
         let acl = {
             // A successful combined request needs an ACL compatible with its
