@@ -64,8 +64,20 @@ pub(super) async fn run(
     .map_err(map_io)?;
     let remote = session.remote().request_handle();
     let destination_root = destination_root.to_path_buf();
-    let mut stats =
-        execute_with_handle(source_root, &destination_root, remote, config, scan_options).await?;
+    let result =
+        execute_with_handle(source_root, &destination_root, remote, config, scan_options).await;
+    let mut stats = match result {
+        Ok(stats) => {
+            session.finish().await.map_err(map_io)?;
+            stats
+        }
+        Err(error) => {
+            if let Err(cleanup) = session.abort().await {
+                tracing::warn!(%cleanup, "failed to clean up SSH push");
+            }
+            return Err(error);
+        }
+    };
     stats.duration = started.elapsed();
     Ok(stats)
 }

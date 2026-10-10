@@ -205,6 +205,7 @@ struct RouterInner {
     // This lock serializes registry/admission changes with terminal publication.
     streams: Mutex<HashMap<StreamId, mpsc::UnboundedSender<RoutedFrame>>>,
     terminal: watch::Sender<Option<Terminal>>,
+    closing: watch::Sender<bool>,
     publication: Arc<crate::endpoint::publication::PublicationAdmission>,
     incoming_tx: mpsc::UnboundedSender<IncomingStream>,
     inbound_frames: Arc<Semaphore>,
@@ -306,6 +307,7 @@ impl RouterSender {
     pub(crate) fn check_active(&self) -> Result<(), SharedRouterError> {
         match self.inner.terminal.borrow().as_ref() {
             Some(state) => Err(state.error()),
+            None if *self.inner.closing.borrow() => Err(Arc::new(RouterError::ShuttingDown)),
             None => Ok(()),
         }
     }
@@ -406,16 +408,20 @@ impl IncomingStreams {
     }
 }
 
-// Also terminate on actor panic/abort, including before its first poll. All
-// ordinary exits publish a terminal state first, so this is only a last-resort
-// failure transition; it cannot overwrite the authoritative cause.
+// Also terminate on actor panic/abort, including before its first poll.
+// Ordinary exits publish terminal state or disarm after a graceful half-close;
+// this last-resort failure cannot overwrite the authoritative cause.
 struct ActorLifetime {
     inner: Arc<RouterInner>,
     direction: &'static str,
+    completed: bool,
 }
 
 impl Drop for ActorLifetime {
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
         publish_terminal(
             &self.inner,
             Terminal::Failed(Arc::new(RouterError::ActorStopped(self.direction))),
@@ -427,6 +433,8 @@ pub struct RouterTasks {
     inner: Arc<RouterInner>,
     reader: JoinHandle<Result<(), SharedRouterError>>,
     writer: JoinHandle<Result<(), SharedRouterError>>,
+    reader_result: Option<Result<(), SharedRouterError>>,
+    writer_result: Option<Result<(), SharedRouterError>>,
 }
 
 impl RouterTasks {
@@ -440,11 +448,29 @@ impl RouterTasks {
     }
 
     async fn finish(&mut self) -> Result<(), SharedRouterError> {
-        let (reader, writer) = tokio::join!(&mut self.reader, &mut self.writer);
-        for task in [reader, writer] {
-            task.map_err(|error| Arc::new(RouterError::TaskFailed(error.to_string())))??;
+        // Store each join result before yielding again. A completion deadline
+        // may cancel this wait, then ordinary-error cleanup resumes it; never
+        // poll a JoinHandle again after consuming its result.
+        async fn join(
+            task: &mut JoinHandle<Result<(), SharedRouterError>>,
+            result: &mut Option<Result<(), SharedRouterError>>,
+        ) -> Result<(), SharedRouterError> {
+            if let Some(result) = result {
+                return result.clone();
+            }
+            let joined = match task.await {
+                Ok(result) => result,
+                Err(error) => Err(Arc::new(RouterError::TaskFailed(error.to_string()))),
+            };
+            *result = Some(joined.clone());
+            joined
         }
-        Ok(())
+        let (reader, writer) = tokio::join!(
+            join(&mut self.reader, &mut self.reader_result),
+            join(&mut self.writer, &mut self.writer_result),
+        );
+        reader?;
+        writer
     }
 }
 
@@ -478,9 +504,11 @@ impl FrameRouter {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (terminal_tx, terminal_rx) = watch::channel(None);
+        let (closing, closing_rx) = watch::channel(false);
         let inner = Arc::new(RouterInner {
             streams: Mutex::new(HashMap::new()),
             terminal: terminal_tx,
+            closing,
             publication: Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             incoming_tx,
             inbound_frames: Arc::new(Semaphore::new(config.max_inbound_frames as usize)),
@@ -500,6 +528,7 @@ impl FrameRouter {
         let reader_lifetime = ActorLifetime {
             inner: Arc::clone(&inner),
             direction: "reader",
+            completed: false,
         };
         let reader_task = tokio::spawn(async move {
             let _lifetime = reader_lifetime;
@@ -514,20 +543,25 @@ impl FrameRouter {
         let writer_lifetime = ActorLifetime {
             inner: Arc::clone(&inner),
             direction: "writer",
+            completed: false,
         };
         let writer_task = tokio::spawn(async move {
-            let _lifetime = writer_lifetime;
+            let mut lifetime = writer_lifetime;
             let result = writer_loop(
                 writer,
                 outbound_rx,
                 &writer_inner,
                 writer_terminal,
+                closing_rx,
                 config.outbound_payload_limit,
             )
             .await;
             if let Err(error) = &result {
                 publish_terminal(&writer_inner, Terminal::Failed(Arc::clone(error)));
             }
+            // Half-close is an ordinary writer exit, not session termination:
+            // the reader must still observe peer EOF/errors after the last Ack.
+            lifetime.completed = result.is_ok() && *writer_inner.closing.borrow();
             result
         });
         Ok(Self {
@@ -540,6 +574,8 @@ impl FrameRouter {
                 inner,
                 reader: reader_task,
                 writer: writer_task,
+                reader_result: None,
+                writer_result: None,
             },
         })
     }
@@ -554,6 +590,26 @@ impl FrameRouter {
 
     pub fn tasks(&self) -> &RouterTasks {
         &self.tasks
+    }
+
+    /// Reject new local work, drain queued output, half-close the transport, then
+    /// join both actors after peer EOF. The SSH owner bounds this wait.
+    pub(crate) async fn finish(&mut self) -> Result<(), SharedRouterError> {
+        {
+            let _streams = self
+                .sender
+                .inner
+                .streams
+                .lock()
+                .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
+            self.sender.inner.publication.close();
+            self.sender.inner.closing.send_replace(true);
+        }
+        self.tasks.finish().await?;
+        match self.sender.inner.terminal.borrow().as_ref() {
+            Some(Terminal::Failed(error)) => Err(Arc::clone(error)),
+            _ => Ok(()),
+        }
     }
 
     /// Stop transport I/O and await its actors. Admitted handlers are owned
@@ -665,6 +721,7 @@ async fn writer_loop<W>(
     mut receiver: mpsc::UnboundedReceiver<OutboundFrame>,
     inner: &Arc<RouterInner>,
     mut terminal: watch::Receiver<Option<Terminal>>,
+    mut closing: watch::Receiver<bool>,
     payload_limit: Option<u64>,
 ) -> Result<(), SharedRouterError>
 where
@@ -672,13 +729,24 @@ where
 {
     let mut limiter = payload_limit.map(crate::sync::ratelimit::RateLimiter::new);
     loop {
+        let draining = *closing.borrow_and_update();
+        if draining {
+            receiver.close();
+        }
         let queued = tokio::select! {
             biased;
             _ = terminated(&mut terminal) => return Ok(()),
+            _ = closing.changed(), if !draining => continue,
             queued = receiver.recv() => queued,
         };
         let Some(mut queued) = queued else {
-            return Ok(());
+            return tokio::select! {
+                biased;
+                _ = terminated(&mut terminal) => Ok(()),
+                result = writer.shutdown() => result
+                    .map_err(crate::protocol::ProtocolError::from)
+                    .map_err(RouterError::from).map_err(Arc::new),
+            };
         };
         let result = tokio::select! {
             biased;
@@ -785,6 +853,9 @@ fn register_stream(
         .map_err(|_| Arc::new(RouterError::StatePoisoned))?;
     if let Some(state) = inner.terminal.borrow().as_ref() {
         return Err(state.error());
+    }
+    if *inner.closing.borrow() {
+        return Err(Arc::new(RouterError::ShuttingDown));
     }
     if streams.contains_key(&stream_id) {
         return Err(Arc::new(RouterError::StreamAlreadyRegistered(
@@ -945,6 +1016,79 @@ mod tests {
             Bytes::from_static(payload),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn finish_drains_output_and_observes_peer_completion() {
+        for peer_error in [false, true] {
+            let (router_io, peer_io) = tokio::io::duplex(1);
+            let (reader, writer) = tokio::io::split(router_io);
+            let (mut peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+            let mut router =
+                FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                    .unwrap();
+            let sender = router.sender();
+            let inbox = sender.open_stream().unwrap();
+            let queued = frame(FrameKind::Data, inbox.stream_id(), b"queued output");
+            sender.send(queued.clone()).await.unwrap();
+            drop(inbox);
+            let peer = async {
+                assert_eq!(
+                    crate::protocol::read_frame(&mut peer_reader).await.unwrap(),
+                    queued
+                );
+                assert!(matches!(
+                    read_frame_or_eof(&mut peer_reader).await.unwrap(),
+                    ReadFrame::CleanEof
+                ));
+                if peer_error {
+                    write_frame(
+                        &mut peer_writer,
+                        &Frame::control(FrameKind::Error, Bytes::new()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+                peer_writer.shutdown().await.unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(router.finish(), peer)
+            })
+            .await
+            .unwrap();
+            if peer_error {
+                assert!(matches!(*result.unwrap_err(), RouterError::PeerError));
+            } else {
+                result.unwrap();
+            }
+            assert!(sender.open_stream().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_finish_can_resume_with_owned_shutdown() {
+        let (router_io, peer_io) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(router_io);
+        let (mut peer_reader, _peer_writer) = tokio::io::split(peer_io);
+        let mut router =
+            FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                .unwrap();
+        // The writer joins after half-close, but the peer retains its write
+        // side. Timeout must not lose that join result and later poll it twice.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), router.finish())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            read_frame_or_eof(&mut peer_reader).await.unwrap(),
+            ReadFrame::CleanEof
+        ));
+        assert!(router.sender().open_stream().is_err());
+        tokio::time::timeout(Duration::from_secs(1), router.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

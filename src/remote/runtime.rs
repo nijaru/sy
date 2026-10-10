@@ -147,6 +147,17 @@ impl ClientRemoteSession {
         })
     }
 
+    /// Complete an idle client transport; its SSH owner supplies the deadline
+    /// and subsequently checks the process status. Responses alone are not
+    /// evidence of successful subprocess completion.
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.router.finish().await.map_err(Into::into)
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        self.router.shutdown().await.map_err(Into::into)
+    }
+
     pub const fn operation(&self) -> Operation {
         self.operation
     }
