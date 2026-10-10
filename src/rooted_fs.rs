@@ -580,28 +580,7 @@ impl RootedStagedFile {
                     self.file.set_xattr(name, value)?;
                 }
             }
-            if let Some(acl) = acl {
-                #[cfg(feature = "acl")]
-                apply_acl_fd(&self.file, acl)?;
-                #[cfg(not(feature = "acl"))]
-                {
-                    let _ = acl;
-                    return Err(RootedFsError::AclUnsupported(
-                        "ACL preservation requires the acl feature; rebuild with --features acl",
-                    ));
-                }
-            }
-            if let Some(expected) = unix_mode.map(|mode| mode & 0o7777) {
-                use std::os::unix::fs::PermissionsExt;
-                let observed = self.file.metadata()?.permissions().mode() & 0o7777;
-                if observed != expected {
-                    return Err(RootedFsError::PreservationModeConflict {
-                        expected,
-                        actual: observed,
-                    });
-                }
-            }
-            Ok(())
+            metadata::apply_acl_and_verify_mode(&self.file, acl, unix_mode)
         }
         #[cfg(not(unix))]
         {

@@ -268,6 +268,84 @@ async fn transferred_file_times_follow_explicit_policy_in_every_direction() {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "acl"))]
+#[tokio::test]
+async fn acl_only_refresh_uses_native_mode_in_every_direction() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    for direction in ["local", "push", "pull"] {
+        let scope = fixture.path().join(direction);
+        let source = scope.join("source");
+        let destination = scope.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut entries = exacl::from_mode(0o640);
+        entries.push(exacl::AclEntry::allow_user(
+            "12345",
+            exacl::Perm::READ | exacl::Perm::WRITE,
+            exacl::Flag::empty(),
+        ));
+        entries.push(exacl::AclEntry::allow_mask(
+            exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        for (name, destination_mode) in [("different-mode", 0o600), ("equal-mode", 0o640)] {
+            let source_file = source.join(name);
+            let destination_file = destination.join(name);
+            // Quick equality deliberately does not imply equal bytes. ACL-only
+            // refresh must preserve OLD destination bytes and inode identity.
+            std::fs::write(&source_file, b"source").unwrap();
+            std::fs::write(&destination_file, b"target").unwrap();
+            exacl::setfacl(&[&source_file], &entries, None).unwrap();
+            std::fs::set_permissions(
+                &destination_file,
+                std::fs::Permissions::from_mode(destination_mode),
+            )
+            .unwrap();
+            for file in [&source_file, &destination_file] {
+                filetime::set_file_mtime(
+                    file,
+                    filetime::FileTime::from_unix_time(1_600_000_000, 123),
+                )
+                .unwrap();
+            }
+        }
+        let before = ["different-mode", "equal-mode"]
+            .map(|name| std::fs::metadata(destination.join(name)).unwrap());
+        let remote = |path: &std::path::Path| {
+            let mut operand = OsString::from("test-peer:");
+            operand.push(path);
+            operand
+        };
+        let mut source_operand = if direction == "pull" {
+            remote(&source)
+        } else {
+            source.as_os_str().to_owned()
+        };
+        source_operand.push("/");
+        let destination_operand = if direction == "push" {
+            remote(&destination)
+        } else {
+            destination.as_os_str().to_owned()
+        };
+        copy(&source_operand, &destination_operand, &["-A"], &search_path).await;
+        for (name, before) in ["different-mode", "equal-mode"].into_iter().zip(before) {
+            let file = destination.join(name);
+            let after = std::fs::metadata(&file).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(after.mode() & 0o7777, 0o640);
+            assert_eq!(std::fs::read(&file).unwrap(), b"target");
+            assert_eq!(
+                exacl::getfacl(&file, None).unwrap(),
+                exacl::getfacl(source.join(name), None).unwrap()
+            );
+            assert_eq!(std::fs::read(source.join(name)).unwrap(), b"source");
+        }
+    }
+}
+
 fn ssh_path(root: &std::path::Path) -> OsString {
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
