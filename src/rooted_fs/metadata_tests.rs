@@ -4,6 +4,53 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use xattr::FileExt;
 
+#[tokio::test]
+async fn matching_mode_time_and_xattrs_do_not_rewrite_the_observed_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("file");
+    std::fs::write(&path, b"original bytes").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let file = File::open(&path).unwrap();
+    file.set_xattr("user.sy-idempotent", b"same\0bytes")
+        .unwrap();
+    file.set_xattr("user.sy-empty", b"").unwrap();
+    // Include native security labels; exact mirroring must not silently omit
+    // them just because the fixture only adds user attributes.
+    let attributes = bounded_xattrs::read_from_file(&file).unwrap();
+    let metadata = file.metadata().unwrap();
+    let modified =
+        Timestamp::new(metadata.mtime(), metadata.mtime_nsec().try_into().unwrap()).unwrap();
+    let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+    let initial = rooted
+        .path_identity_blocking(&relative())
+        .unwrap()
+        .unwrap()
+        .1;
+    for _ in 0..2 {
+        let result = rooted
+            .apply_observed_preservation_blocking(
+                &relative(),
+                EntryKind::File,
+                initial,
+                Some(0o640),
+                Some(modified),
+                &MetadataPreservation {
+                    xattrs: Some(&attributes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result, initial,
+            "matching preservation changed inode metadata"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+    assert_eq!(bounded_xattrs::read_from_file(&file).unwrap(), attributes);
+}
+
 fn relative() -> RelativePath {
     RelativePath::new("file").unwrap()
 }
