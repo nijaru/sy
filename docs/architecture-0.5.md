@@ -357,6 +357,8 @@ Exchange cheap ordered metadata first. No block signatures are included in the i
 
 The same merge reconciler consumes the remote metadata stream while it arrives.
 
+`ScanRequest` carries scan_flags:u8, metadata_flags:u8, max_depth:u32, scope:u8 (0=Tree, 1=Entry). Entry adds byte_len:u32 and bounded native path bytes in the sender's platform encoding. The server validates exactly one relative name before admitting a producer, even for an absent preview root; it inspects that name through the held root FD without sibling enumeration or directory descent. Tree remains a distinct intentional query.
+
 ### On-demand signatures
 
 Only changed large files that are plausible delta candidates request destination signatures:
@@ -404,7 +406,7 @@ The scheduler controls fairness and byte budgets. Frame sizes remain moderate so
 
 Compression is negotiated; do not compress copy operations or signatures. `Auto` samples the first file-data chunk and uses the elapsed-time model to decide whether to compress this transfer. `Always` attempts every chunk, including after an incompressible first chunk. Both send raw bytes unless the actual compressed payload is smaller; only smaller zstd payloads carry the `COMPRESSED` frame flag.
 
-The current exact wire contract is 3.8 (no earlier-minor compatibility). Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
+The current exact wire contract is 3.9 (no earlier-minor compatibility). Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
 
 ## Integrity
 

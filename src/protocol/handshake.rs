@@ -43,8 +43,12 @@ pub const PROTOCOL_V3_7: ProtocolVersion = ProtocolVersion { major: 3, minor: 7 
 /// The former boolean request layout is incompatible.
 pub const PROTOCOL_V3_8: ProtocolVersion = ProtocolVersion { major: 3, minor: 8 };
 
+/// Adds explicit Tree/Entry selection to metadata scan requests.
+/// The former fixed six-byte scan request layout is incompatible.
+pub const PROTOCOL_V3_9: ProtocolVersion = ProtocolVersion { major: 3, minor: 9 };
+
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_8);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_9);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {
@@ -424,13 +428,13 @@ mod tests {
 
     #[test]
     fn current_wire_contract_rejects_previous_minor() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_8));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_9));
         assert!(matches!(
-            negotiate_version(VersionRange::exact(PROTOCOL_V3_7), SUPPORTED_VERSIONS),
+            negotiate_version(VersionRange::exact(PROTOCOL_V3_8), SUPPORTED_VERSIONS),
             Err(ProtocolError::NoCompatibleVersion { .. })
         ));
         assert!(matches!(
-            negotiate_version(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_7)),
+            negotiate_version(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_8)),
             Err(ProtocolError::NoCompatibleVersion { .. })
         ));
     }
