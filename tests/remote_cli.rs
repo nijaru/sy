@@ -484,6 +484,51 @@ async fn remote_directory_basename_and_contents_spellings_bind_real_tree_roots()
 }
 
 #[tokio::test]
+async fn matching_preservation_through_ssh_does_not_touch_the_source() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    let source = fixture.path().join("source");
+    std::fs::create_dir_all(source.join("nested")).unwrap();
+    let file = source.join("nested/file");
+    std::fs::write(&file, b"original source bytes").unwrap();
+    xattr::set(&file, "user.sy-idempotent", b"original attribute").unwrap();
+    let observe = || {
+        [&source, &source.join("nested"), &file].map(|path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let original = observe();
+    for pull in [false, true] {
+        let (mut source_arg, destination_arg) = operands(&source, &source, pull);
+        source_arg.push("/");
+        for flags in ["-pX", "-ptX"] {
+            copy(&source_arg, &destination_arg, &[flags], &search_path).await;
+            assert_eq!(
+                observe(),
+                original,
+                "equal preservation mutated source metadata"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"original source bytes");
+            assert_eq!(
+                xattr::get(&file, "user.sy-idempotent").unwrap().unwrap(),
+                b"original attribute"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn destination_directory_syntax_cannot_authorize_leaf_replacement() {
     use std::os::unix::fs::MetadataExt;
 

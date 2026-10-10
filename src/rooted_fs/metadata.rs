@@ -93,7 +93,11 @@ impl MetadataPreservation<'_> {
 pub(super) fn mirror_xattrs_fd(file: &File, xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
     use xattr::FileExt;
     for (name, value) in xattrs {
-        file.set_xattr(name, value)?;
+        // Preservation is a state contract, not a requirement to rewrite an
+        // identical attribute (which needlessly changes ctime).
+        if !bounded_xattrs::value_matches(file, name, value)? {
+            file.set_xattr(name, value)?;
+        }
     }
     for name in file.list_xattr()? {
         if !xattrs.iter().any(|(wanted, _)| wanted == &name) {

@@ -52,6 +52,35 @@ pub(super) fn read_from_file(_file: &File) -> Result<Vec<(OsString, Vec<u8>)>> {
     Err(RootedFsError::UnsupportedPlatform)
 }
 
+/// Compare only the requested value, without allocating for a potentially
+/// much larger existing attribute. ERANGE means replacement is needed, not
+/// permission to retry with an unbounded allocation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn value_matches(file: &File, name: &std::ffi::OsStr, expected: &[u8]) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let name =
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| RootedFsError::PathContainsNul)?;
+    let mut buffer = vec![0; expected.len()];
+    match get(file, &name, &mut buffer) {
+        Ok(length) => Ok(length == expected.len() && buffer == expected),
+        Err(error) if error.raw_os_error() == Some(libc::ERANGE) => Ok(false),
+        #[cfg(target_os = "linux")]
+        Err(error) if error.raw_os_error() == Some(libc::ENODATA) => Ok(false),
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(libc::ENOATTR) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(super) fn value_matches(
+    _file: &File,
+    _name: &std::ffi::OsStr,
+    _expected: &[u8],
+) -> Result<bool> {
+    Err(RootedFsError::UnsupportedPlatform)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_bounded(
     used: usize,
@@ -140,6 +169,22 @@ fn syscall_length(result: libc::ssize_t) -> io::Result<usize> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_value_comparison_distinguishes_missing_empty_and_changed_values() {
+        use xattr::FileExt;
+        let file = tempfile::tempfile().unwrap();
+        let name = std::ffi::OsStr::new("user.sy-compare");
+        assert!(!value_matches(&file, name, b"").unwrap());
+        file.set_xattr(name, b"longer value").unwrap();
+        for wanted in [&b""[..], &b"short"[..], &b"longer value!"[..]] {
+            assert!(!value_matches(&file, name, wanted).unwrap());
+        }
+        assert!(value_matches(&file, name, b"longer value").unwrap());
+        file.set_xattr(name, b"").unwrap();
+        assert!(value_matches(&file, name, b"").unwrap());
+        assert!(!value_matches(&file, name, b"value").unwrap());
+    }
 
     #[test]
     fn rejects_oversized_query_before_reading_or_allocating_the_value() {

@@ -3706,7 +3706,14 @@ fn require_exclusive_file_metadata(file: &File, relative: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn apply_fd_metadata(fd: RawFd, unix_mode: Option<u32>, modified: Option<Timestamp>) -> Result<()> {
-    if let Some(mode) = unix_mode {
+    if unix_mode.is_none() && modified.is_none() {
+        return Ok(());
+    }
+    let times = modified.map(modified_timespecs).transpose()?;
+    let current = stat_fd(fd)?;
+    if let Some(mode) =
+        unix_mode.filter(|mode| current.st_mode & 0o7777 != (mode & 0o7777) as libc::mode_t)
+    {
         let result = unsafe {
             // SAFETY: `fd` is live for this call. chmod ignores file-type bits;
             // explicitly retaining only permission/special bits makes the wire
@@ -3717,8 +3724,9 @@ fn apply_fd_metadata(fd: RawFd, unix_mode: Option<u32>, modified: Option<Timesta
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    if let Some(modified) = modified {
-        let times = modified_timespecs(modified)?;
+    if let Some(times) = times.filter(|times| {
+        current.st_mtime != times[1].tv_sec || current.st_mtime_nsec != times[1].tv_nsec
+    }) {
         let result = unsafe {
             // SAFETY: `fd` is live and `times` contains exactly two initialized
             // timespec values. UTIME_OMIT preserves the existing access time.
