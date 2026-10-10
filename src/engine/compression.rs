@@ -7,13 +7,27 @@ use std::time::Duration;
 /// `auto` may still choose no compression when that is faster end to end.
 pub const ZSTD_FAST_LEVEL: i32 = -5;
 
+/// Requested compression mode, retaining the CLI's accepted choices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompressionDetection {
+    /// Sample bounded data chunks and use the elapsed-time model.
+    #[default]
+    Auto,
+    /// Retained CLI choice; v3 uses the same sampled policy as `Auto`.
+    Extension,
+    /// Attempt every chunk, sending raw bytes when compression expands it.
+    Always,
+    /// Do not attempt compression.
+    Never,
+}
+
 /// Per-transfer compression decision policy, mapped from the CLI flags.
 ///
 /// `Auto` samples the first chunk and compresses only when the wall-clock
 /// model (`choose_for_min_elapsed`) predicts a win at the current link rate.
 /// `Always` attempts every chunk, keeping raw bytes when compression would
-/// expand them. The legacy extension-
-/// only detection mode has no 0.5 meaning (the model is sample-based) and maps
+/// expand them. The legacy extension-only detection mode has no 0.5 meaning
+/// (the model is sample-based) and maps
 /// to `Auto` at the v3 boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionPolicy {

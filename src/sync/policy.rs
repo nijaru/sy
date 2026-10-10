@@ -6,7 +6,7 @@
 //! controller results and errors back into `SyncStats` and `SyncError`.
 
 use crate::cli::SymlinkMode;
-use crate::compress::CompressionDetection;
+use crate::engine::compression::CompressionDetection;
 use crate::error::{Result, SyncError};
 use crate::filter::FilterEngine;
 use crate::sync::config::{DeleteMode, SyncConfig};
@@ -474,7 +474,7 @@ mod tests {
     fn test_config() -> SyncConfig {
         let mut config = SyncConfig::test_default();
         config.max_concurrent = 2;
-        config.verification.mode = crate::integrity::ChecksumType::None;
+        config.verification.mode = crate::sync::config::ChecksumType::None;
         config
     }
 

@@ -2,9 +2,7 @@ extern crate self as sy;
 
 // Public API — these are the stable library exports
 pub mod cli;
-pub mod compress;
 pub mod error;
-pub mod integrity;
 pub mod sparse;
 pub mod sync;
 pub mod temp_file;
