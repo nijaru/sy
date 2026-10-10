@@ -442,11 +442,12 @@ pub enum IncomingRequest {
 pub struct ServerScanHandler {
     rooted: SessionRoot,
     sender: RouterSender,
+    peer: PlatformOs,
 }
 
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
-        serve_incoming_scan_session(self.rooted.clone(), incoming, &self.sender).await
+        serve_incoming_scan_session(self.rooted.clone(), incoming, &self.sender, self.peer).await
     }
 }
 
@@ -618,6 +619,7 @@ impl ServerRemoteSession {
         ServerScanHandler {
             rooted: self.opened.rooted.clone(),
             sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
         }
     }
 

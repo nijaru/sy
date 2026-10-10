@@ -1,5 +1,5 @@
 use super::codec::SliceReader;
-use super::{ProtocolError, Result};
+use super::{ProtocolError, Result, WirePath, MAX_WIRE_PATH_BYTES};
 use bitflags::bitflags;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -25,12 +25,21 @@ bitflags! {
     }
 }
 
+/// Physical namespace queried by a scan. Entry names use the sender's native
+/// path encoding; the endpoint validates exactly one relative component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireScanScope {
+    Tree,
+    Entry(WirePath),
+}
+
 /// Request for one ordered metadata enumeration stream.
 ///
 /// This remains separate from `SessionOpen`: opening an endpoint and enumerating
 /// it are distinct operations, and future sessions may issue more than one scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireScanRequest {
+    pub scope: WireScanScope,
     pub respect_gitignore: bool,
     pub include_git_dir: bool,
     pub follow_symlinks: bool,
@@ -42,7 +51,9 @@ pub struct WireScanRequest {
 }
 
 impl WireScanRequest {
-    pub fn encode(self) -> Bytes {
+    /// Protocol 3.9: scan_flags:u8, metadata_flags:u8, max_depth:u32,
+    /// scope:u8 (0=Tree, 1=Entry), then for Entry byte_len:u32 + native bytes.
+    pub fn encode(&self) -> Bytes {
         let mut scan = ScanFlags::empty();
         scan.set(ScanFlags::RESPECT_GITIGNORE, self.respect_gitignore);
         scan.set(ScanFlags::INCLUDE_GIT_DIR, self.include_git_dir);
@@ -55,10 +66,23 @@ impl WireScanRequest {
         metadata.set(MetadataFlags::IDENTITY, self.identity);
         metadata.set(MetadataFlags::HARDLINK_GROUP, self.hardlink_group);
 
-        let mut out = BytesMut::with_capacity(6);
+        let scope_len = match &self.scope {
+            WireScanScope::Tree => 0,
+            WireScanScope::Entry(path) => 4 + path.as_bytes().len(),
+        };
+        let mut out = BytesMut::with_capacity(7 + scope_len);
         out.put_u8(scan.bits());
         out.put_u8(metadata.bits());
         out.put_u32(self.max_depth.unwrap_or(0));
+        match &self.scope {
+            WireScanScope::Tree => out.put_u8(0),
+            WireScanScope::Entry(path) => {
+                out.put_u8(1);
+                // WirePath construction bounds length to MAX_WIRE_PATH_BYTES.
+                out.put_u32(path.as_bytes().len() as u32);
+                out.extend_from_slice(path.as_bytes());
+            }
+        }
         out.freeze()
     }
 
@@ -76,6 +100,27 @@ impl WireScanRequest {
                 reason: "unknown scan metadata flag bits",
             })?;
         let raw_depth = reader.u32()?;
+        let scope = match reader.u8()? {
+            0 => WireScanScope::Tree,
+            1 => {
+                let len = reader.u32()? as usize;
+                // Reject the claimed length before copying or allocating bytes,
+                // even if the payload itself is truncated.
+                if len > MAX_WIRE_PATH_BYTES {
+                    return Err(ProtocolError::PathTooLong {
+                        len,
+                        max: MAX_WIRE_PATH_BYTES,
+                    });
+                }
+                WireScanScope::Entry(WirePath::new(Bytes::copy_from_slice(reader.take(len)?))?)
+            }
+            _ => {
+                return Err(ProtocolError::InvalidField {
+                    field: "scan_scope",
+                    reason: "unknown scan selection",
+                })
+            }
+        };
         reader.finish()?;
 
         if !scan.contains(ScanFlags::HAS_MAX_DEPTH) && raw_depth != 0 {
@@ -86,6 +131,7 @@ impl WireScanRequest {
         }
 
         Ok(Self {
+            scope,
             respect_gitignore: scan.contains(ScanFlags::RESPECT_GITIGNORE),
             include_git_dir: scan.contains(ScanFlags::INCLUDE_GIT_DIR),
             follow_symlinks: scan.contains(ScanFlags::FOLLOW_SYMLINKS),
@@ -105,6 +151,7 @@ mod tests {
     #[test]
     fn scan_request_round_trip_preserves_zero_depth() {
         let request = WireScanRequest {
+            scope: WireScanScope::Tree,
             respect_gitignore: true,
             include_git_dir: false,
             follow_symlinks: false,
@@ -123,6 +170,7 @@ mod tests {
         assert!(WireScanRequest::decode(&[0, 0x80, 0, 0, 0, 0]).is_err());
 
         let request = WireScanRequest {
+            scope: WireScanScope::Tree,
             respect_gitignore: false,
             include_git_dir: false,
             follow_symlinks: false,
@@ -138,7 +186,50 @@ mod tests {
     }
 
     #[test]
+    fn entry_selection_is_bounded_and_rejects_malformed_layouts() {
+        let request = WireScanRequest {
+            scope: WireScanScope::Entry(WirePath::new(b"name\xff".to_vec()).unwrap()),
+            respect_gitignore: false,
+            include_git_dir: true,
+            follow_symlinks: false,
+            max_depth: None,
+            unix_mode: true,
+            symlink_target: true,
+            identity: true,
+            hardlink_group: true,
+        };
+        let encoded = request.encode();
+        assert_eq!(WireScanRequest::decode(&encoded).unwrap(), request);
+        for len in 0..encoded.len() {
+            assert!(
+                WireScanRequest::decode(&encoded[..len]).is_err(),
+                "prefix {len}"
+            );
+        }
+        for (offset, value) in [(0, 0x80), (1, 0x80), (6, 2), (6, 255)] {
+            let mut bad = encoded.to_vec();
+            bad[offset] = value;
+            assert!(WireScanRequest::decode(&bad).is_err());
+        }
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(WireScanRequest::decode(&trailing).is_err());
+
+        // The size check wins over truncation: no claimed-length allocation.
+        let mut oversized = encoded[..11].to_vec();
+        oversized[7..11].copy_from_slice(&((MAX_WIRE_PATH_BYTES + 1) as u32).to_be_bytes());
+        assert!(matches!(
+            WireScanRequest::decode(&oversized),
+            Err(ProtocolError::PathTooLong { .. })
+        ));
+        let mut bounded = request;
+        bounded.scope =
+            WireScanScope::Entry(WirePath::new(vec![0xff; MAX_WIRE_PATH_BYTES]).unwrap());
+        assert_eq!(WireScanRequest::decode(&bounded.encode()).unwrap(), bounded);
+    }
+
+    #[test]
     fn scan_request_rejects_depth_without_flag() {
-        assert!(WireScanRequest::decode(&[0, 0, 0, 0, 0, 1]).is_err());
+        assert!(WireScanRequest::decode(&[0, 0, 0, 0, 0, 1, 0]).is_err());
     }
 }

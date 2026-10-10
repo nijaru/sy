@@ -5,7 +5,7 @@ use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::{EntryMetadataRequest, ScanRequest};
 use crate::protocol::{
     Frame, FrameFlags, FrameKind, Platform, PlatformOs, ProtocolError, RelativeWirePath, StreamId,
-    WireEntry, WireEntryKind, WirePath, WireScanRequest,
+    WireEntry, WireEntryKind, WirePath, WireScanRequest, WireScanScope,
 };
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
 use crate::rooted_fs::RootedFs;
@@ -96,12 +96,34 @@ pub async fn request_scan(
     request: ScanRequest,
     peer: PlatformOs,
 ) -> Result<EntryStream> {
+    request_scoped_scan(sender, request, WireScanScope::Tree, peer).await
+}
+
+/// Inspect exactly one physical name under the negotiated root, without
+/// enumerating siblings or descending into a selected directory.
+pub async fn request_entry_scan(
+    sender: &RouterSender,
+    request: ScanRequest,
+    path: RelativePath,
+    peer: PlatformOs,
+) -> Result<EntryStream> {
+    validate_selected_name(path.as_path())?;
+    let scope = WireScanScope::Entry(encode_native_path(path.as_path())?);
+    request_scoped_scan(sender, request, scope, peer).await
+}
+
+async fn request_scoped_scan(
+    sender: &RouterSender,
+    request: ScanRequest,
+    scope: WireScanScope,
+    peer: PlatformOs,
+) -> Result<EntryStream> {
     ensure_compatible_path_encoding(peer)?;
+    let wire = scan_request_to_wire(request, scope)?;
     let inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     require_data_stream(stream_id)?;
 
-    let wire = scan_request_to_wire(request)?;
     let frame = Frame::new(
         FrameKind::ScanRequest,
         FrameFlags::empty(),
@@ -122,20 +144,24 @@ pub async fn serve_incoming_scan_rooted(
     rooted: RootedFs,
     incoming: IncomingStream,
     sender: &RouterSender,
+    peer: PlatformOs,
 ) -> Result<()> {
-    serve_incoming_scan_session(super::SessionRoot::Present(rooted), incoming, sender).await
+    serve_incoming_scan_session(super::SessionRoot::Present(rooted), incoming, sender, peer).await
 }
 
 pub(super) async fn serve_incoming_scan_session(
     root: super::SessionRoot,
     incoming: IncomingStream,
     sender: &RouterSender,
+    peer: PlatformOs,
 ) -> Result<()> {
     let IncomingStream { first, mut inbox } = incoming;
     let stream_id = inbox.stream_id();
     let first_frame = first.frame();
     require_stream(first_frame, stream_id)?;
-    let request = decode_scan_request(first_frame)?;
+    // Validate native selection before admitting ANY producer, including an
+    // absent-preview response. Absence cannot turn a malformed path into success.
+    let (request, selection) = decode_scan_request(first_frame, peer)?;
     // RootedFs scans resolve through held root descriptors without following
     // symlinks (root confinement); a follow-scan is not yet offered remotely.
     // The bit is rejected loudly rather than silently ignored so a client
@@ -147,7 +173,7 @@ pub(super) async fn serve_incoming_scan_session(
 
     match root {
         super::SessionRoot::Present(rooted) => {
-            serve_scan(rooted, request, sender, stream_id).await?
+            serve_scan(rooted, request, selection, sender, stream_id).await?
         }
         super::SessionRoot::AbsentPreview => {
             sender
@@ -172,18 +198,22 @@ pub async fn serve_incoming_scan(
     let rooted = RootedFs::open(root.to_path_buf())
         .await
         .map_err(|error| RemoteScanError::LocalScan(Box::new(error)))?;
-    serve_incoming_scan_rooted(rooted, incoming, sender).await
+    serve_incoming_scan_rooted(rooted, incoming, sender, Platform::current().os).await
 }
 
 #[cfg(unix)]
 async fn serve_scan(
     rooted: RootedFs,
     request: ScanRequest,
+    selection: Option<RelativePath>,
     sender: &RouterSender,
     stream_id: StreamId,
 ) -> Result<()> {
     require_data_stream(stream_id)?;
-    let mut entries = rooted.entry_stream(request);
+    let mut entries = match selection {
+        None => rooted.entry_stream(request),
+        Some(path) => rooted.selected_entry_stream(path, request),
+    };
 
     let sent: Result<()> = tokio::select! {
         biased;
@@ -221,6 +251,7 @@ async fn serve_scan(
 async fn serve_scan(
     _rooted: RootedFs,
     _request: ScanRequest,
+    _selection: Option<RelativePath>,
     _sender: &RouterSender,
     stream_id: StreamId,
 ) -> Result<()> {
@@ -253,7 +284,10 @@ async fn receive_scan_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Resul
     Ok(())
 }
 
-fn decode_scan_request(frame: &Frame) -> Result<ScanRequest> {
+fn decode_scan_request(
+    frame: &Frame,
+    peer: PlatformOs,
+) -> Result<(ScanRequest, Option<RelativePath>)> {
     require_data_stream(frame.stream_id())?;
     require_empty_flags(frame)?;
     if frame.kind() != FrameKind::ScanRequest {
@@ -262,7 +296,17 @@ fn decode_scan_request(frame: &Frame) -> Result<ScanRequest> {
             actual: frame.kind(),
         });
     }
-    wire_to_scan_request(WireScanRequest::decode(frame.payload())?)
+    let wire = WireScanRequest::decode(frame.payload())?;
+    let request = wire_to_scan_request(&wire)?;
+    let selection = match wire.scope {
+        WireScanScope::Tree => None,
+        WireScanScope::Entry(path) => {
+            let native = decode_native_path(path, peer)?;
+            validate_selected_name(&native)?;
+            Some(RelativePath::new(native)?)
+        }
+    };
+    Ok((request, selection))
 }
 
 /// Convert one routed metadata inbox into the engine's ordered entry stream.
@@ -323,12 +367,13 @@ fn remote_entry_stream(
     Ok(EntryStream::new(stream))
 }
 
-fn scan_request_to_wire(request: ScanRequest) -> Result<WireScanRequest> {
+fn scan_request_to_wire(request: ScanRequest, scope: WireScanScope) -> Result<WireScanRequest> {
     let max_depth = request
         .max_depth
         .map(|depth| u32::try_from(depth).map_err(|_| RemoteScanError::DepthTooLarge(depth)))
         .transpose()?;
     Ok(WireScanRequest {
+        scope,
         respect_gitignore: request.respect_gitignore,
         include_git_dir: request.include_git_dir,
         follow_symlinks: request.follow_symlinks,
@@ -340,7 +385,7 @@ fn scan_request_to_wire(request: ScanRequest) -> Result<WireScanRequest> {
     })
 }
 
-fn wire_to_scan_request(request: WireScanRequest) -> Result<ScanRequest> {
+fn wire_to_scan_request(request: &WireScanRequest) -> Result<ScanRequest> {
     let max_depth = request
         .max_depth
         .map(|depth| usize::try_from(depth).map_err(|_| RemoteScanError::UnsupportedDepth(depth)))
@@ -518,6 +563,16 @@ fn decode_relative_path(path: RelativeWirePath, peer: PlatformOs) -> Result<Rela
     RelativePath::new(native).map_err(RemoteScanError::from)
 }
 
+fn validate_selected_name(path: &Path) -> Result<()> {
+    let name = path.as_os_str();
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        // Comparing the spelling also rejects normalized separators and `a/.`.
+        (Some(Component::Normal(component)), None) if component == name => Ok(()),
+        _ => Err(RemoteScanError::InvalidPathComponent),
+    }
+}
+
 fn validate_native_component(component: &OsStr) -> Result<()> {
     let mut components = Path::new(component).components();
     match (components.next(), components.next()) {
@@ -628,6 +683,10 @@ fn decode_native_path(_path: WirePath, peer: PlatformOs) -> Result<PathBuf> {
     })
 }
 
+#[cfg(all(test, unix))]
+#[path = "selected_scan_tests.rs"]
+mod selected_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +708,9 @@ mod tests {
                 hardlink_group: true,
             },
         };
-        let decoded = wire_to_scan_request(scan_request_to_wire(request).unwrap()).unwrap();
+        let decoded =
+            wire_to_scan_request(&scan_request_to_wire(request, WireScanScope::Tree).unwrap())
+                .unwrap();
         assert_eq!(decoded, request);
     }
 

@@ -657,8 +657,7 @@ mod tests {
     async fn incompatible_client_is_rejected_before_root_creation() {
         let parent = tempfile::TempDir::new().unwrap();
         let root = parent.path().join("must-not-be-created");
-        let old = VersionRange::new(crate::protocol::PROTOCOL_V3, crate::protocol::PROTOCOL_V3_6)
-            .unwrap();
+        let old = VersionRange::exact(crate::protocol::PROTOCOL_V3_8);
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(server_io);
         let hello =
@@ -702,7 +701,7 @@ mod tests {
                 SUPPORTED_VERSIONS
             );
             let response = ServerHello::new(
-                crate::protocol::PROTOCOL_V3_6,
+                crate::protocol::PROTOCOL_V3_8,
                 process_capabilities(),
                 Platform::current(),
                 "old",

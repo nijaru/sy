@@ -14,7 +14,7 @@ use crate::engine::work::TransferSummary;
 use crate::protocol::{FrameKind, Operation, PlatformOs, ProtocolVersion};
 use crate::remote::hash::{request_content_hash, require_blake3};
 use crate::remote::router::RouterSender;
-use crate::remote::scan::request_scan;
+use crate::remote::scan::{request_entry_scan, request_scan};
 use crate::remote::signature::{
     choose_signature_block_size, request_signatures, RemoteSignatureError, SignatureEvent,
     SignatureStream,
@@ -92,6 +92,15 @@ impl ClientRemoteHandle {
 
     pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
         request_scan(&self.sender, request, self.peer).await
+    }
+
+    /// Metadata for one physical name; directories are returned without children.
+    pub async fn scan_entry(
+        &self,
+        request: ScanRequest,
+        path: RelativePath,
+    ) -> crate::remote::scan::Result<EntryStream> {
+        request_entry_scan(&self.sender, request, path, self.peer).await
     }
 
     pub(crate) async fn existing_fingerprint(
