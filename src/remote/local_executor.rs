@@ -1427,10 +1427,9 @@ fn requested_metadata(
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> std::result::Result<RequestedMetadata, LocalSyncError> {
-    let unix_mode = if policy.preserve_permissions
-        && !source.is_symlink()
-        && destination.unix_mode != source.unix_mode
-    {
+    // Preservation constrains the result even when the scanned modes match:
+    // ACL/xattr work can change mode bits, including native SGID retention.
+    let unix_mode = if policy.preserve_permissions && !source.is_symlink() {
         Some(source.unix_mode.ok_or_else(|| {
             LocalSyncError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)

@@ -279,10 +279,9 @@ fn requested_metadata(
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions
-        && !source.is_symlink()
-        && destination.unix_mode != source.unix_mode
-    {
+    // Preservation constrains the result even when the scanned modes match:
+    // ACL/xattr work can change mode bits, including native SGID retention.
+    let unix_mode = if policy.preserve_permissions && !source.is_symlink() {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePushLowerError::MissingPreservedMode(source.path.as_path().to_path_buf())
         })?)
@@ -1302,6 +1301,37 @@ mod tests {
 
     fn symlink(value: &str, target: &str) -> Entry {
         Entry::symlink(path(value), PathBuf::from(target), Timestamp::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn metadata_refresh_retains_equal_requested_mode_constraint() {
+        for preserve_permissions in [false, true] {
+            let mut source = file("file", 1, 0o2640);
+            source.modified = Timestamp::new(100, 0).unwrap();
+            let destination = file("file", 1, 0o2640);
+            let work = lower_sync_op(
+                SyncOp::Metadata {
+                    source,
+                    destination,
+                },
+                ExecutionPolicy {
+                    preserve_permissions,
+                    preserve_times: true,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let RemotePushAction::ApplyMetadata {
+                unix_mode,
+                modified,
+                ..
+            } = work.into_action()
+            else {
+                panic!("expected observed metadata refresh");
+            };
+            assert_eq!(unix_mode, preserve_permissions.then_some(0o2640));
+            assert_eq!(modified, Some(Timestamp::new(100, 0).unwrap()));
+        }
     }
 
     #[test]
