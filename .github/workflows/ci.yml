@@ -159,7 +159,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test --locked
-          cargo test --locked --lib --all-features
+          cargo test --locked --all-features
         timeout-minutes: 15
 
   test-macos:
@@ -173,5 +173,5 @@ jobs:
       - name: Run tests
         run: |
           cargo test --locked
-          cargo test --locked --lib --all-features
+          cargo test --locked --all-features
         timeout-minutes: 15
