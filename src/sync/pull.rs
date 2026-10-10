@@ -87,7 +87,7 @@ pub(super) async fn run(
     let mut display_source = std::ffi::OsString::from(format!("{host}:"));
     display_source.push(source_root);
     let display_source = std::path::PathBuf::from(display_source);
-    let mut stats = execute_with_handle(
+    let result = execute_with_handle(
         &display_source,
         destination_root,
         remote,
@@ -95,7 +95,19 @@ pub(super) async fn run(
         config,
         scan_options,
     )
-    .await?;
+    .await;
+    let mut stats = match result {
+        Ok(stats) => {
+            session.finish().await.map_err(map_io)?;
+            stats
+        }
+        Err(error) => {
+            if let Err(cleanup) = session.abort().await {
+                tracing::warn!(%cleanup, "failed to clean up SSH pull");
+            }
+            return Err(error);
+        }
+    };
     stats.duration = started.elapsed();
     Ok(stats)
 }
