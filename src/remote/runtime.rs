@@ -283,7 +283,7 @@ impl ClientRemoteSession {
         &self,
         source_root: crate::endpoint::source_root::SourceRoot,
         source: Entry,
-        destination: Option<crate::remote::transfer::TransferDestination>,
+        destination: crate::remote::transfer::TransferDestination,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
         request_file_transfer(
@@ -1150,9 +1150,10 @@ mod tests {
             .transfer_file(
                 authority,
                 source,
-                Some(crate::remote::transfer::TransferDestination::whole(
+                crate::remote::transfer::TransferDestination::whole(
+                    RelativePath::new("file.bin").unwrap(),
                     expectation,
-                )),
+                ),
             )
             .await
             .unwrap();
@@ -1345,9 +1346,10 @@ mod tests {
             .transfer_file(
                 authority,
                 source,
-                Some(crate::remote::transfer::TransferDestination::whole(
+                crate::remote::transfer::TransferDestination::whole(
+                    RelativePath::new("file.bin").unwrap(),
                     expectation,
-                )),
+                ),
             )
             .await
             .unwrap();

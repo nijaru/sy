@@ -6,7 +6,7 @@
 //! transactional-refused exactly as on push — the planner's contract is
 //! direction-neutral.
 
-use crate::engine::domain::{Entry, EntryIdentity, EntryKind, SyncOp, Timestamp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::ResourceRequest;
 use crate::engine::work::WorkItem;
@@ -16,11 +16,16 @@ pub fn lower_pull_op(
     op: SyncOp,
     policy: ExecutionPolicy,
 ) -> Result<Option<WorkItem<RemotePullAction>>> {
-    if op.path() != &op.source().path {
-        return Err(RemotePullError::DestinationAddressUnsupported);
+    if op.source().is_directory() && op.path() != &op.source().path {
+        return Err(RemotePullError::DirectoryAddressUnsupported(
+            op.path().clone(),
+        ));
     }
     match op {
-        SyncOp::Create { source, .. } => lower_create(source, policy),
+        SyncOp::Create {
+            source,
+            destination_path,
+        } => lower_create(source, destination_path, policy),
         SyncOp::Update {
             source,
             destination,
@@ -39,11 +44,13 @@ pub fn lower_pull_op(
 
 fn lower_create(
     source: Entry,
+    destination_path: RelativePath,
     policy: ExecutionPolicy,
 ) -> Result<Option<WorkItem<RemotePullAction>>> {
     match source.kind {
         EntryKind::Directory => Ok(Some(work_item(RemotePullAction::CreateDirectory {
             source,
+            destination_path,
         }))),
         EntryKind::File => {
             // Staging is private at 0600, so a committed file always needs an
@@ -58,6 +65,7 @@ fn lower_create(
             };
             Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
+                destination_path,
                 destination: None,
                 metadata,
             })))
@@ -65,6 +73,7 @@ fn lower_create(
         EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path,
             destination: None,
         }))),
     }
@@ -91,6 +100,7 @@ fn lower_update(
             };
             Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
+                destination_path: destination.path.clone(),
                 destination: Some(destination),
                 metadata,
             })))
@@ -99,6 +109,7 @@ fn lower_update(
         EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path: destination.path.clone(),
             destination: Some(destination),
         }))),
     }
@@ -123,6 +134,7 @@ fn lower_replace(
             };
             Ok(Some(work_item(RemotePullAction::FetchFile {
                 source,
+                destination_path: destination.path.clone(),
                 destination: Some(destination),
                 metadata,
             })))
@@ -130,6 +142,7 @@ fn lower_replace(
         EntryKind::Symlink => Ok(Some(work_item(RemotePullAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path: destination.path.clone(),
             destination: Some(destination),
         }))),
     }
@@ -146,12 +159,14 @@ fn lower_metadata(
     let Some((unix_mode, modified)) = requested_metadata(&source, &destination, policy)? else {
         return Ok(None);
     };
-    let expected_destination = destination.identity.ok_or_else(|| {
-        RemotePullError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
-    })?;
+    if destination.identity.is_none() {
+        return Err(RemotePullError::MissingDestinationIdentity(
+            destination.path.as_path().to_path_buf(),
+        ));
+    }
     Ok(Some(metadata_work(
         source,
-        expected_destination,
+        destination,
         unix_mode,
         modified,
     )))
@@ -211,13 +226,13 @@ fn work_item(action: RemotePullAction) -> WorkItem<RemotePullAction> {
 
 fn metadata_work(
     source: Entry,
-    expected_destination: EntryIdentity,
+    destination: Entry,
     unix_mode: Option<u32>,
     modified: Option<Timestamp>,
 ) -> WorkItem<RemotePullAction> {
     work_item(RemotePullAction::ApplyMetadata {
         source,
-        expected_destination,
+        destination,
         unix_mode,
         modified,
     })

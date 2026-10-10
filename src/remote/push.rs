@@ -35,15 +35,17 @@ pub const REMOTE_FILE_WORKING_SET: u64 = 8 * 1024 * 1024;
 pub enum RemotePushAction {
     CreateDirectory {
         source: Entry,
+        destination_path: RelativePath,
     },
     TransferFile {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: TransferMetadata,
-        source_removal: bool,
     },
     ReplaceSymlink {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
@@ -58,8 +60,10 @@ pub enum RemotePushAction {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushLowerError {
-    #[error("selected-leaf destination binding is not supported over SSH")]
-    DestinationAddressUnsupported,
+    #[error("scanned destination address does not match transfer target {0}")]
+    DestinationAddressMismatch(RelativePath),
+    #[error("distinct directory addresses require subtree finalization support at {0}")]
+    DirectoryAddressUnsupported(RelativePath),
     #[error("regular-file commit requires Unix mode metadata for {0}")]
     MissingFileMode(PathBuf),
 
@@ -124,11 +128,16 @@ pub fn lower_sync_op(
     op: SyncOp,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
-    if op.path() != &op.source().path {
-        return Err(RemotePushLowerError::DestinationAddressUnsupported);
+    if op.source().is_directory() && op.path() != &op.source().path {
+        return Err(RemotePushLowerError::DirectoryAddressUnsupported(
+            op.path().clone(),
+        ));
     }
     match op {
-        SyncOp::Create { source, .. } => lower_create(source, policy),
+        SyncOp::Create {
+            source,
+            destination_path,
+        } => lower_create(source, destination_path, policy),
         SyncOp::Update {
             source,
             destination,
@@ -147,11 +156,13 @@ pub fn lower_sync_op(
 
 fn lower_create(
     source: Entry,
+    destination_path: RelativePath,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
     match source.kind {
         EntryKind::Directory => Ok(Some(mutation_work(RemotePushAction::CreateDirectory {
             source,
+            destination_path,
         }))),
         EntryKind::File => {
             // Staging stays private at 0600. A new committed file therefore
@@ -169,14 +180,15 @@ fn lower_create(
             };
             Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
+                destination_path,
                 destination: None,
                 metadata,
-                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path,
             destination: None,
         }))),
     }
@@ -187,6 +199,7 @@ fn lower_update(
     destination: Entry,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
+    let destination_path = destination.path.clone();
     match source.kind {
         EntryKind::File => {
             let mode = if policy.preserve_permissions {
@@ -205,15 +218,16 @@ fn lower_update(
             };
             Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
+                destination_path,
                 destination: Some(destination),
                 metadata,
-                source_removal: true,
             })))
         }
         EntryKind::Directory => lower_metadata(source, destination, policy),
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path,
             destination: Some(destination),
         }))),
     }
@@ -224,6 +238,7 @@ fn lower_replace(
     destination: Entry,
     policy: ExecutionPolicy,
 ) -> LowerResult<Option<WorkItem<RemotePushAction>>> {
+    let destination_path = destination.path.clone();
     match source.kind {
         EntryKind::Directory => Err(RemotePushLowerError::TransactionalDirectoryReplace(
             source.path.as_path().to_path_buf(),
@@ -240,15 +255,16 @@ fn lower_replace(
             };
             Ok(Some(file_work(RemotePushAction::TransferFile {
                 source,
+                destination_path,
                 // Keep the namespace precondition even without a regular-file basis.
                 destination: Some(destination),
                 metadata,
-                source_removal: true,
             })))
         }
         EntryKind::Symlink => Ok(Some(mutation_work(RemotePushAction::ReplaceSymlink {
             modified: policy.preserve_times.then_some(source.modified),
             source,
+            destination_path,
             destination: Some(destination),
         }))),
     }
@@ -432,8 +448,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<RemotePushAction>>, RemotePushError> {
-        if op.path() != &op.source().path {
-            return Err(RemotePushLowerError::DestinationAddressUnsupported.into());
+        if op.source().is_directory() && op.path() != &op.source().path {
+            return Err(
+                RemotePushLowerError::DirectoryAddressUnsupported(op.path().clone()).into(),
+            );
         }
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
@@ -597,10 +615,31 @@ impl RemotePushExecutor {
         item: WorkItem<RemotePushAction>,
     ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
+        if let RemotePushAction::TransferFile {
+            destination_path,
+            destination: Some(observed),
+            ..
+        }
+        | RemotePushAction::ReplaceSymlink {
+            destination_path,
+            destination: Some(observed),
+            ..
+        } = &action
+        {
+            if destination_path != &observed.path {
+                return Err(RemotePushLowerError::DestinationAddressMismatch(
+                    destination_path.clone(),
+                )
+                .into());
+            }
+        }
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
-            RemotePushAction::CreateDirectory { source } => {
+            RemotePushAction::CreateDirectory {
+                source,
+                destination_path,
+            } => {
                 let rooted = self.source_root.rooted();
                 let expected = source.identity.ok_or_else(|| {
                     crate::rooted_fs::RootedFsError::DestinationChanged(
@@ -619,19 +658,19 @@ impl RemotePushExecutor {
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-                let identity = self.remote.create_directory(&source.path).await?;
+                let identity = self.remote.create_directory(&destination_path).await?;
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
-                    &source.path,
+                    &destination_path,
                 );
                 Ok(crate::engine::work::WorkResult::DirectoryPrepared(identity))
             }
             RemotePushAction::TransferFile {
                 source,
+                destination_path,
                 destination,
                 metadata,
-                source_removal,
             } => {
                 // -H/--preserve-hardlinks: members of one scanned group
                 // share a single transferred representative; the rest become
@@ -645,10 +684,10 @@ impl RemotePushExecutor {
                         return self
                             .execute_grouped_file(
                                 source,
+                                destination_path,
                                 destination,
                                 metadata,
                                 group,
-                                source_removal,
                             )
                             .await
                             .map(crate::engine::work::WorkResult::Transfer);
@@ -670,7 +709,9 @@ impl RemotePushExecutor {
                             .await?;
                     }
                 }
-                let destination_transfer = self.prepare_destination(destination).await?;
+                let destination_transfer = self
+                    .prepare_destination(destination_path.clone(), destination)
+                    .await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 // The requester captures xattrs/ACLs from the same held file
                 // descriptor that produces transfer bytes, then sends them on
@@ -695,24 +736,27 @@ impl RemotePushExecutor {
                     .await?;
                 let receipt = PublishedDestinationReceipt::for_file(
                     source.path.clone(),
-                    source.path.clone(),
+                    destination_path.clone(),
                     source.identity,
                     &crate::endpoint::io::VerificationStatus::Verified,
                     publication,
                 );
-                if source_removal {
-                    self.remove_committed_source(&receipt, &source).await?;
-                }
+                self.remove_committed_source(&receipt, &source).await?;
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
                     crate::sync::output::ItemizeOp::Create
                 };
-                self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+                self.report(
+                    op,
+                    crate::sync::output::ItemizeKind::File,
+                    &destination_path,
+                );
                 Ok(crate::engine::work::WorkResult::Transfer(summary))
             }
             RemotePushAction::ReplaceSymlink {
                 source,
+                destination_path,
                 destination,
                 modified,
             } => {
@@ -731,11 +775,11 @@ impl RemotePushExecutor {
                     .transpose()?;
                 let publication = self
                     .remote
-                    .replace_symlink(&source.path, target, expected_identity, modified)
+                    .replace_symlink(&destination_path, target, expected_identity, modified)
                     .await?;
                 let receipt = PublishedDestinationReceipt::for_symlink(
                     source.path.clone(),
-                    source.path.clone(),
+                    destination_path.clone(),
                     source.identity,
                     publication,
                 );
@@ -743,7 +787,7 @@ impl RemotePushExecutor {
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
-                    &source.path,
+                    &destination_path,
                 );
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
@@ -764,7 +808,7 @@ impl RemotePushExecutor {
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 let metadata = crate::remote::runtime::metadata::observed_metadata(
-                    &source.path,
+                    &destination.path,
                     source.kind,
                     expected_destination,
                     unix_mode,
@@ -800,10 +844,10 @@ impl RemotePushExecutor {
     async fn execute_grouped_file(
         &self,
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: TransferMetadata,
         group: [u8; 32],
-        source_removal: bool,
     ) -> Result<TransferSummary> {
         let groups = self.hardlink_groups.lock().await;
         if let Some(first) = groups.get(group).await? {
@@ -832,7 +876,7 @@ impl RemotePushExecutor {
                 .remote
                 .hardlink(
                     &first.path,
-                    &source.path,
+                    &destination_path,
                     first.publication,
                     expected_destination,
                 )
@@ -840,20 +884,22 @@ impl RemotePushExecutor {
             groups.advance(group, publication.identity).await?;
             let receipt = PublishedDestinationReceipt::for_hardlink(
                 source.path.clone(),
-                source.path.clone(),
+                destination_path.clone(),
                 source.identity,
                 publication,
             );
-            if source_removal {
-                self.defer_grouped_source_removal(group, &receipt, &source)
-                    .await?;
-            }
+            self.defer_grouped_source_removal(group, &receipt, &source)
+                .await?;
             let op = if destination.is_some() {
                 crate::sync::output::ItemizeOp::Update
             } else {
                 crate::sync::output::ItemizeOp::Create
             };
-            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            self.report(
+                op,
+                crate::sync::output::ItemizeKind::File,
+                &destination_path,
+            );
             return Ok(TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
@@ -871,7 +917,9 @@ impl RemotePushExecutor {
                     .await?;
             }
         }
-        let destination_transfer = self.prepare_destination(destination).await?;
+        let destination_transfer = self
+            .prepare_destination(destination_path.clone(), destination)
+            .await?;
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
         // The requester captures xattrs/ACLs from the same held file
         // descriptor that produces transfer bytes.
@@ -897,7 +945,7 @@ impl RemotePushExecutor {
             .await?;
         let receipt = PublishedDestinationReceipt::for_file(
             source.path.clone(),
-            source.path.clone(),
+            destination_path.clone(),
             source.identity,
             &crate::endpoint::io::VerificationStatus::Verified,
             publication,
@@ -906,7 +954,7 @@ impl RemotePushExecutor {
             .insert(
                 group,
                 HardlinkRepresentative {
-                    path: source.path.clone(),
+                    path: destination_path.clone(),
                     publication: receipt
                         .publication()
                         .map_err(std::io::Error::other)?
@@ -916,17 +964,19 @@ impl RemotePushExecutor {
                 },
             )
             .await?;
-        if source_removal {
-            self.defer_grouped_source_removal(group, &receipt, &source)
-                .await?;
-        }
+        self.defer_grouped_source_removal(group, &receipt, &source)
+            .await?;
         drop(groups);
         let op = if is_update {
             crate::sync::output::ItemizeOp::Update
         } else {
             crate::sync::output::ItemizeOp::Create
         };
-        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        self.report(
+            op,
+            crate::sync::output::ItemizeKind::File,
+            &destination_path,
+        );
         Ok(summary)
     }
 
@@ -1192,13 +1242,14 @@ impl RemotePushExecutor {
     /// The scanned destination state the remote commit must observe, plus a
     /// delta index when signature collection selected one for that entry.
     ///
-    /// `None` is a create: the receiver requires the path to remain absent.
+    /// Without an old observation, the explicit target must remain absent.
     async fn prepare_destination(
         &self,
+        path: RelativePath,
         destination: Option<Entry>,
-    ) -> Result<Option<TransferDestination>> {
+    ) -> Result<TransferDestination> {
         let Some(destination) = destination else {
-            return Ok(None);
+            return Ok(TransferDestination::create(path));
         };
         let identity = destination.identity.ok_or_else(|| {
             RemotePushError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
@@ -1216,10 +1267,10 @@ impl RemotePushExecutor {
         } else {
             None
         };
-        Ok(Some(TransferDestination {
-            expectation,
-            delta_index,
-        }))
+        Ok(match delta_index {
+            Some(index) => TransferDestination::delta(path, expectation, index),
+            None => TransferDestination::whole(path, expectation),
+        })
     }
 
     /// Read the local source's extended attributes for one entry when `-X`
@@ -1527,11 +1578,13 @@ mod tests {
             let RemotePushAction::ReplaceSymlink {
                 source: pushed,
                 destination: push_expected,
+                destination_path,
                 modified,
             } = push
             else {
                 panic!("expected symlink replacement");
             };
+            assert_eq!(destination_path, source.path);
             assert_eq!(pushed, source);
             assert_eq!(push_expected, destination);
             assert_eq!(modified, Some(source.modified));
@@ -1542,11 +1595,13 @@ mod tests {
             let crate::remote::pull::RemotePullAction::ReplaceSymlink {
                 source: pulled,
                 destination: pull_expected,
+                destination_path,
                 modified,
             } = pull
             else {
                 panic!("expected symlink replacement");
             };
+            assert_eq!(destination_path, source.path);
             assert_eq!(pulled, source);
             assert_eq!(pull_expected, destination);
             assert_eq!(modified, Some(source.modified));
