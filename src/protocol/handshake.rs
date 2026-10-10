@@ -39,8 +39,12 @@ pub const PROTOCOL_V3_6: ProtocolVersion = ProtocolVersion { major: 3, minor: 6 
 /// Adds cheap observation-bound reads for scalar source metadata validation.
 pub const PROTOCOL_V3_7: ProtocolVersion = ProtocolVersion { major: 3, minor: 7 };
 
+/// Preserves typed None/Auto/Always compression policy on pull fetch requests.
+/// The former boolean request layout is incompatible.
+pub const PROTOCOL_V3_8: ProtocolVersion = ProtocolVersion { major: 3, minor: 8 };
+
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_7);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionRange {
@@ -414,6 +418,19 @@ mod tests {
         let server = VersionRange::exact(ProtocolVersion { major: 4, minor: 0 });
         assert!(matches!(
             negotiate_version(client, server),
+            Err(ProtocolError::NoCompatibleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn current_wire_contract_rejects_previous_minor() {
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_8));
+        assert!(matches!(
+            negotiate_version(VersionRange::exact(PROTOCOL_V3_7), SUPPORTED_VERSIONS),
+            Err(ProtocolError::NoCompatibleVersion { .. })
+        ));
+        assert!(matches!(
+            negotiate_version(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_7)),
             Err(ProtocolError::NoCompatibleVersion { .. })
         ));
     }

@@ -402,7 +402,9 @@ The scheduler controls fairness and byte budgets. Frame sizes remain moderate so
 
 ### Compression
 
-Compression is negotiated and applied only where it earns its cost. Do not compress copy operations or signatures. Literal/file-data chunks may be compressed when sampling/extension policy predicts a benefit, and the wire flag is set only when compression actually reduced the payload.
+Compression is negotiated; do not compress copy operations or signatures. `Auto` samples the first file-data chunk and uses the elapsed-time model to decide whether to compress this transfer. `Always` attempts every chunk, including after an incompressible first chunk. Both send raw bytes unless the actual compressed payload is smaller; only smaller zstd payloads carry the `COMPRESSED` frame flag.
+
+The current exact wire contract is 3.8 (no earlier-minor compatibility). Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
 
 ## Integrity
 
