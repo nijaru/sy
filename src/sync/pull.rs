@@ -342,7 +342,6 @@ mod tests {
     fn supported_config() -> crate::sync::SyncConfig {
         let mut config = crate::sync::SyncConfig::test_default();
         config.max_concurrent = 2;
-        config.verification.mode = crate::sync::config::ChecksumType::None;
         config
     }
 

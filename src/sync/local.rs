@@ -244,7 +244,7 @@ pub(super) async fn run(
             .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
             .with_rate_limiter(rate_limiter)
             .with_remove_source_files(config.remove_source_files)
-            .with_verify_on_write(config.verification.verify_on_write)
+            .with_verify_on_write(config.verify_on_write)
             .with_hardlinks(config.preserve.hardlinks)
             .with_xattrs(config.preserve.xattrs)
             .with_acls(config.preserve.acls)
@@ -260,7 +260,7 @@ pub(super) async fn run(
     let mut stats = summary_stats(summary)?;
     // --verify's staged verification is fail-fast on this path: a successful
     // run verified every transferred file.
-    if config.verification.verify_on_write {
+    if config.verify_on_write {
         stats.files_verified = usize::try_from(summary.files_transferred).map_err(|_| {
             SyncError::Config("v3 verified counter exceeds platform usize".to_string())
         })?;

@@ -169,7 +169,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
 
     // Get verification mode
     let verification_mode = cli.verification_mode();
-    let checksum_type = verification_mode.checksum_type();
     let verify_on_write = verification_mode.verify_blocks();
 
     // Get symlink mode
@@ -360,10 +359,7 @@ Or install from local source with: cargo install --path . --features acl"#
         filter_engine,
         bwlimit: cli.bwlimit,
         json: cli.json,
-        verification: sync::VerificationConfig {
-            mode: checksum_type,
-            verify_on_write,
-        },
+        verify_on_write,
         preserve: sync::PreserveConfig {
             xattrs: cli.preserve_xattrs,
             hardlinks: cli.preserve_hardlinks,

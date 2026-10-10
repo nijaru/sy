@@ -17,7 +17,7 @@ pub struct SyncConfig {
     pub filter_engine: FilterEngine,
     pub bwlimit: Option<u64>,
     pub json: bool,
-    pub verification: VerificationConfig,
+    pub verify_on_write: bool,
     pub preserve: PreserveConfig,
     pub comparison: ComparisonConfig,
     pub dest_is_remote: bool,
@@ -51,10 +51,7 @@ impl SyncConfig {
             filter_engine: FilterEngine::new(),
             bwlimit: None,
             json: false,
-            verification: VerificationConfig {
-                mode: ChecksumType::Fast,
-                verify_on_write: false,
-            },
+            verify_on_write: false,
             preserve: PreserveConfig::default(),
             comparison: ComparisonConfig::default(),
             dest_is_remote: false,
@@ -140,23 +137,6 @@ pub struct ComparisonConfig {
     pub checksum: bool,
     pub update_only: bool,
     pub ignore_existing: bool,
-}
-
-/// Checksum policy marker carried by synchronization configuration.
-///
-/// Endpoints own the verification algorithm: v3 always verifies BLAKE3, and
-/// optional local staged verification is controlled by `verify_on_write`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChecksumType {
-    None,
-    #[default]
-    Fast,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct VerificationConfig {
-    pub mode: ChecksumType,
-    pub verify_on_write: bool,
 }
 
 #[derive(Debug, Clone)]
