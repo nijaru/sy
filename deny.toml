@@ -1,13 +1,27 @@
 # cargo-deny configuration
 # https://embarkstudios.github.io/cargo-deny/
 
+# Audit the native desktop CLI graph, including release and compile surfaces.
+# Transitive WebAssembly backends are not sy artifacts; they must not expand
+# the license policy for our native builds. Add targets here when adding ports.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # RUSTSEC-2025-0119: number_prefix unmaintained (transitive via indicatif)
-# RUSTSEC-2025-0134: rustls-pemfile unmaintained (transitive via object_store)
 # RUSTSEC-2025-0141: bincode unmaintained (1.3.3 considered complete, used for checksumdb)
-ignore = ["RUSTSEC-2025-0119", "RUSTSEC-2025-0134", "RUSTSEC-2025-0141"]
+ignore = ["RUSTSEC-2025-0119", "RUSTSEC-2025-0141"]
 
 [licenses]
 allow = [
