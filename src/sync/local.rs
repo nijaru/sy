@@ -71,6 +71,11 @@ pub(super) async fn run(
         false
     };
 
+    // Complete fallible discovery before either scan producer is admitted.
+    let namespace_semantics = crate::fs_util::namespace_semantics(destination_root)
+        .await
+        .map_err(map_io)?;
+
     // Both scans are local. The source walk honors the ignore rules where
     // the files live; the destination scan stays COMPLETE (gitignore never
     // narrows what reconciliation sees) — the same boundary as every other
@@ -127,10 +132,7 @@ pub(super) async fn run(
         let destination_root_owned = destination_root.to_path_buf();
         preflight_sync_scoped_with_content(
             OrderedReconciler::with_scope(source, destination, scope.clone()),
-            comparison_policy(
-                config,
-                crate::fs_util::namespace_semantics(destination_root),
-            ),
+            comparison_policy(config, namespace_semantics),
             delete_policy(&config.delete),
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)

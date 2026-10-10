@@ -162,7 +162,7 @@ async fn execute_with_handle(
     reporter.start(source_root, destination_root);
     // Pin local destination authority before admitting the remote producer.
     // Its complete scan never inherits source selection rules.
-    let mut destination = executor
+    let (namespace_semantics, mut destination) = executor
         .destination_entries(destination_scan_request(config), config.dry_run)
         .await
         .map_err(map_io)?;
@@ -193,10 +193,7 @@ async fn execute_with_handle(
     // disabled on v3 pull until the server-side ignore-scope design lands.
     let mut plan = preflight_sync_scoped_with_content(
         OrderedReconciler::new(source, destination),
-        comparison_policy(
-            config,
-            crate::fs_util::namespace_semantics(destination_root),
-        ),
+        comparison_policy(config, namespace_semantics),
         delete_policy(&config.delete),
         move |entry| {
             entry_in_size_scope(entry, min_size, max_size)
