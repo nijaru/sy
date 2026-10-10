@@ -853,16 +853,18 @@ impl StagedWriter for LocalStagedWriter {
         Ok(())
     }
 
-    async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()> {
+    async fn set_metadata(&mut self, metadata: &super::io::StagedMetadata) -> Result<()> {
         self.file_mut()?.flush().await?;
-        let time = filetime::FileTime::from_system_time(metadata.modified);
-        let modified = sy::engine::domain::Timestamp::new(time.seconds(), time.nanoseconds())
-            .map_err(|error| SyncError::Config(error.to_string()))?;
-        #[cfg(unix)]
-        let unix_mode = Some(metadata.mode);
-        #[cfg(not(unix))]
-        let unix_mode = None;
-        self.with_staged(move |staged| staged.apply_metadata_blocking(unix_mode, Some(modified)))
+        let modified = metadata
+            .modified
+            .map(|modified| {
+                let time = filetime::FileTime::from_system_time(modified);
+                sy::engine::domain::Timestamp::new(time.seconds(), time.nanoseconds())
+                    .map_err(|error| SyncError::Config(error.to_string()))
+            })
+            .transpose()?;
+        let unix_mode = metadata.unix_mode;
+        self.with_staged(move |staged| staged.apply_metadata_blocking(unix_mode, modified))
             .await
     }
 
@@ -1493,6 +1495,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn absent_staged_timestamp_does_not_replace_native_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let endpoint = LocalEndpoint::new(root.path().to_path_buf());
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"private bytes").await.unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        writer
+            .set_metadata(&crate::endpoint::io::StagedMetadata {
+                modified: Some(old),
+                unix_mode: Some(0o600),
+            })
+            .await
+            .unwrap();
+        let metadata = crate::endpoint::io::StagedMetadata {
+            modified: None,
+            unix_mode: Some(0o640),
+        };
+        crate::endpoint::io::finalize_staged_writer(
+            writer,
+            &metadata,
+            &crate::endpoint::io::Preservation::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .into_publication()
+        .unwrap();
+        let observed = std::fs::metadata(root.path().join("file")).unwrap();
+        assert_eq!(observed.modified().unwrap(), old);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(observed.permissions().mode() & 0o7777, 0o640);
+        }
+    }
+
     fn make_meta() -> FileMetadata {
         FileMetadata {
             size: 7,
@@ -2086,7 +2130,7 @@ mod tests {
         let completion = tokio::spawn(async move {
             crate::endpoint::io::finalize_staged_writer(
                 writer,
-                &make_meta(),
+                &crate::endpoint::io::StagedMetadata::from(&make_meta()),
                 &crate::endpoint::io::Preservation::default(),
                 Some(blake3::hash(b"content")),
                 None,
@@ -2161,7 +2205,7 @@ mod tests {
         writer.write(b"content").await.unwrap();
         let mismatch = crate::endpoint::io::finalize_staged_writer(
             writer,
-            &metadata,
+            &crate::endpoint::io::StagedMetadata::from(&metadata),
             &preservation,
             Some(blake3::hash(b"different")),
             None,
@@ -2183,7 +2227,7 @@ mod tests {
         writer.write(b"content").await.unwrap();
         let verified = crate::endpoint::io::finalize_staged_writer(
             writer,
-            &metadata,
+            &crate::endpoint::io::StagedMetadata::from(&metadata),
             &preservation,
             Some(blake3::hash(b"content")),
             None,
@@ -2252,7 +2296,7 @@ mod tests {
         });
         let result = crate::endpoint::io::finalize_staged_writer(
             writer,
-            &make_meta(),
+            &crate::endpoint::io::StagedMetadata::from(&make_meta()),
             &crate::endpoint::io::Preservation::default(),
             Some(blake3::hash(b"content")),
             Some(pre_commit),
@@ -2282,7 +2326,7 @@ mod tests {
 
         let result = crate::endpoint::io::finalize_staged_writer(
             writer,
-            &metadata,
+            &crate::endpoint::io::StagedMetadata::from(&metadata),
             &crate::endpoint::io::Preservation::default(),
             Some(blake3::hash(b"private bytes")),
             None,
@@ -2317,7 +2361,10 @@ mod tests {
             .await
             .unwrap();
         writer.write(b"content").await.unwrap();
-        writer.set_metadata(&make_meta()).await.unwrap();
+        writer
+            .set_metadata(&crate::endpoint::io::StagedMetadata::from(&make_meta()))
+            .await
+            .unwrap();
         writer.commit().await.unwrap().finalize(None).await.unwrap();
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"content");
     }

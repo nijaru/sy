@@ -61,23 +61,26 @@ proptest! {
             fs::write(source.path().join(format!("file_{}.txt", i)), format!("content_{}", i)).unwrap();
         }
 
-        // First sync (exclude .git for predictable file counts)
+        // Preserve timestamps so the second size+mtime quick check is equal.
+        // Exclude .git for predictable selected file counts.
         let output1 = Command::new(sy_bin())
             .args([
                 &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
                 "--exclude-vcs",
+                "-t",
             ])
             .output()
             .unwrap();
         prop_assert!(output1.status.success());
 
-        // Second sync (exclude .git for predictable file counts)
+        // Second sync requests the same preservation policy.
         let output2 = Command::new(sy_bin())
             .args([
                 &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
                 "--exclude-vcs",
+                "-t",
             ])
             .output()
             .unwrap();

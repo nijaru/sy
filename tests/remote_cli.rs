@@ -195,6 +195,79 @@ async fn remote_selection_checksum_and_absent_preview_follow_shared_cli_policy()
     }
 }
 
+#[tokio::test]
+async fn transferred_file_times_follow_explicit_policy_in_every_direction() {
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 123_456_000);
+    for direction in ["local", "local-stream", "push", "pull"] {
+        for preserve in [false, true] {
+            let scope = fixture.path().join(format!("{direction}-{preserve}"));
+            let source = scope.join("source");
+            let destination = scope.join("destination");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            for name in ["create", "update", "replace"] {
+                let file = source.join(name);
+                std::fs::write(&file, b"selected source bytes").unwrap();
+                filetime::set_file_mtime(file, old).unwrap();
+            }
+            std::fs::write(destination.join("update"), b"old").unwrap();
+            std::os::unix::fs::symlink("absent", destination.join("replace")).unwrap();
+            let remote = |path: &std::path::Path| {
+                let mut operand = OsString::from("test-peer:");
+                operand.push(path);
+                operand
+            };
+            let mut source_operand = if direction == "pull" {
+                remote(&source)
+            } else {
+                source.as_os_str().to_owned()
+            };
+            // Local operands use rsync's explicit contents spelling.
+            source_operand.push("/");
+            let destination_operand = if direction == "push" {
+                remote(&destination)
+            } else {
+                destination.as_os_str().to_owned()
+            };
+            let before = std::time::SystemTime::now() - Duration::from_secs(2);
+            let mut flags = Vec::new();
+            if preserve {
+                flags.push("-t");
+            }
+            if direction == "local-stream" {
+                flags.push("--bwlimit=1M");
+            }
+            copy(&source_operand, &destination_operand, &flags, &search_path).await;
+            let after = std::time::SystemTime::now() + Duration::from_secs(2);
+            for name in ["create", "update", "replace"] {
+                let file = destination.join(name);
+                assert_eq!(std::fs::read(&file).unwrap(), b"selected source bytes");
+                let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+                if preserve {
+                    assert_eq!(
+                        filetime::FileTime::from_system_time(modified),
+                        old,
+                        "{direction}: {name}"
+                    );
+                } else {
+                    assert!(
+                        modified >= before && modified <= after,
+                        "{direction}: {name} inherited a source/old timestamp: {modified:?}"
+                    );
+                }
+                assert_eq!(
+                    filetime::FileTime::from_last_modification_time(
+                        &std::fs::metadata(source.join(name)).unwrap()
+                    ),
+                    old
+                );
+            }
+        }
+    }
+}
+
 fn ssh_path(root: &std::path::Path) -> OsString {
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();

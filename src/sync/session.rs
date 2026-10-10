@@ -379,15 +379,16 @@ mod tests {
         let dest = TempDir::new().unwrap();
         std::fs::write(source.path().join("file"), b"content").unwrap();
 
-        let first = local_session(&source, &dest, test_config())
+        // Size+mtime quick equality needs timestamps preserved on the first
+        // transfer; bare copies now consistently honor the absence of -t.
+        let mut config = test_config();
+        config.preserve.times = true;
+        let first = local_session(&source, &dest, config.clone())
             .sync()
             .await
             .unwrap();
         assert_eq!(first.files_created, 1);
-        let second = local_session(&source, &dest, test_config())
-            .sync()
-            .await
-            .unwrap();
+        let second = local_session(&source, &dest, config).sync().await.unwrap();
         assert_eq!(second.files_skipped, 1);
     }
 

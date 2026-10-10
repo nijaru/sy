@@ -72,6 +72,11 @@ sy [OPTIONS] <SOURCE> <DESTINATION>
 | `--compress` | Compress transfers (auto-detected) |
 | `-j, --parallel <N>` | Parallel transfers (default: 10) |
 
+Use `-t` or `-a` to preserve source modification times in local, push, and pull
+transfers. Without them, `sy` does not apply source timestamps. Because the
+default comparison uses size and mtime, a later bare sync may copy those files
+again; use `-t` for timestamp-based incremental synchronization.
+
 ### Sync Modes
 
 ```bash
