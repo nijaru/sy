@@ -18,10 +18,7 @@ mod verification;
 #[cfg(feature = "watch")]
 pub mod watch_session;
 
-pub use config::{
-    parse_delete_limit, ComparisonConfig, DeleteMode, PreserveConfig, SyncConfig,
-    VerificationConfig,
-};
+pub use config::{parse_delete_limit, ComparisonConfig, DeleteMode, PreserveConfig, SyncConfig};
 #[allow(unused_imports)]
 pub use stats::{SyncError, SyncStats};
 pub use verification::{VerificationCounts, VerificationResult};

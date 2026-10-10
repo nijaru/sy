@@ -9,7 +9,6 @@ pub use parser::Arguments;
 use std::path::PathBuf;
 
 use crate::engine::compression::CompressionDetection;
-use crate::sync::config::ChecksumType;
 
 use crate::sync::scanner::ScanOptions;
 
@@ -76,14 +75,6 @@ pub enum VerificationMode {
 }
 
 impl VerificationMode {
-    /// Get the checksum type for this mode
-    pub fn checksum_type(&self) -> ChecksumType {
-        match self {
-            Self::None => ChecksumType::None,
-            Self::Verify => ChecksumType::Fast,
-        }
-    }
-
     /// Whether --verify enables post-write verification of committed bytes.
     /// The local engine hashes staged bytes against the source before the
     /// rename commit; the v3 protocol always verifies unconditionally.
@@ -1448,12 +1439,6 @@ mod tests {
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
-    }
-
-    #[test]
-    fn test_verification_mode_checksum_type_mapping() {
-        assert_eq!(VerificationMode::None.checksum_type(), ChecksumType::None);
-        assert_eq!(VerificationMode::Verify.checksum_type(), ChecksumType::Fast);
     }
 
     #[test]
