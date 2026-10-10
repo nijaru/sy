@@ -94,6 +94,10 @@ impl TransferResult {
 /// This trait provides a unified interface for file operations that works
 /// across both local filesystems and remote systems (SSH, SFTP, etc.)
 #[async_trait]
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait adds #[must_use] to methods returning already-must-use boxed futures"
+)]
 #[allow(dead_code)] // Methods will be used when we implement SSH transport
 pub trait Transport: Send + Sync {
     /// Set scanning options (respect gitignore, include .git)
