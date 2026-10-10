@@ -196,7 +196,7 @@ impl ClientRemoteHandle {
         &self,
         source_root: SourceRoot,
         source: Entry,
-        destination: Option<TransferDestination>,
+        destination: TransferDestination,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
         request_file_transfer(&self.sender, source_root, source, destination, self.peer)
@@ -208,7 +208,7 @@ impl ClientRemoteHandle {
         &self,
         source_root: SourceRoot,
         source: Entry,
-        destination: Option<TransferDestination>,
+        destination: TransferDestination,
         metadata: TransferMetadata,
     ) -> Result<TransferSummary> {
         self.require_push(FrameKind::FileBegin)?;
@@ -223,7 +223,7 @@ impl ClientRemoteHandle {
         &self,
         source_root: SourceRoot,
         source: Entry,
-        destination: Option<TransferDestination>,
+        destination: TransferDestination,
         metadata: TransferMetadata,
         compression: Option<CompressionPolicy>,
     ) -> Result<TransferSummary> {
@@ -246,7 +246,7 @@ impl ClientRemoteHandle {
         &self,
         source_root: SourceRoot,
         source: Entry,
-        destination: Option<TransferDestination>,
+        destination: TransferDestination,
         metadata: TransferMetadata,
         stream_policy: TransferStreamPolicy,
     ) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {

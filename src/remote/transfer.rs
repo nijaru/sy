@@ -114,7 +114,7 @@ pub enum RemoteTransferError {
     #[error("file fetch supplied unrequested {0} preservation metadata")]
     UnexpectedFetchPreservation(&'static str),
 
-    #[error("delta transfer requires a regular-file basis at the source path")]
+    #[error("delta transfer requires a regular-file basis at the destination path")]
     InvalidBasis,
 
     #[error(
@@ -271,27 +271,38 @@ fn validate_destination_state(
 
 /// The scanned destination state one transfer commits against.
 ///
-/// `None` at the call site is a create: the receiver requires the destination
-/// path to remain absent. Updates carry the scanned identity expectation so a
-/// racing replacement aborts staging before commit; delta transfers add the
-/// signature index produced from that same destination entry.
+/// An absent expectation is a create: the receiver requires the explicit
+/// destination path to remain absent. Updates carry the scanned identity
+/// expectation so a racing replacement aborts staging before commit; delta
+/// transfers add the signature index produced from that same destination entry.
 #[derive(Debug)]
 pub struct TransferDestination {
-    pub expectation: WireFileBasis,
-    pub delta_index: Option<BasisIndex>,
+    path: RelativePath,
+    expectation: Option<WireFileBasis>,
+    delta_index: Option<BasisIndex>,
 }
 
 impl TransferDestination {
-    pub const fn whole(expectation: WireFileBasis) -> Self {
+    pub fn create(path: RelativePath) -> Self {
         Self {
-            expectation,
+            path,
+            expectation: None,
             delta_index: None,
         }
     }
 
-    pub const fn delta(expectation: WireFileBasis, delta_index: BasisIndex) -> Self {
+    pub fn whole(path: RelativePath, expectation: WireFileBasis) -> Self {
         Self {
-            expectation,
+            path,
+            expectation: Some(expectation),
+            delta_index: None,
+        }
+    }
+
+    pub fn delta(path: RelativePath, expectation: WireFileBasis, delta_index: BasisIndex) -> Self {
+        Self {
+            path,
+            expectation: Some(expectation),
             delta_index: Some(delta_index),
         }
     }
@@ -301,7 +312,7 @@ pub async fn request_file_transfer(
     sender: &RouterSender,
     source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
-    destination: Option<TransferDestination>,
+    destination: TransferDestination,
     peer: PlatformOs,
 ) -> Result<TransferSummary> {
     request_file_transfer_with_metadata(
@@ -319,7 +330,7 @@ pub async fn request_file_transfer_with_metadata(
     sender: &RouterSender,
     source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
-    destination: Option<TransferDestination>,
+    destination: TransferDestination,
     metadata: TransferMetadata,
     peer: PlatformOs,
 ) -> Result<TransferSummary> {
@@ -339,7 +350,7 @@ pub async fn request_file_transfer_with_policy(
     sender: &RouterSender,
     source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
-    destination: Option<TransferDestination>,
+    destination: TransferDestination,
     metadata: TransferMetadata,
     peer: PlatformOs,
     compression: Option<crate::engine::compression::CompressionPolicy>,
@@ -365,7 +376,7 @@ pub async fn request_file_transfer_with_stream_policy(
     sender: &RouterSender,
     source_root: crate::endpoint::source_root::SourceRoot,
     source: Entry,
-    destination: Option<TransferDestination>,
+    destination: TransferDestination,
     metadata: TransferMetadata,
     peer: PlatformOs,
     stream_policy: TransferStreamPolicy,
@@ -405,17 +416,16 @@ pub async fn request_file_transfer_with_stream_policy(
         metadata.acls = captured_preservation.acls;
     }
 
-    let encoded_path = encode_relative_path(source.path.as_path())?;
-    let (begin, basis_index) = match destination {
+    let encoded_path = encode_relative_path(destination.path.as_path())?;
+    let published_path = destination.path;
+    let basis_index = destination.delta_index;
+    let begin = match destination.expectation {
         // The expectation is the scanned destination identity; delta
         // transfers reuse it as their copy-op basis. The receiver refuses
         // racing replacements before commit in both cases.
-        Some(destination) => (
-            WireFileBegin::delta(encoded_path, source.size, destination.expectation),
-            destination.delta_index,
-        ),
+        Some(expectation) => WireFileBegin::delta(encoded_path, source.size, expectation),
         // A create: the receiver requires the path to remain absent.
-        None => (WireFileBegin::whole(encoded_path, source.size), None),
+        None => WireFileBegin::whole(encoded_path, source.size),
     };
     let begin = begin
         .with_metadata(
@@ -425,8 +435,6 @@ pub async fn request_file_transfer_with_stream_policy(
                 .map(|value| (value.seconds(), value.nanoseconds())),
         )?
         .with_bsd_flags(stream_policy.final_flags);
-    let published_path = source.path.clone();
-
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
     sender
@@ -1483,7 +1491,7 @@ mod tests {
             &router.sender(),
             authority,
             source,
-            Some(TransferDestination::whole(destination_expectation)),
+            TransferDestination::whole(destination.path, destination_expectation),
             TransferMetadata {
                 unix_mode: Some(0o640),
                 modified: Some(modified),
@@ -1572,7 +1580,11 @@ mod tests {
             &router.sender(),
             authority,
             source,
-            Some(TransferDestination::delta(expectation, delta_index)),
+            TransferDestination::delta(
+                RelativePath::new("file.bin").unwrap(),
+                expectation,
+                delta_index,
+            ),
             session.server.platform.os,
         )
         .await

@@ -72,9 +72,11 @@ async fn metadata_completion_rechecks_source_after_admitted_native_work() {
             resume: resume_rx,
         },
     );
+    let mut destination = source.clone();
+    destination.identity = Some(expected);
     let action = RemotePullAction::ApplyMetadata {
         source,
-        expected_destination: expected,
+        destination,
         unix_mode: Some(0o600),
         modified: None,
     };
@@ -278,13 +280,15 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                             .await,
                         _ => {
                             let action = match mutation {
-                                Mutation::Directory => {
-                                    RemotePullAction::CreateDirectory { source: directory }
-                                }
+                                Mutation::Directory => RemotePullAction::CreateDirectory {
+                                    destination_path: directory.path.clone(),
+                                    source: directory,
+                                },
                                 Mutation::Symlink => {
                                     let mut destination = source.clone();
                                     destination.identity = Some(before);
                                     RemotePullAction::ReplaceSymlink {
+                                        destination_path: file.clone(),
                                         source: Entry::symlink(
                                             file,
                                             "target".into(),
@@ -294,16 +298,21 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                                         modified: None,
                                     }
                                 }
-                                Mutation::Metadata => RemotePullAction::ApplyMetadata {
-                                    source,
-                                    expected_destination: before,
-                                    unix_mode: Some(0o600),
-                                    modified: Some(Timestamp::UNIX_EPOCH),
-                                },
+                                Mutation::Metadata => {
+                                    let mut destination = source.clone();
+                                    destination.identity = Some(before);
+                                    RemotePullAction::ApplyMetadata {
+                                        source,
+                                        destination,
+                                        unix_mode: Some(0o600),
+                                        modified: Some(Timestamp::UNIX_EPOCH),
+                                    }
+                                }
                                 Mutation::Fetch | Mutation::Hardlink => {
                                     let mut destination = source.clone();
                                     destination.identity = Some(before);
                                     RemotePullAction::FetchFile {
+                                        destination_path: source.path.clone(),
                                         source,
                                         destination: Some(destination),
                                         metadata: PullTransferMetadata {

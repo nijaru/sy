@@ -16,7 +16,7 @@ use crate::endpoint::io::{ExpectedDestination, VerificationStatus};
 use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::engine::compression::CompressionPolicy;
-use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
+use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
 use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
@@ -36,8 +36,10 @@ pub const REMOTE_FETCH_WORKING_SET: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePullError {
-    #[error("selected-leaf destination binding is not supported over SSH")]
-    DestinationAddressUnsupported,
+    #[error("scanned destination address does not match transfer target {0}")]
+    DestinationAddressMismatch(RelativePath),
+    #[error("distinct directory addresses require subtree finalization support at {0}")]
+    DirectoryAddressUnsupported(RelativePath),
     #[error("hardlink bookkeeping failed: {0}")]
     HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
@@ -128,20 +130,23 @@ fn destination_expectation(destination: Option<&Entry>) -> Result<ExpectedDestin
 pub enum RemotePullAction {
     CreateDirectory {
         source: Entry,
+        destination_path: RelativePath,
     },
     FetchFile {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: PullTransferMetadata,
     },
     ReplaceSymlink {
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         modified: Option<Timestamp>,
     },
     ApplyMetadata {
         source: Entry,
-        expected_destination: EntryIdentity,
+        destination: Entry,
         unix_mode: Option<u32>,
         modified: Option<Timestamp>,
     },
@@ -376,10 +381,30 @@ impl RemotePullExecutor {
         item: WorkItem<RemotePullAction>,
     ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
+        if let RemotePullAction::FetchFile {
+            destination_path,
+            destination: Some(observed),
+            ..
+        }
+        | RemotePullAction::ReplaceSymlink {
+            destination_path,
+            destination: Some(observed),
+            ..
+        } = &action
+        {
+            if destination_path != &observed.path {
+                return Err(RemotePullError::DestinationAddressMismatch(
+                    destination_path.clone(),
+                ));
+            }
+        }
         let _permit = self.scheduler.acquire(resources).await?;
 
         match action {
-            RemotePullAction::CreateDirectory { source } => {
+            RemotePullAction::CreateDirectory {
+                source,
+                destination_path,
+            } => {
                 let expected = source.identity.ok_or_else(|| {
                     crate::rooted_fs::RootedFsError::DestinationChanged(
                         source.path.as_path().to_path_buf(),
@@ -389,7 +414,7 @@ impl RemotePullExecutor {
                     .read_directory_preservation(&source.path, expected, Default::default())
                     .await?;
                 let rooted = self.metadata_authority().await?.clone();
-                let relative = source.path.clone();
+                let relative = destination_path.clone();
                 let identity = tokio::task::spawn_blocking(move || {
                     rooted.create_directory_blocking(&relative)
                 })
@@ -398,12 +423,13 @@ impl RemotePullExecutor {
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Directory,
-                    &source.path,
+                    &destination_path,
                 );
                 Ok(crate::engine::work::WorkResult::DirectoryPrepared(identity))
             }
             RemotePullAction::FetchFile {
                 source,
+                destination_path,
                 destination,
                 metadata,
             } => {
@@ -413,7 +439,13 @@ impl RemotePullExecutor {
                     if let Some(identity) = source.hardlink_group {
                         let group = *identity.as_bytes();
                         return self
-                            .execute_grouped_fetch(source, destination, metadata, group)
+                            .execute_grouped_fetch(
+                                source,
+                                destination_path,
+                                destination,
+                                metadata,
+                                group,
+                            )
                             .await
                             .map(crate::engine::work::WorkResult::Transfer);
                     }
@@ -428,18 +460,29 @@ impl RemotePullExecutor {
                 // silently skipped.
                 self.backup_replacement(destination.as_ref()).await?;
                 let (summary, _) = self
-                    .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
+                    .fetch_into_staging(
+                        &source,
+                        &destination_path,
+                        expected_destination,
+                        &metadata,
+                        bsd_flags,
+                    )
                     .await?;
                 let op = if is_update {
                     crate::sync::output::ItemizeOp::Update
                 } else {
                     crate::sync::output::ItemizeOp::Create
                 };
-                self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+                self.report(
+                    op,
+                    crate::sync::output::ItemizeKind::File,
+                    &destination_path,
+                );
                 Ok(crate::engine::work::WorkResult::Transfer(summary))
             }
             RemotePullAction::ReplaceSymlink {
                 source,
+                destination_path,
                 destination,
                 modified,
             } => {
@@ -448,7 +491,7 @@ impl RemotePullExecutor {
                 })?;
                 let expected = destination_expectation(destination.as_ref())?;
                 let rooted = self.metadata_authority().await?.clone();
-                let relative = source.path.clone();
+                let relative = destination_path.clone();
                 let target = target.to_path_buf();
                 tokio::task::spawn_blocking(move || {
                     rooted.replace_symlink_blocking(
@@ -463,24 +506,29 @@ impl RemotePullExecutor {
                 self.report(
                     crate::sync::output::ItemizeOp::Create,
                     crate::sync::output::ItemizeKind::Symlink,
-                    &source.path,
+                    &destination_path,
                 );
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
             RemotePullAction::ApplyMetadata {
                 source,
-                expected_destination,
+                destination,
                 unix_mode,
                 modified,
             } => {
+                let expected_destination = destination.identity.ok_or_else(|| {
+                    RemotePullError::MissingDestinationIdentity(
+                        destination.path.as_path().to_path_buf(),
+                    )
+                })?;
                 self.remote.validate_observation(&source).await?;
                 let xattrs = self.read_source_xattrs(&source).await?;
                 let acls = self.read_source_acls(&source).await?;
                 let bsd_flags = self.read_source_bsd_flags(&source).await?;
                 self.remote.validate_observation(&source).await?;
                 let rooted = self.metadata_authority().await?.clone();
-                let relative = source.path.clone();
-                let kind = source.kind;
+                let relative = destination.path;
+                let kind = destination.kind;
                 tokio::task::spawn_blocking(move || {
                     rooted.apply_observed_preservation_blocking(
                         &relative,
@@ -512,6 +560,7 @@ impl RemotePullExecutor {
     async fn execute_grouped_fetch(
         &self,
         source: Entry,
+        destination_path: RelativePath,
         destination: Option<Entry>,
         metadata: PullTransferMetadata,
         group: [u8; 32],
@@ -534,7 +583,7 @@ impl RemotePullExecutor {
             self.backup_replacement(destination.as_ref()).await?;
 
             let rooted = self.metadata_authority().await?.clone();
-            let path = source.path.clone();
+            let path = destination_path.clone();
             let publication = tokio::task::spawn_blocking(move || {
                 rooted.publish_hardlink_blocking(
                     &first.path,
@@ -551,7 +600,11 @@ impl RemotePullExecutor {
             } else {
                 crate::sync::output::ItemizeOp::Create
             };
-            self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+            self.report(
+                op,
+                crate::sync::output::ItemizeKind::File,
+                &destination_path,
+            );
             return Ok(crate::engine::work::TransferSummary {
                 file_size: source.size,
                 digest: [0_u8; 32],
@@ -564,13 +617,19 @@ impl RemotePullExecutor {
         let bsd_flags = self.read_source_bsd_flags(&source).await?;
         self.backup_replacement(destination.as_ref()).await?;
         let (summary, publication) = self
-            .fetch_into_staging(&source, expected_destination, &metadata, bsd_flags)
+            .fetch_into_staging(
+                &source,
+                &destination_path,
+                expected_destination,
+                &metadata,
+                bsd_flags,
+            )
             .await?;
         groups
             .insert(
                 group,
                 HardlinkRepresentative {
-                    path: source.path.clone(),
+                    path: destination_path.clone(),
                     publication: publication.identity,
                     unix_mode: metadata.unix_mode,
                     modified: metadata.modified,
@@ -583,7 +642,11 @@ impl RemotePullExecutor {
         } else {
             crate::sync::output::ItemizeOp::Create
         };
-        self.report(op, crate::sync::output::ItemizeKind::File, &source.path);
+        self.report(
+            op,
+            crate::sync::output::ItemizeKind::File,
+            &destination_path,
+        );
         Ok(summary)
     }
 
@@ -595,6 +658,7 @@ impl RemotePullExecutor {
     async fn fetch_into_staging(
         &self,
         source: &Entry,
+        destination_path: &RelativePath,
         expected_destination: ExpectedDestination,
         metadata: &PullTransferMetadata,
         final_flags: Option<u32>,
@@ -602,13 +666,13 @@ impl RemotePullExecutor {
         crate::engine::work::TransferSummary,
         crate::rooted_fs::PublishedFileProof,
     )> {
-        let dest = self.dest_path(&source.path);
+        let dest = self.dest_path(destination_path);
         let staged_metadata = staged_file_metadata(metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone())
             .with_rooted_authority(self.metadata_authority().await?.clone())
             .with_publication_admission(self.sender.publication_admission());
         let mut staged = endpoint
-            .begin_write(source.path.as_path(), expected_destination)
+            .begin_write(destination_path.as_path(), expected_destination)
             .await?;
         let fetched = fetch_file(
             &self.sender,
@@ -668,7 +732,7 @@ impl RemotePullExecutor {
         crate::remote::fetch::acknowledge_fetch(&self.sender, fetched.stream_id)
             .await
             .map_err(|error| RemotePullError::CommittedAckFailed {
-                path: source.path.as_path().to_path_buf(),
+                path: destination_path.as_path().to_path_buf(),
                 reason: error.to_string(),
             })?;
         Ok((fetched.summary, publication))
@@ -854,16 +918,18 @@ impl RemotePullExecutor {
         if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
             return Ok(None);
         }
-        let expected_destination = destination.identity.ok_or_else(|| {
-            RemotePullError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
-        })?;
+        if destination.identity.is_none() {
+            return Err(RemotePullError::MissingDestinationIdentity(
+                destination.path.as_path().to_path_buf(),
+            ));
+        }
         let (unix_mode, modified) =
             crate::remote::pull_lower::requested_metadata(&source, &destination, policy)?
                 .unwrap_or((None, None));
         Ok(Some(WorkItem::new(
             RemotePullAction::ApplyMetadata {
                 source,
-                expected_destination,
+                destination,
                 unix_mode,
                 modified,
             },
@@ -973,8 +1039,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
         op: crate::engine::domain::SyncOp,
         policy: crate::engine::planner::ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<RemotePullAction>>, RemotePullError> {
-        if op.path() != &op.source().path {
-            return Err(RemotePullError::DestinationAddressUnsupported);
+        if op.source().is_directory() && op.path() != &op.source().path {
+            return Err(RemotePullError::DirectoryAddressUnsupported(
+                op.path().clone(),
+            ));
         }
         if let crate::engine::domain::SyncOp::Unchanged {
             source,
