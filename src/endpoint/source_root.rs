@@ -13,6 +13,13 @@ pub struct SourceRoot {
 }
 
 impl SourceRoot {
+    /// Retain the authority already captured during operand classification.
+    pub fn from_rooted(rooted: RootedFs) -> Self {
+        Self {
+            rooted: rooted.into_local_source_authority(),
+        }
+    }
+
     pub async fn open(path: PathBuf) -> rooted_fs::Result<Self> {
         Ok(Self {
             rooted: RootedFs::open(path).await?.into_local_source_authority(),

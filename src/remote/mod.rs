@@ -4,6 +4,7 @@ mod data;
 pub mod fetch;
 pub mod hash;
 pub mod local_executor;
+pub mod operand;
 pub mod path;
 pub mod pull;
 pub mod pull_lower;
@@ -19,7 +20,7 @@ pub mod ssh;
 pub mod transfer;
 pub mod xattr;
 
-use crate::endpoint::{Capabilities as EndpointCapabilities, Endpoint};
+use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::protocol::{
     negotiate_version, read_frame, write_frame, CapabilitySet, ClientHello, Frame, FrameKind,
     Operation, Platform, PlatformOs, ProtocolError, ServerHello, SessionOpen, SessionReady,
@@ -71,13 +72,13 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 struct ClientSession {
     server: ServerHello,
     capabilities: EndpointCapabilities,
-    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
+    ready: SessionReady,
 }
 
 #[derive(Debug, Clone)]
 enum SessionRoot {
     Present(RootedFs),
-    AbsentPreview,
+    Pending(crate::rooted_fs::operand::PendingRoot),
 }
 
 #[derive(Debug, Clone)]
@@ -92,11 +93,26 @@ struct OpenedServerSession {
 
 /// Perform the v3 client control-plane handshake over an already-connected
 /// transport. No file data is exchanged here.
+#[cfg(test)]
 async fn client_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     operation: Operation,
     root: &Path,
+) -> Result<ClientSession>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    client_operand_handshake(reader, writer, operation, root, None).await
+}
+
+async fn client_operand_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    operation: Operation,
+    root: &Path,
+    operand: Option<&operand::RemoteOperand>,
 ) -> Result<ClientSession>
 where
     R: AsyncRead + Unpin,
@@ -119,22 +135,25 @@ where
     negotiate_version(versions, VersionRange::exact(server.version))?;
 
     let root = encode_target_root(root, server.platform.os)?;
-    let open = SessionOpen::new(operation, root);
+    let mut open = SessionOpen::new(operation, root);
+    if let Some(operand) = operand {
+        open.operand = operand.encode(server.platform.os)?;
+    }
     let frame = Frame::control(FrameKind::SessionOpen, open.encode()?)?;
     write_frame(writer, &frame).await?;
     writer.flush().await?;
 
     let frame = read_frame(reader).await?;
     expect_control(&frame, FrameKind::SessionReady)?;
-    let ready = SessionReady::decode(frame.payload(), server.version)?;
+    let ready = SessionReady::decode(frame.payload())?;
+    ready.validate_for(&open)?;
     let capabilities =
         EndpointCapabilities::from_negotiated_wire(ready.capabilities, ready.modtime_precision_ns);
-    let namespace_semantics = ready.namespace_semantics.map(Into::into);
 
     Ok(ClientSession {
         server,
         capabilities,
-        namespace_semantics,
+        ready,
     })
 }
 
@@ -163,22 +182,64 @@ where
     let frame = read_frame(reader).await?;
     expect_control(&frame, FrameKind::SessionOpen)?;
     let open = SessionOpen::decode(frame.payload())?;
-    let root = expand_tilde(decode_native_root(open.root)?);
-    let rooted = prepare_root(open.operation, &root).await?;
+    let path = expand_tilde(decode_native_root(open.path)?);
+    let (rooted, resolved, source_shape) = match open.operand {
+        crate::protocol::OperandRequest::Source { contents } => {
+            let source = crate::rooted_fs::operand::BoundSource::open(path, contents).await?;
+            let resolved = match &source.shape {
+                crate::rooted_fs::operand::SourceShape::Directory { .. } => {
+                    crate::protocol::ResolvedOperand::Tree
+                }
+                crate::rooted_fs::operand::SourceShape::Leaf { name } => {
+                    crate::protocol::ResolvedOperand::Entry {
+                        name: encode_target_root(name.as_path(), Platform::current().os)?,
+                    }
+                }
+            };
+            let shape = operand::native_shape(&source.shape)?;
+            (SessionRoot::Present(source.rooted), resolved, Some(shape))
+        }
+        crate::protocol::OperandRequest::Destination { source } => {
+            let source = operand::decode_shape(source)?;
+            let destination =
+                crate::rooted_fs::operand::BoundDestination::open(path, source).await?;
+            let resolved = match destination.name {
+                None => crate::protocol::ResolvedOperand::Tree,
+                Some(name) => crate::protocol::ResolvedOperand::Entry {
+                    name: encode_target_root(name.as_path(), Platform::current().os)?,
+                },
+            };
+            let root = match destination.root {
+                crate::rooted_fs::operand::DestinationRoot::Present(rooted) => {
+                    SessionRoot::Present(rooted)
+                }
+                crate::rooted_fs::operand::DestinationRoot::Pending(pending) => {
+                    SessionRoot::Pending(pending)
+                }
+            };
+            (root, resolved, None)
+        }
+    };
+    let root = match &rooted {
+        SessionRoot::Present(rooted) => rooted.root_path().to_path_buf(),
+        SessionRoot::Pending(pending) => pending.path().to_path_buf(),
+    };
 
-    let endpoint = crate::endpoint::local::LocalEndpoint::new(root.clone());
     let capabilities = negotiated_capabilities(client.capabilities);
-    let precision = endpoint.capabilities().modtime_precision.as_nanos();
-    let modtime_precision_ns = u64::try_from(precision).unwrap_or(u64::MAX);
+    // Native stat timestamp fields do not certify filesystem timestamp precision.
+    let modtime_precision_ns = 0;
     // Root-scoped name semantics: the client's alias preflight must follow the
     // opened filesystem, not the peer OS name.
     let namespace_semantics = match &rooted {
         SessionRoot::Present(rooted) => rooted.namespace_semantics().await?,
-        SessionRoot::AbsentPreview => crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+        SessionRoot::Pending(_) => crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
     }
     .into();
-    let ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
-    let frame = Frame::control(FrameKind::SessionReady, ready.encode(version))?;
+    let mut ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
+    ready.resolved = resolved;
+    ready.source_shape = source_shape;
+    ready.pending = matches!(rooted, SessionRoot::Pending(_));
+    let frame = Frame::control(FrameKind::SessionReady, ready.encode()?)?;
     write_frame(writer, &frame).await?;
     writer.flush().await?;
 
@@ -315,23 +376,6 @@ const fn acl_advertised_for(os: PlatformOs) -> bool {
         let _ = os;
         false
     }
-}
-
-async fn prepare_root(operation: Operation, root: &Path) -> Result<SessionRoot> {
-    if root.as_os_str().is_empty() {
-        return Err(RemoteError::InvalidRoot("root path is empty"));
-    }
-
-    match tokio::fs::try_exists(root).await? {
-        true => {}
-        false if operation == Operation::PreviewPush => return Ok(SessionRoot::AbsentPreview),
-        false if operation == Operation::Push => tokio::fs::create_dir_all(root).await?,
-        false => return Err(RemoteError::InvalidRoot("pull root does not exist")),
-    }
-    // Never substitute an ancestor descriptor for an absent preview root.
-    Ok(SessionRoot::Present(
-        RootedFs::open(root.to_path_buf()).await?,
-    ))
 }
 
 #[cfg(unix)]
@@ -485,15 +529,13 @@ mod tests {
         assert_eq!(client.server.version, SUPPORTED_VERSIONS.max);
         // The client receives the probed root semantics, not an OS guess.
         assert_eq!(
-            client.namespace_semantics,
-            Some(
-                crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
-                    .await
-                    .unwrap()
-                    .namespace_semantics()
-                    .await
-                    .unwrap()
-            )
+            crate::engine::namespace::NamespaceSemantics::from(client.ready.namespace_semantics),
+            crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
+                .await
+                .unwrap()
+                .namespace_semantics()
+                .await
+                .unwrap()
         );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
@@ -630,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_session_creates_missing_root() {
+    async fn push_session_binds_absence_without_creating_root() {
         let parent = tempfile::TempDir::new().unwrap();
         let root = parent.path().join("missing").join("nested");
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -649,15 +691,16 @@ mod tests {
         )
         .await
         .unwrap();
-        server.await.unwrap().unwrap();
-        assert!(root.is_dir());
+        let opened = server.await.unwrap().unwrap();
+        assert!(matches!(opened.rooted, SessionRoot::Pending(_)));
+        assert!(!root.parent().unwrap().exists());
     }
 
     #[tokio::test]
     async fn incompatible_client_is_rejected_before_root_creation() {
         let parent = tempfile::TempDir::new().unwrap();
         let root = parent.path().join("must-not-be-created");
-        let old = VersionRange::exact(crate::protocol::PROTOCOL_V3_8);
+        let old = VersionRange::exact(crate::protocol::PROTOCOL_V3_9);
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(server_io);
         let hello =
@@ -701,7 +744,7 @@ mod tests {
                 SUPPORTED_VERSIONS
             );
             let response = ServerHello::new(
-                crate::protocol::PROTOCOL_V3_8,
+                crate::protocol::PROTOCOL_V3_9,
                 process_capabilities(),
                 Platform::current(),
                 "old",

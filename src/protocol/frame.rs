@@ -62,6 +62,8 @@ pub enum FrameKind {
     /// Staged preservation on a file-transfer stream: the complete exacl-unified
     /// ACL text to apply before commit (empty text clears).
     FileAcls = 32,
+    /// Acquire an initially absent destination root for a chosen Create target.
+    AcquireRoot = 33,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -100,6 +102,7 @@ impl TryFrom<u8> for FrameKind {
             30 => Ok(Self::BsdFlagsResult),
             31 => Ok(Self::FileXattrs),
             32 => Ok(Self::FileAcls),
+            33 => Ok(Self::AcquireRoot),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }

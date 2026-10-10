@@ -50,6 +50,7 @@ pub(super) async fn run(
     user: &Option<String>,
     config: &SyncConfig,
     scan_options: ScanOptions,
+    contents: bool,
 ) -> Result<SyncStats> {
     let started = Instant::now();
     // OpenSSH resolves this alias with the user's own ssh_config; only an
@@ -71,10 +72,11 @@ pub(super) async fn run(
     // The pull session root is the remote SOURCE root. The server refuses to
     // create a missing pull root, which is the data-safe direction: a typo'd
     // source path fails loudly instead of scanning an empty new tree.
-    let session = SshRemoteSession::connect_with_options(
+    let session = SshRemoteSession::connect_operand_with_options(
         &target,
         Operation::Pull,
         source_root,
+        &sy::remote::operand::RemoteOperand::Source { contents },
         router_config,
         launch,
     )
@@ -87,14 +89,44 @@ pub(super) async fn run(
     let mut display_source = std::ffi::OsString::from(format!("{host}:"));
     display_source.push(source_root);
     let display_source = std::path::PathBuf::from(display_source);
-    let result = execute_with_handle(
-        &display_source,
-        destination_root,
-        remote,
-        sender,
-        config,
-        scan_options,
-    )
+    let result = async {
+        let shape = remote
+            .binding()
+            .source_shape
+            .clone()
+            .ok_or_else(|| SyncError::Config("peer omitted source operand shape".into()))?;
+        let shape = sy::remote::operand::decode_shape(shape).map_err(map_io)?;
+        let source_name = match &shape {
+            sy::rooted_fs::operand::SourceShape::Directory { .. } => None,
+            sy::rooted_fs::operand::SourceShape::Leaf { name } => Some(name.clone()),
+        };
+        let destination =
+            sy::rooted_fs::operand::BoundDestination::open(destination_root.to_path_buf(), shape)
+                .await
+                .map_err(map_io)?;
+        let scope = match (source_name, &destination.name) {
+            (None, None) => sy::engine::domain::SyncScope::Tree,
+            (Some(source), Some(destination)) => sy::engine::domain::SyncScope::SelectedLeaf {
+                source,
+                destination: destination.clone(),
+            },
+            _ => {
+                return Err(SyncError::Config(
+                    "inconsistent local destination operand binding".into(),
+                ))
+            }
+        };
+        execute_bound(
+            &display_source,
+            destination,
+            scope,
+            remote,
+            sender,
+            config,
+            scan_options,
+        )
+        .await
+    }
     .await;
     let mut stats = match result {
         Ok(stats) => {
@@ -112,6 +144,7 @@ pub(super) async fn run(
     Ok(stats)
 }
 
+#[cfg(test)]
 async fn execute_with_handle(
     source_root: &Path,
     destination_root: &Path,
@@ -120,6 +153,35 @@ async fn execute_with_handle(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    let destination = sy::rooted_fs::operand::BoundDestination::open(
+        destination_root.to_path_buf(),
+        sy::rooted_fs::operand::SourceShape::Directory { basename: None },
+    )
+    .await
+    .map_err(map_io)?;
+    execute_bound(
+        source_root,
+        destination,
+        sy::engine::domain::SyncScope::Tree,
+        remote,
+        sender,
+        config,
+        scan_options,
+    )
+    .await
+}
+
+async fn execute_bound(
+    source_root: &Path,
+    destination: sy::rooted_fs::operand::BoundDestination,
+    scope: sy::engine::domain::SyncScope,
+    remote: ClientRemoteHandle,
+    sender: sy::remote::router::RouterSender,
+    config: &SyncConfig,
+    scan_options: ScanOptions,
+) -> Result<SyncStats> {
+    let destination_root = destination.root.path().to_path_buf();
+    let destination_root = destination_root.as_path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -149,6 +211,7 @@ async fn execute_with_handle(
         sender,
         scheduler,
     )
+    .with_destination_binding(destination)
     .with_backup_enabled(config.backup.is_some())
     .with_backup(pull_backup_dir(config, destination_root))
     .with_backup_suffix(config.suffix.clone())
@@ -163,10 +226,20 @@ async fn execute_with_handle(
     // Pin local destination authority before admitting the remote producer.
     // Its complete scan never inherits source selection rules.
     let (namespace_semantics, mut destination) = executor
-        .destination_entries(destination_scan_request(config), config.dry_run)
+        .destination_entries(destination_scan_request(config))
         .await
         .map_err(map_io)?;
-    let source = match remote.scan(source_scan_request(config, scan_options)).await {
+    let source_scan = match &scope {
+        sy::engine::domain::SyncScope::Tree => {
+            remote.scan(source_scan_request(config, scan_options)).await
+        }
+        sy::engine::domain::SyncScope::SelectedLeaf { source, .. } => {
+            remote
+                .scan_entry(source_scan_request(config, scan_options), source.clone())
+                .await
+        }
+    };
+    let source = match source_scan {
         Ok(source) => source,
         Err(error) => {
             let operation = ControllerError::backend("source scan preparation", error);
@@ -192,7 +265,7 @@ async fn execute_with_handle(
     // follow selection exists; symlinks reconcile by target. Delete stays
     // disabled on v3 pull until the server-side ignore-scope design lands.
     let mut plan = preflight_sync_scoped_with_content(
-        OrderedReconciler::new(source, destination),
+        OrderedReconciler::with_scope(source, destination, scope),
         comparison_policy(config, namespace_semantics),
         delete_policy(&config.delete),
         move |entry| {
@@ -261,6 +334,21 @@ async fn execute_with_handle(
         return Ok(stats);
     }
 
+    let mut create = None;
+    plan.validate_operations(|operation| {
+        if create.is_none() && matches!(operation, sy::engine::domain::SyncOp::Create { .. }) {
+            create = Some(operation.path().clone());
+        }
+        futures::future::ready(Ok(()))
+    })
+    .await
+    .map_err(map_controller_error)?;
+    if let Some(create) = create {
+        executor
+            .acquire_destination_for_create(&create)
+            .await
+            .map_err(map_io)?;
+    }
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
     let summary: SyncSummary = SyncController::new(executor, max_in_flight)

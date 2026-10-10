@@ -42,9 +42,48 @@ pub struct ClientRemoteHandle {
     peer: PlatformOs,
     protocol_version: ProtocolVersion,
     capabilities: EndpointCapabilities,
-    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
     sender: RouterSender,
+    binding: std::sync::Arc<ClientRootBinding>,
 }
+
+/// One acknowledged root epoch, shared by the session and every request handle.
+/// The cell serializes acquisition; an interrupted attempt closes the session
+/// rather than retrying against a possibly acquired but unacknowledged root.
+pub(super) struct ClientRootBinding {
+    initial: crate::protocol::SessionReady,
+    acquired: tokio::sync::OnceCell<crate::protocol::SessionReady>,
+}
+
+impl ClientRootBinding {
+    pub(super) fn new(initial: crate::protocol::SessionReady) -> Self {
+        Self {
+            initial,
+            acquired: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub(super) fn ready(&self) -> &crate::protocol::SessionReady {
+        self.acquired.get().unwrap_or(&self.initial)
+    }
+}
+
+struct AcquisitionAttempt(Option<RouterSender>);
+
+impl Drop for AcquisitionAttempt {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            sender.fail(std::sync::Arc::new(
+                crate::remote::router::RouterError::SessionFailed(
+                    "root acquisition ended without a trusted acknowledgement".to_owned(),
+                ),
+            ));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "client_binding_tests.rs"]
+mod binding_tests;
 
 impl ClientRemoteSession {
     pub fn request_handle(&self) -> ClientRemoteHandle {
@@ -53,13 +92,83 @@ impl ClientRemoteSession {
             peer: self.server.platform.os,
             protocol_version: self.server.version,
             capabilities: self.capabilities,
-            namespace_semantics: self.namespace_semantics,
             sender: self.router.sender(),
+            binding: std::sync::Arc::clone(&self.binding),
         }
     }
 }
 
 impl ClientRemoteHandle {
+    pub fn binding(&self) -> &crate::protocol::SessionReady {
+        self.binding.ready()
+    }
+
+    /// Full preflight has drained scans and selected a Create at this address.
+    pub async fn acquire_root_for_create(&self, create: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::AcquireRoot)?;
+        if !self.binding().pending {
+            return Ok(());
+        }
+        self.binding
+            .acquired
+            .get_or_try_init(|| async {
+                let mut attempt = AcquisitionAttempt(Some(self.sender.clone()));
+                let ready = self.request_root_acquisition(create).await?;
+                attempt.0 = None;
+                Ok::<_, super::RemoteSessionError>(ready)
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn request_root_acquisition(
+        &self,
+        create: &RelativePath,
+    ) -> Result<crate::protocol::SessionReady> {
+        let request = crate::protocol::AcquireRoot {
+            create: crate::remote::path::encode_relative_path(create.as_path())
+                .map_err(|error| crate::remote::RemoteError::Io(std::io::Error::other(error)))?,
+        };
+        let mut inbox = self.sender.open_stream()?;
+        let id = inbox.stream_id();
+        let frame = crate::protocol::Frame::new(
+            FrameKind::AcquireRoot,
+            crate::protocol::FrameFlags::FINAL | crate::protocol::FrameFlags::ACK_REQUIRED,
+            id,
+            request.encode(),
+        )
+        .map_err(crate::remote::RemoteError::from)?;
+        self.sender.send(frame).await?;
+        let routed = inbox.recv().await?.ok_or_else(|| {
+            crate::remote::RemoteError::Protocol(crate::protocol::ProtocolError::InvalidMessage(
+                "acquisition ended before acknowledgement",
+            ))
+        })?;
+        let frame = routed.frame();
+        if frame.kind() != FrameKind::Ack || !frame.flags().is_empty() {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage(
+                    "invalid acquisition acknowledgement",
+                ),
+            )
+            .into());
+        }
+        let ready = crate::protocol::SessionReady::decode(frame.payload())
+            .map_err(crate::remote::RemoteError::from)?;
+        if ready.pending
+            || ready.resolved != self.binding.initial.resolved
+            || ready.source_shape != self.binding.initial.source_shape
+        {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage(
+                    "acquisition changed operand binding",
+                ),
+            )
+            .into());
+        }
+        Ok(ready)
+    }
+
     pub const fn operation(&self) -> Operation {
         self.operation
     }
@@ -76,12 +185,9 @@ impl ClientRemoteHandle {
         &self.capabilities
     }
 
-    /// Destination name-comparison semantics probed by the server for the
-    /// negotiated root. `None` only when the negotiated protocol is 3.0.
-    pub const fn namespace_semantics(
-        &self,
-    ) -> Option<crate::engine::namespace::NamespaceSemantics> {
-        self.namespace_semantics
+    /// Actual held-root semantics; pending roots remain unqualified.
+    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
+        self.binding().namespace_semantics.into()
     }
 
     /// The session's frame router sender. Executors open fetch streams

@@ -407,6 +407,7 @@ Or install from local source with: cargo install --path . --features acl"#
             EndpointPair::from_sync_path(destination)?,
             config.clone(),
         )
+        .with_source_contents(source.has_trailing_slash())
     }
     .with_scan_options(cli.scan_options());
 

@@ -75,24 +75,7 @@ async fn serve_requests(
     tasks: &mut JoinSet<RequestResult>,
     max_tasks: usize,
 ) -> Result<()> {
-    let handlers = RequestHandlers {
-        scan: session.scan_handler(),
-        native: if session.has_root() {
-            Some(NativeRequestHandlers {
-                hash: session.hash_handler()?,
-                signatures: session.signature_handler()?,
-                file: session.file_handler()?,
-                metadata: session.metadata_handler()?,
-                mutation: session.mutation_handler()?,
-                xattr: session.xattr_handler()?,
-                acl: session.acl_handler()?,
-                bsd_flags: session.bsd_flags_handler()?,
-                fetch: fetch_handler(session)?,
-            })
-        } else {
-            None
-        },
-    };
+    let mut handlers = RequestHandlers::new(session)?;
     let mut accepting = true;
     let mut failure = None;
 
@@ -104,9 +87,18 @@ async fn serve_requests(
                 biased;
                 joined = tasks.join_next(), if !tasks.is_empty() => check_joined(joined),
                 request = session.next_request() => match request {
-                    Ok(Some(request)) => {
-                        spawn_request(tasks, &handlers, request)
+                    Ok(Some(IncomingRequest::AcquireRoot(incoming))) => {
+                        // Producers own their blocking work until drained. Never
+                        // change root authority beneath active scans/handlers.
+                        let drained = async {
+                            while !tasks.is_empty() { check_joined(tasks.join_next().await)?; }
+                            session.acquire_root(incoming).await?;
+                            handlers = RequestHandlers::new(session)?;
+                            Ok(())
+                        }.await;
+                        drained
                     }
+                    Ok(Some(request)) => spawn_request(tasks, &handlers, request),
                     Ok(None) => {
                         accepting = false;
                         Ok(())
@@ -171,10 +163,31 @@ fn fetch_handler(session: &ServerRemoteSession) -> Result<ServerFetchHandler> {
 }
 
 impl RequestHandlers {
+    fn new(session: &ServerRemoteSession) -> Result<Self> {
+        Ok(Self {
+            scan: session.scan_handler(),
+            native: if session.has_root() {
+                Some(NativeRequestHandlers {
+                    hash: session.hash_handler()?,
+                    signatures: session.signature_handler()?,
+                    file: session.file_handler()?,
+                    metadata: session.metadata_handler()?,
+                    mutation: session.mutation_handler()?,
+                    xattr: session.xattr_handler()?,
+                    acl: session.acl_handler()?,
+                    bsd_flags: session.bsd_flags_handler()?,
+                    fetch: fetch_handler(session)?,
+                })
+            } else {
+                None
+            },
+        })
+    }
+
     fn native(&self) -> Result<&NativeRequestHandlers> {
         self.native
             .as_ref()
-            .ok_or_else(|| RemoteSessionError::AbsentPreviewRoot.into())
+            .ok_or_else(|| RemoteSessionError::PendingRoot.into())
     }
 }
 
@@ -184,6 +197,9 @@ fn spawn_request(
     request: IncomingRequest,
 ) -> Result<()> {
     match request {
+        IncomingRequest::AcquireRoot(_) => {
+            return Err(ServeError::Request("acquisition bypassed barrier".into()))
+        }
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
             tasks.spawn(async move {

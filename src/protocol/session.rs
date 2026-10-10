@@ -1,6 +1,7 @@
 use super::codec::SliceReader;
-use super::handshake::{ProtocolVersion, PROTOCOL_V3_1};
-use super::{CapabilitySet, ProtocolError, Result, WirePath, MAX_WIRE_PATH_BYTES};
+use super::operand::{get_path, put_path};
+use super::{CapabilitySet, ProtocolError, Result, WirePath};
+use super::{OperandRequest, ResolvedOperand, SourceShape};
 use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,46 +31,70 @@ impl TryFrom<u8> for Operation {
 
 /// Opens the remote endpoint after protocol/platform negotiation.
 ///
-/// `root` is encoded for the server platform announced in `ServerHello`. Keeping
-/// it out of `ClientHello` avoids interpreting target-native bytes before the
-/// target platform is known.
+/// The operand path is encoded for the server platform announced in
+/// `ServerHello`. Its role and source shape determine the actual held root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOpen {
     pub operation: Operation,
-    pub root: WirePath,
+    pub path: WirePath,
+    pub operand: OperandRequest,
 }
 
 impl SessionOpen {
-    pub const fn new(operation: Operation, root: WirePath) -> Self {
-        Self { operation, root }
+    /// Explicit directory-root API used by low-level endpoint callers.
+    pub fn new(operation: Operation, path: WirePath) -> Self {
+        let operand = match operation {
+            Operation::Pull => OperandRequest::Source { contents: true },
+            Operation::Push | Operation::PreviewPush => OperandRequest::Destination {
+                source: SourceShape::Directory { basename: None },
+            },
+        };
+        Self {
+            operation,
+            path,
+            operand,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if matches!(
+            (&self.operation, &self.operand),
+            (Operation::Pull, OperandRequest::Source { .. })
+                | (
+                    Operation::Push | Operation::PreviewPush,
+                    OperandRequest::Destination { .. }
+                )
+        ) {
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidMessage(
+                "operand role disagrees with operation",
+            ))
+        }
     }
 
     pub fn encode(&self) -> Result<Bytes> {
-        let root_len =
-            u32::try_from(self.root.as_bytes().len()).map_err(|_| ProtocolError::InvalidField {
-                field: "root",
-                reason: "root path length exceeds u32",
-            })?;
-        let mut out = BytesMut::with_capacity(5 + self.root.as_bytes().len());
+        self.validate()?;
+        let mut out = BytesMut::new();
         out.put_u8(self.operation as u8);
-        out.put_u32(root_len);
-        out.extend_from_slice(self.root.as_bytes());
+        self.operand.put(&mut out)?;
+        put_path(&mut out, &self.path)?;
         Ok(out.freeze())
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let operation = Operation::try_from(reader.u8()?)?;
-        let root_len = reader.u32()? as usize;
-        if root_len > MAX_WIRE_PATH_BYTES {
-            return Err(ProtocolError::PathTooLong {
-                len: root_len,
-                max: MAX_WIRE_PATH_BYTES,
-            });
-        }
-        let root = WirePath::new(Bytes::copy_from_slice(reader.take(root_len)?))?;
+        let operand = OperandRequest::get(&mut reader)?;
+        let path = get_path(&mut reader)?;
         reader.finish()?;
-        Ok(Self { operation, root })
+        let open = Self {
+            operation,
+            path,
+            operand,
+        };
+        open.validate()?;
+        Ok(open)
     }
 }
 
@@ -126,16 +151,18 @@ impl WireNamespaceSemantics {
     }
 }
 
-/// Confirms that the root was opened and reports capabilities for that concrete
-/// endpoint/filesystem, which may be narrower than process-wide capabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Reports the resolved physical query and its held or pending root authority.
+/// A pending destination has no filesystem-qualified namespace profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionReady {
     pub capabilities: CapabilitySet,
     /// Timestamp comparison resolution for this endpoint. Zero means unknown.
     pub modtime_precision_ns: u64,
-    /// Root name-comparison semantics. Always present for negotiated
-    /// protocol >= 3.1; `None` only when decoding a 3.0 peer's message.
-    pub namespace_semantics: Option<WireNamespaceSemantics>,
+    /// Name semantics of the actual root; pending roots are unqualified.
+    pub namespace_semantics: WireNamespaceSemantics,
+    pub resolved: ResolvedOperand,
+    pub source_shape: Option<SourceShape>,
+    pub pending: bool,
 }
 
 impl SessionReady {
@@ -147,45 +174,95 @@ impl SessionReady {
         Self {
             capabilities,
             modtime_precision_ns,
-            namespace_semantics: Some(namespace_semantics),
+            namespace_semantics,
+            resolved: ResolvedOperand::Tree,
+            source_shape: None,
+            pending: false,
         }
     }
 
-    pub fn encode(self, version: ProtocolVersion) -> Bytes {
-        let mut out = BytesMut::with_capacity(17);
+    pub(crate) fn validate_for(&self, open: &SessionOpen) -> Result<()> {
+        let valid = match (&open.operand, &self.source_shape, &self.resolved) {
+            (
+                OperandRequest::Source { contents },
+                Some(SourceShape::Directory { basename }),
+                ResolvedOperand::Tree,
+            ) => !self.pending && (!contents || basename.is_none()),
+            (
+                OperandRequest::Source { .. },
+                Some(SourceShape::Leaf { name }),
+                ResolvedOperand::Entry { name: selected },
+            ) => !self.pending && name == selected,
+            (
+                OperandRequest::Destination {
+                    source: SourceShape::Directory { .. },
+                },
+                None,
+                ResolvedOperand::Tree,
+            )
+            | (
+                OperandRequest::Destination {
+                    source: SourceShape::Leaf { .. },
+                },
+                None,
+                ResolvedOperand::Entry { .. },
+            ) => true,
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidMessage(
+                "resolved operand disagrees with request",
+            ))
+        }
+    }
+
+    pub fn encode(&self) -> Result<Bytes> {
+        let mut out = BytesMut::new();
         out.put_u64(self.capabilities.bits());
         out.put_u64(self.modtime_precision_ns);
-        if version >= PROTOCOL_V3_1 {
-            match self.namespace_semantics {
-                Some(semantics) => out.put_u8(semantics.encode()),
-                // A 3.1 encoder always sends a concrete answer; unknown axes
-                // are values, not absent fields.
-                None => out.put_u8(
-                    WireNamespaceSemantics {
-                        case: NameFolding::Unspecified,
-                        normalization: NameFolding::Unspecified,
-                    }
-                    .encode(),
-                ),
+        out.put_u8(self.namespace_semantics.encode());
+        self.resolved.put(&mut out)?;
+        match &self.source_shape {
+            None => out.put_u8(0),
+            Some(shape) => {
+                out.put_u8(1);
+                shape.put(&mut out)?;
             }
         }
-        out.freeze()
+        out.put_u8(u8::from(self.pending));
+        Ok(out.freeze())
     }
 
-    pub fn decode(payload: &[u8], version: ProtocolVersion) -> Result<Self> {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(payload);
         let capabilities = CapabilitySet::from_bits_retain(reader.u64()?);
         let modtime_precision_ns = reader.u64()?;
-        let namespace_semantics = if version >= PROTOCOL_V3_1 {
-            Some(WireNamespaceSemantics::decode(reader.u8()?)?)
-        } else {
-            None
+        let namespace_semantics = WireNamespaceSemantics::decode(reader.u8()?)?;
+        let resolved = ResolvedOperand::get(&mut reader)?;
+        let source_shape = match reader.u8()? {
+            0 => None,
+            1 => Some(SourceShape::get(&mut reader)?),
+            _ => {
+                return Err(ProtocolError::InvalidMessage(
+                    "unknown source shape presence",
+                ))
+            }
+        };
+        let pending = match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtocolError::InvalidMessage("unknown pending root flag")),
         };
         reader.finish()?;
         Ok(Self {
             capabilities,
             modtime_precision_ns,
             namespace_semantics,
+            resolved,
+            source_shape,
+            pending,
         })
     }
 }
@@ -193,6 +270,7 @@ impl SessionReady {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MAX_WIRE_PATH_BYTES;
 
     #[test]
     fn session_open_round_trip_preserves_target_native_root() {
@@ -231,34 +309,71 @@ mod tests {
                 normalization: NameFolding::Unspecified,
             },
         );
-        let decoded = SessionReady::decode(&ready.encode(PROTOCOL_V3_1), PROTOCOL_V3_1).unwrap();
+        let decoded = SessionReady::decode(&ready.encode().unwrap()).unwrap();
         assert_eq!(decoded, ready);
     }
 
     #[test]
-    fn session_ready_v3_0_shape_carries_no_semantics() {
-        let ready = SessionReady::new(
+    fn operand_layout_rejects_invalid_tags_lengths_and_truncation() {
+        let name = WirePath::new(b"name\xff".to_vec()).unwrap();
+        let open = SessionOpen {
+            operation: Operation::Push,
+            path: WirePath::new(b"/target".to_vec()).unwrap(),
+            operand: OperandRequest::Destination {
+                source: SourceShape::Leaf { name: name.clone() },
+            },
+        };
+        let encoded = open.encode().unwrap();
+        assert_eq!(SessionOpen::decode(&encoded).unwrap(), open);
+        for len in 0..encoded.len() {
+            assert!(SessionOpen::decode(&encoded[..len]).is_err());
+        }
+        for offset in [0, 1, 2] {
+            let mut invalid = encoded.to_vec();
+            invalid[offset] = 255;
+            assert!(SessionOpen::decode(&invalid).is_err());
+        }
+        let mut oversized = encoded.to_vec();
+        oversized[3..7].copy_from_slice(&((MAX_WIRE_PATH_BYTES + 1) as u32).to_be_bytes());
+        assert!(matches!(
+            SessionOpen::decode(&oversized),
+            Err(ProtocolError::PathTooLong { .. })
+        ));
+        // Pull uses a distinct source request and a strictly boolean contents
+        // tag; destination shapes cannot be smuggled into that role.
+        let source = SessionOpen::new(Operation::Pull, WirePath::new(b"/source".to_vec()).unwrap());
+        let mut invalid = source.encode().unwrap().to_vec();
+        invalid[2] = 2;
+        assert!(SessionOpen::decode(&invalid).is_err());
+        let mut invalid = encoded.to_vec();
+        invalid[0] = Operation::Pull as u8;
+        assert!(SessionOpen::decode(&invalid).is_err());
+        let mut ready = SessionReady::new(
             CapabilitySet::BLAKE3,
-            7,
+            0,
             WireNamespaceSemantics {
-                case: NameFolding::Exact,
-                normalization: NameFolding::Exact,
+                case: NameFolding::Unspecified,
+                normalization: NameFolding::Unspecified,
             },
         );
-        let legacy = ready.encode(super::super::handshake::PROTOCOL_V3);
-        assert_eq!(legacy.len(), 16);
-        let decoded = SessionReady::decode(&legacy, super::super::handshake::PROTOCOL_V3).unwrap();
-        assert_eq!(decoded.namespace_semantics, None);
-        assert_eq!(decoded.capabilities, CapabilitySet::BLAKE3);
-
-        // Shape follows the negotiated version, so mismatched expectations
-        // fail loudly instead of silently reading the wrong fields.
-        assert!(SessionReady::decode(&legacy, PROTOCOL_V3_1).is_err());
-        assert!(SessionReady::decode(
-            &ready.encode(PROTOCOL_V3_1),
-            super::super::handshake::PROTOCOL_V3
-        )
-        .is_err());
+        ready.resolved = ResolvedOperand::Entry { name: name.clone() };
+        ready.source_shape = Some(SourceShape::Leaf { name });
+        let encoded = ready.encode().unwrap();
+        assert_eq!(SessionReady::decode(&encoded).unwrap(), ready);
+        for len in 0..encoded.len() {
+            assert!(SessionReady::decode(&encoded[..len]).is_err());
+        }
+        for offset in [16, 17, 27, 28, encoded.len() - 1] {
+            let mut invalid = encoded.to_vec();
+            invalid[offset] = 255;
+            assert!(SessionReady::decode(&invalid).is_err());
+        }
+        let mut oversized = encoded.to_vec();
+        oversized[18..22].copy_from_slice(&((MAX_WIRE_PATH_BYTES + 1) as u32).to_be_bytes());
+        assert!(matches!(
+            SessionReady::decode(&oversized),
+            Err(ProtocolError::PathTooLong { .. })
+        ));
     }
 
     #[test]

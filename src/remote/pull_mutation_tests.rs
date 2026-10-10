@@ -392,8 +392,14 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                         client.sender(),
                         Scheduler::new(ResourceBudget::default()).unwrap(),
                     );
+                    // Discovery is now read-only even for a real run. The
+                    // separate post-preflight acquisition owns mkdir admission.
+                    let (_, entries) = fresh.destination_entries(Default::default()).await.unwrap();
+                    assert!(entries.try_collect::<Vec<_>>().await.unwrap().is_empty());
                     assert!(matches!(
-                        fresh.destination_entries(Default::default(), false).await,
+                        fresh
+                            .acquire_destination_for_create(&RelativePath::new("file").unwrap())
+                            .await,
                         Err(RemotePullError::Rooted(RootedFsError::CommitCancelled))
                     ));
                     assert!(!destination_root.path().join("absent").exists());

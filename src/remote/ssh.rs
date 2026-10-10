@@ -74,10 +74,36 @@ impl SshRemoteSession {
         Self::connect_command(command, operation, remote_root, router_config).await
     }
 
+    pub async fn connect_operand_with_options(
+        target: &SshTarget,
+        operation: Operation,
+        path: &Path,
+        operand: &crate::remote::operand::RemoteOperand,
+        router_config: RouterConfig,
+        launch: SshLaunchOptions,
+    ) -> Result<Self> {
+        let mut command = Command::new("ssh");
+        command.args(ssh_arguments(target, &launch));
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::inherit());
+        Self::connect_command_operand(command, operation, path, Some(operand), router_config).await
+    }
+
     async fn connect_command(
+        command: Command,
+        operation: Operation,
+        path: &Path,
+        config: RouterConfig,
+    ) -> Result<Self> {
+        Self::connect_command_operand(command, operation, path, None, config).await
+    }
+
+    async fn connect_command_operand(
         mut command: Command,
         operation: Operation,
         remote_root: &Path,
+        operand: Option<&crate::remote::operand::RemoteOperand>,
         router_config: RouterConfig,
     ) -> Result<Self> {
         command.kill_on_drop(true);
@@ -90,9 +116,30 @@ impl SshRemoteSession {
                 .stdout
                 .take()
                 .context("failed to open v3 SSH stdout")?;
-            ClientRemoteSession::connect(reader, writer, operation, remote_root, router_config)
-                .await
-                .context("v3 SSH handshake failed")
+            match operand {
+                Some(operand) => {
+                    ClientRemoteSession::connect_operand(
+                        reader,
+                        writer,
+                        operation,
+                        remote_root,
+                        operand,
+                        router_config,
+                    )
+                    .await
+                }
+                None => {
+                    ClientRemoteSession::connect(
+                        reader,
+                        writer,
+                        operation,
+                        remote_root,
+                        router_config,
+                    )
+                    .await
+                }
+            }
+            .context("v3 SSH handshake failed")
         }
         .await;
         match connection {
