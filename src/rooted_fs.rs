@@ -2707,46 +2707,16 @@ impl RootedFs {
         kind: EntryKind,
         xattrs: &[(OsString, Vec<u8>)],
     ) -> Result<()> {
-        use xattr::FileExt;
-
-        let total = xattrs.iter().try_fold(0_usize, |total, (name, value)| {
-            total
-                .checked_add(name.as_bytes().len())
-                .and_then(|value_total| value_total.checked_add(value.len()))
-                .ok_or(RootedFsError::XattrSetTooLarge {
-                    len: usize::MAX,
-                    max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-                })
-        })?;
-        if total > crate::protocol::MAX_XATTR_TOTAL_BYTES {
-            return Err(RootedFsError::XattrSetTooLarge {
-                len: total,
-                max: crate::protocol::MAX_XATTR_TOTAL_BYTES,
-            });
+        MetadataPreservation {
+            xattrs: Some(xattrs),
+            ..Default::default()
         }
-
+        .validate()?;
         let file = self.open_xattr_entry_blocking(relative, kind)?;
         require_exclusive_file_metadata(&file, relative)?;
         self.verify_metadata_binding_blocking(relative, &file, kind)?;
         let _permit = self.admit_mutation_blocking()?;
-        for (name, value) in xattrs {
-            file.set_xattr(name, value)?;
-        }
-        // Mirror semantics: attributes that exist only on the destination are
-        // removed so stale values cannot survive a sync.
-        for existing in file.list_xattr()? {
-            if !xattrs.iter().any(|(name, _)| name == &existing) {
-                match file.remove_xattr(&existing) {
-                    Ok(()) => {}
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::PermissionDenied
-                            || error.raw_os_error() == Some(libc::EPERM)
-                            || error.raw_os_error() == Some(libc::EACCES) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        Ok(())
+        metadata::mirror_xattrs_fd(&file, xattrs)
     }
 
     #[cfg(not(unix))]
@@ -4828,13 +4798,15 @@ mod tests {
         std::fs::create_dir(root.path().join("dir")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let name = OsString::from("user.sy-test");
+        let file = rooted.open_regular_blocking(&relative("file")).unwrap();
+        // A successful exact request includes native fields (e.g. SELinux's
+        // automatic label), changing only the intentional user attribute.
+        let native_attrs = read_xattrs_from_file(&file).unwrap();
+        let mut attrs = native_attrs.clone();
+        attrs.push((name.clone(), b"one".to_vec()));
 
         rooted
-            .write_xattrs_blocking(
-                &relative("file"),
-                EntryKind::File,
-                &[(name.clone(), b"one".to_vec())],
-            )
+            .write_xattrs_blocking(&relative("file"), EntryKind::File, &attrs)
             .unwrap();
         let written_identity = rooted
             .path_identity_blocking(&relative("file"))
@@ -4854,9 +4826,9 @@ mod tests {
             vec![(name.clone(), b"one".to_vec())]
         );
 
-        // Mirroring an empty set clears stale destination attributes.
+        // Mirroring the original native set clears the stale user attribute.
         rooted
-            .write_xattrs_blocking(&relative("file"), EntryKind::File, &[])
+            .write_xattrs_blocking(&relative("file"), EntryKind::File, &native_attrs)
             .unwrap();
         let cleared_identity = rooted
             .path_identity_blocking(&relative("file"))
@@ -4875,6 +4847,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .1;
+        let directory = rooted
+            .open_xattr_entry_blocking(Path::new("dir"), EntryKind::Directory)
+            .unwrap();
+        let mut attrs = read_xattrs_from_file(&directory).unwrap();
+        attrs.push((name.clone(), b"dir".to_vec()));
         rooted
             .finalize_directory_blocking(
                 &relative("dir"),
@@ -4882,7 +4859,7 @@ mod tests {
                 None,
                 None,
                 &DirectoryPreservation {
-                    xattrs: Some(vec![(name.clone(), b"dir".to_vec())]),
+                    xattrs: Some(attrs),
                     ..Default::default()
                 },
             )

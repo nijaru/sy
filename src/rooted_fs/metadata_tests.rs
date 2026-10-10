@@ -183,6 +183,57 @@ async fn native_acl_outcome_is_verified_without_rewriting_its_mask() {
 }
 
 #[tokio::test]
+async fn exact_xattr_mirror_reports_denied_required_removal() {
+    for observed in [false, true] {
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("file");
+        std::fs::write(&path, b"unchanged").unwrap();
+        let file = File::open(&path).unwrap();
+        file.set_xattr("user.sy-stale", b"old").unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let rooted = RootedFs::open(destination.path().to_path_buf())
+            .await
+            .unwrap();
+        let expected = rooted
+            .path_identity_blocking(&relative())
+            .unwrap()
+            .unwrap()
+            .1;
+        // Unlike successful fixtures, this deliberately requests removal of
+        // every attribute on an unwritable inode. Exact preservation must fail,
+        // not claim success while ignoring EACCES/EPERM from required removals.
+        let result = if observed {
+            rooted
+                .apply_observed_preservation_blocking(
+                    &relative(),
+                    EntryKind::File,
+                    expected,
+                    None,
+                    None,
+                    &MetadataPreservation {
+                        xattrs: Some(&[]),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| ())
+        } else {
+            rooted.write_xattrs_blocking(&relative(), EntryKind::File, &[])
+        };
+        assert!(
+            matches!(result, Err(RootedFsError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "observed={observed}: {result:?}"
+        );
+        assert_eq!(
+            file.get_xattr("user.sy-stale").unwrap(),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+    }
+}
+
+#[tokio::test]
 async fn shared_inode_preservation_refuses_before_any_requested_field() {
     let source = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
@@ -201,7 +252,8 @@ async fn shared_inode_preservation_refuses_before_any_requested_field() {
         .unwrap()
         .unwrap()
         .1;
-    let attrs = vec![(OsString::from("user.sy-authority"), b"new".to_vec())];
+    let mut attrs = read_xattrs_from_file(&file).unwrap();
+    attrs.push((OsString::from("user.sy-authority"), b"new".to_vec()));
     let acl = acl(&file);
     let flags = requested_flags();
     let mut requests = vec![
@@ -295,7 +347,10 @@ async fn preservation_keeps_observed_descriptor_after_foreign_namespace_substitu
             .1;
         let held = std::fs::File::open(destination.path().join("file")).unwrap();
         let acl = acl(&held);
-        let attrs = vec![(OsString::from("user.sy-authority"), b"new".to_vec())];
+        // Snapshot the original inode before substitution; retaining native
+        // fields makes this an admissible exact mirror, not a label removal.
+        let mut attrs = read_xattrs_from_file(&held).unwrap();
+        attrs.push((OsString::from("user.sy-authority"), b"new".to_vec()));
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         rooted.pause_mutation_at(
