@@ -66,6 +66,88 @@ fn preserved_symlink_loops_do_not_require_target_resolution() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_visible_destination_and_backup_obey_selected_overwrite_policy() {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid has no pointer arguments or side effects.
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    for case in ["overwrite", "unreadable-old-backup", "unreadable-backup"] {
+        let root = tempdir().unwrap();
+        let source = root.path().join("original");
+        let destination = root.path().join("renamed");
+        let backup = root.path().join("renamed~");
+        std::fs::write(&source, b"replacement payload").unwrap();
+        std::fs::write(&destination, b"old bytes").unwrap();
+        std::fs::write(&backup, b"previous backup").unwrap();
+        std::fs::write(root.path().join("sibling"), b"untouched sibling").unwrap();
+        let mut old = std::fs::File::open(&destination).unwrap();
+        let unreadable = if case == "unreadable-backup" {
+            &backup
+        } else {
+            &destination
+        };
+        std::fs::set_permissions(unreadable, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_eq!(
+            std::fs::File::open(unreadable).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let identity = |path: &Path| {
+            let stat = std::fs::metadata(path).unwrap();
+            (
+                stat.dev(),
+                stat.ino(),
+                stat.nlink(),
+                stat.len(),
+                stat.mode(),
+                stat.mtime(),
+                stat.mtime_nsec(),
+                stat.ctime(),
+                stat.ctime_nsec(),
+            )
+        };
+        let source_before = identity(&source);
+        let destination_before = identity(&destination);
+        let backup_before = identity(&backup);
+        let flags: &[&str] = if case == "overwrite" {
+            &["-p"]
+        } else {
+            &["-p", "--backup"]
+        };
+        let output = run(&source, &destination, flags);
+        if case == "unreadable-old-backup" {
+            assert!(
+                !output.status.success(),
+                "backup must not be silently omitted"
+            );
+            assert_eq!(identity(&destination), destination_before);
+            assert_eq!(identity(&backup), backup_before);
+            assert_eq!(std::fs::read(&backup).unwrap(), b"previous backup");
+        } else {
+            success(output);
+            assert_eq!(std::fs::read(&destination).unwrap(), b"replacement payload");
+            assert_eq!(
+                std::fs::read(&backup).unwrap(),
+                if case == "overwrite" {
+                    &b"previous backup"[..]
+                } else {
+                    &b"old bytes"[..]
+                }
+            );
+        }
+        let mut bytes = Vec::new();
+        old.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"old bytes");
+        assert_eq!(identity(&source), source_before);
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement payload");
+        assert_eq!(
+            std::fs::read(root.path().join("sibling")).unwrap(),
+            b"untouched sibling"
+        );
+    }
+}
+
 #[test]
 fn renamed_leaf_obeys_selection_and_comparison() {
     for flags in [

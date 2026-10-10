@@ -330,10 +330,10 @@ fn apply_mutation(
             );
         }
         WireMutationKind::RemoveFileLike => {
-            rooted.remove_destination_blocking(&path, false, expected_identity)?
+            rooted.remove_destination_blocking(&path, false, expected_identity)?;
         }
         WireMutationKind::RemoveDirectory => {
-            rooted.remove_destination_blocking(&path, true, expected_identity)?
+            rooted.remove_destination_blocking(&path, true, expected_identity)?;
         }
         WireMutationKind::CopyFile => {
             let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;

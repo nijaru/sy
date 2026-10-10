@@ -1324,6 +1324,9 @@ fn delta_candidate(destination: &Entry, minimum_size: u64, capabilities: &Capabi
     destination.is_file()
         && destination.size >= minimum_size
         && destination.identity.is_some()
+        // Optional byte-strategy hint, not authorization: mode 000 still has
+        // an exact destination expectation and ordinary publication checks.
+        && destination.unix_mode.is_none_or(|mode| mode & 0o444 != 0)
         && capabilities.rolling_signatures
 }
 
@@ -1521,7 +1524,7 @@ mod tests {
 
     #[test]
     fn delta_candidate_requires_size_identity_and_negotiated_support() {
-        let destination = file("file", DEFAULT_REMOTE_DELTA_MIN_SIZE, 0o644);
+        let mut destination = file("file", DEFAULT_REMOTE_DELTA_MIN_SIZE, 0o644);
         let supported = Capabilities {
             rolling_signatures: true,
             ..Capabilities::default()
@@ -1541,6 +1544,19 @@ mod tests {
             &destination,
             DEFAULT_REMOTE_DELTA_MIN_SIZE,
             &unsupported,
+        ));
+        destination.unix_mode = Some(0);
+        assert!(!delta_candidate(
+            &destination,
+            DEFAULT_REMOTE_DELTA_MIN_SIZE,
+            &supported
+        ));
+        // Unknown permissions are not evidence of denied reads.
+        destination.unix_mode = None;
+        assert!(delta_candidate(
+            &destination,
+            DEFAULT_REMOTE_DELTA_MIN_SIZE,
+            &supported
         ));
     }
 

@@ -233,8 +233,8 @@ enum ReconstructionOp {
 
 struct PreparedReconstruction {
     staged: RootedStagedFile,
-    /// Copy-op basis: only present when the destination is a regular file.
-    basis: Option<(File, WireFileBasis)>,
+    /// Opened only on the first Copy, never for an all-literal replacement.
+    basis: Option<File>,
     rooted: RootedFs,
     relative: RelativePath,
     expectation: Option<WireFileBasis>,
@@ -906,43 +906,7 @@ fn prepare_reconstruction(
     relative: &RelativePath,
     expectation: Option<WireFileBasis>,
 ) -> Result<PreparedReconstruction> {
-    let current_expectation = expectation
-        .map(|expected| {
-            let identity = rooted.retired_destination_identity_blocking(
-                EntryIdentity::from_bytes(expected.identity()),
-            )?;
-            Ok::<_, RootedFsError>(WireFileBasis::new(
-                expected.file_size(),
-                *identity.as_bytes(),
-            ))
-        })
-        .transpose()?;
-    let observed = rooted.path_identity_blocking(relative)?;
-    let path = relative.as_path().to_path_buf();
-    let basis = match current_expectation {
-        Some(expected) => match observed {
-            Some((kind, identity)) if identity.as_bytes() == &expected.identity() => {
-                if kind == EntryKind::File {
-                    // The copy-op basis is the old destination itself; the
-                    // opened handle is revalidated at completion.
-                    let file = rooted.open_regular_blocking(relative)?;
-                    validate_basis(&file, expected)?;
-                    Some((file, expected))
-                } else {
-                    // Non-regular destination (type transition): whole bytes
-                    // only, with the identity expectation still enforced.
-                    None
-                }
-            }
-            _ => return Err(RemoteTransferError::DestinationChanged { path }),
-        },
-        None => {
-            if observed.is_some() {
-                return Err(RemoteTransferError::UnexpectedDestination { path });
-            }
-            None
-        }
-    };
+    validate_destination_state(&rooted, relative, expectation)?;
     let expected_destination =
         expectation.map_or(crate::endpoint::ExpectedDestination::Absent, |expected| {
             crate::endpoint::ExpectedDestination::Unchanged(EntryIdentity::from_bytes(
@@ -953,7 +917,7 @@ fn prepare_reconstruction(
         rooted.begin_staged_file_with_expectation_blocking(relative, expected_destination)?;
     Ok(PreparedReconstruction {
         staged,
-        basis,
+        basis: None,
         rooted,
         relative: relative.clone(),
         expectation,
@@ -990,9 +954,18 @@ fn reconstruct_file(
                     .ok_or(RemoteTransferError::ByteCountOverflow)?;
             }
             ReconstructionOp::Copy(copy) => {
-                let Some((basis, expected)) = prepared.basis.as_mut() else {
-                    return Err(RemoteTransferError::CopyWithoutBasis);
-                };
+                let expected = prepared
+                    .expectation
+                    .ok_or(RemoteTransferError::CopyWithoutBasis)?;
+                if prepared.basis.is_none() {
+                    let file = prepared.rooted.open_regular_blocking(&prepared.relative)?;
+                    validate_basis(&prepared.rooted, &file, &prepared.relative, expected)?;
+                    prepared.basis = Some(file);
+                }
+                let basis = prepared
+                    .basis
+                    .as_mut()
+                    .ok_or(RemoteTransferError::CopyWithoutBasis)?;
                 file_size = checked_output_size(
                     file_size,
                     usize::try_from(copy.copy_len())
@@ -1001,7 +974,7 @@ fn reconstruct_file(
                 )?;
                 copy_basis_range(
                     basis,
-                    *expected,
+                    expected,
                     copy,
                     prepared.staged.file_mut(),
                     &mut hasher,
@@ -1049,8 +1022,15 @@ fn reconstruct_file(
                     &prepared.relative,
                     prepared.expectation,
                 )?;
-                if let Some((basis, expected)) = prepared.basis.as_ref() {
-                    validate_basis(basis, *expected)?;
+                if let Some(basis) = prepared.basis.as_ref() {
+                    validate_basis(
+                        &prepared.rooted,
+                        basis,
+                        &prepared.relative,
+                        prepared
+                            .expectation
+                            .ok_or(RemoteTransferError::CopyWithoutBasis)?,
+                    )?;
                 }
                 let published = prepared.staged.commit_with_admission(admission)?;
                 let proof = published.finalize_blocking(begin.bsd_flags())?;
@@ -1127,10 +1107,20 @@ pub(crate) fn validate_source(
     Ok(())
 }
 
-fn validate_basis(file: &File, expected: WireFileBasis) -> Result<()> {
-    let metadata = file.metadata()?;
-    let identity = opened_identity(&metadata)?;
-    if metadata.len() != expected.file_size() || identity.as_bytes() != &expected.identity() {
+fn validate_basis(
+    rooted: &RootedFs,
+    file: &File,
+    relative: &RelativePath,
+    expected: WireFileBasis,
+) -> Result<()> {
+    // Always resolve the ORIGINAL scanned identity through exact own retirement
+    // records. A fresh opened stat is not permission to adopt a different basis.
+    let metadata = rooted.observed_regular_metadata_blocking(
+        file,
+        relative,
+        EntryIdentity::from_bytes(expected.identity()),
+    )?;
+    if metadata.len() != expected.file_size() {
         return Err(RemoteTransferError::BasisChanged {
             expected_size: expected.file_size(),
             actual_size: metadata.len(),
@@ -1767,6 +1757,121 @@ mod tests {
                 assert_eq!(std::fs::metadata(&path).unwrap().ino(), original_inode);
             }
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconstruction_opens_basis_only_for_copy_and_keeps_original_expectation() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        for case in [
+            "unreadable-literal",
+            "unreadable-copy",
+            "raced-copy",
+            "readable-copy",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("file");
+            std::fs::write(&target, b"old").unwrap();
+            let unreadable = case.starts_with("unreadable");
+            if unreadable {
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o0)).unwrap();
+                assert_eq!(
+                    File::open(&target).unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+            }
+            let original = std::fs::metadata(&target).unwrap();
+            let identity = opened_identity(&original).unwrap();
+            let expectation = WireFileBasis::new(original.len(), *identity.as_bytes());
+            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let relative = RelativePath::new("file").unwrap();
+            let prepared = tokio::task::spawn_blocking({
+                let relative = relative.clone();
+                move || prepare_reconstruction(rooted, &relative, Some(expectation))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if case == "raced-copy" {
+                let foreign = root.path().join("foreign");
+                std::fs::write(&foreign, b"foreign").unwrap();
+                std::fs::rename(foreign, &target).unwrap();
+            }
+            let before = opened_identity(&std::fs::metadata(&target).unwrap()).unwrap();
+            let literal = case == "unreadable-literal";
+            let bytes = if literal { b"new" } else { b"old" };
+            // HAS_BASIS still carries the overwrite expectation even when the
+            // actual stream contains only Data. No wire-format change is needed.
+            let begin = WireFileBegin::delta(
+                encode_relative_path(relative.as_path()).unwrap(),
+                3,
+                expectation,
+            )
+            .with_metadata(Some(0o600), None)
+            .unwrap();
+            let (tx, rx) = mpsc::channel(2);
+            tx.send(if literal {
+                ReconstructionOp::Data(DataChunk::Plain(Bytes::from_static(bytes)))
+            } else {
+                ReconstructionOp::Copy(WireDeltaCopy::new(0, 3).unwrap())
+            })
+            .await
+            .unwrap();
+            tx.send(ReconstructionOp::End(WireFileEnd::new(
+                3,
+                *blake3::hash(bytes).as_bytes(),
+            )))
+            .await
+            .unwrap();
+            drop(tx);
+            let result = tokio::task::spawn_blocking(move || {
+                reconstruct_file(
+                    prepared,
+                    begin,
+                    rx,
+                    &std::sync::Arc::new(
+                        crate::endpoint::publication::PublicationAdmission::default(),
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+            match case {
+                "unreadable-copy" => {
+                    assert!(
+                        matches!(result, Err(RemoteTransferError::RootedFs(RootedFsError::Io(error))) if error.kind() == io::ErrorKind::PermissionDenied)
+                    );
+                    assert_eq!(
+                        opened_identity(&std::fs::metadata(&target).unwrap()).unwrap(),
+                        before
+                    );
+                }
+                "raced-copy" => {
+                    assert!(matches!(
+                        result,
+                        Err(RemoteTransferError::RootedFs(
+                            RootedFsError::DestinationChanged(_)
+                        ))
+                    ));
+                    assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+                    assert_eq!(
+                        opened_identity(&std::fs::metadata(&target).unwrap()).unwrap(),
+                        before
+                    );
+                }
+                _ => {
+                    let (summary, _) = result.unwrap();
+                    assert_eq!(summary.reused_bytes, if literal { 0 } else { 3 });
+                    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+                }
+            }
+            assert_eq!(
+                std::fs::read_dir(root.path()).unwrap().count(),
+                1,
+                "stage must be drained"
+            );
         }
     }
 

@@ -794,6 +794,64 @@ async fn remote_selected_missing_parents_are_acquired_only_for_chosen_create() {
     }
 }
 
+#[tokio::test]
+async fn unreadable_selected_destination_is_replaced_without_old_payload_reads() {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no pointer arguments or side effects.
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    for pull in [false, true] {
+        let scope = fixture.path().join(if pull { "pull" } else { "push" });
+        std::fs::create_dir(&scope).unwrap();
+        let source = scope.join("original");
+        let destination = scope.join("renamed");
+        // The push old file qualifies by size for optional signatures. Mode 000
+        // must select whole bytes rather than fail that optimization request.
+        let old_size = if pull {
+            3
+        } else {
+            sy::remote::push::DEFAULT_REMOTE_DELTA_MIN_SIZE as usize
+        };
+        let payload = vec![b'n'; old_size + 1];
+        std::fs::write(&source, &payload).unwrap();
+        std::fs::write(&destination, vec![b'o'; old_size]).unwrap();
+        std::fs::write(scope.join("sibling"), b"untouched").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_eq!(
+            std::fs::File::open(&destination).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let source_observation = || {
+            let stat = std::fs::metadata(&source).unwrap();
+            (
+                stat.dev(),
+                stat.ino(),
+                stat.nlink(),
+                stat.len(),
+                stat.mode(),
+                stat.mtime(),
+                stat.mtime_nsec(),
+                stat.ctime(),
+                stat.ctime_nsec(),
+            )
+        };
+        let before = source_observation();
+        let (source_arg, destination_arg) = operands(&source, &destination, pull);
+        copy(
+            &source_arg,
+            &destination_arg,
+            &["-p", "--verify=after"],
+            &search_path,
+        )
+        .await;
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        assert_eq!(std::fs::read(&source).unwrap(), payload);
+        assert_eq!(source_observation(), before);
+        assert_eq!(std::fs::read(scope.join("sibling")).unwrap(), b"untouched");
+    }
+}
+
 fn ssh_path(root: &std::path::Path) -> OsString {
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();

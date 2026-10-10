@@ -2,9 +2,10 @@
 //! and current identities; lookups take at most 256 branches per index, with
 //! constant RAM and one scratch descriptor regardless of tree/group size.
 //!
-//! The root's blocking-worker lock covers validation, native mutation and both
-//! observations of the same old descriptor. It is independent of cancellation
-//! admission: closing admission never waits for filesystem work or this lock.
+//! The root's blocking-worker lock covers validation, native mutation and
+//! old-observation finalization. Shared lineage advances only through the same
+//! original descriptor. Closing independent cancellation admission never waits
+//! for filesystem work or this lock.
 
 use super::{
     identity_from_stat, stat_at_optional, stat_fd, HeldDestinationExpectation, Result,
@@ -17,9 +18,94 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 
+#[derive(Clone, Copy)]
 pub(super) enum RetirementStep {
     Exchange,
     Unlink,
+}
+
+/// User-authorized single-link regular rename/unlink needs no old-byte/cleanup FD.
+/// Exchange and shared retirement instead retain the original inode descriptor.
+/// Neither form is portable compare-and-swap against concurrent namespace writes.
+pub(super) enum OldDestinationObservation {
+    VisibleSingleLink { before: libc::stat },
+    PinnedRetirement(RetiredDestinationObservation),
+}
+
+impl OldDestinationObservation {
+    pub(super) fn capture(
+        parent: RawFd,
+        leaf: &OsStr,
+        path: &Path,
+        expected: HeldDestinationExpectation,
+        lineage: &mut RetirementLineage,
+        operation: RetirementStep,
+    ) -> Result<Option<Self>> {
+        let Some(named) = stat_at_optional(parent, leaf)? else {
+            return match expected {
+                HeldDestinationExpectation::Unchanged(_) => {
+                    Err(RootedFsError::DestinationChanged(path.to_path_buf()))
+                }
+                _ => Ok(None),
+            };
+        };
+        match expected {
+            HeldDestinationExpectation::Absent => {
+                return Err(RootedFsError::DestinationChanged(path.to_path_buf()));
+            }
+            HeldDestinationExpectation::Unchanged(expected) => {
+                if identity_from_stat(&named) != Some(lineage.resolve(expected)?) {
+                    return Err(RootedFsError::DestinationChanged(path.to_path_buf()));
+                }
+            }
+            HeldDestinationExpectation::Unverified => {}
+        }
+        // Select by the native effect and full no-follow stat, never by an
+        // open error. A later change cannot switch this observation's authority.
+        if matches!(operation, RetirementStep::Unlink)
+            && named.st_mode & libc::S_IFMT == libc::S_IFREG
+            && named.st_nlink == 1
+        {
+            Ok(Some(Self::VisibleSingleLink { before: named }))
+        } else {
+            RetiredDestinationObservation::capture(parent, leaf, path, named)
+                .map(|old| Some(Self::PinnedRetirement(old)))
+        }
+    }
+
+    pub(super) fn verify(&self, named: &libc::stat, path: &Path) -> Result<()> {
+        match self {
+            Self::VisibleSingleLink { before } => {
+                if super::staging::same_observation(before, named) {
+                    Ok(())
+                } else {
+                    Err(RootedFsError::DestinationChanged(path.to_path_buf()))
+                }
+            }
+            Self::PinnedRetirement(old) => old.verify(named, path),
+        }
+    }
+
+    pub(super) fn cleanup_identity(&self) -> Option<libc::stat> {
+        match self {
+            Self::VisibleSingleLink { .. } => None,
+            Self::PinnedRetirement(old) => Some(old.before),
+        }
+    }
+
+    pub(super) fn record(
+        &mut self,
+        lineage: &mut RetirementLineage,
+        step: RetirementStep,
+        path: &Path,
+    ) -> Result<()> {
+        match self {
+            // The last visible name was consumed. Never inspect/adopt its
+            // replacement or create cleanup/alias authority from the old stat.
+            Self::VisibleSingleLink { .. } => Ok(()),
+            Self::PinnedRetirement(old) => old.record(lineage, step, path),
+        }
+    }
 }
 
 /// Lives only across native publication/cleanup, not across transfer work.
@@ -34,12 +120,8 @@ impl RetiredDestinationObservation {
         parent: RawFd,
         leaf: &OsStr,
         path: &Path,
-        expected: HeldDestinationExpectation,
-        lineage: &mut RetirementLineage,
-    ) -> Result<Option<Self>> {
-        let Some(named) = stat_at_optional(parent, leaf)? else {
-            return Ok(None);
-        };
+        named: libc::stat,
+    ) -> Result<Self> {
         let name = super::component_cstring(leaf)?;
         #[cfg(target_os = "linux")]
         let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -70,16 +152,7 @@ impl RetiredDestinationObservation {
             tracks_lineage,
         };
         observation.verify(&named, path)?;
-        if let HeldDestinationExpectation::Unchanged(expected) = expected {
-            if identity_from_stat(&before) != Some(lineage.resolve(expected)?) {
-                return Err(RootedFsError::DestinationChanged(path.to_path_buf()));
-            }
-        }
-        Ok(Some(observation))
-    }
-
-    pub(super) fn cleanup_identity(&self) -> libc::stat {
-        self.before
+        Ok(observation)
     }
 
     pub(super) fn verify(&self, named: &libc::stat, path: &Path) -> Result<()> {
@@ -337,5 +410,47 @@ impl DiskIndex {
             self.roots[index] = Some(branch);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::domain::RelativePath;
+    use crate::rooted_fs::RootedFs;
+
+    #[test]
+    fn failed_post_unlink_record_reports_commit_and_poisoned_authority() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a"), b"retained bytes").unwrap();
+        std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+        let rooted = RootedFs::open_blocking(root.path().into()).unwrap();
+        let a = RelativePath::new("a").unwrap();
+        let b = RelativePath::new("b").unwrap();
+        let expected = rooted.path_identity_blocking(&a).unwrap().unwrap().1;
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        // A real read-only file allows lookup of the initially empty index,
+        // then fails the journal write after the native unlink has succeeded.
+        rooted.retirement.lock().unwrap().disk = Some(DiskIndex {
+            file: File::open(journal.path()).unwrap(),
+            roots: [None; 2],
+        });
+        assert!(matches!(
+            rooted.remove_destination_blocking(&a, false, Some(expected)),
+            Err(RootedFsError::DeletionCommittedFinalizationFailed { .. })
+        ));
+        assert!(!root.path().join("a").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("b")).unwrap(),
+            b"retained bytes"
+        );
+        assert!(rooted.retirement.lock().unwrap().failed);
+        assert!(rooted
+            .remove_destination_blocking(&b, false, Some(expected))
+            .is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("b")).unwrap(),
+            b"retained bytes"
+        );
     }
 }
