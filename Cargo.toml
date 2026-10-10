@@ -79,6 +79,7 @@ futures = "0.3.31"
 bytes = "1.11.1"
 bitflags = "2.10.0"
 unicode-normalization = "0.1"
+caseless = "0.2.2"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

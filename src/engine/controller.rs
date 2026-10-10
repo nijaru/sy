@@ -1884,7 +1884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_detects_unicode_normalization_collision() {
+    async fn preflight_rejects_unqualified_unicode_normalization_alias() {
         let nfc = "caf\u{e9}.txt";
         let nfd = "cafe\u{301}.txt";
         let source = entries(vec![file(nfd, 10, 1), file(nfc, 10, 1)]);
@@ -1901,7 +1901,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            ControllerError::Namespace(NamespacePreflightError::Collision(_))
+            ControllerError::Namespace(NamespacePreflightError::Ambiguity(_))
         ));
     }
 

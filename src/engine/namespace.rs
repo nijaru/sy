@@ -15,10 +15,12 @@
 //!   or a Unicode transform. `NamespaceSemantics` records what the destination
 //!   root actually folds; when a rule is unknown the check stays conservative
 //!   (assumes folding) and reports `NamespaceAmbiguity` instead of claiming a
-//!   definitive collision.
+//!   definitive collision. Known folding axes still do not qualify a native
+//!   Unicode table/version: generic Unicode matches remain ambiguity too.
 
 use super::domain::RelativePath;
 use super::native_path;
+use caseless::Caseless;
 use std::cmp::Ordering;
 use std::io;
 use tokio::io::AsyncWriteExt;
@@ -81,12 +83,6 @@ impl NamespaceSemantics {
         matches!(self.case, Folding::Exact) && matches!(self.normalization, Folding::Exact)
     }
 
-    /// True when every alias report is a proven collision under known rules.
-    pub const fn is_fully_specified(self) -> bool {
-        !matches!(self.case, Folding::Unspecified)
-            && !matches!(self.normalization, Folding::Unspecified)
-    }
-
     const fn folds_case(self, lenient: bool) -> bool {
         match self.case {
             Folding::Exact => false,
@@ -105,11 +101,17 @@ impl NamespaceSemantics {
 
     /// Alias key for `path`.
     ///
-    /// `lenient` folds every axis that is `Folded` *or* `Unspecified`; the
-    /// strict form folds only proven-folded axes. Equal strict keys alias under
-    /// every interpretation of the unknown axes (a proven collision), while
-    /// equal lenient-only keys alias under some interpretations (ambiguity).
+    /// `lenient` folds every axis that is `Folded` *or* `Unspecified`. The
+    /// strict form transforms only ASCII paths under proven-folded axes.
+    /// Non-ASCII transformations have no qualified native Unicode profile, so
+    /// their matches are ambiguity, not proof of filesystem equivalence.
     fn key(self, path: &RelativePath, lenient: bool) -> Vec<u8> {
+        // Native folding capabilities do not specify a Unicode table/version
+        // or every filesystem collation detail. Only ASCII transformations
+        // can establish a strict key; Unicode matches remain conservative.
+        if !lenient && !path.as_path().as_os_str().as_encoded_bytes().is_ascii() {
+            return native_path::encode(path.as_path().as_os_str());
+        }
         let fold_case = self.folds_case(lenient);
         let fold_norm = self.folds_normalization(lenient);
         if !fold_case && !fold_norm {
@@ -134,6 +136,17 @@ fn fold_component(
     fold_norm: bool,
 ) {
     let raw = component.as_encoded_bytes();
+    // ASCII has no normalization work or multi-character fold expansions.
+    if raw.is_ascii() {
+        bytes.extend(raw.iter().map(|&byte| {
+            if fold_case {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            }
+        }));
+        return;
+    }
     let Ok(text) = std::str::from_utf8(raw) else {
         // Non-UTF-8 names have no Unicode folding model; fold ASCII case only.
         for &byte in raw {
@@ -146,23 +159,21 @@ fn fold_component(
         return;
     };
 
-    let mut folded: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(text);
-    if fold_case {
-        folded = std::borrow::Cow::Owned(folded.to_lowercase());
+    match (fold_case, fold_norm) {
+        // Canonical caseless matching requires decomposition both before and
+        // after full folding. Lowercasing alone misses expansions (ß -> ss),
+        // ligatures and equivalences such as the two lowercase Greek sigmas.
+        (true, true) => append_chars(bytes, text.nfd().default_case_fold().nfd()),
+        (true, false) => append_chars(bytes, text.chars().default_case_fold()),
+        (false, true) => append_chars(bytes, text.nfd()),
+        (false, false) => bytes.extend_from_slice(raw),
     }
-    if fold_norm {
-        folded = std::borrow::Cow::Owned(folded.nfd().collect());
-    }
-    if fold_case {
-        // Second pass: lowercase expansions produced by decomposition.
-        for ch in folded.chars() {
-            for lower in ch.to_lowercase() {
-                let mut buf = [0_u8; 4];
-                bytes.extend_from_slice(lower.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    } else {
-        bytes.extend_from_slice(folded.as_bytes());
+}
+
+fn append_chars(bytes: &mut Vec<u8>, chars: impl Iterator<Item = char>) {
+    for ch in chars {
+        let mut buffer = [0_u8; 4];
+        bytes.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
     }
 }
 
@@ -876,18 +887,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unicode_normalization_detects_collision() {
+    async fn unicode_normalization_reports_ambiguity() {
         let nfc = "caf\u{e9}.txt";
         let nfd = "cafe\u{301}.txt";
         let error = detect(insensitive(), tiny_budget(), &[nfc, nfd])
             .await
             .unwrap_err();
-        let NamespacePreflightError::Collision(collision) = error else {
-            panic!("expected definitive collision, got: {error}");
+        let NamespacePreflightError::Ambiguity(ambiguity) = error else {
+            panic!("expected unqualified Unicode ambiguity, got: {error}");
         };
         // Reports in native byte order: the NFD spelling sorts first.
-        assert_eq!(collision.existing, rel(nfd));
-        assert_eq!(collision.colliding, rel(nfc));
+        assert_eq!(ambiguity.existing, rel(nfd));
+        assert_eq!(ambiguity.colliding, rel(nfc));
+    }
+
+    #[tokio::test]
+    async fn full_unicode_casefold_aliases_are_ambiguous() {
+        for pair in [["Straße", "STRASSE"], ["σ", "ς"], ["ﬃ", "ffi"]] {
+            let error = detect(insensitive(), tiny_budget(), &pair)
+                .await
+                .expect_err("lowercasing is not sufficient for native casefold aliases");
+            assert!(matches!(error, NamespacePreflightError::Ambiguity(_)));
+            // Proven byte-exact directories still admit these distinct names.
+            detect(NamespaceSemantics::BYTE_EXACT, tiny_budget(), &pair)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_unicode_aliases_cannot_pass_preflight() {
+        let root = tempfile::tempdir().unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
+            .await
+            .unwrap();
+        let semantics = rooted.namespace_semantics().await.unwrap();
+        for (index, pair) in [["Straße", "STRASSE"], ["σ", "ς"], ["ﬃ", "ffi"]]
+            .into_iter()
+            .enumerate()
+        {
+            let parent = root.path().join(index.to_string());
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::create_dir(parent.join(pair[0])).unwrap();
+            match std::fs::create_dir(parent.join(pair[1])) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    assert!(
+                        matches!(
+                            detect(semantics, tiny_budget(), &pair).await,
+                            Err(NamespacePreflightError::Ambiguity(_))
+                        ),
+                        "native alias passed preflight: {pair:?}, {semantics:?}"
+                    );
+                }
+                result => result.unwrap(),
+            }
+        }
     }
 
     #[tokio::test]
