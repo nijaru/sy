@@ -5,7 +5,12 @@ use super::domain::{
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
+
+mod manifest;
+mod reader;
+pub use reader::PlanJournalReader;
+pub(crate) use reader::{PlanRecord, PlanRecordPosition};
 
 pub(crate) const MAX_RECORD_PAYLOAD: usize = 1024 * 1024;
 const ENTRY_OPTION_MODE: u8 = 1 << 0;
@@ -50,7 +55,10 @@ pub type Result<T> = std::result::Result<T, PlanJournalError>;
 /// teaching the planner about a concrete endpoint or transfer strategy.
 pub struct PlanJournal {
     file: tokio::fs::File,
-    records: usize,
+    records: u64,
+    end: u64,
+    healthy: bool,
+    manifest: manifest::ManifestWriter,
 }
 
 impl PlanJournal {
@@ -61,10 +69,24 @@ impl PlanJournal {
         Ok(Self {
             file: tokio::fs::File::from_std(file),
             records: 0,
+            end: 0,
+            healthy: true,
+            manifest: manifest::ManifestWriter::new().await?,
         })
     }
 
-    pub async fn append(&mut self, operation: &SyncOp) -> Result<()> {
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.healthy {
+            Ok(())
+        } else {
+            Err(PlanJournalError::InvalidRecord(
+                "incomplete plan journal write",
+            ))
+        }
+    }
+
+    pub(crate) async fn append(&mut self, operation: &SyncOp) -> Result<PlanRecordPosition> {
+        self.ensure_healthy()?;
         let payload = encode_operation(operation)?;
         if payload.is_empty() {
             return Err(PlanJournalError::EmptyRecord);
@@ -75,88 +97,53 @@ impl PlanJournal {
                 maximum: MAX_RECORD_PAYLOAD,
             });
         }
-        let payload_len =
+        let payload_bytes =
             u32::try_from(payload.len()).map_err(|_| PlanJournalError::RecordTooLarge {
                 actual: payload.len(),
                 maximum: MAX_RECORD_PAYLOAD,
             })?;
-
-        self.file.write_u32(payload_len).await?;
+        let next_end = self
+            .end
+            .checked_add(reader::HEADER_BYTES)
+            .and_then(|start| start.checked_add(u64::from(payload_bytes)))
+            .ok_or_else(|| io::Error::other("plan journal length overflow"))?;
+        let next_records = self
+            .records
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("plan journal record count overflow"))?;
+        let position = PlanRecordPosition {
+            offset: self.end,
+            ordinal: self.records,
+            payload_bytes,
+            digest: *blake3::hash(&payload).as_bytes(),
+        };
+        // Cancellation or any partial write leaves the builder unsealable.
+        self.healthy = false;
+        self.file.write_u32(payload_bytes).await?;
+        self.file.write_u64(self.records).await?;
         self.file.write_all(&payload).await?;
-        self.records = self.records.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "plan journal record count overflow",
-            )
-        })?;
-        Ok(())
+        self.manifest.append(position).await?;
+        self.records = next_records;
+        self.end = next_end;
+        self.healthy = true;
+        Ok(position)
     }
 
     pub async fn seal(mut self) -> Result<PlanJournalReader> {
+        self.ensure_healthy()?;
         self.file.flush().await?;
-        let end = self.file.metadata().await?.len();
-        self.file.seek(SeekFrom::Start(0)).await?;
-        Ok(PlanJournalReader {
-            file: self.file,
-            remaining: self.records,
-            end,
-        })
-    }
-}
-
-pub struct PlanJournalReader {
-    file: tokio::fs::File,
-    remaining: usize,
-    end: u64,
-}
-
-impl PlanJournalReader {
-    pub(crate) async fn rewind(&mut self, records: usize) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0)).await?;
-        self.remaining = records;
-        Ok(())
-    }
-
-    pub async fn next(&mut self) -> Result<Option<SyncOp>> {
-        if self.remaining == 0 {
-            self.reject_trailing_data().await?;
-            return Ok(None);
-        }
-
-        let payload_len = self.file.read_u32().await? as usize;
-        if payload_len == 0 {
-            return Err(PlanJournalError::EmptyRecord);
-        }
-        if payload_len > MAX_RECORD_PAYLOAD {
-            return Err(PlanJournalError::RecordTooLarge {
-                actual: payload_len,
-                maximum: MAX_RECORD_PAYLOAD,
-            });
-        }
-
-        let mut payload = vec![0_u8; payload_len];
-        self.file.read_exact(&mut payload).await?;
-        let operation = decode_operation(&payload)?;
-        self.remaining = self.remaining.checked_sub(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "plan journal contains more records than expected",
-            )
-        })?;
-        if self.remaining == 0 {
-            self.reject_trailing_data().await?;
-        }
-        Ok(Some(operation))
-    }
-
-    async fn reject_trailing_data(&mut self) -> Result<()> {
-        let position = self.file.stream_position().await?;
-        if position != self.end {
+        if self.file.metadata().await?.len() != self.end {
             return Err(PlanJournalError::InvalidRecord(
-                "trailing bytes after final plan journal record",
+                "plan extent differs from completed writes",
             ));
         }
-        Ok(())
+        let manifest = self.manifest.seal(self.records).await?;
+        Ok(PlanJournalReader::new(
+            self.file.into_std().await,
+            self.records,
+            self.end,
+            manifest,
+        ))
     }
 }
 
@@ -592,17 +579,163 @@ mod tests {
             .await
             .unwrap();
         let mut reader = journal.seal().await.unwrap();
-        reader.file.seek(SeekFrom::Start(0)).await.unwrap();
-        reader
-            .file
-            .write_u32(u32::try_from(MAX_RECORD_PAYLOAD + 1).unwrap())
-            .await
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = reader.file().try_clone().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&u32::try_from(MAX_RECORD_PAYLOAD + 1).unwrap().to_be_bytes())
             .unwrap();
-        reader.file.flush().await.unwrap();
-        reader.file.seek(SeekFrom::Start(0)).await.unwrap();
 
         let error = reader.next().await.unwrap_err();
         assert!(matches!(error, PlanJournalError::RecordTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn positioned_replay_preserves_sequential_cursor_and_original_payload() {
+        let operations = ["a", "b", "c"].map(|name| SyncOp::Skip {
+            source: file(name, 1, 0xAA),
+            reason: SkipReason::Filtered,
+        });
+        let mut writer = PlanJournal::new().await.unwrap();
+        let mut positions = Vec::new();
+        for op in &operations {
+            positions.push(writer.append(op).await.unwrap());
+        }
+        let mut reader = writer.seal().await.unwrap();
+        assert_eq!(reader.read_at(positions[2]).await.unwrap(), operations[2]);
+        assert_eq!(reader.next().await.unwrap(), Some(operations[0].clone()));
+        assert_eq!(reader.read_at(positions[0]).await.unwrap(), operations[0]);
+        assert_eq!(reader.next().await.unwrap(), Some(operations[1].clone()));
+        reader.rewind().unwrap();
+        assert_eq!(reader.next().await.unwrap(), Some(operations[0].clone()));
+    }
+
+    #[tokio::test]
+    async fn original_append_manifest_rejects_valid_substitution_before_and_during_replay() {
+        use std::io::{Seek, SeekFrom, Write};
+        for after_gate in [false, true] {
+            let operations = ["a", "b"].map(|name| SyncOp::Skip {
+                source: file(name, 1, 0xAA),
+                reason: SkipReason::Filtered,
+            });
+            let mut writer = PlanJournal::new().await.unwrap();
+            let first = writer.append(&operations[0]).await.unwrap();
+            let second = writer.append(&operations[1]).await.unwrap();
+            let mut reader = writer.seal().await.unwrap();
+            if after_gate {
+                // A preceding certificate pass is not execution-time authority.
+                reader.read_at(first).await.unwrap();
+                reader.read_at(second).await.unwrap();
+                assert_eq!(reader.next().await.unwrap(), Some(operations[0].clone()));
+            }
+            let target = if after_gate { second } else { first };
+            let replacement = SyncOp::Skip {
+                source: file("x", 1, 0xAA),
+                reason: SkipReason::Filtered,
+            };
+            let mut data = reader.file().try_clone().unwrap();
+            data.seek(SeekFrom::Start(target.offset + reader::HEADER_BYTES))
+                .unwrap();
+            data.write_all(&encode_operation(&replacement).unwrap())
+                .unwrap();
+            // next_record verifies the original append leaf, rather than making
+            // a fresh digest that would silently become catalogue authority.
+            assert!(reader.next_record().await.is_err());
+            assert!(reader.rewind().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_frontier_boundaries_preserve_every_original_locator() {
+        for count in [0, 1, 2, 3, 7, 8, 9, 63, 64, 65] {
+            let mut writer = PlanJournal::new().await.unwrap();
+            let mut positions = Vec::new();
+            for ordinal in 0..count {
+                let operation = SyncOp::Skip {
+                    source: file(&format!("f-{ordinal}"), 1, 0xAA),
+                    reason: SkipReason::Filtered,
+                };
+                positions.push((writer.append(&operation).await.unwrap(), operation));
+            }
+            let mut reader = writer.seal().await.unwrap();
+            for (position, operation) in positions.iter().rev() {
+                assert_eq!(reader.read_at(*position).await.unwrap(), *operation);
+            }
+            for (_, operation) in positions {
+                assert_eq!(reader.next().await.unwrap(), Some(operation));
+            }
+            assert_eq!(reader.next().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_manifest_proofs_poison_all_plan_reads() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut writer = PlanJournal::new().await.unwrap();
+        let operation = SyncOp::Skip {
+            source: file("a", 1, 0xAA),
+            reason: SkipReason::Filtered,
+        };
+        let position = writer.append(&operation).await.unwrap();
+        let mut reader = writer.seal().await.unwrap();
+        let replacement = SyncOp::Skip {
+            source: file("x", 1, 0xAA),
+            reason: SkipReason::Filtered,
+        };
+        let payload = encode_operation(&replacement).unwrap();
+        let mut data = reader.file().try_clone().unwrap();
+        data.seek(SeekFrom::Start(reader::HEADER_BYTES)).unwrap();
+        data.write_all(&payload).unwrap();
+        let mut proof = reader.manifest_file().try_clone().unwrap();
+        proof.seek(SeekFrom::Start(29)).unwrap();
+        // Both mutable artifacts now agree on a valid replacement. Only the
+        // retained append-time root prevents them from inventing new intent.
+        proof.write_all(blake3::hash(&payload).as_bytes()).unwrap();
+        assert!(reader.next().await.is_err());
+        assert!(reader.read_at(position).await.is_err());
+        assert!(reader.rewind().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_substituted_positions_poison_replay_and_rewind() {
+        use std::io::{Seek, SeekFrom, Write};
+        for fault in ["ordinal", "length", "payload", "extent", "offset"] {
+            let op = SyncOp::Skip {
+                source: file("a", 1, 0xAA),
+                reason: SkipReason::Filtered,
+            };
+            let mut writer = PlanJournal::new().await.unwrap();
+            let mut position = writer.append(&op).await.unwrap();
+            let mut reader = writer.seal().await.unwrap();
+            let mut file = reader.file().try_clone().unwrap();
+            match fault {
+                "ordinal" => position.ordinal += 1,
+                "length" => {
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    file.write_all(&u32::try_from(MAX_RECORD_PAYLOAD + 1).unwrap().to_be_bytes())
+                        .unwrap();
+                }
+                "payload" => {
+                    let substitute = SyncOp::Skip {
+                        source: super::tests::file("b", 1, 0xAA),
+                        reason: SkipReason::Filtered,
+                    };
+                    file.seek(SeekFrom::Start(reader::HEADER_BYTES)).unwrap();
+                    file.write_all(&encode_operation(&substitute).unwrap())
+                        .unwrap();
+                }
+                "extent" => file
+                    .set_len(position.offset + reader::HEADER_BYTES + 1)
+                    .unwrap(),
+                "offset" => position.offset = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert!(reader.read_at(position).await.is_err(), "{fault}");
+            assert!(
+                reader.next().await.is_err(),
+                "{fault} authorized later replay"
+            );
+            assert!(reader.rewind().is_err(), "{fault} authorized rewind");
+        }
     }
 
     #[test]

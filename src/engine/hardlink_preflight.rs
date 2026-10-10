@@ -1,16 +1,22 @@
-//! Byte commitments for every selected hardlink member, before any writes.
+//! Byte commitments and sealed membership before planned hardlink file work.
 //!
 //! Transfer work promises source bytes; quick-equal metadata/unchanged work
 //! retains old destination bytes. Neither may silently win over the other.
-//! Only the first commitment and its demand-driven digest are indexed per
-//! group, on disk. Scanning the completed operation journal checks every member
-//! without a tree-sized set, membership vector, or retained file descriptors.
+//! The first commitment and its demand-driven digest are indexed per group;
+//! complete membership retains original plan locators alongside that baseline.
+//! All storage is disk-backed, without a tree-sized resident collection or
+//! per-group file descriptors.
 use super::disk_radix::DiskRadix;
 use super::domain::{Entry, RelativePath, SyncOp};
 use super::plan_journal::{
-    decode_operation, encode_operation, PlanJournalError, MAX_RECORD_PAYLOAD,
+    decode_operation, encode_operation, PlanJournalError, PlanRecord, PlanRecordPosition,
+    MAX_RECORD_PAYLOAD,
 };
+
+mod catalogue;
 use super::scheduler::{ResourceRequest, Scheduler, SchedulerError};
+pub(crate) use catalogue::HardlinkCatalogue;
+use catalogue::{Membership, GROUP_HEADER_BYTES};
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -84,9 +90,18 @@ impl ByteCommitment {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct HardlinkCommitments {
     disk: Arc<Mutex<Option<CommitmentDisk>>>,
+    ready: bool,
+}
+
+impl Default for HardlinkCommitments {
+    fn default() -> Self {
+        Self {
+            disk: Arc::new(Mutex::new(None)),
+            ready: true,
+        }
+    }
 }
 
 impl HardlinkCommitments {
@@ -104,18 +119,57 @@ impl HardlinkCommitments {
                     file: tempfile::tempfile()?,
                     index: DiskRadix::new()?,
                     healthy: true,
+                    members: tempfile::tempfile()?,
+                    group_count: 0,
+                    member_count: 0,
+                    group_end: 0,
+                    member_end: 0,
+                    last_position: None,
                 });
             }
-            operation(
-                disk.as_mut()
-                    .ok_or_else(|| invalid("missing hardlink commitment scratch"))?,
-            )
+            let disk = disk
+                .as_mut()
+                .ok_or_else(|| invalid("missing hardlink commitment scratch"))?;
+            let result = operation(disk);
+            if result.is_err() {
+                disk.healthy = false;
+            }
+            result
         })
         .await
         .map_err(|error| HardlinkPreflightError::Worker(error.to_string()))?
     }
 
-    pub async fn check<F, Fut, E>(
+    pub(crate) async fn check<F, Fut, E>(
+        &mut self,
+        record: PlanRecord,
+        scheduler: &Scheduler,
+        hash: &mut F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(ByteCommitment) -> Fut,
+        Fut: Future<Output = std::result::Result<[u8; 32], E>>,
+        E: From<HardlinkPreflightError>,
+    {
+        if !self.ready {
+            return Err(
+                HardlinkPreflightError::from(invalid("incomplete hardlink preflight")).into(),
+            );
+        }
+        self.ready = false;
+        let group = ByteCommitment::from_operation(&record.operation)
+            .and_then(|_| record.operation.source().hardlink_group)
+            .map(|group| *group.as_bytes());
+        self.check_bytes(record.operation, scheduler, hash).await?;
+        if let Some(group) = group {
+            self.with_disk(move |disk| disk.append_member(group, record.position))
+                .await?;
+        }
+        self.ready = true;
+        Ok(())
+    }
+
+    async fn check_bytes<F, Fut, E>(
         &self,
         operation: SyncOp,
         scheduler: &Scheduler,
@@ -225,12 +279,20 @@ struct Baseline {
     operation: SyncOp,
     digest: Option<[u8; 32]>,
     source_compatible: bool,
+    membership: Membership,
+    record_digest: [u8; 32],
 }
 
 struct CommitmentDisk {
     file: File,
     index: DiskRadix,
     healthy: bool,
+    members: File,
+    group_count: u64,
+    member_count: u64,
+    group_end: u64,
+    member_end: u64,
+    last_position: Option<PlanRecordPosition>,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -238,10 +300,16 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 impl CommitmentDisk {
-    fn offset(&mut self, group: [u8; 32]) -> Result<Option<u64>> {
-        if !self.healthy {
-            return Err(invalid("incomplete hardlink commitment scratch").into());
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.healthy {
+            Ok(())
+        } else {
+            Err(invalid("incomplete hardlink commitment scratch").into())
         }
+    }
+
+    fn offset(&mut self, group: [u8; 32]) -> Result<Option<u64>> {
+        self.ensure_healthy()?;
         Ok(self.index.get(group)?)
     }
 
@@ -249,8 +317,29 @@ impl CommitmentDisk {
         let Some(offset) = self.offset(group)? else {
             return Ok(None);
         };
+        let baseline = self.get_at(offset)?.0;
+        if baseline
+            .operation
+            .source()
+            .hardlink_group
+            .map(|key| *key.as_bytes())
+            != Some(group)
+        {
+            return Err(invalid("commitment lookup selected another group").into());
+        }
+        Ok(Some(baseline))
+    }
+
+    fn get_at(&mut self, offset: u64) -> Result<(Baseline, u64)> {
+        self.ensure_healthy()?;
+        if offset
+            .checked_add(GROUP_HEADER_BYTES)
+            .is_none_or(|end| end > self.group_end)
+        {
+            return Err(invalid("catalogue group offset outside sealed extent").into());
+        }
         self.file.seek(SeekFrom::Start(offset))?;
-        let mut header = [0; 37];
+        let mut header = [0; GROUP_HEADER_BYTES as usize];
         self.file.read_exact(&mut header)?;
         let len = u32::from_le_bytes(
             header[..4]
@@ -262,30 +351,61 @@ impl CommitmentDisk {
         }
         let digest = if header[4] & 1 != 0 {
             Some(
-                header[5..]
+                header[5..37]
                     .try_into()
                     .map_err(|_| invalid("invalid commitment digest"))?,
             )
         } else {
             None
         };
+        let next = offset
+            .checked_add(GROUP_HEADER_BYTES)
+            .and_then(|start| start.checked_add(len as u64))
+            .filter(|next| *next <= self.group_end)
+            .ok_or_else(|| invalid("catalogue group payload outside sealed extent"))?;
         let mut bytes = vec![0; len];
         self.file.read_exact(&mut bytes)?;
+        let mut seal = blake3::Hasher::new();
+        seal.update(&header);
+        seal.update(&bytes);
+        let record_digest = *seal.finalize().as_bytes();
         let operation = decode_operation(&bytes)?;
-        if operation
+        let group = *operation
             .source()
             .hardlink_group
-            .map(|identity| *identity.as_bytes())
-            != Some(group)
+            .ok_or_else(|| invalid("catalogue group has no identity"))?
+            .as_bytes();
+        if self.index.get(group)? != Some(offset)
             || ByteCommitment::from_operation(&operation).is_none()
         {
             return Err(invalid("invalid commitment group").into());
         }
-        Ok(Some(Baseline {
-            operation,
-            digest,
-            source_compatible: header[4] & 2 != 0,
-        }))
+        Ok((
+            Baseline {
+                operation,
+                digest,
+                source_compatible: header[4] & 2 != 0,
+                record_digest,
+                membership: Membership {
+                    head: u64::from_le_bytes(
+                        header[37..45]
+                            .try_into()
+                            .map_err(|_| invalid("invalid membership head"))?,
+                    ),
+                    tail: u64::from_le_bytes(
+                        header[45..53]
+                            .try_into()
+                            .map_err(|_| invalid("invalid membership tail"))?,
+                    ),
+                    count: u64::from_le_bytes(
+                        header[53..61]
+                            .try_into()
+                            .map_err(|_| invalid("invalid membership count"))?,
+                    ),
+                },
+            },
+            next,
+        ))
     }
 
     fn insert(&mut self, group: [u8; 32], operation: &SyncOp) -> Result<()> {
@@ -301,8 +421,20 @@ impl CommitmentDisk {
         let offset = self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&[0; 33])?;
+        let membership = Membership::default();
+        self.file.write_all(&membership.head.to_le_bytes())?;
+        self.file.write_all(&membership.tail.to_le_bytes())?;
+        self.file.write_all(&membership.count.to_le_bytes())?;
         self.file.write_all(&bytes)?;
         self.index.insert(group, offset)?;
+        self.group_count = self
+            .group_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("catalogue group count overflow"))?;
+        self.group_end = offset
+            .checked_add(GROUP_HEADER_BYTES)
+            .and_then(|start| start.checked_add(u64::from(len)))
+            .ok_or_else(|| invalid("catalogue group extent overflow"))?;
         self.healthy = true;
         Ok(())
     }
@@ -387,7 +519,7 @@ mod tests {
             let mut hash = |_| async { panic!("this group must not read any payload") };
             for operation in operations {
                 commitments
-                    .check::<_, _, HardlinkPreflightError>(operation, &scheduler, &mut hash)
+                    .check_bytes::<_, _, HardlinkPreflightError>(operation, &scheduler, &mut hash)
                     .await
                     .unwrap();
             }
@@ -411,7 +543,7 @@ mod tests {
             retained("c", [4; 32]),
         ] {
             commitments
-                .check(operation, &scheduler, &mut hash)
+                .check_bytes(operation, &scheduler, &mut hash)
                 .await
                 .unwrap();
         }
@@ -424,7 +556,7 @@ mod tests {
             source.identity = Some(EntryIdentity::from_bytes([8; 32]));
         }
         let result = commitments
-            .check(changed, &scheduler, &mut |_| async {
+            .check_bytes(changed, &scheduler, &mut |_| async {
                 panic!("a group key must not replace the original source observation")
             })
             .await;
@@ -446,12 +578,12 @@ mod tests {
             std::future::ready(Ok::<_, HardlinkPreflightError>([7; 32]))
         };
         commitments
-            .check(retained("a", [2; 32]), &scheduler, &mut hash)
+            .check_bytes(retained("a", [2; 32]), &scheduler, &mut hash)
             .await
             .unwrap();
         for member in 0..32 {
             commitments
-                .check(
+                .check_bytes(
                     create(&format!("source-{member}"), [1; 32]),
                     &scheduler,
                     &mut hash,
@@ -468,7 +600,7 @@ mod tests {
             source.identity = Some(EntryIdentity::from_bytes([8; 32]));
         }
         let result = commitments
-            .check(changed, &scheduler, &mut |_| async {
+            .check_bytes(changed, &scheduler, &mut |_| async {
                 panic!("cached parity must not adopt a changed source observation")
             })
             .await;
@@ -535,10 +667,22 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let scheduler = Scheduler::new(Default::default()).unwrap();
-            let commitments = HardlinkCommitments::default();
+            let mut commitments = HardlinkCommitments::default();
+            let mut journal = super::super::plan_journal::PlanJournal::new()
+                .await
+                .unwrap();
             let mut hash = |_| async { panic!("new source groups require no fingerprint") };
+            let operation = create("a", [0; 32]);
+            let position = journal.append(&operation).await.unwrap();
             commitments
-                .check::<_, _, HardlinkPreflightError>(create("a", [0; 32]), &scheduler, &mut hash)
+                .check::<_, _, HardlinkPreflightError>(
+                    PlanRecord {
+                        position,
+                        operation,
+                    },
+                    &scheduler,
+                    &mut hash,
+                )
                 .await
                 .unwrap();
             let before = rss_kib();
@@ -546,9 +690,14 @@ mod tests {
             // 64 MiB of native path records, without a tree-sized resident map.
             for index in 1..=8192_u64 {
                 let group = *blake3::hash(&index.to_le_bytes()).as_bytes();
+                let operation = create(&path, group);
+                let position = journal.append(&operation).await.unwrap();
                 commitments
                     .check::<_, _, HardlinkPreflightError>(
-                        create(&path, group),
+                        PlanRecord {
+                            position,
+                            operation,
+                        },
                         &scheduler,
                         &mut hash,
                     )
@@ -562,15 +711,25 @@ mod tests {
             );
             for index in [1_u64, 4096, 8192] {
                 let group = *blake3::hash(&index.to_le_bytes()).as_bytes();
+                let operation = create("later-member", group);
+                let position = journal.append(&operation).await.unwrap();
                 commitments
                     .check::<_, _, HardlinkPreflightError>(
-                        create("later-member", group),
+                        PlanRecord {
+                            position,
+                            operation,
+                        },
                         &scheduler,
                         &mut hash,
                     )
                     .await
                     .unwrap();
             }
+            let mut catalogue = commitments.seal().await.unwrap();
+            let reader = journal.seal().await.unwrap();
+            assert_eq!((catalogue.groups(), catalogue.member_count()), (8193, 8196));
+            catalogue.revalidate(&reader).await.unwrap();
+            assert!(rss_kib() < before + 8 * 1024);
         });
     }
 }
