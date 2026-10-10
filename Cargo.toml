@@ -102,10 +102,6 @@ name = "sync_bench"
 harness = false
 
 [[bench]]
-name = "comparative_bench"
-harness = false
-
-[[bench]]
 name = "delta_bench"
 harness = false
 

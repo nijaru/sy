@@ -247,22 +247,19 @@ mutation are not an atomic compare-and-swap.
 
 ## Benchmarks
 
-Historical 0.4-era measurements (macOS M3 Max, NVMe); the 0.5 engine will be
-re-benchmarked before release. Results vary by hardware, file sizes, and
-workload.
-
-| Scenario | sy | rsync | Speedup |
-|----------|-----|-------|---------|
-| 1000 × 1KB files | 189ms | 237ms | 1.25× |
-| 10 × 10MB files | 29ms | 330ms | 11.5× |
-| 1 × 100MB file | 38ms | 324ms | 8.6× |
-| Incremental (no changes) | 33ms | 63ms | 1.9× |
-
-Run benchmarks yourself:
+No validated performance comparison is available yet for the 0.5 engine.
+The CLI harness compares archive-style copies of caller-owned files. It checks
+exact destination trees outside timing and reports unchanged samples only when
+public transfer evidence proves zero file payload. Rates count logical file
+bytes, not wire traffic.
 
 ```bash
-cargo bench
+cargo build --release
+python3 scripts/benchmark.py --quick --sy-binary target/release/sy
+cargo bench  # Engine and codec microbenchmarks
 ```
+
+The quick run checks the harness; it is not a representative performance study.
 
 ## Configuration
 
@@ -278,13 +275,12 @@ exclude = [".git", "node_modules", "*.pyc"]
 
 | Feature | sy | rsync |
 |---------|-----|-------|
-| Local sync speed | Fast (parallel) | Sequential |
-| Delta sync | Yes (rolling + BLAKE3) | Yes (MD4) |
+| Delta sync | Yes (rolling + BLAKE3) | Yes |
 | COW reflinks | Yes | No |
 | SSH sync | Yes | Yes |
 | Wire protocol | Custom | rsync protocol |
 | Incremental | Yes | Yes |
-| Compression | zstd | zlib |
+| Compression | zstd | Multiple codecs |
 
 **sy is not a drop-in rsync replacement.** Same mental model, different protocol. For rsync-to-rsync compatibility, use rsync.
 
