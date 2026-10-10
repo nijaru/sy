@@ -172,11 +172,11 @@ where
     let modtime_precision_ns = u64::try_from(precision).unwrap_or(u64::MAX);
     // Root-scoped name semantics: the client's alias preflight must follow the
     // opened filesystem, not the peer OS name.
-    let semantics_root = root.clone();
-    let namespace_semantics = tokio::task::spawn_blocking(move || {
-        crate::fs_util::namespace_semantics(&semantics_root).into()
-    })
-    .await?;
+    let namespace_semantics = match &rooted {
+        SessionRoot::Present(rooted) => rooted.namespace_semantics().await?,
+        SessionRoot::AbsentPreview => crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+    }
+    .into();
     let ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
     let frame = Frame::control(FrameKind::SessionReady, ready.encode(version))?;
     write_frame(writer, &frame).await?;
@@ -486,7 +486,11 @@ mod tests {
         // The client receives the probed root semantics, not an OS guess.
         assert_eq!(
             client.namespace_semantics,
-            Some(crate::fs_util::namespace_semantics(root.path()))
+            Some(
+                crate::fs_util::namespace_semantics(root.path())
+                    .await
+                    .unwrap()
+            )
         );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());

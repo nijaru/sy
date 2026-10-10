@@ -2078,13 +2078,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_reports_ambiguity_when_semantics_are_unknown() {
+    async fn preflight_reports_ambiguity_without_qualified_semantics() {
         let source = entries(vec![file("FILE.txt", 10, 1), file("file.txt", 10, 1)]);
         let destination = entries(vec![]);
-        let policy = ComparisonPolicy {
-            namespace_semantics: crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
-            ..ComparisonPolicy::default()
-        };
+        let policy = ComparisonPolicy::default();
 
         let err = preflight_sync(source, destination, policy, None, |_| true)
             .await

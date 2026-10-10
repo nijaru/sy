@@ -302,13 +302,17 @@ impl RemotePullExecutor {
             .map_err(Into::into)
     }
 
-    /// Observe and pin the destination before admitting the remote source scan.
-    /// An absent preview root is empty, never a writable substitute root.
+    /// Prepare the destination's namespace observation and scan together,
+    /// using the same authority as execution. All fallible discovery precedes
+    /// producer admission. An absent preview root is empty and unqualified.
     pub async fn destination_entries(
         &self,
         request: crate::engine::scan::ScanRequest,
         dry_run: bool,
-    ) -> Result<crate::engine::reconcile::EntryStream> {
+    ) -> Result<(
+        crate::engine::namespace::NamespaceSemantics,
+        crate::engine::reconcile::EntryStream,
+    )> {
         #[cfg(unix)]
         {
             let root = self.destination_root.clone();
@@ -337,11 +341,14 @@ impl RemotePullExecutor {
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
             if absent {
-                return Ok(crate::engine::reconcile::EntryStream::new(
-                    futures::stream::empty(),
+                return Ok((
+                    crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+                    crate::engine::reconcile::EntryStream::new(futures::stream::empty()),
                 ));
             }
-            Ok(self.metadata_authority().await?.entry_stream(request))
+            let rooted = self.metadata_authority().await?;
+            let namespace = rooted.namespace_semantics().await?;
+            Ok((namespace, rooted.entry_stream(request)))
         }
         #[cfg(not(unix))]
         {

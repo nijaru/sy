@@ -1165,6 +1165,27 @@ impl RootedFs {
             .map_err(|error| RootedFsError::Worker(error.to_string()))?
     }
 
+    /// Read-only namespace rules of this held directory, not a fresh pathname
+    /// lookup or a uniform profile of all descendant directories/mounts.
+    pub async fn namespace_semantics(
+        &self,
+    ) -> Result<crate::engine::namespace::NamespaceSemantics> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            let rooted = self.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::fs_util::namespace::directory_semantics(rooted.root_fd.as_fd())
+            })
+            .await
+            .map_err(|error| RootedFsError::Worker(error.to_string()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(crate::engine::namespace::NamespaceSemantics::UNSPECIFIED)
+        }
+    }
+
     pub(crate) fn open_blocking_for_worker(root: PathBuf) -> Result<Self> {
         Self::open_blocking(root)
     }

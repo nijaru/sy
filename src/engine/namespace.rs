@@ -19,7 +19,6 @@
 
 use super::domain::RelativePath;
 use super::native_path;
-use crate::protocol::PlatformOs;
 use std::cmp::Ordering;
 use std::io;
 use tokio::io::AsyncWriteExt;
@@ -54,12 +53,12 @@ pub struct NamespaceSemantics {
 
 impl Default for NamespaceSemantics {
     fn default() -> Self {
-        Self::BYTE_EXACT
+        Self::UNSPECIFIED
     }
 }
 
 impl NamespaceSemantics {
-    /// Byte-exact names (Linux ext4/xfs/btrfs and most Unix defaults).
+    /// Names are proven byte-exact for the observed directory.
     pub const BYTE_EXACT: Self = Self {
         case: Folding::Exact,
         normalization: Folding::Exact,
@@ -71,21 +70,11 @@ impl NamespaceSemantics {
         normalization: Folding::Unspecified,
     };
 
-    /// Case folding with Unicode canonical decomposition (APFS default, NTFS).
+    /// Case folding with Unicode canonical decomposition.
     pub const CASE_AND_NORMALIZATION_FOLDED: Self = Self {
         case: Folding::Folded,
         normalization: Folding::Folded,
     };
-
-    /// Fallback approximation used only when a peer predates root-scoped
-    /// namespace negotiation. Prefer `fs_util::namespace_semantics` or the
-    /// negotiated value.
-    pub fn for_platform(os: PlatformOs) -> Self {
-        match os {
-            PlatformOs::Macos | PlatformOs::Windows => Self::CASE_AND_NORMALIZATION_FOLDED,
-            _ => Self::BYTE_EXACT,
-        }
-    }
 
     /// True when distinct byte names can never alias, letting preflight skip.
     pub const fn is_byte_exact(self) -> bool {
