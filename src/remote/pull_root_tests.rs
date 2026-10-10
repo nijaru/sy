@@ -66,7 +66,7 @@ async fn pull_metadata_refuses_replaced_local_root_and_reports_admitted_effects(
             client.sender(),
             Scheduler::new(Default::default()).unwrap(),
         ));
-        let (_, mut destinations) = executor.destination_entries(request, false).await.unwrap();
+        let (_, mut destinations) = executor.destination_entries(request).await.unwrap();
         let destination = destinations.try_next().await.unwrap().unwrap();
         destinations.close().await.unwrap();
         let rooted = executor.metadata_authority().await.unwrap().clone();

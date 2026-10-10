@@ -1750,6 +1750,7 @@ mod tests {
                     IncomingRequest::Xattr(_) => panic!("unexpected xattr request"),
                     IncomingRequest::Acl(_) => panic!("unexpected acl request"),
                     IncomingRequest::BsdFlags(_) => panic!("unexpected bsd flags request"),
+                    IncomingRequest::AcquireRoot(_) => panic!("unexpected acquisition request"),
                 }
             }
             order

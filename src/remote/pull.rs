@@ -164,7 +164,10 @@ pub struct PullTransferMetadata {
 /// staging, and commit.
 pub struct RemotePullExecutor {
     destination_root: PathBuf,
+    /// The sole acquired execution authority, shared by scans and all effects.
     metadata_authority: tokio::sync::OnceCell<crate::rooted_fs::RootedFs>,
+    /// Initial classification/acquisition seed, never used to adopt another root.
+    destination_binding: tokio::sync::OnceCell<crate::rooted_fs::operand::BoundDestination>,
     remote: ClientRemoteHandle,
     sender: RouterSender,
     scheduler: Scheduler,
@@ -208,6 +211,7 @@ impl RemotePullExecutor {
         Self {
             destination_root,
             metadata_authority: tokio::sync::OnceCell::new(),
+            destination_binding: tokio::sync::OnceCell::new(),
             remote,
             sender,
             scheduler,
@@ -223,6 +227,59 @@ impl RemotePullExecutor {
             acls: false,
             bsd_flags: false,
         }
+    }
+
+    pub fn with_destination_binding(
+        mut self,
+        binding: crate::rooted_fs::operand::BoundDestination,
+    ) -> Self {
+        self.destination_root = binding.root.path().to_path_buf();
+        self.destination_binding = tokio::sync::OnceCell::new_with(Some(binding));
+        self
+    }
+
+    async fn binding(&self) -> Result<&crate::rooted_fs::operand::BoundDestination> {
+        let binding = self
+            .destination_binding
+            .get_or_try_init(|| async {
+                crate::rooted_fs::operand::BoundDestination::open(
+                    self.destination_root.clone(),
+                    crate::rooted_fs::operand::SourceShape::Directory { basename: None },
+                )
+                .await
+            })
+            .await?;
+        Ok(binding)
+    }
+
+    /// Initial acquisition is authorized only after full preflight chose Create.
+    pub async fn acquire_destination_for_create(&self, create: &RelativePath) -> Result<()> {
+        if self.metadata_authority.get().is_some() {
+            self.metadata_authority().await?;
+            return Ok(());
+        }
+        let binding = self.binding().await?;
+        if binding.name.as_ref().is_some_and(|name| name != create) {
+            return Err(RemotePullError::DestinationAddressMismatch(create.clone()));
+        }
+        if matches!(
+            binding.root,
+            crate::rooted_fs::operand::DestinationRoot::Present(_)
+        ) {
+            self.metadata_authority().await?;
+            return Ok(());
+        }
+        let mut root = binding.root.clone();
+        root.bind_mutations(self.sender.publication_admission(), false);
+        let rooted = root.acquire_local().await?;
+        let held = rooted.clone();
+        tokio::task::spawn_blocking(move || held.verify_root_path_blocking())
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+        self.metadata_authority.set(rooted).map_err(|_| {
+            crate::rooted_fs::RootedFsError::RootChanged(self.destination_root.clone())
+        })?;
+        Ok(())
     }
 
     pub fn with_backup(mut self, backup_dir: Option<std::path::PathBuf>) -> Self {
@@ -299,10 +356,14 @@ impl RemotePullExecutor {
         let authority = self
             .metadata_authority
             .get_or_try_init(|| async {
-                let mut rooted =
-                    crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
+                let binding = self.binding().await?;
+                let crate::rooted_fs::operand::DestinationRoot::Present(rooted) = &binding.root
+                else {
+                    return Err(RemotePullError::Remote(RemoteSessionError::PendingRoot));
+                };
+                let mut rooted = rooted.clone();
                 rooted.bind_session_mutations(self.sender.publication_admission(), false);
-                Ok::<_, crate::rooted_fs::RootedFsError>(rooted)
+                Ok::<_, RemotePullError>(rooted)
             })
             .await?;
         let rooted = authority.clone();
@@ -314,43 +375,23 @@ impl RemotePullExecutor {
 
     /// Prepare the destination's namespace observation and scan together,
     /// using the same authority as execution. All fallible discovery precedes
-    /// producer admission. An absent preview root is empty and unqualified.
+    /// producer admission. A pending root is empty and unqualified.
     pub async fn destination_entries(
         &self,
         request: crate::engine::scan::ScanRequest,
-        dry_run: bool,
     ) -> Result<(
         crate::engine::namespace::NamespaceSemantics,
         crate::engine::reconcile::EntryStream,
     )> {
         #[cfg(unix)]
         {
-            let root = self.destination_root.clone();
-            let admission = self.sender.publication_admission();
-            let absent = tokio::task::spawn_blocking(move || -> crate::rooted_fs::Result<bool> {
-                match std::fs::metadata(&root) {
-                    Ok(_) => Ok(false),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && dry_run => {
-                        Ok(true)
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        let _permit = admission.admit().map_err(|error| match error {
-                            crate::endpoint::publication::AdmissionError::Closed => {
-                                crate::rooted_fs::RootedFsError::CommitCancelled
-                            }
-                            crate::endpoint::publication::AdmissionError::Exhausted => {
-                                crate::rooted_fs::RootedFsError::CommitAdmissionExhausted
-                            }
-                        })?;
-                        std::fs::create_dir_all(root)?;
-                        Ok(false)
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-            if absent {
+            let binding = self.binding().await?;
+            if self.metadata_authority.get().is_none()
+                && matches!(
+                    binding.root,
+                    crate::rooted_fs::operand::DestinationRoot::Pending(_)
+                )
+            {
                 return Ok((
                     crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
                     crate::engine::reconcile::EntryStream::new(futures::stream::empty()),
@@ -358,11 +399,15 @@ impl RemotePullExecutor {
             }
             let rooted = self.metadata_authority().await?;
             let namespace = rooted.namespace_semantics().await?;
-            Ok((namespace, rooted.entry_stream(request)))
+            let entries = match &binding.name {
+                Some(name) => rooted.selected_entry_stream(name.clone(), request),
+                None => rooted.entry_stream(request),
+            };
+            Ok((namespace, entries))
         }
         #[cfg(not(unix))]
         {
-            let _ = (request, dry_run);
+            let _ = request;
             Err(crate::rooted_fs::RootedFsError::UnsupportedPlatform.into())
         }
     }
@@ -1129,7 +1174,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
 
     async fn finish_deferred_source_removals(&self) -> std::result::Result<(), RemotePullError> {
         // A no-op plan still has to complete against the original local
-        // operator address. Do not acquire/create a root for an absent preview.
+        // operator address. Do not acquire/create an unneeded pending root.
         if self.metadata_authority.get().is_some() {
             self.metadata_authority().await?;
         }

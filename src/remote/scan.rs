@@ -175,7 +175,7 @@ pub(super) async fn serve_incoming_scan_session(
         super::SessionRoot::Present(rooted) => {
             serve_scan(rooted, request, selection, sender, stream_id).await?
         }
-        super::SessionRoot::AbsentPreview => {
+        super::SessionRoot::Pending(_) => {
             sender
                 .send(Frame::new(
                     FrameKind::EntryEnd,

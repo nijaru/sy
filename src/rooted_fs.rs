@@ -1,5 +1,6 @@
 mod directory;
 mod metadata;
+pub mod operand;
 mod publication;
 mod staging;
 pub use publication::{PublishedEntryProof, PublishedFileProof, RootedPublishedFile};
@@ -2284,7 +2285,12 @@ impl RootedFs {
             OwnedFd::from_raw_fd(fd)
         };
 
-        Ok(Self {
+        Ok(Self::from_operand_fd(root, root_fd))
+    }
+
+    #[cfg(unix)]
+    fn from_operand_fd(root: PathBuf, root_fd: OwnedFd) -> Self {
+        Self {
             mutation_admission: RootedMutationAdmission::Unrestricted,
             source_path_continuity: false,
             #[cfg(test)]
@@ -2294,7 +2300,7 @@ impl RootedFs {
             root_path: Arc::new(root),
             root_fd: Arc::new(root_fd),
             retirement: Arc::new(std::sync::Mutex::new(RetirementLineage::default())),
-        })
+        }
     }
 
     #[cfg(not(unix))]

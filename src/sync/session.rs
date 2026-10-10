@@ -21,7 +21,7 @@ pub enum EndpointPair {
     Ssh {
         host: String,
         user: Option<String>,
-        root: PathBuf,
+        operand: PathBuf,
     },
 }
 
@@ -36,7 +36,7 @@ impl EndpointPair {
             } => Ok(Self::Ssh {
                 host: host.clone(),
                 user: user.clone(),
-                root: path.clone(),
+                operand: path.clone(),
             }),
             crate::path::SyncPath::S3 { .. } | crate::path::SyncPath::Gcs { .. } => Err(
                 SyncError::Config("S3/GCS endpoints not yet supported".to_string()),
@@ -44,10 +44,11 @@ impl EndpointPair {
         }
     }
 
-    pub fn root(&self) -> &Path {
+    /// Operator operand until direction-specific binding captures its root FD.
+    pub fn path(&self) -> &Path {
         match self {
             Self::Local(endpoint) => endpoint.root(),
-            Self::Ssh { root, .. } => root,
+            Self::Ssh { operand, .. } => operand,
         }
     }
 
@@ -77,6 +78,7 @@ pub struct SyncSession {
     config: SyncConfig,
     scan_options: ScanOptions,
     scope: SyncScope,
+    source_contents: bool,
 }
 
 impl SyncSession {
@@ -87,6 +89,7 @@ impl SyncSession {
             config,
             scan_options: ScanOptions::default(),
             scope: SyncScope::Tree,
+            source_contents: true,
         }
     }
 
@@ -111,6 +114,11 @@ impl SyncSession {
         );
         session.scope = scope;
         Ok(session)
+    }
+
+    pub fn with_source_contents(mut self, contents: bool) -> Self {
+        self.source_contents = contents;
+        self
     }
 
     pub fn with_scan_options(mut self, scan_options: ScanOptions) -> Self {
@@ -142,8 +150,8 @@ impl SyncSession {
 
     async fn direct_local(&self) -> Result<SyncStats> {
         super::local::run(
-            self.source.root(),
-            self.dest.root(),
+            self.source.path(),
+            self.dest.path(),
             &self.config,
             self.scan_options,
             self.scope.clone(),
@@ -275,7 +283,11 @@ impl SyncSession {
 
     async fn streaming_push(&self) -> Result<SyncStats> {
         let (host, user, dest_root) = match &self.dest {
-            EndpointPair::Ssh { host, user, root } => (host, user, root),
+            EndpointPair::Ssh {
+                host,
+                user,
+                operand,
+            } => (host, user, operand),
             _ => {
                 return Err(SyncError::Config(
                     "destination must be SSH for push".to_string(),
@@ -283,19 +295,24 @@ impl SyncSession {
             }
         };
         super::push::run(
-            self.source.root(),
+            self.source.path(),
             dest_root,
             host,
             user,
             &self.config,
             self.scan_options,
+            self.source_contents,
         )
         .await
     }
 
     async fn streaming_pull(&self) -> Result<SyncStats> {
         let (host, user, source_root) = match &self.source {
-            EndpointPair::Ssh { host, user, root } => (host, user, root),
+            EndpointPair::Ssh {
+                host,
+                user,
+                operand,
+            } => (host, user, operand),
             _ => return Err(SyncError::Config("source must be SSH for pull".to_string())),
         };
         #[cfg(feature = "ssh")]
@@ -305,11 +322,12 @@ impl SyncSession {
             }
             super::pull::run(
                 source_root,
-                self.dest.root(),
+                self.dest.path(),
                 host,
                 user,
                 &self.config,
                 self.scan_options,
+                self.source_contents,
             )
             .await
         }

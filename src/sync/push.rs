@@ -6,10 +6,7 @@ use crate::sync::{SyncConfig, SyncStats};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
-use sy::engine::controller::{
-    preflight_sync_scoped, preflight_sync_scoped_with_content, preview_sync, SyncController,
-};
-use sy::engine::namespace::NamespaceSemantics;
+use sy::engine::controller::{preflight_sync_scoped_with_content, preview_sync, SyncController};
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::protocol::Operation;
 use sy::remote::hash::{hash_rooted_file, RemoteHashError};
@@ -26,11 +23,22 @@ pub(super) async fn run(
     user: &Option<String>,
     config: &SyncConfig,
     scan_options: ScanOptions,
+    contents: bool,
 ) -> Result<SyncStats> {
+    let bound = if config.preserve.symlink_mode == SymlinkMode::Follow {
+        sy::rooted_fs::operand::BoundSource::open_following(source_root.to_path_buf(), contents)
+            .await
+    } else {
+        sy::rooted_fs::operand::BoundSource::open(source_root.to_path_buf(), contents).await
+    }
+    .map_err(map_io)?;
+    let source_authority = sy::endpoint::source_root::SourceRoot::from_rooted(bound.rooted);
     // Refuse before connecting or allocating controller/session journals.
-    sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
-        .await
-        .map_err(map_io)?;
+    sy::endpoint::local_entry_scan::validate_scratch_location(
+        source_authority.path().to_path_buf(),
+    )
+    .await
+    .map_err(map_io)?;
     let started = Instant::now();
     // OpenSSH resolves this alias with the user's own ssh_config; only an
     // explicit `user@` from the command line overrides it.
@@ -49,7 +57,7 @@ pub(super) async fn run(
         // --contimeout bounds the OpenSSH connection establishment.
         connect_timeout: config.contimeout,
     };
-    let session = SshRemoteSession::connect_with_options(
+    let session = SshRemoteSession::connect_operand_with_options(
         &target,
         if config.dry_run {
             Operation::PreviewPush
@@ -57,15 +65,46 @@ pub(super) async fn run(
             Operation::Push
         },
         destination_root,
+        &sy::remote::operand::RemoteOperand::Destination {
+            source: bound.shape.clone(),
+        },
         router_config,
         launch,
     )
     .await
     .map_err(map_io)?;
     let remote = session.remote().request_handle();
-    let destination_root = destination_root.to_path_buf();
-    let result =
-        execute_with_handle(source_root, &destination_root, remote, config, scan_options).await;
+    let result = async {
+        let scope = match (&bound.shape, &remote.binding().resolved) {
+            (
+                sy::rooted_fs::operand::SourceShape::Directory { .. },
+                sy::protocol::ResolvedOperand::Tree,
+            ) => sy::engine::domain::SyncScope::Tree,
+            (
+                sy::rooted_fs::operand::SourceShape::Leaf { name },
+                sy::protocol::ResolvedOperand::Entry { name: destination },
+            ) => sy::engine::domain::SyncScope::SelectedLeaf {
+                source: name.clone(),
+                destination: sy::remote::operand::decode_name(destination.clone())
+                    .map_err(map_io)?,
+            },
+            _ => {
+                return Err(SyncError::Config(
+                    "peer returned inconsistent destination operand binding".into(),
+                ))
+            }
+        };
+        execute_bound(
+            source_authority,
+            destination_root,
+            remote,
+            config,
+            scan_options,
+            scope,
+        )
+        .await
+    }
+    .await;
     let mut stats = match result {
         Ok(stats) => {
             session.finish().await.map_err(map_io)?;
@@ -82,6 +121,7 @@ pub(super) async fn run(
     Ok(stats)
 }
 
+#[cfg(test)]
 async fn execute_with_handle(
     source_root: &Path,
     destination_root: &Path,
@@ -92,6 +132,26 @@ async fn execute_with_handle(
     let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
         .await
         .map_err(map_io)?;
+    execute_bound(
+        source_authority,
+        destination_root,
+        remote,
+        config,
+        scan_options,
+        sy::engine::domain::SyncScope::Tree,
+    )
+    .await
+}
+
+async fn execute_bound(
+    source_authority: sy::endpoint::source_root::SourceRoot,
+    destination_root: &Path,
+    remote: ClientRemoteHandle,
+    config: &SyncConfig,
+    scan_options: ScanOptions,
+    scope: sy::engine::domain::SyncScope,
+) -> Result<SyncStats> {
+    let source_root = source_authority.path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -100,18 +160,24 @@ async fn execute_with_handle(
     ));
     let scan_started = std::time::Instant::now();
     let source_request = source_scan_request(config, scan_options);
-    let source_rooted = if config.comparison.checksum {
-        Some(source_authority.rooted())
-    } else {
-        None
-    };
-    let destination = remote
-        .scan(destination_scan_request(config))
-        .await
-        .map_err(map_io)?;
+    let source_rooted = source_authority.rooted();
+    let destination = match &scope {
+        sy::engine::domain::SyncScope::Tree => remote.scan(destination_scan_request(config)).await,
+        sy::engine::domain::SyncScope::SelectedLeaf { destination, .. } => {
+            remote
+                .scan_entry(destination_scan_request(config), destination.clone())
+                .await
+        }
+    }
+    .map_err(map_io)?;
     reporter.start(source_root, destination_root);
     let source = filtered_source_stream(
-        source_authority.entries(source_request),
+        match &scope {
+            sy::engine::domain::SyncScope::Tree => source_authority.entries(source_request),
+            sy::engine::domain::SyncScope::SelectedLeaf { source, .. } => {
+                source_authority.selected_entries(source.clone(), source_request, false)
+            }
+        },
         config.filter_engine.clone(),
     );
     let min_size = config.min_size;
@@ -131,68 +197,45 @@ async fn execute_with_handle(
     ));
     // Both exact-version peers report root semantics. Unknown filesystem
     // semantics remain conservative, never an OS-derived aliasing guess.
-    let namespace_semantics = remote
-        .namespace_semantics()
-        .unwrap_or(NamespaceSemantics::UNSPECIFIED);
-    let mut plan = if let Some(source_rooted) = source_rooted {
-        let hash_remote = remote.clone();
-        preflight_sync_scoped_with_content(
-            sy::engine::reconcile::OrderedReconciler::new(source, destination),
-            comparison_policy(config, namespace_semantics),
-            delete_policy(&config.delete),
-            move |entry| {
-                entry_in_size_scope(entry, min_size, max_size)
-                    && entry_selected_by_symlink_mode(entry, skip_symlinks)
-            },
-            move |entry| {
-                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-                    && entry_in_depth_scope(entry, max_depth)
-                    && entry_in_vcs_scope(entry, include_git_dir)
-                    && entry_not_source_ignored(&ignore_scope, entry)
-            },
-            move |source, destination| {
-                let source_rooted = source_rooted.clone();
-                let hash_remote = hash_remote.clone();
-                async move {
-                    let source_identity = source
-                        .identity
-                        .ok_or(RemoteHashError::MissingBasisIdentity)?;
-                    // Finish admitted native hashing before starting the peer
-                    // request; sibling failure must not drop an owned job.
-                    let source_hash = hash_rooted_file(
-                        source_rooted,
-                        source.path.clone(),
-                        source.size,
-                        source_identity,
-                    )
-                    .await?;
-                    let destination_hash = hash_remote.content_hash(&destination).await?;
-                    Ok(source_hash == destination_hash)
-                }
-            },
-        )
-        .await
-        .map_err(map_controller_error)?
-    } else {
-        preflight_sync_scoped(
-            source,
-            destination,
-            comparison_policy(config, namespace_semantics),
-            delete_policy(&config.delete),
-            move |entry| {
-                entry_in_size_scope(entry, min_size, max_size)
-                    && entry_selected_by_symlink_mode(entry, skip_symlinks)
-            },
-            move |entry| {
-                delete_filter.should_include(entry.path.as_path(), entry.is_directory())
-                    && entry_in_depth_scope(entry, max_depth)
-                    && entry_in_vcs_scope(entry, include_git_dir)
-                    && entry_not_source_ignored(&ignore_scope, entry)
-            },
-        )
-        .await
-        .map_err(map_controller_error)?
-    };
+    let namespace_semantics = remote.namespace_semantics();
+    let hash_remote = remote.clone();
+    let mut plan = preflight_sync_scoped_with_content(
+        sy::engine::reconcile::OrderedReconciler::with_scope(source, destination, scope),
+        comparison_policy(config, namespace_semantics),
+        delete_policy(&config.delete),
+        move |entry| {
+            entry_in_size_scope(entry, min_size, max_size)
+                && entry_selected_by_symlink_mode(entry, skip_symlinks)
+        },
+        move |entry| {
+            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                && entry_in_depth_scope(entry, max_depth)
+                && entry_in_vcs_scope(entry, include_git_dir)
+                && entry_not_source_ignored(&ignore_scope, entry)
+        },
+        move |source, destination| {
+            let source_rooted = source_rooted.clone();
+            let hash_remote = hash_remote.clone();
+            async move {
+                let source_identity = source
+                    .identity
+                    .ok_or(RemoteHashError::MissingBasisIdentity)?;
+                // Finish admitted native hashing before starting the peer
+                // request; sibling failure must not drop an owned job.
+                let source_hash = hash_rooted_file(
+                    source_rooted,
+                    source.path.clone(),
+                    source.size,
+                    source_identity,
+                )
+                .await?;
+                let destination_hash = hash_remote.content_hash(&destination).await?;
+                Ok(source_hash == destination_hash)
+            }
+        },
+    )
+    .await
+    .map_err(map_controller_error)?;
 
     source_authority.validate().await.map_err(map_io)?;
     if config.preserve.hardlinks {
@@ -281,6 +324,23 @@ async fn execute_with_handle(
     } else {
         None
     };
+    if remote.binding().pending {
+        let mut create = None;
+        plan.validate_operations(|operation| {
+            if create.is_none() && matches!(operation, sy::engine::domain::SyncOp::Create { .. }) {
+                create = Some(operation.path().clone());
+            }
+            futures::future::ready(Ok(()))
+        })
+        .await
+        .map_err(map_controller_error)?;
+        if let Some(create) = create {
+            remote
+                .acquire_root_for_create(&create)
+                .await
+                .map_err(map_io)?;
+        }
+    }
     let executor = RemotePushExecutor::new(
         source_authority,
         remote,

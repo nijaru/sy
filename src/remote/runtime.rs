@@ -7,6 +7,12 @@ pub(crate) mod metadata;
 #[path = "mutation.rs"]
 mod mutation;
 pub use client::ClientRemoteHandle;
+#[path = "scope.rs"]
+mod scope;
+pub use scope::ScopeError;
+#[cfg(all(test, unix))]
+#[path = "scope_tests.rs"]
+mod scope_tests;
 
 use crate::endpoint::Capabilities as EndpointCapabilities;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
@@ -33,7 +39,7 @@ use crate::remote::transfer::{
     request_file_transfer, serve_incoming_file_rooted, RemoteTransferError,
 };
 use crate::remote::xattr::{request_read_xattrs, serve_incoming_xattr_rooted, RemoteXattrError};
-use crate::remote::{client_handshake, server_handshake, OpenedServerSession, SessionRoot};
+use crate::remote::{server_handshake, OpenedServerSession, SessionRoot};
 use crate::rooted_fs::RootedFs;
 use crate::transfer::delta::{
     BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
@@ -69,8 +75,11 @@ pub enum RemoteSessionError {
         kind: FrameKind,
     },
 
-    #[error("absent preview root has no filesystem authority")]
-    AbsentPreviewRoot,
+    #[error(transparent)]
+    Scope(#[from] ScopeError),
+
+    #[error("pending destination root has no filesystem authority")]
+    PendingRoot,
 
     #[error("compression requested but the peer did not negotiate the ZSTD capability")]
     PeerLacksZstd,
@@ -120,14 +129,14 @@ pub struct ClientRemoteSession {
     operation: Operation,
     server: ServerHello,
     capabilities: EndpointCapabilities,
-    namespace_semantics: Option<crate::engine::namespace::NamespaceSemantics>,
+    binding: std::sync::Arc<client::ClientRootBinding>,
     router: FrameRouter,
 }
 
 impl ClientRemoteSession {
     pub async fn connect<R, W>(
-        mut reader: R,
-        mut writer: W,
+        reader: R,
+        writer: W,
         operation: Operation,
         root: &Path,
         config: RouterConfig,
@@ -136,13 +145,50 @@ impl ClientRemoteSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let negotiated = client_handshake(&mut reader, &mut writer, operation, root).await?;
+        Self::connect_binding(reader, writer, operation, root, None, config).await
+    }
+
+    pub async fn connect_operand<R, W>(
+        reader: R,
+        writer: W,
+        operation: Operation,
+        path: &Path,
+        operand: &crate::remote::operand::RemoteOperand,
+        config: RouterConfig,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::connect_binding(reader, writer, operation, path, Some(operand), config).await
+    }
+
+    async fn connect_binding<R, W>(
+        mut reader: R,
+        mut writer: W,
+        operation: Operation,
+        path: &Path,
+        operand: Option<&crate::remote::operand::RemoteOperand>,
+        config: RouterConfig,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let negotiated = crate::remote::client_operand_handshake(
+            &mut reader,
+            &mut writer,
+            operation,
+            path,
+            operand,
+        )
+        .await?;
         let router = FrameRouter::start(reader, writer, RouterRole::Client, config)?;
         Ok(Self {
             operation,
             server: negotiated.server,
             capabilities: negotiated.capabilities,
-            namespace_semantics: negotiated.namespace_semantics,
+            binding: std::sync::Arc::new(client::ClientRootBinding::new(negotiated.ready)),
             router,
         })
     }
@@ -170,10 +216,8 @@ impl ClientRemoteSession {
         &self.capabilities
     }
 
-    pub const fn namespace_semantics(
-        &self,
-    ) -> Option<crate::engine::namespace::NamespaceSemantics> {
-        self.namespace_semantics
+    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
+        self.binding.ready().namespace_semantics.into()
     }
 
     pub fn sender(&self) -> RouterSender {
@@ -426,6 +470,7 @@ impl ClientRemoteSession {
 }
 
 pub enum IncomingRequest {
+    AcquireRoot(IncomingStream),
     Scan(IncomingStream),
     Hash(IncomingStream),
     Signatures(IncomingStream),
@@ -586,11 +631,15 @@ impl ServerRemoteSession {
     {
         let mut opened = server_handshake(&mut reader, &mut writer).await?;
         let router = FrameRouter::start(reader, writer, RouterRole::Server, config)?;
-        if let SessionRoot::Present(rooted) = &mut opened.rooted {
-            rooted.bind_session_mutations(
+        match &mut opened.rooted {
+            SessionRoot::Present(rooted) => rooted.bind_session_mutations(
                 router.sender().publication_admission(),
                 opened.operation != Operation::Push,
-            );
+            ),
+            SessionRoot::Pending(pending) => pending.bind_mutations(
+                router.sender().publication_admission(),
+                opened.operation != Operation::Push,
+            ),
         }
         Ok(Self { opened, router })
     }
@@ -607,8 +656,8 @@ impl ServerRemoteSession {
         &self.opened.root
     }
 
-    pub const fn ready(&self) -> SessionReady {
-        self.opened.ready
+    pub fn ready(&self) -> &SessionReady {
+        &self.opened.ready
     }
 
     pub fn sender(&self) -> RouterSender {
@@ -631,7 +680,7 @@ impl ServerRemoteSession {
     pub fn scan_handler_rooted(&self) -> Result<RootedFs> {
         match &self.opened.rooted {
             SessionRoot::Present(rooted) => Ok(rooted.clone()),
-            SessionRoot::AbsentPreview => Err(RemoteSessionError::AbsentPreviewRoot),
+            SessionRoot::Pending(_) => Err(RemoteSessionError::PendingRoot),
         }
     }
 
@@ -713,19 +762,74 @@ impl ServerRemoteSession {
             .map_err(RemoteSessionError::Router)
     }
 
+    /// Called only at the drained acquisition barrier, before rebuilding all handlers.
+    pub(crate) async fn acquire_root(&mut self, incoming: IncomingStream) -> Result<()> {
+        let frame = incoming.first.frame();
+        if frame.flags()
+            != (crate::protocol::FrameFlags::FINAL | crate::protocol::FrameFlags::ACK_REQUIRED)
+        {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage("invalid acquisition flags"),
+            )
+            .into());
+        }
+        let request = crate::protocol::AcquireRoot::decode(frame.payload())
+            .map_err(crate::remote::RemoteError::from)?;
+        let path =
+            crate::remote::path::decode_relative_path(request.create, self.client().platform.os)
+                .map_err(|error| crate::remote::RemoteError::Io(std::io::Error::other(error)))?;
+        if let crate::protocol::ResolvedOperand::Entry { name } = &self.opened.ready.resolved {
+            if crate::remote::operand::decode_name(name.clone())? != path {
+                return Err(crate::remote::RemoteError::InvalidRoot(
+                    "acquisition target differs from selected destination",
+                )
+                .into());
+            }
+        }
+        let SessionRoot::Pending(pending) = &self.opened.rooted else {
+            return Err(crate::remote::RemoteError::InvalidRoot("root is already acquired").into());
+        };
+        let rooted = crate::rooted_fs::operand::DestinationRoot::Pending(pending.clone())
+            .acquire()
+            .await
+            .map_err(crate::remote::RemoteError::from)?;
+        let namespace = rooted
+            .namespace_semantics()
+            .await
+            .map_err(crate::remote::RemoteError::from)?;
+        self.opened.rooted = SessionRoot::Present(rooted);
+        self.opened.ready.pending = false;
+        self.opened.ready.namespace_semantics = namespace.into();
+        let ack = crate::protocol::Frame::new(
+            FrameKind::Ack,
+            crate::protocol::FrameFlags::empty(),
+            frame.stream_id(),
+            self.opened
+                .ready
+                .encode()
+                .map_err(crate::remote::RemoteError::from)?,
+        )
+        .map_err(crate::remote::RemoteError::from)?;
+        self.sender().send(ack).await?;
+        Ok(())
+    }
+
     pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
         let Some(incoming) = self.router.incoming().recv().await? else {
             return Ok(None);
         };
 
         let kind = incoming.first.frame().kind();
-        if !self.has_root() && kind != FrameKind::ScanRequest {
+        if !self.has_root() && kind != FrameKind::ScanRequest && kind != FrameKind::AcquireRoot {
             return Err(RemoteSessionError::OperationMismatch {
                 operation: self.operation(),
                 kind,
             });
         }
-        match kind {
+        let request = match kind {
+            FrameKind::AcquireRoot if self.operation() == Operation::Push && !self.has_root() => {
+                Ok(Some(IncomingRequest::AcquireRoot(incoming)))
+            }
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
@@ -785,7 +889,28 @@ impl ServerRemoteSession {
                 kind: incoming.first.frame().kind(),
             }),
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
+        }?;
+        if let Some(request) = &request {
+            let incoming = match request {
+                IncomingRequest::AcquireRoot(incoming)
+                | IncomingRequest::Scan(incoming)
+                | IncomingRequest::Hash(incoming)
+                | IncomingRequest::Signatures(incoming)
+                | IncomingRequest::File(incoming)
+                | IncomingRequest::FileFetch(incoming)
+                | IncomingRequest::Metadata(incoming)
+                | IncomingRequest::Mutation(incoming)
+                | IncomingRequest::Xattr(incoming)
+                | IncomingRequest::Acl(incoming)
+                | IncomingRequest::BsdFlags(incoming) => incoming,
+            };
+            scope::authorize(
+                &self.opened.ready.resolved,
+                incoming.first.frame(),
+                self.opened.client.platform.os,
+            )?;
         }
+        Ok(request)
     }
 }
 
@@ -838,7 +963,7 @@ async fn preview_requests_have_only_the_observed_read_authority() {
                             Err(RootedFsError::ReadOnlyRoot)
                         ));
                     }
-                    Err(RemoteSessionError::AbsentPreviewRoot) => assert!(!present),
+                    Err(RemoteSessionError::PendingRoot) => assert!(!present),
                     Err(error) => panic!("{error}"),
                 }
                 assert!(matches!(session.next_request().await,
@@ -1045,7 +1170,8 @@ mod tests {
                     | IncomingRequest::Mutation(_)
                     | IncomingRequest::Xattr(_)
                     | IncomingRequest::Acl(_)
-                    | IncomingRequest::BsdFlags(_) => {
+                    | IncomingRequest::BsdFlags(_)
+                    | IncomingRequest::AcquireRoot(_) => {
                         panic!("unexpected mutation request")
                     }
                 }

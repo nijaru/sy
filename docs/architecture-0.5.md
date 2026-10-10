@@ -334,7 +334,7 @@ The client sends:
 protocol version/range
 build identity
 operation (push/pull)
-requested root
+typed source or destination operand
 requested semantics
 client capabilities
 ```
@@ -350,6 +350,42 @@ negotiated semantics
 ```
 
 Do not guess remote capabilities from endpoint type.
+
+The exact wire contract is **3.10**, with no earlier-minor compatibility.
+Version refusal precedes operand classification or filesystem root opening.
+`SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
+
+- Operation: 1=Push, 2=Pull, 3=PreviewPush.
+- Operand request: 0=Source followed by `contents:u8` (0/1); 1=Destination
+  followed by source shape. Roles must agree with the operation.
+- Source shape: 0=Directory contents/no basename, 1=Directory plus basename,
+  2=Leaf plus physical source name. Names are `byte_len:u32, native_bytes`.
+
+`SessionReady` is `capabilities:u64, modtime_precision_ns:u64,
+namespace_semantics:u8, resolved_operand, source_shape_presence:u8,
+[source_shape], pending:u8`. Resolved operand is 0=Tree or 1=Entry plus name.
+Presence and pending are 0/1. Pull returns source shape and cannot be pending;
+push returns no source shape. Every path/name length is bounded by
+`MAX_WIRE_PATH_BYTES` before allocation, and all tags are validated.
+
+Classification retains the selected directory FD, or the parent FD plus exact
+physical leaf name. Source names are never virtually renamed. Directory
+basename/trailing-slash semantics bind actual tree roots; selected leaves use
+one-name scans and the shared selected-leaf reconciler. An operator-selected
+destination directory symlink may be followed initially, then remains FD-bound.
+
+Missing destination parents are pending, not created by handshake or scanning.
+Pending namespace semantics are unqualified. After complete preflight selects a
+Create, `AcquireRoot` (frame kind 33) carries its destination `RelativeWirePath`,
+not a new root. An Entry-bound session requires that exact selected name. The
+server drains active handlers before acquisition and rebuilds every handler from
+the captured root FD. Its Ack carries the updated `SessionReady`, including the
+actual held-root namespace profile. Acquisition creates permanent parents from
+the original held ancestor, refuses foreign existing names, and does not claim
+private creator ownership, cleanup authority, or whole-run rollback. Local
+acquisition also requires original operator-path continuity; remote authority
+permits relocation of the held ancestor/root. Neither adopts a replacement after
+capturing its original root FD.
 
 ### Metadata phase
 
@@ -406,7 +442,7 @@ The scheduler controls fairness and byte budgets. Frame sizes remain moderate so
 
 Compression is negotiated; do not compress copy operations or signatures. `Auto` samples the first file-data chunk and uses the elapsed-time model to decide whether to compress this transfer. `Always` attempts every chunk, including after an incompressible first chunk. Both send raw bytes unless the actual compressed payload is smaller; only smaller zstd payloads carry the `COMPRESSED` frame flag.
 
-The current exact wire contract is 3.9 (no earlier-minor compatibility). Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
+Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
 
 ## Integrity
 
