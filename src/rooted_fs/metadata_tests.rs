@@ -22,6 +22,19 @@ fn requested_flags() -> Option<u32> {
 fn acl(file: &File) -> Option<String> {
     #[cfg(feature = "acl")]
     {
+        // Namespace/shared-inode tests request 0600; keep their ACL compatible
+        // so an ACL-mask conflict does not hide the ownership failure.
+        #[cfg(target_os = "linux")]
+        let mut entries = {
+            let _ = file;
+            let mut entries = exacl::from_mode(0o600);
+            entries.push(exacl::AclEntry::allow_mask(
+                exacl::Perm::empty(),
+                exacl::Flag::empty(),
+            ));
+            entries
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut entries = exacl::getfacl(fd_fixture_path(file), None).unwrap();
         entries.push(exacl::AclEntry::allow_user(
             "1",
@@ -37,14 +50,136 @@ fn acl(file: &File) -> Option<String> {
     }
 }
 
-#[cfg(feature = "acl")]
+#[cfg(all(feature = "acl", not(target_os = "linux")))]
 fn fd_fixture_path(file: &File) -> PathBuf {
     // macOS ACL construction is path-based only in this fixture; held FD ACL
     // implementation is exercised by the operation under test below.
-    #[cfg(target_os = "linux")]
-    return PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    #[cfg(not(target_os = "linux"))]
     PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(all(target_os = "linux", feature = "acl"))]
+#[tokio::test]
+async fn native_acl_outcome_is_verified_without_rewriting_its_mask() {
+    use std::io::Write;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    std::fs::write(&source, b"source bytes").unwrap();
+    let mut entries = exacl::from_mode(0o640);
+    entries.push(exacl::AclEntry::allow_user(
+        "12345",
+        exacl::Perm::READ | exacl::Perm::WRITE,
+        exacl::Flag::empty(),
+    ));
+    entries.push(exacl::AclEntry::allow_mask(
+        exacl::Perm::READ,
+        exacl::Flag::empty(),
+    ));
+    exacl::setfacl(&[&source], &entries, None).unwrap();
+    // Canonical, native-observed ACL: the named user's write permission is
+    // limited by the READ mask. chmod(0600) after ACL would silently clear it.
+    let entries = exacl::getfacl(&source, None).unwrap();
+    let text = exacl::to_string(&entries).unwrap();
+
+    for (staged, kind) in [
+        (false, EntryKind::File),
+        (false, EntryKind::Directory),
+        (true, EntryKind::File),
+    ] {
+        for requested_mode in [None, Some(0o640), Some(0o600)] {
+            let destination = tempfile::tempdir().unwrap();
+            let path = destination.path().join("file");
+            if kind == EntryKind::Directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"old bytes").unwrap();
+            }
+            let rooted = RootedFs::open(destination.path().into()).await.unwrap();
+            let expected = rooted
+                .path_identity_blocking(&relative())
+                .unwrap()
+                .unwrap()
+                .1;
+            let preservation = MetadataPreservation {
+                acl: Some(&text),
+                ..Default::default()
+            };
+            let result = if staged {
+                let mut writer = rooted
+                    .begin_staged_file_with_expectation_blocking(
+                        &relative(),
+                        ExpectedDestination::Unchanged(expected),
+                    )
+                    .unwrap();
+                writer.file_mut().write_all(b"new bytes").unwrap();
+                writer
+                    .apply_metadata_blocking(requested_mode, None)
+                    .unwrap();
+                let result = writer.apply_preservation_blocking(None, Some(&text), requested_mode);
+                assert_eq!(
+                    exacl::getfacl(fd_alias_path(&writer.file), None).unwrap(),
+                    entries
+                );
+                if result.is_ok() {
+                    writer.commit().unwrap().finalize_blocking(None).unwrap();
+                }
+                result
+            } else if kind == EntryKind::Directory {
+                rooted.finalize_directory_blocking(
+                    &relative(),
+                    expected,
+                    requested_mode,
+                    None,
+                    &DirectoryPreservation {
+                        acl: Some(text.clone()),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                rooted
+                    .apply_observed_preservation_blocking(
+                        &relative(),
+                        kind,
+                        expected,
+                        requested_mode,
+                        None,
+                        &preservation,
+                    )
+                    .map(|_| ())
+            };
+            if requested_mode == Some(0o600) {
+                assert!(
+                    matches!(
+                        result,
+                        Err(RootedFsError::PreservationModeConflict {
+                            expected: 0o600,
+                            actual: 0o640
+                        })
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+            if !staged || requested_mode != Some(0o600) {
+                assert_eq!(exacl::getfacl(&path, None).unwrap(), entries);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                    0o640
+                );
+            }
+            if kind == EntryKind::File {
+                let wanted: &[u8] = if staged && requested_mode != Some(0o600) {
+                    b"new bytes"
+                } else {
+                    b"old bytes"
+                };
+                assert_eq!(std::fs::read(&path).unwrap(), wanted);
+            }
+        }
+    }
+    assert_eq!(exacl::getfacl(&source, None).unwrap(), entries);
+    assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
 }
 
 #[tokio::test]

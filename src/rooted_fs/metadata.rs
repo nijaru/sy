@@ -72,30 +72,9 @@ impl MetadataPreservation<'_> {
                 }
             }
         }
-        if let Some(acl) = self.acl {
-            #[cfg(feature = "acl")]
-            apply_acl_fd(file, acl)?;
-            #[cfg(not(feature = "acl"))]
-            {
-                let _ = acl;
-                return Err(RootedFsError::AclUnsupported(
-                    "ACL preservation requires the acl feature",
-                ));
-            }
-        }
-        // ACL first, then requested mode/mask; flags last because immutable
-        // flags can prevent the other required fields from being written.
         apply_fd_metadata(file.as_raw_fd(), unix_mode, modified)?;
-        if let Some(expected) = unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            let actual = file.metadata()?.permissions().mode() & 0o7777;
-            if actual != expected & 0o7777 {
-                return Err(RootedFsError::PreservationModeConflict {
-                    expected: expected & 0o7777,
-                    actual,
-                });
-            }
-        }
+        apply_acl_and_verify_mode(file, self.acl, unix_mode)?;
+        // Immutable flags are last: they can prevent preceding required fields.
         if let Some(flags) = self.bsd_flags {
             #[cfg(target_os = "macos")]
             {
@@ -113,6 +92,35 @@ impl MetadataPreservation<'_> {
         }
         Ok(())
     }
+}
+
+/// ACL application can change mode bits. A requested mode is an independent
+/// contract to verify, not permission to rewrite the requested ACL with chmod.
+#[cfg(unix)]
+pub(super) fn apply_acl_and_verify_mode(
+    file: &File,
+    acl: Option<&str>,
+    unix_mode: Option<u32>,
+) -> Result<()> {
+    if let Some(acl) = acl {
+        #[cfg(feature = "acl")]
+        apply_acl_fd(file, acl)?;
+        #[cfg(not(feature = "acl"))]
+        {
+            let _ = acl;
+            return Err(RootedFsError::AclUnsupported(
+                "ACL preservation requires the acl feature",
+            ));
+        }
+    }
+    if let Some(expected) = unix_mode.map(|mode| mode & 0o7777) {
+        use std::os::unix::fs::PermissionsExt;
+        let actual = file.metadata()?.permissions().mode() & 0o7777;
+        if actual != expected {
+            return Err(RootedFsError::PreservationModeConflict { expected, actual });
+        }
+    }
+    Ok(())
 }
 
 impl RootedFs {

@@ -79,8 +79,9 @@ impl RootedFs {
     /// Admission covers this multi-field operation, not atomicity: after it
     /// starts, cancellation cannot interrupt it and failures may leave some
     /// fields applied. Directory link counts are not regular-file sharing.
-    /// ACLs precede chmod so the requested POSIX mask/mode wins; immutable
-    /// flags are last, after children, deletion and every other required field.
+    /// Mode precedes ACL application; conflicting effective modes fail rather
+    /// than silently changing an ACL mask. Immutable flags are last, after
+    /// children, deletion and every other required field.
     pub fn finalize_directory_blocking(
         &self,
         path: &RelativePath,

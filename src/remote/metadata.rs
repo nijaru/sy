@@ -318,6 +318,8 @@ mod tests {
     use super::*;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use std::os::unix::fs::MetadataExt;
+    #[cfg(feature = "acl")]
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn observed_preservation_rpc_refuses_foreign_destination_and_closed_admission_before_any_field(
@@ -499,9 +501,15 @@ mod tests {
         let modified = Timestamp::new(1_600_000_010, 0).unwrap();
         let attrs = vec![(std::ffi::OsString::from("user.sy-owner"), b"value".to_vec())];
         #[cfg(feature = "acl")]
-        let acl = Some(
-            exacl::to_string(&exacl::getfacl(root.path().join("file"), None).unwrap()).unwrap(),
-        );
+        let acl = {
+            // A successful combined request needs an ACL compatible with its
+            // requested 0640 mode, not the destination's initial 0644 ACL.
+            let source = tempfile::tempdir().unwrap();
+            let path = source.path().join("file");
+            std::fs::write(&path, b"source").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            Some(exacl::to_string(&exacl::getfacl(&path, None).unwrap()).unwrap())
+        };
         #[cfg(not(feature = "acl"))]
         let acl: Option<String> = None;
         #[cfg(target_os = "macos")]
