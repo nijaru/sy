@@ -342,7 +342,7 @@ mod tests {
     fn supported_config() -> crate::sync::SyncConfig {
         let mut config = crate::sync::SyncConfig::test_default();
         config.max_concurrent = 2;
-        config.verification.mode = crate::integrity::ChecksumType::None;
+        config.verification.mode = crate::sync::config::ChecksumType::None;
         config
     }
 
@@ -906,7 +906,7 @@ mod tests {
         .await
         .unwrap();
         let mut config = supported_config();
-        config.compression_detection = crate::compress::CompressionDetection::Always;
+        config.compression_detection = crate::engine::compression::CompressionDetection::Always;
         let stats = execute_with_handle(
             source_root.path(),
             destination_root.path(),

@@ -1,7 +1,6 @@
 use crate::cli::SymlinkMode;
-use crate::compress::CompressionDetection;
+use crate::engine::compression::CompressionDetection;
 use crate::filter::FilterEngine;
-use crate::integrity::ChecksumType;
 use std::path::PathBuf;
 pub use sy::engine::delete_plan::DeleteLimit;
 
@@ -141,6 +140,17 @@ pub struct ComparisonConfig {
     pub checksum: bool,
     pub update_only: bool,
     pub ignore_existing: bool,
+}
+
+/// Checksum policy marker carried by synchronization configuration.
+///
+/// Endpoints own the verification algorithm: v3 always verifies BLAKE3, and
+/// optional local staged verification is controlled by `verify_on_write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChecksumType {
+    None,
+    #[default]
+    Fast,
 }
 
 #[derive(Debug, Clone, Default)]

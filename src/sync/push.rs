@@ -388,7 +388,7 @@ mod tests {
         super::super::hardlink_tests::assert_destination_alias_deletion(execute_hardlink_fixture)
             .await;
     }
-    use crate::compress::CompressionDetection;
+    use crate::engine::compression::CompressionDetection;
     use crate::filter::FilterEngine;
     use crate::sync::DeleteMode;
     use futures::stream;
@@ -404,7 +404,7 @@ mod tests {
     fn supported_config() -> SyncConfig {
         let mut config = SyncConfig::test_default();
         config.max_concurrent = 2;
-        config.verification.mode = crate::integrity::ChecksumType::None;
+        config.verification.mode = crate::sync::config::ChecksumType::None;
         config
     }
 

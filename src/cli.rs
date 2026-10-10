@@ -8,11 +8,8 @@ pub use args::PathError;
 pub use parser::Arguments;
 use std::path::PathBuf;
 
-// Import integrity types for verification modes
-use crate::integrity::ChecksumType;
-
-// Import compression types for detection modes
-use crate::compress::CompressionDetection;
+use crate::engine::compression::CompressionDetection;
+use crate::sync::config::ChecksumType;
 
 use crate::sync::scanner::ScanOptions;
 

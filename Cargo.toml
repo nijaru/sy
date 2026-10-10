@@ -62,14 +62,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 
-# Hash functions (for future phases, included now to avoid rebuild churn)
+# Hash functions
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 blake3 = "1"
-hex = "0.4"
 
-# Compression
-zstd = "0.13"  # Level 3: 8.7 GB/s, best ratio
-lz4_flex = "0.13"  # 23 GB/s, faster but lower ratio
+# Bounded protocol-v3 data chunk compression
+zstd = "0.13"
 
 # Parallel processing
 rayon = "1.10"
@@ -93,6 +91,8 @@ exacl = { version = "0.12", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+# Codec challenger in compress_bench; production v3 uses zstd only.
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 tempfile = "3"
 proptest = "1"
 usage = { package = "usage-rs", version = "6.12", features = ["test", "completions"] }

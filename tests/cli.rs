@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::process::{Command, Output};
 use sy::cli::{Arguments, Cli, SymlinkMode, VerifyMode};
-use sy::compress::CompressionDetection;
+use sy::engine::compression::CompressionDetection;
 use usage::test::{self as harness, Page};
 
 fn parse(words: &[&str]) -> Cli {
