@@ -157,15 +157,14 @@ fn lower_metadata(
     )))
 }
 
-fn requested_metadata(
+pub(super) fn requested_metadata(
     source: &Entry,
     destination: &Entry,
     policy: ExecutionPolicy,
 ) -> Result<Option<(Option<u32>, Option<Timestamp>)>> {
-    let unix_mode = if policy.preserve_permissions
-        && !source.is_symlink()
-        && destination.unix_mode != source.unix_mode
-    {
+    // Preservation constrains the result even when the scanned modes match:
+    // ACL/xattr work can change mode bits, including native SGID retention.
+    let unix_mode = if policy.preserve_permissions && !source.is_symlink() {
         Some(source.unix_mode.ok_or_else(|| {
             RemotePullError::MissingScannedMode(source.path.as_path().to_path_buf())
         })?)

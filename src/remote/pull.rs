@@ -842,6 +842,7 @@ impl RemotePullExecutor {
         &self,
         source: Entry,
         destination: Entry,
+        policy: crate::engine::planner::ExecutionPolicy,
     ) -> Result<Option<WorkItem<RemotePullAction>>> {
         if !source.is_file() || !(self.xattrs || self.acls || self.bsd_flags) {
             return Ok(None);
@@ -849,12 +850,15 @@ impl RemotePullExecutor {
         let expected_destination = destination.identity.ok_or_else(|| {
             RemotePullError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
         })?;
+        let (unix_mode, modified) =
+            crate::remote::pull_lower::requested_metadata(&source, &destination, policy)?
+                .unwrap_or((None, None));
         Ok(Some(WorkItem::new(
             RemotePullAction::ApplyMetadata {
                 source,
                 expected_destination,
-                unix_mode: None,
-                modified: None,
+                unix_mode,
+                modified,
             },
             ResourceRequest {
                 active_files: 0,
@@ -971,7 +975,7 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
             ..
         } = op
         {
-            return self.lower_unchanged_file_preservation(source, destination);
+            return self.lower_unchanged_file_preservation(source, destination, policy);
         }
         crate::remote::pull_lower::lower_pull_op(op, policy)
     }

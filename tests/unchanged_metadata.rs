@@ -98,6 +98,13 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
             .with_xattrs(true)
             .with_bsd_flags(cfg!(target_os = "macos"));
             let work = executor.lower(operation, policy).unwrap().unwrap();
+            assert!(matches!(
+                work.action(),
+                sy::remote::pull::RemotePullAction::ApplyMetadata {
+                    unix_mode: Some(0o640),
+                    ..
+                }
+            ));
             assert!(work.resources().buffered_bytes > 0);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(10), executor.execute(work))
@@ -113,6 +120,13 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
                 .with_bsd_flags(cfg!(target_os = "macos"))
                 .with_remove_source_files(remove_source);
             let work = executor.lower(operation, policy).unwrap().unwrap();
+            assert!(matches!(
+                work.action(),
+                sy::remote::local_executor::LocalSyncAction::ApplyMetadata {
+                    unix_mode: Some(0o640),
+                    ..
+                }
+            ));
             assert!(work.resources().buffered_bytes > 0);
             tokio::time::timeout(std::time::Duration::from_secs(10), executor.execute(work))
                 .await
