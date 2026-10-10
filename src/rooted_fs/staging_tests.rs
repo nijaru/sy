@@ -107,6 +107,59 @@ fn staged_verification_and_unverified_preparation_cannot_adopt_later_fd_edits() 
     }
 }
 
+#[test]
+fn mode000_publication_verifies_and_finalizes_through_original_stage_fd() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no pointer arguments or side effects.
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    std::fs::write(&target, b"old").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o0)).unwrap();
+    assert_eq!(
+        File::open(&target).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
+    let mut staged = rooted
+        .begin_staged_file_blocking(&relative("target"))
+        .unwrap();
+    staged
+        .file_mut()
+        .write_all(b"verified replacement")
+        .unwrap();
+    let mut original = staged.try_clone_file().unwrap();
+    staged.apply_metadata_blocking(Some(0), None).unwrap();
+    assert_eq!(
+        staged.staged_hash_blocking().unwrap(),
+        blake3::hash(b"verified replacement")
+    );
+    #[cfg(target_os = "macos")]
+    let flags = Some(libc::UF_NODUMP);
+    #[cfg(not(target_os = "macos"))]
+    let flags = None;
+    let proof = staged.commit().unwrap().finalize_blocking(flags).unwrap();
+    proof.revalidate_blocking(&rooted).unwrap();
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0
+    );
+    assert_eq!(
+        File::open(&target).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    original.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    original.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"verified replacement");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        stat_fd(original.as_raw_fd()).unwrap().st_flags,
+        libc::UF_NODUMP
+    );
+}
+
 #[tokio::test]
 async fn late_staging_name_substitution_never_overwrites_or_cleans_foreign_data() {
     for cancel in [false, true] {

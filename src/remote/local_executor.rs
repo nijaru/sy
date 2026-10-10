@@ -400,8 +400,9 @@ impl LocalSyncExecutor {
             rooted.verify_root_path_blocking()?;
             rooted.backup_file_blocking(&relative, &backup, expected)?;
             rooted.verify_root_path_blocking()?;
-            rooted.remove_destination_blocking(&relative, false, Some(expected))?;
-            rooted.verify_root_path_blocking()
+            rooted
+                .remove_destination_blocking(&relative, false, Some(expected))?
+                .verify_local_root(&rooted, &relative)
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -1019,12 +1020,13 @@ impl LocalSyncExecutor {
             let action = action.clone();
             let result = tokio::task::spawn_blocking(move || {
                 rooted.verify_root_path_blocking()?;
-                rooted.remove_destination_blocking(
-                    &action.path,
-                    action.kind == EntryKind::Directory,
-                    Some(expected),
-                )?;
-                rooted.verify_root_path_blocking()
+                rooted
+                    .remove_destination_blocking(
+                        &action.path,
+                        action.kind == EntryKind::Directory,
+                        Some(expected),
+                    )?
+                    .verify_local_root(&rooted, &action.path)
             })
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?;

@@ -359,6 +359,9 @@ mod tests {
                     std::fs::set_permissions(&source_file, std::fs::Permissions::from_mode(0o0))
                         .unwrap();
                 }
+                let source_before = crate::endpoint::local_identity::identity_for_metadata(
+                    &std::fs::metadata(&source_file).unwrap(),
+                );
                 let before = crate::endpoint::local_identity::identity_for_metadata(
                     &std::fs::metadata(&destination_file).unwrap(),
                 );
@@ -402,42 +405,41 @@ mod tests {
                     before
                 );
                 assert!(stale.exists(), "preflight must not mutate the namespace");
-                if skip || cfg!(target_os = "linux") {
-                    // Exercise actual skip everywhere and native O_PATH-backed
-                    // retirement on Linux. macOS O_EVTONLY retirement still
-                    // requires read permission; preview is not execution proof.
-                    config.dry_run = false;
-                    if !cfg!(target_os = "linux") {
-                        config.delete = crate::sync::DeleteMode::Disabled;
-                    }
-                    let actual = run(
-                        source.path(),
-                        destination.path(),
-                        &config,
-                        ScanOptions::default(),
-                        scope,
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(actual.files_updated, u64::from(!skip));
-                    if skip {
-                        assert_eq!(
-                            crate::endpoint::local_identity::identity_for_metadata(
-                                &std::fs::metadata(&destination_file).unwrap()
-                            ),
-                            before
-                        );
-                    } else {
-                        assert_eq!(
-                            std::fs::read(&destination_file).unwrap(),
-                            b"replacement payload"
-                        );
-                    }
-                    if cfg!(target_os = "linux") {
-                        assert_eq!(stale.exists(), !tree);
-                    }
+                config.dry_run = false;
+                let actual = run(
+                    source.path(),
+                    destination.path(),
+                    &config,
+                    ScanOptions::default(),
+                    scope,
+                )
+                .await
+                .unwrap();
+                assert_eq!(actual.files_updated, u64::from(!skip));
+                if skip {
+                    assert_eq!(
+                        crate::endpoint::local_identity::identity_for_metadata(
+                            &std::fs::metadata(&destination_file).unwrap()
+                        ),
+                        before
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(&destination_file).unwrap(),
+                        b"replacement payload"
+                    );
                 }
-                assert!(source_file.exists());
+                assert_eq!(stale.exists(), !tree);
+                assert_eq!(
+                    crate::endpoint::local_identity::identity_for_metadata(
+                        &std::fs::metadata(&source_file).unwrap()
+                    ),
+                    source_before,
+                    "source metadata and lineage must remain read-only"
+                );
+                if !skip {
+                    assert_eq!(std::fs::read(&source_file).unwrap(), b"replacement payload");
+                }
             }
         }
     }

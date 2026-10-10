@@ -970,15 +970,13 @@ impl RemotePullExecutor {
         let relative = action.path.clone();
         tokio::task::spawn_blocking(move || {
             rooted.verify_root_path_blocking()?;
-            rooted.remove_destination_blocking(
-                &relative,
-                action.kind == EntryKind::Directory,
-                action.identity,
-            )?;
-            crate::endpoint::local::verify_committed_root(
-                &rooted,
-                &rooted.root_path().join(relative.as_path()),
-            )?;
+            rooted
+                .remove_destination_blocking(
+                    &relative,
+                    action.kind == EntryKind::Directory,
+                    action.identity,
+                )?
+                .verify_local_root(&rooted, &relative)?;
             Ok::<_, RemotePullError>(())
         })
         .await

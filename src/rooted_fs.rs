@@ -11,7 +11,7 @@ use staging::VerifiedObservation;
 mod retirement;
 pub(crate) use metadata::MetadataPreservation;
 #[cfg(unix)]
-use retirement::{RetiredDestinationObservation, RetirementLineage, RetirementStep};
+use retirement::{OldDestinationObservation, RetirementLineage, RetirementStep};
 #[cfg(all(test, unix))]
 mod metadata_tests;
 #[cfg(all(test, unix))]
@@ -91,6 +91,9 @@ pub enum RootedFsError {
 
     #[error("destination was committed at {path}, but required finalization failed: {reason}")]
     CommittedFinalizationFailed { path: PathBuf, reason: String },
+
+    #[error("destination was deleted at {path}, but required finalization failed: {reason}")]
+    DeletionCommittedFinalizationFailed { path: PathBuf, reason: String },
 
     #[error("rooted filesystem path must contain only normal relative components")]
     InvalidRelativePath,
@@ -221,6 +224,30 @@ enum RootedMutationAdmission {
 enum RemovalAuthority {
     Source(EntryIdentity),
     Destination(Option<EntryIdentity>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RemovalOutcome {
+    Removed,
+    AlreadyAbsent,
+    RetainedNonempty,
+}
+
+impl RemovalOutcome {
+    /// Local callers require post-operation operator-path continuity. Remote
+    /// held roots intentionally do not: relocation does not revoke their FD.
+    pub(crate) fn verify_local_root(self, rooted: &RootedFs, path: &RelativePath) -> Result<()> {
+        rooted.verify_root_path_blocking().map_err(|error| {
+            if matches!(self, Self::Removed) {
+                RootedFsError::DeletionCommittedFinalizationFailed {
+                    path: path.as_path().to_path_buf(),
+                    reason: error.to_string(),
+                }
+            } else {
+                error
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,7 +478,7 @@ struct RootedNamespaceTransaction {
     destination_name: OsString,
     destination_path: PathBuf,
     #[cfg(unix)]
-    retired_destination: Option<RetiredDestinationObservation>,
+    retired_destination: Option<OldDestinationObservation>,
     #[cfg(unix)]
     staged: Option<OwnedStagingEntry>,
     #[cfg(unix)]
@@ -793,12 +820,17 @@ impl RootedNamespaceTransaction {
         let staging_check = self.observe_staging();
         // Capture OLD after preparation waits, before late admission; retain it
         // only for native publication/cleanup. This is still not portable CAS.
-        self.retired_destination = RetiredDestinationObservation::capture(
+        self.retired_destination = OldDestinationObservation::capture(
             self.parent_fd.as_raw_fd(),
             &self.destination_name,
             &self.destination_path,
             self.expected_destination,
             lineage,
+            if is_type_transition {
+                RetirementStep::Exchange
+            } else {
+                RetirementStep::Unlink
+            },
         )?;
         // Check the hardlink's exact post-preparation source last, after all
         // blocking namespace/lineage checks, never by adopting a fresh identity.
@@ -810,6 +842,13 @@ impl RootedNamespaceTransaction {
             .pause_mutation(PublicationPausePoint::AfterAdmission);
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::AfterAdmission);
+        self.verify_parent_binding()?;
+        self.verify_expected_destination_with_lineage(lineage)?;
+        if let Some(old) = &self.retired_destination {
+            let named = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?
+                .ok_or_else(|| RootedFsError::DestinationChanged(self.destination_path.clone()))?;
+            old.verify(&named, &self.destination_path)?;
+        }
         let staging_check = self.observe_staging();
         validate_source()?;
         staging_check?;
@@ -853,7 +892,7 @@ impl RootedNamespaceTransaction {
         self.cleanup_owned = if is_type_transition {
             self.retired_destination
                 .as_ref()
-                .map(|old| old.cleanup_identity())
+                .and_then(|old| old.cleanup_identity())
         } else if matches!(
             self.expected_destination,
             HeldDestinationExpectation::Absent
@@ -1990,14 +2029,15 @@ impl RootedFs {
     /// follows the destination leaf.
     ///
     /// Destination expectations may follow only this root's exact own old-inode
-    /// retirements. A successful unlink records its held old observation before
-    /// another alias can use the advanced authority.
+    /// retirements. Shared unlinks record their held old observation before
+    /// another alias can use the advanced authority; consuming an unshared
+    /// regular name creates no cleanup or retirement authority.
     pub(crate) fn remove_destination_blocking(
         &self,
         relative: &RelativePath,
         is_directory: bool,
         expected_identity: Option<EntryIdentity>,
-    ) -> Result<()> {
+    ) -> Result<RemovalOutcome> {
         #[cfg(unix)]
         {
             self.remove_path_blocking(
@@ -2028,6 +2068,7 @@ impl RootedFs {
                 false,
                 RemovalAuthority::Source(expected_identity),
             )
+            .map(|_| ())
         }
         #[cfg(not(unix))]
         {
@@ -2708,7 +2749,7 @@ impl RootedFs {
         relative: &Path,
         is_directory: bool,
         authority: RemovalAuthority,
-    ) -> Result<()> {
+    ) -> Result<RemovalOutcome> {
         self.require_writable()?;
         let mut lineage = self
             .retirement
@@ -2737,7 +2778,7 @@ impl RootedFs {
             let error = std::io::Error::last_os_error();
             // A vanished entry is idempotent success.
             if error.raw_os_error() == Some(libc::ENOENT) {
-                return Ok(());
+                return Ok(RemovalOutcome::AlreadyAbsent);
             }
             return Err(error.into());
         }
@@ -2770,7 +2811,7 @@ impl RootedFs {
         self.verify_parent_binding_blocking(relative, &parent)?;
         let mut retired = match authority {
             RemovalAuthority::Source(_) => None,
-            RemovalAuthority::Destination(expected) => RetiredDestinationObservation::capture(
+            RemovalAuthority::Destination(expected) => OldDestinationObservation::capture(
                 parent.as_raw_fd(),
                 &leaf,
                 relative,
@@ -2779,21 +2820,35 @@ impl RootedFs {
                     HeldDestinationExpectation::Unchanged,
                 ),
                 &mut lineage,
+                RetirementStep::Unlink,
             )?,
         };
         let _permit = self.admit_mutation_blocking()?;
+        if let Some(old) = &retired {
+            self.verify_parent_binding_blocking(relative, &parent)?;
+            let named = stat_at_optional(parent.as_raw_fd(), &leaf)?
+                .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
+            old.verify(&named, relative)?;
+        }
         if matches!(authority, RemovalAuthority::Source(_)) {
             self.verify_source_root_path_blocking()?;
         }
         match unlink_at(parent.as_raw_fd(), &leaf, is_directory) {
             Ok(()) => {
                 if let Some(retired) = &mut retired {
-                    retired.record(&mut lineage, RetirementStep::Unlink, relative)?;
+                    retired
+                        .record(&mut lineage, RetirementStep::Unlink, relative)
+                        .map_err(|error| RootedFsError::DeletionCommittedFinalizationFailed {
+                            path: relative.to_path_buf(),
+                            reason: error.to_string(),
+                        })?;
                 }
-                Ok(())
+                Ok(RemovalOutcome::Removed)
             }
             // A vanished entry is idempotent success.
-            Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
+                Ok(RemovalOutcome::AlreadyAbsent)
+            }
             // A non-empty directory is kept, not an error: under --backup a
             // deletion's backup copy may legitimately repopulate the
             // directory right before its removal (rsync behaves the same).
@@ -2802,7 +2857,7 @@ impl RootedFs {
                     && (error.raw_os_error() == Some(libc::ENOTEMPTY)
                         || error.raw_os_error() == Some(libc::EEXIST)) =>
             {
-                Ok(())
+                Ok(RemovalOutcome::RetainedNonempty)
             }
             Err(error) => Err(error),
         }
