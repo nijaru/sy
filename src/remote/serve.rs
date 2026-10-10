@@ -129,9 +129,14 @@ async fn serve_requests(
         }
     }
 
-    // Joining transport actors also guarantees an interrupted partial write
-    // cannot outlive the session or be resumed on the same transport.
-    if let Err(error) = session.shutdown().await {
+    // Orderly EOF drains admitted output and checks both actor results. Error
+    // cleanup instead interrupts I/O; neither path detaches transport actors.
+    let transport = if failure.is_some() {
+        session.shutdown().await
+    } else {
+        session.finish().await
+    };
+    if let Err(error) = transport {
         if failure.is_none() {
             failure = Some(ServeError::Session(error));
         }
@@ -299,6 +304,110 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A frame-boundary EOF is orderly only if admitted fetch work has its
+    /// commit Ack. Missing or truncated acknowledgements must fail the agent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_completion_requires_ack_before_eof() {
+        use crate::protocol::{
+            read_frame, write_frame, StreamId, WireFetchCompression, WireFileFetchRequest,
+        };
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"validated source").unwrap();
+        let source = crate::endpoint::source_root::SourceRoot::open(root.path().to_path_buf())
+            .await
+            .unwrap()
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        for ending in ["ack", "missing", "truncated"] {
+            let (mut client_io, server_io) = tokio::io::duplex(4096);
+            let (server_reader, server_writer) = tokio::io::split(server_io);
+            let serving = tokio::spawn(serve_transport(
+                server_reader,
+                server_writer,
+                RouterConfig::default(),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(&mut client_io);
+            crate::remote::client_handshake(&mut reader, &mut writer, Operation::Pull, root.path())
+                .await
+                .unwrap();
+            let id = StreamId::new(1);
+            let request = WireFileFetchRequest::new(
+                crate::remote::path::encode_relative_path(source.path.as_path()).unwrap(),
+                source.size,
+                *source.identity.unwrap().as_bytes(),
+                WireFetchCompression::None,
+            );
+            write_frame(
+                &mut writer,
+                &Frame::new(
+                    FrameKind::FileFetchRequest,
+                    FrameFlags::empty(),
+                    id,
+                    request.encode(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            loop {
+                let frame = read_frame(&mut reader).await.unwrap();
+                if frame.kind() == FrameKind::FileEnd {
+                    break;
+                }
+                assert_eq!(frame.kind(), FrameKind::Data);
+            }
+            match ending {
+                "ack" => write_frame(
+                    &mut writer,
+                    &Frame::new(FrameKind::Ack, FrameFlags::empty(), id, bytes::Bytes::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+                "truncated" => writer.write_all(&[0]).await.unwrap(),
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            writer.shutdown().await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), serving)
+                .await
+                .unwrap()
+                .unwrap();
+            match ending {
+                "ack" => result.unwrap(),
+                "missing" => assert!(
+                    matches!(result, Err(ServeError::Request(_))),
+                    "missing commit Ack must fail admitted handler work: {result:?}"
+                ),
+                "truncated" => assert!(result.is_err(), "truncated Ack cannot become graceful EOF"),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("file")).unwrap(),
+            b"validated source"
+        );
+        assert_eq!(
+            crate::endpoint::source_root::SourceRoot::open(root.path().to_path_buf())
+                .await
+                .unwrap()
+                .entries(Default::default())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .remove(0)
+                .identity,
+            source.identity
+        );
+    }
 
     #[tokio::test]
     async fn terminal_paths_drain_admitted_handlers_and_blocking_work() {

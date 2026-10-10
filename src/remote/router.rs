@@ -155,8 +155,9 @@ pub enum RouterError {
 
 pub type SharedRouterError = Arc<RouterError>;
 
-/// The first terminal transition wins. EOF stops admission and transport I/O,
-/// but already received stream responses remain readable. Failure discards work.
+/// EOF stops admission and drains admitted output; already received stream
+/// responses remain readable. Failure discards work and can supersede EOF;
+/// the first failure remains authoritative.
 #[derive(Clone)]
 enum Terminal {
     Eof,
@@ -292,12 +293,13 @@ impl RouterSender {
         if let Some(completion) = completion {
             tokio::select! {
                 biased;
-                // A flushed Ack remains successful if EOF arrives before the
-                // waiter is next polled. Otherwise completion is uncertain.
+                // EOF is a read half-close, not evidence that an admitted Ack
+                // failed. The peer can read it before our async flush completes.
+                // Wait for the writer's actual result; failures still interrupt.
                 completed = completion => completed.map_err(|_| {
                     self.check_active().err().unwrap_or_else(|| Arc::new(RouterError::WriterClosed))
                 })?,
-                state = terminated(&mut terminal) => return Err(state.error()),
+                error = failed(&mut terminal) => return Err(error),
             }
         }
         Ok(())
@@ -410,7 +412,7 @@ impl IncomingStreams {
 
 // Also terminate on actor panic/abort, including before its first poll.
 // Ordinary exits publish terminal state or disarm after a graceful half-close;
-// this last-resort failure cannot overwrite the authoritative cause.
+// this last-resort failure cannot overwrite an authoritative failure.
 struct ActorLifetime {
     inner: Arc<RouterInner>,
     direction: &'static str,
@@ -531,11 +533,12 @@ impl FrameRouter {
             completed: false,
         };
         let reader_task = tokio::spawn(async move {
-            let _lifetime = reader_lifetime;
+            let mut lifetime = reader_lifetime;
             let result = reader_loop(reader, &reader_sender, reader_terminal).await;
             if let Err(error) = &result {
                 reader_sender.fail(Arc::clone(error));
             }
+            lifetime.completed = true;
             result
         });
         let writer_inner = Arc::clone(&inner);
@@ -561,7 +564,7 @@ impl FrameRouter {
             }
             // Half-close is an ordinary writer exit, not session termination:
             // the reader must still observe peer EOF/errors after the last Ack.
-            lifetime.completed = result.is_ok() && *writer_inner.closing.borrow();
+            lifetime.completed = true;
             result
         });
         Ok(Self {
@@ -627,6 +630,18 @@ async fn terminated(terminal: &mut watch::Receiver<Option<Terminal>>) -> Termina
         }
         if terminal.changed().await.is_err() {
             return Terminal::Failed(Arc::new(RouterError::ShuttingDown));
+        }
+    }
+}
+
+/// Clean EOF does not cancel admitted writes. A transport/protocol failure does.
+async fn failed(terminal: &mut watch::Receiver<Option<Terminal>>) -> SharedRouterError {
+    loop {
+        if let Some(Terminal::Failed(error)) = terminal.borrow_and_update().as_ref() {
+            return Arc::clone(error);
+        }
+        if terminal.changed().await.is_err() {
+            return Arc::new(RouterError::ShuttingDown);
         }
     }
 }
@@ -729,20 +744,24 @@ where
 {
     let mut limiter = payload_limit.map(crate::sync::ratelimit::RateLimiter::new);
     loop {
-        let draining = *closing.borrow_and_update();
+        let eof = matches!(terminal.borrow().as_ref(), Some(Terminal::Eof));
+        let draining = *closing.borrow_and_update() || eof;
         if draining {
             receiver.close();
         }
         let queued = tokio::select! {
             biased;
-            _ = terminated(&mut terminal) => return Ok(()),
+            state = terminated(&mut terminal), if !eof => match state {
+                Terminal::Failed(_) => return Ok(()),
+                Terminal::Eof => continue,
+            },
             _ = closing.changed(), if !draining => continue,
             queued = receiver.recv() => queued,
         };
         let Some(mut queued) = queued else {
             return tokio::select! {
                 biased;
-                _ = terminated(&mut terminal) => Ok(()),
+                _ = failed(&mut terminal) => Ok(()),
                 result = writer.shutdown() => result
                     .map_err(crate::protocol::ProtocolError::from)
                     .map_err(RouterError::from).map_err(Arc::new),
@@ -750,7 +769,7 @@ where
         };
         let result = tokio::select! {
             biased;
-            _ = terminated(&mut terminal) => return Ok(()),
+            _ = failed(&mut terminal) => return Ok(()),
             result = async {
                 if let (Some(limiter), FrameKind::Data) = (limiter.as_mut(), queued.frame.kind()) {
                     let sleep = limiter.consume(queued.frame.payload().len() as u64);
@@ -768,8 +787,8 @@ where
             } => result,
         };
         if let Err(error) = result {
-            // Publish before dropping the Ack completion sender: even on
-            // another worker, its waiter must see the authoritative cause.
+            // Publish before dropping Ack completion, including after EOF:
+            // its waiter and actor joins must retain the actual flush error.
             publish_terminal(inner, Terminal::Failed(Arc::clone(&error)));
             return Err(error);
         }
@@ -890,7 +909,7 @@ fn publish_terminal(inner: &Arc<RouterInner>, state: Terminal) {
     let Ok(mut streams) = inner.streams.lock() else {
         // Poisoning is itself terminal; still wake waiters and close budgets.
         inner.terminal.send_if_modified(|terminal| {
-            if terminal.is_some() {
+            if matches!(terminal, Some(Terminal::Failed(_))) {
                 return false;
             }
             *terminal = Some(Terminal::Failed(Arc::new(RouterError::StatePoisoned)));
@@ -902,13 +921,15 @@ fn publish_terminal(inner: &Arc<RouterInner>, state: Terminal) {
         inner.outbound_bytes.close();
         return;
     };
-    let changed = inner.terminal.send_if_modified(|terminal| {
-        if terminal.is_some() {
-            return false;
-        }
-        *terminal = Some(state);
-        true
-    });
+    let changed = inner
+        .terminal
+        .send_if_modified(|terminal| match (&*terminal, &state) {
+            (Some(Terminal::Failed(_)), _) | (Some(Terminal::Eof), Terminal::Eof) => false,
+            _ => {
+                *terminal = Some(state);
+                true
+            }
+        });
     if changed {
         inner.inbound_frames.close();
         inner.inbound_bytes.close();
@@ -1016,6 +1037,118 @@ mod tests {
             Bytes::from_static(payload),
         )
         .unwrap()
+    }
+
+    /// The peer can read an Ack while its writer is still awaiting flush.
+    /// Hold that flush until the reader has observed peer EOF, then complete
+    /// (or fail) it. This interleaving must not invent an EOF handler failure.
+    #[tokio::test]
+    async fn ack_flush_completion_survives_peer_eof() {
+        for ending in ["success", "flush failure", "abort"] {
+            let (router_io, peer_io) = tokio::io::duplex(4096);
+            let (reader, writer) = tokio::io::split(router_io);
+            let (mut peer_reader, mut peer_writer) = tokio::io::split(peer_io);
+            let (release_tx, release_rx) = oneshot::channel();
+            let mut router = FrameRouter::start(
+                reader,
+                GatedFlush {
+                    writer,
+                    release: release_rx,
+                    fail: ending == "flush failure",
+                },
+                RouterRole::Server,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let sender = router.sender();
+            let inbox = sender.open_stream().unwrap();
+            let ack_sender = sender.clone();
+            let ack = tokio::spawn(async move {
+                ack_sender
+                    .send(frame(FrameKind::Ack, inbox.stream_id(), b"ok"))
+                    .await
+            });
+            assert_eq!(
+                crate::protocol::read_frame(&mut peer_reader)
+                    .await
+                    .unwrap()
+                    .kind(),
+                FrameKind::Ack
+            );
+            peer_writer.shutdown().await.unwrap();
+            assert!(matches!(*sender.closed().await, RouterError::TransportEof));
+            if ending == "abort" {
+                // A later failure must interrupt an EOF drain without requiring
+                // the outstanding flush to complete, and retain its cause.
+                sender.fail(Arc::new(RouterError::PeerError));
+                sender.fail(Arc::new(RouterError::ShuttingDown));
+            } else {
+                let _ = release_tx.send(());
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), ack)
+                .await
+                .unwrap()
+                .unwrap();
+            let joined = tokio::time::timeout(Duration::from_secs(1), router.finish())
+                .await
+                .unwrap();
+            if ending == "flush failure" {
+                assert!(matches!(
+                    *result.unwrap_err(),
+                    RouterError::Protocol(crate::protocol::ProtocolError::Io(_))
+                ));
+                assert!(
+                    joined.is_err(),
+                    "flush failure must survive EOF in actor joins"
+                );
+            } else if ending == "abort" {
+                assert!(matches!(*result.unwrap_err(), RouterError::PeerError));
+                assert!(matches!(*joined.unwrap_err(), RouterError::PeerError));
+            } else {
+                result.unwrap();
+                joined.unwrap();
+            }
+            assert!(
+                sender.open_stream().is_err(),
+                "EOF must still close admission"
+            );
+        }
+    }
+
+    struct GatedFlush<W> {
+        writer: W,
+        release: oneshot::Receiver<()>,
+        fail: bool,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for GatedFlush<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.writer).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            use std::future::Future;
+            std::task::ready!(std::pin::Pin::new(&mut self.release).poll(cx)).unwrap();
+            if self.fail {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected flush failure")))
+            } else {
+                std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+            }
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+        }
     }
 
     #[tokio::test]

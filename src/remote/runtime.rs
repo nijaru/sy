@@ -697,6 +697,13 @@ impl ServerRemoteSession {
         })
     }
 
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.router
+            .finish()
+            .await
+            .map_err(RemoteSessionError::Router)
+    }
+
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
         self.router
             .shutdown()
