@@ -296,15 +296,20 @@ impl RemotePullExecutor {
     }
 
     async fn metadata_authority(&self) -> Result<&crate::rooted_fs::RootedFs> {
-        self.metadata_authority
+        let authority = self
+            .metadata_authority
             .get_or_try_init(|| async {
                 let mut rooted =
                     crate::rooted_fs::RootedFs::open(self.destination_root.clone()).await?;
                 rooted.bind_session_mutations(self.sender.publication_admission(), false);
                 Ok::<_, crate::rooted_fs::RootedFsError>(rooted)
             })
+            .await?;
+        let rooted = authority.clone();
+        tokio::task::spawn_blocking(move || rooted.verify_root_path_blocking())
             .await
-            .map_err(Into::into)
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+        Ok(authority)
     }
 
     /// Prepare the destination's namespace observation and scan together,
@@ -363,13 +368,14 @@ impl RemotePullExecutor {
     }
 
     pub async fn destination_content_hash(&self, entry: Entry) -> Result<[u8; 32]> {
-        Ok(crate::endpoint::existing::fingerprint(
+        let fingerprint = crate::endpoint::existing::fingerprint(
             self.metadata_authority().await?.clone(),
             entry,
             Default::default(),
         )
-        .await?
-        .content)
+        .await?;
+        self.metadata_authority().await?;
+        Ok(fingerprint.content)
     }
 
     fn dest_path(&self, relative: &RelativePath) -> PathBuf {
@@ -416,7 +422,13 @@ impl RemotePullExecutor {
                 let rooted = self.metadata_authority().await?.clone();
                 let relative = destination_path.clone();
                 let identity = tokio::task::spawn_blocking(move || {
-                    rooted.create_directory_blocking(&relative)
+                    rooted.verify_root_path_blocking()?;
+                    let identity = rooted.create_directory_blocking(&relative)?;
+                    crate::endpoint::local::verify_committed_root(
+                        &rooted,
+                        &rooted.root_path().join(relative.as_path()),
+                    )?;
+                    Ok::<_, RemotePullError>(identity)
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -494,12 +506,18 @@ impl RemotePullExecutor {
                 let relative = destination_path.clone();
                 let target = target.to_path_buf();
                 tokio::task::spawn_blocking(move || {
+                    rooted.verify_root_path_blocking()?;
                     rooted.replace_symlink_blocking(
                         &relative,
                         &target,
                         rooted_destination_expectation(expected),
                         modified,
-                    )
+                    )?;
+                    crate::endpoint::local::verify_committed_root(
+                        &rooted,
+                        &rooted.root_path().join(relative.as_path()),
+                    )?;
+                    Ok::<_, RemotePullError>(())
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -530,6 +548,7 @@ impl RemotePullExecutor {
                 let relative = destination.path;
                 let kind = destination.kind;
                 tokio::task::spawn_blocking(move || {
+                    rooted.verify_root_path_blocking()?;
                     rooted.apply_observed_preservation_blocking(
                         &relative,
                         kind,
@@ -541,7 +560,12 @@ impl RemotePullExecutor {
                             acl: acls.as_deref(),
                             bsd_flags,
                         },
-                    )
+                    )?;
+                    crate::endpoint::local::verify_committed_root(
+                        &rooted,
+                        &rooted.root_path().join(relative.as_path()),
+                    )?;
+                    Ok::<_, RemotePullError>(())
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -585,12 +609,18 @@ impl RemotePullExecutor {
             let rooted = self.metadata_authority().await?.clone();
             let path = destination_path.clone();
             let publication = tokio::task::spawn_blocking(move || {
-                rooted.publish_hardlink_blocking(
+                rooted.verify_root_path_blocking()?;
+                let publication = rooted.publish_hardlink_blocking(
                     &first.path,
                     &path,
                     first.publication,
                     rooted_destination_expectation(expected_destination),
-                )
+                )?;
+                crate::endpoint::local::verify_committed_root(
+                    &rooted,
+                    &rooted.root_path().join(path.as_path()),
+                )?;
+                Ok::<_, RemotePullError>(publication)
             })
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -775,15 +805,27 @@ impl RemotePullExecutor {
             let expected = existing.identity.ok_or_else(|| {
                 RemotePullError::MissingDestinationIdentity(existing.path.as_path().to_path_buf())
             })?;
-            let backup_abs = self.backup_destination_for(&existing.path)?;
-            let rooted = self.metadata_authority().await?.clone();
-            let relative = existing.path.clone();
-            tokio::task::spawn_blocking(move || {
-                rooted.backup_file_blocking(&relative, &backup_abs, expected)
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            self.backup_observed_file(&existing.path, expected).await?;
         }
+        Ok(())
+    }
+
+    async fn backup_observed_file(
+        &self,
+        relative: &RelativePath,
+        expected: crate::engine::domain::EntryIdentity,
+    ) -> Result<()> {
+        let backup_abs = self.backup_destination_for(relative)?;
+        let rooted = self.metadata_authority().await?.clone();
+        let relative = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
+            rooted.backup_file_blocking(&relative, &backup_abs, expected)?;
+            crate::endpoint::local::verify_committed_root(&rooted, &backup_abs)?;
+            Ok::<_, RemotePullError>(())
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
         Ok(())
     }
 
@@ -877,23 +919,22 @@ impl RemotePullExecutor {
             let expected = action
                 .identity
                 .ok_or_else(|| RemotePullError::MissingDestinationIdentity(path.clone()))?;
-            let backup_abs = self.backup_destination_for(&action.path)?;
-            let rooted = self.metadata_authority().await?.clone();
-            let relative = action.path.clone();
-            tokio::task::spawn_blocking(move || {
-                rooted.backup_file_blocking(&relative, &backup_abs, expected)
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            self.backup_observed_file(&action.path, expected).await?;
         }
         let rooted = self.metadata_authority().await?.clone();
         let relative = action.path.clone();
         tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
             rooted.remove_destination_blocking(
                 &relative,
                 action.kind == EntryKind::Directory,
                 action.identity,
-            )
+            )?;
+            crate::endpoint::local::verify_committed_root(
+                &rooted,
+                &rooted.root_path().join(relative.as_path()),
+            )?;
+            Ok::<_, RemotePullError>(())
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -978,13 +1019,19 @@ impl RemotePullExecutor {
             Default::default()
         };
         tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
             rooted.finalize_directory_blocking(
                 &metadata.path,
                 expected,
                 metadata.unix_mode,
                 metadata.modified,
                 &preservation,
-            )
+            )?;
+            crate::endpoint::local::verify_committed_root(
+                &rooted,
+                &rooted.root_path().join(metadata.path.as_path()),
+            )?;
+            Ok::<_, RemotePullError>(())
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -1081,6 +1128,11 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
     }
 
     async fn finish_deferred_source_removals(&self) -> std::result::Result<(), RemotePullError> {
+        // A no-op plan still has to complete against the original local
+        // operator address. Do not acquire/create a root for an absent preview.
+        if self.metadata_authority.get().is_some() {
+            self.metadata_authority().await?;
+        }
         Ok(())
     }
 
@@ -1098,6 +1150,10 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
 #[cfg(all(test, unix))]
 #[path = "pull_mutation_tests.rs"]
 mod mutation_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pull_root_tests.rs"]
+mod root_tests;
 
 #[cfg(test)]
 mod tests {
