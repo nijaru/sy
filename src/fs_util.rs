@@ -3,8 +3,6 @@ use std::path::Path;
 ///
 /// This module provides platform-specific filesystem detection to enable intelligent
 /// strategy selection in delta sync operations.
-use sy::engine::namespace::NamespaceSemantics;
-
 pub(crate) mod namespace;
 
 /// Check if a filesystem supports copy-on-write (COW) reflinks
@@ -235,21 +233,6 @@ pub fn has_hard_links(_path: &Path) -> bool {
     false
 }
 
-/// Observe one directory's namespace through a pinned root. Missing preview
-/// roots have no known profile; other acquisition failures remain errors.
-/// This does not establish uniform rules across descendants or nested mounts.
-pub async fn namespace_semantics(root: &Path) -> crate::rooted_fs::Result<NamespaceSemantics> {
-    match crate::rooted_fs::RootedFs::open(root.to_path_buf()).await {
-        Ok(rooted) => rooted.namespace_semantics().await,
-        Err(crate::rooted_fs::RootedFsError::Io(error))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(NamespaceSemantics::UNSPECIFIED)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +247,10 @@ mod tests {
     #[tokio::test]
     async fn namespace_semantics_match_case_alias_behavior() {
         let temp = TempDir::new().unwrap();
-        let semantics = namespace_semantics(temp.path()).await.unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(temp.path().into())
+            .await
+            .unwrap();
+        let semantics = rooted.namespace_semantics().await.unwrap();
 
         fs::create_dir(temp.path().join("Probe")).unwrap();
         let aliases = fs::create_dir(temp.path().join("probe")).is_err();
@@ -283,7 +269,10 @@ mod tests {
         use std::ffi::OsString;
 
         let temp = TempDir::new().unwrap();
-        let semantics = namespace_semantics(temp.path()).await.unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(temp.path().into())
+            .await
+            .unwrap();
+        let semantics = rooted.namespace_semantics().await.unwrap();
 
         let nfc = OsString::from("caf\u{e9}");
         let nfd = OsString::from("cafe\u{301}");
@@ -319,15 +308,16 @@ mod tests {
 
         assert_eq!(rooted.namespace_semantics().await.unwrap(), expected);
         assert!(matches!(
-            namespace_semantics(&original).await,
+            crate::rooted_fs::RootedFs::open(original.clone()).await,
             Err(crate::rooted_fs::RootedFsError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotADirectory
         ));
         fs::remove_file(&original).unwrap();
-        assert_eq!(
-            namespace_semantics(&original).await.unwrap(),
-            NamespaceSemantics::UNSPECIFIED
-        );
+        assert!(matches!(
+            crate::rooted_fs::RootedFs::open(original).await,
+            Err(crate::rooted_fs::RootedFsError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
         assert_eq!(rooted.namespace_semantics().await.unwrap(), expected);
     }
 

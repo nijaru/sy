@@ -1,5 +1,5 @@
 use super::RootedFs;
-use crate::endpoint::local_identity::metadata_identity;
+use crate::endpoint::local_identity::{metadata_identity, stat_identity};
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::ScanRequest;
@@ -52,6 +52,9 @@ pub(crate) enum RootedScanError {
     #[error("descriptor-rooted scan observed an unstable symlink: {0}")]
     UnstableSymlink(PathBuf),
 
+    #[error("descriptor-rooted scan entry changed: {0}")]
+    EntryChanged(PathBuf),
+
     #[error("descriptor-rooted scan path is invalid: {0}")]
     InvalidRelativePath(PathBuf),
 
@@ -72,6 +75,45 @@ impl RootedFs {
         let rooted = self.clone();
         EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
             scan_worker(rooted, request, sender)
+        })
+    }
+
+    /// Inspect exactly one physical name beneath the held destination root.
+    /// No sibling enumeration or descent into a selected directory is allowed.
+    pub(crate) fn selected_entry_stream(
+        &self,
+        path: RelativePath,
+        request: ScanRequest,
+    ) -> EntryStream {
+        let rooted = self.clone();
+        EntryStream::spawn_blocking(1, move |sender| {
+            if request.respect_gitignore {
+                return Err(Box::new(RootedScanError::GitignoreUnsupported) as BoxError);
+            }
+            let name = path
+                .as_path()
+                .file_name()
+                .filter(|_| path.as_path().components().count() == 1)
+                .ok_or_else(|| {
+                    Box::new(RootedScanError::InvalidRelativePath(
+                        path.as_path().to_path_buf(),
+                    )) as BoxError
+                })?;
+            validate_path_bound(path.as_path())?;
+            // Only a missing initial name is an empty observation. An error
+            // after lstat (including disappearance during inspection) is a scan race.
+            let stat = match lstat_at(rooted.root_fd.as_raw_fd(), name, path.as_path()) {
+                Err(RootedScanError::Metadata { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Ok(())
+                }
+                Err(error) => return Err(Box::new(error)),
+                Ok(stat) => stat,
+            };
+            let inspected = inspect_entry(rooted.root_fd.as_raw_fd(), name, &path, request, stat)?;
+            let _ = sender.blocking_send(Ok(inspected.entry));
+            Ok(())
         })
     }
 }
@@ -325,7 +367,8 @@ fn walk_tree(
         validate_path_bound(&relative_path)?;
         let relative = RelativePath::new(relative_path.clone())
             .map_err(|_| RootedScanError::InvalidRelativePath(relative_path))?;
-        let inspected = inspect_entry(directory.as_raw_fd(), &name, &relative, request)?;
+        let stat = lstat_at(directory.as_raw_fd(), &name, relative.as_path())?;
+        let inspected = inspect_entry(directory.as_raw_fd(), &name, &relative, request, stat)?;
         if sender.blocking_send(Ok(inspected.entry)).is_err() {
             return Ok(());
         }
@@ -360,8 +403,8 @@ fn inspect_entry(
     name: &OsStr,
     relative: &RelativePath,
     request: ScanRequest,
+    stat: libc::stat,
 ) -> Result<InspectedEntry, RootedScanError> {
-    let stat = lstat_at(parent, name, relative.as_path())?;
     let file_type = stat.st_mode & libc::S_IFMT;
 
     if file_type == libc::S_IFDIR {
@@ -381,8 +424,15 @@ fn inspect_entry(
                 path: relative.as_path().to_path_buf(),
                 source,
             })?;
-        let entry =
-            entry_from_metadata(relative.clone(), EntryKind::Directory, &metadata, request)?;
+        if !metadata.is_dir()
+            || stat_identity(&stat, EntryKind::Directory)
+                != metadata_identity(&metadata, EntryKind::Directory)
+        {
+            return Err(RootedScanError::EntryChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        let entry = directory_entry_from_metadata(relative.clone(), &metadata, request)?;
         return Ok(InspectedEntry {
             entry,
             directory: Some(directory),
@@ -390,19 +440,36 @@ fn inspect_entry(
     }
 
     if file_type == libc::S_IFREG {
-        let file = open_regular_at(parent, name, relative.as_path())?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| RootedScanError::Metadata {
-                path: relative.as_path().to_path_buf(),
-                source,
-            })?;
-        if !metadata.file_type().is_file() {
-            return Err(RootedScanError::UnstableSymlink(
+        // Metadata discovery needs search permission on the held parent, not
+        // read permission on the payload. No-follow stat observations also
+        // reject a type/name replacement without opening a raced FIFO/device.
+        let after = lstat_at(parent, name, relative.as_path())?;
+        let identity = stat_identity(&stat, EntryKind::File)
+            .ok_or_else(|| RootedScanError::NegativeSize(relative.as_path().to_path_buf()))?;
+        if after.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat_identity(&after, EntryKind::File) != Some(identity)
+        {
+            return Err(RootedScanError::EntryChanged(
                 relative.as_path().to_path_buf(),
             ));
         }
-        let entry = entry_from_metadata(relative.clone(), EntryKind::File, &metadata, request)?;
+        let (mtime, mtime_nsec, _, _) = stat_times(&stat)?;
+        let modified = Timestamp::new(mtime, mtime_nsec)
+            .map_err(|_| RootedScanError::InvalidTimestamp(relative.as_path().to_path_buf()))?;
+        let size = u64::try_from(stat.st_size)
+            .map_err(|_| RootedScanError::NegativeSize(relative.as_path().to_path_buf()))?;
+        let mut entry = Entry::file(relative.clone(), size, modified);
+        if request.metadata.unix_mode {
+            entry.unix_mode = Some(stat_mode_u32(&stat) & 0o7777);
+        }
+        if request.metadata.identity {
+            entry.identity = Some(identity);
+        }
+        if request.metadata.hardlink_group && stat.st_nlink > 1 {
+            #[allow(clippy::unnecessary_cast)] // libc widths differ by platform.
+            let group = hardlink_group(stat.st_dev as u64, stat.st_ino as u64);
+            entry.hardlink_group = Some(group);
+        }
         return Ok(InspectedEntry {
             entry,
             directory: None,
@@ -447,9 +514,8 @@ fn inspect_entry(
     }
 }
 
-fn entry_from_metadata(
+fn directory_entry_from_metadata(
     relative: RelativePath,
-    kind: EntryKind,
     metadata: &std::fs::Metadata,
     request: ScanRequest,
 ) -> Result<Entry, RootedScanError> {
@@ -457,28 +523,21 @@ fn entry_from_metadata(
         .map_err(|_| RootedScanError::InvalidTimestamp(relative.as_path().to_path_buf()))?;
     let modified = Timestamp::new(metadata.mtime(), nanoseconds)
         .map_err(|_| RootedScanError::InvalidTimestamp(relative.as_path().to_path_buf()))?;
-    let mut entry = match kind {
-        EntryKind::File => Entry::file(relative, metadata.len(), modified),
-        EntryKind::Directory => Entry::directory(relative, modified),
-        EntryKind::Symlink => Entry::symlink(relative, PathBuf::new(), modified),
-    };
+    let mut entry = Entry::directory(relative, modified);
     if request.metadata.unix_mode {
         entry.unix_mode = Some(metadata.mode() & 0o7777);
     }
     if request.metadata.identity {
-        entry.identity = metadata_identity(metadata, kind);
-    }
-    if request.metadata.hardlink_group && kind == EntryKind::File && metadata.nlink() > 1 {
-        entry.hardlink_group = Some(hardlink_group(metadata));
+        entry.identity = metadata_identity(metadata, EntryKind::Directory);
     }
     Ok(entry)
 }
 
-fn hardlink_group(metadata: &std::fs::Metadata) -> EntryIdentity {
+fn hardlink_group(device: u64, inode: u64) -> EntryIdentity {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sy-hardlink-group-v1\0");
-    hasher.update(&metadata.dev().to_le_bytes());
-    hasher.update(&metadata.ino().to_le_bytes());
+    hasher.update(&device.to_le_bytes());
+    hasher.update(&inode.to_le_bytes());
     EntryIdentity::from_bytes(*hasher.finalize().as_bytes())
 }
 
@@ -672,31 +731,6 @@ fn open_dir_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<OwnedFd, Root
     })
 }
 
-fn open_regular_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<File, RootedScanError> {
-    let name = component_cstring(name)?;
-    let fd = unsafe {
-        // SAFETY: parent is live and name is one NUL-terminated component.
-        // O_NONBLOCK prevents a raced FIFO/device replacement from blocking the
-        // metadata scan; the opened type is verified before use.
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err(RootedScanError::Metadata {
-            path: path.to_path_buf(),
-            source: io::Error::last_os_error(),
-        });
-    }
-    let owned = unsafe {
-        // SAFETY: successful openat returned a fresh owned descriptor.
-        OwnedFd::from_raw_fd(fd)
-    };
-    Ok(File::from(owned))
-}
-
 fn readlink_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<PathBuf, RootedScanError> {
     let name = component_cstring(name)?;
     let mut capacity = 256_usize;
@@ -796,6 +830,105 @@ mod tests {
             .map(|entry| entry.unwrap())
             .collect::<Vec<_>>()
             .await
+    }
+
+    #[tokio::test]
+    async fn mode000_tree_and_selected_scans_are_metadata_only() {
+        use futures::TryStreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses DAC; a green root run would not prove this regression.
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "native mode000 proof requires an unprivileged UID"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"unreadable payload").unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        let held = File::open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_eq!(
+            File::open(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "fixture must deny a new payload open"
+        );
+        let rooted = RootedFs::open(root.path().into()).await.unwrap();
+        let request = ScanRequest {
+            metadata: crate::engine::scan::EntryMetadataRequest {
+                unix_mode: true,
+                hardlink_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tree = collect(&rooted, request).await;
+        let selected: Vec<Entry> = rooted
+            .selected_entry_stream(RelativePath::new("file").unwrap(), request)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(selected, [tree[1].clone()]);
+        let metadata = held.metadata().unwrap();
+        for entry in tree {
+            assert_eq!(entry.size, metadata.len());
+            assert_eq!(entry.unix_mode, Some(0));
+            assert_eq!(
+                entry.identity,
+                metadata_identity(&metadata, EntryKind::File)
+            );
+            assert_eq!(
+                entry.hardlink_group,
+                Some(hardlink_group(metadata.dev(), metadata.ino()))
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_type_and_directory_replacement_between_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let rooted = RootedFs::open_blocking(root.path().into()).unwrap();
+        for directory in [false, true] {
+            let path = root.path().join("entry");
+            if directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"original").unwrap();
+            }
+            let relative = RelativePath::new("entry").unwrap();
+            let stat = lstat_at(
+                rooted.root_fd.as_raw_fd(),
+                OsStr::new("entry"),
+                relative.as_path(),
+            )
+            .unwrap();
+            std::fs::rename(&path, root.path().join("held")).unwrap();
+            if directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::os::unix::fs::symlink("held", &path).unwrap();
+            }
+            assert!(matches!(
+                inspect_entry(
+                    rooted.root_fd.as_raw_fd(),
+                    OsStr::new("entry"),
+                    &relative,
+                    ScanRequest::default(),
+                    stat
+                ),
+                Err(RootedScanError::EntryChanged(_))
+            ));
+            if directory {
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::remove_dir(root.path().join("held")).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::remove_file(root.path().join("held")).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -1047,6 +1180,49 @@ mod tests {
         let entries = collect(&rooted, ScanRequest::default()).await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path.as_path(), Path::new("inside"));
+    }
+
+    #[tokio::test]
+    async fn selected_scan_uses_held_root_and_only_the_physical_name() {
+        use futures::TryStreamExt;
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("root");
+        let retained = parent.path().join("retained");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("selected"), b"original").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(original.join("sibling")).unwrap();
+        let rooted = RootedFs::open(original.clone()).await.unwrap();
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("selected"), b"foreign bytes").unwrap();
+        let request = ScanRequest::default();
+        let selected = RelativePath::new("selected").unwrap();
+        let entries = rooted
+            .selected_entry_stream(selected.clone(), request)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, selected);
+        assert_eq!(entries[0].size, b"original".len() as u64);
+        assert!(rooted
+            .selected_entry_stream(RelativePath::new("missing").unwrap(), request)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty());
+        // Actual lookup/type failures must not become an absent observation;
+        // multi-component requests must never inspect a parent subtree.
+        for path in [
+            "sibling".to_string(),
+            "x".repeat(1024),
+            "parent/selected".into(),
+        ] {
+            let mut stream =
+                rooted.selected_entry_stream(RelativePath::new(path).unwrap(), request);
+            assert!(stream.next().await.unwrap().is_err());
+            stream.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

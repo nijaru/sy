@@ -13,7 +13,11 @@ use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-/// Local filesystem endpoint.
+/// Local filesystem endpoint. Clones share the acquired root and retirement
+/// lineage, so scanning, comparison and execution retain one native authority.
+/// Unlike a remote negotiated root, local completion also requires the original
+/// operator pathname to still identify that held root.
+#[derive(Clone)]
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
@@ -51,14 +55,19 @@ impl LocalEndpoint {
         self
     }
 
+    /// The initial root observation, without retrying a missing pathname.
+    pub(crate) fn acquired_rooted_fs(&self) -> Option<&sy::rooted_fs::RootedFs> {
+        self.rooted.get().map(std::convert::AsRef::as_ref)
+    }
+
     pub(crate) async fn rooted_fs(
         &self,
         create_root: bool,
     ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
-        let root = self.root.clone();
         let rooted = self
             .rooted
             .get_or_try_init(|| async move {
+                let root = self.root.clone();
                 if create_root {
                     tokio::fs::create_dir_all(&root).await?;
                 }
@@ -167,6 +176,19 @@ fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
     }
 }
 
+pub(crate) fn verify_committed_root(
+    rooted: &sy::rooted_fs::RootedFs,
+    destination: &Path,
+) -> Result<()> {
+    rooted
+        .verify_root_path_blocking()
+        .map_err(|error| SyncError::CommittedRootChanged {
+            destination: destination.to_path_buf(),
+            root: rooted.root_path().to_path_buf(),
+            reason: error.to_string(),
+        })
+}
+
 fn map_rooted_read_error(
     rooted: &sy::rooted_fs::RootedFs,
     error: sy::rooted_fs::RootedFsError,
@@ -263,7 +285,6 @@ pub(crate) async fn verify_destination_expectation(
 /// Local staged writes share the rooted endpoint transaction owner.
 struct LocalStagedWriter {
     rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
-    root_path: PathBuf,
     destination_path: PathBuf,
     staged: Option<sy::rooted_fs::RootedStagedFile>,
     admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
@@ -303,7 +324,6 @@ impl Drop for PublicationCancellationGuard {
 struct LocalPendingPublication {
     published: sy::rooted_fs::RootedPublishedFile,
     rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
-    root_path: PathBuf,
     destination_path: PathBuf,
     cancellation_guard: PublicationCancellationGuard,
 }
@@ -317,29 +337,18 @@ impl PendingPublication for LocalPendingPublication {
         let Self {
             published,
             rooted,
-            root_path,
             destination_path,
             mut cancellation_guard,
         } = *self;
         let finalization_path = destination_path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let verify_root = || {
-                rooted.verify_root_path_blocking().map_err(|error| {
-                    SyncError::CommittedRootChanged {
-                        destination: destination_path.clone(),
-                        root: root_path.clone(),
-                        reason: error.to_string(),
-                    }
-                })
-            };
-            verify_root()?;
+            verify_committed_root(&rooted, &destination_path)?;
             let proof = published
                 .finalize_blocking(flags)
                 .map_err(map_rooted_fs_error)?;
-            // A held root confines native effects even if its public name was
-            // replaced during admitted finalization. That is not successful
-            // completion at the operator's destination address.
-            verify_root()?;
+            // Admitted work stays on the original inode, but a lost operator
+            // address is a committed failure, never a source-removal receipt.
+            verify_committed_root(&rooted, &destination_path)?;
             Ok(proof)
         })
         .await
@@ -357,7 +366,6 @@ impl LocalStagedWriter {
         rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
         relative: sy::engine::domain::RelativePath,
         expectation: ExpectedDestination,
-        root_path: PathBuf,
         destination_path: PathBuf,
     ) -> Result<Self> {
         let parent = relative.parent();
@@ -385,7 +393,6 @@ impl LocalStagedWriter {
 
         Ok(Self {
             rooted,
-            root_path,
             destination_path,
             staged: Some(staged),
             admission: std::sync::Arc::new(
@@ -970,7 +977,6 @@ impl StagedWriter for LocalStagedWriter {
             .ok_or_else(|| SyncError::Config("staged writer is already closed".to_string()))?;
         let worker_admission = std::sync::Arc::clone(&self.admission);
         let rooted = std::sync::Arc::clone(&self.rooted);
-        let root_path = self.root_path.clone();
         let destination_path = self.destination_path.clone();
         let cancellation_guard =
             PublicationCancellationGuard::new(std::sync::Arc::clone(&self.admission));
@@ -989,14 +995,8 @@ impl StagedWriter for LocalStagedWriter {
                 let published = staged
                     .commit_with_admission(&worker_admission)
                     .map_err(map_rooted_fs_error)?;
-                match rooted.verify_root_path_blocking() {
-                    Ok(()) => Ok(published),
-                    Err(error) => Err(SyncError::CommittedRootChanged {
-                        destination: destination_path,
-                        root: root_path,
-                        reason: error.to_string(),
-                    }),
-                }
+                verify_committed_root(&rooted, &destination_path)?;
+                Ok(published)
             });
         #[cfg(test)]
         if let Some(queued) = self.commit_queued.take() {
@@ -1011,7 +1011,6 @@ impl StagedWriter for LocalStagedWriter {
         Ok(Box::new(LocalPendingPublication {
             published,
             rooted: self.rooted,
-            root_path: self.root_path,
             destination_path: self.destination_path,
             cancellation_guard,
         }))
@@ -1279,7 +1278,15 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn source_rooted_authority(&self) -> Result<Option<crate::rooted_fs::RootedFs>> {
-        Ok(Some(self.rooted_fs(false).await?.as_ref().clone()))
+        let rooted = self.rooted_fs(false).await?;
+        tokio::task::spawn_blocking(move || {
+            rooted
+                .verify_root_path_blocking()
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
+            Ok(Some(rooted.as_ref().clone()))
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
     }
 
     async fn open_native_file_following(&self, path: &Path) -> Result<Option<std::fs::File>> {
@@ -1399,14 +1406,9 @@ impl Endpoint for LocalEndpoint {
             .map_err(|error| SyncError::Config(error.to_string()))?;
         let rooted = self.rooted_fs(true).await?;
         let destination_path = self.root.join(relative.as_path());
-        let mut writer = LocalStagedWriter::new(
-            rooted,
-            relative,
-            expected_destination,
-            self.root.clone(),
-            destination_path,
-        )
-        .await?;
+        let mut writer =
+            LocalStagedWriter::new(rooted, relative, expected_destination, destination_path)
+                .await?;
         if let Some(admission) = &self.publication {
             writer.admission = std::sync::Arc::clone(admission);
         }
@@ -1708,7 +1710,6 @@ mod tests {
                 std::sync::Arc::clone(&rooted),
                 relative,
                 ExpectedDestination::SnapshotAtOpen,
-                dir.path().to_path_buf(),
                 dir.path().join("file"),
             )
             .await
@@ -1751,7 +1752,6 @@ mod tests {
                 rooted,
                 sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
                 ExpectedDestination::Absent,
-                dir.path().to_path_buf(),
                 dir.path().join("independent"),
             )
             .await
@@ -1818,7 +1818,6 @@ mod tests {
             std::sync::Arc::clone(&rooted),
             sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
             ExpectedDestination::SnapshotAtOpen,
-            dir.path().to_path_buf(),
             dir.path().join("file"),
         )
         .await
@@ -1864,7 +1863,6 @@ mod tests {
             rooted,
             sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
             ExpectedDestination::Absent,
-            dir.path().to_path_buf(),
             dir.path().join("independent"),
         )
         .await
@@ -1912,13 +1910,15 @@ mod tests {
                 .await,
             Err(SyncError::DestinationChanged { .. })
         ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn pending_publication_retains_original_inode_observation() {
-        for replace_name in [false, true] {
+        for race in [0, 1, 2] {
             let dir = TempDir::new().unwrap();
+            let retained = TempDir::new().unwrap();
             let path = dir.path().join("file");
             fs::write(&path, b"old").unwrap();
             let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
@@ -1930,7 +1930,11 @@ mod tests {
             let pending = writer.commit().await.unwrap();
             assert_eq!(fs::read(&path).unwrap(), b"published");
 
-            if replace_name {
+            if race == 2 {
+                fs::rename(dir.path(), retained.path().join("held")).unwrap();
+                fs::create_dir(dir.path()).unwrap();
+                fs::write(&path, b"foreign").unwrap();
+            } else if race == 1 {
                 fs::rename(&path, dir.path().join("owned")).unwrap();
                 fs::write(&path, b"foreign").unwrap();
             } else {
@@ -1939,14 +1943,26 @@ mod tests {
                 xattr::set(&path, "user.sy-foreign", b"changed").unwrap();
             }
             let result = pending.finalize(None).await;
-            assert!(matches!(
-                result,
-                Err(SyncError::CommittedFinalizationFailed { .. })
-            ));
-            if replace_name {
+            if race == 2 {
+                assert!(matches!(
+                    result,
+                    Err(SyncError::CommittedRootChanged { .. })
+                ));
+                assert_eq!(fs::read(&path).unwrap(), b"foreign");
+                assert_eq!(
+                    fs::read(retained.path().join("held/file")).unwrap(),
+                    b"published"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SyncError::CommittedFinalizationFailed { .. })
+                ));
+            }
+            if race == 1 {
                 assert_eq!(fs::read(&path).unwrap(), b"foreign");
                 assert_eq!(fs::read(dir.path().join("owned")).unwrap(), b"published");
-            } else {
+            } else if race == 0 {
                 assert_eq!(fs::read(&path).unwrap(), b"published");
                 assert_eq!(
                     xattr::get(&path, "user.sy-foreign").unwrap(),
@@ -1995,7 +2011,6 @@ mod tests {
                     std::sync::Arc::clone(&rooted),
                     sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
                     ExpectedDestination::Absent,
-                    dir.path().to_path_buf(),
                     dir.path().join("file"),
                 )
                 .await
@@ -2040,7 +2055,6 @@ mod tests {
                     rooted,
                     sy::engine::domain::RelativePath::new(PathBuf::from("independent")).unwrap(),
                     ExpectedDestination::Absent,
-                    dir.path().to_path_buf(),
                     dir.path().join("independent"),
                 )
                 .await
@@ -2082,7 +2096,6 @@ mod tests {
             std::sync::Arc::new(rooted),
             sy::engine::domain::RelativePath::new(PathBuf::from("file")).unwrap(),
             ExpectedDestination::Absent,
-            dir.path().to_path_buf(),
             dir.path().join("file"),
         )
         .await

@@ -29,6 +29,43 @@ fn event(output: &Output, kind: &str) -> serde_json::Value {
         .unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn preserved_symlink_loops_do_not_require_target_resolution() {
+    for (source_loop, existing_parent, destination_loop) in [
+        (true, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        let root = tempdir().unwrap();
+        let source = root.path().join("loop");
+        let destination = root.path().join("destination/copy");
+        std::fs::write(root.path().join("payload"), b"untouched target").unwrap();
+        let target = if source_loop { "loop" } else { "payload" };
+        std::os::unix::fs::symlink(target, &source).unwrap();
+        if existing_parent {
+            std::fs::create_dir(destination.parent().unwrap()).unwrap();
+        }
+        if destination_loop {
+            std::os::unix::fs::symlink("copy", &destination).unwrap();
+        }
+        let before = std::fs::symlink_metadata(&source).unwrap();
+        success(run(&source, &destination, &[]));
+        assert_eq!(std::fs::read_link(&destination).unwrap(), Path::new(target));
+        assert_eq!(std::fs::read_link(&source).unwrap(), Path::new(target));
+        use std::os::unix::fs::MetadataExt;
+        let after = std::fs::symlink_metadata(&source).unwrap();
+        assert_eq!(
+            (before.ino(), before.ctime(), before.ctime_nsec()),
+            (after.ino(), after.ctime(), after.ctime_nsec())
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("payload")).unwrap(),
+            b"untouched target"
+        );
+    }
+}
+
 #[test]
 fn renamed_leaf_obeys_selection_and_comparison() {
     for flags in [
@@ -129,6 +166,38 @@ fn leaf_scope_preserves_parent_siblings_and_excluded_target() {
         event(&output, "verification_result")["files_mismatched"][0],
         source.to_str().unwrap()
     );
+}
+
+#[test]
+fn missing_selected_parent_is_created_only_for_authorized_work() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("original");
+    let destination = root.path().join("missing/parents/renamed");
+    std::fs::write(&source, b"selected bytes").unwrap();
+    let output = success(run(&source, &destination, &["--dry-run", "--json"]));
+    assert_eq!(event(&output, "summary")["files_created"], 1);
+    assert!(!root.path().join("missing").exists());
+    for flags in [
+        vec!["--exclude=original"],
+        vec!["--existing"],
+        vec!["--max-size=3"],
+        vec![
+            "--existing",
+            "--preserve-hardlinks",
+            "--remove-source-files",
+        ],
+    ] {
+        success(run(&source, &destination, &flags));
+        assert!(!root.path().join("missing").exists(), "{flags:?}");
+    }
+    // Prospective parent creation must not turn an initially absent spelling
+    // into an effect at the selected source's own name.
+    let alias = root.path().join("missing/../original");
+    assert!(!run(&source, &alias, &[]).status.success());
+    assert!(!root.path().join("missing").exists());
+    assert_eq!(std::fs::read(&source).unwrap(), b"selected bytes");
+    success(run(&source, &destination, &[]));
+    assert_eq!(std::fs::read(&destination).unwrap(), b"selected bytes");
 }
 
 #[test]

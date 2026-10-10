@@ -115,10 +115,14 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
             let _closed = server.await.unwrap();
             result.map_err(|error| error.to_string())
         } else {
-            let executor = LocalSyncExecutor::new(authority, destination.path().into(), scheduler)
-                .with_xattrs(true)
-                .with_bsd_flags(cfg!(target_os = "macos"))
-                .with_remove_source_files(remove_source);
+            let executor = LocalSyncExecutor::new(
+                authority,
+                sy::endpoint::local::LocalEndpoint::new(destination.path().into()),
+                scheduler,
+            )
+            .with_xattrs(true)
+            .with_bsd_flags(cfg!(target_os = "macos"))
+            .with_remove_source_files(remove_source);
             let work = executor.lower(operation, policy).unwrap().unwrap();
             assert!(matches!(
                 work.action(),

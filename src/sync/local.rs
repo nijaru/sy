@@ -39,6 +39,47 @@ pub(super) async fn run(
     let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
         .await
         .map_err(map_io)?;
+    // Pin an existing destination before any producer is admitted. Only an
+    // initially missing root may be acquired later: selected parents must wait
+    // for completed effect protection, and previews never create roots.
+    let destination_endpoint =
+        sy::endpoint::local::LocalEndpoint::new(destination_root.to_path_buf());
+    match destination_endpoint.rooted_fs(false).await {
+        Ok(_) => {}
+        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            if scope == SyncScope::Tree && !config.dry_run {
+                destination_endpoint.rooted_fs(true).await?;
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    run_with_authorities(
+        source_authority,
+        destination_endpoint,
+        config,
+        scan_options,
+        scope,
+    )
+    .await
+}
+
+/// Discovery, comparison and execution all consume the initially acquired
+/// destination. An uninitialized endpoint records initial absence, not permission
+/// to reopen an existing observation; only completed selected preflight may admit
+/// later creation.
+async fn run_with_authorities(
+    source_authority: sy::endpoint::source_root::SourceRoot,
+    destination_endpoint: sy::endpoint::local::LocalEndpoint,
+    config: &SyncConfig,
+    scan_options: ScanOptions,
+    scope: SyncScope,
+) -> Result<SyncStats> {
+    use sy::endpoint::Endpoint;
+    let source_root = source_authority.path();
+    // The retained FD owns native destination authority. This operator address
+    // must still name that root at local execution/completion boundaries.
+    let destination_root_owned = destination_endpoint.root().to_path_buf();
+    let destination_root = destination_root_owned.as_path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
         config.json,
@@ -48,33 +89,13 @@ pub(super) async fn run(
     let scan_started = Instant::now();
     reporter.start(source_root, destination_root);
 
-    // A missing tree destination is an empty observation during dry-run, not
-    // an excuse to create it. Observe before admitting either scan so an early
-    // filesystem failure cannot detach a source scanner. Selected-leaf scans
-    // already represent missing parents without creating them.
-    let destination_absent = if scope == SyncScope::Tree {
-        let root = destination_root.to_path_buf();
-        let dry_run = config.dry_run;
-        tokio::task::spawn_blocking(move || match std::fs::metadata(&root) {
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && dry_run => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(root)?;
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        })
-        .await
-        .map_err(map_io)?
-        .map_err(map_io)?
-    } else {
-        false
-    };
-
     // Complete fallible discovery before either scan producer is admitted.
-    let namespace_semantics = crate::fs_util::namespace_semantics(destination_root)
-        .await
-        .map_err(map_io)?;
+    // Query only the stored observation, never retry the root pathname here.
+    let destination_authority = destination_endpoint.acquired_rooted_fs();
+    let namespace_semantics = match destination_authority {
+        Some(rooted) => rooted.namespace_semantics().await.map_err(map_io)?,
+        None => sy::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+    };
 
     // Both scans are local. The source walk honors the ignore rules where
     // the files live; the destination scan stays COMPLETE (gitignore never
@@ -83,14 +104,10 @@ pub(super) async fn run(
     let (source, destination) = match &scope {
         SyncScope::Tree => (
             source_authority.entries(source_scan_request(config, scan_options)),
-            if destination_absent {
-                sy::engine::reconcile::EntryStream::new(futures::stream::empty())
-            } else {
-                sy::endpoint::local_entry_scan::local_entry_stream(
-                    destination_root.to_path_buf(),
-                    destination_scan_request(config),
-                )
-            },
+            destination_authority.as_ref().map_or_else(
+                || sy::engine::reconcile::EntryStream::new(futures::stream::empty()),
+                |rooted| rooted.entry_stream(destination_scan_request(config)),
+            ),
         ),
         SyncScope::SelectedLeaf {
             source,
@@ -101,11 +118,14 @@ pub(super) async fn run(
                 source_scan_request(config, scan_options),
                 false,
             ),
-            sy::endpoint::local_entry_scan::selected_leaf_stream(
-                destination_root.to_path_buf(),
-                destination.clone(),
-                destination_scan_request(config),
-                true,
+            destination_authority.as_ref().map_or_else(
+                || sy::engine::reconcile::EntryStream::new(futures::stream::empty()),
+                |rooted| {
+                    rooted.selected_entry_stream(
+                        destination.clone(),
+                        destination_scan_request(config),
+                    )
+                },
             ),
         ),
     };
@@ -129,7 +149,7 @@ pub(super) async fn run(
 
     let mut plan = {
         let source_authority = source_authority.clone();
-        let destination_root_owned = destination_root.to_path_buf();
+        let destination_endpoint = destination_endpoint.clone();
         preflight_sync_scoped_with_content(
             OrderedReconciler::with_scope(source, destination, scope.clone()),
             comparison_policy(config, namespace_semantics),
@@ -147,11 +167,9 @@ pub(super) async fn run(
             },
             move |source: Entry, destination: Entry| {
                 let source_authority = source_authority.clone();
-                let destination_root = destination_root_owned.clone();
+                let destination_endpoint = destination_endpoint.clone();
                 async move {
                     let source_endpoint = source_authority.endpoint();
-                    let destination_endpoint =
-                        sy::endpoint::local::LocalEndpoint::new(destination_root);
                     let source_hash = observed_hash(
                         &source_endpoint,
                         &source,
@@ -174,9 +192,21 @@ pub(super) async fn run(
     };
 
     source_authority.validate().await.map_err(map_io)?;
+    if let Some(rooted) = destination_authority.cloned() {
+        tokio::task::spawn_blocking(move || rooted.verify_root_path_blocking())
+            .await
+            .map_err(map_io)?
+            .map_err(map_io)?;
+    }
     if let SyncScope::SelectedLeaf { source, .. } = &scope {
-        super::selected::validate_effects(&mut plan, source_root, source, destination_root, config)
-            .await?;
+        super::selected::validate_effects(
+            &mut plan,
+            &source_authority,
+            source,
+            &destination_endpoint,
+            config,
+        )
+        .await?;
     }
 
     if config.preserve.hardlinks {
@@ -186,10 +216,9 @@ pub(super) async fn run(
                     source_authority.endpoint(),
                     config.preserve.symlink_mode == SymlinkMode::Follow,
                 ),
-                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => (
-                    sy::endpoint::local::LocalEndpoint::new(destination_root.to_path_buf()),
-                    false,
-                ),
+                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => {
+                    (destination_endpoint.clone(), false)
+                }
             };
             async move {
                 observed_hash(&endpoint, commitment.entry(), follow)
@@ -220,6 +249,19 @@ pub(super) async fn run(
         return Ok(stats);
     }
 
+    if destination_authority.is_none() {
+        let mut requires_root = false;
+        plan.validate_operations(|operation| {
+            requires_root |= matches!(operation, sy::engine::domain::SyncOp::Create { .. });
+            futures::future::ready(Ok(()))
+        })
+        .await
+        .map_err(map_controller_error)?;
+        if requires_root {
+            destination_endpoint.rooted_fs(true).await?;
+        }
+    }
+
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
         SyncError::Config("parallel transfer count must be greater than zero".to_string())
     })?;
@@ -236,22 +278,21 @@ pub(super) async fn run(
             sy::sync::ratelimit::RateLimiter::new(limit),
         ))
     });
-    let executor =
-        LocalSyncExecutor::new(source_authority, destination_root.to_path_buf(), scheduler)
-            .with_backup(
-                config.backup.is_some(),
-                backup_dir(config, destination_root),
-                config.suffix.clone(),
-            )
-            .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
-            .with_rate_limiter(rate_limiter)
-            .with_remove_source_files(config.remove_source_files)
-            .with_verify_on_write(config.verify_on_write)
-            .with_hardlinks(config.preserve.hardlinks)
-            .with_xattrs(config.preserve.xattrs)
-            .with_acls(config.preserve.acls)
-            .with_bsd_flags(config.preserve.flags)
-            .with_reporter(Some(reporter.clone()));
+    let executor = LocalSyncExecutor::new(source_authority, destination_endpoint, scheduler)
+        .with_backup(
+            config.backup.is_some(),
+            backup_dir(config, destination_root),
+            config.suffix.clone(),
+        )
+        .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
+        .with_rate_limiter(rate_limiter)
+        .with_remove_source_files(config.remove_source_files)
+        .with_verify_on_write(config.verify_on_write)
+        .with_hardlinks(config.preserve.hardlinks)
+        .with_xattrs(config.preserve.xattrs)
+        .with_acls(config.preserve.acls)
+        .with_bsd_flags(config.preserve.flags)
+        .with_reporter(Some(reporter.clone()));
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
@@ -288,6 +329,252 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn mode000_preflight_plans_skip_replace_and_scoped_delete_without_payload_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "native mode000 proof requires an unprivileged UID"
+        );
+        for tree in [true, false] {
+            for skip in [true, false] {
+                let source = tempfile::tempdir().unwrap();
+                let destination = tempfile::tempdir().unwrap();
+                let source_file = source.path().join("file");
+                let destination_file = destination.path().join("file");
+                let stale = destination.path().join("stale");
+                std::fs::write(&source_file, b"replacement payload").unwrap();
+                std::fs::write(&destination_file, b"old").unwrap();
+                std::fs::write(&stale, b"stale").unwrap();
+                for path in [&destination_file, &stale] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0)).unwrap();
+                    assert_eq!(
+                        std::fs::File::open(path).unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied,
+                        "fixture must deny payload reads"
+                    );
+                }
+                if skip {
+                    std::fs::set_permissions(&source_file, std::fs::Permissions::from_mode(0o0))
+                        .unwrap();
+                }
+                let before = crate::endpoint::local_identity::identity_for_metadata(
+                    &std::fs::metadata(&destination_file).unwrap(),
+                );
+                let mut config = SyncConfig::test_default();
+                // Replacement deliberately requests the readable source mode;
+                // without -p, Update retains the old destination's mode 000.
+                config.preserve.permissions = true;
+                config.comparison.ignore_existing = skip;
+                config.dry_run = true;
+                config.delete = crate::sync::DeleteMode::Enabled {
+                    limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
+                    force: true,
+                };
+                let scope = if tree {
+                    SyncScope::Tree
+                } else {
+                    SyncScope::SelectedLeaf {
+                        source: sy::engine::domain::RelativePath::new("file").unwrap(),
+                        destination: sy::engine::domain::RelativePath::new("file").unwrap(),
+                    }
+                };
+                let stats = run(
+                    source.path(),
+                    destination.path(),
+                    &config,
+                    ScanOptions::default(),
+                    scope.clone(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("tree={tree} skip={skip}: {error:?}"));
+                assert_eq!(stats.files_updated, u64::from(!skip));
+                assert_eq!(
+                    stats.files_deleted,
+                    usize::from(tree),
+                    "selected deletion must not expand to siblings"
+                );
+                assert_eq!(
+                    crate::endpoint::local_identity::identity_for_metadata(
+                        &std::fs::metadata(&destination_file).unwrap()
+                    ),
+                    before
+                );
+                assert!(stale.exists(), "preflight must not mutate the namespace");
+                if skip || cfg!(target_os = "linux") {
+                    // Exercise actual skip everywhere and native O_PATH-backed
+                    // retirement on Linux. macOS O_EVTONLY retirement still
+                    // requires read permission; preview is not execution proof.
+                    config.dry_run = false;
+                    if !cfg!(target_os = "linux") {
+                        config.delete = crate::sync::DeleteMode::Disabled;
+                    }
+                    let actual = run(
+                        source.path(),
+                        destination.path(),
+                        &config,
+                        ScanOptions::default(),
+                        scope,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(actual.files_updated, u64::from(!skip));
+                    if skip {
+                        assert_eq!(
+                            crate::endpoint::local_identity::identity_for_metadata(
+                                &std::fs::metadata(&destination_file).unwrap()
+                            ),
+                            before
+                        );
+                    } else {
+                        assert_eq!(
+                            std::fs::read(&destination_file).unwrap(),
+                            b"replacement payload"
+                        );
+                    }
+                    if cfg!(target_os = "linux") {
+                        assert_eq!(stale.exists(), !tree);
+                    }
+                }
+                assert!(source_file.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_root_authority_rejects_identical_leaf_alias_swap() {
+        use futures::TryStreamExt;
+        use sy::endpoint::existing::{fingerprint, FingerprintOptions};
+        use sy::endpoint::local::LocalEndpoint;
+        use sy::endpoint::source_root::SourceRoot;
+
+        for scope in [
+            SyncScope::Tree,
+            SyncScope::SelectedLeaf {
+                source: sy::engine::domain::RelativePath::new("file").unwrap(),
+                destination: sy::engine::domain::RelativePath::new("file").unwrap(),
+            },
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let source_path = parent.path().join("source");
+            let original = parent.path().join("destination");
+            let foreign = parent.path().join("foreign");
+            let held = parent.path().join("held");
+            for root in [&source_path, &original, &foreign] {
+                std::fs::create_dir(root).unwrap();
+            }
+            std::fs::write(source_path.join("file"), b"new").unwrap();
+            std::fs::hard_link(source_path.join("file"), source_path.join("retained")).unwrap();
+            std::fs::write(original.join("file"), b"old").unwrap();
+            std::fs::write(original.join("retained"), b"new").unwrap();
+            // Establish all leaf aliases BEFORE observations: ctime/nlink remain
+            // identical across the root swap, defeating a path-reopening executor.
+            for name in ["file", "retained"] {
+                std::fs::hard_link(original.join(name), foreign.join(name)).unwrap();
+            }
+            std::fs::write(foreign.join("sibling"), b"foreign sibling").unwrap();
+            let source = SourceRoot::open(source_path.clone()).await.unwrap();
+            let destination = LocalEndpoint::new(original.clone());
+            let rooted = destination.rooted_fs(false).await.unwrap();
+            let mut config = SyncConfig::test_default();
+            config.comparison.checksum = true;
+            config.preserve.hardlinks = true;
+            config.remove_source_files = true;
+            let entries = rooted
+                .entry_stream(destination_scan_request(&config))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let before = fingerprint(
+                rooted.as_ref().clone(),
+                entries[0].clone(),
+                FingerprintOptions::default(),
+            )
+            .await
+            .unwrap();
+            std::fs::rename(&original, &held).unwrap();
+            std::fs::rename(&foreign, &original).unwrap();
+            let after = fingerprint(
+                rooted.as_ref().clone(),
+                entries[0].clone(),
+                FingerprintOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                before, after,
+                "hash and namespace binding must use the original root"
+            );
+            assert!(observed_hash(&destination, &entries[0], false)
+                .await
+                .is_err());
+
+            // Exercise the production discovery/scan/checksum/hardlink-preflight/
+            // execution path with the run's originally acquired authorities.
+            assert!(run_with_authorities(
+                source,
+                destination,
+                &config,
+                ScanOptions::default(),
+                scope
+            )
+            .await
+            .is_err());
+            assert_eq!(std::fs::read(held.join("file")).unwrap(), b"old");
+            assert_eq!(std::fs::read(original.join("file")).unwrap(), b"old");
+            assert_eq!(std::fs::read(held.join("retained")).unwrap(), b"new");
+            assert_eq!(std::fs::read(original.join("retained")).unwrap(), b"new");
+            assert_eq!(std::fs::read_dir(&original).unwrap().count(), 3);
+            assert_eq!(std::fs::read_dir(&held).unwrap().count(), 2);
+            for name in ["file", "retained"] {
+                assert_eq!(std::fs::read(source_path.join(name)).unwrap(), b"new");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_discovery_refuses_wrong_types_and_preserves_preview_absence() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        let destination = parent.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file"), b"source bytes").unwrap();
+        std::fs::write(&destination, b"not a directory").unwrap();
+        let mut config = SyncConfig::test_default();
+        config.remove_source_files = true;
+        for dry_run in [false, true] {
+            config.dry_run = dry_run;
+            let error = run(
+                &source,
+                &destination,
+                &config,
+                ScanOptions::default(),
+                SyncScope::Tree,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SyncError::Io(error)
+                if error.kind() == std::io::ErrorKind::NotADirectory));
+            assert_eq!(std::fs::read(source.join("file")).unwrap(), b"source bytes");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"not a directory");
+        }
+        std::fs::remove_file(&destination).unwrap();
+        let stats = run(
+            &source,
+            &destination,
+            &config,
+            ScanOptions::default(),
+            SyncScope::Tree,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.files_created, 1);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(source.join("file")).unwrap(), b"source bytes");
+    }
+
+    #[tokio::test]
     async fn source_root_swap_preserves_original_and_out_of_scope_aliases() {
         use super::super::hardlink_tests::{
             is_original_root_change, SourceRootSwap, SwapBeforeSourceRemovals,
@@ -297,7 +584,7 @@ mod tests {
             let mut fixture = SourceRootSwap::new().await;
             let inner = LocalSyncExecutor::new(
                 fixture.source.clone(),
-                fixture.destination.path().into(),
+                sy::endpoint::local::LocalEndpoint::new(fixture.destination.path().into()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_hardlinks(preserve_hardlinks)

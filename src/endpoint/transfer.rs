@@ -295,16 +295,6 @@ struct SourceCheck {
     identity: EntryIdentity,
 }
 
-#[derive(Debug, Clone)]
-enum DestinationCheck {
-    Absent(PathBuf),
-    Unchanged {
-        path: PathBuf,
-        identity: EntryIdentity,
-    },
-    Unverified,
-}
-
 /// Deterministic race-injection point: runs immediately before the commit
 /// checks, inside the scan/commit race window. Production callers pass `None`;
 /// unit tests inject filesystem mutations here to exercise abort paths.
@@ -321,17 +311,14 @@ enum CheckPoint {
 
 /// Commit-time race expectations for one transfer.
 ///
-/// Portable filesystem race detection observes source and destination with
-/// separate stat/rename syscalls. Ordinary concurrent edits, replacements,
-/// truncations, and growth change the identity token and abort staging before
-/// commit; an adversarial ABA replacement that restores every observed field
-/// (including ctime) is outside what portable stat can prove.
+/// Source checks retain the opened observation. Destination expectations are
+/// passed unchanged to the endpoint transaction, which owns rooted validation
+/// before staging and publication; a lexical destination stat is not authority.
 #[derive(Clone)]
 struct CommitChecks {
     source: Option<SourceCheck>,
     source_rooted: Option<crate::rooted_fs::RootedFs>,
     source_relative: RelativePath,
-    destination: DestinationCheck,
     test_hook: Option<RaceHook>,
 }
 
@@ -349,7 +336,6 @@ impl CommitChecks {
         source_rooted: Option<crate::rooted_fs::RootedFs>,
         source_relative: RelativePath,
         source_native: Option<&Path>,
-        dest_native: Option<&Path>,
         follow_symlinks: bool,
         test_hook: Option<RaceHook>,
     ) -> Result<Self> {
@@ -378,37 +364,10 @@ impl CommitChecks {
             }
             SourceExpectation::Unverified => None,
         };
-        let destination = match identity.destination {
-            ExpectedDestination::Absent => {
-                let path = require_native(dest_native, "destination")?;
-                DestinationCheck::Absent(path)
-            }
-            ExpectedDestination::Unchanged(expected) => {
-                let path = require_native(dest_native, "destination")?;
-                DestinationCheck::Unchanged {
-                    path,
-                    identity: expected,
-                }
-            }
-            ExpectedDestination::SnapshotAtOpen => {
-                let path = require_native(dest_native, "destination")?;
-                match observe(&path, false)? {
-                    Observation::Identified(identity) => {
-                        DestinationCheck::Unchanged { path, identity }
-                    }
-                    Observation::Missing => {
-                        return Err(SyncError::DestinationChanged { path });
-                    }
-                    Observation::Unidentified => DestinationCheck::Unverified,
-                }
-            }
-            ExpectedDestination::Unverified => DestinationCheck::Unverified,
-        };
         Ok(Self {
             source,
             source_rooted,
             source_relative,
-            destination,
             test_hook,
         })
     }
@@ -458,40 +417,8 @@ impl CommitChecks {
         Ok(())
     }
 
-    fn verify_destination(&self) -> Result<()> {
-        match &self.destination {
-            DestinationCheck::Absent(path) => {
-                if observe(path, false)? != Observation::Missing {
-                    return Err(SyncError::DestinationChanged { path: path.clone() });
-                }
-            }
-            DestinationCheck::Unchanged { path, identity } => {
-                if observe(path, false)? != Observation::Identified(*identity) {
-                    return Err(SyncError::DestinationChanged { path: path.clone() });
-                }
-            }
-            DestinationCheck::Unverified => {}
-        }
-        Ok(())
-    }
-
     fn expected_source_identity(&self) -> Option<EntryIdentity> {
         self.source.as_ref().map(|source| source.identity)
-    }
-
-    fn expected_destination(&self) -> ExpectedDestination {
-        match self.destination {
-            DestinationCheck::Absent(_) => ExpectedDestination::Absent,
-            DestinationCheck::Unchanged { identity, .. } => {
-                ExpectedDestination::Unchanged(identity)
-            }
-            DestinationCheck::Unverified => ExpectedDestination::Unverified,
-        }
-    }
-
-    fn verify(&self, checkpoint: CheckPoint) -> Result<()> {
-        self.verify_source(checkpoint)?;
-        self.verify_destination()
     }
 }
 
@@ -603,23 +530,21 @@ where
         .map_err(|error| SyncError::Config(error.to_string()))?;
     let source_for_checks = source_relative.clone();
     let source_native_checks = source_native.clone();
-    let dest_native_checks = dest_native.clone();
     let checks = tokio::task::spawn_blocking(move || {
         let checks = CommitChecks::resolve(
             options.identity,
             source_rooted,
             source_for_checks,
             source_native_checks.as_deref(),
-            dest_native_checks.as_deref(),
             options.follow_symlinks,
             test_hook,
         )?;
-        checks.verify(CheckPoint::Open)?;
+        checks.verify_source(CheckPoint::Open)?;
         Ok::<_, SyncError>(checks)
     })
     .await
     .map_err(|error| SyncError::Io(std::io::Error::other(error)))??;
-    let expected_destination = checks.expected_destination();
+    let expected_destination = options.identity.destination;
     let mut before_stage = Some(before_stage);
     let dest_relative = RelativePath::new(dest_path.to_path_buf())
         .map_err(|error| SyncError::Config(error.to_string()))?;
@@ -741,9 +666,6 @@ where
                 && source_caps.random_read
                 && dest_caps.random_write
                 && dest_caps.reflink
-                && dest_native
-                    .as_deref()
-                    .is_some_and(crate::fs_util::supports_cow_reflinks)
             {
                 let (returned_source, result) = reflink_patch(
                     source_file,
@@ -923,6 +845,19 @@ async fn native_whole_staged_copy(
 }
 
 #[cfg(target_os = "linux")]
+fn native_file_supports_reflink(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file's descriptor is live; stat is writable for one statfs.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatfs initialized the output structure.
+    let stat = unsafe { stat.assume_init() };
+    Ok(matches!(stat.f_type, 0x9123683E | 0x58465342)) // Btrfs or XFS.
+}
+
+#[cfg(target_os = "linux")]
 async fn reflink_patch(
     source_file: std::fs::File,
     dest: &dyn Endpoint,
@@ -956,29 +891,40 @@ async fn reflink_patch(
     }) else {
         return Ok((source_file, None));
     };
-    verify_open_destination_identity(&destination_basis, expected_destination_identity, dest_path)?;
-    if destination_basis.metadata()?.nlink() > 1 {
-        return Ok((source_file, None));
-    }
+    let destination_path = dest_path.to_path_buf();
 
     // Reflink patching trades an extra destination read for fewer physical
     // writes. Keep it conservative until the benchmark suite tunes this.
     let (source_file, destination_basis, ratio) = tokio::task::spawn_blocking(move || {
         let mut source_file = source_file;
         let mut destination_basis = destination_basis;
-        let ratio = sy::transfer::ratio::estimate_change_ratio_files(
-            &mut source_file,
-            &mut destination_basis,
-            TRANSFER_BUFFER_SIZE,
-            Some(16),
-            Some(0.25),
-        );
-        (source_file, destination_basis, ratio)
+        verify_open_destination_identity(
+            &destination_basis,
+            expected_destination_identity,
+            &destination_path,
+        )?;
+        // Qualify the actual held basis, including submounts, not its former
+        // lexical name (which may now designate an unrelated filesystem).
+        let ratio = if destination_basis.metadata()?.nlink() > 1
+            || !native_file_supports_reflink(&destination_basis)?
+        {
+            Ok(None)
+        } else {
+            sy::transfer::ratio::estimate_change_ratio_files(
+                &mut source_file,
+                &mut destination_basis,
+                TRANSFER_BUFFER_SIZE,
+                Some(16),
+                Some(0.25),
+            )
+            .map(Some)
+        };
+        Ok::<_, SyncError>((source_file, destination_basis, ratio))
     })
     .await
-    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+    .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))??;
     let ratio = match ratio {
-        Ok(ratio) if ratio.use_delta => ratio,
+        Ok(Some(ratio)) if ratio.use_delta => ratio,
         Ok(_) => return Ok((source_file, None)),
         Err(error) => {
             tracing::debug!("reflink change sampling failed: {error}");

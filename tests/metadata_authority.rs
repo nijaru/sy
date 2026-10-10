@@ -205,7 +205,7 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
                 Direction::Local => {
                     let executor = LocalSyncExecutor::new(
                         authority,
-                        destination.path().to_path_buf(),
+                        sy::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
                         scheduler,
                     );
                     let work = lower_local_op(op, policy).unwrap().unwrap();
@@ -343,7 +343,7 @@ async fn local_directory_creation_and_finalize_refuse_swapped_ancestors() {
         .unwrap();
     let executor = LocalSyncExecutor::new(
         authority.clone(),
-        destination.path().to_path_buf(),
+        sy::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
         Scheduler::new(ResourceBudget::default()).unwrap(),
     );
     std::fs::rename(
