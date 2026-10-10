@@ -101,10 +101,17 @@ pub(crate) async fn observed_hash(
         .await?
         .ok_or_else(|| SyncError::Config("endpoint cannot bind an observed source hash".into()))?;
     if !follow {
-        return sy::endpoint::existing::fingerprint(rooted, entry.clone(), Default::default())
+        let fingerprint =
+            sy::endpoint::existing::fingerprint(rooted.clone(), entry.clone(), Default::default())
+                .await
+                .map_err(map_io)?;
+        // This helper compares local operator operands. Remote fingerprint RPCs
+        // retain the peer's held-root semantics without this pathname contract.
+        tokio::task::spawn_blocking(move || rooted.verify_root_path_blocking())
             .await
-            .map(|fingerprint| fingerprint.content)
-            .map_err(map_io);
+            .map_err(map_io)?
+            .map_err(map_io)?;
+        return Ok(fingerprint.content);
     }
     let file = endpoint
         .open_native_file_following(entry.path.as_path())

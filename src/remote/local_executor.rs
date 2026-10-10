@@ -114,7 +114,6 @@ pub type LocalTransferMetadata = crate::endpoint::transfer::TransferMetadata;
 
 pub struct LocalSyncExecutor {
     source_root: crate::endpoint::source_root::SourceRoot,
-    destination_root: PathBuf,
     source_endpoint: crate::endpoint::local::LocalEndpoint,
     destination_endpoint: crate::endpoint::local::LocalEndpoint,
     scheduler: Scheduler,
@@ -157,15 +156,12 @@ pub struct LocalSyncExecutor {
 impl LocalSyncExecutor {
     pub fn new(
         source_root: crate::endpoint::source_root::SourceRoot,
-        destination_root: PathBuf,
+        destination_endpoint: crate::endpoint::local::LocalEndpoint,
         scheduler: Scheduler,
     ) -> Self {
         let source_endpoint = source_root.endpoint();
-        let destination_endpoint =
-            crate::endpoint::local::LocalEndpoint::new(destination_root.clone());
         Self {
             source_root,
-            destination_root,
             source_endpoint,
             destination_endpoint,
             scheduler,
@@ -326,7 +322,7 @@ impl LocalSyncExecutor {
     }
 
     fn destination_path(&self, relative: &RelativePath) -> PathBuf {
-        self.destination_root.join(relative.as_path())
+        crate::endpoint::Endpoint::root(&self.destination_endpoint).join(relative.as_path())
     }
 
     fn lower_unchanged_file_preservation(
@@ -356,7 +352,7 @@ impl LocalSyncExecutor {
     /// destination-anchored — never relative to the process CWD.
     fn backup_destination_for(&self, relative: &RelativePath) -> Result<PathBuf> {
         backup_destination_path(
-            &self.destination_root,
+            crate::endpoint::Endpoint::root(&self.destination_endpoint),
             relative,
             self.backup_dir.as_deref(),
             &self.backup_suffix,
@@ -380,7 +376,9 @@ impl LocalSyncExecutor {
         let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
         tokio::task::spawn_blocking(move || {
-            rooted.backup_file_blocking(&relative, &backup, expected)
+            rooted.verify_root_path_blocking()?;
+            rooted.backup_file_blocking(&relative, &backup, expected)?;
+            rooted.verify_root_path_blocking()
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -399,8 +397,11 @@ impl LocalSyncExecutor {
         let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
         tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
             rooted.backup_file_blocking(&relative, &backup, expected)?;
-            rooted.remove_destination_blocking(&relative, false, Some(expected))
+            rooted.verify_root_path_blocking()?;
+            rooted.remove_destination_blocking(&relative, false, Some(expected))?;
+            rooted.verify_root_path_blocking()
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -435,7 +436,10 @@ impl LocalSyncExecutor {
                         Default::default(),
                     )?;
                     source_root.verify_root_path_blocking()?;
-                    rooted.create_directory_blocking(&destination_path)
+                    rooted.verify_root_path_blocking()?;
+                    let identity = rooted.create_directory_blocking(&destination_path)?;
+                    rooted.verify_root_path_blocking()?;
+                    Ok::<_, crate::rooted_fs::RootedFsError>(identity)
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -563,7 +567,8 @@ impl LocalSyncExecutor {
                 let relative = destination.path.clone();
                 let kind = source.kind;
                 let identity = tokio::task::spawn_blocking(move || {
-                    rooted.apply_observed_preservation_blocking(
+                    rooted.verify_root_path_blocking()?;
+                    let identity = rooted.apply_observed_preservation_blocking(
                         &relative,
                         kind,
                         expected_destination,
@@ -574,7 +579,9 @@ impl LocalSyncExecutor {
                             acl: acls.as_deref(),
                             bsd_flags,
                         },
-                    )
+                    )?;
+                    rooted.verify_root_path_blocking()?;
+                    Ok::<_, crate::rooted_fs::RootedFsError>(identity)
                 })
                 .await
                 .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -635,12 +642,20 @@ impl LocalSyncExecutor {
             let first_path = first.path.clone();
             let destination_path_for_worker = destination_path.clone();
             let publication = tokio::task::spawn_blocking(move || {
-                rooted.publish_hardlink_blocking(
+                rooted.verify_root_path_blocking()?;
+                let proof = rooted.publish_hardlink_blocking(
                     &first_path,
                     &destination_path_for_worker,
                     first.publication,
                     expected,
-                )
+                )?;
+                crate::endpoint::local::verify_committed_root(
+                    &rooted,
+                    &rooted
+                        .root_path()
+                        .join(destination_path_for_worker.as_path()),
+                )?;
+                Ok::<_, LocalSyncError>(proof)
             })
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -742,19 +757,22 @@ impl LocalSyncExecutor {
     async fn finish_deferred_source_removals(&self) -> Result<()> {
         if self.remove_source_files && self.hardlinks {
             let groups = self.hardlink_groups.lock().await;
-            let rooted = self.metadata_authority().await?;
             self.hardlink_removals
-                .replay(self.source_root.clone(), &groups, |proof| {
-                    let rooted = rooted.clone();
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            rooted.verify_root_path_blocking()?;
-                            proof.revalidate_blocking(&rooted)
-                        })
+                .replay(self.source_root.clone(), &groups, |proof| async move {
+                    // Empty/skipped selected work may have no destination
+                    // root. Acquire only when a recorded proof needs it.
+                    let rooted = self
+                        .metadata_authority()
                         .await
-                        .map_err(std::io::Error::other)?
-                        .map_err(std::io::Error::other)
-                    }
+                        .map_err(std::io::Error::other)?;
+                    tokio::task::spawn_blocking(move || {
+                        rooted.verify_root_path_blocking()?;
+                        proof.revalidate_blocking(&rooted)?;
+                        rooted.verify_root_path_blocking()
+                    })
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .map_err(std::io::Error::other)
                 })
                 .await?;
         }
@@ -916,22 +934,29 @@ impl LocalSyncExecutor {
         let rooted = self.metadata_authority().await?;
         let target = target.to_path_buf();
         let relative = relative.clone();
-        Ok(tokio::task::spawn_blocking(move || {
-            rooted.publish_symlink_blocking(&relative, &target, expected, modified)
+        tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
+            let proof = rooted.publish_symlink_blocking(&relative, &target, expected, modified)?;
+            crate::endpoint::local::verify_committed_root(
+                &rooted,
+                &rooted.root_path().join(relative.as_path()),
+            )?;
+            Ok::<_, LocalSyncError>(proof)
         })
         .await
-        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??)
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
     }
 
     async fn metadata_authority(&self) -> Result<crate::rooted_fs::RootedFs> {
         // Byte staging and executor links must share one run-owned lineage;
         // independently opening the same pathname creates distinct authority.
-        Ok(self
-            .destination_endpoint
-            .rooted_fs(false)
-            .await?
-            .as_ref()
-            .clone())
+        let rooted = self.destination_endpoint.rooted_fs(false).await?;
+        Ok(tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
+            Ok::<_, crate::rooted_fs::RootedFsError>(rooted.as_ref().clone())
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??)
     }
 
     /// --remove-source-files: remove the source entry after the destination
@@ -954,32 +979,21 @@ impl LocalSyncExecutor {
                 std::io::Error::other(error.to_string()),
             )
         })?;
-        {
-            let rooted = self.metadata_authority().await?;
-            let receipt = receipt.clone();
-            tokio::task::spawn_blocking(move || {
-                rooted
-                    .verify_root_path_blocking()
-                    .map_err(|error| crate::error::SyncError::Config(error.to_string()))?;
-                receipt.revalidate_destination_blocking(&rooted)
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
-            .map_err(|error| {
-                LocalSyncError::Source(
-                    self.source_path(&source.path),
-                    std::io::Error::other(error.to_string()),
-                )
-            })?;
-        }
-        self.remove_source_entry_on_disk(source).await
-    }
-
-    /// Revalidate and unlink through a held root; never follow a raced ancestor.
-    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
+        let destination = self.metadata_authority().await?;
         let rooted = self.source_root.rooted();
-        existing::remove_observed_source(rooted, source.clone()).await?;
-        Ok(())
+        let receipt = receipt.clone();
+        let source = source.clone();
+        // Check the operator address in the unlink worker, not just before it
+        // is queued. The separate root/name checks and unlink are not CAS.
+        tokio::task::spawn_blocking(move || {
+            destination.verify_root_path_blocking()?;
+            receipt.revalidate_destination_blocking(&destination)?;
+            destination.verify_root_path_blocking()?;
+            existing::remove_observed_source_blocking(&rooted, &source)?;
+            Ok::<_, LocalSyncError>(())
+        })
+        .await
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
     }
 
     /// Delete one destination-only entry after the delete-threshold gate. A
@@ -1004,11 +1018,13 @@ impl LocalSyncExecutor {
             let rooted = self.metadata_authority().await?;
             let action = action.clone();
             let result = tokio::task::spawn_blocking(move || {
+                rooted.verify_root_path_blocking()?;
                 rooted.remove_destination_blocking(
                     &action.path,
                     action.kind == EntryKind::Directory,
                     Some(expected),
-                )
+                )?;
+                rooted.verify_root_path_blocking()
             })
             .await
             .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?;
@@ -1071,13 +1087,15 @@ impl LocalSyncExecutor {
                 Default::default()
             };
             source.verify_root_path_blocking()?;
+            rooted.verify_root_path_blocking()?;
             rooted.finalize_directory_blocking(
                 &metadata.path,
                 expected,
                 metadata.unix_mode,
                 metadata.modified,
                 &preservation,
-            )
+            )?;
+            rooted.verify_root_path_blocking()
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -1487,80 +1505,174 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn replaced_publication_cannot_authorize_source_removal() {
+    async fn planned_publication_rejects_replaced_root_with_identical_leaf_alias() {
         use futures::TryStreamExt;
-        let source_root = tempfile::tempdir().unwrap();
-        let destination_root = tempfile::tempdir().unwrap();
-        std::fs::write(source_root.path().join("input"), b"published bytes").unwrap();
-        let authority =
-            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
-                .await
-                .unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let source_root = parent.path().join("source");
+        let destination_root = parent.path().join("destination");
+        let foreign = parent.path().join("foreign");
+        let held = parent.path().join("held");
+        for root in [&source_root, &destination_root, &foreign] {
+            std::fs::create_dir(root).unwrap();
+        }
+        std::fs::write(source_root.join("file"), b"new bytes").unwrap();
+        std::fs::write(destination_root.join("file"), b"old bytes").unwrap();
+        // Establish the alias before scanning, so nlink/ctime cannot expose a
+        // fresh-path executor's adoption of the foreign root.
+        std::fs::hard_link(destination_root.join("file"), foreign.join("file")).unwrap();
+        let authority = crate::endpoint::source_root::SourceRoot::open(source_root.clone())
+            .await
+            .unwrap();
+        let request = crate::engine::scan::ScanRequest {
+            metadata: crate::engine::scan::EntryMetadataRequest {
+                unix_mode: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let source = authority
-            .entries(Default::default())
+            .entries(request)
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
             .remove(0);
-        let source_endpoint = authority.endpoint();
-        let destination_endpoint =
-            crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf());
-        let result = crate::endpoint::transfer::transfer_file(
-            &source_endpoint,
-            source.path.as_path(),
-            &destination_endpoint,
-            std::path::Path::new("renamed"),
-            TransferOptions {
-                update: false,
-                verify: false,
-                follow_symlinks: false,
-                rate_limiter: None,
-                identity: crate::endpoint::transfer::TransferIdentity {
-                    source: crate::endpoint::transfer::SourceExpectation::Scanned(
-                        source.identity.unwrap(),
-                    ),
-                    destination: crate::endpoint::ExpectedDestination::Absent,
-                },
-                preservation: crate::endpoint::io::Preservation::default(),
-                preservation_request: crate::endpoint::io::PreservationRequest::default(),
-                final_flags: None,
-                metadata: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            result.verification,
-            crate::endpoint::io::VerificationStatus::NotRequested
-        );
+        let endpoint = crate::endpoint::local::LocalEndpoint::new(destination_root.clone());
+        let rooted = endpoint.rooted_fs(false).await.unwrap();
+        let destination = rooted
+            .entry_stream(request)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let executor = LocalSyncExecutor::new(
             authority,
-            destination_root.path().to_path_buf(),
+            endpoint,
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
         .with_remove_source_files(true);
-        std::fs::rename(
-            destination_root.path().join("renamed"),
-            destination_root.path().join("saved"),
+        let work = lower_local_op(
+            SyncOp::Update {
+                source,
+                destination,
+            },
+            ExecutionPolicy::default(),
         )
+        .unwrap()
         .unwrap();
-        std::fs::write(
-            destination_root.path().join("renamed"),
-            b"foreign replacement",
-        )
-        .unwrap();
-        assert!(executor
-            .remove_committed_source(&result.receipt, &source)
+        std::fs::rename(&destination_root, &held).unwrap();
+        std::fs::rename(&foreign, &destination_root).unwrap();
+        assert!(executor.execute(work).await.is_err());
+        for root in [&held, &destination_root] {
+            assert_eq!(std::fs::read(root.join("file")).unwrap(), b"old bytes");
+            assert_eq!(
+                std::fs::read_dir(root).unwrap().count(),
+                1,
+                "no leaked private staging"
+            );
+        }
+        assert_eq!(
+            std::fs::read(source_root.join("file")).unwrap(),
+            b"new bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_publication_or_root_cannot_authorize_source_removal() {
+        use futures::TryStreamExt;
+        for change_root in [false, true] {
+            let retained = tempfile::tempdir().unwrap();
+            let source_root = tempfile::tempdir().unwrap();
+            let destination_root = tempfile::tempdir().unwrap();
+            std::fs::write(source_root.path().join("input"), b"published bytes").unwrap();
+            let authority =
+                crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let source = authority
+                .entries(Default::default())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .remove(0);
+            let source_endpoint = authority.endpoint();
+            let destination_endpoint =
+                crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf());
+            let result = crate::endpoint::transfer::transfer_file(
+                &source_endpoint,
+                source.path.as_path(),
+                &destination_endpoint,
+                std::path::Path::new("renamed"),
+                TransferOptions {
+                    update: false,
+                    verify: false,
+                    follow_symlinks: false,
+                    rate_limiter: None,
+                    identity: crate::endpoint::transfer::TransferIdentity {
+                        source: crate::endpoint::transfer::SourceExpectation::Scanned(
+                            source.identity.unwrap(),
+                        ),
+                        destination: crate::endpoint::ExpectedDestination::Absent,
+                    },
+                    preservation: crate::endpoint::io::Preservation::default(),
+                    preservation_request: crate::endpoint::io::PreservationRequest::default(),
+                    final_flags: None,
+                    metadata: None,
+                },
+            )
             .await
-            .is_err());
-        assert_eq!(
-            std::fs::read(source_root.path().join("input")).unwrap(),
-            b"published bytes"
-        );
-        assert_eq!(
-            std::fs::read(destination_root.path().join("renamed")).unwrap(),
-            b"foreign replacement"
-        );
+            .unwrap();
+            assert_eq!(
+                result.verification,
+                crate::endpoint::io::VerificationStatus::NotRequested
+            );
+            let executor = LocalSyncExecutor::new(
+                authority,
+                destination_endpoint,
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_remove_source_files(true);
+            if change_root {
+                let rooted = executor.metadata_authority().await.unwrap();
+                std::fs::rename(destination_root.path(), retained.path().join("held")).unwrap();
+                std::fs::create_dir(destination_root.path()).unwrap();
+                // The held leaf/proof is still valid. Only the local operator
+                // address has changed; that alone must prohibit source unlink.
+                result
+                    .receipt
+                    .revalidate_destination_blocking(&rooted)
+                    .unwrap();
+            } else {
+                std::fs::rename(
+                    destination_root.path().join("renamed"),
+                    destination_root.path().join("saved"),
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                destination_root.path().join("renamed"),
+                b"foreign replacement",
+            )
+            .unwrap();
+            assert!(executor
+                .remove_committed_source(&result.receipt, &source)
+                .await
+                .is_err());
+            assert_eq!(
+                std::fs::read(source_root.path().join("input")).unwrap(),
+                b"published bytes"
+            );
+            assert_eq!(
+                std::fs::read(destination_root.path().join("renamed")).unwrap(),
+                b"foreign replacement"
+            );
+            if change_root {
+                assert_eq!(
+                    std::fs::read(retained.path().join("held/renamed")).unwrap(),
+                    b"published bytes"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1582,7 +1694,7 @@ mod tests {
             .remove(0);
         let executor = LocalSyncExecutor::new(
             authority,
-            destination_root.path().to_path_buf(),
+            crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf()),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
         .with_remove_source_files(true);
@@ -1649,7 +1761,7 @@ mod tests {
             .unwrap();
             let executor = LocalSyncExecutor::new(
                 authority,
-                destination_root.path().to_path_buf(),
+                crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_remove_source_files(true);
@@ -1726,7 +1838,7 @@ mod tests {
             .unwrap();
             let executor = LocalSyncExecutor::new(
                 authority,
-                dest_root.path().to_path_buf(),
+                crate::endpoint::local::LocalEndpoint::new(dest_root.path().to_path_buf()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_hardlinks(true);
@@ -1799,7 +1911,7 @@ mod tests {
             let entries: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
             let executor = LocalSyncExecutor::new(
                 authority,
-                dest_root.path().to_path_buf(),
+                crate::endpoint::local::LocalEndpoint::new(dest_root.path().to_path_buf()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_hardlinks(true)
@@ -1836,12 +1948,23 @@ mod tests {
     #[tokio::test]
     async fn verified_existing_hardlink_removal_waits_for_all_destination_proofs() {
         use futures::TryStreamExt;
-        for race in [false, true] {
+        for race in [0, 1, 2] {
             let source_root = tempfile::tempdir().unwrap();
             let destination_root = tempfile::tempdir().unwrap();
+            let foreign = tempfile::tempdir().unwrap();
+            let retained = tempfile::tempdir().unwrap();
             for root in [source_root.path(), destination_root.path()] {
                 std::fs::write(root.join("a"), b"same").unwrap();
                 std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+            }
+            if race == 2 {
+                for name in ["a", "b"] {
+                    std::fs::hard_link(
+                        destination_root.path().join(name),
+                        foreign.path().join(name),
+                    )
+                    .unwrap();
+                }
             }
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.hardlink_group = true;
@@ -1859,7 +1982,7 @@ mod tests {
             .unwrap();
             let executor = LocalSyncExecutor::new(
                 authority,
-                destination_root.path().to_path_buf(),
+                crate::endpoint::local::LocalEndpoint::new(destination_root.path().to_path_buf()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_hardlinks(true)
@@ -1872,14 +1995,29 @@ mod tests {
                 assert!(source_root.path().join("a").exists());
                 assert!(source_root.path().join("b").exists());
             }
-            if race {
+            if race == 1 {
                 std::fs::remove_file(destination_root.path().join("b")).unwrap();
                 std::fs::write(destination_root.path().join("b"), b"foreign").unwrap();
+            } else if race == 2 {
+                std::fs::rename(destination_root.path(), retained.path().join("held")).unwrap();
+                std::fs::rename(foreign.path(), destination_root.path()).unwrap();
             }
             let result = executor.finish_deferred_source_removals().await;
-            assert_eq!(result.is_err(), race);
-            assert_eq!(source_root.path().join("a").exists(), race);
-            assert_eq!(source_root.path().join("b").exists(), race);
+            assert_eq!(result.is_err(), race != 0);
+            assert_eq!(source_root.path().join("a").exists(), race != 0);
+            assert_eq!(source_root.path().join("b").exists(), race != 0);
+            if race == 2 {
+                for name in ["a", "b"] {
+                    assert_eq!(
+                        std::fs::read(destination_root.path().join(name)).unwrap(),
+                        b"same"
+                    );
+                    assert_eq!(
+                        std::fs::read(retained.path().join("held").join(name)).unwrap(),
+                        b"same"
+                    );
+                }
+            }
         }
     }
 
@@ -1929,7 +2067,7 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                    dest_root.path().to_path_buf(),
+                    crate::endpoint::local::LocalEndpoint::new(dest_root.path().to_path_buf()),
                     Scheduler::new(ResourceBudget::default()).unwrap(),
                 );
                 assert!(executor.execute(work).await.is_err());
@@ -1965,7 +2103,7 @@ mod tests {
                 crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                     .await
                     .unwrap(),
-                destination.path().to_path_buf(),
+                crate::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
                 Scheduler::new(ResourceBudget::default()).unwrap(),
             )
             .with_backup(true, None, "~".into());
@@ -2006,7 +2144,7 @@ mod tests {
             crate::endpoint::source_root::SourceRoot::open(temp_src.path().to_path_buf())
                 .await
                 .unwrap(),
-            temp_dst.path().to_path_buf(),
+            crate::endpoint::local::LocalEndpoint::new(temp_dst.path().to_path_buf()),
             scheduler,
         );
 

@@ -233,10 +233,14 @@ async fn run_case(
         Direction::Local => {
             SyncController::new(
                 wrap(
-                    LocalSyncExecutor::new(authority, destination.path().to_path_buf(), scheduler)
-                        .with_xattrs(true)
-                        .with_acls(acl)
-                        .with_bsd_flags(flags),
+                    LocalSyncExecutor::new(
+                        authority,
+                        sy::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
+                        scheduler,
+                    )
+                    .with_xattrs(true)
+                    .with_acls(acl)
+                    .with_bsd_flags(flags),
                 ),
                 NonZeroUsize::new(2).unwrap(),
             )

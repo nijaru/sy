@@ -487,7 +487,10 @@ mod tests {
         assert_eq!(
             client.namespace_semantics,
             Some(
-                crate::fs_util::namespace_semantics(root.path())
+                crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
+                    .await
+                    .unwrap()
+                    .namespace_semantics()
                     .await
                     .unwrap()
             )

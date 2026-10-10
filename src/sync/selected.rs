@@ -33,7 +33,14 @@ pub(super) async fn resolve(
         let destination = match std::fs::metadata(&destination) {
             Ok(metadata) if metadata.is_dir() => destination.join(source_name.as_path()),
             Ok(_) => destination,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => destination,
+            // Missing and cyclic targets cannot designate a directory. Keep
+            // the operand as a replaceable leaf, not a resolved target path.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                destination
+            }
             Err(error) => return Err(error.into()),
         };
         let destination_name = leaf_name(&destination)?;
@@ -67,20 +74,25 @@ fn leaf_name(path: &Path) -> Result<RelativePath> {
 
 pub(super) async fn validate_effects(
     plan: &mut SyncPlan,
-    source_root: &Path,
+    source_authority: &crate::endpoint::source_root::SourceRoot,
     source: &RelativePath,
-    destination_root: &Path,
+    destination_endpoint: &crate::endpoint::local::LocalEndpoint,
     config: &SyncConfig,
 ) -> Result<()> {
-    let source = source_root.join(source.as_path());
-    let destination_root = destination_root.to_path_buf();
+    use crate::endpoint::Endpoint;
+    let source = source_authority.path().join(source.as_path());
+    let source_authority = source_authority.clone();
+    let destination_root = destination_endpoint.root().to_path_buf();
+    let destination_authority = destination_endpoint.acquired_rooted_fs().cloned();
     let backup_dir = super::local::backup_dir(config, &destination_root);
     let backup = config.backup.is_some();
     let suffix = config.suffix.clone();
     let unchanged_mutates = config.preserve.xattrs || config.preserve.acls || config.preserve.flags;
     plan.validate_operations(move |operation| {
         let source = source.clone();
+        let source_authority = source_authority.clone();
         let destination_root = destination_root.clone();
+        let destination_authority = destination_authority.clone();
         let backup_dir = backup_dir.clone();
         let suffix = suffix.clone();
         async move {
@@ -90,7 +102,14 @@ pub(super) async fn validate_effects(
                 return Ok(());
             }
             tokio::task::spawn_blocking(move || {
-                protect_source(&source, &destination_root.join(operation.path().as_path()))?;
+                source_authority
+                    .validate_blocking()
+                    .map_err(std::io::Error::other)?;
+                protect_source(
+                    &source,
+                    &destination_root.join(operation.path().as_path()),
+                    destination_authority.as_ref(),
+                )?;
                 let existing = match &operation {
                     SyncOp::Update { destination, .. }
                     | SyncOp::Replace { destination, .. }
@@ -105,8 +124,11 @@ pub(super) async fn validate_effects(
                         &suffix,
                     )
                     .map_err(std::io::Error::other)?;
-                    protect_source(&source, &path)?;
+                    protect_source(&source, &path, destination_authority.as_ref())?;
                 }
+                source_authority
+                    .validate_blocking()
+                    .map_err(std::io::Error::other)?;
                 Ok::<(), std::io::Error>(())
             })
             .await
@@ -118,7 +140,25 @@ pub(super) async fn validate_effects(
     .map_err(super::policy::map_controller_error)
 }
 
-fn protect_source(source: &Path, effect: &Path) -> std::io::Result<()> {
+fn protect_source(
+    source: &Path,
+    effect: &Path,
+    destination: Option<&crate::rooted_fs::RootedFs>,
+) -> std::io::Result<()> {
+    if let Some(rooted) = destination {
+        if let Ok(relative) = effect.strip_prefix(rooted.root_path()) {
+            let relative = RelativePath::new(relative).map_err(std::io::Error::other)?;
+            if rooted
+                .effect_aliases_local_source_blocking(&relative, source)
+                .map_err(std::io::Error::other)?
+            {
+                return Err(alias_error(source, effect));
+            }
+            return Ok(());
+        }
+    }
+    // Missing-root creation and explicitly external backups still have path
+    // effects. Existing in-root effects above use ONLY the held namespace.
     // Canonical parents catch aliases through directory symlinks. Comparing
     // inode observations also catches hardlinks with distinct physical names.
     let source_name = std::fs::canonicalize(parent(source))?.join(
@@ -150,13 +190,17 @@ fn protect_source(source: &Path, effect: &Path) -> std::io::Result<()> {
         .zip(std::fs::canonicalize(effect).ok())
         .is_some_and(|(source, effect)| source == effect);
     if source_name == effect_name || inode_alias || followed_alias {
-        return Err(std::io::Error::other(format!(
-            "planned destination effect {} aliases selected source {}",
-            effect.display(),
-            source.display()
-        )));
+        return Err(alias_error(source, effect));
     }
     Ok(())
+}
+
+fn alias_error(source: &Path, effect: &Path) -> std::io::Error {
+    std::io::Error::other(format!(
+        "planned destination effect {} aliases selected source {}",
+        effect.display(),
+        source.display()
+    ))
 }
 
 fn resolved_effect(path: &Path) -> std::io::Result<PathBuf> {

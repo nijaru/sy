@@ -1614,6 +1614,66 @@ impl RootedFs {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
+    /// Read-only local effect protection uses the held destination namespace,
+    /// including the leaf's target for conservative selected-source protection.
+    /// Following here only observes aliases; it never authorizes data access or
+    /// mutation outside the root. The caller retains source path continuity.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // libc device/inode integer types differ by platform.
+    pub(crate) fn effect_aliases_local_source_blocking(
+        &self,
+        relative: &RelativePath,
+        source: &Path,
+    ) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let (parent, leaf) = match self.open_parent_blocking(relative.as_path()) {
+            Ok(parent) => parent,
+            Err(RootedFsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        let source_entry = std::fs::symlink_metadata(source)?;
+        if stat_at_optional(parent.as_raw_fd(), &leaf)?.is_some_and(|stat| {
+            stat.st_dev as u64 == source_entry.dev() && stat.st_ino as u64 == source_entry.ino()
+        }) {
+            return Ok(true);
+        }
+        // Preserved symlink targets are opaque data. A missing or cyclic
+        // target has no resolved inode to compare; other lookup failures must
+        // still prevent an unproven alias decision.
+        let source_target = match std::fs::metadata(source) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(false)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match stat_at(parent.as_raw_fd(), &leaf, 0) {
+            Ok(stat) => Ok(stat.st_dev as u64 == source_target.dev()
+                && stat.st_ino as u64 == source_target.ino()),
+            Err(RootedFsError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn effect_aliases_local_source_blocking(
+        &self,
+        _relative: &RelativePath,
+        _source: &Path,
+    ) -> Result<bool> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     /// Validate one deferred hardlink source name against its exact scanned
     /// identity. The removal journal runs this for every published member
     /// before unlinking any of them, so a pre-deferred race preserves the whole
@@ -3250,17 +3310,18 @@ fn after_own_unlink(before: HardlinkSourceState, after: HardlinkSourceState) -> 
 
 #[cfg(unix)]
 fn stat_at_no_follow(parent: RawFd, component: &OsStr) -> Result<libc::stat> {
+    stat_at(parent, component, libc::AT_SYMLINK_NOFOLLOW)
+}
+
+#[cfg(unix)]
+fn stat_at(parent: RawFd, component: &OsStr, flags: libc::c_int) -> Result<libc::stat> {
     let component = component_cstring(component)?;
     let mut metadata = MaybeUninit::<libc::stat>::uninit();
     let result = unsafe {
         // SAFETY: `parent` is held, `component` is a live single component,
-        // and AT_SYMLINK_NOFOLLOW inspects the entry without following it.
-        libc::fstatat(
-            parent,
-            component.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
+        // and metadata is writable for one stat structure. Callers select
+        // no-follow inspection or read-only local alias observation explicitly.
+        libc::fstatat(parent, component.as_ptr(), metadata.as_mut_ptr(), flags)
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());

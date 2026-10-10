@@ -70,8 +70,12 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
     std::fs::rename(dest.path().join("file"), dest.path().join("old")).unwrap();
     std::fs::write(dest.path().join("file"), b"raced").unwrap();
     let controller = SyncController::new(
-        LocalSyncExecutor::new(authority, dest.path().to_path_buf(), scheduler())
-            .with_remove_source_files(true),
+        LocalSyncExecutor::new(
+            authority,
+            sy::endpoint::local::LocalEndpoint::new(dest.path().to_path_buf()),
+            scheduler(),
+        )
+        .with_remove_source_files(true),
         NonZeroUsize::new(2).unwrap(),
     );
     assert!(controller.execute(plan).await.is_err());
@@ -255,8 +259,12 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
         .await
         .unwrap();
     let entry = observed(authority.entries(ScanRequest::default())).await;
-    let executor = LocalSyncExecutor::new(authority.clone(), alias, scheduler())
-        .with_remove_source_files(true);
+    let executor = LocalSyncExecutor::new(
+        authority.clone(),
+        sy::endpoint::local::LocalEndpoint::new(alias),
+        scheduler(),
+    )
+    .with_remove_source_files(true);
     assert!(SyncPlanExecutor::remove_unchanged_source(
         &executor,
         &entry,
@@ -277,8 +285,12 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
             break entry;
         }
     };
-    let executor = LocalSyncExecutor::new(authority, destination.path().to_path_buf(), scheduler())
-        .with_remove_source_files(true);
+    let executor = LocalSyncExecutor::new(
+        authority,
+        sy::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
+        scheduler(),
+    )
+    .with_remove_source_files(true);
     SyncPlanExecutor::remove_unchanged_source(
         &executor,
         &source_entry,

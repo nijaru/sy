@@ -362,6 +362,7 @@ pub(crate) async fn remove_verified_source(
         // it is queued. Remote fingerprints perform this check on the peer;
         // neither case promises cross-endpoint atomic compare-and-swap.
         if let Some(destination) = local_destination {
+            destination.verify_root_path_blocking()?;
             if rooted.entry_binding_blocking(receipt.source_path())?
                 == destination.entry_binding_blocking(receipt.destination_path())?
             {
@@ -383,6 +384,7 @@ pub(crate) async fn remove_verified_source(
                     }
                     error => error.into(),
                 })?;
+            destination.verify_root_path_blocking()?;
         }
         remove_observed_source_blocking(&rooted, &source)
     })
@@ -400,7 +402,7 @@ pub(crate) async fn remove_observed_source(rooted: RootedFs, source: Entry) -> R
         .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
 }
 
-fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<()> {
+pub(crate) fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<()> {
     validate_path(rooted, source)?;
     let expected = source
         .identity

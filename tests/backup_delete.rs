@@ -53,7 +53,7 @@ async fn delete_with_backup(
             sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                 .await
                 .unwrap(),
-            destination.to_path_buf(),
+            sy::endpoint::local::LocalEndpoint::new(destination.to_path_buf()),
             scheduler,
         )
         .with_backup(true, None, "~".into());
@@ -307,7 +307,7 @@ async fn local_delete_cannot_follow_a_raced_ancestor_outside_the_root() {
             sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                 .await
                 .unwrap(),
-            root.path().to_path_buf(),
+            sy::endpoint::local::LocalEndpoint::new(root.path().to_path_buf()),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
         .with_backup(backup, None, "~".into());
