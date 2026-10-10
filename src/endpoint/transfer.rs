@@ -78,23 +78,25 @@ pub(crate) fn timestamp_to_system_time(timestamp: Timestamp) -> Option<std::time
     }
 }
 
-fn apply_requested_metadata(
-    metadata: &mut FileMetadata,
+fn requested_staged_metadata(
+    metadata: &FileMetadata,
     requested: Option<TransferMetadata>,
     source_path: &Path,
-) -> Result<()> {
+) -> Result<super::io::StagedMetadata> {
+    let mut staged = super::io::StagedMetadata::from(metadata);
     if let Some(transfer_metadata) = requested {
+        staged.modified = None;
         if let Some(modified) = transfer_metadata.modified {
-            metadata.modified = timestamp_to_system_time(modified).ok_or_else(|| {
+            staged.modified = Some(timestamp_to_system_time(modified).ok_or_else(|| {
                 SyncError::Config(format!(
                     "requested timestamp for {} is outside the supported range",
                     source_path.display()
                 ))
-            })?;
+            })?);
         }
         #[cfg(unix)]
         if let Some(mode) = transfer_metadata.unix_mode {
-            metadata.mode = mode;
+            staged.unix_mode = Some(mode);
         }
         #[cfg(not(unix))]
         if transfer_metadata.unix_mode.is_some() {
@@ -103,14 +105,13 @@ fn apply_requested_metadata(
             ));
         }
     }
-    Ok(())
+    Ok(staged)
 }
 
 async fn generic_source_metadata(
     source: &dyn Endpoint,
     source_path: &Path,
     follow_symlinks: bool,
-    requested: Option<TransferMetadata>,
 ) -> Result<FileMetadata> {
     let mut metadata = source.metadata(source_path).await?;
     if follow_symlinks && metadata.is_symlink {
@@ -124,7 +125,6 @@ async fn generic_source_metadata(
             source_path.display()
         )));
     }
-    apply_requested_metadata(&mut metadata, requested, source_path)?;
     Ok(metadata)
 }
 
@@ -211,6 +211,7 @@ struct NativeTransferResult {
 
 struct NativeStagedCopyPolicy {
     metadata: FileMetadata,
+    staged_metadata: super::io::StagedMetadata,
     expected_destination: ExpectedDestination,
     verify: bool,
     checks: CommitChecks,
@@ -221,6 +222,7 @@ struct NativeStagedCopyPolicy {
 struct NativeReflinkPatchPolicy {
     source_path: PathBuf,
     metadata: FileMetadata,
+    staged_metadata: super::io::StagedMetadata,
     expected_destination: ExpectedDestination,
     verify: bool,
     checks: CommitChecks,
@@ -640,9 +642,7 @@ where
     };
     let metadata = if let Some(file) = source_file.as_ref() {
         verify_open_source_identity(file, checks.expected_source_identity(), source_path)?;
-        let mut metadata = file_metadata_from_open_file(file)?;
-        apply_requested_metadata(&mut metadata, options.metadata, source_path)?;
-        metadata
+        file_metadata_from_open_file(file)?
     } else {
         if source_native.is_some() || checks.expected_source_identity().is_some() {
             return Err(SyncError::Config(format!(
@@ -652,14 +652,9 @@ where
         }
         // Generic endpoints may stream under the caller's explicit Unverified
         // contract; never downgrade a requested native identity guarantee.
-        generic_source_metadata(
-            source,
-            source_path,
-            options.follow_symlinks,
-            options.metadata,
-        )
-        .await?
+        generic_source_metadata(source, source_path, options.follow_symlinks).await?
     };
+    let staged_metadata = requested_staged_metadata(&metadata, options.metadata, source_path)?;
     let mut preservation = options.preservation;
     if preservation_requested {
         let Some(file) = source_file.as_ref() else {
@@ -719,6 +714,7 @@ where
                     dest_path,
                     NativeStagedCopyPolicy {
                         metadata: metadata.clone(),
+                        staged_metadata,
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
@@ -756,6 +752,7 @@ where
                     NativeReflinkPatchPolicy {
                         source_path: source_path.to_path_buf(),
                         metadata: metadata.clone(),
+                        staged_metadata,
                         expected_destination,
                         verify: options.verify,
                         checks: checks.clone(),
@@ -783,6 +780,7 @@ where
                 dest_path,
                 NativeStagedCopyPolicy {
                     metadata,
+                    staged_metadata,
                     expected_destination,
                     verify: options.verify,
                     checks,
@@ -835,6 +833,7 @@ where
             dest_path,
             &StreamCopyPolicy {
                 metadata: &metadata,
+                staged_metadata: &staged_metadata,
                 verify: options.verify,
                 expected_destination,
                 rate_limiter: options.rate_limiter.as_ref(),
@@ -907,7 +906,7 @@ async fn native_whole_staged_copy(
     );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
-        &policy.metadata,
+        &policy.staged_metadata,
         &policy.preservation,
         expected_hash,
         Some(pre_commit),
@@ -933,6 +932,7 @@ async fn reflink_patch(
     let NativeReflinkPatchPolicy {
         source_path,
         metadata,
+        staged_metadata,
         expected_destination,
         verify,
         checks,
@@ -1036,7 +1036,7 @@ async fn reflink_patch(
     );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
-        &metadata,
+        &staged_metadata,
         &preservation,
         expected_hash,
         Some(pre_commit),
@@ -1136,7 +1136,7 @@ async fn native_sparse_staged_copy(
     );
     let (verification, publication) = crate::endpoint::io::finalize_staged_writer(
         writer,
-        &policy.metadata,
+        &policy.staged_metadata,
         &policy.preservation,
         expected_hash,
         Some(pre_commit),

@@ -1309,7 +1309,7 @@ fn lower_create(
             })?;
             let metadata = LocalTransferMetadata {
                 unix_mode: Some(mode),
-                modified: Some(source.modified),
+                modified: policy.preserve_times.then_some(source.modified),
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
@@ -1346,7 +1346,7 @@ fn lower_update(
             })?;
             let metadata = LocalTransferMetadata {
                 unix_mode: Some(mode),
-                modified: Some(source.modified),
+                modified: policy.preserve_times.then_some(source.modified),
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,
@@ -1383,7 +1383,7 @@ fn lower_replace(
             })?;
             let metadata = LocalTransferMetadata {
                 unix_mode: Some(mode),
-                modified: Some(source.modified),
+                modified: policy.preserve_times.then_some(source.modified),
             };
             Ok(Some(file_work(LocalSyncAction::TransferFile {
                 source,

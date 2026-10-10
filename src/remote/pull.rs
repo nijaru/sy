@@ -14,7 +14,7 @@
 
 use crate::endpoint::io::{ExpectedDestination, VerificationStatus};
 use crate::endpoint::local::LocalEndpoint;
-use crate::endpoint::{Endpoint, FileMetadata};
+use crate::endpoint::Endpoint;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
@@ -596,7 +596,7 @@ impl RemotePullExecutor {
         crate::rooted_fs::PublishedFileProof,
     )> {
         let dest = self.dest_path(&source.path);
-        let staged_metadata = staged_file_metadata(source, metadata, &dest)?;
+        let staged_metadata = staged_file_metadata(metadata, &dest)?;
         let endpoint = LocalEndpoint::new(self.destination_root.clone())
             .with_rooted_authority(self.metadata_authority().await?.clone())
             .with_publication_admission(self.sender.publication_admission());
@@ -917,49 +917,40 @@ impl RemotePullExecutor {
 
 #[cfg(unix)]
 fn staged_file_metadata(
-    source: &Entry,
     metadata: &PullTransferMetadata,
     destination: &Path,
-) -> Result<FileMetadata> {
+) -> Result<crate::endpoint::io::StagedMetadata> {
     let mode = metadata
         .unix_mode
         .ok_or_else(|| RemotePullError::MissingScannedMode(destination.to_path_buf()))?;
-    // Without --times the committed file keeps its natural creation time
-    // (rsync semantics: no -t means the destination mtime is "now"); with
-    // --times it carries the source's scanned mtime.
+    // Without --times leave the staged file's native write time untouched;
+    // do not replace it with a clock sample taken before fetching bytes.
     let modified = metadata
         .modified
-        .map(system_time_from_timestamp)
-        .unwrap_or_else(std::time::SystemTime::now);
-    Ok(FileMetadata {
-        size: source.size,
+        .map(|value| {
+            crate::endpoint::transfer::timestamp_to_system_time(value).ok_or_else(|| {
+                RemotePullError::LocalMutation(
+                    destination.to_path_buf(),
+                    std::io::Error::other("requested timestamp outside supported range"),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(crate::endpoint::io::StagedMetadata {
         modified,
-        is_dir: false,
-        is_symlink: false,
-        mode,
+        unix_mode: Some(mode),
     })
 }
 
 #[cfg(not(unix))]
 fn staged_file_metadata(
-    _source: &Entry,
     _metadata: &PullTransferMetadata,
     destination: &Path,
-) -> Result<FileMetadata> {
+) -> Result<crate::endpoint::io::StagedMetadata> {
     Err(RemotePullError::LocalMutation(
         destination.to_path_buf(),
         std::io::Error::other("staged metadata is unix-only in the v3 pull"),
     ))
-}
-
-fn system_time_from_timestamp(timestamp: Timestamp) -> std::time::SystemTime {
-    if timestamp.seconds() >= 0 {
-        std::time::SystemTime::UNIX_EPOCH
-            + std::time::Duration::new(timestamp.seconds() as u64, timestamp.nanoseconds())
-    } else {
-        std::time::SystemTime::UNIX_EPOCH
-            - std::time::Duration::new((-(timestamp.seconds() as i128)) as u64, 0)
-    }
 }
 
 impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {

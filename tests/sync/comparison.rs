@@ -139,9 +139,10 @@ fn test_default_uses_mtime_and_size() {
 
     fs::write(source.path().join("file.txt"), "content").unwrap();
 
-    // Initial sync
+    // Establish equal timestamps explicitly; bare copies no longer preserve
+    // source times as an accidental local-only default.
     let output = Command::new(sy_bin())
-        .args(sync_args(&source, &dest, &[]))
+        .args(sync_args(&source, &dest, &["-t"]))
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -681,12 +682,13 @@ fn test_nanosecond_mtime_preserved() {
             src_nanos
         );
 
-        // Sync
+        // Request timestamp preservation, including fractional seconds.
         let output = Command::new(sy_bin())
             .args([
                 &format!("{}/", source.path().display()),
                 dest.path().to_str().unwrap(),
                 "--exclude-vcs",
+                "-t",
             ])
             .output()
             .unwrap();

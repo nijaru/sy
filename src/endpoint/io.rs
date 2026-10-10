@@ -90,12 +90,37 @@ pub(crate) fn verify_staged_mode(_path: &Path, _expected_mode: Option<u32>) -> R
     Ok(())
 }
 
-impl FileMetadata {
-    /// The mode this platform preserves, when it records one.
+/// Requested effects on private staging, separate from source observations.
+/// An absent timestamp leaves the native write time untouched.
+#[derive(Debug, Clone, Copy)]
+pub struct StagedMetadata {
+    pub modified: Option<std::time::SystemTime>,
+    pub unix_mode: Option<u32>,
+}
+
+impl From<&FileMetadata> for StagedMetadata {
+    fn from(metadata: &FileMetadata) -> Self {
+        Self {
+            modified: Some(metadata.modified),
+            unix_mode: {
+                #[cfg(unix)]
+                {
+                    Some(metadata.mode)
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl StagedMetadata {
     pub const fn preserved_mode(&self) -> Option<u32> {
         #[cfg(unix)]
         {
-            Some(self.mode)
+            self.unix_mode
         }
         #[cfg(not(unix))]
         {
@@ -116,7 +141,7 @@ impl FileMetadata {
 #[async_trait]
 pub trait StagedWriter: Send {
     async fn write(&mut self, data: &[u8]) -> Result<()>;
-    async fn set_metadata(&mut self, metadata: &FileMetadata) -> Result<()>;
+    async fn set_metadata(&mut self, metadata: &StagedMetadata) -> Result<()>;
 
     /// Apply the preservation payload (xattrs/ACLs) to private staging state
     /// before commit, then prove the effective mode still matches `metadata`.
@@ -248,7 +273,7 @@ pub(crate) type PreCommit = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>
 
 pub(crate) async fn finalize_staged_writer(
     mut writer: Box<dyn StagedWriter>,
-    metadata: &FileMetadata,
+    metadata: &StagedMetadata,
     preservation: &Preservation,
     expected_hash: Option<blake3::Hash>,
     pre_commit: Option<PreCommit>,
@@ -316,9 +341,11 @@ pub struct StreamCopyResult {
 
 /// Inputs for one bounded streaming copy.
 pub struct StreamCopyPolicy<'a> {
-    /// Metadata observed for the selected source object (including a followed
-    /// symlink target) and requested transfer overrides.
+    /// Original metadata observed for the selected source object, including a
+    /// followed symlink target. Size controls bounded copying, not preservation.
     pub metadata: &'a FileMetadata,
+    /// Selected effects on staging; absence is not a source-metadata fallback.
+    pub staged_metadata: &'a StagedMetadata,
     pub flags: Option<u32>,
     /// Hash bytes as they flow and verify the staged result before commit.
     pub verify: bool,
@@ -424,7 +451,7 @@ pub(crate) async fn copy_file_streaming_from_reader(
     let expected_hash = hasher.map(|hasher| hasher.finalize());
     let (verification, publication) = finalize_staged_writer(
         writer,
-        metadata,
+        policy.staged_metadata,
         policy.preservation,
         expected_hash,
         policy.pre_commit.clone(),
@@ -496,6 +523,7 @@ mod tests {
                 Path::new("file"),
                 &StreamCopyPolicy {
                     metadata: &metadata,
+                    staged_metadata: &StagedMetadata::from(&metadata),
                     flags: None,
                     verify: false,
                     expected_destination: ExpectedDestination::SnapshotAtOpen,
@@ -545,7 +573,7 @@ mod tests {
 
         let error = finalize_staged_writer(
             writer,
-            &metadata,
+            &StagedMetadata::from(&metadata),
             &preservation,
             Some(blake3::hash(b"bytes")),
             Some(pre_commit),
