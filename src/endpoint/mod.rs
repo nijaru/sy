@@ -82,6 +82,10 @@ pub struct FileMetadata {
 }
 
 #[async_trait]
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait adds #[must_use] to methods returning already-must-use boxed futures"
+)]
 #[allow(dead_code)] // Wired in by Phase 3 (SyncSession)
 pub trait Endpoint: Send + Sync {
     fn endpoint_type(&self) -> EndpointType;
