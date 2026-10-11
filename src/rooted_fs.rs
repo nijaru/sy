@@ -992,8 +992,15 @@ impl RootedNamespaceTransaction {
     fn finish_commit_blocking(&mut self, lineage: &mut RetirementLineage) -> Result<()> {
         let mut staged_link_removed = false;
         let mut cleanup = || -> Result<()> {
-            if let Some(stat) = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?
-            {
+            let named = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
+            // A missing OLD binding is not proof of completed retirement:
+            // a foreign rename may have retained the original inode elsewhere.
+            if named.is_none() && self.retired_destination.is_some() {
+                return Err(RootedFsError::DestinationChanged(
+                    self.destination_path.clone(),
+                ));
+            }
+            if let Some(stat) = named {
                 // Only the old entry itself is authorized. New descendants are
                 // retained inside private staging if rmdir refuses them.
                 if let Some(observation) = self.retired_destination.as_ref() {

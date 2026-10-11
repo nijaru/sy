@@ -410,6 +410,33 @@ fn exchanged_old_cleanup_requires_ownership_for_directories_and_single_link_file
 }
 
 #[test]
+fn displaced_exchange_retirement_cannot_report_complete_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("target")).unwrap();
+    let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
+    let mut staged = rooted
+        .begin_staged_file_blocking(&relative("target"))
+        .unwrap();
+    staged.file_mut().write_all(b"new").unwrap();
+    let private = root.path().join(&staged.namespace.staging_dir_name);
+    staged.namespace.seal_staging().unwrap();
+    let mut lineage = rooted.retirement.lock().unwrap();
+    let _permits = staged
+        .namespace
+        .publish_blocking(None, None, &mut lineage, || Ok(()))
+        .unwrap();
+    std::fs::rename(private.join("contents"), root.path().join("retained-old")).unwrap();
+    assert!(matches!(
+        staged.namespace.finish_commit_blocking(&mut lineage),
+        Err(RootedFsError::CommittedCleanupPending { .. })
+    ));
+    drop(staged);
+    assert_eq!(std::fs::read(root.path().join("target")).unwrap(), b"new");
+    assert!(root.path().join("retained-old").is_dir());
+    assert!(private.is_dir());
+}
+
+#[test]
 fn abort_cleanup_tolerates_missing_contents_but_never_recurses_owned_directory() {
     let root = tempfile::tempdir().unwrap();
     let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
