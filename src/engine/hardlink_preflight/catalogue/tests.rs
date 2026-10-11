@@ -3,7 +3,6 @@ use crate::engine::domain::{
     ContentComparison, Entry, EntryIdentity, RelativePath, SkipReason, SyncOp, Timestamp,
 };
 use crate::engine::plan_journal::{PlanJournal, PlanRecord};
-use crate::engine::scheduler::Scheduler;
 
 fn source(name: &str, group: u8) -> Entry {
     let mut source = Entry::file(RelativePath::new(name).unwrap(), 6, Timestamp::UNIX_EPOCH);
@@ -23,18 +22,13 @@ fn create(name: &str, group: u8) -> SyncOp {
 async fn build(operations: &[SyncOp]) -> (HardlinkCatalogue, PlanJournalReader) {
     let mut journal = PlanJournal::new().await.unwrap();
     let mut commitments = HardlinkCommitments::default();
-    let scheduler = Scheduler::new(Default::default()).unwrap();
     for operation in operations {
         let position = journal.append(operation).await.unwrap();
         commitments
-            .check(
-                PlanRecord {
-                    position,
-                    operation: operation.clone(),
-                },
-                &scheduler,
-                &mut |_| std::future::ready(Ok::<_, HardlinkPreflightError>([7; 32])),
-            )
+            .collect(PlanRecord {
+                position,
+                operation: operation.clone(),
+            })
             .await
             .unwrap();
     }
@@ -142,9 +136,21 @@ async fn corrupt_membership_or_valid_looking_baseline_change_permanently_poison_
                         MEMBER_BYTES + 40,
                         0_u64.to_le_bytes().to_vec(),
                     ),
-                    // Digest bytes with a valid flag/header remain parseable: the
-                    // immutable aggregate seal must still reject their replacement.
-                    "baseline" => (&mut disk.file, 5, vec![42; 32]),
+                    // A valid-looking original operation substitution must
+                    // still fail its plan binding and immutable aggregate seal.
+                    "baseline" => {
+                        let mut replacement = source("a", 1);
+                        replacement.size = 7;
+                        let operation = SyncOp::Create {
+                            destination_path: replacement.path.clone(),
+                            source: replacement,
+                        };
+                        (
+                            &mut disk.file,
+                            GROUP_HEADER_BYTES,
+                            crate::engine::plan_journal::encode_operation(&operation)?,
+                        )
+                    }
                     "truncation" => {
                         disk.members.set_len(disk.member_end - 1)?;
                         return Ok(None);
@@ -181,73 +187,43 @@ async fn corrupt_membership_or_valid_looking_baseline_change_permanently_poison_
 }
 
 #[tokio::test]
-async fn failed_or_cancelled_byte_check_cannot_seal_partial_membership() {
-    for cancel in [false, true] {
-        let scheduler = Scheduler::new(Default::default()).unwrap();
-        let mut journal = PlanJournal::new().await.unwrap();
-        let mut commitments = HardlinkCommitments::default();
-        let first = create("a", 1);
-        let position = journal.append(&first).await.unwrap();
-        commitments
-            .check::<_, _, HardlinkPreflightError>(
-                PlanRecord {
-                    position,
-                    operation: first,
-                },
-                &scheduler,
-                &mut |_| async { panic!("one source commitment needs no bytes") },
-            )
-            .await
-            .unwrap();
-        let source = source("b", 1);
-        let mut destination = source.clone();
-        destination.identity = Some(EntryIdentity::from_bytes([9; 32]));
-        let second = SyncOp::Metadata {
-            source,
-            destination,
-        };
-        let position = journal.append(&second).await.unwrap();
-        if cancel {
-            let (entered, mut receiving) = tokio::sync::mpsc::channel(1);
-            let mut hash = move |_| {
-                let entered = entered.clone();
-                async move {
-                    entered.send(()).await.unwrap();
-                    std::future::pending::<Result<[u8; 32]>>().await
-                }
-            };
-            {
-                let checking = commitments.check(
-                    PlanRecord {
-                        position,
-                        operation: second,
-                    },
-                    &scheduler,
-                    &mut hash,
-                );
-                tokio::pin!(checking);
-                tokio::select! {
-                    result = &mut checking => panic!("check unexpectedly completed: {result:?}"),
-                    _ = receiving.recv() => {},
-                }
-            }
-        } else {
-            let result = commitments
-                .check(
-                    PlanRecord {
-                        position,
-                        operation: second,
-                    },
-                    &scheduler,
-                    &mut |_| async {
-                        Err::<[u8; 32], _>(HardlinkPreflightError::Io(std::io::Error::other(
-                            "fingerprint failed",
-                        )))
-                    },
-                )
-                .await;
-            assert!(result.is_err());
-        }
-        assert!(commitments.seal().await.is_err());
+async fn cancelled_collection_cannot_retry_or_seal_partial_membership() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let mut journal = PlanJournal::new().await.unwrap();
+    let mut commitments = HardlinkCommitments::default();
+    let first = create("a", 1);
+    let position = journal.append(&first).await.unwrap();
+    commitments
+        .collect(PlanRecord {
+            position,
+            operation: first,
+        })
+        .await
+        .unwrap();
+    let operation = create("b", 1);
+    let position = journal.append(&operation).await.unwrap();
+    // Hold the scratch lock so cancellation lands at actual blocking I/O,
+    // rather than introducing a production hook or a mocked hash future.
+    let disk = Arc::clone(&commitments.disk);
+    let guard = disk.lock().unwrap();
+    {
+        let collecting = commitments.collect(PlanRecord {
+            position,
+            operation,
+        });
+        tokio::pin!(collecting);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(collecting.as_mut().poll(&mut context).is_pending());
     }
+    drop(guard);
+    assert!(commitments
+        .collect(PlanRecord {
+            position,
+            operation: create("b", 1)
+        })
+        .await
+        .is_err());
+    assert!(commitments.seal().await.is_err());
 }

@@ -17,7 +17,6 @@ use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::Endpoint;
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
-use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
@@ -34,14 +33,26 @@ use std::sync::Arc;
 /// scheduler byte budget is direction-symmetric.
 pub const REMOTE_FETCH_WORKING_SET: u64 = 8 * 1024 * 1024;
 
+mod group;
+
+#[cfg(all(test, unix))]
+#[path = "pull/group_tests.rs"]
+mod group_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePullError {
     #[error("scanned destination address does not match transfer target {0}")]
     DestinationAddressMismatch(RelativePath),
     #[error("distinct directory addresses require subtree finalization support at {0}")]
     DirectoryAddressUnsupported(RelativePath),
-    #[error("hardlink bookkeeping failed: {0}")]
-    HardlinkState(#[from] std::io::Error),
+    #[error(transparent)]
+    Group(#[from] group::PullGroupError),
+    #[error("pull group at {path} may be published, but source completion is uncertain: {source}")]
+    SourceCompletionUncertain {
+        path: PathBuf,
+        #[source]
+        source: Box<RemotePullError>,
+    },
     #[error(transparent)]
     Remote(#[from] RemoteSessionError),
 
@@ -182,11 +193,8 @@ pub struct RemotePullExecutor {
     /// capability is checked before the first request, mirroring the push
     /// side's transfer_file_with_policy contract.
     compression: Option<CompressionPolicy>,
-    /// -H/--preserve-hardlinks: group -> first committed destination path.
-    /// The mutex is held across a grouped fetch so members serialize
-    /// (ungrouped files stay concurrent), mirroring the push executor.
+    /// Sealed catalogue groups execute once through the shared controller.
     hardlinks: bool,
-    hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
     /// -X/--preserve-xattrs: mirror the remote source's extended attributes
     /// onto the local destination for every entry this executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -222,7 +230,6 @@ impl RemotePullExecutor {
             rate_limiter: None,
             compression: None,
             hardlinks: false,
-            hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -432,6 +439,19 @@ impl RemotePullExecutor {
         item: WorkItem<RemotePullAction>,
     ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
+        if self.hardlinks
+            && matches!(
+                &action,
+                RemotePullAction::FetchFile { source, .. }
+                    | RemotePullAction::ApplyMetadata { source, .. }
+                    if source.hardlink_group.is_some()
+            )
+        {
+            return Err(crate::engine::hardlink_runtime::GroupError::Invalid(
+                "hardlink members require sealed whole-group execution",
+            )
+            .into());
+        }
         if let RemotePullAction::FetchFile {
             destination_path,
             destination: Some(observed),
@@ -490,23 +510,6 @@ impl RemotePullExecutor {
                 destination,
                 metadata,
             } => {
-                // -H: members after the first link to the representative
-                // instead of fetching the same bytes again.
-                if self.hardlinks {
-                    if let Some(identity) = source.hardlink_group {
-                        let group = *identity.as_bytes();
-                        return self
-                            .execute_grouped_fetch(
-                                source,
-                                destination_path,
-                                destination,
-                                metadata,
-                                group,
-                            )
-                            .await
-                            .map(crate::engine::work::WorkResult::Transfer);
-                    }
-                }
                 let is_update = destination.is_some();
                 let expected_destination = destination_expectation(destination.as_ref())?;
                 self.validate_file_fetch_options()?;
@@ -620,109 +623,6 @@ impl RemotePullExecutor {
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
-    }
-
-    /// One grouped fetch under `-H`: fetch the representative or link
-    /// subsequent members to it locally. Group membership is scan-time, so
-    /// linking members validate their own scanned identity through a rooted
-    /// fingerprint request before publication. The group mutex serializes members.
-    async fn execute_grouped_fetch(
-        &self,
-        source: Entry,
-        destination_path: RelativePath,
-        destination: Option<Entry>,
-        metadata: PullTransferMetadata,
-        group: [u8; 32],
-    ) -> Result<crate::engine::work::TransferSummary> {
-        let expected_destination = destination_expectation(destination.as_ref())?;
-        let groups = self.hardlink_groups.lock().await;
-        if let Some(first) = groups.get(group).await? {
-            first.validate_metadata(metadata.unix_mode, metadata.modified)?;
-            // Bind the linking member to its own scanned observation. A group
-            // key alone says which inode was scanned, not that it is unchanged.
-            self.remote
-                .existing_fingerprint(
-                    &source,
-                    crate::endpoint::existing::FingerprintOptions::default(),
-                )
-                .await
-                .map_err(RemoteSessionError::from)?;
-            let is_update = destination.is_some();
-
-            self.backup_replacement(destination.as_ref()).await?;
-
-            let rooted = self.metadata_authority().await?.clone();
-            let path = destination_path.clone();
-            let publication = tokio::task::spawn_blocking(move || {
-                rooted.verify_root_path_blocking()?;
-                let publication = rooted.publish_hardlink_blocking(
-                    &first.path,
-                    &path,
-                    first.publication,
-                    rooted_destination_expectation(expected_destination),
-                )?;
-                crate::endpoint::local::verify_committed_root(
-                    &rooted,
-                    &rooted.root_path().join(path.as_path()),
-                )?;
-                Ok::<_, RemotePullError>(publication)
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-            groups.advance(group, publication.identity).await?;
-            let op = if is_update {
-                crate::sync::output::ItemizeOp::Update
-            } else {
-                crate::sync::output::ItemizeOp::Create
-            };
-            self.report(
-                op,
-                crate::sync::output::ItemizeKind::File,
-                &destination_path,
-            );
-            return Ok(crate::engine::work::TransferSummary {
-                file_size: source.size,
-                digest: [0_u8; 32],
-                literal_bytes: 0,
-                reused_bytes: source.size,
-            });
-        }
-        let is_update = destination.is_some();
-        self.validate_file_fetch_options()?;
-        let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        self.backup_replacement(destination.as_ref()).await?;
-        let (summary, publication) = self
-            .fetch_into_staging(
-                &source,
-                &destination_path,
-                expected_destination,
-                &metadata,
-                bsd_flags,
-            )
-            .await?;
-        groups
-            .insert(
-                group,
-                HardlinkRepresentative {
-                    path: destination_path.clone(),
-                    publication: publication.identity,
-                    unix_mode: metadata.unix_mode,
-                    modified: metadata.modified,
-                },
-            )
-            .await?;
-        drop(groups);
-        let op = if is_update {
-            crate::sync::output::ItemizeOp::Update
-        } else {
-            crate::sync::output::ItemizeOp::Create
-        };
-        self.report(
-            op,
-            crate::sync::output::ItemizeKind::File,
-            &destination_path,
-        );
-        Ok(summary)
     }
 
     /// Fetch one source file into endpoint staging and commit atomically.
@@ -1145,6 +1045,19 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
         crate::remote::pull_lower::lower_pull_op(op, policy)
     }
 
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        self.hardlinks
+    }
+
+    async fn execute_hardlink_group(
+        &self,
+        group: &mut crate::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        policy: crate::engine::planner::ExecutionPolicy,
+    ) -> Result<Option<()>> {
+        self.execute_whole_group(group, policy).await?;
+        Ok(Some(()))
+    }
+
     fn is_directory_action(&self, action: &RemotePullAction) -> bool {
         matches!(action, RemotePullAction::CreateDirectory { .. })
     }
@@ -1201,140 +1114,6 @@ mod root_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn hardlink_pull_revalidates_members_and_keeps_one_metadata_owner() {
-        use crate::engine::controller::SyncPlanExecutor;
-        use crate::engine::domain::SyncOp;
-        use crate::engine::planner::ExecutionPolicy;
-        use crate::engine::scheduler::ResourceBudget;
-        use crate::protocol::Operation;
-        use crate::remote::router::RouterConfig;
-        use crate::remote::runtime::ClientRemoteSession;
-        use futures::TryStreamExt;
-        use std::os::unix::fs::MetadataExt;
-
-        for race in [None, Some("source"), Some("metadata")] {
-            let source_root = tempfile::tempdir().unwrap();
-            let dest_root = tempfile::tempdir().unwrap();
-            std::fs::write(source_root.path().join("a"), b"new").unwrap();
-            std::fs::hard_link(source_root.path().join("a"), source_root.path().join("b")).unwrap();
-            std::fs::write(dest_root.path().join("b"), b"old").unwrap();
-            let mut request = crate::engine::scan::ScanRequest::default();
-            request.metadata.hardlink_group = true;
-            request.metadata.unix_mode = true;
-            let entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
-                source_root.path().to_path_buf(),
-                request,
-            )
-            .try_collect()
-            .await
-            .unwrap();
-            let destination = crate::endpoint::local_entry_scan::local_entry_stream(
-                dest_root.path().to_path_buf(),
-                request,
-            )
-            .try_next()
-            .await
-            .unwrap()
-            .unwrap();
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let (client_reader, client_writer) = tokio::io::split(client_io);
-            let (server_reader, server_writer) = tokio::io::split(server_io);
-            let server = tokio::spawn(crate::remote::serve::serve_transport(
-                server_reader,
-                server_writer,
-                RouterConfig::default(),
-            ));
-            let client = ClientRemoteSession::connect(
-                client_reader,
-                client_writer,
-                Operation::Pull,
-                source_root.path(),
-                RouterConfig::default(),
-            )
-            .await
-            .unwrap();
-            let executor = RemotePullExecutor::new(
-                dest_root.path().to_path_buf(),
-                client.request_handle(),
-                client.sender(),
-                Scheduler::new(ResourceBudget::default()).unwrap(),
-            )
-            .with_hardlinks(true);
-            let first = crate::remote::pull_lower::lower_pull_op(
-                SyncOp::Create {
-                    destination_path: entries[0].clone().path.clone(),
-                    source: entries[0].clone(),
-                },
-                ExecutionPolicy::default(),
-            )
-            .unwrap()
-            .unwrap();
-            SyncPlanExecutor::execute(&executor, first).await.unwrap();
-            let mode = std::fs::metadata(dest_root.path().join("a"))
-                .unwrap()
-                .mode();
-            if race == Some("source") {
-                std::fs::write(source_root.path().join("b"), b"bad").unwrap();
-            }
-            let work = crate::remote::pull_lower::lower_pull_op(
-                SyncOp::Update {
-                    source: entries[1].clone(),
-                    destination,
-                },
-                ExecutionPolicy::default(),
-            )
-            .unwrap()
-            .unwrap();
-            let (mut action, resources) = work.into_parts();
-            if race == Some("metadata") {
-                let RemotePullAction::FetchFile { metadata, .. } = &mut action else {
-                    panic!("expected file fetch")
-                };
-                metadata.unix_mode = Some(0o600);
-                // Ensure a real conflict regardless of the process umask.
-                if mode & 0o7777 == 0o600 {
-                    metadata.unix_mode = Some(0o644);
-                }
-            }
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                SyncPlanExecutor::execute(&executor, WorkItem::new(action, resources)),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                std::fs::metadata(dest_root.path().join("a"))
-                    .unwrap()
-                    .mode(),
-                mode
-            );
-            assert_eq!(std::fs::read(dest_root.path().join("a")).unwrap(), b"new");
-            if race.is_some() {
-                assert!(result.is_err());
-                assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), b"old");
-            } else {
-                let crate::engine::work::WorkResult::Transfer(transfer) = result.unwrap() else {
-                    panic!("expected transfer receipt")
-                };
-                assert_eq!(transfer.reused_bytes, 3);
-                assert_eq!(
-                    std::fs::metadata(dest_root.path().join("a")).unwrap().ino(),
-                    std::fs::metadata(dest_root.path().join("b")).unwrap().ino()
-                );
-            }
-            assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 2);
-            drop(executor);
-            drop(client);
-            let served = tokio::time::timeout(std::time::Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(served.is_err(), race == Some("source"));
-        }
-    }
 
     #[cfg(unix)]
     #[tokio::test]

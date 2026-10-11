@@ -1,12 +1,13 @@
-//! Complete selected membership, kept alongside the byte-commitment baseline.
+//! Complete selected membership bound to original sealed plan records.
 use super::{
-    invalid, ByteCommitment, CommitmentDisk, HardlinkCommitments, HardlinkPreflightError, Result,
+    invalid, selected_member, HardlinkCommitments, HardlinkPreflightError, MembershipDisk, Result,
 };
 use crate::engine::plan_journal::{PlanJournalReader, PlanRecordPosition};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-pub(super) const GROUP_HEADER_BYTES: u64 = 61;
+// Payload length and the head/tail/count of the ordered member chain.
+pub(super) const GROUP_HEADER_BYTES: u64 = 28;
 const MEMBER_BYTES: u64 = 92;
 const NO_MEMBER: u64 = u64::MAX;
 
@@ -33,7 +34,7 @@ impl Default for Membership {
 /// Immutable membership of a successfully checked plan. The mutex only owns
 /// scratch seek cursors, never endpoint data or a live group inode owner.
 pub(crate) struct HardlinkCatalogue {
-    disk: Arc<Mutex<Option<CommitmentDisk>>>,
+    disk: Arc<Mutex<Option<MembershipDisk>>>,
     groups: u64,
     members: u64,
     group_end: u64,
@@ -51,7 +52,7 @@ impl HardlinkCommitments {
             let disk = self
                 .disk
                 .lock()
-                .map_err(|_| invalid("hardlink commitment lock poisoned"))?;
+                .map_err(|_| invalid("hardlink membership lock poisoned"))?;
             disk.is_none()
         };
         let (groups, members, group_end, member_end, digest) = if empty {
@@ -116,7 +117,7 @@ impl HardlinkCatalogue {
 
     async fn with_disk<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&mut CommitmentDisk) -> Result<T> + Send + 'static,
+        operation: impl FnOnce(&mut MembershipDisk) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let disk = Arc::clone(&self.disk);
         let (group_end, member_end) = (self.group_end, self.member_end);
@@ -199,7 +200,7 @@ impl HardlinkCatalogue {
                     )
                     .into());
                 }
-                if ByteCommitment::from_operation(&operation).is_none()
+                if !selected_member(&operation)
                     || operation.source().hardlink_group
                         != baseline.operation.source().hardlink_group
                     || operation.source().identity != baseline.operation.source().identity
@@ -281,7 +282,7 @@ fn catalogue_hasher(groups: u64, members: u64) -> blake3::Hasher {
     seal
 }
 
-impl CommitmentDisk {
+impl MembershipDisk {
     fn catalogue_digest(&mut self) -> Result<[u8; 32]> {
         let mut seal = catalogue_hasher(self.group_count, self.member_count);
         let mut group_offset = 0;
@@ -376,7 +377,7 @@ impl CommitmentDisk {
         } else {
             baseline.membership.head
         };
-        self.file.seek(SeekFrom::Start(group_offset + 37))?;
+        self.file.seek(SeekFrom::Start(group_offset + 4))?;
         self.file.write_all(&head.to_le_bytes())?;
         self.file.write_all(&offset.to_le_bytes())?;
         self.file.write_all(&count.to_le_bytes())?;

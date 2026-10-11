@@ -34,7 +34,7 @@ pub enum ScopeError {
     Operand(#[from] crate::remote::RemoteError),
 }
 
-pub(super) fn authorize(
+pub(crate) fn authorize(
     resolved: &ResolvedOperand,
     frame: &Frame,
     peer: PlatformOs,
@@ -73,6 +73,8 @@ pub(super) fn authorize(
         FrameKind::SignatureRequest => WireSignatureRequest::decode(payload)?.path,
         FrameKind::FileFetchRequest => WireFileFetchRequest::decode(payload)?.path,
         FrameKind::FileBegin => WireFileBegin::decode(payload)?.path,
+        FrameKind::GroupOpen => crate::protocol::WireGroupOpen::decode(payload)?.file.path,
+        FrameKind::GroupMember => crate::protocol::WireGroupMember::decode(payload)?.path,
         FrameKind::Metadata => match payload.first() {
             Some(&DIRECTORY_READ) | Some(&DIRECTORY_FINALIZE) => {
                 WireDirectoryMetadata::decode(payload)?.path
@@ -93,11 +95,6 @@ pub(super) fn authorize(
                     return Err(mismatch(RequestedScope::Path(mutation.path)));
                 }
                 return Ok(());
-            }
-            // A hardlink's representative is also primary authority; sharing
-            // CopyFile's field must not confer its secondary-backup exception.
-            if let Some(source) = mutation.copy_source() {
-                require_selected(source.clone())?;
             }
             mutation.path
         }

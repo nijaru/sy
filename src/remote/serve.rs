@@ -41,6 +41,8 @@ struct NativeRequestHandlers {
     acl: ServerAclHandler,
     bsd_flags: ServerBsdFlagsHandler,
     fetch: ServerFetchHandler,
+    resolved: crate::protocol::ResolvedOperand,
+    group_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Pull-session whole-file source producer. The compression policy mirrors
@@ -177,6 +179,8 @@ impl RequestHandlers {
                     acl: session.acl_handler()?,
                     bsd_flags: session.bsd_flags_handler()?,
                     fetch: fetch_handler(session)?,
+                    resolved: session.ready().resolved.clone(),
+                    group_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 })
             } else {
                 None
@@ -260,6 +264,47 @@ fn spawn_request(
                 .map_err(|error| error.to_string())
             });
         }
+        IncomingRequest::Group(incoming) => {
+            let role = crate::protocol::WireGroupOpen::decode(incoming.first.frame().payload())
+                .map_err(|error| ServeError::Request(error.to_string()))?
+                .role;
+            let native = handlers.native()?;
+            let handler = native.fetch.clone();
+            let resolved = native.resolved.clone();
+            let group_slot = native.group_slot.clone();
+            tasks.spawn(async move {
+                // A terminal reply may reach the peer before this handler's
+                // joined cleanup releases admission. Queue the next bounded
+                // request instead of turning that scheduling gap into failure.
+                let _permit = group_slot
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let result = match role {
+                    crate::protocol::WireGroupRole::Source => {
+                        crate::remote::group::serve_source(
+                            handler.rooted.clone(),
+                            incoming,
+                            &handler.sender,
+                            handler.peer,
+                            resolved,
+                        )
+                        .await
+                    }
+                    crate::protocol::WireGroupRole::Destination => {
+                        crate::remote::group::serve_destination(
+                            handler.rooted.clone(),
+                            incoming,
+                            &handler.sender,
+                            handler.peer,
+                            resolved,
+                        )
+                        .await
+                    }
+                };
+                result.map_err(|error| error.to_string())
+            });
+        }
         IncomingRequest::Mutation(incoming) => {
             let handler = handlers.native()?.mutation.clone();
             tasks.spawn(async move {
@@ -320,6 +365,158 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn next_group_waits_for_prior_admission_retirement() {
+        use crate::protocol::{
+            WireEntryKind, WireFetchCompression, WireFileBasis, WireFileBegin, WireGroupMember,
+            WireGroupOpen, WireGroupResult, WireGroupRole, WireGroupSeal, WireGroupStep,
+        };
+        use futures::TryStreamExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"source").unwrap();
+        let source = crate::endpoint::source_root::SourceRoot::open(root.path().into())
+            .await
+            .unwrap()
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+        let (client, server) = tokio::join!(
+            ClientRemoteSession::connect(
+                cr,
+                cw,
+                Operation::Pull,
+                root.path(),
+                RouterConfig::default()
+            ),
+            ServerRemoteSession::accept(sr, sw, RouterConfig::default()),
+        );
+        let client = client.unwrap();
+        let mut server = server.unwrap();
+        let handlers = RequestHandlers::new(&server).unwrap();
+        let previous = handlers
+            .native()
+            .unwrap()
+            .group_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let sender = client.sender();
+        let mut inbox = sender.open_stream().unwrap();
+        let stream = inbox.stream_id();
+        sender
+            .send(
+                Frame::new(
+                    FrameKind::GroupOpen,
+                    FrameFlags::empty(),
+                    stream,
+                    WireGroupOpen {
+                        role: WireGroupRole::Source,
+                        source_bytes: false,
+                        retain_metadata: false,
+                        xattrs: false,
+                        acls: false,
+                        source_flags: false,
+                        verify_bytes: false,
+                        compression: WireFetchCompression::None,
+                        file: WireFileBegin::delta(
+                            crate::remote::path::encode_relative_path(source.path.as_path())
+                                .unwrap(),
+                            source.size,
+                            WireFileBasis::new(source.size, *source.identity.unwrap().as_bytes()),
+                        ),
+                    }
+                    .encode(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let member = WireGroupMember {
+            ordinal: 0,
+            path: crate::remote::path::encode_relative_path(source.path.as_path()).unwrap(),
+            observation: Some((WireEntryKind::File, *source.identity.unwrap().as_bytes())),
+        };
+        let payload = member.encode();
+        let mut digest = blake3::Hasher::new();
+        digest.update(&(payload.len() as u32).to_be_bytes());
+        digest.update(&payload);
+        let seal = WireGroupSeal {
+            count: 1,
+            digest: *digest.finalize().as_bytes(),
+        };
+        for (kind, payload) in [
+            (FrameKind::GroupMember, payload),
+            (FrameKind::GroupMembersEnd, seal.encode()),
+        ] {
+            sender
+                .send(Frame::new(kind, FrameFlags::empty(), stream, payload).unwrap())
+                .await
+                .unwrap();
+        }
+        let request = server.next_request().await.unwrap().unwrap();
+        let mut tasks = JoinSet::new();
+        let spawned = spawn_request(&mut tasks, &handlers, request);
+        // Inspect the blocked next opener while the previous handler still
+        // owns its cleanup permit, then release before any assertion.
+        let early = if spawned.is_ok() {
+            tokio::time::timeout(Duration::from_millis(20), tasks.join_next()).await
+        } else {
+            Ok(None)
+        };
+        drop(previous);
+        spawned.unwrap();
+        assert!(
+            early.is_err(),
+            "next group must queue, not terminate the session"
+        );
+        let declaration = inbox.recv().await.unwrap().unwrap();
+        assert_eq!(
+            WireGroupResult::decode(declaration.frame().payload()).unwrap(),
+            WireGroupResult::Declarations(seal)
+        );
+        drop(declaration);
+        for (step, reply) in [
+            (
+                WireGroupStep::Prepare,
+                WireGroupResult::SourceReady { flags: None },
+            ),
+            (WireGroupStep::Abort, WireGroupResult::Aborted),
+        ] {
+            sender
+                .send(
+                    Frame::new(
+                        FrameKind::GroupStep,
+                        FrameFlags::empty(),
+                        stream,
+                        step.encode(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let received = inbox.recv().await.unwrap().unwrap();
+            assert_eq!(
+                WireGroupResult::decode(received.frame().payload()).unwrap(),
+                reply
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(client);
+        server.shutdown().await.unwrap();
+    }
 
     /// A frame-boundary EOF is orderly only if admitted fetch work has its
     /// commit Ack. Missing or truncated acknowledgements must fail the agent.

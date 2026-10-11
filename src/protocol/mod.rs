@@ -9,6 +9,7 @@ pub use directory::{
 mod entry;
 mod fetch;
 mod frame;
+mod group;
 mod handshake;
 mod hash;
 mod metadata;
@@ -30,11 +31,14 @@ pub use frame::{
     read_frame, read_frame_or_eof, write_frame, Frame, FrameFlags, FrameKind, ReadFrame, StreamId,
     MAX_FRAME_PAYLOAD,
 };
+pub use group::{
+    WireGroupMember, WireGroupOpen, WireGroupResult, WireGroupRole, WireGroupSeal, WireGroupStep,
+};
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1, PROTOCOL_V3_10,
-    PROTOCOL_V3_2, PROTOCOL_V3_3, PROTOCOL_V3_4, PROTOCOL_V3_5, PROTOCOL_V3_6, PROTOCOL_V3_7,
-    PROTOCOL_V3_8, PROTOCOL_V3_9, SUPPORTED_VERSIONS,
+    PROTOCOL_V3_11, PROTOCOL_V3_2, PROTOCOL_V3_3, PROTOCOL_V3_4, PROTOCOL_V3_5, PROTOCOL_V3_6,
+    PROTOCOL_V3_7, PROTOCOL_V3_8, PROTOCOL_V3_9, SUPPORTED_VERSIONS,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::{WireMetadata, WireMetadataTarget};

@@ -8,7 +8,7 @@ pub(crate) mod metadata;
 mod mutation;
 pub use client::ClientRemoteHandle;
 #[path = "scope.rs"]
-mod scope;
+pub(crate) mod scope;
 pub use scope::ScopeError;
 #[cfg(all(test, unix))]
 #[path = "scope_tests.rs"]
@@ -47,8 +47,8 @@ use crate::transfer::delta::{
 use futures::StreamExt;
 use metadata::{request_metadata, serve_incoming_metadata_rooted, RemoteMetadataError};
 use mutation::{
-    request_copy_file, request_create_directory, request_hardlink, request_remove,
-    request_replace_symlink, serve_incoming_mutation_rooted, RemoteMutationError,
+    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
+    serve_incoming_mutation_rooted, RemoteMutationError,
 };
 use std::path::Path;
 #[cfg(test)]
@@ -417,28 +417,6 @@ impl ClientRemoteSession {
         .map_err(Into::into)
     }
 
-    /// Server-side hardlink beneath the pinned root (`-H`). Links
-    /// `destination` to the existing `source` inode without moving bytes.
-    pub async fn hardlink(
-        &self,
-        source: &RelativePath,
-        destination: &RelativePath,
-        source_identity: EntryIdentity,
-        expected_destination: Option<EntryIdentity>,
-    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
-        self.require_push(FrameKind::Mutation)?;
-        request_hardlink(
-            &self.router.sender(),
-            source,
-            destination,
-            source_identity,
-            expected_destination,
-            self.server.platform.os,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
     /// Read the remote source's attributes for the required observation (`-X`).
     pub async fn read_xattrs(
         &self,
@@ -476,6 +454,7 @@ pub enum IncomingRequest {
     Signatures(IncomingStream),
     File(IncomingStream),
     FileFetch(IncomingStream),
+    Group(IncomingStream),
     Metadata(IncomingStream),
     Mutation(IncomingStream),
     Xattr(IncomingStream),
@@ -852,6 +831,41 @@ impl ServerRemoteSession {
                 }
                 Ok(Some(IncomingRequest::FileFetch(incoming)))
             }
+            FrameKind::GroupOpen => {
+                let open = crate::protocol::WireGroupOpen::decode(incoming.first.frame().payload())
+                    .map_err(crate::remote::RemoteError::from)?;
+                if !matches!(
+                    (self.operation(), open.role),
+                    (Operation::Pull, crate::protocol::WireGroupRole::Source)
+                        | (Operation::Push, crate::protocol::WireGroupRole::Destination)
+                ) {
+                    return Err(RemoteSessionError::OperationMismatch {
+                        operation: self.operation(),
+                        kind,
+                    });
+                }
+                for (requested, capability, name) in [
+                    (true, CapabilitySet::HARDLINK, "hardlinks"),
+                    (open.xattrs, CapabilitySet::XATTR, "xattrs"),
+                    (open.acls, CapabilitySet::ACL, "ACLs"),
+                    (open.source_flags, CapabilitySet::BSD_FLAGS, "BSD flags"),
+                    (
+                        !matches!(
+                            open.compression,
+                            crate::protocol::WireFetchCompression::None
+                        ),
+                        CapabilitySet::ZSTD,
+                        "zstd",
+                    ),
+                ] {
+                    if requested && !self.opened.ready.capabilities.contains(capability) {
+                        return Err(
+                            RemoteTransferError::PreservationUnavailable { feature: name }.into(),
+                        );
+                    }
+                }
+                Ok(Some(IncomingRequest::Group(incoming)))
+            }
             FrameKind::FileBegin if self.opened.operation == Operation::Push => {
                 Ok(Some(IncomingRequest::File(incoming)))
             }
@@ -898,6 +912,7 @@ impl ServerRemoteSession {
                 | IncomingRequest::Signatures(incoming)
                 | IncomingRequest::File(incoming)
                 | IncomingRequest::FileFetch(incoming)
+                | IncomingRequest::Group(incoming)
                 | IncomingRequest::Metadata(incoming)
                 | IncomingRequest::Mutation(incoming)
                 | IncomingRequest::Xattr(incoming)
@@ -1166,6 +1181,7 @@ mod tests {
                     IncomingRequest::Hash(_)
                     | IncomingRequest::File(_)
                     | IncomingRequest::FileFetch(_)
+                    | IncomingRequest::Group(_)
                     | IncomingRequest::Metadata(_)
                     | IncomingRequest::Mutation(_)
                     | IncomingRequest::Xattr(_)

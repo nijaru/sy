@@ -4,7 +4,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 const BRANCH_BYTES: usize = 19;
 
-pub(super) struct DiskRadix {
+pub(crate) struct DiskRadix {
     file: File,
     root: Option<u64>,
     healthy: bool,

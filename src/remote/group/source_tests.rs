@@ -1,0 +1,178 @@
+use super::*;
+use crate::protocol::{Platform, RelativeWirePath, WireFileBasis, WireFileBegin};
+use crate::remote::group::declarations::add_to_seal;
+use crate::remote::router::{FrameRouter, RouterConfig, RouterRole, StreamInbox};
+use std::path::Path;
+
+fn path(name: &str) -> RelativeWirePath {
+    crate::remote::path::encode_relative_path(Path::new(name)).unwrap()
+}
+async fn send(sender: &RouterSender, inbox: &StreamInbox, kind: FrameKind, payload: Bytes) {
+    sender
+        .send(Frame::new(kind, FrameFlags::empty(), inbox.stream_id(), payload).unwrap())
+        .await
+        .unwrap();
+}
+async fn reply(inbox: &mut StreamInbox) -> WireGroupResult {
+    let routed = inbox.recv().await.unwrap().unwrap();
+    assert_eq!(routed.frame().kind(), FrameKind::GroupResult);
+    WireGroupResult::decode(routed.frame().payload()).unwrap()
+}
+
+#[tokio::test]
+async fn lease_keeps_source_authority_through_each_member_and_exact_completion() {
+    for outcome in ["complete", "changed-parent", "premature-completion"] {
+        let change_second_parent = outcome == "changed-parent";
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("first"), b"original").unwrap();
+        std::fs::hard_link(root.path().join("first"), root.path().join("dir/second")).unwrap();
+        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let rooted_for_worker = rooted.clone();
+        let identity = tokio::task::spawn_blocking(move || {
+            rooted_for_worker
+                .path_identity_blocking(
+                    &decode_relative_path(path("first"), Platform::current().os).unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .1
+        })
+        .await
+        .unwrap();
+        let members = [
+            WireGroupMember {
+                ordinal: 0,
+                path: path("first"),
+                observation: Some((WireEntryKind::File, *identity.as_bytes())),
+            },
+            WireGroupMember {
+                ordinal: 1,
+                path: path("dir/second"),
+                observation: Some((WireEntryKind::File, *identity.as_bytes())),
+            },
+        ];
+        let mut digest = blake3::Hasher::new();
+        for member in &members {
+            add_to_seal(&mut digest, member).unwrap();
+        }
+        let seal = WireGroupSeal {
+            count: 2,
+            digest: *digest.finalize().as_bytes(),
+        };
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+        let client =
+            FrameRouter::start(cr, cw, RouterRole::Client, RouterConfig::default()).unwrap();
+        let server = tokio::spawn(async move {
+            let mut router =
+                FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
+            let incoming = router.incoming().recv().await.unwrap().unwrap();
+            serve(
+                rooted,
+                incoming,
+                &router.sender(),
+                Platform::current().os,
+                ResolvedOperand::Tree,
+            )
+            .await
+        });
+        let sender = client.sender();
+        let mut inbox = sender.open_stream().unwrap();
+        let open = WireGroupOpen {
+            role: WireGroupRole::Source,
+            source_bytes: false,
+            retain_metadata: false,
+            xattrs: false,
+            acls: false,
+            source_flags: false,
+            verify_bytes: false,
+            compression: WireFetchCompression::None,
+            file: WireFileBegin::delta(
+                path("first"),
+                8,
+                WireFileBasis::new(8, *identity.as_bytes()),
+            ),
+        };
+        send(&sender, &inbox, FrameKind::GroupOpen, open.encode()).await;
+        for member in &members {
+            send(&sender, &inbox, FrameKind::GroupMember, member.encode()).await;
+        }
+        send(&sender, &inbox, FrameKind::GroupMembersEnd, seal.encode()).await;
+        assert_eq!(reply(&mut inbox).await, WireGroupResult::Declarations(seal));
+        send(
+            &sender,
+            &inbox,
+            FrameKind::GroupStep,
+            WireGroupStep::Prepare.encode(),
+        )
+        .await;
+        assert_eq!(
+            reply(&mut inbox).await,
+            WireGroupResult::SourceReady { flags: None }
+        );
+        assert!(!server.is_finished());
+        send(
+            &sender,
+            &inbox,
+            FrameKind::GroupStep,
+            WireGroupStep::Validate(0).encode(),
+        )
+        .await;
+        assert_eq!(reply(&mut inbox).await, WireGroupResult::Validated(0));
+        if outcome == "premature-completion" {
+            send(
+                &sender,
+                &inbox,
+                FrameKind::GroupStep,
+                WireGroupStep::Finish(seal).encode(),
+            )
+            .await;
+            assert!(matches!(server.await.unwrap(), Err(GroupError::Phase(_))));
+            assert_eq!(
+                std::fs::read(root.path().join("first")).unwrap(),
+                b"original"
+            );
+            continue;
+        }
+        if change_second_parent {
+            std::fs::rename(root.path().join("dir"), root.path().join("held-dir")).unwrap();
+            std::fs::create_dir(root.path().join("dir")).unwrap();
+            std::fs::write(root.path().join("dir/second"), b"original").unwrap();
+        }
+        send(
+            &sender,
+            &inbox,
+            FrameKind::GroupStep,
+            WireGroupStep::Validate(1).encode(),
+        )
+        .await;
+        if change_second_parent {
+            assert!(matches!(server.await.unwrap(), Err(GroupError::Source(_))));
+            assert_eq!(
+                std::fs::read(root.path().join("held-dir/second")).unwrap(),
+                b"original"
+            );
+        } else {
+            assert_eq!(reply(&mut inbox).await, WireGroupResult::Validated(1));
+            assert!(!server.is_finished());
+            send(
+                &sender,
+                &inbox,
+                FrameKind::GroupStep,
+                WireGroupStep::Finish(seal).encode(),
+            )
+            .await;
+            assert_eq!(
+                reply(&mut inbox).await,
+                WireGroupResult::SourceComplete(seal)
+            );
+            server.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("first")).unwrap(),
+            b"original"
+        );
+    }
+}

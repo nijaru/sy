@@ -118,7 +118,6 @@ enum Mutation {
     Backup,
     ExternalBackup,
     Fetch,
-    Hardlink,
 }
 
 #[tokio::test]
@@ -132,7 +131,6 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
         Mutation::Backup,
         Mutation::ExternalBackup,
         Mutation::Fetch,
-        Mutation::Hardlink,
     ] {
         for admitted in [false, true] {
             let source_root = tempfile::tempdir().unwrap();
@@ -144,16 +142,6 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
             std::fs::create_dir(destination_root.path().join("directory")).unwrap();
             let mut request = crate::engine::scan::ScanRequest::default();
             request.metadata.unix_mode = true;
-            if matches!(mutation, Mutation::Hardlink) {
-                std::fs::hard_link(
-                    source_root.path().join("file"),
-                    source_root.path().join("member"),
-                )
-                .unwrap();
-                std::fs::write(destination_root.path().join("representative"), b"new bytes")
-                    .unwrap();
-                request.metadata.hardlink_group = true;
-            }
             let source_entries: Vec<Entry> = crate::endpoint::local_entry_scan::local_entry_stream(
                 source_root.path().to_path_buf(),
                 request,
@@ -204,29 +192,6 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                         executor.with_backup(Some(external_backup.path().join("new-directory")));
                 }
             }
-            if matches!(mutation, Mutation::Hardlink) {
-                executor = executor.with_hardlinks(true);
-                executor
-                    .hardlink_groups
-                    .lock()
-                    .await
-                    .insert(
-                        *source.hardlink_group.unwrap().as_bytes(),
-                        HardlinkRepresentative {
-                            path: RelativePath::new("representative").unwrap(),
-                            publication: crate::endpoint::local_identity::metadata_identity(
-                                &std::fs::metadata(destination_root.path().join("representative"))
-                                    .unwrap(),
-                                EntryKind::File,
-                            )
-                            .unwrap(),
-                            unix_mode: Some(0o600),
-                            modified: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-            }
             let rooted = executor.metadata_authority().await.unwrap().clone();
             let file = RelativePath::new("file").unwrap();
             let before = rooted.path_identity_blocking(&file).unwrap().unwrap().1;
@@ -242,7 +207,7 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             rooted.pause_mutation_at(
-                usize::from(matches!(mutation, Mutation::Hardlink)),
+                0,
                 PublicationPause {
                     point: if admitted {
                         PublicationPausePoint::AfterAdmission
@@ -308,7 +273,7 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                                         modified: Some(Timestamp::UNIX_EPOCH),
                                     }
                                 }
-                                Mutation::Fetch | Mutation::Hardlink => {
+                                Mutation::Fetch => {
                                     let mut destination = source.clone();
                                     destination.identity = Some(before);
                                     RemotePullAction::FetchFile {
@@ -484,36 +449,14 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                             b"new bytes"
                         );
                     }
-                    Mutation::Hardlink => {
-                        assert!(result.is_ok(), "{result:?}");
-                        assert_eq!(
-                            std::fs::metadata(destination_root.path().join("file"))
-                                .unwrap()
-                                .ino(),
-                            std::fs::metadata(destination_root.path().join("representative"))
-                                .unwrap()
-                                .ino()
-                        );
-                    }
                 }
-            }
-            if matches!(mutation, Mutation::Hardlink) {
-                assert_eq!(
-                    std::fs::metadata(destination_root.path().join("representative"))
-                        .unwrap()
-                        .nlink(),
-                    if admitted { 2 } else { 1 }
-                );
             }
             assert!(
                 std::fs::read_dir(destination_root.path())
                     .unwrap()
                     .all(|entry| {
                         let name = entry.unwrap().file_name();
-                        name == "file"
-                            || name == "directory"
-                            || name == "file~"
-                            || name == "representative"
+                        name == "file" || name == "directory" || name == "file~"
                     }),
                 "{mutation:?}: private staging leaked"
             );

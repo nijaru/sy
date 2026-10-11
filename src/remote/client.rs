@@ -1,7 +1,6 @@
 use super::metadata::request_metadata;
 use super::mutation::{
-    request_copy_file, request_create_directory, request_hardlink, request_remove,
-    request_replace_symlink,
+    request_copy_file, request_create_directory, request_remove, request_replace_symlink,
 };
 use super::{ClientRemoteSession, RemoteSessionError, Result};
 use crate::endpoint::source_root::SourceRoot;
@@ -550,28 +549,6 @@ impl ClientRemoteHandle {
             source,
             destination,
             expected_source_identity,
-            self.peer,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Server-side hardlink beneath the pinned root (`-H`). Links
-    /// `destination` to the existing `source` inode without moving bytes.
-    pub async fn hardlink(
-        &self,
-        source: &RelativePath,
-        destination: &RelativePath,
-        source_identity: EntryIdentity,
-        expected_destination: Option<EntryIdentity>,
-    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
-        self.require_push(FrameKind::Mutation)?;
-        request_hardlink(
-            &self.sender,
-            source,
-            destination,
-            source_identity,
-            expected_destination,
             self.peer,
         )
         .await

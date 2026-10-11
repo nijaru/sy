@@ -493,9 +493,7 @@ async fn interleaved_hardlink_parents_are_prepared_before_leaves_and_finalized_l
     )
     .await
     .unwrap();
-    plan.validate_hardlink_bytes(|_| async { panic!("new groups need no comparison hash") })
-        .await
-        .unwrap();
+    plan.seal_hardlink_membership().await.unwrap();
     let summary = SyncController::new(
         BeforeFinalize {
             inner: LocalSyncExecutor::new(

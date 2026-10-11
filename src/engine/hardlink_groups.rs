@@ -1,6 +1,6 @@
-//! Exact session-local hardlink representatives without a tree-sized cache.
-//! The shared disk radix index stores offsets into bounded native-path records;
-//! neither group count nor path ordering increases RAM or descriptors.
+//! Finalized local group records for deferred source-removal verification.
+//! The disk radix index keeps paths and metadata off the resident common path;
+//! these immutable records never authorize later hardlink publication.
 use super::disk_radix::DiskRadix;
 use super::domain::{EntryIdentity, RelativePath, Timestamp};
 use super::native_path;
@@ -18,26 +18,8 @@ pub(crate) struct HardlinkRepresentative {
     pub modified: Option<Timestamp>,
 }
 
-impl HardlinkRepresentative {
-    /// Inode metadata is applied by the representative transaction only.
-    pub fn validate_metadata(
-        &self,
-        unix_mode: Option<u32>,
-        modified: Option<Timestamp>,
-    ) -> io::Result<()> {
-        let mode = |mode: Option<u32>| mode.map(|value| value & 0o7777);
-        if mode(self.unix_mode) != mode(unix_mode) || self.modified != modified {
-            return Err(io::Error::other(
-                "hardlink group members request incompatible inode metadata",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Lazily creates scratch state only when a grouped transfer actually runs.
-/// The blocking lock protects file seeks inside workers, never across await;
-/// the executor's async lock separately protects the publication protocol.
+/// Scratch state is created only when finalized groups need removal records.
+/// The blocking lock protects file seeks inside workers, never across await.
 #[derive(Default)]
 pub(crate) struct HardlinkGroups {
     disk: Arc<Mutex<Option<DiskIndex>>>,
@@ -54,11 +36,6 @@ impl HardlinkGroups {
         representative: HardlinkRepresentative,
     ) -> io::Result<()> {
         self.with_disk(move |disk| disk.insert(key, representative))
-            .await
-    }
-
-    pub async fn advance(&self, key: [u8; 32], identity: EntryIdentity) -> io::Result<()> {
-        self.with_disk(move |disk| disk.advance(key, identity))
             .await
     }
 
@@ -154,17 +131,6 @@ impl DiskIndex {
             unix_mode,
             modified,
         })
-    }
-
-    fn advance(&mut self, key: [u8; 32], identity: EntryIdentity) -> io::Result<()> {
-        let offset = self
-            .offset(key)?
-            .ok_or_else(|| invalid("missing hardlink group"))?;
-        self.healthy = false;
-        self.file.seek(SeekFrom::Start(offset + 21))?;
-        self.file.write_all(identity.as_bytes())?;
-        self.healthy = true;
-        Ok(())
     }
 
     fn insert(&mut self, key: [u8; 32], value: HardlinkRepresentative) -> io::Result<()> {
@@ -324,20 +290,5 @@ mod tests {
             groups.get([0; 32]).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-    }
-
-    #[tokio::test]
-    async fn later_members_cannot_change_inode_metadata() {
-        let groups = HardlinkGroups::default();
-        let value = representative(0);
-        groups.insert([0; 32], value.clone()).await.unwrap();
-        let stored = groups.get([0; 32]).await.unwrap().unwrap();
-        assert!(stored
-            .validate_metadata(Some(0o100640), value.modified)
-            .is_ok());
-        assert!(stored
-            .validate_metadata(Some(0o600), value.modified)
-            .is_err());
-        assert!(stored.validate_metadata(value.unix_mode, None).is_err());
     }
 }

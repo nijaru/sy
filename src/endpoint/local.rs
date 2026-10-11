@@ -283,7 +283,7 @@ pub(crate) async fn verify_destination_expectation(
 }
 
 /// Local staged writes share the rooted endpoint transaction owner.
-struct LocalStagedWriter {
+pub(crate) struct LocalStagedWriter {
     rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
     destination_path: PathBuf,
     staged: Option<sy::rooted_fs::RootedStagedFile>,
@@ -362,7 +362,7 @@ impl PendingPublication for LocalPendingPublication {
 }
 
 impl LocalStagedWriter {
-    async fn new(
+    pub(crate) async fn new(
         rooted: std::sync::Arc<sy::rooted_fs::RootedFs>,
         relative: sy::engine::domain::RelativePath,
         expectation: ExpectedDestination,
@@ -404,7 +404,7 @@ impl LocalStagedWriter {
         })
     }
 
-    async fn with_staged<T, F>(&mut self, operation: F) -> Result<T>
+    pub(crate) async fn with_staged<T, F>(&mut self, operation: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut sy::rooted_fs::RootedStagedFile) -> sy::rooted_fs::Result<T>
@@ -423,6 +423,46 @@ impl LocalStagedWriter {
         .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
         self.staged = Some(staged);
         result.map_err(map_rooted_fs_error)
+    }
+
+    /// Transfer the ORIGINAL creator and protected anchor to the native group
+    /// owner. The async duplicate is drained and dropped, never reopened from a
+    /// visible member; conversion itself does not authorize publication.
+    pub(crate) async fn into_group(mut self) -> Result<sy::rooted_fs::RootedStagedGroup> {
+        if let Err(operation) = self.file_mut()?.flush().await {
+            return match Box::new(self).abort().await {
+                Ok(()) => Err(SyncError::Io(operation)),
+                Err(abort) => Err(SyncError::StagingAbortFailed {
+                    operation: operation.to_string(),
+                    abort: abort.to_string(),
+                }),
+            };
+        }
+        if let Some(file) = self.file.take() {
+            let duplicate = file.into_std().await;
+            tokio::task::spawn_blocking(move || drop(duplicate))
+                .await
+                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+        let staged = self
+            .staged
+            .take()
+            .ok_or_else(|| SyncError::Config("staged writer is already closed".to_string()))?;
+        let rooted = self.rooted.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(operation) = rooted.verify_root_path_blocking() {
+                return match staged.abort() {
+                    Ok(()) => Err(map_rooted_fs_error(operation)),
+                    Err(abort) => Err(SyncError::StagingAbortFailed {
+                        operation: operation.to_string(),
+                        abort: abort.to_string(),
+                    }),
+                };
+            }
+            staged.into_group_blocking().map_err(map_rooted_fs_error)
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?
     }
 
     fn file_mut(&mut self) -> Result<&mut tokio::fs::File> {

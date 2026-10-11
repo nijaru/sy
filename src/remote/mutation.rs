@@ -53,7 +53,7 @@ pub enum RemoteMutationError {
     #[error("copy-file mutation is missing its source path")]
     MissingCopySource,
 
-    #[error("copy/hardlink mutation is missing its source identity")]
+    #[error("copy-file mutation is missing its source identity")]
     MissingCopySourceIdentity,
 
     #[error("native symlink target encoding is unsupported for peer platform {0:?}")]
@@ -148,30 +148,6 @@ pub async fn request_copy_file(
     .await
 }
 
-/// Request a server-side hardlink beneath the pinned root
-/// (`-H/--preserve-hardlinks`: link `destination` to existing `source`).
-pub async fn request_hardlink(
-    sender: &RouterSender,
-    source: &RelativePath,
-    destination: &RelativePath,
-    source_identity: EntryIdentity,
-    expected_destination: Option<EntryIdentity>,
-    peer: PlatformOs,
-) -> Result<crate::rooted_fs::PublishedEntryProof> {
-    ensure_compatible_path_encoding(peer)?;
-    let payload = request_mutation_payload(
-        sender,
-        WireMutation::hardlink(
-            encode_relative_path(source.as_path())?,
-            encode_relative_path(destination.as_path())?,
-            *source_identity.as_bytes(),
-            expected_destination.map(|id| *id.as_bytes()),
-        ),
-    )
-    .await?;
-    decode_publication_ack(destination, EntryKind::File, &payload)
-}
-
 pub(crate) async fn request_verify_publication(
     sender: &RouterSender,
     proof: &crate::rooted_fs::PublishedEntryProof,
@@ -247,7 +223,7 @@ pub async fn serve_incoming_mutation_rooted(
         .cloned()
         .map(|target| decode_native_target(target, peer))
         .transpose()?;
-    let copy_source = if kind == WireMutationKind::CopyFile || kind == WireMutationKind::Hardlink {
+    let copy_source = if kind == WireMutationKind::CopyFile {
         let source = mutation
             .copy_source()
             .cloned()
@@ -263,7 +239,6 @@ pub async fn serve_incoming_mutation_rooted(
         .expected_identity()
         .copied()
         .map(EntryIdentity::from_bytes);
-    let source_identity = mutation.source_identity().map(EntryIdentity::from_bytes);
     let entry_kind = mutation.entry_kind().map(domain_kind);
     let modified = mutation
         .modified()
@@ -284,7 +259,6 @@ pub async fn serve_incoming_mutation_rooted(
             copy_source,
             expected_identity,
             modified,
-            source_identity,
             entry_kind,
         )
     })
@@ -311,7 +285,6 @@ fn apply_mutation(
     copy_source: Option<RelativePath>,
     expected_identity: Option<EntryIdentity>,
     modified: Option<Timestamp>,
-    source_identity: Option<EntryIdentity>,
     entry_kind: Option<EntryKind>,
 ) -> Result<Bytes> {
     match kind {
@@ -340,17 +313,6 @@ fn apply_mutation(
             let expected =
                 expected_identity.ok_or(RemoteMutationError::MissingCopySourceIdentity)?;
             rooted.copy_file_blocking(&source, &path, expected)?;
-        }
-        WireMutationKind::Hardlink => {
-            let source = copy_source.ok_or(RemoteMutationError::MissingCopySource)?;
-            let identity = source_identity.ok_or(RemoteMutationError::MissingCopySourceIdentity)?;
-            let expected = expected_identity.map_or(
-                crate::endpoint::ExpectedDestination::Absent,
-                crate::endpoint::ExpectedDestination::Unchanged,
-            );
-            return encode_publication_ack(
-                rooted.publish_hardlink_blocking(&source, &path, identity, expected)?,
-            );
         }
         WireMutationKind::VerifyPublication => {
             let identity = expected_identity.ok_or(RemoteMutationError::Protocol(
@@ -564,7 +526,7 @@ mod tests {
         let peer = Platform::current().os;
 
         let server_task = tokio::spawn(async move {
-            for _ in 0..6 {
+            for _ in 0..5 {
                 let incoming = server.incoming().recv().await.unwrap().unwrap();
                 serve_incoming_mutation_rooted(rooted.clone(), incoming, &sender, peer)
                     .await
@@ -612,19 +574,6 @@ mod tests {
         request_remove(&client.sender(), &old, false, old_id, peer)
             .await
             .unwrap();
-        // -H: the server links through held descriptors; the linked path
-        // shares the source inode.
-        std::fs::write(root.path().join("basis"), b"basis").unwrap();
-        let basis = RelativePath::new("basis").unwrap();
-        let linked = RelativePath::new("linked").unwrap();
-        let basis_id = crate::endpoint::local_identity::metadata_identity(
-            &std::fs::symlink_metadata(root.path().join("basis")).unwrap(),
-            EntryKind::File,
-        )
-        .unwrap();
-        request_hardlink(&client.sender(), &basis, &linked, basis_id, None, peer)
-            .await
-            .unwrap();
         let dir_meta = std::fs::symlink_metadata(root.path().join("dir")).unwrap();
         let dir_id = crate::endpoint::local_identity::metadata_identity(
             &dir_meta,
@@ -637,13 +586,6 @@ mod tests {
 
         assert!(!root.path().join("old").exists());
         assert!(!root.path().join("dir").exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let basis = std::fs::metadata(root.path().join("basis")).unwrap();
-            let linked = std::fs::metadata(root.path().join("linked")).unwrap();
-            assert_eq!(basis.ino(), linked.ino());
-        }
         assert_eq!(
             std::fs::read_link(root.path().join("link")).unwrap(),
             Path::new("../updated")

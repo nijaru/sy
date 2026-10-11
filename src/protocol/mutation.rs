@@ -14,10 +14,6 @@ pub enum WireMutationKind {
     /// Server-side copy beneath the pinned root. Seeds the object-native
     /// copy strategy and backs up replaced/deleted files for `--backup`.
     CopyFile = 5,
-    /// Server-side hardlink beneath the pinned root (`-H/--preserve-hardlinks`:
-    /// link `path` to the existing `copy_source` inode). Both stay beneath
-    /// the pinned root; the source must be a regular file.
-    Hardlink = 6,
     /// Revalidate a finalized file/symlink or verified-existing destination
     /// observation before source removal.
     VerifyPublication = 7,
@@ -33,7 +29,6 @@ impl TryFrom<u8> for WireMutationKind {
             3 => Ok(Self::RemoveFileLike),
             4 => Ok(Self::RemoveDirectory),
             5 => Ok(Self::CopyFile),
-            6 => Ok(Self::Hardlink),
             7 => Ok(Self::VerifyPublication),
             _ => Err(ProtocolError::InvalidField {
                 field: "mutation_kind",
@@ -53,13 +48,12 @@ impl TryFrom<u8> for WireMutationKind {
 pub struct WireMutation {
     pub path: RelativeWirePath,
     kind: WireMutationKind,
-    source_identity: Option<[u8; 32]>,
     entry_kind: Option<WireEntryKind>,
     symlink_target: Option<WirePath>,
     /// Copy source for `CopyFile` mutations; the primary `path` is the copy
     /// destination (the backup location). Both stay beneath the pinned root.
     copy_source: Option<RelativeWirePath>,
-    /// For symlinks/hardlinks, None means expected Absent. For copies this
+    /// For symlinks, None means expected Absent. For copies this
     /// required token identifies the source, not the backup destination.
     expected_identity: Option<[u8; 32]>,
     modified: Option<(i64, u32)>,
@@ -70,7 +64,6 @@ impl WireMutation {
         Self {
             path,
             kind: WireMutationKind::CreateDirectory,
-            source_identity: None,
             entry_kind: None,
             symlink_target: None,
             copy_source: None,
@@ -88,7 +81,6 @@ impl WireMutation {
         Self {
             path,
             kind: WireMutationKind::ReplaceSymlink,
-            source_identity: None,
             entry_kind: None,
             symlink_target: Some(target),
             copy_source: None,
@@ -104,7 +96,6 @@ impl WireMutation {
         Self {
             path,
             kind: WireMutationKind::RemoveFileLike,
-            source_identity: None,
             entry_kind: None,
             symlink_target: None,
             copy_source: None,
@@ -120,7 +111,6 @@ impl WireMutation {
         Self {
             path,
             kind: WireMutationKind::RemoveDirectory,
-            source_identity: None,
             entry_kind: None,
             symlink_target: None,
             copy_source: None,
@@ -141,34 +131,10 @@ impl WireMutation {
         Self {
             path: destination,
             kind: WireMutationKind::CopyFile,
-            source_identity: None,
             entry_kind: None,
             symlink_target: None,
             copy_source: Some(source),
             expected_identity: Some(expected_source_identity),
-            modified: None,
-        }
-    }
-
-    /// Link `destination` to the existing root-relative `source` inode.
-    /// Used for `-H/--preserve-hardlinks`: members of one scanned hardlink
-    /// group share a single transferred representative; the rest become
-    /// links to it. The `copy_source` field carries the link source so the
-    /// wire shape stays bounded like `CopyFile`.
-    pub fn hardlink(
-        source: RelativeWirePath,
-        destination: RelativeWirePath,
-        source_identity: [u8; 32],
-        expected_destination: Option<[u8; 32]>,
-    ) -> Self {
-        Self {
-            path: destination,
-            kind: WireMutationKind::Hardlink,
-            source_identity: Some(source_identity),
-            entry_kind: None,
-            symlink_target: None,
-            copy_source: Some(source),
-            expected_identity: expected_destination,
             modified: None,
         }
     }
@@ -181,7 +147,6 @@ impl WireMutation {
         Self {
             path,
             kind: WireMutationKind::VerifyPublication,
-            source_identity: None,
             entry_kind: Some(kind),
             symlink_target: None,
             copy_source: None,
@@ -206,9 +171,6 @@ impl WireMutation {
         self.expected_identity.as_ref()
     }
 
-    pub const fn source_identity(&self) -> Option<[u8; 32]> {
-        self.source_identity
-    }
     pub const fn entry_kind(&self) -> Option<WireEntryKind> {
         self.entry_kind
     }
@@ -277,7 +239,6 @@ impl WireMutation {
             || self.kind == WireMutationKind::ReplaceSymlink
             || self.kind == WireMutationKind::CopyFile
             || self.kind == WireMutationKind::VerifyPublication
-            || self.kind == WireMutationKind::Hardlink
         {
             capacity = capacity
                 .checked_add(
@@ -293,12 +254,7 @@ impl WireMutation {
         }
 
         capacity = capacity
-            .checked_add(if self.source_identity.is_some() {
-                32
-            } else {
-                0
-            })
-            .and_then(|value| value.checked_add(usize::from(self.entry_kind.is_some())))
+            .checked_add(usize::from(self.entry_kind.is_some()))
             .ok_or(ProtocolError::InvalidMessage(
                 "mutation payload length overflow",
             ))?;
@@ -319,7 +275,6 @@ impl WireMutation {
             || self.kind == WireMutationKind::ReplaceSymlink
             || self.kind == WireMutationKind::CopyFile
             || self.kind == WireMutationKind::VerifyPublication
-            || self.kind == WireMutationKind::Hardlink
         {
             if let Some(identity) = self.expected_identity {
                 out.put_u8(1);
@@ -336,9 +291,6 @@ impl WireMutation {
             } else {
                 out.put_u8(0);
             }
-        }
-        if let Some(identity) = self.source_identity {
-            out.extend_from_slice(&identity);
         }
         if let Some(kind) = self.entry_kind {
             out.put_u8(kind as u8);
@@ -371,27 +323,25 @@ impl WireMutation {
         } else {
             None
         };
-        let copy_source =
-            if kind == WireMutationKind::CopyFile || kind == WireMutationKind::Hardlink {
-                let source_len = reader.u32()? as usize;
-                if source_len > MAX_WIRE_PATH_BYTES {
-                    return Err(ProtocolError::PathTooLong {
-                        len: source_len,
-                        max: MAX_WIRE_PATH_BYTES,
-                    });
-                }
-                Some(RelativeWirePath::decode(Bytes::copy_from_slice(
-                    reader.take(source_len)?,
-                ))?)
-            } else {
-                None
-            };
+        let copy_source = if kind == WireMutationKind::CopyFile {
+            let source_len = reader.u32()? as usize;
+            if source_len > MAX_WIRE_PATH_BYTES {
+                return Err(ProtocolError::PathTooLong {
+                    len: source_len,
+                    max: MAX_WIRE_PATH_BYTES,
+                });
+            }
+            Some(RelativeWirePath::decode(Bytes::copy_from_slice(
+                reader.take(source_len)?,
+            ))?)
+        } else {
+            None
+        };
         let expected_identity = if kind == WireMutationKind::RemoveFileLike
             || kind == WireMutationKind::RemoveDirectory
             || kind == WireMutationKind::ReplaceSymlink
             || kind == WireMutationKind::CopyFile
             || kind == WireMutationKind::VerifyPublication
-            || kind == WireMutationKind::Hardlink
         {
             match reader.u8()? {
                 0 => None,
@@ -420,11 +370,6 @@ impl WireMutation {
         } else {
             None
         };
-        let source_identity = if kind == WireMutationKind::Hardlink {
-            Some(reader.array::<32>()?)
-        } else {
-            None
-        };
         let entry_kind = if kind == WireMutationKind::VerifyPublication {
             Some(WireEntryKind::try_from(reader.u8()?)?)
         } else {
@@ -434,7 +379,6 @@ impl WireMutation {
         let mutation = Self {
             path,
             kind,
-            source_identity,
             entry_kind,
             symlink_target,
             copy_source,
@@ -446,8 +390,7 @@ impl WireMutation {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.source_identity.is_some() != (self.kind == WireMutationKind::Hardlink)
-            || self.entry_kind.is_some() != (self.kind == WireMutationKind::VerifyPublication)
+        if self.entry_kind.is_some() != (self.kind == WireMutationKind::VerifyPublication)
             || self.entry_kind == Some(WireEntryKind::Directory)
         {
             return Err(ProtocolError::InvalidMessage(
@@ -477,7 +420,6 @@ impl WireMutation {
         ) {
             (WireMutationKind::ReplaceSymlink, true, false, _)
             | (WireMutationKind::CopyFile, false, true, true)
-            | (WireMutationKind::Hardlink, false, true, _)
             | (WireMutationKind::CreateDirectory, false, false, false)
             | (WireMutationKind::RemoveFileLike, false, false, _)
             | (WireMutationKind::RemoveDirectory, false, false, _)
@@ -500,17 +442,13 @@ impl WireMutation {
                 field: "copy_source",
                 reason: "copy-file mutation requires a source path",
             }),
-            (WireMutationKind::Hardlink, _, _, _) => Err(ProtocolError::InvalidField {
-                field: "copy_source",
-                reason: "hardlink mutation requires a source path",
-            }),
             (_, true, _, _) => Err(ProtocolError::InvalidField {
                 field: "symlink_target",
                 reason: "target is valid only for replace-symlink mutation",
             }),
             (_, _, true, _) => Err(ProtocolError::InvalidField {
                 field: "copy_source",
-                reason: "copy source is valid only for copy-file or hardlink mutation",
+                reason: "copy source is valid only for copy-file mutation",
             }),
             (_, _, _, true) => Err(ProtocolError::InvalidField {
                 field: "expected_identity",
@@ -542,8 +480,7 @@ mod tests {
             WireMutation::remove_file_like(path(), Some([7; 32])),
             WireMutation::remove_directory(path(), None),
             WireMutation::remove_directory(path(), Some([8; 32])),
-            WireMutation::copy_file(path(), backup_dir.clone(), [7; 32]),
-            WireMutation::hardlink(path(), backup_dir, [3; 32], None),
+            WireMutation::copy_file(path(), backup_dir, [7; 32]),
             WireMutation::verify_publication(path(), [4; 32], WireEntryKind::Symlink),
         ];
         for mutation in mutations {
@@ -568,14 +505,11 @@ mod tests {
         let copy = WireMutation::copy_file(path(), path(), [7; 32])
             .encode()
             .unwrap();
-        let hardlink = WireMutation::hardlink(path(), path(), [3; 32], Some([4; 32]))
-            .encode()
-            .unwrap();
         let verification =
             WireMutation::verify_publication(path(), [4; 32], WireEntryKind::Symlink)
                 .encode()
                 .unwrap();
-        for message in [&encoded, &symlink, &copy, &hardlink, &verification] {
+        for message in [&encoded, &symlink, &copy, &verification] {
             for len in 0..message.len() {
                 assert!(WireMutation::decode(&message[..len]).is_err());
             }
@@ -621,14 +555,16 @@ mod tests {
         *invalid_copy_flag.last_mut().unwrap() = 2;
         assert!(WireMutation::decode(&invalid_copy_flag).is_err());
         let mut unknown = encoded.to_vec();
-        unknown[0] = u8::MAX;
-        assert!(matches!(
-            WireMutation::decode(&unknown),
-            Err(ProtocolError::InvalidField {
-                field: "mutation_kind",
-                ..
-            })
-        ));
+        for kind in [6, u8::MAX] {
+            unknown[0] = kind;
+            assert!(matches!(
+                WireMutation::decode(&unknown),
+                Err(ProtocolError::InvalidField {
+                    field: "mutation_kind",
+                    ..
+                })
+            ));
+        }
     }
 
     proptest! {

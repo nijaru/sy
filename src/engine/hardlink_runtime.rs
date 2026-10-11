@@ -4,6 +4,8 @@ use super::hardlink_preflight::catalogue::{HardlinkCatalogue, MemberCursor};
 use super::plan_journal::{PlanJournalReader, PlanRecordPosition};
 use crate::rooted_fs::PublishedFileProof;
 
+pub(crate) mod intent;
+
 #[cfg(test)]
 mod tests;
 
@@ -129,12 +131,20 @@ impl<'a> HardlinkGroupPlan<'a> {
         Ok(())
     }
 
+    /// Remote completion acknowledgements must not precede the same exact
+    /// membership check that the controller requires on return.
+    pub(crate) async fn verify_complete(&mut self) -> Result<(), GroupError> {
+        if !self.healthy || self.completion.next().await?.is_some() || self.completed == 0 {
+            self.healthy = false;
+            return Err(GroupError::Invalid("selected members remain incomplete"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn finish(
         mut self,
     ) -> Result<(super::controller::SyncSummary, [u8; 32]), GroupError> {
-        if !self.healthy || self.completion.next().await?.is_some() || self.completed == 0 {
-            return Err(GroupError::Invalid("selected members remain incomplete"));
-        }
+        self.verify_complete().await?;
         Ok((self.summary, *self.seal.finalize().as_bytes()))
     }
 }

@@ -5,23 +5,26 @@ use crate::protocol::{
     Frame, FrameFlags, FrameKind, PlatformOs, ProtocolError, StreamId, WireData, WireDeltaCopy,
     WireFileBasis, WireFileBegin, WireFileEnd, MAX_TRANSFER_DATA_SIZE,
 };
-use crate::remote::data::DataChunk;
 use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
 };
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
-use crate::rooted_fs::{RootedFs, RootedFsError, RootedStagedFile};
+use crate::rooted_fs::{RootedFs, RootedFsError};
 use crate::transfer::delta::{match_delta, BasisIndex, DeltaMatchError, DeltaOp};
 use bytes::Bytes;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read};
+#[cfg(test)]
+use std::io::{Seek, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 pub(crate) const PRODUCER_QUEUE_DEPTH: usize = 8;
-const RECONSTRUCTION_QUEUE_DEPTH: usize = 8;
-const COPY_BUFFER_SIZE: usize = 64 * 1024;
+pub(super) mod population;
+use population::{prepare_reconstruction, ReconstructionReceiver};
+#[cfg(test)]
+use population::{reconstruct_file, ReconstructionOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransferPreservationRequest {
@@ -151,6 +154,17 @@ pub enum RemoteTransferError {
     #[error("file reconstruction worker stopped before transfer completion")]
     ReconstructionStopped,
 
+    #[error(
+        "file reconstruction failed ({operation}); private staging abort also failed ({abort})"
+    )]
+    ReconstructionAbortFailed {
+        operation: Box<RemoteTransferError>,
+        abort: Box<RemoteTransferError>,
+    },
+
+    #[error("file reconstruction requires an empty private staging file")]
+    NonemptyReconstructionStage,
+
     #[error("file transfer stream {stream_id} ended before FileEnd")]
     UnexpectedStreamEnd { stream_id: u32 },
 
@@ -221,23 +235,6 @@ pub(crate) enum ProducerItem {
     /// `FrameFlags::COMPRESSED` so the receiver knows to decompress.
     CompressedData(Bytes),
     Copy(WireDeltaCopy),
-}
-
-enum ReconstructionOp {
-    Data(DataChunk),
-    Copy(WireDeltaCopy),
-    Xattrs(Vec<(OsString, Vec<u8>)>),
-    Acls(String),
-    End(WireFileEnd),
-}
-
-struct PreparedReconstruction {
-    staged: RootedStagedFile,
-    /// Opened only on the first Copy, never for an all-literal replacement.
-    basis: Option<File>,
-    rooted: RootedFs,
-    relative: RelativePath,
-    expectation: Option<WireFileBasis>,
 }
 
 /// Prove the destination still carries the state the client scanned.
@@ -592,6 +589,31 @@ pub(super) async fn send_produced_file(
     produced
 }
 
+/// Decode the existing FileBegin before preparing native staging. Group owners
+/// can use this same boundary for a FileBegin received within their held inbox.
+pub(super) fn decode_reconstruction_begin(
+    frame: &Frame,
+    stream_id: StreamId,
+    peer: PlatformOs,
+) -> Result<(WireFileBegin, RelativePath)> {
+    require_stream(frame, stream_id)?;
+    require_empty_flags(frame)?;
+    if frame.kind() != FrameKind::FileBegin {
+        return Err(RemoteTransferError::UnexpectedFrame {
+            expected: FrameKind::FileBegin,
+            actual: frame.kind(),
+        });
+    }
+    let begin = WireFileBegin::decode(frame.payload())?;
+    if begin.bsd_flags().is_some() && !cfg!(target_os = "macos") {
+        return Err(RemoteTransferError::PreservationUnavailable {
+            feature: "BSD flags",
+        });
+    }
+    let relative = decode_relative_path(begin.path.clone(), peer)?;
+    Ok((begin, relative))
+}
+
 /// Reconstruct one peer-opened file stream beneath the root pinned when the v3
 /// session was opened. FileBegin may securely reopen a destination basis through
 /// that descriptor, but the session root pathname is never resolved again.
@@ -603,22 +625,7 @@ pub async fn serve_incoming_file_rooted(
 ) -> Result<TransferSummary> {
     let IncomingStream { first, mut inbox } = incoming;
     let stream_id = inbox.stream_id();
-    let first_frame = first.frame();
-    require_stream(first_frame, stream_id)?;
-    require_empty_flags(first_frame)?;
-    if first_frame.kind() != FrameKind::FileBegin {
-        return Err(RemoteTransferError::UnexpectedFrame {
-            expected: FrameKind::FileBegin,
-            actual: first_frame.kind(),
-        });
-    }
-    let begin = WireFileBegin::decode(first_frame.payload())?;
-    if begin.bsd_flags().is_some() && !cfg!(target_os = "macos") {
-        return Err(RemoteTransferError::PreservationUnavailable {
-            feature: "BSD flags",
-        });
-    }
-    let relative = decode_relative_path(begin.path.clone(), peer)?;
+    let (begin, relative) = decode_reconstruction_begin(first.frame(), stream_id, peer)?;
     drop(first);
 
     let basis = begin.basis();
@@ -627,32 +634,13 @@ pub async fn serve_incoming_file_rooted(
             .await
             .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??;
 
-    let (reconstruction_tx, reconstruction_rx) = mpsc::channel(RECONSTRUCTION_QUEUE_DEPTH);
-    let begin_for_worker = begin.clone();
+    let mut receiver = ReconstructionReceiver::start(prepared, begin);
+    let ready = receiver.receive(&mut inbox, require_file_end_flags).await?;
     let admission = sender.publication_admission();
-    let mut worker = tokio::task::spawn_blocking(move || {
-        reconstruct_file(prepared, begin_for_worker, reconstruction_rx, &admission)
-    });
-
-    // A malformed frame closes admission and joins the staging owner before
-    // returning. Also observe worker failure while waiting for peer input: a
-    // rejected chunk must not require another frame to wake the receiver.
-    let (summary, publication) = tokio::select! {
-        received = receive_reconstruction(&mut inbox, &begin, &reconstruction_tx) => {
-            drop(reconstruction_tx);
-            let reconstructed = await_reconstruction(worker).await;
-            match (received, reconstructed) {
-                (Ok(()), result) => result?,
-                (Err(RemoteTransferError::ReconstructionStopped), Err(error)) => return Err(error),
-                (Err(error), _) => return Err(error),
-            }
-        }
-        reconstructed = &mut worker => {
-            drop(reconstruction_tx);
-            reconstructed
-                .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??
-        }
-    };
+    let (summary, publication) =
+        tokio::task::spawn_blocking(move || ready.commit_blocking(&admission))
+            .await
+            .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))??;
     sender
         .send(Frame::new(
             FrameKind::Ack,
@@ -662,94 +650,6 @@ pub async fn serve_incoming_file_rooted(
         )?)
         .await?;
     Ok(summary)
-}
-
-async fn receive_reconstruction(
-    inbox: &mut StreamInbox,
-    begin: &WireFileBegin,
-    reconstruction_tx: &mpsc::Sender<ReconstructionOp>,
-) -> Result<()> {
-    let stream_id = inbox.stream_id();
-    let mut seen_xattrs = false;
-    let mut seen_acls = false;
-
-    loop {
-        let routed = inbox
-            .recv()
-            .await?
-            .ok_or(RemoteTransferError::UnexpectedStreamEnd {
-                stream_id: stream_id.get(),
-            })?;
-        let frame = routed.frame();
-        require_stream(frame, stream_id)?;
-
-        let op = match frame.kind() {
-            FrameKind::Data => ReconstructionOp::Data(DataChunk::from_frame(frame)?),
-            FrameKind::DeltaCopy => {
-                require_empty_flags(frame)?;
-                if begin.basis().is_none() {
-                    return Err(RemoteTransferError::CopyWithoutBasis);
-                }
-                ReconstructionOp::Copy(WireDeltaCopy::decode(frame.payload())?)
-            }
-            FrameKind::FileXattrs => {
-                require_empty_flags(frame)?;
-                if seen_xattrs {
-                    return Err(RemoteTransferError::UnexpectedFrame {
-                        expected: FrameKind::FileEnd,
-                        actual: FrameKind::FileXattrs,
-                    });
-                }
-                seen_xattrs = true;
-                let entries = crate::protocol::WireXattrResult::decode(frame.payload())?;
-                let xattrs = entries
-                    .entries()
-                    .iter()
-                    .map(|entry| {
-                        Ok((
-                            crate::engine::native_path::decode(entry.name())?.into_os_string(),
-                            entry.value().to_vec(),
-                        ))
-                    })
-                    .collect::<std::result::Result<Vec<(OsString, Vec<u8>)>, std::io::Error>>()?;
-                ReconstructionOp::Xattrs(xattrs)
-            }
-            FrameKind::FileAcls => {
-                require_empty_flags(frame)?;
-                if seen_acls {
-                    return Err(RemoteTransferError::UnexpectedFrame {
-                        expected: FrameKind::FileEnd,
-                        actual: FrameKind::FileAcls,
-                    });
-                }
-                seen_acls = true;
-                ReconstructionOp::Acls(
-                    crate::protocol::WireAcl::decode(frame.payload())?
-                        .text()
-                        .to_string(),
-                )
-            }
-            FrameKind::FileEnd => {
-                require_file_end_flags(frame)?;
-                ReconstructionOp::End(WireFileEnd::decode(frame.payload())?)
-            }
-            actual => {
-                return Err(RemoteTransferError::UnexpectedFrame {
-                    expected: FrameKind::FileEnd,
-                    actual,
-                });
-            }
-        };
-        let is_end = matches!(op, ReconstructionOp::End(_));
-        reconstruction_tx
-            .send(op)
-            .await
-            .map_err(|_| RemoteTransferError::ReconstructionStopped)?;
-        drop(routed);
-        if is_end {
-            return Ok(());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -763,7 +663,7 @@ async fn serve_incoming_file(
     serve_incoming_file_rooted(rooted, incoming, sender, peer).await
 }
 
-fn produce_source(
+pub(super) fn produce_source(
     mut file: File,
     expected_identity: EntryIdentity,
     expected_size: u64,
@@ -901,183 +801,6 @@ pub(crate) fn produce_whole(
     })
 }
 
-fn prepare_reconstruction(
-    rooted: RootedFs,
-    relative: &RelativePath,
-    expectation: Option<WireFileBasis>,
-) -> Result<PreparedReconstruction> {
-    validate_destination_state(&rooted, relative, expectation)?;
-    let expected_destination =
-        expectation.map_or(crate::endpoint::ExpectedDestination::Absent, |expected| {
-            crate::endpoint::ExpectedDestination::Unchanged(EntryIdentity::from_bytes(
-                expected.identity(),
-            ))
-        });
-    let staged =
-        rooted.begin_staged_file_with_expectation_blocking(relative, expected_destination)?;
-    Ok(PreparedReconstruction {
-        staged,
-        basis: None,
-        rooted,
-        relative: relative.clone(),
-        expectation,
-    })
-}
-
-fn reconstruct_file(
-    mut prepared: PreparedReconstruction,
-    begin: WireFileBegin,
-    mut receiver: mpsc::Receiver<ReconstructionOp>,
-    admission: &std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
-) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
-    let mut hasher = blake3::Hasher::new();
-    let mut file_size = 0_u64;
-    let mut literal_bytes = 0_u64;
-    let mut reused_bytes = 0_u64;
-    // Preservation frames buffer as bounded sets and are applied to staging
-    // between metadata and commit, matching the local transaction lifecycle.
-    let mut xattrs: Option<Vec<(OsString, Vec<u8>)>> = None;
-    let mut acls: Option<String> = None;
-
-    while let Some(op) = receiver.blocking_recv() {
-        match op {
-            ReconstructionOp::Data(chunk) => {
-                let bytes = chunk.decode_blocking()?;
-                file_size = checked_output_size(file_size, bytes.len(), begin.file_size())?;
-                prepared.staged.file_mut().write_all(&bytes)?;
-                hasher.update(&bytes);
-                literal_bytes = literal_bytes
-                    .checked_add(
-                        u64::try_from(bytes.len())
-                            .map_err(|_| RemoteTransferError::ByteCountOverflow)?,
-                    )
-                    .ok_or(RemoteTransferError::ByteCountOverflow)?;
-            }
-            ReconstructionOp::Copy(copy) => {
-                let expected = prepared
-                    .expectation
-                    .ok_or(RemoteTransferError::CopyWithoutBasis)?;
-                if prepared.basis.is_none() {
-                    let file = prepared.rooted.open_regular_blocking(&prepared.relative)?;
-                    validate_basis(&prepared.rooted, &file, &prepared.relative, expected)?;
-                    prepared.basis = Some(file);
-                }
-                let basis = prepared
-                    .basis
-                    .as_mut()
-                    .ok_or(RemoteTransferError::CopyWithoutBasis)?;
-                file_size = checked_output_size(
-                    file_size,
-                    usize::try_from(copy.copy_len())
-                        .map_err(|_| RemoteTransferError::ByteCountOverflow)?,
-                    begin.file_size(),
-                )?;
-                copy_basis_range(
-                    basis,
-                    expected,
-                    copy,
-                    prepared.staged.file_mut(),
-                    &mut hasher,
-                )?;
-                reused_bytes = reused_bytes
-                    .checked_add(u64::from(copy.copy_len()))
-                    .ok_or(RemoteTransferError::ByteCountOverflow)?;
-            }
-            ReconstructionOp::Xattrs(values) => xattrs = Some(values),
-            ReconstructionOp::Acls(text) => acls = Some(text),
-            ReconstructionOp::End(end) => {
-                if end.file_size() != begin.file_size() || file_size != begin.file_size() {
-                    return Err(RemoteTransferError::SizeMismatch {
-                        expected_size: begin.file_size(),
-                        announced_size: end.file_size(),
-                        actual_size: file_size,
-                    });
-                }
-                let digest = *hasher.finalize().as_bytes();
-                if digest != end.digest() {
-                    return Err(RemoteTransferError::DigestMismatch);
-                }
-                let modified = begin
-                    .modified()
-                    .map(|(seconds, nanoseconds)| Timestamp::new(seconds, nanoseconds))
-                    .transpose()
-                    .map_err(|_| ProtocolError::InvalidField {
-                        field: "modified_nanoseconds",
-                        reason: "nanoseconds must be below 1,000,000,000",
-                    })?;
-                prepared.staged.apply_preservation_blocking(
-                    begin.unix_mode(),
-                    modified,
-                    xattrs.as_deref(),
-                    acls.as_deref(),
-                )?;
-                if prepared.staged.staged_hash_blocking()?.as_bytes() != &digest {
-                    return Err(RemoteTransferError::DigestMismatch);
-                }
-                // The scanned destination state must still hold at commit.
-                validate_destination_state(
-                    &prepared.rooted,
-                    &prepared.relative,
-                    prepared.expectation,
-                )?;
-                if let Some(basis) = prepared.basis.as_ref() {
-                    validate_basis(
-                        &prepared.rooted,
-                        basis,
-                        &prepared.relative,
-                        prepared
-                            .expectation
-                            .ok_or(RemoteTransferError::CopyWithoutBasis)?,
-                    )?;
-                }
-                let published = prepared.staged.commit_with_admission(admission)?;
-                let proof = published.finalize_blocking(begin.bsd_flags())?;
-                return Ok((
-                    TransferSummary {
-                        file_size,
-                        digest,
-                        literal_bytes,
-                        reused_bytes,
-                    },
-                    proof,
-                ));
-            }
-        }
-    }
-
-    Err(RemoteTransferError::MissingFileEnd)
-}
-
-fn copy_basis_range(
-    basis: &mut File,
-    expected: WireFileBasis,
-    copy: WireDeltaCopy,
-    destination: &mut File,
-    hasher: &mut blake3::Hasher,
-) -> Result<()> {
-    let end = copy.end()?;
-    if end > expected.file_size() {
-        return Err(RemoteTransferError::CopyOutOfBounds {
-            offset: copy.basis_offset(),
-            end,
-            basis_size: expected.file_size(),
-        });
-    }
-
-    basis.seek(SeekFrom::Start(copy.basis_offset()))?;
-    let mut remaining =
-        usize::try_from(copy.copy_len()).map_err(|_| RemoteTransferError::ByteCountOverflow)?;
-    let mut buffer = [0_u8; COPY_BUFFER_SIZE];
-    while remaining != 0 {
-        let take = remaining.min(buffer.len());
-        basis.read_exact(&mut buffer[..take])?;
-        destination.write_all(&buffer[..take])?;
-        hasher.update(&buffer[..take]);
-        remaining -= take;
-    }
-    Ok(())
-}
-
 fn checked_output_size(current: u64, added: usize, expected_size: u64) -> Result<u64> {
     let added = u64::try_from(added).map_err(|_| RemoteTransferError::ByteCountOverflow)?;
     let next = current
@@ -1154,16 +877,6 @@ pub(crate) async fn receive_ack(
     Ok(crate::protocol::WireFileAck::decode(frame.payload())?)
 }
 
-async fn await_reconstruction(
-    worker: tokio::task::JoinHandle<
-        Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)>,
-    >,
-) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
-    worker
-        .await
-        .map_err(|error| RemoteTransferError::ReconstructionJoin(error.to_string()))?
-}
-
 fn require_stream(frame: &Frame, stream_id: StreamId) -> Result<()> {
     if frame.stream_id() == stream_id {
         Ok(())
@@ -1198,10 +911,14 @@ fn require_file_end_flags(frame: &Frame) -> Result<()> {
 }
 
 #[cfg(all(test, unix))]
+mod population_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::engine::rolling::WeakChecksum;
     use crate::protocol::Operation;
+    use crate::remote::data::DataChunk;
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use crate::remote::{client_handshake, server_handshake};
     use crate::transfer::delta::{BasisBlock, BasisIndexLimits};
@@ -1898,12 +1615,7 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::channel(2);
         let worker = tokio::task::spawn_blocking(move || {
-            reconstruct_file(
-                prepared,
-                begin,
-                rx,
-                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
-            )
+            population::populate_reconstruction(prepared, begin, rx)
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
@@ -2101,11 +1813,18 @@ mod tests {
     #[tokio::test]
     async fn preservation_failure_aborts_reconstruction() {
         let root = tempfile::TempDir::new().unwrap();
+        let target = root.path().join("file");
+        std::fs::write(&target, b"old").unwrap();
+        let original = std::fs::metadata(&target).unwrap();
+        let expectation = WireFileBasis::new(
+            original.len(),
+            *opened_identity(&original).unwrap().as_bytes(),
+        );
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let relative = RelativePath::new(PathBuf::from("file")).unwrap();
         let prepared = tokio::task::spawn_blocking({
             let relative = relative.clone();
-            move || prepare_reconstruction(rooted, &relative, None)
+            move || prepare_reconstruction(rooted, &relative, Some(expectation))
         })
         .await
         .unwrap()
@@ -2115,12 +1834,7 @@ mod tests {
         let begin = WireFileBegin::whole(wire_path, 3);
         let (tx, rx) = mpsc::channel(4);
         let worker = tokio::task::spawn_blocking(move || {
-            reconstruct_file(
-                prepared,
-                begin,
-                rx,
-                &std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
-            )
+            population::populate_reconstruction(prepared, begin, rx)
         });
         tx.send(ReconstructionOp::Data(DataChunk::Plain(
             Bytes::from_static(b"new"),
@@ -2139,8 +1853,16 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        assert!(worker.await.unwrap().is_err());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(RemoteTransferError::RootedFs(_))
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        let preserved = std::fs::metadata(&target).unwrap();
+        assert_eq!(preserved.ino(), original.ino());
+        assert_eq!(preserved.mode(), original.mode());
+        assert_eq!(preserved.mtime(), original.mtime());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     /// Whole-file replacement of a scanned symlink is a legal type transition:

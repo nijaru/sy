@@ -5,10 +5,8 @@ use crate::engine::compression::CompressionPolicy;
 use crate::engine::delete_plan::DeleteAction;
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, SyncOp, Timestamp};
 use crate::engine::finalize_journal::FinalizeMetadata;
-use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler, SchedulerError};
-use crate::engine::work::TransferSummary;
 use crate::engine::work::WorkItem;
 use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::bsdflags::RemoteBsdFlagsError;
@@ -79,6 +77,10 @@ pub enum RemotePushLowerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePushError {
+    #[error("hardlink group failed: {0}")]
+    Group(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("remote destination may be committed; source completion uncertain: {0}")]
+    SourceCompletionUncertain(#[source] Box<RemotePushError>),
     #[error(transparent)]
     Directory(#[from] crate::rooted_fs::RootedFsError),
     #[error("hardlink bookkeeping failed: {0}")]
@@ -115,6 +117,8 @@ pub enum RemotePushError {
     #[error(transparent)]
     BsdFlags(#[from] RemoteBsdFlagsError),
 }
+
+mod group;
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
 pub type Result<T> = std::result::Result<T, RemotePushError>;
@@ -416,13 +420,8 @@ pub struct RemotePushExecutor {
     backup: Option<RemoteBackupPlan>,
     /// -z/--compress: chunk compression policy for file transfers.
     compression: Option<CompressionPolicy>,
-    /// -H/--preserve-hardlinks: exact scratch state retains each group's
-    /// committed representative and inode metadata. Grouped work serializes
-    /// through publication; ungrouped files stay concurrent. Skipped entries
-    /// do not establish representatives.
     hardlinks: bool,
-    hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
-    hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal,
+    hardlink_removals: group::DeferredSourceRemovals,
     /// -X/--preserve-xattrs: mirror the local source's extended attributes
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -462,6 +461,19 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
             return self.lower_unchanged_file_preservation(source, destination, policy);
         }
         lower_sync_op(op, policy).map_err(RemotePushError::from)
+    }
+
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        self.hardlinks
+    }
+
+    async fn execute_hardlink_group(
+        &self,
+        group: &mut crate::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        policy: ExecutionPolicy,
+    ) -> Result<Option<()>> {
+        self.execute_whole_group(group, policy).await?;
+        Ok(Some(()))
     }
 
     fn is_directory_action(&self, action: &RemotePushAction) -> bool {
@@ -520,8 +532,7 @@ impl RemotePushExecutor {
             backup: None,
             compression: None,
             hardlinks: false,
-            hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
-            hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal::default(),
+            hardlink_removals: group::DeferredSourceRemovals::default(),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -615,6 +626,18 @@ impl RemotePushExecutor {
         item: WorkItem<RemotePushAction>,
     ) -> Result<crate::engine::work::WorkResult> {
         let (action, resources) = item.into_parts();
+        if self.hardlinks {
+            let source = match &action {
+                RemotePushAction::TransferFile { source, .. }
+                | RemotePushAction::ApplyMetadata { source, .. } => Some(source),
+                _ => None,
+            };
+            if source.is_some_and(|source| source.is_file() && source.hardlink_group.is_some()) {
+                return Err(RemotePushError::Group(Box::new(std::io::Error::other(
+                    "selected hardlinks require sealed whole-group execution",
+                ))));
+            }
+        }
         if let RemotePushAction::TransferFile {
             destination_path,
             destination: Some(observed),
@@ -672,27 +695,6 @@ impl RemotePushExecutor {
                 destination,
                 metadata,
             } => {
-                // -H/--preserve-hardlinks: members of one scanned group
-                // share a single transferred representative; the rest become
-                // server-side links to it. The group mutex is held across a
-                // grouped transfer so members serialize (ungrouped files
-                // stay concurrent); the legacy executor was fully serial
-                // here, so this is strictly more concurrent.
-                if self.hardlinks {
-                    if let Some(identity) = source.hardlink_group {
-                        let group = *identity.as_bytes();
-                        return self
-                            .execute_grouped_file(
-                                source,
-                                destination_path,
-                                destination,
-                                metadata,
-                                group,
-                            )
-                            .await
-                            .map(crate::engine::work::WorkResult::Transfer);
-                    }
-                }
                 let is_update = destination.is_some();
                 // --backup preserves the replaced destination file first. The
                 // server copies it beneath the pinned root before the staged
@@ -836,203 +838,13 @@ impl RemotePushExecutor {
         }
     }
 
-    /// One grouped regular file under `-H`: transfer the representative or
-    /// link subsequent members to it. The caller holds no locks; this method
-    /// owns group serialization. A linking member revalidates its scan
-    /// identity first so a source replaced after the scan fails loudly
-    /// instead of linking stale bytes.
-    async fn execute_grouped_file(
-        &self,
-        source: Entry,
-        destination_path: RelativePath,
-        destination: Option<Entry>,
-        metadata: TransferMetadata,
-        group: [u8; 32],
-    ) -> Result<TransferSummary> {
-        let groups = self.hardlink_groups.lock().await;
-        if let Some(first) = groups.get(group).await? {
-            self.check_source_identity(&source).await?;
-            first.validate_metadata(metadata.unix_mode, metadata.modified)?;
-            if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
-                if existing.is_file() {
-                    let backup_path = plan.destination(&existing.path).ok_or_else(|| {
-                        RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
-                    })?;
-                    self.copy_backup(&existing.path, &backup_path, existing.identity)
-                        .await?;
-                }
-            }
-            let expected_destination = destination
-                .as_ref()
-                .map(|entry| {
-                    entry.identity.ok_or_else(|| {
-                        RemotePushError::MissingDestinationIdentity(
-                            entry.path.as_path().to_path_buf(),
-                        )
-                    })
-                })
-                .transpose()?;
-            let publication = self
-                .remote
-                .hardlink(
-                    &first.path,
-                    &destination_path,
-                    first.publication,
-                    expected_destination,
-                )
-                .await?;
-            groups.advance(group, publication.identity).await?;
-            let receipt = PublishedDestinationReceipt::for_hardlink(
-                source.path.clone(),
-                destination_path.clone(),
-                source.identity,
-                publication,
-            );
-            self.defer_grouped_source_removal(group, &receipt, &source)
-                .await?;
-            let op = if destination.is_some() {
-                crate::sync::output::ItemizeOp::Update
-            } else {
-                crate::sync::output::ItemizeOp::Create
-            };
-            self.report(
-                op,
-                crate::sync::output::ItemizeKind::File,
-                &destination_path,
-            );
-            return Ok(TransferSummary {
-                file_size: source.size,
-                digest: [0_u8; 32],
-                literal_bytes: 0,
-                reused_bytes: source.size,
-            });
-        }
-        let is_update = destination.is_some();
-        if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
-            if existing.is_file() {
-                let backup_path = plan.destination(&existing.path).ok_or_else(|| {
-                    RemotePushError::InvalidBackupPath(existing.path.as_path().to_path_buf())
-                })?;
-                self.copy_backup(&existing.path, &backup_path, existing.identity)
-                    .await?;
-            }
-        }
-        let destination_transfer = self
-            .prepare_destination(destination_path.clone(), destination)
-            .await?;
-        let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        // The requester captures xattrs/ACLs from the same held file
-        // descriptor that produces transfer bytes.
-        let stream_policy = TransferStreamPolicy {
-            preservation: TransferPreservationRequest {
-                xattrs: self.xattrs,
-                acls: self.acls,
-            },
-            compression: self.compression,
-            final_flags: bsd_flags,
-        };
-        let representative_mode = metadata.unix_mode;
-        let representative_modified = metadata.modified;
-        let (summary, publication) = self
-            .remote
-            .transfer_file_with_stream_policy(
-                self.source_root.clone(),
-                source.clone(),
-                destination_transfer,
-                metadata,
-                stream_policy,
-            )
-            .await?;
-        let receipt = PublishedDestinationReceipt::for_file(
-            source.path.clone(),
-            destination_path.clone(),
-            source.identity,
-            &crate::endpoint::io::VerificationStatus::Verified,
-            publication,
-        );
-        groups
-            .insert(
-                group,
-                HardlinkRepresentative {
-                    path: destination_path.clone(),
-                    publication: receipt
-                        .publication()
-                        .map_err(std::io::Error::other)?
-                        .identity,
-                    unix_mode: representative_mode,
-                    modified: representative_modified,
-                },
-            )
-            .await?;
-        self.defer_grouped_source_removal(group, &receipt, &source)
-            .await?;
-        drop(groups);
-        let op = if is_update {
-            crate::sync::output::ItemizeOp::Update
-        } else {
-            crate::sync::output::ItemizeOp::Create
-        };
-        self.report(
-            op,
-            crate::sync::output::ItemizeKind::File,
-            &destination_path,
-        );
-        Ok(summary)
-    }
-
-    async fn defer_grouped_source_removal(
-        &self,
-        group: [u8; 32],
-        receipt: &PublishedDestinationReceipt,
-        source: &Entry,
-    ) -> Result<()> {
-        if !self.remove_source_files {
-            return Ok(());
-        }
-        receipt.validate_source_removal(source).map_err(|error| {
-            RemotePushError::SourceRemoval(
-                self.source_root.path().join(source.path.as_path()),
-                std::io::Error::other(error.to_string()),
-            )
-        })?;
-        self.check_source_identity(source).await?;
-        self.hardlink_removals
-            .append(
-                group,
-                source,
-                receipt.publication().map_err(std::io::Error::other)?,
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn finish_deferred_source_removals(&self) -> Result<()> {
-        if self.remove_source_files && self.hardlinks {
-            let groups = self.hardlink_groups.lock().await;
-            self.hardlink_removals
-                .replay(self.source_root.clone(), &groups, |proof| async move {
-                    match proof {
-                        crate::engine::hardlink_removals::GroupDestinationProof::Published(
-                            proof,
-                        ) => self.remote.revalidate_publication(&proof).await,
-                        crate::engine::hardlink_removals::GroupDestinationProof::Existing {
-                            path,
-                            identity,
-                        } => {
-                            self.remote
-                                .revalidate_existing_destination(&path, identity)
-                                .await
-                        }
-                    }
-                    .map_err(std::io::Error::other)
-                })
-                .await?;
-        }
-        Ok(())
+        self.hardlink_removals.replay(self).await
     }
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
+        self.source_root.validate().await?;
         let rooted = self.source_root.rooted();
         let source = source.clone();
         tokio::task::spawn_blocking(move || existing::validate_path(&rooted, &source))
@@ -1190,15 +1002,6 @@ impl RemotePushExecutor {
         self.remote
             .revalidate_existing_destination(&destination.path, receipt.destination_identity())
             .await?;
-        if self.hardlinks {
-            if let Some(group) = source.hardlink_group {
-                self.check_source_identity(source).await?;
-                self.hardlink_removals
-                    .append_existing(*group.as_bytes(), source, &receipt)
-                    .await?;
-                return Ok(());
-            }
-        }
         existing::remove_verified_source(source_rooted, source.clone(), receipt, None).await?;
         Ok(())
     }

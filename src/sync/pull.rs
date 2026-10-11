@@ -296,27 +296,9 @@ async fn execute_bound(
     .map_err(map_controller_error)?;
 
     if config.preserve.hardlinks {
-        plan.validate_hardlink_bytes(|commitment| {
-            let remote = remote.clone();
-            let executor = &executor;
-            async move {
-                match commitment {
-                    sy::engine::hardlink_preflight::ByteCommitment::Source(entry) => {
-                        remote.content_hash(&entry).await.map_err(|error| {
-                            ControllerError::backend("source hardlink byte commitment", error)
-                        })
-                    }
-                    sy::engine::hardlink_preflight::ByteCommitment::Destination(entry) => executor
-                        .destination_content_hash(entry)
-                        .await
-                        .map_err(|error| {
-                            ControllerError::backend("destination hardlink byte commitment", error)
-                        }),
-                }
-            }
-        })
-        .await
-        .map_err(map_controller_error)?;
+        plan.seal_hardlink_membership()
+            .await
+            .map_err(map_controller_error)?;
     }
 
     if config.dry_run {
@@ -396,28 +378,55 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn hardlink_preflight_byte_commitments() {
-        super::super::hardlink_tests::assert_byte_commitments(
-            |source, destination, config| async move {
-                let (client, server) = super::super::hardlink_tests::remote_session(
-                    sy::protocol::Operation::Pull,
-                    &source,
+    async fn hardlink_pull_repairs_quick_equal_topology() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("first"), b"source").unwrap();
+        std::fs::hard_link(source.path().join("first"), source.path().join("second")).unwrap();
+        for name in ["first", "second"] {
+            std::fs::write(destination.path().join(name), b"target").unwrap();
+            for root in [source.path(), destination.path()] {
+                let path = root.join(name);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+                filetime::set_file_mtime(
+                    &path,
+                    filetime::FileTime::from_unix_time(1_600_000_000, 123),
                 )
-                .await;
-                let result = execute_with_handle(
-                    &source,
-                    &destination,
-                    client.request_handle(),
-                    client.sender(),
-                    &config,
-                    ScanOptions::default(),
-                )
-                .await;
-                super::super::hardlink_tests::finish_session(client, server).await;
-                result
-            },
+                .unwrap();
+            }
+        }
+        let (client, server) =
+            super::super::hardlink_tests::remote_session(Operation::Pull, source.path()).await;
+        let mut config = supported_config();
+        config.preserve.hardlinks = true;
+        let result = execute_with_handle(
+            source.path(),
+            destination.path(),
+            client.request_handle(),
+            client.sender(),
+            &config,
+            ScanOptions::default(),
         )
         .await;
+        super::super::hardlink_tests::finish_session(client, server).await;
+        let stats = result.unwrap();
+        assert_eq!(stats.files_updated, 2);
+        assert_eq!(stats.bytes_transferred, 6);
+        for name in ["first", "second"] {
+            assert_eq!(
+                std::fs::read(destination.path().join(name)).unwrap(),
+                b"source"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(destination.path().join("first"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(destination.path().join("second"))
+                .unwrap()
+                .ino()
+        );
     }
     use crate::sync::scanner::ScanOptions;
     use sy::protocol::Operation;
@@ -1010,10 +1019,8 @@ mod tests {
         );
     }
 
-    /// -H/--preserve-hardlinks on pull: one fetch moves the representative's
-    /// bytes; the other member links to it locally. The server sees exactly
-    /// scan + one fetch + member validation — no second fetch or mutation (the destination is
-    /// local, so linking never crosses the wire).
+    /// -H fetches canonical bytes once under one source lease, then publishes
+    /// all local aliases before exact completion of that lease.
     #[tokio::test]
     async fn hardlink_group_fetches_once_and_links_locally() {
         let source_root = TempDir::new().unwrap();
@@ -1025,62 +1032,8 @@ mod tests {
         )
         .unwrap();
 
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, server_writer) = tokio::io::split(server_io);
-        let (complete, completed) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, Default::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let rooted = session.scan_handler_rooted().unwrap();
-            let sender = session.sender();
-            let peer = session.client().platform.os;
-            // One scan, one fetch, and validation of the later member.
-            for _ in 0..3 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => {
-                        scan.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::FileFetch(incoming) => {
-                        sy::remote::fetch::serve_incoming_file_fetch(
-                            rooted.clone(),
-                            incoming,
-                            &sender,
-                            peer,
-                        )
-                        .await
-                        .unwrap();
-                    }
-                    IncomingRequest::Hash(incoming) => {
-                        sy::remote::hash::serve_incoming_hash_rooted(
-                            rooted.clone(),
-                            incoming,
-                            &sender,
-                            peer,
-                        )
-                        .await
-                        .unwrap();
-                    }
-                    _other => panic!("unexpected v3 pull request variant"),
-                }
-            }
-            // Closing transport before the admitted local link completes is
-            // cancellation, not a successful remote-session lifecycle.
-            completed.await.unwrap();
-        });
-
-        let session = sy::remote::runtime::ClientRemoteSession::connect(
-            client_reader,
-            client_writer,
-            Operation::Pull,
-            source_root.path(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let (session, server) =
+            super::super::hardlink_tests::remote_session(Operation::Pull, source_root.path()).await;
         let mut config = supported_config();
         config.preserve.hardlinks = true;
         let stats = execute_with_handle(
@@ -1094,8 +1047,7 @@ mod tests {
         .await
         .unwrap();
 
-        complete.send(()).unwrap();
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 2);
         assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
         assert_eq!(

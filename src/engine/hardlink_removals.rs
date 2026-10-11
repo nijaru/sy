@@ -559,13 +559,37 @@ mod tests {
                 .unwrap();
             let groups = super::super::hardlink_groups::HardlinkGroups::default();
             let group = [9; 32];
-            let mut proof = publish(&dest, &rel("member-0"));
+            let mut stage = dest
+                .begin_staged_file_with_expectation_blocking(
+                    &rel("member-0"),
+                    crate::endpoint::ExpectedDestination::Absent,
+                )
+                .unwrap();
+            stage.file_mut().write_all(b"x").unwrap();
+            let mut owner = stage.into_group_blocking().unwrap();
+            let admission = Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+            for index in 0..LINKS {
+                owner
+                    .publish_member_blocking(
+                        &rel(&format!("member-{index}")),
+                        crate::endpoint::ExpectedDestination::Absent,
+                        &admission,
+                        || Ok(()),
+                    )
+                    .unwrap();
+            }
+            let finalized = owner
+                .finish_blocking(rel("member-0"), None, admission)
+                .unwrap();
+            let first = finalized
+                .proof_for_member_blocking(&rel("member-0"))
+                .unwrap();
             groups
                 .insert(
                     group,
                     super::super::hardlink_groups::HardlinkRepresentative {
-                        path: proof.path.clone(),
-                        publication: proof.identity,
+                        path: first.path,
+                        publication: first.identity,
                         unix_mode: None,
                         modified: None,
                     },
@@ -577,17 +601,10 @@ mod tests {
                 let (_, identity) = rooted.path_identity_blocking(&path).unwrap().unwrap();
                 let mut entry = Entry::file(path, 1, Timestamp::UNIX_EPOCH);
                 entry.identity = Some(identity);
-                if index != 0 {
-                    proof = dest
-                        .publish_hardlink_blocking(
-                            &rel("member-0"),
-                            &entry.path,
-                            proof.identity,
-                            crate::endpoint::ExpectedDestination::Absent,
-                        )
-                        .unwrap();
-                    groups.advance(group, proof.identity).await.unwrap();
-                }
+                let proof = finalized
+                    .proof_for_member_blocking(&entry.path)
+                    .unwrap()
+                    .into();
                 journal.append(group, &entry, &proof).await.unwrap();
             }
             journal

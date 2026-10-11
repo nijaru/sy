@@ -5,6 +5,7 @@ mod metadata;
 #[cfg(all(unix, feature = "acl"))]
 use acl_state::{acl_matches_fd, apply_acl_fd, desired_acl_entries, read_acl_entries_fd};
 mod group;
+pub(crate) use group::RootedStagedGroup;
 mod group_metadata;
 #[cfg(all(test, unix))]
 mod group_tests;
@@ -2301,6 +2302,19 @@ impl RootedFs {
         _kind: EntryKind,
         _expected: EntryIdentity,
     ) -> Result<u32> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    /// Read demand-driven flags from the ORIGINAL held content descriptor.
+    /// The source carrier owns identity/name validation around this read.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn read_open_file_bsd_flags_blocking(&self, file: &File) -> Result<u32> {
+        use std::os::macos::fs::MetadataExt;
+        Ok(file.metadata()?.st_flags())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn read_open_file_bsd_flags_blocking(&self, _file: &File) -> Result<u32> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 

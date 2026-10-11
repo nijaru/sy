@@ -1,4 +1,4 @@
-//! Exact 3.10 operand vocabulary. Names and operands use target-native bytes.
+//! Operand vocabulary. Names and operands use target-native bytes.
 use super::codec::SliceReader;
 use super::{ProtocolError, Result, WirePath, MAX_WIRE_PATH_BYTES};
 use bytes::{BufMut, Bytes, BytesMut};

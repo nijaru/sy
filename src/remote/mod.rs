@@ -2,6 +2,7 @@ pub mod acl;
 pub mod bsdflags;
 mod data;
 pub mod fetch;
+pub(crate) mod group;
 pub mod hash;
 pub mod local_executor;
 pub mod operand;
@@ -15,6 +16,7 @@ pub mod runtime;
 pub mod scan;
 pub mod serve;
 pub mod signature;
+pub(crate) mod source_file;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod transfer;

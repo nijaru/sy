@@ -239,39 +239,9 @@ async fn execute_bound(
 
     source_authority.validate().await.map_err(map_io)?;
     if config.preserve.hardlinks {
-        plan.validate_hardlink_bytes(|commitment| {
-            let remote = remote.clone();
-            let source_authority = source_authority.clone();
-            async move {
-                match commitment {
-                    sy::engine::hardlink_preflight::ByteCommitment::Source(entry) => {
-                        let endpoint = source_authority.endpoint();
-                        observed_hash(
-                            &endpoint,
-                            &entry,
-                            config.preserve.symlink_mode == SymlinkMode::Follow,
-                        )
-                        .await
-                        .map_err(|error| {
-                            sy::engine::controller::ControllerError::backend(
-                                "source hardlink byte commitment",
-                                error,
-                            )
-                        })
-                    }
-                    sy::engine::hardlink_preflight::ByteCommitment::Destination(entry) => {
-                        remote.content_hash(&entry).await.map_err(|error| {
-                            sy::engine::controller::ControllerError::backend(
-                                "destination hardlink byte commitment",
-                                error,
-                            )
-                        })
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(map_controller_error)?;
+        plan.seal_hardlink_membership()
+            .await
+            .map_err(map_controller_error)?;
     }
 
     if config.dry_run {
@@ -438,8 +408,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn hardlink_preflight_byte_commitments() {
-        super::super::hardlink_tests::assert_byte_commitments(execute_hardlink_fixture).await;
+    async fn hardlink_create_and_quick_equal_repair_use_selected_first_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for (missing, permissions, expected_mode) in
+            [("a", false, 0o640), ("b", false, 0o600), ("b", true, 0o640)]
+        {
+            let source = TempDir::new().unwrap();
+            let destination = TempDir::new().unwrap();
+            std::fs::write(source.path().join("a"), b"SOURCE").unwrap();
+            std::fs::set_permissions(
+                source.path().join("a"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            std::fs::hard_link(source.path().join("a"), source.path().join("b")).unwrap();
+            let existing = if missing == "a" { "b" } else { "a" };
+            std::fs::write(destination.path().join(existing), b"OLDOLD").unwrap();
+            std::fs::set_permissions(
+                destination.path().join(existing),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let time = filetime::FileTime::from_last_modification_time(
+                &std::fs::metadata(source.path().join(existing)).unwrap(),
+            );
+            filetime::set_file_mtime(destination.path().join(existing), time).unwrap();
+            let mut config = supported_config();
+            config.preserve.hardlinks = true;
+            config.preserve.permissions = permissions;
+            let stats = execute_hardlink_fixture(
+                source.path().to_path_buf(),
+                destination.path().to_path_buf(),
+                config,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.bytes_transferred, 6);
+            assert_eq!(stats.files_created, 1);
+            assert_eq!(stats.files_updated, 1);
+            let a = std::fs::metadata(destination.path().join("a")).unwrap();
+            let b = std::fs::metadata(destination.path().join("b")).unwrap();
+            assert_eq!(a.ino(), b.ino());
+            assert_eq!(a.mode() & 0o777, expected_mode);
+            assert_eq!(
+                std::fs::read(destination.path().join("b")).unwrap(),
+                b"SOURCE"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -833,11 +848,9 @@ mod tests {
         assert!(destination_root.path().join("sub").is_dir());
     }
 
-    /// -H/--preserve-hardlinks over v3: members of one scanned group share
-    /// a single transferred representative; the rest become server-side
-    /// links to it. One file's bytes move; both destination paths share one
-    /// inode. With --remove-source-files, local source names are removed only
-    /// after the whole group has published.
+    /// Exercise the CLI adapter through the compiled whole-group server:
+    /// population occurs once and removals follow exact final group proof.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hardlink_group_shares_one_transfer_and_removes_sources_over_v3() {
         let source_root = TempDir::new().unwrap();
@@ -849,42 +862,9 @@ mod tests {
         )
         .unwrap();
 
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let mutation = session.mutation_handler().unwrap();
-            // Destination scan, representative transfer, member publication,
-            // and both final destination proofs before grouped source removal.
-            for _ in 0..5 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected hardlink v3 adapter request"),
-                }
-            }
-        });
-
-        let session = ClientRemoteSession::connect(
-            client_reader,
-            client_writer,
-            Operation::Push,
-            destination_root.path(),
-            RouterConfig::default(),
-        )
-        .await
-        .unwrap();
+        let (session, server) =
+            super::super::hardlink_tests::remote_session(Operation::Push, destination_root.path())
+                .await;
         let mut config = supported_config();
         config.preserve.hardlinks = true;
         config.remove_source_files = true;
@@ -898,7 +878,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 2);
         assert_eq!(stats.bytes_transferred, b"shared-bytes".len() as u64);
         assert!(!source_root.path().join("first").exists());

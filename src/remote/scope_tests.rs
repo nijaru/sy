@@ -288,28 +288,6 @@ async fn entry_push_refuses_sibling_mutators_without_native_effects() {
             .unwrap(),
         ),
         (
-            FrameKind::Mutation,
-            WireMutation::hardlink(
-                sibling_path.clone(),
-                selected_path.clone(),
-                sibling_identity,
-                Some(identity(&selected, EntryKind::File)),
-            )
-            .encode()
-            .unwrap(),
-        ),
-        (
-            FrameKind::Mutation,
-            WireMutation::hardlink(
-                selected_path,
-                sibling_path,
-                identity(&selected, EntryKind::File),
-                Some(sibling_identity),
-            )
-            .encode()
-            .unwrap(),
-        ),
-        (
             FrameKind::Metadata,
             WireDirectoryMetadata {
                 path: directory_path.clone(),

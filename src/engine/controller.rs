@@ -200,35 +200,6 @@ impl SyncPlan {
         Ok(())
     }
 
-    /// Check every selected regular hardlink member's byte commitment before
-    /// execution. Hash only distinct retained observations or mixed retained /
-    /// source commitments; ordinary new-source groups need no extra read.
-    /// This is complete preflight, not a snapshot or execution-time authority.
-    pub async fn validate_hardlink_bytes<F, Fut>(&mut self, mut hash: F) -> Result<()>
-    where
-        F: FnMut(crate::engine::hardlink_preflight::ByteCommitment) -> Fut,
-        Fut: Future<Output = Result<[u8; 32]>>,
-    {
-        // Failed/cancelled validation is terminal. Never certify a remaining
-        // suffix with a fresh builder after the record cursor has advanced.
-        if matches!(self.hardlinks, HardlinkPreflight::Failed) {
-            return self.hardlinks.revalidate(&self.reader).await;
-        }
-        self.reader.rewind()?;
-        self.hardlinks = HardlinkPreflight::Failed;
-        let mut commitments = crate::engine::hardlink_preflight::HardlinkCommitments::default();
-        let scheduler = crate::engine::scheduler::Scheduler::new(Default::default())
-            .map_err(|error| ControllerError::backend("hardlink preflight resources", error))?;
-        while let Some(record) = self.reader.next_record().await? {
-            commitments.check(record, &scheduler, &mut hash).await?;
-        }
-        self.reader.rewind()?;
-        let mut catalogue = commitments.seal().await?;
-        catalogue.revalidate(&self.reader).await?;
-        self.hardlinks = HardlinkPreflight::Ready(catalogue);
-        Ok(())
-    }
-
     pub const fn operations(&self) -> u64 {
         self.operations
     }
@@ -1344,16 +1315,24 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn failed_or_cancelled_hardlink_preflight_cannot_retry_or_reach_execution() {
+    #[test]
+    fn failed_or_cancelled_hardlink_membership_cannot_retry_or_reach_execution() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(hardlink_membership_failure_cases());
+    }
+
+    async fn hardlink_membership_failure_cases() {
         use crate::engine::domain::EntryIdentity;
-        use crate::engine::hardlink_preflight::ByteCommitment;
         for (cancel, preview) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut a = file("a", 6, 0);
             a.identity = Some(EntryIdentity::from_bytes([1; 32]));
             a.hardlink_group = Some(EntryIdentity::from_bytes([1; 32]));
             let mut b = a.clone();
             b.path = path("b");
+            b.identity = Some(EntryIdentity::from_bytes([2; 32]));
             let mut old_a = a.clone();
             old_a.identity = Some(EntryIdentity::from_bytes([9; 32]));
             old_a.hardlink_group = None;
@@ -1370,39 +1349,36 @@ mod tests {
             .await
             .unwrap();
             if cancel {
-                let (entered, mut receiving) = tokio::sync::mpsc::channel(1);
-                let mut hash = move |_| {
-                    let entered = entered.clone();
-                    async move {
-                        entered.send(()).await.unwrap();
-                        std::future::pending::<Result<[u8; 32]>>().await
-                    }
+                // Stall actual journal I/O in this runtime's single blocking
+                // slot. Cancellation must poison plan authority before any
+                // asynchronous read can complete, not just a hash callback.
+                let (entered, receiving) = tokio::sync::oneshot::channel();
+                let (release, released) = std::sync::mpsc::channel();
+                let worker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+                receiving.await.unwrap();
+                let pending = {
+                    let sealing = plan.seal_hardlink_membership();
+                    tokio::pin!(sealing);
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    sealing.as_mut().poll(&mut context).is_pending()
                 };
-                {
-                    let checking = plan.validate_hardlink_bytes(&mut hash);
-                    tokio::pin!(checking);
-                    tokio::select! {
-                        result = &mut checking => panic!("unexpected completion: {result:?}"),
-                        _ = receiving.recv() => {},
-                    }
-                }
+                release.send(()).unwrap();
+                worker.await.unwrap();
+                assert!(pending, "collection completed despite blocked journal I/O");
             } else {
-                assert!(plan
-                    .validate_hardlink_bytes(|commitment| async move {
-                        Ok(match commitment {
-                            ByteCommitment::Source(_) => [8; 32],
-                            ByteCommitment::Destination(_) => [7; 32],
-                        })
-                    })
-                    .await
-                    .is_err());
+                assert!(matches!(
+                    plan.seal_hardlink_membership().await,
+                    Err(ControllerError::HardlinkPreflight(
+                        crate::engine::hardlink_preflight::HardlinkPreflightError::SourceChanged { .. }
+                    ))
+                ));
             }
-            // The record cursor may now be at EOF or mid-group. Fresh validation
-            // must not certify that empty/suffix view as the completed plan.
-            assert!(plan
-                .validate_hardlink_bytes(|_| async { panic!("failed plan must be terminal") })
-                .await
-                .is_err());
+            // Fresh validation must not certify the remaining suffix after
+            // cancellation or inconsistent original source observations.
+            assert!(plan.seal_hardlink_membership().await.is_err());
             let result = if preview {
                 preview_sync(plan, |_| panic!("failed preflight reached preview output"))
                     .await
@@ -1898,6 +1874,7 @@ mod tests {
                     }
                     IncomingRequest::Hash(_) => panic!("unexpected hash request"),
                     IncomingRequest::FileFetch(_) => panic!("unexpected fetch request"),
+                    IncomingRequest::Group(_) => panic!("unexpected group request"),
                     IncomingRequest::Signatures(_) => panic!("unexpected signature request"),
                     IncomingRequest::Xattr(_) => panic!("unexpected xattr request"),
                     IncomingRequest::Acl(_) => panic!("unexpected acl request"),

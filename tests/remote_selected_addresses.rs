@@ -365,12 +365,12 @@ async fn selected_address_matrix(push: bool) {
     }
 }
 
-/// A group's representative is a destination address, never its source name.
-/// This exercises the per-item lowering boundary without claiming full native
-/// hardlink-group projection or selected remote scanning.
+/// A selected hardlink member keeps its physical source address while its
+/// singleton catalogue publishes at the independently selected destination.
+/// Multi-member inode fidelity is covered by whole-group controller tests;
+/// arbitrary per-member rename projection is not a supported scan scope.
 #[tokio::test]
-async fn renamed_hardlink_members_use_the_published_destination_representative() {
-    use futures::TryStreamExt;
+async fn selected_hardlink_member_uses_physical_source_and_renamed_destination() {
     for push in [true, false] {
         let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
@@ -382,18 +382,38 @@ async fn renamed_hardlink_members_use_the_published_destination_representative()
         let mut request = ScanRequest::default();
         request.metadata.unix_mode = true;
         request.metadata.hardlink_group = true;
-        let mut members = Vec::new();
-        for name in ["a", "b"] {
-            let entries: Vec<_> =
-                selected_leaf_stream(source.path().into(), relative(name), request, false)
-                    .try_collect()
-                    .await
-                    .unwrap();
-            assert_eq!(entries.len(), 1);
-            members.extend(entries);
-        }
-        assert!(members[0].hardlink_group.is_some());
-        assert_eq!(members[0].hardlink_group, members[1].hardlink_group);
+        let reconciler = OrderedReconciler::with_scope(
+            selected_leaf_stream(source.path().into(), relative("a"), request, false),
+            selected_leaf_stream(
+                destination.path().into(),
+                relative("renamed-a"),
+                request,
+                true,
+            ),
+            SyncScope::SelectedLeaf {
+                source: relative("a"),
+                destination: relative("renamed-a"),
+            },
+        );
+        let mut plan = preflight_sync_scoped_with_content(
+            reconciler,
+            Default::default(),
+            None,
+            |_| true,
+            |_| false,
+            |_, _| async { panic!("new leaf requires no content comparison") },
+        )
+        .await
+        .unwrap();
+        plan.validate_operations(|operation| async move {
+            assert!(operation.source().hardlink_group.is_some());
+            assert_eq!(operation.source().path, relative("a"));
+            assert_eq!(operation.path(), &relative("renamed-a"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        plan.seal_hardlink_membership().await.unwrap();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(server_io);
         let server = tokio::spawn(sy::remote::serve::serve_transport(
@@ -425,7 +445,7 @@ async fn renamed_hardlink_members_use_the_published_destination_representative()
                 let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
                     .await
                     .unwrap();
-                execute_renamed_group(
+                SyncController::new(
                     RemotePushExecutor::new(
                         authority,
                         client.request_handle(),
@@ -434,11 +454,13 @@ async fn renamed_hardlink_members_use_the_published_destination_representative()
                     )
                     .with_hardlinks(true)
                     .with_remove_source_files(true),
-                    members,
+                    NonZeroUsize::new(2).unwrap(),
                 )
-                .await;
+                .execute(plan)
+                .await
+                .unwrap()
             } else {
-                execute_renamed_group(
+                SyncController::new(
                     RemotePullExecutor::new(
                         destination.path().into(),
                         client.request_handle(),
@@ -446,28 +468,40 @@ async fn renamed_hardlink_members_use_the_published_destination_representative()
                         scheduler,
                     )
                     .with_hardlinks(true),
-                    members,
+                    NonZeroUsize::new(2).unwrap(),
                 )
-                .await;
+                .execute(plan)
+                .await
+                .unwrap()
             }
         };
-        tokio::time::timeout(Duration::from_secs(10), execution)
+        let summary = tokio::time::timeout(Duration::from_secs(10), execution)
             .await
             .unwrap();
-        let first = std::fs::metadata(destination.path().join("renamed-a")).unwrap();
-        let second = std::fs::metadata(destination.path().join("renamed-b")).unwrap();
-        assert_eq!(first.ino(), second.ino());
+        assert_eq!(summary.files_created, 1);
+        assert_eq!(summary.literal_bytes, 11);
+        assert_eq!(
+            std::fs::metadata(destination.path().join("renamed-a"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("renamed-a")).unwrap(),
+            b"group bytes"
+        );
         for name in ["a", "b"] {
-            assert_eq!(
-                std::fs::read(destination.path().join(format!("renamed-{name}"))).unwrap(),
-                b"group bytes"
-            );
             assert_eq!(
                 std::fs::read(destination.path().join(name)).unwrap(),
                 b"untouched sibling"
             );
-            assert_eq!(source.path().join(name).exists(), !push);
         }
+        assert_eq!(source.path().join("a").exists(), !push);
+        assert_eq!(
+            std::fs::read(source.path().join("b")).unwrap(),
+            b"group bytes"
+        );
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 3);
         drop(client);
         tokio::time::timeout(Duration::from_secs(10), server)
             .await
@@ -475,32 +509,4 @@ async fn renamed_hardlink_members_use_the_published_destination_representative()
             .unwrap()
             .unwrap();
     }
-}
-
-async fn execute_renamed_group<E: sy::engine::controller::SyncPlanExecutor>(
-    executor: E,
-    members: Vec<sy::engine::domain::Entry>,
-) {
-    for (index, source) in members.into_iter().enumerate() {
-        let destination_path = relative(if index == 0 { "renamed-a" } else { "renamed-b" });
-        let work = executor
-            .lower(
-                SyncOp::Create {
-                    source,
-                    destination_path,
-                },
-                Default::default(),
-            )
-            .unwrap()
-            .unwrap();
-        let sy::engine::work::WorkResult::Transfer(summary) = executor.execute(work).await.unwrap()
-        else {
-            panic!("expected hardlink transfer");
-        };
-        assert_eq!(
-            summary.reused_bytes,
-            if index == 0 { 0 } else { summary.file_size }
-        );
-    }
-    executor.finish_deferred_source_removals().await.unwrap();
 }

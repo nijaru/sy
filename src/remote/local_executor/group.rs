@@ -2,6 +2,7 @@
 use super::*;
 use crate::endpoint::Endpoint;
 use crate::engine::domain::SyncOp;
+use crate::engine::hardlink_runtime::intent::{destination, GroupIntent};
 use crate::engine::hardlink_runtime::{GroupError, HardlinkGroupPlan};
 use crate::engine::work::{TransferSummary, WorkResult};
 use crate::rooted_fs::{PublishedFileProof, RootedFsError};
@@ -32,32 +33,16 @@ impl LocalSyncExecutor {
         let source = first.source().clone();
         self.check_source_identity(&source).await?;
         let representative = destination(&first).cloned();
-        let mut canonical_source = transfers_bytes(&first);
-        let coalesced_identity = representative
-            .as_ref()
-            .and_then(|entry| entry.is_file().then_some(entry.identity).flatten());
+        let mut intent = GroupIntent::new(&first, policy);
         while let Some(member) = members.next().await? {
             self.check_source_identity(member.source()).await?;
-            canonical_source |= transfers_bytes(&member)
-                || coalesced_identity.is_none()
-                || destination(&member).and_then(|entry| entry.identity) != coalesced_identity;
+            intent.include(&member);
         }
-        let mode = if policy.preserve_permissions
-            || representative.is_none()
-            || matches!(first, SyncOp::Replace { .. })
-        {
-            source.unix_mode
-        } else {
-            representative.as_ref().and_then(|entry| entry.unix_mode)
-        }
-        .ok_or_else(|| LocalSyncError::MissingScannedMode(self.source_path(&source.path)))?;
-        let modified = if policy.preserve_times {
-            Some(source.modified)
-        } else if matches!(first, SyncOp::Metadata { .. } | SyncOp::Unchanged { .. }) {
-            representative.as_ref().map(|entry| entry.modified)
-        } else {
-            None
-        };
+        let canonical_source = intent.canonical_source;
+        let mode = intent
+            .unix_mode
+            .ok_or_else(|| LocalSyncError::MissingScannedMode(self.source_path(&source.path)))?;
+        let modified = intent.modified;
         let rooted = self.metadata_authority().await?;
         let source_file =
             if canonical_source || self.xattrs || self.acls || self.remove_source_files {
@@ -187,7 +172,7 @@ impl LocalSyncExecutor {
             }
         }
 
-        let retained = matches!(first, SyncOp::Metadata { .. } | SyncOp::Unchanged { .. });
+        let retained = intent.retain_metadata;
         let first_path = first.path().clone();
         let expected = expected_destination(&first)?;
         let rate_limiter = self.rate_limiter.clone();
@@ -348,15 +333,19 @@ impl LocalSyncExecutor {
             self.check_source_identity(member.source()).await?;
             if canonical_source {
                 let literal_bytes = if first_copy { copied_bytes } else { 0 };
-                group.record_work(
-                    &member,
+                // The creator is populated once. Linking another name does
+                // not reconstruct bytes or constitute a delta transfer.
+                let work = if first_copy {
                     WorkResult::Transfer(TransferSummary {
                         file_size: source.size,
                         digest,
                         literal_bytes,
-                        reused_bytes: if first_copy { 0 } else { source.size },
-                    }),
-                )?;
+                        reused_bytes: 0,
+                    })
+                } else {
+                    WorkResult::Metadata
+                };
+                group.record_work(&member, work)?;
                 self.report_transfer(
                     if destination(&member).is_some() {
                         crate::sync::output::ItemizeOp::Update
@@ -513,23 +502,6 @@ impl Drop for CloseAdmission {
     fn drop(&mut self) {
         self.0.close();
     }
-}
-
-fn destination(operation: &SyncOp) -> Option<&Entry> {
-    match operation {
-        SyncOp::Create { .. } | SyncOp::Skip { .. } => None,
-        SyncOp::Update { destination, .. }
-        | SyncOp::Replace { destination, .. }
-        | SyncOp::Metadata { destination, .. }
-        | SyncOp::Unchanged { destination, .. } => Some(destination),
-    }
-}
-
-fn transfers_bytes(operation: &SyncOp) -> bool {
-    matches!(
-        operation,
-        SyncOp::Create { .. } | SyncOp::Update { .. } | SyncOp::Replace { .. }
-    )
 }
 
 fn expected_destination(operation: &SyncOp) -> Result<crate::endpoint::ExpectedDestination> {

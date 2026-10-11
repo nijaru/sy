@@ -64,6 +64,11 @@ pub enum FrameKind {
     FileAcls = 32,
     /// Acquire an initially absent destination root for a chosen Create target.
     AcquireRoot = 33,
+    GroupOpen = 34,
+    GroupMember = 35,
+    GroupMembersEnd = 36,
+    GroupStep = 37,
+    GroupResult = 38,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -103,6 +108,11 @@ impl TryFrom<u8> for FrameKind {
             31 => Ok(Self::FileXattrs),
             32 => Ok(Self::FileAcls),
             33 => Ok(Self::AcquireRoot),
+            34 => Ok(Self::GroupOpen),
+            35 => Ok(Self::GroupMember),
+            36 => Ok(Self::GroupMembersEnd),
+            37 => Ok(Self::GroupStep),
+            38 => Ok(Self::GroupResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }

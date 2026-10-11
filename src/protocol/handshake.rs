@@ -48,13 +48,20 @@ pub const PROTOCOL_V3_8: ProtocolVersion = ProtocolVersion { major: 3, minor: 8 
 pub const PROTOCOL_V3_9: ProtocolVersion = ProtocolVersion { major: 3, minor: 9 };
 
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_10);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_11);
 
 /// Typed operand binding and deferred destination-root acquisition.
 /// The former root-only SessionOpen/SessionReady layouts are incompatible.
 pub const PROTOCOL_V3_10: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 10,
+};
+
+/// Sealed whole-group declarations, source leases and original-creator proofs.
+/// Per-member representative publication is not a compatible group lifecycle.
+pub const PROTOCOL_V3_11: ProtocolVersion = ProtocolVersion {
+    major: 3,
+    minor: 11,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,7 +442,7 @@ mod tests {
 
     #[test]
     fn current_wire_contract_rejects_previous_minor() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_10));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_11));
         assert!(matches!(
             negotiate_version(VersionRange::exact(PROTOCOL_V3_8), SUPPORTED_VERSIONS),
             Err(ProtocolError::NoCompatibleVersion { .. })
