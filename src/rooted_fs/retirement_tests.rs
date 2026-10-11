@@ -388,6 +388,7 @@ fn unreadable_shared_and_exchange_old_entries_still_require_original_fd() {
                 .begin_namespace_blocking(
                     relative.as_path(),
                     ExpectedDestination::Unchanged(scanned),
+                    StagingOrigin::Created,
                 )
                 .unwrap();
             std::fs::create_dir(

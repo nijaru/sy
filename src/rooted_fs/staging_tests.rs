@@ -7,6 +7,175 @@ fn relative(path: &str) -> RelativePath {
 }
 
 #[tokio::test]
+async fn fresh_absent_publication_does_not_wait_for_unrelated_old_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("old"), b"old").unwrap();
+    std::fs::hard_link(root.path().join("old"), root.path().join("old-alias")).unwrap();
+    let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+    let original = rooted
+        .path_identity_blocking(&relative("old"))
+        .unwrap()
+        .unwrap()
+        .1;
+    let mut old = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("old"),
+            ExpectedDestination::Unchanged(original),
+        )
+        .unwrap();
+    old.file_mut().write_all(b"replaced").unwrap();
+    let (reached, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    old.pause_publication(PublicationPause {
+        point: PublicationPausePoint::BeforeAdmission,
+        reached,
+        resume: resume_rx,
+    });
+    let old_worker = tokio::task::spawn_blocking(move || old.commit());
+    reached_rx.await.unwrap();
+    let fresh_root = rooted.clone();
+    let mut fresh_worker = tokio::task::spawn_blocking(move || {
+        let mut file = fresh_root.begin_staged_file_with_expectation_blocking(
+            &relative("fresh"),
+            ExpectedDestination::Absent,
+        )?;
+        file.file_mut().write_all(b"fresh")?;
+        file.commit()?;
+        fresh_root
+            .begin_staged_symlink_blocking(
+                &relative("link"),
+                Path::new("fresh"),
+                ExpectedDestination::Absent,
+                None,
+            )?
+            .commit()?;
+        let mut file = fresh_root.begin_staged_file_with_expectation_blocking(
+            &relative("group-first"),
+            ExpectedDestination::Absent,
+        )?;
+        file.file_mut().write_all(b"group")?;
+        let mut group = file.into_group_blocking()?;
+        let admission = Arc::new(PublicationAdmission::default());
+        for name in ["group-first", "group-second"] {
+            group.publish_member_blocking(
+                &relative(name),
+                ExpectedDestination::Absent,
+                &admission,
+                || Ok(()),
+            )?;
+        }
+        group.finish_blocking(relative("group-first"), None, admission)?;
+        Ok::<_, RootedFsError>(())
+    });
+    // Release and join both workers even when the old implementation blocks.
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(5), &mut fresh_worker).await;
+    resume.send(()).unwrap();
+    old_worker.await.unwrap().unwrap();
+    match progress {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            fresh_worker.await.unwrap().unwrap();
+            panic!("fresh publication waited for unrelated OLD retirement");
+        }
+    }
+    for (name, bytes) in [
+        ("old", b"replaced".as_slice()),
+        ("fresh", b"fresh"),
+        ("group-first", b"group"),
+        ("group-second", b"group"),
+    ] {
+        assert_eq!(std::fs::read(root.path().join(name)).unwrap(), bytes);
+    }
+    assert_eq!(
+        std::fs::read_link(root.path().join("link")).unwrap(),
+        Path::new("fresh")
+    );
+    let first = std::fs::metadata(root.path().join("group-first")).unwrap();
+    let second = std::fs::metadata(root.path().join("group-second")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        (first.dev(), first.ino(), first.nlink()),
+        (second.dev(), second.ino(), 2)
+    );
+    // The same real lineage must still advance the remaining original OLD alias.
+    let mut alias = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("old-alias"),
+            ExpectedDestination::Unchanged(original),
+        )
+        .unwrap();
+    alias.file_mut().write_all(b"alias replacement").unwrap();
+    alias.commit().unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("old-alias")).unwrap(),
+        b"alias replacement"
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 6);
+}
+
+#[test]
+fn visible_alias_and_snapshot_absence_cannot_bypass_failed_retirement_authority() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source"), b"visible").unwrap();
+    let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
+    let source = rooted
+        .path_identity_blocking(&relative("source"))
+        .unwrap()
+        .unwrap()
+        .1;
+    let mut snapshot = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("snapshot"),
+            ExpectedDestination::SnapshotAtOpen,
+        )
+        .unwrap();
+    snapshot.file_mut().write_all(b"snapshot").unwrap();
+    let retirement = Arc::clone(&rooted.retirement);
+    assert!(std::thread::spawn(move || {
+        let _guard = retirement.lock().unwrap();
+        panic!("failed OLD authority");
+    })
+    .join()
+    .is_err());
+    let mut fresh = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("fresh"),
+            ExpectedDestination::Absent,
+        )
+        .unwrap();
+    fresh.file_mut().write_all(b"fresh").unwrap();
+    fresh.commit().unwrap();
+    assert!(snapshot.commit().is_err());
+    assert!(rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("snapshot"),
+            ExpectedDestination::SnapshotAtOpen,
+        )
+        .is_err());
+    assert!(rooted
+        .create_hardlink_path_blocking(
+            Path::new("source"),
+            Path::new("alias"),
+            source,
+            ExpectedDestination::Absent,
+        )
+        .is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("source")).unwrap(),
+        b"visible"
+    );
+    assert_eq!(std::fs::read(root.path().join("fresh")).unwrap(), b"fresh");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(root.path().join("source"))
+            .unwrap()
+            .nlink(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn transient_destination_kind_cannot_turn_absent_publication_into_exchange() {
     let root = tempfile::tempdir().unwrap();
     let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
@@ -86,7 +255,11 @@ fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
     let root = tempfile::tempdir().unwrap();
     let rooted = RootedFs::open_blocking(root.path().to_path_buf()).unwrap();
     let mut namespace = rooted
-        .begin_namespace_blocking(Path::new("target"), ExpectedDestination::Absent)
+        .begin_namespace_blocking(
+            Path::new("target"),
+            ExpectedDestination::Absent,
+            StagingOrigin::Created,
+        )
         .unwrap();
     let contents = root
         .path()
@@ -400,7 +573,11 @@ async fn hardlink_publication_checks_private_name_and_retains_foreign_substituti
 
 fn private_directory(rooted: &RootedFs) -> RootedNamespaceTransaction {
     let mut namespace = rooted
-        .begin_namespace_blocking(Path::new("target"), ExpectedDestination::SnapshotAtOpen)
+        .begin_namespace_blocking(
+            Path::new("target"),
+            ExpectedDestination::SnapshotAtOpen,
+            StagingOrigin::Created,
+        )
         .unwrap();
     let name = component_cstring(&namespace.temp_name).unwrap();
     // SAFETY: the held directory and live single-component name create only a
@@ -441,12 +618,12 @@ fn exchanged_old_cleanup_requires_ownership_for_directories_and_single_link_file
         namespace.seal_staging().unwrap();
         let mut lineage = rooted.retirement.lock().unwrap();
         namespace
-            .publish_blocking(None, None, &mut lineage, || Ok(()))
+            .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
             .unwrap();
         std::fs::rename(private.join("contents"), root.path().join("old")).unwrap();
         std::fs::write(private.join("contents"), b"foreign").unwrap();
         assert!(matches!(
-            namespace.finish_commit_blocking(&mut lineage),
+            namespace.finish_commit_blocking(Some(&mut lineage)),
             Err(RootedFsError::CommittedCleanupPending { .. })
         ));
         drop(namespace);
@@ -478,11 +655,11 @@ fn displaced_exchange_retirement_cannot_report_complete_cleanup() {
     let mut lineage = rooted.retirement.lock().unwrap();
     let _permits = staged
         .namespace
-        .publish_blocking(None, None, &mut lineage, || Ok(()))
+        .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
         .unwrap();
     std::fs::rename(private.join("contents"), root.path().join("retained-old")).unwrap();
     assert!(matches!(
-        staged.namespace.finish_commit_blocking(&mut lineage),
+        staged.namespace.finish_commit_blocking(Some(&mut lineage)),
         Err(RootedFsError::CommittedCleanupPending { .. })
     ));
     drop(staged);
@@ -531,12 +708,14 @@ fn pending_publication_retains_sealed_fields_after_native_effect() {
     } = staged;
     let mut lineage = rooted.retirement.lock().unwrap();
     namespace
-        .publish_blocking(None, None, &mut lineage, || Ok(()))
+        .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
         .unwrap();
     // A same-inode edit after publication cannot be adopted by from_committed.
     // ctime may advance only around our own namespace effects, never here.
     xattr::set(root.path().join("target"), "user.sy-foreign", b"changed").unwrap();
-    namespace.finish_commit_blocking(&mut lineage).unwrap();
+    namespace
+        .finish_commit_blocking(Some(&mut lineage))
+        .unwrap();
     let observation = namespace.sealed.unwrap();
     let error = RootedPublishedFile::from_committed(
         file,

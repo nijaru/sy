@@ -505,6 +505,10 @@ struct RootedNamespaceTransaction {
     publication_pause: Option<PublicationPause>,
     rooted: RootedFs,
     expected_destination: HeldDestinationExpectation,
+    // Only explicit original absence plus a genuinely created staging inode
+    // is independent of OLD retirement. Visible-inode aliases never qualify.
+    #[cfg(unix)]
+    independent_publication: bool,
     #[cfg(unix)]
     parent_fd: OwnedFd,
     #[cfg(unix)]
@@ -819,16 +823,22 @@ impl RootedNamespaceTransaction {
         let retirement = Arc::clone(&self.rooted.retirement);
         // Only blocking workers acquire this lock; cancellation closes its
         // independent atomic admission state without waiting for native I/O.
-        let mut lineage = retirement
-            .lock()
-            .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+        let mut lineage = if self.independent_publication {
+            None
+        } else {
+            Some(
+                retirement
+                    .lock()
+                    .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?,
+            )
+        };
         let _permits = self.publish_blocking(
             session_admission.as_deref(),
             admission,
-            &mut lineage,
+            lineage.as_deref_mut(),
             validate_source,
         )?;
-        self.finish_commit_blocking(&mut lineage)
+        self.finish_commit_blocking(lineage.as_deref_mut())
     }
 
     #[cfg(unix)]
@@ -836,11 +846,11 @@ impl RootedNamespaceTransaction {
         &mut self,
         session_admission: Option<&'a PublicationAdmission>,
         transaction_admission: Option<&'a PublicationAdmission>,
-        lineage: &mut RetirementLineage,
+        mut lineage: Option<&mut RetirementLineage>,
         validate_source: impl Fn() -> Result<()>,
     ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
         self.verify_parent_binding()?;
-        self.verify_expected_destination_with_lineage(lineage)?;
+        self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::BeforeDestinationObservation);
 
@@ -876,7 +886,7 @@ impl RootedNamespaceTransaction {
         // These checks detect observed races, not an atomic compare-and-swap.
         // A child arriving after the empty check must never be recursively removed.
         self.verify_parent_binding()?;
-        self.verify_expected_destination_with_lineage(lineage)?;
+        self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
 
         // Admission is the beginning of native publication, after potentially
         // blocking validation. A later close cannot interrupt or roll it back.
@@ -886,22 +896,30 @@ impl RootedNamespaceTransaction {
         self.rooted
             .pause_mutation(PublicationPausePoint::BeforeAdmission);
         self.verify_parent_binding()?;
-        self.verify_expected_destination_with_lineage(lineage)?;
+        self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
         let staging_check = self.observe_staging();
         // Capture OLD after preparation waits, before late admission; retain it
         // only for native publication/cleanup. This is still not portable CAS.
-        self.retired_destination = OldDestinationObservation::capture(
-            self.parent_fd.as_raw_fd(),
-            &self.destination_name,
-            &self.destination_path,
-            self.expected_destination,
-            lineage,
-            if is_type_transition {
-                RetirementStep::Exchange
-            } else {
-                RetirementStep::Unlink
-            },
-        )?;
+        self.retired_destination = match lineage.as_deref_mut() {
+            Some(lineage) => OldDestinationObservation::capture(
+                self.parent_fd.as_raw_fd(),
+                &self.destination_name,
+                &self.destination_path,
+                self.expected_destination,
+                lineage,
+                if is_type_transition {
+                    RetirementStep::Exchange
+                } else {
+                    RetirementStep::Unlink
+                },
+            )?,
+            None => {
+                // Preserve capture's last native absence check. There can be
+                // no OLD observation or retirement effect on this path.
+                self.verify_expected_destination_with_lineage(None)?;
+                None
+            }
+        };
         // Check the hardlink's exact post-preparation source last, after all
         // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
@@ -913,7 +931,7 @@ impl RootedNamespaceTransaction {
         #[cfg(test)]
         self.pause_publication(PublicationPausePoint::AfterAdmission);
         self.verify_parent_binding()?;
-        self.verify_expected_destination_with_lineage(lineage)?;
+        self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
         if let Some(old) = &self.retired_destination {
             let named = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?
                 .ok_or_else(|| RootedFsError::DestinationChanged(self.destination_path.clone()))?;
@@ -990,7 +1008,9 @@ impl RootedNamespaceTransaction {
         if let Some(observation) = self.retired_destination.as_mut() {
             observation
                 .record(
-                    lineage,
+                    lineage.ok_or_else(|| {
+                        std::io::Error::other("missing original retirement authority")
+                    })?,
                     if is_type_transition {
                         RetirementStep::Exchange
                     } else {
@@ -1011,7 +1031,10 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(unix)]
-    fn finish_commit_blocking(&mut self, lineage: &mut RetirementLineage) -> Result<()> {
+    fn finish_commit_blocking(
+        &mut self,
+        mut lineage: Option<&mut RetirementLineage>,
+    ) -> Result<()> {
         let mut staged_link_removed = false;
         let mut cleanup = || -> Result<()> {
             let named = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
@@ -1036,7 +1059,9 @@ impl RootedNamespaceTransaction {
                     );
                     if let Some(observation) = self.retired_destination.as_mut() {
                         observation.record(
-                            lineage,
+                            lineage.as_deref_mut().ok_or_else(|| {
+                                std::io::Error::other("missing original retirement authority")
+                            })?,
                             RetirementStep::Unlink,
                             &self.destination_path,
                         )?;
@@ -1105,31 +1130,38 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn verify_expected_destination(&self) -> Result<()> {
+        if matches!(
+            self.expected_destination,
+            HeldDestinationExpectation::Absent
+        ) {
+            return self.verify_expected_destination_with_lineage(None);
+        }
         let mut lineage = self
             .rooted
             .retirement
             .lock()
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-        self.verify_expected_destination_with_lineage(&mut lineage)
+        self.verify_expected_destination_with_lineage(Some(&mut lineage))
     }
 
     #[cfg(unix)]
     fn verify_expected_destination_with_lineage(
         &self,
-        lineage: &mut RetirementLineage,
+        lineage: Option<&mut RetirementLineage>,
     ) -> Result<()> {
         match self.expected_destination {
-            HeldDestinationExpectation::Unverified => Ok(()),
-            HeldDestinationExpectation::Absent => {
-                if stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?.is_none() {
-                    Ok(())
-                } else {
-                    Err(RootedFsError::DestinationChanged(
-                        self.destination_path.clone(),
-                    ))
-                }
-            }
-            HeldDestinationExpectation::Unchanged(expected) => {
+            HeldDestinationExpectation::Absent => verify_absent_at(
+                self.parent_fd.as_raw_fd(),
+                &self.destination_name,
+                &self.destination_path,
+            ),
+            expected => {
+                let lineage = lineage.ok_or_else(|| {
+                    std::io::Error::other("missing original retirement authority")
+                })?;
+                let HeldDestinationExpectation::Unchanged(expected) = expected else {
+                    return Ok(());
+                };
                 let actual = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?
                     .and_then(|stat| identity_from_stat(&stat));
                 if actual == Some(lineage.resolve(expected)?) {
@@ -1172,6 +1204,13 @@ enum HeldDestinationExpectation {
     Unverified,
     Absent,
     Unchanged(EntryIdentity),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum StagingOrigin {
+    Created,
+    VisibleAlias,
 }
 
 impl Drop for RootedNamespaceTransaction {
@@ -2016,7 +2055,11 @@ impl RootedFs {
     ) -> Result<RootedNamespaceTransaction> {
         #[cfg(unix)]
         {
-            let mut namespace = self.begin_namespace_blocking(relative.as_path(), expected)?;
+            let mut namespace = self.begin_namespace_blocking(
+                relative.as_path(),
+                expected,
+                StagingOrigin::Created,
+            )?;
             let mut prepare = || -> Result<()> {
                 let target = CString::new(target.as_os_str().as_bytes())
                     .map_err(|_| RootedFsError::PathContainsNul)?;
@@ -2431,7 +2474,8 @@ impl RootedFs {
         relative: &Path,
         expected: ExpectedDestination,
     ) -> Result<RootedStagedFile> {
-        let mut namespace = self.begin_namespace_blocking(relative, expected)?;
+        let mut namespace =
+            self.begin_namespace_blocking(relative, expected, StagingOrigin::Created)?;
         let file = match create_staging_file_at(
             namespace.staging_dir_fd.as_raw_fd(),
             &namespace.temp_name,
@@ -2453,12 +2497,16 @@ impl RootedFs {
         &self,
         relative: &Path,
         expected: ExpectedDestination,
+        origin: StagingOrigin,
     ) -> Result<RootedNamespaceTransaction> {
         // Private scratch may be prepared after cancellation, but never on a
         // pull source. Publication itself must still obtain late admission.
         self.require_writable()?;
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
-        let expected_destination = {
+        let expected_destination = if matches!(expected, ExpectedDestination::Absent) {
+            verify_absent_at(parent_fd.as_raw_fd(), &destination_name, relative)?;
+            HeldDestinationExpectation::Absent
+        } else {
             let mut lineage = self
                 .retirement
                 .lock()
@@ -2489,6 +2537,8 @@ impl RootedFs {
                 publication_pause: None,
                 rooted: self.clone(),
                 expected_destination,
+                independent_publication: matches!(expected, ExpectedDestination::Absent)
+                    && matches!(origin, StagingOrigin::Created),
                 parent_fd,
                 staging_dir_fd,
                 staging_dir_name,
@@ -2538,7 +2588,11 @@ impl RootedFs {
             return Err(RootedFsError::DestinationChanged(source.to_path_buf()));
         }
         let before = hardlink_state_from_stat(&initial, source)?;
-        let mut namespace = self.begin_namespace_blocking(destination, expected_destination)?;
+        let mut namespace = self.begin_namespace_blocking(
+            destination,
+            expected_destination,
+            StagingOrigin::VisibleAlias,
+        )?;
         namespace.verify_expected_destination()?;
         if let Some(dest) =
             stat_at_optional(namespace.parent_fd.as_raw_fd(), &namespace.destination_name)?
@@ -3244,6 +3298,15 @@ fn capture_destination_expectation(
                 .ok_or_else(changed),
         },
         ExpectedDestination::Unverified => Ok(HeldDestinationExpectation::Unverified),
+    }
+}
+
+#[cfg(unix)]
+fn verify_absent_at(parent: RawFd, component: &OsStr, path: &Path) -> Result<()> {
+    if stat_at_optional(parent, component)?.is_none() {
+        Ok(())
+    } else {
+        Err(RootedFsError::DestinationChanged(path.to_path_buf()))
     }
 }
 
@@ -5373,14 +5436,14 @@ mod tests {
             staged.seal_staging().unwrap();
             let mut lineage = rooted.retirement.lock().unwrap();
             staged
-                .publish_blocking(None, None, &mut lineage, || Ok(()))
+                .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
                 .unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =
                 create_staging_file_at(held_directory.as_raw_fd(), OsStr::new("child")).unwrap();
             child.write_all(b"keep").unwrap();
             assert!(matches!(
-                staged.finish_commit_blocking(&mut lineage),
+                staged.finish_commit_blocking(Some(&mut lineage)),
                 Err(RootedFsError::CommittedCleanupPending { .. })
             ));
             drop(staged);

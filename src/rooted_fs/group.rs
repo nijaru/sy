@@ -105,11 +105,11 @@ impl RootedStagedGroup {
             GroupProgress::Failed => return Err(RootedFsError::IncompleteStagedGroup),
         };
         self.anchor.observe_original_file()?;
-        let mut alias = self
-            .anchor
-            .namespace
-            .rooted
-            .begin_namespace_blocking(relative.as_path(), expected)?;
+        let mut alias = self.anchor.namespace.rooted.begin_namespace_blocking(
+            relative.as_path(),
+            expected,
+            StagingOrigin::Created,
+        )?;
         alias.strict_cleanup = true;
         // Pin cleanup ownership before linkat, including clone failure. The
         // original creator FD, not an opened visible member, identifies alias.
