@@ -5,50 +5,456 @@ use std::time::Duration;
 use xattr::FileExt;
 
 #[tokio::test]
-async fn matching_mode_time_and_xattrs_do_not_rewrite_the_observed_inode() {
+async fn native_preservation_is_effect_free_only_when_entire_request_matches() {
     use std::os::unix::fs::MetadataExt;
 
-    let fixture = tempfile::tempdir().unwrap();
-    let path = fixture.path().join("file");
-    std::fs::write(&path, b"original bytes").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    let file = File::open(&path).unwrap();
-    file.set_xattr("user.sy-idempotent", b"same\0bytes")
-        .unwrap();
-    file.set_xattr("user.sy-empty", b"").unwrap();
-    // Include native security labels; exact mirroring must not silently omit
-    // them just because the fixture only adds user attributes.
-    let attributes = bounded_xattrs::read_from_file(&file).unwrap();
-    let metadata = file.metadata().unwrap();
-    let modified =
-        Timestamp::new(metadata.mtime(), metadata.mtime_nsec().try_into().unwrap()).unwrap();
-    let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
-    let initial = rooted
-        .path_identity_blocking(&relative())
-        .unwrap()
-        .unwrap()
-        .1;
-    for _ in 0..2 {
-        let result = rooted
-            .apply_observed_preservation_blocking(
+    for shared in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"original bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = File::open(&path).unwrap();
+        file.set_xattr("user.sy-idempotent", b"same\0bytes")
+            .unwrap();
+        file.set_xattr("user.sy-empty", b"").unwrap();
+        let requested_acl = acl(&file);
+        #[cfg(feature = "acl")]
+        apply_acl_fd(&file, requested_acl.as_deref().unwrap()).unwrap();
+        let flags = requested_flags();
+        #[cfg(target_os = "macos")]
+        apply_bsd_flags_fd(&file, flags.unwrap()).unwrap();
+        if shared {
+            std::fs::hard_link(&path, fixture.path().join("source-alias")).unwrap();
+        }
+        let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+        // Include native labels, not just the fixture's user attributes.
+        let attributes = bounded_xattrs::read_from_file(&file).unwrap();
+        let metadata = file.metadata().unwrap();
+        let modified =
+            Timestamp::new(metadata.mtime(), metadata.mtime_nsec().try_into().unwrap()).unwrap();
+        let mode = metadata.mode() & 0o7777;
+        let initial = rooted
+            .path_identity_blocking(&relative())
+            .unwrap()
+            .unwrap()
+            .1;
+        #[cfg(feature = "acl")]
+        let native_acl = read_acl_entries_fd(&file).unwrap();
+        // Repeat with the ORIGINAL observation, not a newly adopted token.
+        // Numeric principal text also exercises native qualifier normalization.
+        for _ in 0..2 {
+            let result = rooted
+                .apply_observed_preservation_blocking(
+                    &relative(),
+                    EntryKind::File,
+                    initial,
+                    Some(mode),
+                    Some(modified),
+                    &MetadataPreservation {
+                        xattrs: Some(&attributes),
+                        acl: requested_acl.as_deref(),
+                        bsd_flags: flags,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                result, initial,
+                "matching preservation changed inode metadata"
+            );
+            assert_eq!(
+                rooted
+                    .path_identity_blocking(&relative())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                initial
+            );
+            assert_eq!(bounded_xattrs::read_from_file(&file).unwrap(), attributes);
+            #[cfg(feature = "acl")]
+            assert_eq!(read_acl_entries_fd(&file).unwrap(), native_acl);
+            #[cfg(target_os = "macos")]
+            assert_eq!(stat_fd(file.as_raw_fd()).unwrap().st_flags, flags.unwrap());
+        }
+        // Single-field entry points share the same effect-free permission.
+        rooted
+            .write_xattrs_blocking(&relative(), EntryKind::File, &attributes)
+            .unwrap();
+        #[cfg(feature = "acl")]
+        rooted
+            .write_acl_blocking(
                 &relative(),
                 EntryKind::File,
-                initial,
-                Some(0o640),
+                requested_acl.as_deref().unwrap(),
+            )
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        rooted
+            .write_bsd_flags_blocking(&relative(), EntryKind::File, flags.unwrap())
+            .unwrap();
+        assert_eq!(
+            rooted
+                .path_identity_blocking(&relative())
+                .unwrap()
+                .unwrap()
+                .1,
+            initial
+        );
+        if shared {
+            // One differing field refuses the WHOLE otherwise-matching request,
+            // including an ACL/flags-only difference late in application order.
+            let mut different_attributes = attributes.clone();
+            different_attributes.push((OsString::from("user.sy-new"), b"new".to_vec()));
+            let mut requests = vec![
+                (
+                    Some(mode ^ 0o100),
+                    Some(modified),
+                    Some(attributes.as_slice()),
+                    requested_acl.as_deref(),
+                    flags,
+                ),
+                (
+                    Some(mode),
+                    Some(Timestamp::UNIX_EPOCH),
+                    Some(attributes.as_slice()),
+                    requested_acl.as_deref(),
+                    flags,
+                ),
+                (
+                    Some(mode),
+                    Some(modified),
+                    Some(different_attributes.as_slice()),
+                    requested_acl.as_deref(),
+                    flags,
+                ),
+            ];
+            if requested_acl.is_some() {
+                requests.push((
+                    Some(mode),
+                    Some(modified),
+                    Some(attributes.as_slice()),
+                    Some(""),
+                    flags,
+                ));
+            }
+            if flags.is_some() {
+                requests.push((
+                    Some(mode),
+                    Some(modified),
+                    Some(attributes.as_slice()),
+                    requested_acl.as_deref(),
+                    Some(0),
+                ));
+            }
+            #[cfg(all(feature = "acl", target_os = "macos"))]
+            let reordered_acl = {
+                let mut entries = exacl::from_str(requested_acl.as_deref().unwrap()).unwrap();
+                entries.reverse();
+                exacl::to_string(&entries).unwrap()
+            };
+            #[cfg(all(feature = "acl", target_os = "macos"))]
+            requests.push((
+                Some(mode),
                 Some(modified),
+                Some(attributes.as_slice()),
+                Some(&reordered_acl),
+                flags,
+            ));
+            for (mode, modified, xattrs, acl, bsd_flags) in requests {
+                let result = rooted.apply_observed_preservation_blocking(
+                    &relative(),
+                    EntryKind::File,
+                    initial,
+                    mode,
+                    modified,
+                    &MetadataPreservation {
+                        xattrs,
+                        acl,
+                        bsd_flags,
+                    },
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(RootedFsError::SharedFileMetadata { links: 2, .. })
+                    ),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    rooted
+                        .path_identity_blocking(&relative())
+                        .unwrap()
+                        .unwrap()
+                        .1,
+                    initial
+                );
+            }
+        }
+        if shared {
+            for result in [
+                rooted.write_xattrs_blocking(&relative(), EntryKind::File, &[]),
+                #[cfg(feature = "acl")]
+                rooted.write_acl_blocking(&relative(), EntryKind::File, ""),
+                #[cfg(target_os = "macos")]
+                rooted.write_bsd_flags_blocking(&relative(), EntryKind::File, 0),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(RootedFsError::SharedFileMetadata { links: 2, .. })
+                    ),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                rooted
+                    .path_identity_blocking(&relative())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                initial
+            );
+        }
+        #[cfg(feature = "acl")]
+        if !shared {
+            // Clearing a genuinely nontrivial ACL still performs native SET,
+            // then a repeated clear must be effect-free (Linux retains base ACL).
+            rooted
+                .write_acl_blocking(&relative(), EntryKind::File, "")
+                .unwrap();
+            let cleared = rooted
+                .path_identity_blocking(&relative())
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_ne!(cleared, initial);
+            assert_ne!(read_acl_entries_fd(&file).unwrap(), native_acl);
+            #[cfg(target_os = "linux")]
+            assert_eq!(read_acl_entries_fd(&file).unwrap(), exacl::from_mode(mode));
+            #[cfg(target_os = "macos")]
+            assert!(read_acl_entries_fd(&file).unwrap().is_empty());
+            rooted
+                .write_acl_blocking(&relative(), EntryKind::File, "")
+                .unwrap();
+            assert_eq!(
+                rooted
+                    .path_identity_blocking(&relative())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                cleared
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        if shared {
+            assert_eq!(
+                std::fs::read(fixture.path().join("source-alias")).unwrap(),
+                b"original bytes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn effect_free_preservation_revalidates_observation_and_session_closure() {
+    for shared in [false, true] {
+        for cancel in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join("file");
+            std::fs::write(&path, b"original bytes").unwrap();
+            if shared {
+                std::fs::hard_link(&path, fixture.path().join("alias")).unwrap();
+            }
+            let mut rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+            let expected = rooted
+                .path_identity_blocking(&relative())
+                .unwrap()
+                .unwrap()
+                .1;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            let admission = Arc::new(PublicationAdmission::default());
+            rooted.bind_session_mutations(Arc::clone(&admission), false);
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            rooted.pause_mutation_at(
+                0,
+                PublicationPause {
+                    point: PublicationPausePoint::BeforeAdmission,
+                    reached: reached_tx,
+                    resume: resume_rx,
+                },
+            );
+            let worker = tokio::task::spawn_blocking(move || {
+                rooted.apply_observed_preservation_blocking(
+                    &relative(),
+                    EntryKind::File,
+                    expected,
+                    Some(mode),
+                    None,
+                    &MetadataPreservation::default(),
+                )
+            });
+            let paused = tokio::time::timeout(Duration::from_secs(5), reached_rx).await;
+            if cancel {
+                admission.close();
+            } else {
+                // Foreign same-inode edit after comparison must not be adopted
+                // as a successful result, even though requested mode still matches.
+                xattr::set(&path, "user.sy-foreign", b"foreign").unwrap();
+            }
+            let before_resume = crate::endpoint::local_identity::metadata_identity(
+                &std::fs::metadata(&path).unwrap(),
+                EntryKind::File,
+            )
+            .unwrap();
+            let _ = resume_tx.send(());
+            let result = worker.await.unwrap();
+            assert!(matches!(paused, Ok(Ok(()))));
+            if cancel {
+                assert!(
+                    matches!(result, Err(RootedFsError::CommitCancelled)),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(RootedFsError::DestinationChanged(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                crate::endpoint::local_identity::metadata_identity(
+                    &std::fs::metadata(&path).unwrap(),
+                    EntryKind::File
+                )
+                .unwrap(),
+                before_resume
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "acl"))]
+#[tokio::test]
+async fn acl_read_denial_does_not_forbid_exclusive_set_or_prove_shared_noop() {
+    use std::os::unix::fs::MetadataExt;
+
+    for shared in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"retained bytes").unwrap();
+        let file = File::open(&path).unwrap();
+        let entries = [exacl::AclEntry::deny_user(
+            &file.metadata().unwrap().uid().to_string(),
+            exacl::Perm::READSECURITY,
+            exacl::Flag::empty(),
+        )];
+        if shared {
+            std::fs::hard_link(&path, fixture.path().join("alias")).unwrap();
+        }
+        exacl::setfacl(&[&path], &entries, None).unwrap();
+        let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+        // macOS also denies pathname stat under this ACE, but descriptor stat
+        // remains available. Do not weaken required namespace read contracts.
+        let expected = identity_from_stat(&stat_fd(file.as_raw_fd()).unwrap()).unwrap();
+        // This is an actual native READ_SECURITY denial, not a mock or a gate
+        // that silently marks the production backend unsupported under root.
+        let required_read = rooted.read_open_file_acl_blocking(&file, &relative());
+        assert!(
+            matches!(required_read, Err(RootedFsError::Io(ref error)) if error.raw_os_error() == Some(libc::EACCES)),
+            "{required_read:?}"
+        );
+        let denied_text = exacl::to_string(&entries).unwrap();
+        if shared {
+            let result = rooted.apply_observed_preservation_blocking(
+                &relative(),
+                EntryKind::File,
+                expected,
+                None,
+                None,
                 &MetadataPreservation {
-                    xattrs: Some(&attributes),
+                    acl: Some(&denied_text),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(RootedFsError::SharedFileMetadata { links: 2, .. })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                identity_from_stat(&stat_fd(file.as_raw_fd()).unwrap()),
+                Some(expected)
+            );
+            // Required reads still report permission errors after refusal.
+            assert!(
+                matches!(read_acl_entries_fd(&file), Err(RootedFsError::Io(ref error)) if error.raw_os_error() == Some(libc::EACCES))
+            );
+            exacl::setfacl(&[&path], &[], None).unwrap();
+        } else {
+            // The shared low-level SET boundary (also used by private staging)
+            // needs no pathname-stat permission and must not gain an ACL READ gate.
+            apply_acl_fd(&file, "").unwrap();
+            assert!(exacl::getfacl(&path, None).unwrap().is_empty());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained bytes");
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "acl"))]
+#[tokio::test]
+async fn acl_state_includes_directory_defaults_and_empty_request_removes_them() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("file");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut entries = exacl::from_mode(0o700);
+    entries.extend(exacl::from_mode(0o750).into_iter().map(|mut entry| {
+        entry.flags |= exacl::Flag::DEFAULT;
+        entry
+    }));
+    exacl::setfacl(&[&path], &entries, None).unwrap();
+    let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+    let file = File::open(&path).unwrap();
+    let text = exacl::to_string(&exacl::getfacl(&path, None).unwrap()).unwrap();
+    let before = stat_fd(file.as_raw_fd()).unwrap();
+    for _ in 0..2 {
+        rooted
+            .finalize_directory_blocking(
+                &relative(),
+                identity_from_stat(&before).unwrap(),
+                Some(0o700),
+                None,
+                &DirectoryPreservation {
+                    acl: Some(text.clone()),
                     ..Default::default()
                 },
             )
             .unwrap();
+        let after = stat_fd(file.as_raw_fd()).unwrap();
         assert_eq!(
-            result, initial,
-            "matching preservation changed inode metadata"
+            (after.st_ctime, after.st_ctime_nsec),
+            (before.st_ctime, before.st_ctime_nsec)
         );
+        assert_eq!(exacl::getfacl(&path, None).unwrap(), entries);
     }
-    assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
-    assert_eq!(bounded_xattrs::read_from_file(&file).unwrap(), attributes);
+    rooted
+        .finalize_directory_blocking(
+            &relative(),
+            identity_from_stat(&before).unwrap(),
+            Some(0o700),
+            None,
+            &DirectoryPreservation {
+                acl: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        exacl::getfacl(&path, None).unwrap(),
+        exacl::from_mode(0o700)
+    );
 }
 
 fn relative() -> RelativePath {
@@ -86,6 +492,12 @@ fn acl(file: &File) -> Option<String> {
         entries.push(exacl::AclEntry::allow_user(
             "1",
             exacl::Perm::READ,
+            exacl::Flag::empty(),
+        ));
+        #[cfg(target_os = "macos")]
+        entries.push(exacl::AclEntry::deny_user(
+            "1",
+            exacl::Perm::WRITE,
             exacl::Flag::empty(),
         ));
         Some(exacl::to_string(&entries).unwrap())

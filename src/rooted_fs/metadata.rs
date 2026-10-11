@@ -42,6 +42,8 @@ impl MetadataPreservation<'_> {
                     max: crate::protocol::MAX_ACL_TEXT_BYTES,
                 });
             }
+            #[cfg(all(feature = "acl", any(target_os = "linux", target_os = "macos")))]
+            exacl::from_str(acl)?;
             #[cfg(not(all(feature = "acl", any(target_os = "linux", target_os = "macos"))))]
             return Err(RootedFsError::AclUnsupported(
                 "ACL preservation requires supported Unix and the acl feature",
@@ -52,6 +54,61 @@ impl MetadataPreservation<'_> {
             return Err(RootedFsError::UnsupportedPlatform);
         }
         Ok(())
+    }
+
+    /// Demand-read only requested fields. Unknown ACL read permission cannot
+    /// establish an effect-free request, but does not forbid an exclusive SET.
+    #[cfg(unix)]
+    fn matches(
+        &self,
+        file: &File,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<bool> {
+        let current = stat_fd(file.as_raw_fd())?;
+        if unix_mode.is_some_and(|mode| current.st_mode & 0o7777 != (mode & 0o7777) as libc::mode_t)
+        {
+            return Ok(false);
+        }
+        if let Some(times) = modified.map(modified_timespecs).transpose()? {
+            if current.st_mtime != times[1].tv_sec || current.st_mtime_nsec != times[1].tv_nsec {
+                return Ok(false);
+            }
+        }
+        if let Some(xattrs) = self.xattrs {
+            use xattr::FileExt;
+            for (name, value) in xattrs {
+                if !bounded_xattrs::value_matches(file, name, value)? {
+                    return Ok(false);
+                }
+            }
+            for name in file.list_xattr()? {
+                if !xattrs.iter().any(|(wanted, _)| wanted == &name) {
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(acl) = self.acl {
+            #[cfg(feature = "acl")]
+            if !acl_matches_fd(file, &desired_acl_entries(file, acl)?)? {
+                return Ok(false);
+            }
+            #[cfg(not(feature = "acl"))]
+            {
+                let _ = acl;
+                return Err(RootedFsError::AclUnsupported(
+                    "ACL preservation requires the acl feature",
+                ));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if self
+            .bsd_flags
+            .is_some_and(|flags| flags != current.st_flags)
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     #[cfg(unix)]
@@ -69,13 +126,7 @@ impl MetadataPreservation<'_> {
         // Immutable flags are last: they can prevent preceding required fields.
         if let Some(flags) = self.bsd_flags {
             #[cfg(target_os = "macos")]
-            {
-                // SAFETY: file is the same live observed descriptor used for
-                // all preceding fields; no namespace lookup redirects flags.
-                if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
+            apply_bsd_flags_fd(file, flags)?;
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = flags;
@@ -139,9 +190,10 @@ pub(super) fn apply_acl_and_verify_mode(
 impl RootedFs {
     /// Validate the scanned destination and apply every requested field through
     /// that single no-follow FD. Shared regular files are refused before the
-    /// first field, even for flags-only work. This is an admitted in-place
-    /// operation, not rollback or compare-and-swap: later hardlink creation and
-    /// concurrent inode writers cannot be excluded by a link-count observation.
+    /// first field unless the entire request is already fulfilled. This is an
+    /// admitted in-place operation, not rollback or compare-and-swap: later
+    /// hardlink creation and concurrent inode writers cannot be excluded by a
+    /// link-count observation.
     pub(crate) fn apply_observed_preservation_blocking(
         &self,
         relative: &RelativePath,
@@ -155,6 +207,8 @@ impl RootedFs {
         {
             self.require_writable()?;
             preservation.validate()?;
+            // Validate even requests that turn out to have no effects.
+            modified.map(modified_timespecs).transpose()?;
             // Serialize validation and effects with own old-inode retirements.
             // Translation cannot adopt a fresh stat or an unrelated ctime edit.
             let mut lineage = self
@@ -215,16 +269,33 @@ impl RootedFs {
                     relative.as_path().to_path_buf(),
                 ));
             }
-            // Guard the entire request, not only chmod/time. Directory link
-            // counts describe topology and are deliberately not file sharing.
-            require_exclusive_file_metadata(&file, relative.as_path())?;
+            // Guard the entire request before any write. Advisory ACL read
+            // denial means effects are unknown, not that exclusive SET is denied.
+            let effect_free = preservation.matches(&file, unix_mode, modified)?;
+            if !effect_free {
+                require_exclusive_file_metadata(&file, relative.as_path())?;
+            }
             self.verify_metadata_binding_blocking(relative.as_path(), &file, kind)?;
+            // Keep the session closure guard even for effect-free completion.
             let _permit = self.admit_mutation_blocking()?;
-            preservation.apply(&file, unix_mode, modified)?;
+            if effect_free {
+                if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected)
+                    || !preservation.matches(&file, unix_mode, modified)?
+                {
+                    return Err(RootedFsError::DestinationChanged(
+                        relative.as_path().to_path_buf(),
+                    ));
+                }
+            } else {
+                preservation.apply(&file, unix_mode, modified)?;
+            }
             let current = identity_from_stat(&stat_fd(file.as_raw_fd())?).ok_or_else(|| {
                 RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
             })?;
-            if self.path_identity_blocking(relative)? != Some((kind, current)) {
+            self.verify_metadata_binding_blocking(relative.as_path(), &file, kind)?;
+            if (effect_free && current != expected)
+                || self.path_identity_blocking(relative)? != Some((kind, current))
+            {
                 return Err(RootedFsError::DestinationChanged(
                     relative.as_path().to_path_buf(),
                 ));

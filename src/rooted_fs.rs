@@ -1,5 +1,9 @@
+#[cfg(all(unix, feature = "acl"))]
+mod acl_state;
 mod directory;
 mod metadata;
+#[cfg(all(unix, feature = "acl"))]
+use acl_state::{acl_matches_fd, apply_acl_fd, desired_acl_entries, read_acl_entries_fd};
 pub mod operand;
 mod publication;
 mod staging;
@@ -26,6 +30,8 @@ mod source_metadata_tests;
 mod staging_tests;
 pub use directory::{DirectoryPreservation, DirectoryPreservationRequest};
 
+#[cfg(all(target_os = "linux", feature = "acl"))]
+mod acl_linux;
 #[cfg(all(target_os = "macos", feature = "acl"))]
 mod acl_macos;
 
@@ -1110,10 +1116,7 @@ impl Drop for RootedNamespaceTransaction {
     }
 }
 
-#[cfg(any(
-    all(target_os = "linux", feature = "acl"),
-    all(target_os = "macos", feature = "acl")
-))]
+#[cfg(all(unix, feature = "acl"))]
 fn check_acl_text_bounded(text: String) -> Result<Option<String>> {
     if text.len() > crate::protocol::MAX_ACL_TEXT_BYTES {
         return Err(RootedFsError::AclSetTooLarge {
@@ -2181,7 +2184,14 @@ impl RootedFs {
         if kind == EntryKind::Directory {
             return Err(RootedFsError::UnobservedDirectoryMutation);
         }
-        self.write_xattrs_path_blocking(relative.as_path(), kind, xattrs)
+        self.write_preservation_blocking(
+            relative,
+            kind,
+            &MetadataPreservation {
+                xattrs: Some(xattrs),
+                ..Default::default()
+            },
+        )
     }
 
     /// Read a file's ACL through the already-open handle for its in-flight
@@ -2219,13 +2229,14 @@ impl RootedFs {
         if kind == EntryKind::Symlink {
             return Err(RootedFsError::UnsupportedSymlinkAcls);
         }
-        if acl.len() > crate::protocol::MAX_ACL_TEXT_BYTES {
-            return Err(RootedFsError::AclSetTooLarge {
-                len: acl.len(),
-                max: crate::protocol::MAX_ACL_TEXT_BYTES,
-            });
-        }
-        self.write_acl_path_blocking(relative.as_path(), kind, acl)
+        self.write_preservation_blocking(
+            relative,
+            kind,
+            &MetadataPreservation {
+                acl: Some(acl),
+                ..Default::default()
+            },
+        )
     }
 
     /// Demand-driven flags bound to the scanned inode, not an unchecked pathname.
@@ -2271,7 +2282,14 @@ impl RootedFs {
         if kind == EntryKind::Symlink {
             return Err(RootedFsError::UnsupportedSymlinkBsdFlags);
         }
-        self.write_bsd_flags_path_blocking(relative.as_path(), kind, flags)
+        self.write_preservation_blocking(
+            relative,
+            kind,
+            &MetadataPreservation {
+                bsd_flags: Some(flags),
+                ..Default::default()
+            },
+        )
     }
 
     /// Apply requested metadata to an existing entry beneath the pinned root.
@@ -2863,83 +2881,38 @@ impl RootedFs {
         }
     }
 
-    #[cfg(unix)]
-    fn write_xattrs_path_blocking(
+    /// Unobserved single-field APIs capture an expectation, then use the same
+    /// held-FD validation/effect guard as an observed multi-field request.
+    fn write_preservation_blocking(
         &self,
-        relative: &Path,
+        relative: &RelativePath,
         kind: EntryKind,
-        xattrs: &[(OsString, Vec<u8>)],
+        preservation: &MetadataPreservation<'_>,
     ) -> Result<()> {
-        MetadataPreservation {
-            xattrs: Some(xattrs),
-            ..Default::default()
-        }
-        .validate()?;
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        require_exclusive_file_metadata(&file, relative)?;
-        self.verify_metadata_binding_blocking(relative, &file, kind)?;
-        let _permit = self.admit_mutation_blocking()?;
-        metadata::mirror_xattrs_fd(&file, xattrs)
+        preservation.validate()?;
+        let expected = self
+            .path_identity_blocking(relative)?
+            .filter(|(actual, _)| *actual == kind)
+            .ok_or_else(|| RootedFsError::DestinationChanged(relative.as_path().to_path_buf()))?
+            .1;
+        self.apply_observed_preservation_blocking(
+            relative,
+            kind,
+            expected,
+            None,
+            None,
+            preservation,
+        )
+        .map(|_| ())
     }
 
-    #[cfg(not(unix))]
-    fn write_xattrs_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-        _xattrs: &[(OsString, Vec<u8>)],
-    ) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    /// Linux: exacl is path-based, but `/proc/self/fd/N` resolves to the
-    /// already-open inode for `acl_get_file` (verified on Fedora: access
-    /// reads, default-entry reads, and writes through read-only descriptors
-    /// all follow the magic link). The fd comes from
-    /// `open_xattr_entry_blocking`, so confinement is unchanged and no
-    /// acl_t conversion is needed: the text is exacl's own unified format.
-    /// If `/proc` is unavailable the lookup fails loudly instead of
-    /// silently reading the wrong file.
-    #[cfg(all(target_os = "linux", feature = "acl"))]
+    #[cfg(all(unix, feature = "acl"))]
     fn read_acl_from_file(&self, file: &File) -> Result<Option<String>> {
-        let entries = exacl::getfacl(fd_alias_path(file), None)?;
+        let entries = read_acl_entries_fd(file)?;
         if entries.is_empty() {
             return Ok(None);
         }
-        let text = exacl::to_string(&entries)?;
-        check_acl_text_bounded(text)
-    }
-
-    #[cfg(all(target_os = "linux", feature = "acl"))]
-    fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        require_exclusive_file_metadata(&file, relative)?;
-        self.verify_metadata_binding_blocking(relative, &file, kind)?;
-        let _permit = self.admit_mutation_blocking()?;
-        apply_acl_fd(&file, acl)
-    }
-
-    /// macOS: `/dev/fd/N` does NOT resolve to the open inode for
-    /// `acl_get_file` (verified: it returns an empty list), so the fd-based
-    /// syscalls in `acl_macos` carry the conversion instead. Same
-    /// no-follow held descriptor, same exacl text format.
-    #[cfg(all(target_os = "macos", feature = "acl"))]
-    fn read_acl_from_file(&self, file: &File) -> Result<Option<String>> {
-        let entries = acl_macos::read_fd_entries(file.as_raw_fd())?;
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let text = exacl::to_string(&entries)?;
-        check_acl_text_bounded(text)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "acl"))]
-    fn write_acl_path_blocking(&self, relative: &Path, kind: EntryKind, acl: &str) -> Result<()> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        require_exclusive_file_metadata(&file, relative)?;
-        self.verify_metadata_binding_blocking(relative, &file, kind)?;
-        let _permit = self.admit_mutation_blocking()?;
-        apply_acl_fd(&file, acl)
+        check_acl_text_bounded(exacl::to_string(&entries)?)
     }
 
     #[cfg(all(unix, not(feature = "acl")))]
@@ -2949,92 +2922,8 @@ impl RootedFs {
         ))
     }
 
-    #[cfg(all(unix, not(feature = "acl")))]
-    fn write_acl_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-        _acl: &str,
-    ) -> Result<()> {
-        Err(RootedFsError::AclUnsupported(
-            "ACL preservation requires the acl feature; rebuild with --features acl",
-        ))
-    }
-
-    #[cfg(all(
-        unix,
-        feature = "acl",
-        not(target_os = "linux"),
-        not(target_os = "macos")
-    ))]
-    fn read_acl_from_file(&self, _file: &File) -> Result<Option<String>> {
-        Err(RootedFsError::AclUnsupported(
-            "access control lists are only supported on Linux and macOS",
-        ))
-    }
-
-    #[cfg(all(
-        unix,
-        feature = "acl",
-        not(target_os = "linux"),
-        not(target_os = "macos")
-    ))]
-    fn write_acl_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-        _acl: &str,
-    ) -> Result<()> {
-        Err(RootedFsError::AclUnsupported(
-            "access control lists are only supported on Linux and macOS",
-        ))
-    }
-
     #[cfg(not(unix))]
     fn read_acl_from_file(&self, _file: &File) -> Result<Option<String>> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(not(unix))]
-    fn write_acl_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-        _acl: &str,
-    ) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    /// macOS: `fchflags` on the held no-follow leaf descriptor replaces the
-    /// whole flag word (0 clears), so the mirror is a single confined
-    /// syscall with no path lookup at all.
-    #[cfg(target_os = "macos")]
-    fn write_bsd_flags_path_blocking(
-        &self,
-        relative: &Path,
-        kind: EntryKind,
-        flags: u32,
-    ) -> Result<()> {
-        let file = self.open_xattr_entry_blocking(relative, kind)?;
-        require_exclusive_file_metadata(&file, relative)?;
-        self.verify_metadata_binding_blocking(relative, &file, kind)?;
-        let _permit = self.admit_mutation_blocking()?;
-        // SAFETY: `file` is a live held descriptor; `fchflags` only mutates
-        // flags on the open file description.
-        let ret = unsafe { libc::fchflags(file.as_raw_fd(), flags) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn write_bsd_flags_path_blocking(
-        &self,
-        _relative: &Path,
-        _kind: EntryKind,
-        _flags: u32,
-    ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -3651,48 +3540,16 @@ fn fd_alias_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
-/// Replace one held descriptor's ACL from exacl-unified text.
-///
-/// Both the rooted entry writers and the staged-writer preservation path
-/// apply through this fd-based core: no path-based lookup can race the
-/// descriptor. Empty text restores the mode-derived base entries on Linux.
-#[cfg(all(target_os = "linux", feature = "acl"))]
-fn apply_acl_fd(file: &File, acl: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // Mirror `LocalEndpoint::write_acl`: empty text restores the
-    // mode-derived base entries instead of leaving a bare ACL.
-    let entries = if acl.is_empty() {
-        let mode = file.metadata()?.permissions().mode();
-        exacl::from_mode(mode & 0o777)
-    } else {
-        exacl::from_str(acl)?
-    };
-    exacl::setfacl(&[fd_alias_path(file)], &entries, None)?;
-    Ok(())
-}
-
-/// macOS: `/dev/fd/N` does NOT resolve to the open inode for exacl's path
-/// API (verified: it returns an empty list), so the fd-based syscalls in
-/// `acl_macos` carry the conversion instead. Same held descriptor, same
-/// exacl text format.
-#[cfg(all(target_os = "macos", feature = "acl"))]
-fn apply_acl_fd(file: &File, acl: &str) -> Result<()> {
-    let entries = exacl::from_str(acl)?;
-    acl_macos::write_fd_entries(file.as_raw_fd(), &entries)?;
-    Ok(())
-}
-
-#[cfg(all(
-    unix,
-    feature = "acl",
-    not(target_os = "linux"),
-    not(target_os = "macos")
-))]
-fn apply_acl_fd(_file: &File, _acl: &str) -> Result<()> {
-    Err(RootedFsError::AclUnsupported(
-        "access control lists are only supported on Linux and macOS",
-    ))
+#[cfg(target_os = "macos")]
+fn apply_bsd_flags_fd(file: &File, flags: u32) -> Result<bool> {
+    if stat_fd(file.as_raw_fd())?.st_flags == flags {
+        return Ok(false);
+    }
+    // SAFETY: file is a live held descriptor; no namespace lookup redirects flags.
+    if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -4821,43 +4678,6 @@ mod tests {
             std::fs::read(outside.path().join("secret")).unwrap(),
             b"outside"
         );
-    }
-
-    #[tokio::test]
-    async fn shared_file_metadata_writes_are_refused_before_mutation() {
-        let root = tempfile::TempDir::new().unwrap();
-        let source = tempfile::TempDir::new().unwrap();
-        let original = source.path().join("excluded");
-        std::fs::write(&original, b"keep").unwrap();
-        std::fs::hard_link(&original, root.path().join("alias")).unwrap();
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let path = relative("alias");
-        let before = rooted.path_identity_blocking(&path).unwrap().unwrap();
-        let attempts = [
-            rooted.apply_metadata_blocking(&path, EntryKind::File, before.1, Some(0o600), None),
-            rooted.apply_metadata_blocking(
-                &path,
-                EntryKind::File,
-                before.1,
-                None,
-                Some(Timestamp::new(1_600_000_001, 0).unwrap()),
-            ),
-            rooted.write_xattrs_blocking(&path, EntryKind::File, &[]),
-            #[cfg(feature = "acl")]
-            rooted.write_acl_blocking(&path, EntryKind::File, ""),
-            #[cfg(target_os = "macos")]
-            rooted.write_bsd_flags_blocking(&path, EntryKind::File, 0),
-        ];
-        for result in attempts {
-            assert!(matches!(
-                result,
-                Err(RootedFsError::SharedFileMetadata { path: rejected, links: 2 })
-                    if rejected == path.as_path()
-            ));
-        }
-        assert_eq!(rooted.path_identity_blocking(&path).unwrap(), Some(before));
-        assert_eq!(std::fs::read(&original).unwrap(), b"keep");
-        assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
     }
 
     #[tokio::test]
