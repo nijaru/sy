@@ -1,40 +1,102 @@
-#![allow(dead_code)]
-use serde::Serialize;
-use std::path::PathBuf;
+//! Unified per-operation output for the sync engines.
+//!
+//! One reporter serves `--itemize`, `--json`, and `--perf` on local sync and
+//! v3 remote push. The reporter owns quiet gating: `--quiet` prints no
+//! per-operation lines, and JSON mode implies quiet for human surfaces so
+//! stdout belongs to NDJSON events alone. Itemize lines go to stderr in the
+//! rsync shape (`<f<`, `<f>`, `*deleting`).
 
-/// JSON output mode for machine-readable sync events
-/// Uses NDJSON format (newline-delimited JSON)
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Serialize;
+
+/// What one completed operation did to the destination namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemizeOp {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Entry kind as the itemize type column reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemizeKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl ItemizeKind {
+    fn marker(self) -> char {
+        match self {
+            ItemizeKind::File => 'f',
+            ItemizeKind::Directory => 'd',
+            ItemizeKind::Symlink => 'L',
+        }
+    }
+}
+
+/// rsync-shaped 11-character itemize field.
+///
+/// Position 1 is the transfer direction: `>` the destination is receiving
+/// this entry, `*` a deletion (rendered as `*deleting` by `operation`).
+/// Position 2 is the kind. The remaining attribute positions use `+` for
+/// attributes a create establishes; updates print `.` where attribute
+/// tracking is not yet wired (never a fake `+`).
+fn itemize_field(op: ItemizeOp, kind: ItemizeKind) -> String {
+    let (state, filler) = match op {
+        ItemizeOp::Create => ('>', "+"),
+        ItemizeOp::Update => ('>', "."),
+        ItemizeOp::Delete => ('*', "+"),
+    };
+    let mut field = format!("{state}{}", kind.marker());
+    field.push_str(&filler.repeat(9));
+    field
+}
+
+/// Machine-readable sync events (NDJSON on stdout).
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncEvent {
+    /// Emitted once when a run has established both roots. Deliberately no
+    /// total-files field: local sync scans in bounded batches and never knows
+    /// the tree size up front; `Summary` carries final counts.
     Start {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         source: PathBuf,
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         destination: PathBuf,
-        total_files: usize,
     },
     Create {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         size: u64,
         bytes_transferred: u64,
     },
     Update {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         size: u64,
         bytes_transferred: u64,
         delta_used: bool,
     },
     Skip {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         reason: String,
     },
     Delete {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
     },
-    #[allow(dead_code)] // Event for error reporting
     Error {
+        #[serde(serialize_with = "super::json_path::serialize_path")]
         path: PathBuf,
         error: String,
     },
+    /// Final event after all work, including deletion replay and directory
+    /// finalization, has finished.
     Summary {
         files_created: usize,
         files_updated: usize,
@@ -45,47 +107,236 @@ pub enum SyncEvent {
         files_verified: usize,
         verification_failures: usize,
     },
-    #[allow(dead_code)] // Event for verify-only mode (Phase 5c)
+    /// `--verify=only` result. Exact counts are independent of bounded examples.
     VerificationResult {
         files_matched: usize,
+        #[serde(flatten)]
+        counts: crate::sync::VerificationCounts,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_mismatched: Vec<PathBuf>,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_only_in_source: Vec<PathBuf>,
+        #[serde(serialize_with = "super::json_path::serialize_paths")]
         files_only_in_dest: Vec<PathBuf>,
         errors: Vec<VerificationError>,
         duration_secs: f64,
         exit_code: i32,
     },
+    /// `--perf` wall-clock breakdown. Engines report what they measured;
+    /// phases an engine does not separate are zero, never guessed.
     Performance {
         total_duration_secs: f64,
         scan_duration_secs: f64,
-        plan_duration_secs: f64,
         transfer_duration_secs: f64,
         bytes_transferred: u64,
-        bytes_read: u64,
-        files_processed: u64,
         files_created: u64,
         files_updated: u64,
         files_deleted: u64,
-        directories_created: u64,
         avg_transfer_speed: f64,
-        peak_transfer_speed: f64,
-        files_per_second: f64,
-        bandwidth_utilization: Option<f64>,
     },
 }
 
 #[derive(Debug, Serialize)]
 pub struct VerificationError {
+    #[serde(serialize_with = "super::json_path::serialize_path")]
     pub path: PathBuf,
     pub error: String,
     pub action: String,
 }
 
 impl SyncEvent {
-    /// Emit this event as JSON to stdout
+    /// Emit this event as NDJSON on stdout.
     pub fn emit(&self) {
         if let Ok(json) = serde_json::to_string(self) {
-            println!("{}", json);
+            println!("{json}");
+        }
+    }
+}
+
+/// Wall-clock split a run reports under `--perf`. `transfer` is the mutation
+/// phase: main work, deletion replay, and directory finalization.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncTimings {
+    pub scan: Duration,
+    pub transfer: Duration,
+}
+
+/// Final counters for `finish`. Primitive-typed so the reporter compiles
+/// identically from both module-tree roots.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SummaryCounts {
+    pub files_created: u64,
+    pub files_updated: u64,
+    pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub bytes_transferred: u64,
+    pub duration_secs: f64,
+    pub files_verified: u64,
+    pub verification_failures: usize,
+}
+
+/// Output surface shared by the local and v3 remote engines.
+///
+/// Built from user flags by each run; all human per-operation output goes to
+/// stderr so JSON owns stdout.
+pub struct SyncReporter {
+    itemize: bool,
+    json: bool,
+    quiet: bool,
+    perf: bool,
+}
+
+impl SyncReporter {
+    pub fn new(itemize: bool, json: bool, quiet: bool, perf: bool) -> Self {
+        // JSON owns stdout: suppress every human surface, including itemize.
+        Self {
+            itemize,
+            json,
+            quiet: quiet || json,
+            perf,
+        }
+    }
+
+    /// Whether NDJSON events are emitted.
+    pub fn json_enabled(&self) -> bool {
+        self.json
+    }
+
+    /// Whether the human perf block is printed at the end.
+    pub fn perf_enabled(&self) -> bool {
+        self.perf
+    }
+
+    pub fn operation(&self, op: ItemizeOp, kind: ItemizeKind, path: &Path) {
+        if !self.itemize || self.quiet {
+            return;
+        }
+        // rsync renders deletions as a bare `*deleting` field.
+        if op == ItemizeOp::Delete {
+            eprintln!("*deleting   {path}", path = path.display());
+        } else {
+            eprintln!("{} {}", itemize_field(op, kind), path.display());
+        }
+    }
+
+    pub fn start(&self, source: &Path, destination: &Path) {
+        if self.json {
+            SyncEvent::Start {
+                source: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+            }
+            .emit();
+        }
+    }
+
+    pub fn created(&self, kind: ItemizeKind, path: &Path, size: u64, bytes: u64) {
+        self.operation(ItemizeOp::Create, kind, path);
+        if self.json {
+            SyncEvent::Create {
+                path: path.to_path_buf(),
+                size,
+                bytes_transferred: bytes,
+            }
+            .emit();
+        }
+    }
+
+    pub fn updated(&self, path: &Path, size: u64, bytes: u64, delta_used: bool) {
+        self.operation(ItemizeOp::Update, ItemizeKind::File, path);
+        if self.json {
+            SyncEvent::Update {
+                path: path.to_path_buf(),
+                size,
+                bytes_transferred: bytes,
+                delta_used,
+            }
+            .emit();
+        }
+    }
+
+    /// A planned skip: source unchanged, destination untouched. Itemize
+    /// renders the rsync no-change field (`.`).
+    pub fn skipped(&self, path: &Path, reason: &str) {
+        if !self.itemize || self.quiet {
+            return;
+        }
+        eprintln!(".f........... {path}", path = path.display());
+        if self.json {
+            SyncEvent::Skip {
+                path: path.to_path_buf(),
+                reason: reason.to_string(),
+            }
+            .emit();
+        }
+    }
+
+    pub fn deleted(&self, kind: ItemizeKind, path: &Path) {
+        self.operation(ItemizeOp::Delete, kind, path);
+        if self.json {
+            SyncEvent::Delete {
+                path: path.to_path_buf(),
+            }
+            .emit();
+        }
+    }
+
+    pub fn failed(&self, path: &Path, error: &str) {
+        if self.json {
+            SyncEvent::Error {
+                path: path.to_path_buf(),
+                error: error.to_string(),
+            }
+            .emit();
+        }
+    }
+
+    /// Terminal output for a completed run: NDJSON summary, the `--perf`
+    /// event, and the human perf block (stderr, quiet-gated).
+    ///
+    /// Takes a `SummaryCounts` of primitives so callers from either compile of
+    /// the module tree share this reporter without a cross-crate type
+    /// dependency.
+    pub fn finish(&self, counts: &SummaryCounts, timings: SyncTimings) {
+        if self.json {
+            SyncEvent::Summary {
+                files_created: counts.files_created as usize,
+                files_updated: counts.files_updated as usize,
+                files_skipped: counts.files_skipped,
+                files_deleted: counts.files_deleted,
+                bytes_transferred: counts.bytes_transferred,
+                duration_secs: counts.duration_secs,
+                files_verified: counts.files_verified as usize,
+                verification_failures: counts.verification_failures,
+            }
+            .emit();
+        }
+        if !self.perf {
+            return;
+        }
+        let total_secs = counts.duration_secs;
+        let avg = if total_secs > 0.0 {
+            counts.bytes_transferred as f64 / total_secs
+        } else {
+            0.0
+        };
+        if self.json {
+            SyncEvent::Performance {
+                total_duration_secs: total_secs,
+                scan_duration_secs: timings.scan.as_secs_f64(),
+                transfer_duration_secs: timings.transfer.as_secs_f64(),
+                bytes_transferred: counts.bytes_transferred,
+                files_created: counts.files_created,
+                files_updated: counts.files_updated,
+                files_deleted: counts.files_deleted as u64,
+                avg_transfer_speed: avg,
+            }
+            .emit();
+        } else if !self.quiet {
+            eprintln!(
+                "Performance: total {total_secs:.3}s, scan {:.3}s, transfer {:.3}s, avg {avg}/s",
+                timings.scan.as_secs_f64(),
+                timings.transfer.as_secs_f64(),
+            );
         }
     }
 }
@@ -95,121 +346,206 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serialize_start_event() {
+    fn itemize_field_matches_rsync_shape() {
+        // Measured against live rsync (-ai): creates and updates are
+        // receiving-direction `>` entries; kind char then nine `+` (create)
+        // or `.` (update, attrs not yet tracked) positions.
+        assert_eq!(
+            itemize_field(ItemizeOp::Create, ItemizeKind::File),
+            ">f+++++++++"
+        );
+        assert_eq!(
+            itemize_field(ItemizeOp::Update, ItemizeKind::File),
+            ">f........."
+        );
+        assert_eq!(
+            itemize_field(ItemizeOp::Create, ItemizeKind::Directory),
+            ">d+++++++++"
+        );
+        assert_eq!(
+            itemize_field(ItemizeOp::Create, ItemizeKind::Symlink),
+            ">L+++++++++"
+        );
+    }
+
+    #[test]
+    fn json_implies_quiet() {
+        let reporter = SyncReporter::new(true, true, false, false);
+        assert!(reporter.json_enabled());
+        // itemize+json together: events only, no human lines.
+        let plain = SyncReporter::new(true, false, false, false);
+        assert!(!plain.quiet_impl_for_test());
+        let json = SyncReporter::new(true, true, false, false);
+        assert!(json.quiet_impl_for_test());
+    }
+
+    impl SyncReporter {
+        fn quiet_impl_for_test(&self) -> bool {
+            self.quiet
+        }
+    }
+
+    #[test]
+    fn quiet_suppresses_itemize() {
+        let reporter = SyncReporter::new(true, false, true, false);
+        assert!(reporter.quiet_impl_for_test());
+    }
+
+    #[test]
+    fn start_event_has_no_total_files() {
         let event = SyncEvent::Start {
             source: PathBuf::from("/src"),
             destination: PathBuf::from("/dst"),
-            total_files: 100,
         };
-
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"start"#));
-        assert!(json.contains(r#""total_files":100"#));
+        assert!(json.contains(r#""type":"start""#));
+        assert!(!json.contains("total_files"));
     }
 
     #[test]
-    fn test_serialize_create_event() {
-        let event = SyncEvent::Create {
-            path: PathBuf::from("file.txt"),
-            size: 1234,
-            bytes_transferred: 1234,
+    fn create_and_delete_events_serialize() {
+        let create = SyncEvent::Create {
+            path: PathBuf::from("f.txt"),
+            size: 10,
+            bytes_transferred: 10,
         };
+        let json = serde_json::to_string(&create).unwrap();
+        assert!(json.contains(r#""type":"create""#));
+        assert!(json.contains(r#""bytes_transferred":10"#));
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"create"#));
-        assert!(json.contains(r#""size":1234"#));
+        let delete = SyncEvent::Delete {
+            path: PathBuf::from("f.txt"),
+        };
+        assert!(serde_json::to_string(&delete)
+            .unwrap()
+            .contains(r#""type":"delete""#));
     }
 
     #[test]
-    fn test_serialize_update_event() {
+    fn update_event_serializes_delta_flag() {
         let event = SyncEvent::Update {
-            path: PathBuf::from("file.txt"),
-            size: 5678,
-            bytes_transferred: 234,
+            path: PathBuf::from("f.txt"),
+            size: 20,
+            bytes_transferred: 5,
             delta_used: true,
         };
-
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"update"#));
         assert!(json.contains(r#""delta_used":true"#));
     }
 
     #[test]
-    fn test_serialize_summary_event() {
+    fn summary_event_serializes() {
         let event = SyncEvent::Summary {
-            files_created: 10,
-            files_updated: 5,
-            files_skipped: 20,
-            files_deleted: 2,
-            bytes_transferred: 123456,
-            duration_secs: 12.5,
-            files_verified: 15,
+            files_created: 3,
+            files_updated: 2,
+            files_skipped: 4,
+            files_deleted: 1,
+            bytes_transferred: 100,
+            duration_secs: 1.5,
+            files_verified: 5,
             verification_failures: 0,
         };
-
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"summary"#));
-        assert!(json.contains(r#""files_created":10"#));
-        assert!(json.contains(r#""duration_secs":12.5"#));
-        assert!(json.contains(r#""files_verified":15"#));
-        assert!(json.contains(r#""verification_failures":0"#));
+        assert!(json.contains(r#""type":"summary""#));
+        assert!(json.contains(r#""files_deleted":1"#));
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
-    fn test_serialize_verification_result() {
-        let event = SyncEvent::VerificationResult {
-            files_matched: 10,
-            files_mismatched: vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")],
-            files_only_in_source: vec![PathBuf::from("src_only.txt")],
-            files_only_in_dest: vec![PathBuf::from("dst_only.txt")],
+    fn json_paths_round_trip_native_names_in_operations_and_verification() {
+        #[cfg(unix)]
+        let (path, encoded) = {
+            use std::os::unix::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_vec(vec![b'f', 0xff])),
+                serde_json::json!({"encoding": "unix_bytes", "bytes": [102, 255]}),
+            )
+        };
+        #[cfg(windows)]
+        let (path, encoded) = {
+            use std::os::windows::ffi::OsStringExt;
+            (
+                PathBuf::from(std::ffi::OsString::from_wide(&[102, 0xdc00])),
+                serde_json::json!({"encoding": "windows_utf16", "units": [102, 0xdc00]}),
+            )
+        };
+        for event in [
+            SyncEvent::Create {
+                path: path.clone(),
+                size: 1,
+                bytes_transferred: 1,
+            },
+            SyncEvent::Update {
+                path: path.clone(),
+                size: 1,
+                bytes_transferred: 1,
+                delta_used: false,
+            },
+            SyncEvent::Skip {
+                path: path.clone(),
+                reason: "unchanged".into(),
+            },
+            SyncEvent::Delete { path: path.clone() },
+            SyncEvent::Error {
+                path: path.clone(),
+                error: "denied".into(),
+            },
+        ] {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["path"], encoded);
+        }
+        let value = serde_json::to_value(SyncEvent::Start {
+            source: path.clone(),
+            destination: "Unicode-日".into(),
+        })
+        .unwrap();
+        assert_eq!(value["source"], encoded);
+        assert_eq!(value["destination"], "Unicode-日");
+        let value = serde_json::to_value(SyncEvent::VerificationResult {
+            files_matched: 0,
+            counts: crate::sync::VerificationCounts {
+                files_mismatched: 1,
+                files_only_in_source: 1,
+                files_only_in_dest: 1,
+                errors: 1,
+            },
+            files_mismatched: vec![path.clone()],
+            files_only_in_source: vec![path.clone()],
+            files_only_in_dest: vec![path.clone()],
             errors: vec![VerificationError {
-                path: PathBuf::from("error_file.txt"),
-                error: "Permission denied".to_string(),
-                action: "verify".to_string(),
+                path,
+                error: "denied".into(),
+                action: "verify".into(),
             }],
-            duration_secs: 1.5,
-            exit_code: 1,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"verification_result"#));
-        assert!(json.contains(r#""files_matched":10"#));
-        assert!(json.contains(r#""files_mismatched"#));
-        assert!(json.contains(r#""file1.txt"#));
-        assert!(json.contains(r#""files_only_in_source"#));
-        assert!(json.contains(r#""src_only.txt"#));
-        assert!(json.contains(r#""files_only_in_dest"#));
-        assert!(json.contains(r#""dst_only.txt"#));
-        assert!(json.contains(r#""errors"#));
-        assert!(json.contains(r#""error_file.txt"#));
-        assert!(json.contains(r#""duration_secs":1.5"#));
-        assert!(json.contains(r#""exit_code":1"#));
+            duration_secs: 0.0,
+            exit_code: 2,
+        })
+        .unwrap();
+        for field in [
+            "files_mismatched",
+            "files_only_in_source",
+            "files_only_in_dest",
+        ] {
+            assert_eq!(value[field][0], encoded);
+        }
+        assert_eq!(value["errors"][0]["path"], encoded);
+        assert_eq!(value["errors_count"], 1);
     }
 
     #[test]
-    fn test_serialize_performance_event() {
+    fn performance_event_serializes() {
         let event = SyncEvent::Performance {
-            total_duration_secs: 10.5,
-            scan_duration_secs: 1.2,
-            plan_duration_secs: 0.8,
-            transfer_duration_secs: 8.5,
-            bytes_transferred: 1_000_000,
-            bytes_read: 1_200_000,
-            files_processed: 100,
-            files_created: 50,
-            files_updated: 30,
-            files_deleted: 10,
-            directories_created: 5,
-            avg_transfer_speed: 117_647.0,
-            peak_transfer_speed: 200_000.0,
-            files_per_second: 9.52,
-            bandwidth_utilization: Some(87.5),
+            total_duration_secs: 2.0,
+            scan_duration_secs: 0.5,
+            transfer_duration_secs: 1.5,
+            bytes_transferred: 1_000,
+            files_created: 1,
+            files_updated: 1,
+            files_deleted: 0,
+            avg_transfer_speed: 500.0,
         };
-
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"performance"#));
-        assert!(json.contains(r#""bytes_transferred":1000000"#));
-        assert!(json.contains(r#""avg_transfer_speed":117647"#));
-        assert!(json.contains(r#""bandwidth_utilization":87.5"#));
+        assert!(json.contains(r#""type":"performance""#));
+        assert!(json.contains(r#""scan_duration_secs":0.5"#));
     }
 }

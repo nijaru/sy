@@ -1,0 +1,1492 @@
+#[path = "client.rs"]
+mod client;
+#[path = "directory.rs"]
+mod directory;
+#[path = "metadata.rs"]
+pub(crate) mod metadata;
+#[path = "mutation.rs"]
+mod mutation;
+pub use client::ClientRemoteHandle;
+#[path = "scope.rs"]
+mod scope;
+pub use scope::ScopeError;
+#[cfg(all(test, unix))]
+#[path = "scope_tests.rs"]
+mod scope_tests;
+
+use crate::endpoint::Capabilities as EndpointCapabilities;
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
+use crate::engine::reconcile::EntryStream;
+use crate::engine::scan::ScanRequest;
+use crate::engine::work::TransferSummary;
+use crate::protocol::{
+    CapabilitySet, ClientHello, FrameKind, Operation, PlatformOs, ServerHello, SessionReady,
+    PROTOCOL_V3_2,
+};
+use crate::remote::acl::serve_incoming_acl_rooted;
+use crate::remote::bsdflags::serve_incoming_bsd_flags_rooted;
+use crate::remote::hash::{request_content_hash, serve_incoming_hash_rooted, RemoteHashError};
+use crate::remote::router::{
+    FrameRouter, IncomingStream, RouterConfig, RouterError, RouterRole, RouterSender,
+    SharedRouterError,
+};
+use crate::remote::scan::{request_scan, serve_incoming_scan_session};
+use crate::remote::signature::{
+    choose_signature_block_size, request_signatures, serve_incoming_signatures_rooted,
+    RemoteSignatureError, SignatureEvent, SignatureStream,
+};
+use crate::remote::transfer::{
+    request_file_transfer, serve_incoming_file_rooted, RemoteTransferError,
+};
+use crate::remote::xattr::{request_read_xattrs, serve_incoming_xattr_rooted, RemoteXattrError};
+use crate::remote::{server_handshake, OpenedServerSession, SessionRoot};
+use crate::rooted_fs::RootedFs;
+use crate::transfer::delta::{
+    BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
+};
+use futures::StreamExt;
+use metadata::{request_metadata, serve_incoming_metadata_rooted, RemoteMetadataError};
+use mutation::{
+    request_copy_file, request_create_directory, request_hardlink, request_remove,
+    request_replace_symlink, serve_incoming_mutation_rooted, RemoteMutationError,
+};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteSessionError {
+    #[error(transparent)]
+    Control(#[from] crate::remote::RemoteError),
+
+    #[error(transparent)]
+    RouterStart(#[from] RouterError),
+
+    #[error("frame router failed: {0}")]
+    Router(SharedRouterError),
+
+    #[error("unsupported v3 request opener: {0:?}")]
+    UnsupportedRequest(FrameKind),
+
+    #[error("v3 request {kind:?} is invalid for {operation:?} session direction")]
+    OperationMismatch {
+        operation: Operation,
+        kind: FrameKind,
+    },
+
+    #[error(transparent)]
+    Scope(#[from] ScopeError),
+
+    #[error("pending destination root has no filesystem authority")]
+    PendingRoot,
+
+    #[error("compression requested but the peer did not negotiate the ZSTD capability")]
+    PeerLacksZstd,
+
+    #[error(transparent)]
+    Hash(#[from] RemoteHashError),
+
+    #[error(transparent)]
+    Signature(#[from] RemoteSignatureError),
+
+    #[error(transparent)]
+    Transfer(#[from] RemoteTransferError),
+
+    #[error(transparent)]
+    Metadata(#[from] RemoteMetadataError),
+
+    #[error(transparent)]
+    Mutation(#[from] RemoteMutationError),
+
+    #[error(transparent)]
+    Xattr(#[from] RemoteXattrError),
+
+    #[error(transparent)]
+    BasisIndex(#[from] BasisIndexError),
+
+    #[error("remote signature stream failed: {0}")]
+    SignatureStream(String),
+
+    #[error("remote signature stream ended without SignatureEnd")]
+    MissingSignatureEnd,
+
+    #[error(
+        "signature block-size selection changed unexpectedly: expected {expected}, got {actual}"
+    )]
+    SignatureBlockSizeMismatch { expected: u32, actual: u32 },
+}
+
+impl From<SharedRouterError> for RemoteSessionError {
+    fn from(error: SharedRouterError) -> Self {
+        Self::Router(error)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, RemoteSessionError>;
+
+pub struct ClientRemoteSession {
+    operation: Operation,
+    server: ServerHello,
+    capabilities: EndpointCapabilities,
+    binding: std::sync::Arc<client::ClientRootBinding>,
+    router: FrameRouter,
+}
+
+impl ClientRemoteSession {
+    pub async fn connect<R, W>(
+        reader: R,
+        writer: W,
+        operation: Operation,
+        root: &Path,
+        config: RouterConfig,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::connect_binding(reader, writer, operation, root, None, config).await
+    }
+
+    pub async fn connect_operand<R, W>(
+        reader: R,
+        writer: W,
+        operation: Operation,
+        path: &Path,
+        operand: &crate::remote::operand::RemoteOperand,
+        config: RouterConfig,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::connect_binding(reader, writer, operation, path, Some(operand), config).await
+    }
+
+    async fn connect_binding<R, W>(
+        mut reader: R,
+        mut writer: W,
+        operation: Operation,
+        path: &Path,
+        operand: Option<&crate::remote::operand::RemoteOperand>,
+        config: RouterConfig,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let negotiated = crate::remote::client_operand_handshake(
+            &mut reader,
+            &mut writer,
+            operation,
+            path,
+            operand,
+        )
+        .await?;
+        let router = FrameRouter::start(reader, writer, RouterRole::Client, config)?;
+        Ok(Self {
+            operation,
+            server: negotiated.server,
+            capabilities: negotiated.capabilities,
+            binding: std::sync::Arc::new(client::ClientRootBinding::new(negotiated.ready)),
+            router,
+        })
+    }
+
+    /// Complete an idle client transport; its SSH owner supplies the deadline
+    /// and subsequently checks the process status. Responses alone are not
+    /// evidence of successful subprocess completion.
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.router.finish().await.map_err(Into::into)
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        self.router.shutdown().await.map_err(Into::into)
+    }
+
+    pub const fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    pub fn server(&self) -> &ServerHello {
+        &self.server
+    }
+
+    pub const fn capabilities(&self) -> &EndpointCapabilities {
+        &self.capabilities
+    }
+
+    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
+        self.binding.ready().namespace_semantics.into()
+    }
+
+    pub fn sender(&self) -> RouterSender {
+        self.router.sender()
+    }
+
+    pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
+        request_scan(&self.router.sender(), request, self.server.platform.os).await
+    }
+
+    pub async fn content_hash(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
+        crate::remote::hash::require_blake3(&self.capabilities)?;
+        request_content_hash(&self.router.sender(), basis, self.server.platform.os).await
+    }
+
+    pub async fn signatures(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
+        if !self.capabilities.rolling_signatures {
+            return Err(RemoteSignatureError::UnsupportedByPeer);
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis);
+        }
+        let identity = basis
+            .identity
+            .ok_or(RemoteSignatureError::MissingBasisIdentity)?;
+        request_signatures(
+            &self.router.sender(),
+            &basis.path,
+            basis.size,
+            identity,
+            self.server.platform.os,
+        )
+        .await
+    }
+
+    pub async fn delta_basis(
+        &self,
+        basis: &Entry,
+        limits: BasisIndexLimits,
+    ) -> Result<Option<BasisIndex>> {
+        if !self.capabilities.rolling_signatures {
+            return Err(RemoteSignatureError::UnsupportedByPeer.into());
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis.into());
+        }
+        if basis.identity.is_none() {
+            return Err(RemoteSignatureError::MissingBasisIdentity.into());
+        }
+
+        let block_size = choose_signature_block_size(basis.size);
+        let mut builder = BasisIndexBuilder::new(block_size, limits)?;
+        let max_blocks = u64::try_from(limits.max_blocks).unwrap_or(u64::MAX);
+        let expected_blocks = basis.size.div_ceil(u64::from(block_size));
+        if expected_blocks > max_blocks {
+            return Ok(None);
+        }
+
+        let (actual_block_size, mut signatures) = self.signatures(basis).await?;
+        if actual_block_size != block_size {
+            return Err(RemoteSessionError::SignatureBlockSizeMismatch {
+                expected: block_size,
+                actual: actual_block_size,
+            });
+        }
+
+        let mut over_limit = false;
+        loop {
+            let Some(event) = signatures.next().await else {
+                return Err(RemoteSessionError::MissingSignatureEnd);
+            };
+            let event =
+                event.map_err(|error| RemoteSessionError::SignatureStream(error.to_string()))?;
+            match event {
+                SignatureEvent::Block(block) if !over_limit => {
+                    let block = BasisBlock {
+                        index: block.index,
+                        size: block.size,
+                        weak: block.weak,
+                        strong: block.strong,
+                    };
+                    match builder.push(block) {
+                        Ok(()) => {}
+                        Err(BasisIndexError::TooManyBlocks { .. }) => over_limit = true,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                SignatureEvent::Block(_) => {}
+                SignatureEvent::End(_) => break,
+            }
+        }
+
+        if over_limit {
+            Ok(None)
+        } else {
+            Ok(Some(builder.finish()))
+        }
+    }
+
+    pub async fn transfer_file(
+        &self,
+        source_root: crate::endpoint::source_root::SourceRoot,
+        source: Entry,
+        destination: crate::remote::transfer::TransferDestination,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer(
+            &self.router.sender(),
+            source_root,
+            source,
+            destination,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn apply_metadata(
+        &self,
+        metadata: crate::protocol::WireMetadata,
+    ) -> Result<EntryIdentity> {
+        self.require_push(FrameKind::Metadata)?;
+        request_metadata(&self.router.sender(), metadata, self.server.platform.os)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn create_directory(&self, path: &RelativePath) -> Result<EntryIdentity> {
+        self.require_push(FrameKind::Mutation)?;
+        request_create_directory(&self.router.sender(), path, self.server.platform.os)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replace_symlink(
+        &self,
+        path: &RelativePath,
+        target: &Path,
+        expected_identity: Option<EntryIdentity>,
+        modified: Option<Timestamp>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
+        self.require_push(FrameKind::Mutation)?;
+        request_replace_symlink(
+            &self.router.sender(),
+            path,
+            target,
+            expected_identity,
+            modified,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn remove(
+        &self,
+        path: &RelativePath,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_remove(
+            &self.router.sender(),
+            path,
+            is_directory,
+            expected_identity,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side copy beneath the pinned root. `--backup` uses this to
+    /// preserve soon-to-be-replaced or deleted destination files; the same
+    /// request is the seed of the object-native copy transfer strategy.
+    pub async fn copy_file(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        expected_source_identity: EntryIdentity,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_copy_file(
+            &self.router.sender(),
+            source,
+            destination,
+            expected_source_identity,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side hardlink beneath the pinned root (`-H`). Links
+    /// `destination` to the existing `source` inode without moving bytes.
+    pub async fn hardlink(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        source_identity: EntryIdentity,
+        expected_destination: Option<EntryIdentity>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
+        self.require_push(FrameKind::Mutation)?;
+        request_hardlink(
+            &self.router.sender(),
+            source,
+            destination,
+            source_identity,
+            expected_destination,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Read the remote source's attributes for the required observation (`-X`).
+    pub async fn read_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        expected: EntryIdentity,
+    ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+        request_read_xattrs(
+            &self.router.sender(),
+            path,
+            kind,
+            expected,
+            self.server.platform.os,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    fn require_push(&self, kind: FrameKind) -> Result<()> {
+        if self.operation == Operation::Push {
+            Ok(())
+        } else {
+            Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind,
+            })
+        }
+    }
+}
+
+pub enum IncomingRequest {
+    AcquireRoot(IncomingStream),
+    Scan(IncomingStream),
+    Hash(IncomingStream),
+    Signatures(IncomingStream),
+    File(IncomingStream),
+    FileFetch(IncomingStream),
+    Metadata(IncomingStream),
+    Mutation(IncomingStream),
+    Xattr(IncomingStream),
+    Acl(IncomingStream),
+    BsdFlags(IncomingStream),
+}
+
+#[derive(Clone)]
+pub struct ServerScanHandler {
+    rooted: SessionRoot,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerScanHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
+        serve_incoming_scan_session(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerHashHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerHashHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::hash::Result<()> {
+        serve_incoming_hash_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Signature requests share the root descriptor opened at SessionOpen. Cloning
+/// this handler duplicates authority to that same held directory, not the root
+/// pathname.
+#[derive(Clone)]
+pub struct ServerSignatureHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerSignatureHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::signature::Result<()> {
+        serve_incoming_signatures_rooted(self.rooted.clone(), incoming, &self.sender, self.peer)
+            .await
+    }
+}
+
+/// File reconstruction shares the root descriptor opened at SessionOpen, so a
+/// later rename or symlink replacement of the root pathname cannot redirect a
+/// transfer.
+#[derive(Clone)]
+pub struct ServerFileHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerFileHandler {
+    pub async fn serve(
+        &self,
+        incoming: IncomingStream,
+    ) -> crate::remote::transfer::Result<TransferSummary> {
+        serve_incoming_file_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Metadata-only updates use the same session-pinned root descriptor and never
+/// resolve the root pathname after SessionOpen.
+#[derive(Clone)]
+pub struct ServerMetadataHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerMetadataHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> metadata::Result<()> {
+        serve_incoming_metadata_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Namespace mutations use the same session-pinned root descriptor as file
+/// reconstruction. The mutation request never reopens the root pathname.
+#[derive(Clone)]
+pub struct ServerMutationHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerMutationHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> mutation::Result<()> {
+        serve_incoming_mutation_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Observation-bound source xattr reads use the session-pinned root.
+#[derive(Clone)]
+pub struct ServerXattrHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerXattrHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::xattr::Result<()> {
+        serve_incoming_xattr_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Observation-bound source ACL reads use the session-pinned root.
+#[derive(Clone)]
+pub struct ServerAclHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerAclHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::acl::Result<()> {
+        serve_incoming_acl_rooted(self.rooted.clone(), incoming, &self.sender, self.peer).await
+    }
+}
+
+/// Observation-bound source flag reads use the session-pinned root.
+#[derive(Clone)]
+pub struct ServerBsdFlagsHandler {
+    rooted: RootedFs,
+    sender: RouterSender,
+    peer: PlatformOs,
+}
+
+impl ServerBsdFlagsHandler {
+    pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::bsdflags::Result<()> {
+        serve_incoming_bsd_flags_rooted(self.rooted.clone(), incoming, &self.sender, self.peer)
+            .await
+    }
+}
+
+pub struct ServerRemoteSession {
+    opened: OpenedServerSession,
+    router: FrameRouter,
+}
+
+impl ServerRemoteSession {
+    pub async fn accept<R, W>(mut reader: R, mut writer: W, config: RouterConfig) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut opened = server_handshake(&mut reader, &mut writer).await?;
+        let router = FrameRouter::start(reader, writer, RouterRole::Server, config)?;
+        match &mut opened.rooted {
+            SessionRoot::Present(rooted) => rooted.bind_session_mutations(
+                router.sender().publication_admission(),
+                opened.operation != Operation::Push,
+            ),
+            SessionRoot::Pending(pending) => pending.bind_mutations(
+                router.sender().publication_admission(),
+                opened.operation != Operation::Push,
+            ),
+        }
+        Ok(Self { opened, router })
+    }
+
+    pub fn client(&self) -> &ClientHello {
+        &self.opened.client
+    }
+
+    pub const fn operation(&self) -> Operation {
+        self.opened.operation
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.opened.root
+    }
+
+    pub fn ready(&self) -> &SessionReady {
+        &self.opened.ready
+    }
+
+    pub fn sender(&self) -> RouterSender {
+        self.router.sender()
+    }
+
+    pub fn scan_handler(&self) -> ServerScanHandler {
+        ServerScanHandler {
+            rooted: self.opened.rooted.clone(),
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        }
+    }
+
+    pub(crate) fn has_root(&self) -> bool {
+        matches!(self.opened.rooted, SessionRoot::Present(_))
+    }
+
+    /// The pinned filesystem authority; absence never borrows a parent root.
+    pub fn scan_handler_rooted(&self) -> Result<RootedFs> {
+        match &self.opened.rooted {
+            SessionRoot::Present(rooted) => Ok(rooted.clone()),
+            SessionRoot::Pending(_) => Err(RemoteSessionError::PendingRoot),
+        }
+    }
+
+    pub fn hash_handler(&self) -> Result<ServerHashHandler> {
+        Ok(ServerHashHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn signature_handler(&self) -> Result<ServerSignatureHandler> {
+        Ok(ServerSignatureHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn file_handler(&self) -> Result<ServerFileHandler> {
+        Ok(ServerFileHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn metadata_handler(&self) -> Result<ServerMetadataHandler> {
+        Ok(ServerMetadataHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn mutation_handler(&self) -> Result<ServerMutationHandler> {
+        Ok(ServerMutationHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn xattr_handler(&self) -> Result<ServerXattrHandler> {
+        Ok(ServerXattrHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn acl_handler(&self) -> Result<ServerAclHandler> {
+        Ok(ServerAclHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub fn bsd_flags_handler(&self) -> Result<ServerBsdFlagsHandler> {
+        Ok(ServerBsdFlagsHandler {
+            rooted: self.scan_handler_rooted()?,
+            sender: self.router.sender(),
+            peer: self.opened.client.platform.os,
+        })
+    }
+
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.router
+            .finish()
+            .await
+            .map_err(RemoteSessionError::Router)
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        self.router
+            .shutdown()
+            .await
+            .map_err(RemoteSessionError::Router)
+    }
+
+    /// Called only at the drained acquisition barrier, before rebuilding all handlers.
+    pub(crate) async fn acquire_root(&mut self, incoming: IncomingStream) -> Result<()> {
+        let frame = incoming.first.frame();
+        if frame.flags()
+            != (crate::protocol::FrameFlags::FINAL | crate::protocol::FrameFlags::ACK_REQUIRED)
+        {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage("invalid acquisition flags"),
+            )
+            .into());
+        }
+        let request = crate::protocol::AcquireRoot::decode(frame.payload())
+            .map_err(crate::remote::RemoteError::from)?;
+        let path =
+            crate::remote::path::decode_relative_path(request.create, self.client().platform.os)
+                .map_err(|error| crate::remote::RemoteError::Io(std::io::Error::other(error)))?;
+        if let crate::protocol::ResolvedOperand::Entry { name } = &self.opened.ready.resolved {
+            if crate::remote::operand::decode_name(name.clone())? != path {
+                return Err(crate::remote::RemoteError::InvalidRoot(
+                    "acquisition target differs from selected destination",
+                )
+                .into());
+            }
+        }
+        let SessionRoot::Pending(pending) = &self.opened.rooted else {
+            return Err(crate::remote::RemoteError::InvalidRoot("root is already acquired").into());
+        };
+        let rooted = crate::rooted_fs::operand::DestinationRoot::Pending(pending.clone())
+            .acquire()
+            .await
+            .map_err(crate::remote::RemoteError::from)?;
+        let namespace = rooted
+            .namespace_semantics()
+            .await
+            .map_err(crate::remote::RemoteError::from)?;
+        self.opened.rooted = SessionRoot::Present(rooted);
+        self.opened.ready.pending = false;
+        self.opened.ready.namespace_semantics = namespace.into();
+        let ack = crate::protocol::Frame::new(
+            FrameKind::Ack,
+            crate::protocol::FrameFlags::empty(),
+            frame.stream_id(),
+            self.opened
+                .ready
+                .encode()
+                .map_err(crate::remote::RemoteError::from)?,
+        )
+        .map_err(crate::remote::RemoteError::from)?;
+        self.sender().send(ack).await?;
+        Ok(())
+    }
+
+    pub async fn next_request(&mut self) -> Result<Option<IncomingRequest>> {
+        let Some(incoming) = self.router.incoming().recv().await? else {
+            return Ok(None);
+        };
+
+        let kind = incoming.first.frame().kind();
+        if !self.has_root() && kind != FrameKind::ScanRequest && kind != FrameKind::AcquireRoot {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation(),
+                kind,
+            });
+        }
+        let request = match kind {
+            FrameKind::AcquireRoot if self.operation() == Operation::Push && !self.has_root() => {
+                Ok(Some(IncomingRequest::AcquireRoot(incoming)))
+            }
+            FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
+            FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
+            FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
+            FrameKind::FileFetchRequest if self.opened.operation == Operation::Pull => {
+                let request =
+                    crate::protocol::WireFileFetchRequest::decode(incoming.first.frame().payload())
+                        .map_err(crate::remote::RemoteError::from)?;
+                for (requested, capability, name) in [
+                    (request.preserve_xattrs(), CapabilitySet::XATTR, "xattrs"),
+                    (request.preserve_acls(), CapabilitySet::ACL, "ACLs"),
+                ] {
+                    if requested
+                        && (self.opened.version < PROTOCOL_V3_2
+                            || !self.opened.ready.capabilities.contains(capability))
+                    {
+                        return Err(
+                            RemoteTransferError::PreservationUnavailable { feature: name }.into(),
+                        );
+                    }
+                }
+                Ok(Some(IncomingRequest::FileFetch(incoming)))
+            }
+            FrameKind::FileBegin if self.opened.operation == Operation::Push => {
+                Ok(Some(IncomingRequest::File(incoming)))
+            }
+            FrameKind::Metadata
+                if self.opened.operation == Operation::Push
+                    || matches!(
+                        incoming.first.frame().payload().first(),
+                        Some(&crate::protocol::DIRECTORY_READ)
+                            | Some(&crate::protocol::OBSERVATION_READ)
+                    ) =>
+            {
+                Ok(Some(IncomingRequest::Metadata(incoming)))
+            }
+            FrameKind::Mutation if self.opened.operation == Operation::Push => {
+                Ok(Some(IncomingRequest::Mutation(incoming)))
+            }
+            // Xattr reads are valid in both directions; the handler refuses a
+            // write in a Pull session because the remote root is then the
+            // read-only source.
+            FrameKind::XattrRequest => Ok(Some(IncomingRequest::Xattr(incoming))),
+            // ACL reads are valid in both directions, with the same
+            // Pull-session write refusal as xattrs.
+            FrameKind::AclRequest => Ok(Some(IncomingRequest::Acl(incoming))),
+            // BSD-flags reads are valid in both directions, with the same
+            // Pull-session write refusal.
+            FrameKind::BsdFlagsRequest => Ok(Some(IncomingRequest::BsdFlags(incoming))),
+            FrameKind::FileBegin | FrameKind::Metadata | FrameKind::Mutation => {
+                Err(RemoteSessionError::OperationMismatch {
+                    operation: self.opened.operation,
+                    kind: incoming.first.frame().kind(),
+                })
+            }
+            FrameKind::FileFetchRequest => Err(RemoteSessionError::OperationMismatch {
+                operation: self.opened.operation,
+                kind: incoming.first.frame().kind(),
+            }),
+            actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
+        }?;
+        if let Some(request) = &request {
+            let incoming = match request {
+                IncomingRequest::AcquireRoot(incoming)
+                | IncomingRequest::Scan(incoming)
+                | IncomingRequest::Hash(incoming)
+                | IncomingRequest::Signatures(incoming)
+                | IncomingRequest::File(incoming)
+                | IncomingRequest::FileFetch(incoming)
+                | IncomingRequest::Metadata(incoming)
+                | IncomingRequest::Mutation(incoming)
+                | IncomingRequest::Xattr(incoming)
+                | IncomingRequest::Acl(incoming)
+                | IncomingRequest::BsdFlags(incoming) => incoming,
+            };
+            scope::authorize(
+                &self.opened.ready.resolved,
+                incoming.first.frame(),
+                self.opened.client.platform.os,
+            )?;
+        }
+        Ok(request)
+    }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn preview_requests_have_only_the_observed_read_authority() {
+    use crate::protocol::{Frame, FrameFlags};
+    use crate::rooted_fs::RootedFsError;
+    for present in [false, true] {
+        let kinds: &[FrameKind] = if present {
+            &[
+                FrameKind::FileBegin,
+                FrameKind::Metadata,
+                FrameKind::Mutation,
+                FrameKind::FileFetchRequest,
+            ]
+        } else {
+            &[
+                FrameKind::FileBegin,
+                FrameKind::Metadata,
+                FrameKind::Mutation,
+                FrameKind::FileFetchRequest,
+                FrameKind::HashRequest,
+                FrameKind::SignatureRequest,
+                FrameKind::XattrRequest,
+                FrameKind::AclRequest,
+                FrameKind::BsdFlagsRequest,
+            ]
+        };
+        for &kind in kinds {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("destination");
+            if present {
+                std::fs::create_dir(&root).unwrap();
+            }
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(server_io);
+            let server = tokio::spawn(async move {
+                let mut session =
+                    ServerRemoteSession::accept(reader, writer, RouterConfig::default())
+                        .await
+                        .unwrap();
+                match session.scan_handler_rooted() {
+                    Ok(rooted) => {
+                        assert!(present);
+                        assert!(matches!(
+                            rooted.create_directory_blocking(
+                                &RelativePath::new("forbidden").unwrap()
+                            ),
+                            Err(RootedFsError::ReadOnlyRoot)
+                        ));
+                    }
+                    Err(RemoteSessionError::PendingRoot) => assert!(!present),
+                    Err(error) => panic!("{error}"),
+                }
+                assert!(matches!(session.next_request().await,
+                    Err(RemoteSessionError::OperationMismatch { operation: Operation::PreviewPush, kind: actual }) if actual == kind));
+                session.shutdown().await.unwrap();
+            });
+            let (reader, writer) = tokio::io::split(client_io);
+            let client = ClientRemoteSession::connect(
+                reader,
+                writer,
+                Operation::PreviewPush,
+                &root,
+                RouterConfig::default(),
+            )
+            .await
+            .unwrap();
+            let sender = client.sender();
+            let inbox = sender.open_stream().unwrap();
+            sender
+                .send(
+                    Frame::new(
+                        kind,
+                        FrameFlags::empty(),
+                        inbox.stream_id(),
+                        bytes::Bytes::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.exists(), present);
+            if present {
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::engine::domain::{EntryKind, Timestamp};
+    use crate::engine::scan::EntryMetadataRequest;
+    use crate::transfer::delta::BasisIndexLimits;
+    use futures::TryStreamExt;
+    use tokio::task::JoinSet;
+
+    #[cfg(unix)]
+    fn file_entry(root: &Path, relative: &str) -> Entry {
+        let path = root.join(relative);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let identity =
+            crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File).unwrap();
+        let mut entry = Entry::file(
+            RelativePath::new(PathBuf::from(relative)).unwrap(),
+            metadata.len(),
+            Timestamp::UNIX_EPOCH,
+        );
+        entry.identity = Some(identity);
+        entry
+    }
+
+    async fn collect_paths(mut entries: EntryStream) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next().await {
+            paths.push(entry.unwrap().path.as_path().to_path_buf());
+        }
+        paths
+    }
+
+    #[tokio::test]
+    async fn session_runtime_multiplexes_two_ordered_scans() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("a"), b"a").unwrap();
+        std::fs::write(root.path().join("dir").join("b"), b"b").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.scan_handler();
+            let mut tasks = JoinSet::new();
+            for _ in 0..2 {
+                let request = session.next_request().await.unwrap().unwrap();
+                let IncomingRequest::Scan(incoming) = request else {
+                    panic!("expected scan request");
+                };
+                let handler = handler.clone();
+                tasks.spawn(async move {
+                    handler.serve(incoming).await.unwrap();
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let request = ScanRequest {
+            respect_gitignore: false,
+            include_git_dir: false,
+            follow_symlinks: false,
+            max_depth: None,
+            metadata: EntryMetadataRequest {
+                unix_mode: cfg!(unix),
+                symlink_target: true,
+                identity: true,
+                hardlink_group: false,
+            },
+        };
+        let first_handle = session.request_handle();
+        let second_handle = first_handle.clone();
+        let first =
+            tokio::spawn(
+                async move { collect_paths(first_handle.scan(request).await.unwrap()).await },
+            );
+        let second =
+            tokio::spawn(
+                async move { collect_paths(second_handle.scan(request).await.unwrap()).await },
+            );
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        server.await.unwrap();
+
+        let expected = vec![
+            PathBuf::from("a"),
+            PathBuf::from("dir"),
+            PathBuf::from("dir/b"),
+        ];
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn signature_budget_preflight_avoids_unbounded_index_growth() {
+        let block_size = choose_signature_block_size(80 * 1024 * 1024 * 1024);
+        assert_eq!(block_size, 1024 * 1024);
+        let expected_blocks = (80_u64 * 1024 * 1024 * 1024).div_ceil(u64::from(block_size));
+        assert!(expected_blocks > u64::try_from(BasisIndexLimits::default().max_blocks).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_multiplexes_scan_and_signatures() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("a"), b"a").unwrap();
+        let data = (0..10_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(root.path().join("data.bin"), &data).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let scan_handler = session.scan_handler();
+            let signature_handler = session.signature_handler().unwrap();
+            let mut tasks = JoinSet::new();
+
+            for _ in 0..2 {
+                match session.next_request().await.unwrap().unwrap() {
+                    IncomingRequest::Scan(incoming) => {
+                        let handler = scan_handler.clone();
+                        tasks.spawn(async move {
+                            handler.serve(incoming).await.unwrap();
+                        });
+                    }
+                    IncomingRequest::Signatures(incoming) => {
+                        let handler = signature_handler.clone();
+                        tasks.spawn(async move {
+                            handler.serve(incoming).await.unwrap();
+                        });
+                    }
+                    IncomingRequest::Hash(_)
+                    | IncomingRequest::File(_)
+                    | IncomingRequest::FileFetch(_)
+                    | IncomingRequest::Metadata(_)
+                    | IncomingRequest::Mutation(_)
+                    | IncomingRequest::Xattr(_)
+                    | IncomingRequest::Acl(_)
+                    | IncomingRequest::BsdFlags(_)
+                    | IncomingRequest::AcquireRoot(_) => {
+                        panic!("unexpected mutation request")
+                    }
+                }
+            }
+
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let scan_request = ScanRequest {
+            respect_gitignore: false,
+            include_git_dir: false,
+            follow_symlinks: false,
+            max_depth: None,
+            metadata: EntryMetadataRequest {
+                unix_mode: cfg!(unix),
+                symlink_target: true,
+                identity: true,
+                hardlink_group: false,
+            },
+        };
+        let signature_basis = file_entry(root.path(), "data.bin");
+
+        let entries = session.scan(scan_request).await.unwrap();
+        let (paths, delta_basis) = tokio::join!(
+            collect_paths(entries),
+            session.delta_basis(&signature_basis, BasisIndexLimits::default())
+        );
+        server.await.unwrap();
+
+        let delta_basis = delta_basis.unwrap().unwrap();
+        assert_eq!(delta_basis.block_size(), 4 * 1024);
+        assert_eq!(delta_basis.block_count(), 3);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("data.bin"),
+                PathBuf::from("dir")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_verified_file_transfer() {
+        let source_root = tempfile::TempDir::new().unwrap();
+        let destination_root = tempfile::TempDir::new().unwrap();
+        let data = b"runtime-transfer";
+        std::fs::write(source_root.path().join("file.bin"), data).unwrap();
+        std::fs::write(destination_root.path().join("file.bin"), b"old").unwrap();
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        let destination = file_entry(destination_root.path(), "file.bin");
+        let expectation = crate::protocol::WireFileBasis::new(
+            destination.size,
+            *destination.identity.unwrap().as_bytes(),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.file_handler().unwrap();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::File(incoming) = request else {
+                panic!("expected file request");
+            };
+            handler.serve(incoming).await.unwrap()
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let sent = session
+            .transfer_file(
+                authority,
+                source,
+                crate::remote::transfer::TransferDestination::whole(
+                    RelativePath::new("file.bin").unwrap(),
+                    expectation,
+                ),
+            )
+            .await
+            .unwrap();
+        let received = server.await.unwrap();
+
+        assert_eq!(sent, received);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("file.bin")).unwrap(),
+            data
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_metadata_update() {
+        use std::os::unix::fs::MetadataExt;
+
+        let destination_root = tempfile::TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("file"), b"data").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.metadata_handler().unwrap();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::Metadata(incoming) = request else {
+                panic!("expected metadata request");
+            };
+            handler.serve(incoming).await.unwrap();
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let modified = Timestamp::new(1_600_000_020, 0).unwrap();
+        session
+            .apply_metadata(
+                metadata::observed_metadata(
+                    &RelativePath::new("file").unwrap(),
+                    EntryKind::File,
+                    crate::endpoint::local_identity::metadata_identity(
+                        &std::fs::symlink_metadata(destination_root.path().join("file")).unwrap(),
+                        EntryKind::File,
+                    )
+                    .unwrap(),
+                    Some(0o640),
+                    Some(modified),
+                    &crate::rooted_fs::MetadataPreservation::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let metadata = std::fs::metadata(destination_root.path().join("file")).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mtime(), modified.seconds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_runtime_dispatches_namespace_mutations() {
+        let destination_root = tempfile::TempDir::new().unwrap();
+        std::fs::write(destination_root.path().join("old"), b"old").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.mutation_handler().unwrap();
+            for _ in 0..4 {
+                let request = session.next_request().await.unwrap().unwrap();
+                let IncomingRequest::Mutation(incoming) = request else {
+                    panic!("expected mutation request");
+                };
+                handler.serve(incoming).await.unwrap();
+            }
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            destination_root.path(),
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let dir = RelativePath::new("dir").unwrap();
+        session.create_directory(&dir).await.unwrap();
+        let link = RelativePath::new("link").unwrap();
+        session
+            .replace_symlink(&link, Path::new("../target"), None, None)
+            .await
+            .unwrap();
+        session
+            .remove(&RelativePath::new("old").unwrap(), false, None)
+            .await
+            .unwrap();
+        session.remove(&dir, true, None).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!destination_root.path().join("old").exists());
+        assert!(!destination_root.path().join("dir").exists());
+        assert_eq!(
+            std::fs::read_link(destination_root.path().join("link")).unwrap(),
+            Path::new("../target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_handler_survives_root_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let source_root = tempfile::TempDir::new().unwrap();
+        let parent = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let root_path = parent.path().join("root");
+        let moved_path = parent.path().join("moved");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("file.bin"), b"pinned-old").unwrap();
+        std::fs::write(outside.path().join("file.bin"), b"outside").unwrap();
+        std::fs::write(source_root.path().join("file.bin"), b"new").unwrap();
+        let authority =
+            crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
+                .await
+                .unwrap();
+        let source = authority
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        let destination = file_entry(&root_path, "file.bin");
+        let expectation = crate::protocol::WireFileBasis::new(
+            destination.size,
+            *destination.identity.unwrap().as_bytes(),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let mut session =
+                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
+                    .await
+                    .unwrap();
+            let handler = session.file_handler().unwrap();
+            ready_tx.send(()).unwrap();
+            let request = session.next_request().await.unwrap().unwrap();
+            let IncomingRequest::File(incoming) = request else {
+                panic!("expected file request");
+            };
+            handler.serve(incoming).await.unwrap();
+        });
+
+        let session = ClientRemoteSession::connect(
+            client_reader,
+            client_writer,
+            Operation::Push,
+            &root_path,
+            RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        ready_rx.await.unwrap();
+        std::fs::rename(&root_path, &moved_path).unwrap();
+        symlink(outside.path(), &root_path).unwrap();
+
+        session
+            .transfer_file(
+                authority,
+                source,
+                crate::remote::transfer::TransferDestination::whole(
+                    RelativePath::new("file.bin").unwrap(),
+                    expectation,
+                ),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(moved_path.join("file.bin")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(outside.path().join("file.bin")).unwrap(),
+            b"outside"
+        );
+    }
+}

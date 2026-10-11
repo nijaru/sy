@@ -1,81 +1,41 @@
-mod binary;
-mod bisync;
-mod cli;
-mod compress;
-mod config;
-mod delta;
-mod endpoint;
-mod error;
-mod filter;
-mod fs_util;
-mod hooks;
-mod integrity;
-mod path;
-mod perf;
-mod resource;
-mod resume;
-mod retry;
-#[allow(dead_code)] // Server is only invoked at runtime via `sy --server`
-mod server;
-mod sparse;
-mod ssh;
-mod streaming;
-mod sync;
-mod temp_file;
-mod transport;
-
 use anyhow::{Context as _, Result};
-use clap::Parser;
-use cli::{Cli, ResumeMode, VerifyMode};
 use colored::Colorize;
-use config::Config;
-use filter::FilterEngine;
-use hooks::{HookContext, HookExecutor, HookType};
-use path::SyncPath;
-use resource::format_bytes;
-use std::path::PathBuf;
-use sync::session::{EndpointPair, SyncSession};
+use sy::cli::{self, Cli, VerifyMode};
+use sy::config::Config;
+use sy::filter::FilterEngine;
+use sy::hooks::{HookContext, HookExecutor, HookType};
+use sy::path::SyncPath;
+use sy::resource::format_bytes;
+use sy::sync;
+use sy::sync::session::{EndpointPair, SyncSession};
 use tracing_subscriber::{fmt, EnvFilter};
-
-/// Compute effective destination path based on rsync trailing slash semantics
-///
-/// Trailing slash behavior (applies to directories):
-/// - Source without trailing slash (`/a/dir`): Copy directory itself → `dest/dir/`
-/// - Source with trailing slash (`/a/dir/`): Copy contents only → `dest/`
-///
-/// For files, trailing slash semantics don't apply - the sync engine handles them
-/// by using the destination path directly or appending the filename as needed.
-///
-/// Note: This function works with path strings and doesn't check the filesystem,
-/// so it works correctly for local, remote (SSH), and S3 sources.
-fn compute_destination_path(source: &SyncPath, destination: &SyncPath) -> PathBuf {
-    let source_path = source.path();
-
-    // For sources with trailing slash, use destination as-is (copy contents)
-    if source.has_trailing_slash() {
-        return destination.path().to_path_buf();
-    }
-
-    // For sources without trailing slash, append source name to destination
-    // (copies the directory/file itself)
-    if let Some(name) = source_path.file_name() {
-        destination.path().join(name)
-    } else {
-        // Fallback: use destination as-is (e.g., root paths)
-        destination.path().to_path_buf()
-    }
-}
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI arguments
-    let mut cli = Cli::parse();
-
-    // Set RUST_BACKTRACE=0 unless user explicitly set it
+    // Set RUST_BACKTRACE=0 unless user explicitly set it.
     if std::env::var("RUST_BACKTRACE").is_err() {
         std::env::set_var("RUST_BACKTRACE", "0");
     }
 
+    // The private v3 SSH agent bypasses the parser and normal CLI setup so stdout
+    // remains protocol-only from the first byte. The remote root is negotiated
+    // in SessionOpen; it is deliberately not accepted as an argv pathname.
+    let mut raw_args = std::env::args_os();
+    let _program = raw_args.next();
+    if raw_args.next().as_deref() == Some(std::ffi::OsStr::new("__serve")) {
+        if raw_args.next().is_some() {
+            eprintln!("Error: __serve does not accept command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = sy::remote::serve::run_stdio().await {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Parse user-facing CLI arguments only after private-agent dispatch.
+    let mut cli = Cli::parse();
     if let Err(e) = run(&mut cli).await {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
@@ -111,11 +71,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 anyhow::bail!("Profile '{}' not found", profile_name);
             }
         }
-    }
-
-    // Server mode (internal use)
-    if cli.server {
-        return sy::server::run_server().await;
     }
 
     // Merge profile with CLI args if --profile is set
@@ -169,12 +124,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 cli.exclude = excludes.clone();
             }
         }
-        if let Some(resume) = profile.resume {
-            // Profile sets resume=false means --no-resume
-            if !resume {
-                cli.resume = ResumeMode::No;
-            }
-        }
     }
 
     // Setup logging
@@ -194,14 +143,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
     cli.validate()?;
 
     // After validation, source and destination must be present
-    let source = cli
-        .source
-        .as_ref()
-        .expect("source required after validation");
-    let destination = cli
-        .destination
-        .as_ref()
-        .expect("destination required after validation");
+    let (source, destination) = match (&cli.source, &cli.destination) {
+        (Some(src), Some(dest)) => (src, dest),
+        _ => return Err(anyhow::anyhow!("Source and destination paths are required")),
+    };
 
     // Create hook executor (unless disabled)
     let hook_executor = if cli.no_hooks {
@@ -211,16 +156,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
             .ok()
             .map(|e| e.with_abort_on_failure(cli.abort_on_hook_failure))
     };
-
-    // Clear cache if requested (before creating engine)
-    if cli.clear_cache {
-        use sync::dircache::DirectoryCache;
-        if let Err(e) = DirectoryCache::delete(destination.path()) {
-            tracing::warn!("Failed to clear directory cache: {}", e);
-        } else if !cli.quiet && !cli.json {
-            tracing::info!("Cleared directory cache");
-        }
-    }
 
     // Print header (skip if JSON mode)
     if !cli.quiet && !cli.json {
@@ -234,7 +169,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
 
     // Get verification mode
     let verification_mode = cli.verification_mode();
-    let checksum_type = verification_mode.checksum_type();
     let verify_on_write = verification_mode.verify_blocks();
 
     // Get symlink mode
@@ -358,11 +292,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
 
     // Load .syignore from source directory (if local)
     if source.is_local() {
-        let source_dir = if source.path().is_file() {
-            source.path().parent().unwrap_or(source.path())
-        } else {
-            source.path()
-        };
+        let source_dir =
+            if std::fs::symlink_metadata(source.path()).is_ok_and(|metadata| !metadata.is_dir()) {
+                source.path().parent().unwrap_or(source.path())
+            } else {
+                source.path()
+            };
 
         match filter_engine.add_syignore_if_exists(source_dir) {
             Ok(true) => {
@@ -389,64 +324,42 @@ Or install from local source with: cargo install --path . --features acl"#
         );
     }
 
-    // Warn about unimplemented flags
-    if cli.partial.is_some() {
-        eprintln!("Warning: --partial is not yet implemented");
+    // Extended attributes are descriptor-based and only compiled on Unix. The
+    // flag is rejected up front rather than failing mid-sync on a platform
+    // where no endpoint can preserve them.
+    #[cfg(not(unix))]
+    if cli.preserve_xattrs {
+        anyhow::bail!("extended attribute preservation is only supported on Unix platforms");
     }
-    if cli.stream {
-        eprintln!("Warning: --stream is not yet implemented");
-    }
-    if cli.retry > 0 {
-        eprintln!("Warning: --retry is not yet wired (SSH has internal retry only)");
+
+    // BSD file flags exist only on macOS (fchflags/st_flags). Reject up
+    // front elsewhere rather than failing mid-sync or silently ignoring the
+    // flag (the old help text called it a no-op; loud beats silent).
+    #[cfg(not(target_os = "macos"))]
+    if cli.preserve_flags {
+        anyhow::bail!("BSD flag preservation is only supported on macOS");
     }
 
     let config = sync::SyncConfig {
         dry_run: cli.dry_run,
         diff_mode: cli.diff,
         delete: if cli.delete {
-            let threshold = if cli.max_delete.ends_with('%') {
-                cli.max_delete
-                    .trim_end_matches('%')
-                    .parse::<u8>()
-                    .unwrap_or(50)
-            } else {
-                // For absolute counts, we'll use 100% (no threshold) since the limit is handled elsewhere
-                100
-            };
+            let limit = sync::parse_delete_limit(&cli.max_delete).map_err(anyhow::Error::msg)?;
             sync::DeleteMode::Enabled {
-                threshold,
+                limit,
                 force: cli.force_delete,
             }
         } else {
             sync::DeleteMode::Disabled
         },
-        max_delete: if cli.delete {
-            Some(cli.max_delete.clone())
-        } else {
-            None
-        },
-        trash: cli.trash,
         quiet: cli.quiet || cli.json,
         max_concurrent: cli.parallel,
-        max_errors: cli.max_errors,
         min_size: cli.min_size,
         max_size: cli.max_size,
         filter_engine,
         bwlimit: cli.bwlimit,
-        resume: sync::ResumeConfig {
-            enabled: cli.resume(),
-            only: cli.resume == ResumeMode::Only,
-            checkpoint_files: cli.checkpoint_files,
-            checkpoint_bytes: cli.checkpoint_bytes,
-        },
         json: cli.json,
-        verification: sync::VerificationConfig {
-            mode: checksum_type,
-            verify_on_write,
-            checksum_db: cli.checksum_db,
-            clear_checksum_db: cli.clear_checksum_db,
-            prune_checksum_db: cli.prune_checksum_db,
-        },
+        verify_on_write,
         preserve: sync::PreserveConfig {
             xattrs: cli.preserve_xattrs,
             hardlinks: cli.preserve_hardlinks,
@@ -454,8 +367,8 @@ Or install from local source with: cargo install --path . --features acl"#
             flags: cli.preserve_flags,
             symlink_mode,
             permissions: cli.should_preserve_permissions(),
+            times: cli.should_preserve_times(),
         },
-        progress: cli.progress,
         comparison: sync::ComparisonConfig {
             ignore_times: cli.ignore_times,
             size_only: cli.size_only,
@@ -463,8 +376,6 @@ Or install from local source with: cargo install --path . --features acl"#
             update_only: cli.update,
             ignore_existing: cli.ignore_existing,
         },
-        cache: cli.cache,
-        clear_cache: cli.clear_cache,
         dest_is_remote: destination.is_remote(),
         perf: cli.perf,
         // rsync-compat flags
@@ -474,22 +385,31 @@ Or install from local source with: cargo install --path . --features acl"#
         backup: cli.backup.clone(),
         backup_dir: cli.backup_dir.clone(),
         suffix: cli.suffix.clone(),
-        partial: cli.partial.clone(),
-        partial_dir: cli.partial_dir.clone(),
         timeout: cli.timeout,
         contimeout: cli.contimeout,
-        compress_level: cli.compress_level,
         compression_detection: cli.compress,
         itemize_changes: cli.itemize_changes,
         human_readable: cli.human_readable,
         stats: cli.stats,
     };
 
-    // Create SyncSession for strategy dispatch
-    let source_endpoint = EndpointPair::from_sync_path(source)?;
-    let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-    let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-        .with_scan_options(cli.scan_options());
+    let session = if source.is_local() && destination.is_local() {
+        SyncSession::for_local_paths(
+            source.path(),
+            destination.path(),
+            source.has_trailing_slash(),
+            config.clone(),
+        )
+        .await?
+    } else {
+        SyncSession::new(
+            EndpointPair::from_sync_path(source)?,
+            EndpointPair::from_sync_path(destination)?,
+            config.clone(),
+        )
+        .with_source_contents(source.has_trailing_slash())
+    }
+    .with_scan_options(cli.scan_options());
 
     // Execute pre-sync hook
     if let Some(ref executor) = hook_executor {
@@ -519,19 +439,9 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("Verifying {} ↔ {}\n", source, destination);
         }
 
-        let result = session.verify(source.path(), destination.path()).await?;
+        let result = session.verify().await?;
 
-        // Determine exit code
-        let exit_code = if !result.errors.is_empty() {
-            2 // Errors occurred
-        } else if !result.files_mismatched.is_empty()
-            || !result.files_only_in_source.is_empty()
-            || !result.files_only_in_dest.is_empty()
-        {
-            1 // Mismatches found
-        } else {
-            0 // All matched
-        };
+        let exit_code = result.exit_code();
 
         // JSON output
         if cli.json {
@@ -539,19 +449,20 @@ Or install from local source with: cargo install --path . --features acl"#
 
             let errors_json: Vec<VerificationError> = result
                 .errors
-                .iter()
+                .into_iter()
                 .map(|e| VerificationError {
-                    path: e.path.clone(),
-                    error: e.error.clone(),
-                    action: e.action.clone(),
+                    path: e.path,
+                    error: e.error,
+                    action: e.action,
                 })
                 .collect();
 
             let event = SyncEvent::VerificationResult {
                 files_matched: result.files_matched,
-                files_mismatched: result.files_mismatched.clone(),
-                files_only_in_source: result.files_only_in_source.clone(),
-                files_only_in_dest: result.files_only_in_dest.clone(),
+                counts: result.counts,
+                files_mismatched: result.files_mismatched,
+                files_only_in_source: result.files_only_in_source,
+                files_only_in_dest: result.files_only_in_dest,
                 errors: errors_json,
                 duration_secs: result.duration.as_secs_f64(),
                 exit_code,
@@ -562,42 +473,58 @@ Or install from local source with: cargo install --path . --features acl"#
             println!("\n✓ Verification complete\n");
             println!("  Files matched:        {}", result.files_matched);
 
-            if !result.files_mismatched.is_empty() {
+            if result.counts.files_mismatched > 0 {
                 println!(
                     "  Files mismatched:     {} ✗",
-                    result.files_mismatched.len()
+                    result.counts.files_mismatched
                 );
                 for path in &result.files_mismatched {
                     println!("    - {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_mismatched,
+                    result.files_mismatched.len(),
+                );
             }
 
-            if !result.files_only_in_source.is_empty() {
+            if result.counts.files_only_in_source > 0 {
                 println!(
                     "  Only in source:       {}",
-                    result.files_only_in_source.len()
+                    result.counts.files_only_in_source
                 );
                 for path in &result.files_only_in_source {
                     println!("    → {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_only_in_source,
+                    result.files_only_in_source.len(),
+                );
             }
 
-            if !result.files_only_in_dest.is_empty() {
+            if result.counts.files_only_in_dest > 0 {
                 println!(
                     "  Only in destination:  {}",
-                    result.files_only_in_dest.len()
+                    result.counts.files_only_in_dest
                 );
                 for path in &result.files_only_in_dest {
                     println!("    ← {}", path.display());
                 }
+                print_omitted(
+                    result.counts.files_only_in_dest,
+                    result.files_only_in_dest.len(),
+                );
             }
 
-            if !result.errors.is_empty() {
-                println!("\n⚠️  Errors occurred during verification:\n");
+            if result.counts.errors > 0 {
+                println!(
+                    "\n⚠️  {} errors occurred during verification:\n",
+                    result.counts.errors
+                );
                 for (i, error) in result.errors.iter().enumerate() {
                     println!("{}. [{}] {}", i + 1, error.action, error.path.display());
                     println!("   {}", error.error);
                 }
+                print_omitted(result.counts.errors, result.errors.len());
             }
 
             println!("\n  Duration:             {:?}", result.duration);
@@ -614,13 +541,12 @@ Or install from local source with: cargo install --path . --features acl"#
                 anyhow::bail!("Watch mode currently only supports local sources.");
             }
 
-            // Watch mode using SyncSession (v0.4)
-            let watch_session = sync::watch_session::WatchSession::from_paths(
-                source,
-                destination,
-                config.clone(),
-                std::time::Duration::from_millis(500), // 500ms debounce
-            )?;
+            // Reuse the configured session, including filters and scan options.
+            let watch_session = sync::watch_session::WatchSession::new(
+                session,
+                source.path().to_path_buf(),
+                std::time::Duration::from_millis(500),
+            );
 
             watch_session.watch().await?;
             return Ok(()); // Watch mode handles its own output
@@ -633,253 +559,10 @@ Or install from local source with: cargo install --path . --features acl"#
         }
     }
 
-    // Run sync (single file, directory, or bidirectional)
-    let stats = if cli.bidirectional {
-        // ... existing bisync logic ...
-        // Bidirectional sync mode
-        if !cli.quiet && !cli.json {
-            println!("sy v{}", env!("CARGO_PKG_VERSION"));
-            println!("Mode: Bidirectional sync");
-            println!("Strategy: {}", cli.conflict_resolve);
-            println!("{} ↔ {}\n", source, destination);
-        }
-
-        // Create transports for source and destination
-        let (source_transport, dest_transport): (
-            std::sync::Arc<dyn transport::Transport>,
-            std::sync::Arc<dyn transport::Transport>,
-        ) = match (&source, &destination) {
-            (crate::path::SyncPath::Local { .. }, crate::path::SyncPath::Local { .. }) => {
-                // Both local
-                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let local_source = std::sync::Arc::new(
-                    transport::local::LocalTransport::with_verifier(verifier.clone()),
-                );
-                let local_dest =
-                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
-                (local_source, local_dest)
-            }
-            (
-                crate::path::SyncPath::Local { .. },
-                crate::path::SyncPath::Remote { host, user, .. },
-            ) => {
-                // Local → Remote
-                let config = if let Some(user) = user {
-                    ssh::config::SshConfig {
-                        hostname: host.clone(),
-                        user: user.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    ssh::config::parse_ssh_config(host)?
-                };
-                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let local =
-                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
-                let remote = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_timeout(
-                        &config,
-                        cli.parallel,
-                        Default::default(),
-                        std::time::Duration::from_secs(
-                            cli.contimeout.or(cli.timeout).unwrap_or(30),
-                        ),
-                    )
-                    .await?,
-                );
-                (local, remote)
-            }
-            (
-                crate::path::SyncPath::Remote { host, user, .. },
-                crate::path::SyncPath::Local { .. },
-            ) => {
-                // Remote → Local
-                let config = if let Some(user) = user {
-                    ssh::config::SshConfig {
-                        hostname: host.clone(),
-                        user: user.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    ssh::config::parse_ssh_config(host)?
-                };
-                let verifier = integrity::IntegrityVerifier::new(checksum_type, verify_on_write);
-                let remote = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_timeout(
-                        &config,
-                        cli.parallel,
-                        Default::default(),
-                        std::time::Duration::from_secs(
-                            cli.contimeout.or(cli.timeout).unwrap_or(30),
-                        ),
-                    )
-                    .await?,
-                );
-                let local =
-                    std::sync::Arc::new(transport::local::LocalTransport::with_verifier(verifier));
-                (remote, local)
-            }
-            (
-                crate::path::SyncPath::Remote {
-                    host: host1,
-                    user: user1,
-                    ..
-                },
-                crate::path::SyncPath::Remote {
-                    host: host2,
-                    user: user2,
-                    ..
-                },
-            ) => {
-                // Remote → Remote
-                let config1 = if let Some(user) = user1 {
-                    ssh::config::SshConfig {
-                        hostname: host1.clone(),
-                        user: user.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    ssh::config::parse_ssh_config(host1)?
-                };
-                let config2 = if let Some(user) = user2 {
-                    ssh::config::SshConfig {
-                        hostname: host2.clone(),
-                        user: user.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    ssh::config::parse_ssh_config(host2)?
-                };
-                let remote1 = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_pool_size(&config1, cli.parallel).await?,
-                );
-                let remote2 = std::sync::Arc::new(
-                    transport::ssh::SshTransport::with_pool_size(&config2, cli.parallel).await?,
-                );
-                (remote1, remote2)
-            }
-            _ => {
-                anyhow::bail!("Bidirectional sync does not support S3 paths");
-            }
-        };
-
-        let bisync_engine = bisync::BisyncEngine::new(source_transport, dest_transport);
-        let max_delete_percent = if cli.max_delete.ends_with('%') {
-            cli.max_delete
-                .trim_end_matches('%')
-                .parse::<u8>()
-                .unwrap_or(50)
-        } else {
-            // For absolute counts, convert to percentage (assuming 100% means no limit)
-            100
-        };
-        let bisync_opts = bisync::BisyncOptions {
-            conflict_resolution: bisync::ConflictResolution::from_str(&cli.conflict_resolve)
-                .ok_or_else(|| anyhow::anyhow!("Invalid conflict resolution strategy"))?,
-            max_delete_percent,
-            dry_run: cli.dry_run,
-            clear_state: cli.clear_bisync_state,
-            force_resync: cli.force_resync,
-        };
-
-        // Compute effective destination path based on trailing slash semantics
-        let effective_dest = compute_destination_path(source, destination);
-
-        let bisync_result = bisync_engine
-            .sync(source.path(), &effective_dest, bisync_opts)
-            .await?;
-
-        // Print conflicts if any
-        if !bisync_result.conflicts.is_empty() && !cli.quiet && !cli.json {
-            println!("\n{} conflicts detected:", bisync_result.conflicts.len());
-            for conflict in &bisync_result.conflicts {
-                println!("  {} - {}", conflict.path.display(), conflict.action);
-            }
-            println!();
-        }
-
-        // Convert BisyncStats to SyncStats for compatibility
-        sync::SyncStats {
-            files_scanned: (bisync_result.stats.files_synced_to_source
-                + bisync_result.stats.files_synced_to_dest) as u64,
-            files_created: bisync_result.stats.files_synced_to_dest as u64,
-            files_updated: bisync_result.stats.files_synced_to_source as u64,
-            files_deleted: bisync_result.stats.files_deleted_from_source
-                + bisync_result.stats.files_deleted_from_dest,
-            files_skipped: 0,
-            bytes_transferred: bisync_result.stats.bytes_transferred,
-            files_delta_synced: 0,
-            delta_bytes_saved: 0,
-            files_compressed: 0,
-            compression_bytes_saved: 0,
-            files_verified: 0,
-            verification_failures: 0,
-            duration: std::time::Duration::from_millis(bisync_result.stats.duration_ms as u64),
-            bytes_would_add: 0,
-            bytes_would_change: 0,
-            bytes_would_delete: 0,
-            dirs_created: 0,
-            symlinks_created: 0,
-            errors: bisync_result
-                .errors
-                .into_iter()
-                .map(|e| sync::SyncError {
-                    path: PathBuf::new(),
-                    error: e,
-                    action: "bidirectional sync".to_string(),
-                })
-                .collect(),
-        }
-    } else if source.is_local() && destination.is_remote() {
-        // Use SyncSession for local → remote SSH push
-        if !cli.quiet && !cli.json {
-            println!("Mode: Streaming push\n");
-        }
-        let source_endpoint = EndpointPair::from_sync_path(source)?;
-        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-            .with_scan_options(cli.scan_options());
-        session.sync().await?
-    } else if source.is_remote() && destination.is_local() {
-        // Use SyncSession for remote → local SSH pull
-        if !cli.quiet && !cli.json {
-            println!("Mode: Streaming pull\n");
-        }
-        let source_endpoint = EndpointPair::from_sync_path(source)?;
-        let dest_endpoint = EndpointPair::from_sync_path(destination)?;
-        let session = SyncSession::new(source_endpoint, dest_endpoint, config.clone())
-            .with_scan_options(cli.scan_options());
-        session.sync().await?
-    } else if cli.is_single_file() {
-        if !cli.quiet && !cli.json {
-            println!("Mode: Single file sync\n");
-        }
-        // For single files, trailing slash doesn't apply - use destination as-is
-        session
-            .sync_single_file(source.path(), destination.path())
-            .await?
-    } else {
-        // Use SyncSession for strategy dispatch
-        let effective_dest = compute_destination_path(source, destination);
-
-        // Update session with effective destination
-        let dest_endpoint = EndpointPair::from_sync_path(&crate::path::SyncPath::Local {
-            path: effective_dest.clone(),
-            has_trailing_slash: false,
-        })?;
-        let session = SyncSession::new(
-            EndpointPair::from_sync_path(source)?,
-            dest_endpoint,
-            config.clone(),
-        )
-        .with_scan_options(cli.scan_options());
-
-        if !cli.quiet && !cli.json && !cli.dry_run {
-            println!("Mode: {:?}\n", session.select_strategy());
-        }
-
-        session.sync().await?
-    };
+    if !cli.quiet && !cli.json && !cli.dry_run {
+        println!("Mode: {:?}\n", session.select_strategy());
+    }
+    let stats = session.sync().await?;
 
     // Execute post-sync hook
     if let Some(ref executor) = hook_executor {
@@ -1065,16 +748,15 @@ Or install from local source with: cargo install --path . --features acl"#
                 );
             }
         }
-
-        // Print performance summary if --perf is enabled
-        if cli.perf {
-            if let Some(metrics) = session.get_performance_metrics() {
-                metrics.print_summary();
-            }
-        }
     }
 
     Ok(())
+}
+
+fn print_omitted(total: usize, shown: usize) {
+    if total > shown {
+        println!("    … {} additional entries not shown", total - shown);
+    }
 }
 
 fn format_duration(duration: std::time::Duration) -> String {

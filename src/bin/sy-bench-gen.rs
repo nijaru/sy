@@ -1,41 +1,45 @@
-use clap::Parser;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+use usage::Cli;
 
-#[derive(Parser, Debug)]
-#[command(name = "sy-bench-gen")]
-#[command(about = "Generates massive file trees for sy benchmarking")]
+#[derive(Cli, Debug)]
+#[usage(
+    bin = "sy-bench-gen",
+    about = "Generates massive file trees for sy benchmarking",
+    unknown_flags = "error",
+    args_override_self = false
+)]
 struct Args {
     /// Root directory for the dataset
-    #[arg(short, long, default_value = "bench_data")]
+    #[usage(short, long, default = "bench_data")]
     root: PathBuf,
 
     /// Total number of files to generate
-    #[arg(short, long, default_value_t = 100_000)]
+    #[usage(short, long, default = "100000")]
     count: usize,
 
     /// Directory depth (creates nested structure)
-    #[arg(short, long, default_value_t = 5)]
+    #[usage(short, long, default = "5")]
     depth: usize,
 
     /// Max files per directory
-    #[arg(short, long, default_value_t = 100)]
+    #[usage(short, long, default = "100")]
     width: usize,
 
     /// Min file size in bytes
-    #[arg(long, default_value_t = 100)]
+    #[usage(long, default = "100")]
     min_size: usize,
 
     /// Max file size in bytes
-    #[arg(long, default_value_t = 10_000)]
+    #[usage(long, default = "10000")]
     max_size: usize,
 
     /// Verification mode (verifies files exist instead of creating)
-    #[arg(long)]
+    #[usage(long)]
     verify: bool,
 }
 

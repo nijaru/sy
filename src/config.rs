@@ -1,5 +1,3 @@
-#![allow(dead_code)] // WIP: config profiles not yet wired into sync flow
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,7 +27,6 @@ pub struct Profile {
     pub delete: Option<bool>,
     pub exclude: Option<Vec<String>>,
     pub bwlimit: Option<String>,
-    pub resume: Option<bool>,
     pub min_size: Option<String>,
     pub max_size: Option<String>,
     pub parallel: Option<usize>,
@@ -108,7 +105,6 @@ destination = "~/dst"
 delete = true
 exclude = ["*.log"]
 bwlimit = "10MB"
-resume = true
         "#;
 
         let config: Config = toml::from_str(toml).unwrap();
@@ -124,7 +120,6 @@ resume = true
         assert_eq!(profile.destination, Some("~/dst".to_string()));
         assert_eq!(profile.delete, Some(true));
         assert_eq!(profile.bwlimit, Some("10MB".to_string()));
-        assert_eq!(profile.resume, Some(true));
     }
 
     #[test]
@@ -209,7 +204,6 @@ destination = "~/dst"
 delete = true
 exclude = ["*.log", "*.tmp"]
 bwlimit = "10MB"
-resume = false
 min_size = "1KB"
 max_size = "100MB"
 parallel = 20
@@ -229,7 +223,6 @@ verbose = 2
             Some(vec!["*.log".to_string(), "*.tmp".to_string()])
         );
         assert_eq!(profile.bwlimit, Some("10MB".to_string()));
-        assert_eq!(profile.resume, Some(false));
         assert_eq!(profile.min_size, Some("1KB".to_string()));
         assert_eq!(profile.max_size, Some("100MB".to_string()));
         assert_eq!(profile.parallel, Some(20));

@@ -1,0 +1,566 @@
+# sy 0.5 architecture
+
+`sy` 0.5 is a clean architectural cut, not an incremental migration of the 0.4 internals. Preserve useful user-facing semantics, but do not preserve internal APIs, transport layers, wire compatibility, or implementation structure solely for compatibility.
+
+The target is one bounded synchronization engine that works across local filesystems, SSH hosts, and eventually object stores.
+
+This document describes the **target**, not a claim that every contract is implemented. Replacement transactions, identity validation, bounded namespace preflight, and endpoint conformance are release requirements; a passing happy-path transfer is not evidence that these contracts hold.
+
+## Design principles
+
+1. **One engine.** Local and remote synchronization share scanning, reconciliation, planning, scheduling, integrity, and safety semantics.
+2. **One binary.** `sy` acts as both the user-facing client and the private remote agent. There is no `sy-remote` in 0.5.
+3. **Bounded memory.** File size and tree size must not imply proportional resident memory on the common path.
+4. **Transactional visibility.** Destination mutations are staged and verified before commit whenever the backend can support atomic replacement.
+5. **Capabilities, not endpoint branches.** Transfer policy is chosen from explicit backend capabilities and workload characteristics.
+6. **Cheap metadata first.** Expensive metadata, hashes, signatures, sparse extents, ACLs, and xattrs are demand-driven.
+7. **Strong end-to-end integrity.** Remote transfers are BLAKE3-verified before commit by default. Size alone is never proof of correctness.
+8. **Deletion is a commit phase.** An incomplete source view can never authorize deletion.
+9. **The source is read-only.** `--remove-source-files` is the only exception and runs only after a confirmed destination commit.
+10. **SSH is the authentication substrate, not the sync architecture.** Use the user's OpenSSH implementation and configuration rather than embedding a second SSH stack.
+
+## Target module shape
+
+The exact file split may evolve, but ownership should converge on this shape:
+
+```text
+src/
+  cli/
+  engine/
+    session.rs
+    reconcile.rs
+    planner.rs
+    scheduler.rs
+    delete_journal.rs
+  endpoint/
+    mod.rs
+    local.rs
+    remote.rs
+    object.rs
+  transfer/
+    whole.rs
+    reflink.rs
+    sparse.rs
+    delta.rs
+  protocol/
+    frame.rs
+    handshake.rs
+    message.rs
+    mux.rs
+    client.rs
+    server.rs
+  remote/
+    ssh.rs
+    bootstrap.rs
+    root.rs
+  metadata/
+  filter/
+  integrity/
+  bisync/
+  main.rs
+  lib.rs
+```
+
+Legacy `sync/`, `streaming/`, `transport/`, and `sy-remote` are temporary scaffolding only while equivalent 0.5 components come online.
+
+## Core pipeline
+
+```text
+source EntryStream ─┐
+                    ├─> Reconciler ─> SyncOp ─> Planner ─> WorkItem ─> Scheduler
+  dest EntryStream ─┘                                             │
+                                                                 ├─ whole copy
+                                                                 ├─ reflink patch
+                                                                 ├─ sparse copy
+                                                                 ├─ rolling delta
+                                                                 ├─ object multipart/server copy
+                                                                 └─ metadata only
+```
+
+Reconciliation and semantic planning decide **what change is required**. Transfer planning decides **how to produce the bytes**. The scheduler decides **when work is allowed to run**. Endpoints own **whether and how a prepared change commits**; byte strategies never publish a replacement themselves.
+
+One engine controller owns completed preflight, preorder directory preparation, bounded concurrent leaf work, draining workers, reverse deletion, and journal-owned directory finalization. Direction-specific adapters must not duplicate preservation, commit, or failure policy. The current direction-neutral controller belongs under `engine` once its dependencies are neutral; its location is not a reason to introduce a second controller.
+
+Local/local, local/remote, and remote/local differ in endpoint implementation, not in reconciliation semantics:
+
+```text
+LocalScan  + LocalScan  -> Reconciler
+LocalScan  + RemoteScan -> Reconciler
+RemoteScan + LocalScan  -> Reconciler
+```
+
+## Paths and roots
+
+All engine-internal paths are validated paths relative to an endpoint root. Do not pass arbitrary absolute paths through transfer/reconciliation APIs.
+
+Introduce a strong relative-path type at the boundary instead of passing unconstrained `PathBuf`/`String` values through the engine. Wire paths must not require UTF-8 on Unix; preserve raw filesystem bytes where the platform supports them.
+
+Remote roots are sent in the protocol handshake, not interpolated into an SSH shell command.
+
+## Endpoint model
+
+An endpoint owns a rooted namespace and semantic operations. The minimum core contract is:
+
+- ordered bounded entry stream
+- stat/metadata lookup
+- streaming reader
+- transactional staged writer
+- create directory/link operations
+- safe deletion
+- demand-driven metadata reads/writes
+- explicit capability discovery
+
+The final core must not contain a whole-tree `scan() -> Vec<Entry>` fallback.
+
+Capability assertions are contracts and require conformance tests. A backend must not advertise a capability that its implementation silently ignores. Root/filesystem properties must not be inferred solely from an endpoint's OS or transport type.
+
+The endpoint contract has one semantic capability vocabulary. Wire capability bits map into it at negotiation; protocol and direction adapters must not independently decide preservation or transaction semantics. Local and SSH implementations use the same transaction lifecycle, while retaining backend-native byte strategies. Extend the existing endpoint/staged-writer boundary rather than adding a parallel transaction framework.
+
+Capabilities include, as applicable:
+
+- atomic replacement
+- streaming read/write
+- staged pre-commit verification
+- random read/write
+- reflink/clone
+- sparse extents
+- server-side copy
+- xattrs
+- ACLs
+- hard links
+- platform flags
+- modification-time precision
+- rolling signatures
+- whole-file hashing
+
+## Entry metadata
+
+The reconciliation entry should be lean. Base fields are roughly:
+
+```text
+relative path
+entry kind
+size
+mtime
+mode/permissions when needed for comparison semantics
+symlink target when preserving links
+```
+
+Additional metadata is requested only when policy requires it:
+
+- hardlink identity only with hardlink preservation
+- xattrs only for an entry that will need xattr preservation
+- ACLs only for an entry that will need ACL preservation
+- BSD/platform flags only when requested
+- sparse extents only when a chosen transfer strategy needs them
+- content hashes only for checksum comparison or integrity work
+
+Do not eagerly compute sparse layout, xattrs, ACLs, block signatures, or whole-file hashes for every scan entry.
+
+## Reconciliation
+
+Source and destination entry streams are emitted in deterministic relative-path order and merge-joined in bounded memory.
+
+The reconciler emits semantic operations such as:
+
+```text
+CreateDirectory
+CreateFile
+UpdateFile
+ReplaceEntry
+CreateSymlink
+CreateHardlink
+ApplyMetadata
+Delete
+Skip
+```
+
+Type transitions must be transactional rather than remove-then-create. Until a backend implements the required guarantee, reject unsupported transitions during complete preflight, before any destination mutation.
+
+For a nondirectory-to-directory transition, stage the replacement subtree completely, including child work and final metadata, before switching visibility. Child completion inside that private subtree is not destination publication: no child receipt authorizes source removal until the enclosing transaction commits and required finalization succeeds.
+
+For directory-to-nondirectory replacement, protect excluded descendants and include all discarded descendants in completed preflight's exact deletion accounting. The replacement entry itself is counted as a replacement, not a duplicate delete candidate. Discarding nonempty directory contents requires explicit deletion authorization (`--delete`); an empty entry-kind replacement does not. Apply the threshold before any destination mutation, and assign discarded descendants to the transition transaction so ordinary delete replay cannot remove/count them a second time. Recursive removal is not a shortcut around deletion safety.
+
+Prefer a backend atomic exchange/replacement primitive where supported. A fallback that renames the old destination to a tombstone and then installs staging has a missing-name window: it is **recoverable multi-step replacement**, not atomic visibility. Enabling that fallback requires an owned on-disk recovery record, identity-checked rollback, process-crash recovery, and safe tombstone cleanup. Recovery must preserve the last valid copy. Automatic destructive recovery requires ownership protected by backend primitives or an explicit exclusive-access assumption; if ownership cannot be established safely, retain recovery artifacts and stop for intervention rather than risk deleting an unrelated replacement. Identity checks alone do not establish atomic ownership under concurrent namespace mutation. Refuse transitions where the supported guarantee cannot be met.
+
+State separately whether an operation provides namespace atomicity, recoverability, or power-loss durability. Any durability claim requires appropriate persistence ordering and tests; successful rename alone is not such a guarantee. Synchronization does not promise whole-run rollback.
+
+### Source mutation / TOCTOU
+
+A scan describes a candidate snapshot, not a guarantee that the source remains unchanged. Regular-file transfer must carry the scanned identity into an opened source handle and validate it before reading and at completion using stable metadata available on the platform (for example device/inode/size/mtime/ctime). Requested preservation metadata must belong to that same validated observation. If the source changes, abort staging with a typed error; retries, if offered, must be bounded.
+
+Native copy, reflink, sparse, hashing and streaming paths must preserve this source binding. A path-based optimization that cannot do so must fall back to a safe bounded strategy. Identity checks detect supported races; they do not create snapshot isolation against arbitrary concurrent in-place writers.
+
+Destination operations carry the expected state (absent or observed identity), revalidated before destructive commit/delete. Portable stat followed by rename/unlink is not atomic compare-and-swap. Use stronger backend preconditions where available and document residual concurrency limits rather than claiming separate syscalls close every race.
+
+### Namespace preflight
+
+Detect destination case/normalization aliases across planned source paths, existing destination paths, and ancestor prefixes before mutation. Comparison semantics belong to the destination root. Where exact semantics are unavailable, use a documented conservative check or reject ambiguous operations; generic Unicode normalization is not proof of filesystem equivalence.
+
+Collision detection must remain bounded even for one extremely wide directory. Use disk-backed records and bounded external sorting/merge (or an equivalently bounded exact algorithm), not a whole-tree or unbounded per-directory map. Bound record sizes, run buffers, merge fan-in and descriptors; propagate scratch I/O failures before mutation. Identical path spellings may deduplicate; distinct names must never silently overwrite one another.
+
+## Exact bounded deletion
+
+Do not use a full source `HashSet`, and do not rely on Bloom-filter false positives in the final design.
+
+During a complete no-mutation preflight merge, append exact destination-only deletion candidates to an on-disk journal. The journal is bounded in RAM and stores records that can be replayed in reverse without keeping an offset index, for example:
+
+```text
+[record payload][record_len:u32]
+```
+
+After both scans complete successfully:
+
+1. calculate the deletion threshold against the actual eligible destination scope;
+2. reject before mutations if the threshold is exceeded;
+3. perform non-delete work;
+4. replay the delete journal in reverse/depth-safe order;
+5. remove the journal.
+
+Excluded descendants protect their ancestors from recursive deletion. Any source scan error disables deletion.
+
+## Scheduler and backpressure
+
+Every internal queue is bounded. The scheduler owns resource budgets rather than relying only on a file-count semaphore.
+
+At minimum budget:
+
+- active files
+- bytes buffered/in flight
+- metadata operations
+- hashing/compression CPU work
+- network frames/writes
+
+Large files consume more of the byte budget than small files. A few multi-gigabyte transfers must not multiply resident memory by the nominal concurrency value.
+
+Blocking filesystem/syscall work that is not genuinely asynchronous must stay off Tokio worker threads. CPU parallelism and I/O concurrency are separate controls.
+
+## Transaction model
+
+For replacement entries, the destination endpoint owns this lifecycle:
+
+```text
+validate source observation and expected destination
+  -> prepare private staging
+  -> transfer / reconstruct / patch
+  -> apply staging-compatible preservation
+  -> verify staged contents and source identity
+  -> revalidate expected destination
+  -> commit using the declared backend guarantee
+  -> required post-commit finalization, if any
+  -> completion receipt / owned cleanup
+```
+
+Failure before commit leaves the previous destination intact under the backend's declared guarantee. Staging must be on the required filesystem and remain private even while applying permissive modes/ACLs; use a protected staging namespace or an equivalent proven mechanism.
+
+Xattrs, ACLs and other staging-compatible preservation belong before commit, not in a second visible-path RPC. Remote preservation for a replacement addresses a session-bound transaction/stream identity with bounded payloads and validated phase transitions. Validate effective mode/ACL interactions rather than assuming metadata application order is harmless.
+
+Only metadata inherently incompatible with commit belongs afterward, such as selected immutable flags. Distinguish pre-commit abort, committed-but-required-finalization-failed, and cleanup-pending outcomes. A post-commit failure cannot be reported as a rollback. Source removal requires a published-destination receipt covering successful required preservation and verification plus source identity revalidation; deletion must not proceed after failed required main-work finalization. An unchanged file may instead receive a verified-existing-destination receipt with strong content/policy-selected preservation proof and revalidated identities. Quick-check equality alone never authorizes source removal. A private staged-subtree child receipt is neither kind of publication receipt.
+
+Directory metadata finalization remains journal-owned after descendant work and deletion. Metadata-only changes on existing inodes have explicit backend semantics, not a fictitious atomic replacement. Hardlink group metadata has one inode-level owner; group bookkeeping must also be bounded.
+
+The endpoint serializes publication admission against disconnect/cancellation, after commit-time validation and before native publication. Cancellation winning admission aborts owned staging. Closing admission must not block a runtime worker behind filesystem I/O. Already-admitted native work may finish after cancellation; neither interruption nor rollback is guaranteed. Lost acknowledgement or cancellation during admitted work leaves completion uncertain: preserve the source and reconcile safely on retry. Strategies never admit or commit publication independently of the endpoint transaction owner.
+
+## Local transfer strategies
+
+### New regular file
+
+Prefer the operating system's optimized copy primitive into same-filesystem staging. Avoid userspace read/write loops when the OS can perform the copy more efficiently.
+
+### Changed regular file on a COW filesystem
+
+For sufficiently large files with a low estimated change ratio:
+
+1. reflink/clone the old destination into staging;
+2. compare source and old destination in large blocks;
+3. overwrite only changed ranges in the clone;
+4. verify if required;
+5. commit staging.
+
+This preserves unchanged extents without making a rolling network delta the default local strategy.
+
+### Non-COW changed file
+
+Prefer an optimized sequential whole copy. Reading both old destination and source merely to reconstruct a local file is often slower than replacing it.
+
+### Sparse files
+
+Detect sparse layout on demand after the sparse strategy is selected. Preserve holes using native extent APIs where possible.
+
+## Remote transport
+
+0.5 uses external OpenSSH as the default transport:
+
+```text
+ssh -T <host> sy __serve
+```
+
+Benefits:
+
+- honors normal `~/.ssh/config` behavior
+- SSH agent/security-key support comes from the user's SSH
+- ProxyJump/ControlMaster and other OpenSSH features work naturally
+- removes the embedded `ssh2`/libssh2/OpenSSL stack
+- simplifies static musl distribution
+
+Pass the original host alias to OpenSSH and only explicit user overrides. Do not parse and reconstruct SSH configuration: `Include`, `Match`, wildcard precedence, identities, and jump-host behavior belong to OpenSSH. Remove unused embedded SSH dependencies as well as their callers. The session owns subprocess shutdown, exit status and error propagation.
+
+The user-provided remote root is never a shell argument. It is part of the binary protocol handshake.
+
+## Protocol v3
+
+Protocol v3 is a clean break. Do not extend v2 for compatibility.
+
+### Framing
+
+Frames have a fixed bounded header and a hard maximum payload size. A representative shape is:
+
+```text
+payload_len:u32
+kind:u8
+flags:u8
+reserved:u16
+stream_id:u32
+payload
+```
+
+Decoders validate lengths before allocation and reject oversized/unknown-invalid input with typed protocol errors. Protocol/property tests must exercise truncated and adversarial frames.
+
+### Handshake
+
+The client sends:
+
+```text
+protocol version/range
+build identity
+operation (push/pull)
+typed source or destination operand
+requested semantics
+client capabilities
+```
+
+The server returns:
+
+```text
+selected protocol
+build identity
+OS/architecture
+filesystem/protocol capabilities
+negotiated semantics
+```
+
+Do not guess remote capabilities from endpoint type.
+
+The exact wire contract is **3.10**, with no earlier-minor compatibility.
+Version refusal precedes operand classification or filesystem root opening.
+`SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
+
+- Operation: 1=Push, 2=Pull, 3=PreviewPush.
+- Operand request: 0=Source followed by `contents:u8` (0/1); 1=Destination
+  followed by source shape. Roles must agree with the operation.
+- Source shape: 0=Directory contents/no basename, 1=Directory plus basename,
+  2=Leaf plus physical source name. Names are `byte_len:u32, native_bytes`.
+
+`SessionReady` is `capabilities:u64, modtime_precision_ns:u64,
+namespace_semantics:u8, resolved_operand, source_shape_presence:u8,
+[source_shape], pending:u8`. Resolved operand is 0=Tree or 1=Entry plus name.
+Presence and pending are 0/1. Pull returns source shape and cannot be pending;
+push returns no source shape. Every path/name length is bounded by
+`MAX_WIRE_PATH_BYTES` before allocation, and all tags are validated.
+
+Classification retains the selected directory FD, or the parent FD plus exact
+physical leaf name. Source names are never virtually renamed. Directory
+basename/trailing-slash semantics bind actual tree roots; selected leaves use
+one-name scans and the shared selected-leaf reconciler. An operator-selected
+destination directory symlink may be followed initially, then remains FD-bound.
+
+Missing destination parents are pending, not created by handshake or scanning.
+Pending namespace semantics are unqualified. After complete preflight selects a
+Create, `AcquireRoot` (frame kind 33) carries its destination `RelativeWirePath`,
+not a new root. An Entry-bound session requires that exact selected name. The
+server drains active handlers before acquisition and rebuilds every handler from
+the captured root FD. Its Ack carries the updated `SessionReady`, including the
+actual held-root namespace profile. Acquisition creates permanent parents from
+the original held ancestor, refuses foreign existing names, and does not claim
+private creator ownership, cleanup authority, or whole-run rollback. Local
+acquisition also requires original operator-path continuity; remote authority
+permits relocation of the held ancestor/root. Neither adopts a replacement after
+capturing its original root FD.
+
+### Metadata phase
+
+Exchange cheap ordered metadata first. No block signatures are included in the initial tree walk.
+
+The same merge reconciler consumes the remote metadata stream while it arrives.
+
+`ScanRequest` carries scan_flags:u8, metadata_flags:u8, max_depth:u32, scope:u8 (0=Tree, 1=Entry). Entry adds byte_len:u32 and bounded native path bytes in the sender's platform encoding. The server validates exactly one relative name before admitting a producer, even for an absent preview root; it inspects that name through the held root FD without sibling enumeration or directory descent. Tree remains a distinct intentional query.
+
+### On-demand signatures
+
+Only changed large files that are plausible delta candidates request destination signatures:
+
+```text
+SignatureRequest(stream_id, path, block_size)
+Signature(...)
+Signature(...)
+SignatureEnd
+```
+
+Signatures are generated and transmitted incrementally.
+
+Block size is adaptive. Start with a target of roughly 4096 blocks per file, rounded to a power of two and clamped around 4 KiB..1 MiB; benchmark and tune rather than hardcoding 4096 bytes.
+
+### Delta streaming
+
+The network path never constructs `Delta { ops: Vec<_> }`.
+
+```text
+source reader
+  -> rolling matcher
+  -> DeltaOp
+  -> bounded queue
+  -> protocol frame
+  -> network
+```
+
+The receiver applies operations directly into staging. Copy operations reference the old destination; literal operations carry bounded data chunks.
+
+### Multiplexing
+
+Every independent file/signature transfer has a `stream_id`. One SSH byte stream can interleave work without requiring multiple SSH connections:
+
+```text
+file A signatures
+file B whole-file data
+file C metadata
+file D delta literals
+```
+
+The scheduler controls fairness and byte budgets. Frame sizes remain moderate so one large file cannot monopolize the connection.
+
+### Compression
+
+Compression is negotiated; do not compress copy operations or signatures. `Auto` samples the first file-data chunk and uses the elapsed-time model to decide whether to compress this transfer. `Always` attempts every chunk, including after an incompressible first chunk. Both send raw bytes unless the actual compressed payload is smaller; only smaller zstd payloads carry the `COMPRESSED` frame flag.
+
+Pull `FileFetchRequest` carries size:u64, scanned identity:[u8;32], preservation_flags:u8, compression:u8, then the relative wire path. Compression values are 0=None, 1=Auto, 2=Always; other values are invalid. Preservation retains xattrs/ACLs bits 1/2; the former boolean compression bit 0 is invalid. Compression intent never substitutes for the actual per-frame representation flag.
+
+## Integrity
+
+### Remote
+
+BLAKE3 is part of the normal remote data path:
+
+```text
+source bytes -> network
+            \-> BLAKE3
+```
+
+The receiver hashes the fully reconstructed staged file. The sender's final file message carries the expected digest. A mismatch aborts staging before commit.
+
+This is default transfer integrity, not merely a `--verify` feature.
+
+### Local
+
+Do not force a second full-file read after OS-native local copies by default; that can erase the performance advantage of native copy primitives. `--verify` can request strong pre-commit/post-copy verification when the user wants the extra I/O.
+
+## Remote root security
+
+Lexical `..` checks are insufficient because existing symlink components can escape a root.
+
+The remote agent must operate relative to a held root directory handle and use platform-safe resolution:
+
+- Linux: prefer `openat2` with `RESOLVE_BENEATH` and appropriate no-follow/no-magic-link flags.
+- macOS/other Unix: walk components using directory FDs/openat-style APIs with no-follow semantics.
+
+No remote mutation may follow a preexisting path component outside the negotiated root.
+
+## One binary and remote bootstrap
+
+0.5 removes `sy-remote`. The same executable has a private `__serve` entrypoint used only as the remote protocol peer.
+
+Portable Linux release artifacts should include at least:
+
+```text
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
+```
+
+alongside platform-native builds where useful. CI verifies the musl artifacts are actually static.
+
+A later bootstrap layer may make remote installation automatic:
+
+1. try `sy __serve` on the remote;
+2. negotiate protocol/build compatibility;
+3. if unavailable, detect remote OS/architecture;
+4. obtain the matching trusted static agent;
+5. upload to a versioned user cache;
+6. verify its digest and mode;
+7. execute the cached agent.
+
+Do not upload the helper on every sync. Preinstalled/offline operation must remain possible.
+
+## Object stores
+
+S3/GCS-style endpoints come after the filesystem/SSH engine is stable. They use backend-native semantics:
+
+- multipart upload
+- ranged reads
+- server-side copy
+- backend checksums/ETags where semantically valid
+- object-level atomic visibility
+
+Do not model object stores as POSIX filesystems just to reuse code.
+
+## CLI
+
+0.5 may preserve familiar rsync-like user syntax while replacing the parser implementation. The final CLI should follow the repository `rust-cli` guidance: one `usage-rs` facade dependency, typed arguments, and generated help/manpage/completion artifacts rather than hand-maintained clap/manpage glue.
+
+CLI migration should happen after the new engine boundaries are stable enough that parser work is not mixed with transfer/protocol debugging.
+
+## Explicit removals before 0.5 release
+
+The following are not part of the target architecture and should be deleted once their 0.5 replacements are live:
+
+- `src/bin/sy-remote.rs`
+- protocol v2 and the old `streaming/` generator/sender/receiver pipeline
+- legacy `transport/`
+- embedded `ssh2` connection stack and homegrown SSH config parser
+- legacy `SyncEngine<T: Transport>`
+- legacy `StrategyPlanner`
+- whole-tree scan fallbacks in the core endpoint contract
+- duplicate stats/planning/transfer representations
+- compatibility-only caches and databases that are not proven useful in the new engine
+- obsolete tests that assert 0.4 implementation details or log strings rather than user-visible semantics
+
+## Non-goals by default
+
+Do not add these unless measurement demonstrates a need:
+
+- QUIC
+- io_uring
+- content-defined chunking
+- a persistent distributed state service
+- rsync wire compatibility
+- multiple custom SSH implementations
+
+## 0.5 release gates
+
+0.5 is ready only when:
+
+- format and Clippy are warning-free on all targets/features;
+- Linux and macOS semantic/integration tests are green;
+- cargo audit/deny are green;
+- protocol decoding has adversarial/property coverage and bounded allocations;
+- remote path confinement has dedicated escape/symlink tests;
+- interrupted transfers and injected preservation/commit failures prove old destinations survive pre-commit aborts, with explicit post-commit failure outcomes;
+- one endpoint conformance suite exercises local and SSH transaction/capability semantics;
+- source/destination race tests cover native whole copy, reflink, sparse and streaming paths;
+- namespace preflight proves bounded RAM/descriptors on wide/deep trees and refuses collisions before mutation;
+- supported directory transitions have failure/process-crash recovery coverage;
+- Linux/macOS tests exercise supported optional features semantically, not only through compilation;
+- remote files are BLAKE3-verified before commit;
+- deletion tests prove incomplete scans cannot delete data;
+- Miri is run over relevant unsafe/path/reflink components where practical;
+- realistic benchmarks cover many-small-files, huge files, unchanged trees, low/high change ratios, local COW/non-COW, and representative SSH links;
+- release CI builds and verifies static musl Linux binaries;
+- all replaced 0.4 architecture is actually removed rather than left as a second path.

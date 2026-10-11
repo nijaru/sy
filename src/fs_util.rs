@@ -1,8 +1,9 @@
+use std::path::Path;
 /// Filesystem utility functions for detecting COW support, hard links, and cross-filesystem operations.
 ///
 /// This module provides platform-specific filesystem detection to enable intelligent
 /// strategy selection in delta sync operations.
-use std::path::Path;
+pub(crate) mod namespace;
 
 /// Check if a filesystem supports copy-on-write (COW) reflinks
 ///
@@ -39,6 +40,7 @@ use std::path::Path;
 /// }
 /// ```
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // Used by platform tests; the rooted clone path is Linux-only.
 pub fn supports_cow_reflinks(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -74,6 +76,9 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
         Err(_) => return false,
     };
 
+    // SAFETY: `path_c` is a valid null-terminated C string, and `stat` points
+    // to writable memory for a `statfs` structure. `statfs` initializes the buffer
+    // on return code 0.
     unsafe {
         let mut stat: std::mem::MaybeUninit<statfs> = std::mem::MaybeUninit::uninit();
         if statfs(path_c.as_ptr(), stat.as_mut_ptr()) == 0 {
@@ -103,6 +108,9 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
         Err(_) => return false,
     };
 
+    // SAFETY: `path_c` is a valid null-terminated C string, and `stat` points
+    // to writable memory for `libc::statfs`. `libc::statfs` initializes the buffer
+    // on return code 0.
     unsafe {
         let mut stat: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
         if libc::statfs(path_c.as_ptr(), stat.as_mut_ptr()) == 0 {
@@ -117,6 +125,7 @@ pub fn supports_cow_reflinks(path: &Path) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(dead_code)] // Used by platform tests; the rooted clone path is Linux-only.
 pub fn supports_cow_reflinks(_path: &Path) -> bool {
     // Windows ReFS supports reflinks via FSCTL_DUPLICATE_EXTENTS_TO_FILE,
     // but it's rare. For now, assume no COW on Windows/other platforms.
@@ -152,6 +161,7 @@ pub fn supports_cow_reflinks(_path: &Path) -> bool {
 /// }
 /// ```
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn same_filesystem(path1: &Path, path2: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -207,6 +217,7 @@ pub fn same_filesystem(_path1: &Path, _path2: &Path) -> bool {
 /// }
 /// ```
 #[cfg(unix)]
+#[allow(dead_code)] // Kept as a public filesystem utility and exercised by tests.
 pub fn has_hard_links(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -216,6 +227,7 @@ pub fn has_hard_links(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)] // Kept as a public filesystem utility and exercised by tests.
 pub fn has_hard_links(_path: &Path) -> bool {
     // Windows has hard links but less common, and we don't use COW there anyway
     false
@@ -225,7 +237,89 @@ pub fn has_hard_links(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use sy::engine::namespace::Folding;
     use tempfile::TempDir;
+
+    /// Behavioral oracle: create a case-variant name beside an existing one and
+    /// compare the filesystem's real aliasing with the probed claim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn namespace_semantics_match_case_alias_behavior() {
+        let temp = TempDir::new().unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(temp.path().into())
+            .await
+            .unwrap();
+        let semantics = rooted.namespace_semantics().await.unwrap();
+
+        fs::create_dir(temp.path().join("Probe")).unwrap();
+        let aliases = fs::create_dir(temp.path().join("probe")).is_err();
+
+        match semantics.case {
+            Folding::Exact => assert!(!aliases, "probe claims byte-exact but names alias"),
+            Folding::Folded => assert!(aliases, "probe claims case folding but names do not alias"),
+            Folding::Unspecified => {}
+        }
+    }
+
+    /// Behavioral oracle for Unicode normalization aliasing (NFC vs NFD).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn namespace_semantics_match_normalization_alias_behavior() {
+        use std::ffi::OsString;
+
+        let temp = TempDir::new().unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(temp.path().into())
+            .await
+            .unwrap();
+        let semantics = rooted.namespace_semantics().await.unwrap();
+
+        let nfc = OsString::from("caf\u{e9}");
+        let nfd = OsString::from("cafe\u{301}");
+        assert_ne!(nfc, nfd);
+        fs::create_dir(temp.path().join(&nfc)).unwrap();
+        let aliases = fs::create_dir(temp.path().join(&nfd)).is_err();
+
+        match semantics.normalization {
+            Folding::Exact => assert!(
+                !aliases,
+                "probe claims byte-exact normalization but NFC/NFD alias"
+            ),
+            Folding::Folded => assert!(
+                aliases,
+                "probe claims normalization folding but NFC/NFD do not alias"
+            ),
+            Folding::Unspecified => {}
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn namespace_observation_keeps_original_directory_after_path_replacement() {
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("root");
+        fs::create_dir(&original).unwrap();
+        let rooted = crate::rooted_fs::RootedFs::open(original.clone())
+            .await
+            .unwrap();
+        let expected = rooted.namespace_semantics().await.unwrap();
+        fs::rename(&original, temp.path().join("retained")).unwrap();
+        fs::write(&original, b"foreign file").unwrap();
+
+        assert_eq!(rooted.namespace_semantics().await.unwrap(), expected);
+        assert!(matches!(
+            crate::rooted_fs::RootedFs::open(original.clone()).await,
+            Err(crate::rooted_fs::RootedFsError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotADirectory
+        ));
+        fs::remove_file(&original).unwrap();
+        assert!(matches!(
+            crate::rooted_fs::RootedFs::open(original).await,
+            Err(crate::rooted_fs::RootedFsError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(rooted.namespace_semantics().await.unwrap(), expected);
+    }
 
     #[test]
     fn test_cow_detection() {

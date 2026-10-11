@@ -7,10 +7,10 @@ on:
         description: "Build only, don't publish"
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,8 +91,33 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test
-        run: cargo test
+      - name: Test default and optional preservation
+        run: |
+          cargo test --locked
+          cargo test --locked --lib --all-features
+
+      - name: Audit dependencies
+        run: cargo install cargo-audit --locked && cargo audit
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Check generated manual
+        run: |
+          cargo install usage-cli --version 6.12.0 --locked
+          cargo run --locked --bin man-gen
+          git diff --exit-code man/sy.1
+
+  verify-macos:
+    name: Verify macOS semantics
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test default and optional preservation
+        run: |
+          cargo test --locked
+          cargo test --locked --lib --all-features
 
   # ============================================================================
   # STAGE 2: Build binaries (parallel)
@@ -100,7 +125,7 @@ jobs:
 
   build-binaries:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs: [verify, verify-macos]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -127,23 +152,80 @@ jobs:
 
       - name: Build release binary
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --locked --release --bin sy --features acl --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sy dist/
-          if [ -f target/${{ matrix.target }}/release/sy-remote ]; then
-            cp target/${{ matrix.target }}/release/sy-remote dist/
-          fi
 
       - name: Create tarball
         run: |
           cd dist
-          tar czf ${{ matrix.artifact_name }}.tar.gz sy sy-remote 2>/dev/null || tar czf ${{ matrix.artifact_name }}.tar.gz sy
-          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+          tar czf ${{ matrix.artifact_name }}.tar.gz sy
+          shasum -a 256 ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}.tar.gz*
+
+  build-musl:
+    name: Build ${{ matrix.target }}
+    needs: [verify, verify-macos]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/setup-cross-toolchain-action@v1.42.0
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # musl artifacts intentionally omit ACLs: no dynamic libacl dependency.
+      - name: Build static release binary
+        run: |
+          cargo build --locked --release --bin sy --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/sy dist/
+
+      - name: Verify the artifact is fully static
+        run: |
+          BIN=dist/sy
+          file "$BIN"
+          # Standalone musl artifacts are the remote-agent distribution story
+          # (#26/#28): they must run on any Linux regardless of its libc.
+          if readelf -l "$BIN" | grep -q "Requesting program interpreter"; then
+            echo "::error::musl artifact has a dynamic interpreter"
+            readelf -l "$BIN"
+            exit 1
+          fi
+          if readelf -d "$BIN" | grep -q "(NEEDED)"; then
+            echo "::error::musl artifact has shared-library dependencies"
+            readelf -d "$BIN"
+            exit 1
+          fi
+
+      - name: Smoke test the static binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          work=$(mktemp -d)
+          printf 'static smoke' > "$work/source"
+          ./dist/sy "$work/source" "$work/copy"
+          test "$(cat "$work/copy")" = "static smoke"
+
+      - name: Create tarball
+        run: |
+          cd dist
+          tar czf sy-${{ matrix.target }}.tar.gz sy
+          sha256sum sy-${{ matrix.target }}.tar.gz > sy-${{ matrix.target }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sy-${{ matrix.target }}
+          path: dist/sy-${{ matrix.target }}.tar.gz*
 
   # ============================================================================
   # STAGE 3: Create GitHub Release (stays draft until manually published)
@@ -151,7 +233,9 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [verify, build-binaries]
+    needs: [verify, verify-macos, build-binaries, build-musl]
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
     runs-on: ubuntu-latest
     steps:
@@ -181,10 +265,11 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: [verify, build-binaries]
+    needs: [verify, verify-macos, build-binaries, build-musl]
     if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -217,47 +302,4 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: cargo publish --token ${{ steps.crates-io-auth.outputs.token }}
 
-  # ============================================================================
-  # STAGE 5: Update Homebrew tap
-  # ============================================================================
-
-  update-homebrew:
-    name: Update Homebrew Tap
-    needs: [verify, create-release]
-    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry-run
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: nijaru/homebrew-tap
-          token: ${{ secrets.TAP_UPDATE_TOKEN }}
-
-      - name: Download checksums
-        run: |
-          gh release download ${{ needs.verify.outputs.tag }} \
-            --repo nijaru/sy \
-            --pattern '*.sha256'
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Update formula
-        run: |
-          TAG=${{ needs.verify.outputs.tag }}
-          VERSION=${{ needs.verify.outputs.version }}
-
-          ARM64_SHA=$(cat sy-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-          SOURCE_SHA=$(curl -sL https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz | shasum -a 256 | awk '{print $1}')
-
-          sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/sy.rb
-          sed -i "s|url \"https://github.com/nijaru/sy/releases/download/v.*/sy-aarch64-apple-darwin.tar.gz\"|url \"https://github.com/nijaru/sy/releases/download/$TAG/sy-aarch64-apple-darwin.tar.gz\"|" Formula/sy.rb
-          sed -i "/on_arm do/,/end/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/sy.rb
-          sed -i "s|url \"https://github.com/nijaru/sy/archive/refs/tags/v.*.tar.gz\"|url \"https://github.com/nijaru/sy/archive/refs/tags/$TAG.tar.gz\"|" Formula/sy.rb
-          sed -i "/on_intel do/,/depends_on/ s/sha256 \".*\"/sha256 \"$SOURCE_SHA\"/" Formula/sy.rb
-
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/sy.rb
-          git commit -m "chore: update sy to ${{ needs.verify.outputs.tag }}"
-          git push
+  # Homebrew updates run only after public release publication; see homebrew.yml.

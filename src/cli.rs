@@ -1,12 +1,14 @@
 use crate::path::SyncPath;
-use clap::{Parser, ValueEnum};
+use anyhow::Context as _;
+use usage::ValueEnum;
+
+mod args;
+mod parser;
+pub use args::PathError;
+pub use parser::Arguments;
 use std::path::PathBuf;
 
-// Import integrity types for verification modes
-use crate::integrity::ChecksumType;
-
-// Import compression types for detection modes
-use crate::compress::CompressionDetection;
+use crate::engine::compression::CompressionDetection;
 
 use crate::sync::scanner::ScanOptions;
 
@@ -20,22 +22,6 @@ pub enum VerifyMode {
     After,
     /// Audit file integrity without modifying anything
     Only,
-}
-
-/// Resume mode for interrupted transfers
-#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
-pub enum ResumeMode {
-    /// Resume interrupted transfers if state found (default)
-    #[default]
-    Auto,
-    /// Only resume interrupted transfers, don't start new ones
-    Only,
-    /// Disable resume support
-    No,
-}
-
-fn parse_sync_path(s: &str) -> Result<SyncPath, String> {
-    Ok(SyncPath::parse(s))
 }
 
 pub fn parse_size(s: &str) -> Result<u64, String> {
@@ -54,6 +40,13 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
 
+    if !num.is_finite() || num < 0.0 {
+        return Err(format!(
+            "Invalid number '{}': must be a finite non-negative number",
+            num_str
+        ));
+    }
+
     let multiplier: u64 = match unit.trim() {
         "B" => 1,
         "KB" | "K" => 1024,
@@ -64,7 +57,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     };
 
     let result = num * multiplier as f64;
-    if result < 0.0 || result > u64::MAX as f64 {
+    if !result.is_finite() || result < 0.0 || result >= u64::MAX as f64 {
         return Err(format!("Size '{}' exceeds maximum (~16 exabytes)", s));
     }
     Ok(result as u64)
@@ -77,22 +70,16 @@ pub enum VerificationMode {
     #[default]
     None,
 
-    /// xxHash3 verification after write (catches corruption)
+    /// Staged verification of written content (catches corruption)
     Verify,
 }
 
 impl VerificationMode {
-    /// Get the checksum type for this mode
-    pub fn checksum_type(&self) -> ChecksumType {
-        match self {
-            Self::None => ChecksumType::None,
-            Self::Verify => ChecksumType::Fast,
-        }
-    }
-
-    /// Check if this mode requires block-level verification
+    /// Whether --verify enables post-write verification of committed bytes.
+    /// The local engine hashes staged bytes against the source before the
+    /// rename commit; the v3 protocol always verifies unconditionally.
     pub fn verify_blocks(&self) -> bool {
-        false
+        matches!(self, Self::Verify)
     }
 }
 
@@ -110,250 +97,144 @@ pub enum SymlinkMode {
     Skip,
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "sy")]
-#[command(about = "Modern file synchronization tool", long_about = None)]
-#[command(version)]
-#[command(after_help = "EXAMPLES:
-    # Basic sync
-    sy /source /destination
-
-    # Preview changes without applying
-    sy /source /destination --dry-run
-
-    # Mirror mode (delete extra files in destination)
-    sy /source /destination --delete
-
-    # Parallel transfers (20 workers)
-    sy /source /destination -j 20
-
-    # Sync single file
-    sy /path/to/file.txt /dest/file.txt
-
-    # Remote sync (SSH)
-    sy /local user@host:/remote
-    sy user@host:/remote /local
-
-    # Quiet mode (only errors)
-    sy /source /destination --quiet
-
-    # Verify file integrity after write
-    sy /source /destination --verify            # xxHash3 verification
-
-    # Resume interrupted transfers
-    sy /source user@host:/dest --resume         # Auto-resume interrupted large files
-    sy /source user@host:/dest --resume=only    # Only resume, don't start new transfers
-    sy /source user@host:/dest --clear-resume-state  # Clear all resume state
-
-For more information: https://github.com/nijaru/sy")]
+#[derive(usage::Args, Debug)]
 pub struct Cli {
     /// Source path (local: /path or remote: user@host:/path)
     /// Optional when using --profile
-    #[arg(value_parser = parse_sync_path)]
+    #[usage(skip)]
     pub source: Option<SyncPath>,
 
     /// Destination path (local: /path or remote: user@host:/path)
     /// Optional when using --profile
-    #[arg(value_parser = parse_sync_path)]
+    #[usage(skip)]
     pub destination: Option<SyncPath>,
 
     /// Show changes without applying them (dry-run)
-    #[arg(short = 'n', long)]
+    #[usage(short = 'n', long)]
     pub dry_run: bool,
 
     /// Show detailed changes in dry-run mode (file sizes, byte changes)
     /// Requires --dry-run to be effective
-    #[arg(long)]
+    #[usage(long)]
     pub diff: bool,
 
     /// Delete files in destination not present in source
-    #[arg(short, long)]
+    #[usage(short, long)]
     pub delete: bool,
 
     /// Force deletion even if it exceeds safety threshold (use with --delete)
-    #[arg(long)]
+    #[usage(long)]
     pub force_delete: bool,
 
-    /// Move deleted files to trash instead of permanent deletion
-    #[arg(long)]
-    pub trash: bool,
-
     /// Verbosity level (can be repeated: -v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[usage(short, long, count)]
     pub verbose: u8,
 
     /// Quiet mode (only show errors)
-    #[arg(short, long)]
+    #[usage(short, long)]
     pub quiet: bool,
 
     /// Show detailed performance summary at the end
-    #[arg(long)]
+    #[usage(long)]
     pub perf: bool,
 
-    /// Show progress bar for each large file (>= 1MB) being transferred
-    /// Automatically hidden when output is piped or with --quiet
-    #[arg(long)]
-    pub progress: bool,
-
     /// Show file transfer statistics after sync completes
-    #[arg(long)]
+    #[usage(long)]
     pub stats: bool,
 
     /// Show file sizes in human-readable format (e.g., 1K, 234M, 2G)
-    #[arg(long)]
+    #[usage(long)]
     pub human_readable: bool,
 
     /// Make backups of existing destination files
     /// Optional MODE: none, simple (default with -b)
-    #[arg(short = 'b', long, num_args = 0..=1, default_missing_value = "simple")]
+    #[usage(short = 'b', long, default_missing = "simple")]
     pub backup: Option<String>,
 
     /// Directory to store backup files (default: same as destination)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::DirPath)]
     pub backup_dir: Option<PathBuf>,
 
     /// Backup file suffix (default: ~)
-    #[arg(long, default_value = "~")]
+    #[usage(long, default = "~")]
     pub suffix: String,
 
-    /// Keep partially transferred files
-    /// Optional DIR to store partial files in a separate directory
-    #[arg(long, num_args = 0..=1, default_missing_value = "", hide = true)]
-    pub partial: Option<String>,
-
-    /// Directory to store partial files (alias for --partial=DIR)
-    #[arg(long)]
-    pub partial_dir: Option<PathBuf>,
-
     /// Remove source files after successful transfer (like mv)
-    #[arg(long)]
+    #[usage(long)]
     pub remove_source_files: bool,
 
     /// Don't create new files on destination, only update existing
-    #[arg(long)]
+    #[usage(long)]
     pub existing: bool,
 
     /// Transfer directories without recursing (like rsync -d)
-    #[arg(long)]
+    #[usage(long)]
     pub dirs: bool,
 
     /// I/O timeout in seconds (for SSH connections)
-    #[arg(long)]
+    #[usage(long)]
     pub timeout: Option<u64>,
 
     /// Connection timeout in seconds (for SSH connections)
-    #[arg(long)]
+    #[usage(long)]
     pub contimeout: Option<u64>,
 
-    /// Compression level (1-9, 0 disables compression)
-    #[arg(long)]
-    pub compress_level: Option<u8>,
-
     /// Show what changed for each file (like rsync -i)
-    #[arg(long, short = 'i')]
+    #[usage(long, short = 'i')]
     pub itemize_changes: bool,
 
     /// Number of parallel file transfers (default: 10)
-    #[arg(short = 'j', long, default_value = "10")]
+    #[usage(short = 'j', long, default = "10")]
     pub parallel: usize,
 
-    /// Maximum number of errors before aborting (0 = unlimited, default: 100)
-    #[arg(long, default_value = "100")]
-    pub max_errors: usize,
-
     /// Minimum file size to sync (e.g., "1MB", "500KB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub min_size: Option<u64>,
 
     /// Maximum file size to sync (e.g., "100MB", "1GB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub max_size: Option<u64>,
 
     /// Exclude files matching pattern (can be repeated)
     /// Examples: "*.log", "node_modules", "target/"
-    #[arg(long)]
+    #[usage(long)]
     pub exclude: Vec<String>,
 
     /// Include files matching pattern (can be repeated, processed in order with --exclude)
     /// Examples: "*.rs", "important.log"
-    #[arg(long)]
+    #[usage(long)]
     pub include: Vec<String>,
 
     /// Filter rules in rsync syntax: "+ pattern" (include) or "- pattern" (exclude)
     /// Can be repeated. Rules processed in order, first match wins.
     /// Examples: "+ *.rs", "- *.log", "- target/*"
-    #[arg(long, allow_hyphen_values = true)]
+    #[usage(long, allow_hyphen_values)]
     pub filter: Vec<String>,
 
     /// Read exclude patterns from file (one pattern per line)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::FilePath)]
     pub exclude_from: Option<std::path::PathBuf>,
 
     /// Read include patterns from file (one pattern per line)
-    #[arg(long)]
+    #[usage(long, value_hint = usage::ValueHint::FilePath)]
     pub include_from: Option<std::path::PathBuf>,
 
     /// Apply exclude template from ~/.config/sy/templates/ (can be repeated)
     /// Examples: "rust", "node", "python"
-    #[arg(long)]
+    #[usage(long)]
     pub exclude_template: Vec<String>,
 
     /// Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
-    #[arg(long, value_parser = parse_size)]
+    #[usage(skip)]
     pub bwlimit: Option<u64>,
 
-    /// Resume mode (auto|only|no)
-    /// - auto: Resume interrupted transfers if state found (default)
-    /// - only: Only resume interrupted transfers, don't start new ones
-    /// - no: Disable resume support
-    #[arg(long, value_enum, default_value = "auto")]
-    pub resume: ResumeMode,
-
-    /// Clear all resume state before starting
-    #[arg(long)]
-    pub clear_resume_state: bool,
-
-    /// Use streaming mode for massive directories (experimental)
-    #[arg(long, hide = true)]
-    pub stream: bool,
-
-    /// Checkpoint every N files (default: 100)
-    #[arg(long, default_value = "100")]
-    pub checkpoint_files: usize,
-
-    /// Checkpoint every N bytes transferred (e.g., "100MB", default: 100MB)
-    #[arg(long, value_parser = parse_size, default_value = "104857600")]
-    pub checkpoint_bytes: u64,
-
-    /// Use directory cache for faster re-syncs (default: false)
-    /// The cache stores directory mtimes to skip unchanged directories
-    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
-    pub cache: bool,
-
-    /// Delete any existing cache files before starting
-    #[arg(long)]
-    pub clear_cache: bool,
-
-    /// Use checksum database for faster --checksum re-syncs (default: false)
-    /// The database stores checksums to avoid recomputation for unchanged files
-    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
-    pub checksum_db: bool,
-
-    /// Clear checksum database before starting
-    #[arg(long)]
-    pub clear_checksum_db: bool,
-
-    /// Remove stale entries from checksum database (files no longer in source)
-    #[arg(long)]
-    pub prune_checksum_db: bool,
-
-    /// Verify file integrity after write using xxHash3 checksums
+    /// Verify file integrity against staged BLAKE3 verification
     ///
     /// Modes:
-    /// - after: Verify each file after writing (default)
+    /// - after: Verify staged content before committing each file
     /// - only: Audit file integrity without modifying anything
     /// - no: Disable verification (default)
-    #[arg(long, value_enum, default_value = "no")]
+    #[usage(long, value_enum, default = "no")]
     pub verify: VerifyMode,
 
     /// Compression mode for transfers
@@ -364,178 +245,190 @@ pub struct Cli {
     ///
     /// -z (no value) enables auto compression
     /// --compress=MODE for explicit control
-    #[arg(short = 'z', long, value_enum, default_value = "never", default_missing_value = "auto", num_args = 0..=1)]
+    #[usage(
+        short = 'z',
+        long,
+        value_enum,
+        default = "never",
+        default_missing = "auto"
+    )]
     pub compress: CompressionDetection,
 
     /// Symlink handling mode (preserve, follow, skip)
-    #[arg(long, value_enum, default_value = "preserve")]
+    #[usage(long, value_enum, default = "preserve")]
     pub links: SymlinkMode,
 
     /// Follow symlinks and copy targets (shortcut for --links follow)
-    #[arg(short = 'L', long)]
+    #[usage(short = 'L', long)]
     pub copy_links: bool,
 
-    /// Treat symlinked directories on receiver as directories
-    /// If dest has a symlink to a dir, sync into that dir rather than replacing it
-    #[arg(short = 'K', long)]
-    pub keep_dirlinks: bool,
-
     /// Preserve extended attributes (xattrs)
-    #[arg(short = 'X', long)]
+    #[usage(short = 'X', long)]
     pub preserve_xattrs: bool,
 
     /// Preserve hard links (treat multiple links to the same file as one copy)
-    #[arg(short = 'H', long)]
+    #[usage(short = 'H', long)]
     pub preserve_hardlinks: bool,
 
     /// Preserve access control lists (ACLs)
-    #[arg(short = 'A', long)]
+    #[usage(short = 'A', long)]
     pub preserve_acls: bool,
 
-    /// Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; no-op on other platforms)
-    #[arg(short = 'F', long)]
+    /// Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; refused on other platforms)
+    #[usage(short = 'F', long)]
     pub preserve_flags: bool,
 
     /// Preserve permissions
-    #[arg(short = 'p', long)]
+    #[usage(short = 'p', long)]
     pub preserve_permissions: bool,
 
     /// Preserve modification times
-    #[arg(short = 't', long)]
+    #[usage(short = 't', long)]
     pub preserve_times: bool,
 
-    /// Preserve group (requires appropriate permissions)
-    #[arg(short = 'g', long)]
-    pub preserve_group: bool,
-
-    /// Preserve owner (requires root)
-    #[arg(short = 'o', long)]
-    pub preserve_owner: bool,
-
-    /// Preserve device files and special files (requires root)
-    #[arg(short = 'D', long)]
-    pub preserve_devices: bool,
-
-    /// Archive mode: preserve all metadata (-rlptgoD) and copy everything
+    /// Archive mode: preserve permissions, times, and symlinks (-rlpt) and copy everything
     ///
-    /// Equivalent to rsync's -rlptgoD (recursive, links, perms, times, group, owner, devices).
-    /// All files are copied by default (no .gitignore filtering, .git directories included).
+    /// Deliberate divergence from rsync -a (-rlptgoD): owner, group, and
+    /// device preservation were unimplemented stubs and are removed rather
+    /// than silently ignored. All files are copied by default (no .gitignore
+    /// filtering, .git directories included).
     ///
     /// Does NOT include: -X (xattrs), -A (ACLs), -H (hardlinks) - add those flags separately.
-    #[arg(short = 'a', long)]
+    #[usage(short = 'a', long)]
     pub archive: bool,
 
     /// Filter files based on .gitignore rules (opt-in)
     ///
     /// By default, sy copies all files like rsync/cp.
     /// Use this flag to respect .gitignore rules for developer-friendly syncs.
-    #[arg(long)]
+    #[usage(long)]
     pub gitignore: bool,
 
     /// Exclude .git directories from the sync (opt-in)
     ///
     /// By default, sy copies .git directories like rsync/cp.
     /// Use this flag to skip version control directories for faster syncs.
-    #[arg(long)]
+    #[usage(long)]
     pub exclude_vcs: bool,
 
     /// Ignore modification times, always compare checksums (rsync --ignore-times)
-    #[arg(long)]
+    #[usage(long)]
     pub ignore_times: bool,
 
     /// Only compare file size, skip mtime checks (rsync --size-only)
-    #[arg(long)]
+    #[usage(long)]
     pub size_only: bool,
 
     /// Always compare checksums instead of size+mtime (slow but thorough, rsync --checksum)
-    #[arg(short = 'c', long)]
+    #[usage(short = 'c', long)]
     pub checksum: bool,
 
     /// Skip files where destination is newer than source (rsync --update)
-    #[arg(short = 'u', long)]
+    #[usage(short = 'u', long)]
     pub update: bool,
 
     /// Skip files that already exist in destination (rsync --ignore-existing)
-    #[arg(long)]
+    #[usage(long)]
     pub ignore_existing: bool,
 
     /// Output JSON (newline-delimited JSON for scripting)
-    #[arg(long)]
+    #[usage(long)]
     pub json: bool,
 
     /// Watch mode - continuously monitor source for changes
-    #[arg(short = 'w', long)]
+    #[usage(short = 'w', long)]
     pub watch: bool,
 
     /// Disable hook execution (skip pre-sync and post-sync hooks)
-    #[arg(long)]
+    #[usage(long)]
     pub no_hooks: bool,
 
     /// Abort sync if any hook fails (default: warn and continue)
-    #[arg(long)]
+    #[usage(long)]
     pub abort_on_hook_failure: bool,
 
     /// Use named profile from config file
-    #[arg(long)]
+    #[usage(long)]
     pub profile: Option<String>,
 
     /// List all available profiles
-    #[arg(long)]
+    #[usage(long)]
     pub list_profiles: bool,
 
     /// Show details of a specific profile
-    #[arg(long)]
+    #[usage(long)]
     pub show_profile: Option<String>,
-
-    /// Bidirectional sync mode - sync changes in both directions
-    /// Detects and resolves conflicts automatically based on --conflict-resolve strategy
-    #[arg(long)]
-    pub bidirectional: bool,
-
-    /// Conflict resolution strategy for bidirectional sync
-    /// Options: newer (default), larger, smaller, source, dest, rename
-    #[arg(long, default_value = "newer")]
-    pub conflict_resolve: String,
 
     /// Maximum deletions allowed
     /// - Absolute count: --max-delete=1000
     /// - Percentage: --max-delete=50%
     /// - 0 = unlimited (default: 50%)
-    #[arg(long, default_value = "50%")]
+    #[usage(long, default = "50%")]
     pub max_delete: String,
-
-    /// Clear bidirectional sync state before syncing
-    /// Forces full comparison instead of using cached state
-    #[arg(long)]
-    pub clear_bisync_state: bool,
-
-    /// Force resync by ignoring corrupt state (recovery mode)
-    /// Use this when bisync state file is corrupted
-    /// All differences will be treated as new changes on first sync
-    #[arg(long)]
-    pub force_resync: bool,
-
-    /// Maximum retry attempts for network operations (default: 0 = no retries)
-    #[arg(long, default_value = "0", hide = true)]
-    pub retry: u32,
-
-    /// Initial delay between retries in seconds (default: 1)
-    /// Delay increases exponentially with each retry (1s, 2s, 4s, ...)
-    #[arg(long, default_value = "1", hide = true)]
-    pub retry_delay: u64,
-
-    /// Internal: Run in server mode (used over SSH)
-    #[arg(long, hide = true)]
-    pub server: bool,
 
     // === rsync compatibility flags (hidden, no-op) ===
     /// Recursive (no-op: sy is always recursive, for rsync compatibility)
-    #[arg(short = 'r', hide = true)]
+    #[usage(short = 'r', hide)]
     pub recursive: bool,
 }
 
 impl Cli {
+    pub fn parse() -> Self {
+        match Arguments::parse().into_cli() {
+            Ok(cli) => cli,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
+        // --diff is a dry-run display variant; without --dry-run it silently
+        // showed nothing, which reads as success while doing nothing at all.
+        if self.diff && !self.dry_run {
+            anyhow::bail!("--diff requires --dry-run (it details planned changes only)");
+        }
+
+        // Pull (remote source -> local destination) runs on the v3 engine.
+        // Flags the v3 pull path does not implement yet are rejected up
+        // front rather than silently ignored mid-sync. Each of these has a
+        // concrete remaining design, not a legacy-transport excuse:
+        // - --delete needs remote ignore-scope evaluation so destination
+        //   counterparts of source-ignored files stay protected;
+        // - --remove-source-files needs confined server-side source removal;
+        // - --copy-links needs a confined remote follow-walk.
+        if let (Some(source), Some(dest)) = (&self.source, &self.destination) {
+            if source.is_remote() && dest.is_local() {
+                if self.delete {
+                    anyhow::bail!(
+                        "--delete is not yet supported for remote->local pulls: the v3 \
+                         engine must evaluate the remote source's ignore rules for delete \
+                         protection before deletions can be authorized. Refusing beats \
+                         risking destination data."
+                    );
+                }
+                let unsupported = [
+                    (self.remove_source_files, "--remove-source-files"),
+                    // Both routes into Follow mode need the confined remote
+                    // follow-walk design.
+                    (
+                        self.copy_links || self.links == SymlinkMode::Follow,
+                        "--copy-links/--links=follow",
+                    ),
+                ];
+                for (enabled, flag) in unsupported {
+                    if enabled {
+                        anyhow::bail!(
+                            "{flag} is not yet supported for remote->local pulls on the v3 \
+                             engine; it would be silently ignored, so it is rejected \
+                             instead."
+                        );
+                    }
+                }
+            }
+        }
+
         // Validate size filters first (independent of source path)
         if let (Some(min), Some(max)) = (self.min_size, self.max_size) {
             if min > max {
@@ -569,51 +462,8 @@ impl Cli {
             }
         }
 
-        // Bidirectional sync validation
-        if self.bidirectional {
-            // Validate max_delete format
-            if !self.max_delete.ends_with('%') {
-                // Absolute count - must be a number
-                if self.max_delete.parse::<u64>().is_err() {
-                    anyhow::bail!(
-                        "--max-delete must be a number or percentage (got: '{}'). Use '50%' for percentage or '1000' for absolute count.",
-                        self.max_delete
-                    );
-                }
-            }
-
-            // Validate conflict resolution strategy
-            let valid_strategies = ["newer", "larger", "smaller", "source", "dest", "rename"];
-            if !valid_strategies.contains(&self.conflict_resolve.as_str()) {
-                anyhow::bail!(
-                    "Invalid --conflict-resolve strategy '{}'. Valid options: {}",
-                    self.conflict_resolve,
-                    valid_strategies.join(", ")
-                );
-            }
-
-            // Bidirectional conflicts with certain flags
-            if self.verify == VerifyMode::Only {
-                anyhow::bail!(
-                    "--bidirectional cannot be used with --verify=only (conflicts with sync logic)"
-                );
-            }
-            if self.watch {
-                anyhow::bail!("--bidirectional with --watch is not yet supported (deferred to future version)");
-            }
-
-            // Bidirectional sync doesn't support S3 paths
-            let source_is_s3 = self.source.as_ref().is_some_and(|p| p.is_s3());
-            let dest_is_s3 = self.destination.as_ref().is_some_and(|p| p.is_s3());
-            if source_is_s3 || dest_is_s3 {
-                anyhow::bail!(
-                    "--bidirectional does not support S3 paths (use unidirectional sync instead)"
-                );
-            }
-        }
-
         // --list-profiles and --show-profile don't need source/destination
-        if self.list_profiles || self.show_profile.is_some() || self.server {
+        if self.list_profiles || self.show_profile.is_some() {
             return Ok(());
         }
 
@@ -627,9 +477,16 @@ impl Cli {
         if let Some(source) = &self.source {
             if source.is_local() {
                 let path = source.path();
-                if !path.exists() {
+                // Preserved/skipped dangling links are valid selected leaves.
+                // Copy-links target validation belongs to the scoped scanner.
+                let observation = std::fs::symlink_metadata(path);
+                if observation
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
                     anyhow::bail!("Source path does not exist: {}", source);
                 }
+                observation.with_context(|| format!("Cannot inspect source path: {source}"))?;
             }
         }
 
@@ -673,27 +530,6 @@ impl Cli {
         }
     }
 
-    /// Get effective resume setting (default: true)
-    ///
-    /// Priority:
-    /// 1. --resume=no: disables resume (returns false)
-    /// 2. --resume or --resume=auto: enables resume (returns true)
-    /// 3. --resume=only: only resume, don't start new (returns true)
-    /// 4. Default: enabled (returns true)
-    pub fn resume(&self) -> bool {
-        match self.resume {
-            ResumeMode::No => false,
-            ResumeMode::Auto | ResumeMode::Only => true,
-        }
-    }
-
-    /// Check if source is a file (not a directory)
-    pub fn is_single_file(&self) -> bool {
-        self.source
-            .as_ref()
-            .is_some_and(|s| s.is_local() && s.path().is_file())
-    }
-
     pub fn log_level(&self) -> tracing::Level {
         if self.quiet || self.json {
             return tracing::Level::ERROR;
@@ -707,33 +543,13 @@ impl Cli {
     }
 
     /// Check if permissions should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for permission preservation (planned feature)
     pub fn should_preserve_permissions(&self) -> bool {
         self.archive || self.preserve_permissions
     }
 
     /// Check if modification times should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for time preservation (planned feature)
     pub fn should_preserve_times(&self) -> bool {
         self.archive || self.preserve_times
-    }
-
-    /// Check if group should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for group preservation (planned feature)
-    pub fn should_preserve_group(&self) -> bool {
-        self.archive || self.preserve_group
-    }
-
-    /// Check if owner should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for owner preservation (planned feature)
-    pub fn should_preserve_owner(&self) -> bool {
-        self.archive || self.preserve_owner
-    }
-
-    /// Check if device files should be preserved (archive mode or explicit flag)
-    #[allow(dead_code)] // Public API for device preservation (planned feature)
-    pub fn should_preserve_devices(&self) -> bool {
-        self.archive || self.preserve_devices
     }
 
     /// Check if symlinks should be preserved (archive mode enables by default)
@@ -756,6 +572,11 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    fn parse_cli(words: &[&str]) -> Cli {
+        let words: Vec<_> = words.iter().map(std::ffi::OsStr::new).collect();
+        Arguments::parse_from(&words).unwrap().into_cli().unwrap()
+    }
+
     #[test]
     fn test_validate_source_exists() {
         let temp = TempDir::new().unwrap();
@@ -772,27 +593,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             min_size: None,
             max_size: None,
             exclude: vec![],
@@ -804,21 +619,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -828,28 +636,14 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -869,27 +663,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             min_size: None,
             max_size: None,
             exclude: vec![],
@@ -901,21 +689,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -925,28 +706,14 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         let result = cli.validate();
         assert!(result.is_err());
@@ -972,27 +739,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1002,21 +763,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1026,34 +780,61 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         // Single file sync is now supported
         assert!(cli.validate().is_ok());
-        assert!(cli.is_single_file());
+    }
+
+    #[test]
+    fn test_validate_pull_rejects_delete() {
+        // remote source -> local destination with --delete must be refused
+        // before any connection: v3 pull must evaluate the remote source's
+        // ignore rules for delete protection before deletions are authorized.
+        let cli = parse_cli(&["host:/src", "/tmp/dst", "--delete"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_pull_rejects_unimplemented_v3_flags() {
+        for flag in ["--remove-source-files", "--copy-links"] {
+            let cli = parse_cli(&["host:/src", "/tmp/dst", flag]);
+            assert!(cli.validate().is_err(), "pull must reject {flag}");
+        }
+    }
+
+    #[test]
+    fn test_validate_pull_accepts_v3_supported_flags() {
+        // The v3 engine honors these on pulls now: backup, output options,
+        // and timeouts are real (not silent no-ops) on the pull path.
+        for flag in [
+            "--backup",
+            "--backup-dir=/tmp/b",
+            "--itemize-changes",
+            "--json",
+            "--perf",
+            "--timeout=30",
+            "--compress",
+        ] {
+            let cli = parse_cli(&["host:/src", "/tmp/dst", flag]);
+            assert!(cli.validate().is_ok(), "pull must accept {flag}");
+        }
+    }
+
+    #[test]
+    fn test_validate_pull_accepts_supported_flags() {
+        // The same flags stay valid on local->local syncs and plain pulls.
+        let cli = parse_cli(&["host:/src", "/tmp/dst"]);
+        assert!(cli.validate().is_ok());
     }
 
     #[test]
@@ -1074,27 +855,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1104,21 +879,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1128,30 +896,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert!(cli.validate().is_ok());
     }
@@ -1171,27 +925,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: true,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1201,21 +949,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1225,30 +966,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::ERROR);
     }
@@ -1268,27 +995,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1298,21 +1019,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1322,30 +1036,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::WARN);
     }
@@ -1365,27 +1065,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 1,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1395,21 +1089,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1419,30 +1106,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::INFO);
     }
@@ -1462,27 +1135,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 2,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1492,21 +1159,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1516,30 +1176,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.log_level(), tracing::Level::TRACE);
     }
@@ -1561,6 +1207,12 @@ mod tests {
         assert_eq!(parse_size("1K").unwrap(), 1024);
         assert_eq!(parse_size("1M").unwrap(), 1024 * 1024);
         assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+
+        // Test non-finite and negative inputs
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("inf").is_err());
+        assert!(parse_size("-10MB").is_err());
+        assert!(parse_size("unknown").is_err());
     }
 
     #[test]
@@ -1578,27 +1230,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1608,21 +1254,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1632,35 +1271,33 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: Some(1024 * 1024), // 1MB
             max_size: Some(500 * 1024),  // 500KB (smaller than min)
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         let result = cli.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min-size"));
+    }
+
+    #[test]
+    fn test_diff_requires_dry_run() {
+        // --diff without --dry-run previously did nothing silently; validation
+        // must reject it so a mistaken invocation cannot read as success.
+        let cli = parse_cli(&["/tmp/source/", "/tmp/dest", "--diff"]);
+        assert!(cli
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--diff requires --dry-run"));
     }
 
     #[test]
@@ -1678,27 +1315,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1708,21 +1339,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1732,30 +1356,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.verification_mode(), VerificationMode::None);
     }
@@ -1775,27 +1385,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1805,21 +1409,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::After, // But --verify flag should override
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1829,45 +1426,27 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         // verify flag should override mode to Verify
         assert_eq!(cli.verification_mode(), VerificationMode::Verify);
     }
 
     #[test]
-    fn test_verification_mode_checksum_type_mapping() {
-        assert_eq!(VerificationMode::None.checksum_type(), ChecksumType::None);
-        assert_eq!(VerificationMode::Verify.checksum_type(), ChecksumType::Fast);
-    }
-
-    #[test]
     fn test_verification_mode_verify_blocks() {
         assert!(!VerificationMode::None.verify_blocks());
-        assert!(!VerificationMode::Verify.verify_blocks());
+        // --verify enables post-write verification; the 0.4 wiring hard-coded
+        // this to false, silently ignoring the flag on every engine.
+        assert!(VerificationMode::Verify.verify_blocks());
     }
 
     #[test]
@@ -1885,27 +1464,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -1915,21 +1488,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -1939,30 +1505,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Preserve);
     }
@@ -1982,27 +1534,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2012,21 +1558,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Skip, // Should be overridden
             copy_links: true,         // Override to Follow
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2036,30 +1575,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Follow);
     }
@@ -2079,27 +1604,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2109,21 +1628,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Skip,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2133,30 +1645,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
         assert_eq!(cli.symlink_mode(), SymlinkMode::Skip);
     }
@@ -2176,27 +1674,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2206,21 +1698,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: true, // Archive mode enabled
             gitignore: false,
             exclude_vcs: false,
@@ -2230,38 +1715,21 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         // Archive mode should enable all these flags
         assert!(cli.should_preserve_permissions());
         assert!(cli.should_preserve_times());
-        assert!(cli.should_preserve_group());
-        assert!(cli.should_preserve_owner());
-        assert!(cli.should_preserve_devices());
         assert!(cli.should_preserve_symlinks());
     }
 
@@ -2280,27 +1748,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2310,21 +1772,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: true, // Only permissions enabled
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2334,38 +1789,21 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         // Only permissions should be enabled
         assert!(cli.should_preserve_permissions());
         assert!(!cli.should_preserve_times());
-        assert!(!cli.should_preserve_group());
-        assert!(!cli.should_preserve_owner());
-        assert!(!cli.should_preserve_devices());
     }
 
     #[test]
@@ -2383,27 +1821,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2413,21 +1845,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: true, // Explicit flag also enabled
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: true, // Archive mode also enabled
             gitignore: false,
             exclude_vcs: false,
@@ -2437,38 +1862,21 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         // All should be enabled (archive mode OR individual flags)
         assert!(cli.should_preserve_permissions());
         assert!(cli.should_preserve_times());
-        assert!(cli.should_preserve_group());
-        assert!(cli.should_preserve_owner());
-        assert!(cli.should_preserve_devices());
     }
 
     #[test]
@@ -2487,27 +1895,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2517,21 +1919,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2541,30 +1936,16 @@ mod tests {
             size_only: true,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         let result = cli.validate();
@@ -2591,27 +1972,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2621,21 +1996,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2645,30 +2013,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2692,27 +2046,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2722,21 +2070,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2746,30 +2087,16 @@ mod tests {
             size_only: false,
             checksum: true, // Only this flag enabled
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         };
 
         // Should be valid - only one comparison flag
@@ -2836,27 +2163,21 @@ mod tests {
             diff: false,
             delete: false,
             force_delete: false,
-            trash: false,
             verbose: 0,
             quiet: false,
             perf: false,
-            progress: false,
             stats: false,
             human_readable: false,
             backup: None,
             backup_dir: None,
             suffix: "~".to_string(),
-            partial: None,
-            partial_dir: None,
             remove_source_files: false,
             existing: false,
             dirs: false,
             timeout: None,
             contimeout: None,
-            compress_level: None,
             itemize_changes: false,
             parallel: 10,
-            max_errors: 100,
             exclude: vec![],
             include: vec![],
             filter: vec![],
@@ -2866,21 +2187,14 @@ mod tests {
             bwlimit: None,
             compress: CompressionDetection::Never,
             verify: VerifyMode::No,
-            resume: ResumeMode::Auto,
-            checkpoint_files: 100,
-            checkpoint_bytes: 104857600,
             links: SymlinkMode::Preserve,
             copy_links: false,
-            keep_dirlinks: false,
             preserve_xattrs: false,
             preserve_hardlinks: false,
             preserve_acls: false,
             preserve_flags: false,
             preserve_permissions: false,
             preserve_times: false,
-            preserve_group: false,
-            preserve_owner: false,
-            preserve_devices: false,
             archive: false,
             gitignore: false,
             exclude_vcs: false,
@@ -2890,30 +2204,16 @@ mod tests {
             size_only: false,
             checksum: false,
             json: false,
-            stream: false,
             watch: false,
             no_hooks: false,
             abort_on_hook_failure: false,
             profile: None,
             list_profiles: false,
             show_profile: None,
-            bidirectional: false,
-            conflict_resolve: "newer".to_string(),
             max_delete: "50%".to_string(),
-            clear_bisync_state: false,
-            force_resync: false,
-            cache: false,
-            clear_cache: false,
-            checksum_db: false,
-            clear_checksum_db: false,
-            prune_checksum_db: false,
             min_size: None,
             max_size: None,
-            retry: 0,
-            retry_delay: 1,
-            clear_resume_state: false,
             recursive: false,
-            server: false,
         }
     }
 }

@@ -1,40 +1,42 @@
-.ie \n(.g .ds Aq \(aq
-.el .ds Aq '
-.TH sy 1  "sy 0.4.0" 
+.TH SY 1
 .SH NAME
 sy \- Modern file synchronization tool
 .SH SYNOPSIS
-\fBsy\fR [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-diff\fR] [\fB\-d\fR|\fB\-\-delete\fR] [\fB\-\-force\-delete\fR] [\fB\-\-trash\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-perf\fR] [\fB\-\-progress\fR] [\fB\-\-stats\fR] [\fB\-\-human\-readable\fR] [\fB\-b\fR|\fB\-\-backup\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-suffix\fR] [\fB\-\-partial\-dir\fR] [\fB\-\-remove\-source\-files\fR] [\fB\-\-existing\fR] [\fB\-\-dirs\fR] [\fB\-\-timeout\fR] [\fB\-\-contimeout\fR] [\fB\-\-compress\-level\fR] [\fB\-i\fR|\fB\-\-itemize\-changes\fR] [\fB\-j\fR|\fB\-\-parallel\fR] [\fB\-\-max\-errors\fR] [\fB\-\-min\-size\fR] [\fB\-\-max\-size\fR] [\fB\-\-exclude\fR] [\fB\-\-include\fR] [\fB\-\-filter\fR] [\fB\-\-exclude\-from\fR] [\fB\-\-include\-from\fR] [\fB\-\-exclude\-template\fR] [\fB\-\-bwlimit\fR] [\fB\-\-resume\fR] [\fB\-\-clear\-resume\-state\fR] [\fB\-\-checkpoint\-files\fR] [\fB\-\-checkpoint\-bytes\fR] [\fB\-\-cache\fR] [\fB\-\-clear\-cache\fR] [\fB\-\-checksum\-db\fR] [\fB\-\-clear\-checksum\-db\fR] [\fB\-\-prune\-checksum\-db\fR] [\fB\-\-verify\fR] [\fB\-z\fR|\fB\-\-compress\fR] [\fB\-\-links\fR] [\fB\-L\fR|\fB\-\-copy\-links\fR] [\fB\-K\fR|\fB\-\-keep\-dirlinks\fR] [\fB\-X\fR|\fB\-\-preserve\-xattrs\fR] [\fB\-H\fR|\fB\-\-preserve\-hardlinks\fR] [\fB\-A\fR|\fB\-\-preserve\-acls\fR] [\fB\-F\fR|\fB\-\-preserve\-flags\fR] [\fB\-p\fR|\fB\-\-preserve\-permissions\fR] [\fB\-t\fR|\fB\-\-preserve\-times\fR] [\fB\-g\fR|\fB\-\-preserve\-group\fR] [\fB\-o\fR|\fB\-\-preserve\-owner\fR] [\fB\-D\fR|\fB\-\-preserve\-devices\fR] [\fB\-a\fR|\fB\-\-archive\fR] [\fB\-\-gitignore\fR] [\fB\-\-exclude\-vcs\fR] [\fB\-\-ignore\-times\fR] [\fB\-\-size\-only\fR] [\fB\-c\fR|\fB\-\-checksum\fR] [\fB\-u\fR|\fB\-\-update\fR] [\fB\-\-ignore\-existing\fR] [\fB\-\-json\fR] [\fB\-w\fR|\fB\-\-watch\fR] [\fB\-\-no\-hooks\fR] [\fB\-\-abort\-on\-hook\-failure\fR] [\fB\-\-profile\fR] [\fB\-\-list\-profiles\fR] [\fB\-\-show\-profile\fR] [\fB\-\-bidirectional\fR] [\fB\-\-conflict\-resolve\fR] [\fB\-\-max\-delete\fR] [\fB\-\-clear\-bisync\-state\fR] [\fB\-\-force\-resync\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fISOURCE\fR] [\fIDESTINATION\fR] 
+\fBsy\fR [OPTIONS] [<SOURCE>] [<DESTINATION>]
 .SH DESCRIPTION
 Modern file synchronization tool
+.PP
 .SH OPTIONS
 .TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
+\fB\-\-min\-size\fR \fI<MIN_SIZE>\fR
+Minimum file size to sync (e.g., "1MB", "500KB")
+.TP
+\fB\-\-max\-size\fR \fI<MAX_SIZE>\fR
+Maximum file size to sync (e.g., "100MB", "1GB")
+.TP
+\fB\-\-bwlimit\fR \fI<BWLIMIT>\fR
+Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
+.TP
+\fB\-n, \-\-dry\-run\fR
 Show changes without applying them (dry\-run)
 .TP
 \fB\-\-diff\fR
 Show detailed changes in dry\-run mode (file sizes, byte changes) Requires \-\-dry\-run to be effective
 .TP
-\fB\-d\fR, \fB\-\-delete\fR
+\fB\-d, \-\-delete\fR
 Delete files in destination not present in source
 .TP
 \fB\-\-force\-delete\fR
 Force deletion even if it exceeds safety threshold (use with \-\-delete)
 .TP
-\fB\-\-trash\fR
-Move deleted files to trash instead of permanent deletion
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
+\fB\-v, \-\-verbose\fR
 Verbosity level (can be repeated: \-v, \-vv, \-vvv)
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
+\fB\-q, \-\-quiet\fR
 Quiet mode (only show errors)
 .TP
 \fB\-\-perf\fR
 Show detailed performance summary at the end
-.TP
-\fB\-\-progress\fR
-Show progress bar for each large file (>= 1MB) being transferred Automatically hidden when output is piped or with \-\-quiet
 .TP
 \fB\-\-stats\fR
 Show file transfer statistics after sync completes
@@ -42,23 +44,23 @@ Show file transfer statistics after sync completes
 \fB\-\-human\-readable\fR
 Show file sizes in human\-readable format (e.g., 1K, 234M, 2G)
 .TP
-\fB\-b\fR, \fB\-\-backup\fR [\fI<BACKUP>\fR]
+\fB\-b, \-\-backup\fR \fI<BACKUP>\fR
 Make backups of existing destination files Optional MODE: none, simple (default with \-b)
 .TP
 \fB\-\-backup\-dir\fR \fI<BACKUP_DIR>\fR
 Directory to store backup files (default: same as destination)
 .TP
-\fB\-\-suffix\fR \fI<SUFFIX>\fR [default: ~]
+\fB\-\-suffix\fR \fI<SUFFIX>\fR
 Backup file suffix (default: ~)
-.TP
-\fB\-\-partial\-dir\fR \fI<PARTIAL_DIR>\fR
-Directory to store partial files (alias for \-\-partial=DIR)
+.RS
+\fIDefault: \fR~
+.RE
 .TP
 \fB\-\-remove\-source\-files\fR
 Remove source files after successful transfer (like mv)
 .TP
 \fB\-\-existing\fR
-Don\*(Aqt create new files on destination, only update existing
+Don't create new files on destination, only update existing
 .TP
 \fB\-\-dirs\fR
 Transfer directories without recursing (like rsync \-d)
@@ -69,23 +71,14 @@ I/O timeout in seconds (for SSH connections)
 \fB\-\-contimeout\fR \fI<CONTIMEOUT>\fR
 Connection timeout in seconds (for SSH connections)
 .TP
-\fB\-\-compress\-level\fR \fI<COMPRESS_LEVEL>\fR
-Compression level (1\-9, 0 disables compression)
-.TP
-\fB\-i\fR, \fB\-\-itemize\-changes\fR
+\fB\-i, \-\-itemize\-changes\fR
 Show what changed for each file (like rsync \-i)
 .TP
-\fB\-j\fR, \fB\-\-parallel\fR \fI<PARALLEL>\fR [default: 10]
+\fB\-j, \-\-parallel\fR \fI<PARALLEL>\fR
 Number of parallel file transfers (default: 10)
-.TP
-\fB\-\-max\-errors\fR \fI<MAX_ERRORS>\fR [default: 100]
-Maximum number of errors before aborting (0 = unlimited, default: 100)
-.TP
-\fB\-\-min\-size\fR \fI<MIN_SIZE>\fR
-Minimum file size to sync (e.g., "1MB", "500KB")
-.TP
-\fB\-\-max\-size\fR \fI<MAX_SIZE>\fR
-Maximum file size to sync (e.g., "100MB", "1GB")
+.RS
+\fIDefault: \fR10
+.RE
 .TP
 \fB\-\-exclude\fR \fI<EXCLUDE>\fR
 Exclude files matching pattern (can be repeated) Examples: "*.log", "node_modules", "target/"
@@ -105,156 +98,53 @@ Read include patterns from file (one pattern per line)
 \fB\-\-exclude\-template\fR \fI<EXCLUDE_TEMPLATE>\fR
 Apply exclude template from ~/.config/sy/templates/ (can be repeated) Examples: "rust", "node", "python"
 .TP
-\fB\-\-bwlimit\fR \fI<BWLIMIT>\fR
-Bandwidth limit in bytes per second (e.g., "1MB", "500KB")
-.TP
-\fB\-\-resume\fR \fI<RESUME>\fR [default: auto]
-Resume mode (auto|only|no) \- auto: Resume interrupted transfers if state found (default) \- only: Only resume interrupted transfers, don\*(Aqt start new ones \- no: Disable resume support
-.br
+\fB\-\-verify\fR \fI<VERIFY>\fR
+Verify file integrity against staged BLAKE3 verification
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-auto: Resume interrupted transfers if state found (default)
-.IP \(bu 2
-only: Only resume interrupted transfers, don\*(Aqt start new ones
-.IP \(bu 2
-no: Disable resume support
+Modes: \- after: Verify staged content before committing each file \- only: Audit file integrity without modifying anything \- no: Disable verification (default)
+.RS
+\fIDefault: \fRno
 .RE
 .TP
-\fB\-\-clear\-resume\-state\fR
-Clear all resume state before starting
-.TP
-\fB\-\-checkpoint\-files\fR \fI<CHECKPOINT_FILES>\fR [default: 100]
-Checkpoint every N files (default: 100)
-.TP
-\fB\-\-checkpoint\-bytes\fR \fI<CHECKPOINT_BYTES>\fR [default: 104857600]
-Checkpoint every N bytes transferred (e.g., "100MB", default: 100MB)
-.TP
-\fB\-\-cache\fR \fI<CACHE>\fR [default: false]
-Use directory cache for faster re\-syncs (default: false) The cache stores directory mtimes to skip unchanged directories
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
-.TP
-\fB\-\-clear\-cache\fR
-Delete any existing cache files before starting
-.TP
-\fB\-\-checksum\-db\fR \fI<CHECKSUM_DB>\fR [default: false]
-Use checksum database for faster \-\-checksum re\-syncs (default: false) The database stores checksums to avoid recomputation for unchanged files
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
-.TP
-\fB\-\-clear\-checksum\-db\fR
-Clear checksum database before starting
-.TP
-\fB\-\-prune\-checksum\-db\fR
-Remove stale entries from checksum database (files no longer in source)
-.TP
-\fB\-\-verify\fR \fI<VERIFY>\fR [default: no]
-Verify file integrity after write using xxHash3 checksums
-
-Modes: \- after: Verify each file after writing (default) \- only: Audit file integrity without modifying anything \- no: Disable verification (default)
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-no: Disable verification (default)
-.IP \(bu 2
-after: Verify each file after writing
-.IP \(bu 2
-only: Audit file integrity without modifying anything
-.RE
-.TP
-\fB\-z\fR, \fB\-\-compress\fR [\fI<COMPRESS>\fR] [default: never]
+\fB\-z, \-\-compress\fR \fI<COMPRESS>\fR
 Compression mode for transfers \- auto: Content\-based detection with sampling (default when enabled) \- extension: Extension\-only detection (legacy) \- always: Always compress (override detection) \- never: Never compress (override detection)
 
 \-z (no value) enables auto compression \-\-compress=MODE for explicit control
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-auto: Content\-based detection with sampling (default)
-.IP \(bu 2
-extension: Extension\-only detection (legacy behavior)
-.IP \(bu 2
-always: Always compress (override detection)
-.IP \(bu 2
-never: Never compress (override detection)
+.RS
+\fIDefault: \fRnever
 .RE
 .TP
-\fB\-\-links\fR \fI<LINKS>\fR [default: preserve]
+\fB\-\-links\fR \fI<LINKS>\fR
 Symlink handling mode (preserve, follow, skip)
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-preserve: Preserve symlinks as symlinks (default)
-.IP \(bu 2
-follow: Follow symlinks and copy targets
-.IP \(bu 2
-skip: Skip all symlinks
+.RS
+\fIDefault: \fRpreserve
 .RE
 .TP
-\fB\-L\fR, \fB\-\-copy\-links\fR
+\fB\-L, \-\-copy\-links\fR
 Follow symlinks and copy targets (shortcut for \-\-links follow)
 .TP
-\fB\-K\fR, \fB\-\-keep\-dirlinks\fR
-Treat symlinked directories on receiver as directories If dest has a symlink to a dir, sync into that dir rather than replacing it
-.TP
-\fB\-X\fR, \fB\-\-preserve\-xattrs\fR
+\fB\-X, \-\-preserve\-xattrs\fR
 Preserve extended attributes (xattrs)
 .TP
-\fB\-H\fR, \fB\-\-preserve\-hardlinks\fR
+\fB\-H, \-\-preserve\-hardlinks\fR
 Preserve hard links (treat multiple links to the same file as one copy)
 .TP
-\fB\-A\fR, \fB\-\-preserve\-acls\fR
+\fB\-A, \-\-preserve\-acls\fR
 Preserve access control lists (ACLs)
 .TP
-\fB\-F\fR, \fB\-\-preserve\-flags\fR
-Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; no\-op on other platforms)
+\fB\-F, \-\-preserve\-flags\fR
+Preserve BSD file flags (macOS only: hidden, immutable, nodump, etc.; refused on other platforms)
 .TP
-\fB\-p\fR, \fB\-\-preserve\-permissions\fR
+\fB\-p, \-\-preserve\-permissions\fR
 Preserve permissions
 .TP
-\fB\-t\fR, \fB\-\-preserve\-times\fR
+\fB\-t, \-\-preserve\-times\fR
 Preserve modification times
 .TP
-\fB\-g\fR, \fB\-\-preserve\-group\fR
-Preserve group (requires appropriate permissions)
-.TP
-\fB\-o\fR, \fB\-\-preserve\-owner\fR
-Preserve owner (requires root)
-.TP
-\fB\-D\fR, \fB\-\-preserve\-devices\fR
-Preserve device files and special files (requires root)
-.TP
-\fB\-a\fR, \fB\-\-archive\fR
-Archive mode: preserve all metadata (\-rlptgoD) and copy everything
+\fB\-a, \-\-archive\fR
+Archive mode: preserve permissions, times, and symlinks (\-rlpt) and copy everything
 
-Equivalent to rsync\*(Aqs \-rlptgoD (recursive, links, perms, times, group, owner, devices). All files are copied by default (no .gitignore filtering, .git directories included).
+Deliberate divergence from rsync \-a (\-rlptgoD): owner, group, and device preservation were unimplemented stubs and are removed rather than silently ignored. All files are copied by default (no .gitignore filtering, .git directories included).
 
 Does NOT include: \-X (xattrs), \-A (ACLs), \-H (hardlinks) \- add those flags separately.
 .TP
@@ -274,10 +164,10 @@ Ignore modification times, always compare checksums (rsync \-\-ignore\-times)
 \fB\-\-size\-only\fR
 Only compare file size, skip mtime checks (rsync \-\-size\-only)
 .TP
-\fB\-c\fR, \fB\-\-checksum\fR
+\fB\-c, \-\-checksum\fR
 Always compare checksums instead of size+mtime (slow but thorough, rsync \-\-checksum)
 .TP
-\fB\-u\fR, \fB\-\-update\fR
+\fB\-u, \-\-update\fR
 Skip files where destination is newer than source (rsync \-\-update)
 .TP
 \fB\-\-ignore\-existing\fR
@@ -286,7 +176,7 @@ Skip files that already exist in destination (rsync \-\-ignore\-existing)
 \fB\-\-json\fR
 Output JSON (newline\-delimited JSON for scripting)
 .TP
-\fB\-w\fR, \fB\-\-watch\fR
+\fB\-w, \-\-watch\fR
 Watch mode \- continuously monitor source for changes
 .TP
 \fB\-\-no\-hooks\fR
@@ -304,64 +194,78 @@ List all available profiles
 \fB\-\-show\-profile\fR \fI<SHOW_PROFILE>\fR
 Show details of a specific profile
 .TP
-\fB\-\-bidirectional\fR
-Bidirectional sync mode \- sync changes in both directions Detects and resolves conflicts automatically based on \-\-conflict\-resolve strategy
-.TP
-\fB\-\-conflict\-resolve\fR \fI<CONFLICT_RESOLVE>\fR [default: newer]
-Conflict resolution strategy for bidirectional sync Options: newer (default), larger, smaller, source, dest, rename
-.TP
-\fB\-\-max\-delete\fR \fI<MAX_DELETE>\fR [default: 50%]
+\fB\-\-max\-delete\fR \fI<MAX_DELETE>\fR
 Maximum deletions allowed \- Absolute count: \-\-max\-delete=1000 \- Percentage: \-\-max\-delete=50% \- 0 = unlimited (default: 50%)
+.RS
+\fIDefault: \fR50%
+.RE
 .TP
-\fB\-\-clear\-bisync\-state\fR
-Clear bidirectional sync state before syncing Forces full comparison instead of using cached state
+\fB\-r\fR
+Recursive (no\-op: sy is always recursive, for rsync compatibility)
 .TP
-\fB\-\-force\-resync\fR
-Force resync by ignoring corrupt state (recovery mode) Use this when bisync state file is corrupted All differences will be treated as new changes on first sync
+\fB\-h, \-\-help\fR
+Print help
 .TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)
-.TP
-\fB\-V\fR, \fB\-\-version\fR
+\fB\-V, \-\-version\fR
 Print version
+.SH ARGUMENTS
 .TP
-[\fISOURCE\fR]
+\fB<SOURCE>\fR
 Source path (local: /path or remote: user@host:/path) Optional when using \-\-profile
 .TP
-[\fIDESTINATION\fR]
+\fB<DESTINATION>\fR
 Destination path (local: /path or remote: user@host:/path) Optional when using \-\-profile
-.SH EXTRA
-EXAMPLES:
-    # Basic sync
-    sy /source /destination
-
-    # Preview changes without applying
-    sy /source /destination \-\-dry\-run
-
-    # Mirror mode (delete extra files in destination)
-    sy /source /destination \-\-delete
-
-    # Parallel transfers (20 workers)
-    sy /source /destination \-j 20
-
-    # Sync single file
-    sy /path/to/file.txt /dest/file.txt
-
-    # Remote sync (SSH)
-    sy /local user@host:/remote
-    sy user@host:/remote /local
-
-    # Quiet mode (only errors)
-    sy /source /destination \-\-quiet
-
-    # Verify file integrity after write
-    sy /source /destination \-\-verify            # xxHash3 verification
-
-    # Resume interrupted transfers
-    sy /source user@host:/dest \-\-resume         # Auto\-resume interrupted large files
-    sy /source user@host:/dest \-\-resume=only    # Only resume, don\*(Aqt start new transfers
-    sy /source user@host:/dest \-\-clear\-resume\-state  # Clear all resume state
-
-For more information: https://github.com/nijaru/sy
-.SH VERSION
-v0.4.0
+.SH EXAMPLES
+\fBBasic sync\fR
+.PP
+.RS 4
+sy /source /destination
+.RE
+.PP
+\fBPreview changes without applying\fR
+.PP
+.RS 4
+sy /source /destination \-\-dry\-run
+.RE
+.PP
+\fBMirror mode (delete extra destination files)\fR
+.PP
+.RS 4
+sy /source /destination \-\-delete
+.RE
+.PP
+\fBParallel transfers (20 workers)\fR
+.PP
+.RS 4
+sy /source /destination \-j 20
+.RE
+.PP
+\fBSync single file\fR
+.PP
+.RS 4
+sy /path/to/file.txt /dest/file.txt
+.RE
+.PP
+\fBRemote sync (SSH push)\fR
+.PP
+.RS 4
+sy /local user@host:/remote
+.RE
+.PP
+\fBRemote sync (SSH pull)\fR
+.PP
+.RS 4
+sy user@host:/remote /local
+.RE
+.PP
+\fBQuiet mode (only errors)\fR
+.PP
+.RS 4
+sy /source /destination \-\-quiet
+.RE
+.PP
+\fBVerify staged integrity before commit\fR
+.PP
+.RS 4
+sy /source /destination \-\-verify=after
+.RE

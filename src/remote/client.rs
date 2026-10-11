@@ -1,0 +1,604 @@
+use super::metadata::request_metadata;
+use super::mutation::{
+    request_copy_file, request_create_directory, request_hardlink, request_remove,
+    request_replace_symlink,
+};
+use super::{ClientRemoteSession, RemoteSessionError, Result};
+use crate::endpoint::source_root::SourceRoot;
+use crate::endpoint::Capabilities as EndpointCapabilities;
+use crate::engine::compression::CompressionPolicy;
+use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
+use crate::engine::reconcile::EntryStream;
+use crate::engine::scan::ScanRequest;
+use crate::engine::work::TransferSummary;
+use crate::protocol::{FrameKind, Operation, PlatformOs, ProtocolVersion};
+use crate::remote::hash::{request_content_hash, require_blake3};
+use crate::remote::router::RouterSender;
+use crate::remote::scan::{request_entry_scan, request_scan};
+use crate::remote::signature::{
+    choose_signature_block_size, request_signatures, RemoteSignatureError, SignatureEvent,
+    SignatureStream,
+};
+use crate::remote::transfer::{
+    request_file_transfer, request_file_transfer_with_stream_policy, TransferDestination,
+    TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
+};
+use crate::remote::xattr::request_read_xattrs;
+use crate::transfer::delta::{
+    BasisBlock, BasisIndex, BasisIndexBuilder, BasisIndexError, BasisIndexLimits,
+};
+use futures::StreamExt;
+use std::path::Path;
+
+/// Cloneable v3 request authority for one already-negotiated remote session.
+///
+/// This deliberately does not own the frame router, incoming-stream receiver,
+/// transport, or SSH child. `ClientRemoteSession` remains the sole lifecycle
+/// owner while scheduler tasks clone this lightweight handle to open independent
+/// multiplexed request streams through the shared bounded `RouterSender`.
+#[derive(Clone)]
+pub struct ClientRemoteHandle {
+    operation: Operation,
+    peer: PlatformOs,
+    protocol_version: ProtocolVersion,
+    capabilities: EndpointCapabilities,
+    sender: RouterSender,
+    binding: std::sync::Arc<ClientRootBinding>,
+}
+
+/// One acknowledged root epoch, shared by the session and every request handle.
+/// The cell serializes acquisition; an interrupted attempt closes the session
+/// rather than retrying against a possibly acquired but unacknowledged root.
+pub(super) struct ClientRootBinding {
+    initial: crate::protocol::SessionReady,
+    acquired: tokio::sync::OnceCell<crate::protocol::SessionReady>,
+}
+
+impl ClientRootBinding {
+    pub(super) fn new(initial: crate::protocol::SessionReady) -> Self {
+        Self {
+            initial,
+            acquired: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub(super) fn ready(&self) -> &crate::protocol::SessionReady {
+        self.acquired.get().unwrap_or(&self.initial)
+    }
+}
+
+struct AcquisitionAttempt(Option<RouterSender>);
+
+impl Drop for AcquisitionAttempt {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            sender.fail(std::sync::Arc::new(
+                crate::remote::router::RouterError::SessionFailed(
+                    "root acquisition ended without a trusted acknowledgement".to_owned(),
+                ),
+            ));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "client_binding_tests.rs"]
+mod binding_tests;
+
+impl ClientRemoteSession {
+    pub fn request_handle(&self) -> ClientRemoteHandle {
+        ClientRemoteHandle {
+            operation: self.operation,
+            peer: self.server.platform.os,
+            protocol_version: self.server.version,
+            capabilities: self.capabilities,
+            sender: self.router.sender(),
+            binding: std::sync::Arc::clone(&self.binding),
+        }
+    }
+}
+
+impl ClientRemoteHandle {
+    pub fn binding(&self) -> &crate::protocol::SessionReady {
+        self.binding.ready()
+    }
+
+    /// Full preflight has drained scans and selected a Create at this address.
+    pub async fn acquire_root_for_create(&self, create: &RelativePath) -> Result<()> {
+        self.require_push(FrameKind::AcquireRoot)?;
+        if !self.binding().pending {
+            return Ok(());
+        }
+        self.binding
+            .acquired
+            .get_or_try_init(|| async {
+                let mut attempt = AcquisitionAttempt(Some(self.sender.clone()));
+                let ready = self.request_root_acquisition(create).await?;
+                attempt.0 = None;
+                Ok::<_, super::RemoteSessionError>(ready)
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn request_root_acquisition(
+        &self,
+        create: &RelativePath,
+    ) -> Result<crate::protocol::SessionReady> {
+        let request = crate::protocol::AcquireRoot {
+            create: crate::remote::path::encode_relative_path(create.as_path())
+                .map_err(|error| crate::remote::RemoteError::Io(std::io::Error::other(error)))?,
+        };
+        let mut inbox = self.sender.open_stream()?;
+        let id = inbox.stream_id();
+        let frame = crate::protocol::Frame::new(
+            FrameKind::AcquireRoot,
+            crate::protocol::FrameFlags::FINAL | crate::protocol::FrameFlags::ACK_REQUIRED,
+            id,
+            request.encode(),
+        )
+        .map_err(crate::remote::RemoteError::from)?;
+        self.sender.send(frame).await?;
+        let routed = inbox.recv().await?.ok_or_else(|| {
+            crate::remote::RemoteError::Protocol(crate::protocol::ProtocolError::InvalidMessage(
+                "acquisition ended before acknowledgement",
+            ))
+        })?;
+        let frame = routed.frame();
+        if frame.kind() != FrameKind::Ack || !frame.flags().is_empty() {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage(
+                    "invalid acquisition acknowledgement",
+                ),
+            )
+            .into());
+        }
+        let ready = crate::protocol::SessionReady::decode(frame.payload())
+            .map_err(crate::remote::RemoteError::from)?;
+        if ready.pending
+            || ready.resolved != self.binding.initial.resolved
+            || ready.source_shape != self.binding.initial.source_shape
+        {
+            return Err(crate::remote::RemoteError::Protocol(
+                crate::protocol::ProtocolError::InvalidMessage(
+                    "acquisition changed operand binding",
+                ),
+            )
+            .into());
+        }
+        Ok(ready)
+    }
+
+    pub const fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    pub const fn peer_platform(&self) -> PlatformOs {
+        self.peer
+    }
+
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    pub const fn capabilities(&self) -> &EndpointCapabilities {
+        &self.capabilities
+    }
+
+    /// Actual held-root semantics; pending roots remain unqualified.
+    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
+        self.binding().namespace_semantics.into()
+    }
+
+    /// The session's frame router sender. Executors open fetch streams
+    /// directly; request helpers wrap it for standard RPCs.
+    pub fn sender(&self) -> crate::remote::router::RouterSender {
+        self.sender.clone()
+    }
+
+    pub async fn scan(&self, request: ScanRequest) -> crate::remote::scan::Result<EntryStream> {
+        request_scan(&self.sender, request, self.peer).await
+    }
+
+    /// Metadata for one physical name; directories are returned without children.
+    pub async fn scan_entry(
+        &self,
+        request: ScanRequest,
+        path: RelativePath,
+    ) -> crate::remote::scan::Result<EntryStream> {
+        request_entry_scan(&self.sender, request, path, self.peer).await
+    }
+
+    pub(crate) async fn existing_fingerprint(
+        &self,
+        basis: &Entry,
+        options: crate::endpoint::existing::FingerprintOptions,
+    ) -> crate::remote::hash::Result<crate::endpoint::existing::ExistingFingerprint> {
+        require_blake3(&self.capabilities)?;
+        crate::remote::hash::request_existing_fingerprint(&self.sender, basis, self.peer, options)
+            .await
+    }
+
+    pub async fn content_hash(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::hash::Result<[u8; crate::protocol::HASH_DIGEST_LEN]> {
+        require_blake3(&self.capabilities)?;
+        request_content_hash(&self.sender, basis, self.peer).await
+    }
+
+    pub async fn signatures(
+        &self,
+        basis: &Entry,
+    ) -> crate::remote::signature::Result<(u32, SignatureStream)> {
+        if !self.capabilities.rolling_signatures {
+            return Err(RemoteSignatureError::UnsupportedByPeer);
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis);
+        }
+        let identity = basis
+            .identity
+            .ok_or(RemoteSignatureError::MissingBasisIdentity)?;
+        request_signatures(&self.sender, &basis.path, basis.size, identity, self.peer).await
+    }
+
+    pub async fn delta_basis(
+        &self,
+        basis: &Entry,
+        limits: BasisIndexLimits,
+    ) -> Result<Option<BasisIndex>> {
+        if !self.capabilities.rolling_signatures {
+            return Err(RemoteSignatureError::UnsupportedByPeer.into());
+        }
+        if !basis.is_file() {
+            return Err(RemoteSignatureError::InvalidBasis.into());
+        }
+        if basis.identity.is_none() {
+            return Err(RemoteSignatureError::MissingBasisIdentity.into());
+        }
+
+        let block_size = choose_signature_block_size(basis.size);
+        let mut builder = BasisIndexBuilder::new(block_size, limits)?;
+        let max_blocks = u64::try_from(limits.max_blocks).unwrap_or(u64::MAX);
+        let expected_blocks = basis.size.div_ceil(u64::from(block_size));
+        if expected_blocks > max_blocks {
+            return Ok(None);
+        }
+
+        let (actual_block_size, mut signatures) = self.signatures(basis).await?;
+        if actual_block_size != block_size {
+            return Err(RemoteSessionError::SignatureBlockSizeMismatch {
+                expected: block_size,
+                actual: actual_block_size,
+            });
+        }
+
+        let mut over_limit = false;
+        loop {
+            let Some(event) = signatures.next().await else {
+                return Err(RemoteSessionError::MissingSignatureEnd);
+            };
+            let event =
+                event.map_err(|error| RemoteSessionError::SignatureStream(error.to_string()))?;
+            match event {
+                SignatureEvent::Block(block) if !over_limit => {
+                    let block = BasisBlock {
+                        index: block.index,
+                        size: block.size,
+                        weak: block.weak,
+                        strong: block.strong,
+                    };
+                    match builder.push(block) {
+                        Ok(()) => {}
+                        Err(BasisIndexError::TooManyBlocks { .. }) => over_limit = true,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                SignatureEvent::Block(_) => {}
+                SignatureEvent::End(_) => break,
+            }
+        }
+
+        if over_limit {
+            Ok(None)
+        } else {
+            Ok(Some(builder.finish()))
+        }
+    }
+
+    pub async fn transfer_file(
+        &self,
+        source_root: SourceRoot,
+        source: Entry,
+        destination: TransferDestination,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        request_file_transfer(&self.sender, source_root, source, destination, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn transfer_file_with_metadata(
+        &self,
+        source_root: SourceRoot,
+        source: Entry,
+        destination: TransferDestination,
+        metadata: TransferMetadata,
+    ) -> Result<TransferSummary> {
+        self.require_push(FrameKind::FileBegin)?;
+        self.transfer_file_with_policy(source_root, source, destination, metadata, None)
+            .await
+    }
+
+    /// `compression` selects per-file chunk compression for the transfer
+    /// (`-z`/`--compress`); `None` disables it. The peer must have negotiated
+    /// the ZSTD capability.
+    pub async fn transfer_file_with_policy(
+        &self,
+        source_root: SourceRoot,
+        source: Entry,
+        destination: TransferDestination,
+        metadata: TransferMetadata,
+        compression: Option<CompressionPolicy>,
+    ) -> Result<TransferSummary> {
+        self.transfer_file_with_stream_policy(
+            source_root,
+            source,
+            destination,
+            metadata,
+            TransferStreamPolicy {
+                preservation: TransferPreservationRequest::default(),
+                compression,
+                final_flags: None,
+            },
+        )
+        .await
+        .map(|(summary, _)| summary)
+    }
+
+    pub async fn transfer_file_with_stream_policy(
+        &self,
+        source_root: SourceRoot,
+        source: Entry,
+        destination: TransferDestination,
+        metadata: TransferMetadata,
+        stream_policy: TransferStreamPolicy,
+    ) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
+        self.require_push(FrameKind::FileBegin)?;
+        for (requested, supported, feature) in [
+            (
+                stream_policy.preservation.xattrs,
+                self.capabilities.preserve_xattrs,
+                "xattrs",
+            ),
+            (
+                stream_policy.preservation.acls,
+                self.capabilities.preserve_acls,
+                "ACLs",
+            ),
+        ] {
+            if requested && (self.protocol_version < crate::protocol::PROTOCOL_V3_2 || !supported) {
+                return Err(
+                    crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
+                        feature,
+                    }
+                    .into(),
+                );
+            }
+        }
+        if stream_policy.final_flags.is_some() && !self.capabilities.preserve_flags {
+            return Err(
+                crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
+                    feature: "BSD flags",
+                }
+                .into(),
+            );
+        }
+        if stream_policy.compression.is_some() && !self.capabilities.zstd {
+            return Err(RemoteSessionError::PeerLacksZstd);
+        }
+        request_file_transfer_with_stream_policy(
+            &self.sender,
+            source_root,
+            source,
+            destination,
+            metadata,
+            self.peer,
+            stream_policy,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub(crate) async fn revalidate_publication(
+        &self,
+        proof: &crate::rooted_fs::PublishedEntryProof,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        super::mutation::request_verify_publication(&self.sender, proof, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn revalidate_existing_destination(
+        &self,
+        path: &RelativePath,
+        identity: EntryIdentity,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        super::mutation::request_verify_destination(
+            &self.sender,
+            path,
+            EntryKind::File,
+            identity,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn apply_metadata(
+        &self,
+        metadata: crate::protocol::WireMetadata,
+    ) -> Result<EntryIdentity> {
+        self.require_push(FrameKind::Metadata)?;
+        request_metadata(&self.sender, metadata, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn validate_observation(
+        &self,
+        entry: &crate::engine::domain::Entry,
+    ) -> Result<()> {
+        super::metadata::request_observation(&self.sender, entry, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn read_directory_preservation(
+        &self,
+        path: &RelativePath,
+        expected: EntryIdentity,
+        request: crate::rooted_fs::DirectoryPreservationRequest,
+    ) -> Result<crate::rooted_fs::DirectoryPreservation> {
+        super::directory::read(&self.sender, path, expected, request, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn finalize_directory_metadata(
+        &self,
+        path: &RelativePath,
+        expected: EntryIdentity,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+        preservation: &crate::rooted_fs::DirectoryPreservation,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Metadata)?;
+        super::directory::finalize(
+            &self.sender,
+            path,
+            expected,
+            unix_mode,
+            modified,
+            preservation,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn create_directory(&self, path: &RelativePath) -> Result<EntryIdentity> {
+        self.require_push(FrameKind::Mutation)?;
+        request_create_directory(&self.sender, path, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replace_symlink(
+        &self,
+        path: &RelativePath,
+        target: &Path,
+        expected_identity: Option<EntryIdentity>,
+        modified: Option<Timestamp>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
+        self.require_push(FrameKind::Mutation)?;
+        request_replace_symlink(
+            &self.sender,
+            path,
+            target,
+            expected_identity,
+            modified,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn remove(
+        &self,
+        path: &RelativePath,
+        is_directory: bool,
+        expected_identity: Option<EntryIdentity>,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_remove(
+            &self.sender,
+            path,
+            is_directory,
+            expected_identity,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side copy beneath the pinned root. `--backup` uses this to
+    /// preserve soon-to-be-replaced or deleted destination files; the same
+    /// request is the seed of the object-native copy transfer strategy.
+    pub async fn copy_file(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        expected_source_identity: EntryIdentity,
+    ) -> Result<()> {
+        self.require_push(FrameKind::Mutation)?;
+        request_copy_file(
+            &self.sender,
+            source,
+            destination,
+            expected_source_identity,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Server-side hardlink beneath the pinned root (`-H`). Links
+    /// `destination` to the existing `source` inode without moving bytes.
+    pub async fn hardlink(
+        &self,
+        source: &RelativePath,
+        destination: &RelativePath,
+        source_identity: EntryIdentity,
+        expected_destination: Option<EntryIdentity>,
+    ) -> Result<crate::rooted_fs::PublishedEntryProof> {
+        self.require_push(FrameKind::Mutation)?;
+        request_hardlink(
+            &self.sender,
+            source,
+            destination,
+            source_identity,
+            expected_destination,
+            self.peer,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Read the remote peer's extended attributes for one entry (`-X`). Used
+    /// when the remote root is the source (a pull).
+    pub async fn read_xattrs(
+        &self,
+        path: &RelativePath,
+        kind: EntryKind,
+        expected: EntryIdentity,
+    ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
+        request_read_xattrs(&self.sender, path, kind, expected, self.peer)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn require_push(&self, kind: FrameKind) -> Result<()> {
+        if self.operation == Operation::Push {
+            Ok(())
+        } else {
+            Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind,
+            })
+        }
+    }
+}
