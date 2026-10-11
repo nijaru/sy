@@ -422,6 +422,7 @@ pub struct RemotePushExecutor {
     compression: Option<CompressionPolicy>,
     hardlinks: bool,
     hardlink_removals: group::DeferredSourceRemovals,
+    source_removals: crate::engine::source_removals::SourceRemovalJournal,
     /// -X/--preserve-xattrs: mirror the local source's extended attributes
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -505,6 +506,19 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         RemotePushExecutor::finish_deferred_source_removals(self).await
     }
 
+    async fn close_source_removals(&self) -> std::result::Result<(), RemotePushError> {
+        self.source_removals
+            .close()
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                RemotePushError::SourceRemoval(
+                    self.source_root.path().to_path_buf(),
+                    std::io::Error::other(error),
+                )
+            })
+    }
+
     async fn remove_unchanged_source(
         &self,
         source: &crate::engine::domain::Entry,
@@ -533,6 +547,7 @@ impl RemotePushExecutor {
             compression: None,
             hardlinks: false,
             hardlink_removals: group::DeferredSourceRemovals::default(),
+            source_removals: crate::engine::source_removals::SourceRemovalJournal::default(),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -839,7 +854,37 @@ impl RemotePushExecutor {
     }
 
     async fn finish_deferred_source_removals(&self) -> Result<()> {
-        self.hardlink_removals.replay(self).await
+        self.hardlink_removals.replay(self).await?;
+        self.source_removals
+            .replay(self.source_root.clone(), |proof| async move {
+                match proof {
+                    crate::engine::source_removals::SourceDestinationProof::Published(proof) => {
+                        self.remote
+                            .revalidate_publication(&proof)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    }
+                    crate::engine::source_removals::SourceDestinationProof::Existing {
+                        path,
+                        identity,
+                        ..
+                    } => {
+                        self.remote
+                            .revalidate_existing_destination(&path, identity)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                RemotePushError::SourceRemoval(
+                    self.source_root.path().to_path_buf(),
+                    std::io::Error::other(error),
+                )
+            })
     }
 
     /// Revalidate a linking member's scan identity (cheap stat, no bytes).
@@ -1002,8 +1047,15 @@ impl RemotePushExecutor {
         self.remote
             .revalidate_existing_destination(&destination.path, receipt.destination_identity())
             .await?;
-        existing::remove_verified_source(source_rooted, source.clone(), receipt, None).await?;
-        Ok(())
+        self.source_removals
+            .append_existing(source, &receipt)
+            .await
+            .map_err(|error| {
+                RemotePushError::SourceRemoval(
+                    self.source_root.path().join(source.path.as_path()),
+                    std::io::Error::other(error),
+                )
+            })
     }
 
     /// Remove the source entry under --remove-source-files after the
@@ -1031,15 +1083,18 @@ impl RemotePushExecutor {
             })?;
             self.remote.revalidate_publication(proof).await?;
         }
-        // The remote acknowledgement and local unlink are not a distributed
-        // CAS: external namespace writers must be excluded for that guarantee.
-        self.remove_source_entry_on_disk(source).await
-    }
-
-    async fn remove_source_entry_on_disk(&self, source: &Entry) -> Result<()> {
-        let rooted = self.source_root.rooted();
-        existing::remove_observed_source(rooted, source.clone()).await?;
-        Ok(())
+        self.check_source_identity(source).await?;
+        // The destination receipt does not bypass the controller's remaining
+        // required directory finalization. Replay revalidates it again.
+        self.source_removals
+            .append_published(source, receipt)
+            .await
+            .map_err(|error| {
+                RemotePushError::SourceRemoval(
+                    self.source_root.path().join(source.path.as_path()),
+                    std::io::Error::other(error),
+                )
+            })
     }
 
     /// The scanned destination state the remote commit must observe, plus a

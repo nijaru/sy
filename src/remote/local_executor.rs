@@ -140,6 +140,7 @@ pub struct LocalSyncExecutor {
     hardlinks: bool,
     hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
     hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal,
+    source_removals: crate::engine::source_removals::SourceRemovalJournal,
     /// -X/--preserve-xattrs: mirror the source's extended attributes onto the
     /// destination for every entry this executor creates or updates. Symlinks
     /// are skipped (their attributes are not portable).
@@ -179,6 +180,7 @@ impl LocalSyncExecutor {
             hardlinks: false,
             hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
             hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal::default(),
+            source_removals: crate::engine::source_removals::SourceRemovalJournal::default(),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -646,6 +648,26 @@ impl LocalSyncExecutor {
                 })
                 .await?;
         }
+        self.source_removals
+            .replay(self.source_root.clone(), |proof| async move {
+                let destination = self
+                    .metadata_authority()
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let source = self.source_root.rooted();
+                tokio::task::spawn_blocking(move || {
+                    proof.revalidate_local_blocking(&source, &destination)
+                })
+                .await
+                .map_err(std::io::Error::other)?
+            })
+            .await
+            .map_err(|error| {
+                LocalSyncError::Source(
+                    self.source_root.path().to_path_buf(),
+                    std::io::Error::other(error),
+                )
+            })?;
         Ok(())
     }
 
@@ -850,20 +872,24 @@ impl LocalSyncExecutor {
             )
         })?;
         let destination = self.metadata_authority().await?;
-        let rooted = self.source_root.rooted();
-        let receipt = receipt.clone();
-        let source = source.clone();
-        // Check the operator address in the unlink worker, not just before it
-        // is queued. The separate root/name checks and unlink are not CAS.
+        let observed_receipt = receipt.clone();
         tokio::task::spawn_blocking(move || {
             destination.verify_root_path_blocking()?;
-            receipt.revalidate_destination_blocking(&destination)?;
+            observed_receipt.revalidate_destination_blocking(&destination)?;
             destination.verify_root_path_blocking()?;
-            existing::remove_observed_source_blocking(&rooted, &source)?;
             Ok::<_, LocalSyncError>(())
         })
         .await
-        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))?
+        .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+        self.check_source_identity(source).await?;
+        // Publication is eligible, not removal: the controller still owns
+        // required containing-directory finalization.
+        self.source_removals
+            .append_published(source, receipt)
+            .await
+            .map_err(|error| {
+                LocalSyncError::Source(self.source_path(&source.path), std::io::Error::other(error))
+            })
     }
 
     /// Delete one destination-only entry after the delete-threshold gate. A
@@ -1022,14 +1048,12 @@ impl LocalSyncExecutor {
                 return Ok(());
             }
         }
-        existing::remove_verified_source(
-            source_rooted,
-            source.clone(),
-            receipt,
-            Some(destination_rooted),
-        )
-        .await?;
-        Ok(())
+        self.source_removals
+            .append_existing(source, &receipt)
+            .await
+            .map_err(|error| {
+                LocalSyncError::Source(self.source_path(&source.path), std::io::Error::other(error))
+            })
     }
 }
 
@@ -1093,6 +1117,19 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
 
     async fn finish_deferred_source_removals(&self) -> std::result::Result<(), LocalSyncError> {
         LocalSyncExecutor::finish_deferred_source_removals(self).await
+    }
+
+    async fn close_source_removals(&self) -> std::result::Result<(), LocalSyncError> {
+        self.source_removals
+            .close()
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                LocalSyncError::Source(
+                    self.source_root.path().to_path_buf(),
+                    std::io::Error::other(error),
+                )
+            })
     }
 
     async fn remove_unchanged_source(
@@ -1676,6 +1713,8 @@ mod tests {
                 );
             } else {
                 result.unwrap();
+                assert!(source_root.path().join("b").exists());
+                executor.finish_deferred_source_removals().await.unwrap();
                 assert!(!source_root.path().join("b").exists());
             }
             assert_eq!(

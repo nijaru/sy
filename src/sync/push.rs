@@ -524,41 +524,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            // Scan, directory creation, three transfers with publication
-            // revalidation before source removal, then directory finalization.
-            for _ in 0..9 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        session
-                            .mutation_handler()
-                            .unwrap()
-                            .serve(incoming)
-                            .await
-                            .unwrap();
-                    }
-                    IncomingRequest::Metadata(incoming) => {
-                        session
-                            .metadata_handler()
-                            .unwrap()
-                            .serve(incoming)
-                            .await
-                            .unwrap();
-                    }
-                    _ => panic!("unexpected remove-source v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -581,7 +551,8 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        drop(session);
+        server.await.unwrap().unwrap();
         assert_eq!(stats.files_created, 2, "created + inner");
         assert_eq!(stats.files_updated, 1);
         assert_eq!(stats.files_skipped, 1);
@@ -635,69 +606,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let hash = session.hash_handler().unwrap();
-            let file = session.file_handler().unwrap();
-            let mut tasks = tokio::task::JoinSet::new();
-            // The verified-existing receipt is revalidated on the peer
-            // immediately before authorizing source removal.
-            for _ in 0..12 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => {
-                        let scan = scan.clone();
-                        tasks.spawn(async move {
-                            scan.serve(incoming)
-                                .await
-                                .map_err(|error| error.to_string())
-                        });
-                    }
-                    IncomingRequest::Hash(incoming) => {
-                        let hash = hash.clone();
-                        tasks.spawn(async move {
-                            hash.serve(incoming)
-                                .await
-                                .map_err(|error| error.to_string())
-                        });
-                    }
-                    IncomingRequest::File(incoming) => {
-                        let file = file.clone();
-                        tasks.spawn(async move {
-                            file.serve(incoming)
-                                .await
-                                .map(|_| ())
-                                .map_err(|error| error.to_string())
-                        });
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        let mutation = session.mutation_handler().unwrap();
-                        tasks.spawn(async move {
-                            mutation
-                                .serve(incoming)
-                                .await
-                                .map_err(|error| error.to_string())
-                        });
-                    }
-                    IncomingRequest::Metadata(incoming) => {
-                        let metadata = session.metadata_handler().unwrap();
-                        tasks.spawn(async move {
-                            metadata
-                                .serve(incoming)
-                                .await
-                                .map_err(|error| error.to_string())
-                        });
-                    }
-                    _ => panic!("unexpected remove-source v3 adapter request"),
-                }
-            }
-            while let Some(joined) = tasks.join_next().await {
-                joined.unwrap().unwrap();
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -721,7 +634,8 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        drop(session);
+        server.await.unwrap().unwrap();
         assert_eq!(stats.files_created, 2, "created + inner");
         assert_eq!(stats.files_updated, 1);
         assert_eq!(stats.files_skipped, 1);

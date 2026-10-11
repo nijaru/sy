@@ -112,6 +112,9 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     async fn finish_deferred_source_removals(&self) -> Result<(), E::Error> {
         self.inner.finish_deferred_source_removals().await
     }
+    async fn close_source_removals(&self) -> Result<(), E::Error> {
+        self.inner.close_source_removals().await
+    }
     async fn remove_unchanged_source(
         &self,
         source: &Entry,
@@ -627,6 +630,164 @@ async fn skipped_directory_policy_restores_destination_not_source_metadata() {
         }
     }
 }
+/// Child publication or strong parity is not removal authority until the
+/// containing directory's required finalization succeeds.
+#[tokio::test]
+async fn failed_parent_finalization_retains_published_and_unchanged_sources() {
+    for direction in [Direction::Local, Direction::Push] {
+        for (unchanged, symlink) in [(false, false), (true, false), (false, true)] {
+            let source = tempfile::tempdir().unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            for root in [source.path(), destination.path()] {
+                std::fs::create_dir(root.join("dir")).unwrap();
+            }
+            std::fs::set_permissions(
+                source.path().join("dir"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap();
+            let child = source.path().join("dir/child");
+            if symlink {
+                std::os::unix::fs::symlink("target", &child).unwrap();
+            } else {
+                std::fs::write(&child, b"verified child").unwrap();
+            }
+            if unchanged {
+                let old = destination.path().join("dir/child");
+                std::fs::copy(&child, &old).unwrap();
+                filetime::set_file_mtime(
+                    &old,
+                    filetime::FileTime::from_last_modification_time(
+                        &std::fs::metadata(&child).unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
+            let authority =
+                sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                    .await
+                    .unwrap();
+            let mut request = ScanRequest::default();
+            request.metadata.unix_mode = true;
+            let source_entries = authority
+                .entries(request)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let destination_entries = local_entry_stream(destination.path().to_path_buf(), request)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let stream = |entries: Vec<Entry>| {
+                sy::engine::reconcile::EntryStream::new(futures::stream::iter(
+                    entries.into_iter().map(Ok),
+                ))
+            };
+            let plan = preflight_sync(
+                stream(source_entries),
+                stream(destination_entries),
+                ComparisonPolicy {
+                    preserve_permissions: true,
+                    ..Default::default()
+                },
+                None,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
+            let wrap = |inner| BeforeFinalize {
+                inner,
+                source: source.path().to_path_buf(),
+                destination: destination.path().to_path_buf(),
+                outside: outside.path().to_path_buf(),
+                mutation: Mutation::DestinationDirectorySwap,
+                prepared_parents: Vec::new(),
+            };
+            let result = match direction {
+                Direction::Local => {
+                    SyncController::new(
+                        wrap(
+                            LocalSyncExecutor::new(
+                                authority,
+                                sy::endpoint::local::LocalEndpoint::new(
+                                    destination.path().to_path_buf(),
+                                ),
+                                scheduler,
+                            )
+                            .with_remove_source_files(true),
+                        ),
+                        NonZeroUsize::new(2).unwrap(),
+                    )
+                    .execute(plan)
+                    .await
+                }
+                Direction::Push => {
+                    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                    let (cr, cw) = tokio::io::split(client_io);
+                    let (sr, sw) = tokio::io::split(server_io);
+                    let server = tokio::spawn(sy::remote::serve::serve_transport(
+                        sr,
+                        sw,
+                        RouterConfig::default(),
+                    ));
+                    let client = ClientRemoteSession::connect(
+                        cr,
+                        cw,
+                        Operation::Push,
+                        destination.path(),
+                        RouterConfig::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let executor = RemotePushExecutor::new(
+                        authority,
+                        client.request_handle(),
+                        scheduler,
+                        BasisIndexLimits::default(),
+                    )
+                    .with_remove_source_files(true);
+                    let result = SyncController::new(
+                        BeforeFinalize {
+                            inner: executor,
+                            source: source.path().to_path_buf(),
+                            destination: destination.path().to_path_buf(),
+                            outside: outside.path().to_path_buf(),
+                            mutation: Mutation::DestinationDirectorySwap,
+                            prepared_parents: Vec::new(),
+                        },
+                        NonZeroUsize::new(2).unwrap(),
+                    )
+                    .execute(plan)
+                    .await;
+                    server.abort();
+                    let _ = server.await;
+                    result
+                }
+                Direction::Pull => unreachable!(),
+            };
+            assert!(result.is_err(), "{direction:?}/{unchanged}/{symlink}");
+            assert!(
+                child.symlink_metadata().is_ok(),
+                "source removal preceded parent finalization: {direction:?}/{unchanged}/{symlink}"
+            );
+            let published = destination.path().join("held-dir/child");
+            if symlink {
+                assert_eq!(std::fs::read_link(&published).unwrap(), Path::new("target"));
+                assert_eq!(std::fs::read_link(&child).unwrap(), Path::new("target"));
+            } else {
+                assert_eq!(std::fs::read(&published).unwrap(), b"verified child");
+                assert_eq!(
+                    std::fs::read(&child).unwrap(),
+                    b"verified child",
+                    "source removal preceded parent finalization: {direction:?}/{unchanged}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "acl"))]
 #[tokio::test]
 async fn directory_default_and_inherited_acls_preserve_requested_mode_mask() {

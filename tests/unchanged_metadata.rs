@@ -132,10 +132,19 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
                 }
             ));
             assert!(work.resources().buffered_bytes > 0);
-            tokio::time::timeout(std::time::Duration::from_secs(10), executor.execute(work))
-                .await
-                .unwrap()
-                .map_err(|error| error.to_string())
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), executor.execute(work))
+                    .await
+                    .unwrap();
+            if result.is_ok() {
+                assert!(
+                    source_path.exists(),
+                    "metadata completion is only removal eligibility"
+                );
+                executor.finish_deferred_source_removals().await.unwrap();
+            }
+            executor.close_source_removals().await.unwrap();
+            result.map_err(|error| error.to_string())
         };
         assert_eq!(
             std::fs::read(&destination_path).unwrap(),

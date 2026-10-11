@@ -141,7 +141,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            existing::remove_observed_source(root.rooted(), source.clone()).await,
+            existing::remove_observed_source_blocking(&root.rooted(), &source),
             Err(existing::ExistingDestinationError::Rooted(
                 RootedFsError::RootChanged(_)
             ))

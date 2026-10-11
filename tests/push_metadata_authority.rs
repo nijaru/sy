@@ -107,7 +107,13 @@ async fn quick_unchanged_push_preserves_destination_bytes_and_removes_source_onl
             ));
         } else {
             assert!(matches!(result, Ok(WorkResult::Metadata)), "{result:?}");
+            assert!(
+                source_path.exists(),
+                "metadata completion is only removal eligibility"
+            );
+            executor.finish_deferred_source_removals().await.unwrap();
         }
+        executor.close_source_removals().await.unwrap();
         let after = std::fs::metadata(&destination_path).unwrap();
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         assert_eq!(

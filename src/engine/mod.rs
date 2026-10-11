@@ -21,4 +21,5 @@ pub mod rolling;
 pub mod scan;
 pub(crate) mod scan_sort;
 pub mod scheduler;
+pub(crate) mod source_removals;
 pub mod work;

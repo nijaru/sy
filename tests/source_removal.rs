@@ -246,6 +246,86 @@ async fn self_sync_cannot_remove_the_only_copy() {
 }
 
 #[tokio::test]
+async fn standalone_existing_aliases_continue_after_own_source_unlink() {
+    use std::os::unix::fs::MetadataExt;
+    let source = tempfile::TempDir::new().unwrap();
+    let destination = tempfile::TempDir::new().unwrap();
+    std::fs::write(source.path().join("a"), b"only copy").unwrap();
+    std::fs::hard_link(source.path().join("a"), source.path().join("b")).unwrap();
+    for name in ["a", "b"] {
+        std::fs::hard_link(source.path().join(name), destination.path().join(name)).unwrap();
+    }
+    let original = std::fs::metadata(source.path().join("a")).unwrap();
+    assert_eq!(original.nlink(), 4);
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+        .await
+        .unwrap();
+    let source_rooted = authority.rooted();
+    let destination_rooted = RootedFs::open(destination.path().to_path_buf())
+        .await
+        .unwrap();
+    let plan = preflight_sync_scoped_with_content(
+        sy::engine::reconcile::OrderedReconciler::new(
+            authority.entries(ScanRequest::default()),
+            local_entry_stream(destination.path().to_path_buf(), ScanRequest::default()),
+        ),
+        ComparisonPolicy {
+            mode: ComparisonMode::Checksum,
+            ..ComparisonPolicy::default()
+        },
+        None,
+        |_| true,
+        |_| futures::future::ready(Ok(true)),
+        move |source, destination| {
+            let source_rooted = source_rooted.clone();
+            let destination_rooted = destination_rooted.clone();
+            async move {
+                let source_hash = sy::remote::hash::hash_rooted_file(
+                    source_rooted,
+                    source.path,
+                    source.size,
+                    source.identity.unwrap(),
+                )
+                .await?;
+                let destination_hash = sy::remote::hash::hash_rooted_file(
+                    destination_rooted,
+                    destination.path,
+                    destination.size,
+                    destination.identity.unwrap(),
+                )
+                .await?;
+                Ok(source_hash == destination_hash)
+            }
+        },
+    )
+    .await
+    .unwrap();
+    let controller = SyncController::new(
+        LocalSyncExecutor::new(
+            authority,
+            sy::endpoint::local::LocalEndpoint::new(destination.path().to_path_buf()),
+            scheduler(),
+        )
+        .with_remove_source_files(true),
+        NonZeroUsize::new(2).unwrap(),
+    );
+    controller.execute(plan).await.unwrap();
+    for name in ["a", "b"] {
+        assert!(!source.path().join(name).exists());
+        assert_eq!(
+            std::fs::read(destination.path().join(name)).unwrap(),
+            b"only copy"
+        );
+        let surviving = std::fs::metadata(destination.path().join(name)).unwrap();
+        assert_eq!(
+            (surviving.dev(), surviving.ino()),
+            (original.dev(), original.ino())
+        );
+        assert_eq!(surviving.nlink(), 2);
+    }
+}
+
+#[tokio::test]
 async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     use sy::engine::controller::SyncPlanExecutor;
     use sy::engine::planner::ExecutionPolicy;
@@ -299,6 +379,10 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     )
     .await
     .unwrap();
+    assert!(source.path().join("file").exists());
+    SyncPlanExecutor::finish_deferred_source_removals(&executor)
+        .await
+        .unwrap();
     assert!(!source.path().join("file").exists());
     assert_eq!(
         std::fs::read(destination.path().join("file")).unwrap(),

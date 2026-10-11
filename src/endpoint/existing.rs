@@ -2,7 +2,9 @@
 #[cfg(test)]
 use crate::endpoint::local_identity::metadata_identity;
 use crate::endpoint::receipt::VerifiedExistingDestinationReceipt;
-use crate::engine::domain::{Entry, EntryKind, RelativePath};
+#[cfg(test)]
+use crate::engine::domain::EntryKind;
+use crate::engine::domain::{Entry, RelativePath};
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::io::Read;
 
@@ -346,62 +348,7 @@ pub(crate) fn receipt(
     ))
 }
 
-pub(crate) async fn remove_verified_source(
-    rooted: RootedFs,
-    source: Entry,
-    receipt: VerifiedExistingDestinationReceipt,
-    local_destination: Option<RootedFs>,
-) -> Result<()> {
-    if receipt.source_path() != &source.path || Some(receipt.source_identity()) != source.identity {
-        return Err(ExistingDestinationError::ObservationChanged(
-            source.path.clone(),
-        ));
-    }
-    tokio::task::spawn_blocking(move || {
-        // Local destination validation belongs in the unlink worker, not before
-        // it is queued. Remote fingerprints perform this check on the peer;
-        // neither case promises cross-endpoint atomic compare-and-swap.
-        if let Some(destination) = local_destination {
-            destination.verify_root_path_blocking()?;
-            if rooted.entry_binding_blocking(receipt.source_path())?
-                == destination.entry_binding_blocking(receipt.destination_path())?
-            {
-                return Err(ExistingDestinationError::SameBinding(
-                    receipt.source_path().clone(),
-                ));
-            }
-            destination
-                .verify_retired_destination_blocking(
-                    receipt.destination_path(),
-                    EntryKind::File,
-                    receipt.destination_identity(),
-                )
-                .map_err(|error| match error {
-                    RootedFsError::DestinationChanged(_) => {
-                        ExistingDestinationError::ObservationChanged(
-                            receipt.destination_path().clone(),
-                        )
-                    }
-                    error => error.into(),
-                })?;
-            destination.verify_root_path_blocking()?;
-        }
-        remove_observed_source_blocking(&rooted, &source)
-    })
-    .await
-    .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
-}
-
 /// The caller owns destination authorization; this helper confines source unlink.
-pub(crate) async fn remove_observed_source(rooted: RootedFs, source: Entry) -> Result<()> {
-    if source.is_directory() {
-        return Ok(());
-    }
-    tokio::task::spawn_blocking(move || remove_observed_source_blocking(&rooted, &source))
-        .await
-        .map_err(|error| ExistingDestinationError::Worker(error.to_string()))?
-}
-
 pub(crate) fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry) -> Result<()> {
     validate_path(rooted, source)?;
     let expected = source
@@ -415,6 +362,36 @@ pub(crate) fn remove_observed_source_blocking(rooted: &RootedFs, source: &Entry)
 mod tests {
     use super::*;
     use crate::engine::domain::Timestamp;
+
+    async fn remove_existing_at_barrier(
+        rooted: RootedFs,
+        source: Entry,
+        receipt: VerifiedExistingDestinationReceipt,
+        destination: RootedFs,
+    ) -> std::io::Result<()> {
+        let journal = crate::engine::source_removals::SourceRemovalJournal::default();
+        journal
+            .append_existing(&source, &receipt)
+            .await
+            .map_err(std::io::Error::other)?;
+        let root = crate::endpoint::source_root::SourceRoot::from_rooted(rooted);
+        let source_rooted = root.rooted();
+        journal
+            .replay(root, |proof| {
+                let source = source_rooted.clone();
+                let destination = destination.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        proof.revalidate_local_blocking(&source, &destination)
+                    })
+                    .await
+                    .map_err(std::io::Error::other)?
+                }
+            })
+            .await
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    }
 
     #[test]
     fn observed_byte_hash_rejects_truncation_and_unbounded_growth() {
@@ -550,13 +527,10 @@ mod tests {
                 held.set_xattr("user.sy-foreign", b"foreign").unwrap();
             }
             let result =
-                remove_verified_source(source_rooted, source, receipt, Some(destination_rooted))
+                remove_existing_at_barrier(source_rooted, source, receipt, destination_rooted)
                     .await;
             if foreign_edit {
-                assert!(matches!(
-                    result,
-                    Err(ExistingDestinationError::ObservationChanged(_))
-                ));
+                assert!(result.is_err());
                 assert_eq!(
                     std::fs::read(source_directory.path().join("input")).unwrap(),
                     b"kept bytes"
@@ -595,15 +569,15 @@ mod tests {
             .unwrap();
             // A hardlink has the same identity; that still cannot turn the
             // destination address into the source this receipt may unlink.
-            assert!(remove_verified_source(
+            assert!(remove_existing_at_barrier(
                 rooted.clone(),
                 destination,
                 proof.clone(),
-                Some(rooted.clone()),
+                rooted.clone(),
             )
             .await
             .is_err());
-            remove_verified_source(rooted.clone(), source, proof, Some(rooted))
+            remove_existing_at_barrier(rooted.clone(), source, proof, rooted)
                 .await
                 .unwrap();
             assert!(!root.path().join("input").exists());
@@ -637,11 +611,11 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("replacement"), b"raced destination").unwrap();
         std::fs::rename(root.path().join("replacement"), root.path().join("renamed")).unwrap();
-        assert!(matches!(
-            remove_verified_source(rooted.clone(), source, proof, Some(rooted)).await,
-            Err(ExistingDestinationError::ObservationChanged(path))
-                if path.as_path() == std::path::Path::new("renamed")
-        ));
+        assert!(
+            remove_existing_at_barrier(rooted.clone(), source, proof, rooted)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(root.path().join("input")).unwrap(),
             b"verified contents"
@@ -676,7 +650,7 @@ mod tests {
                 EntryKind::File
             )
         );
-        assert!(remove_observed_source(rooted, entry).await.is_err());
+        assert!(remove_observed_source_blocking(&rooted, &entry).is_err());
         assert_eq!(
             std::fs::read(outside.path().join("parent/file")).unwrap(),
             b"keep"

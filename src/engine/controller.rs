@@ -48,6 +48,13 @@ pub enum ControllerError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[error("{operation}; source-removal drain also failed: {source}")]
+    SourceRemovalDrain {
+        operation: Box<ControllerError>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("metadata preservation requires Unix mode metadata for {0}")]
     MissingPreservedMode(RelativePath),
 
@@ -692,6 +699,12 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
     fn finish_deferred_source_removals(
         &self,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+    /// Close eligibility and join native work retained by a cancelled removal.
+    fn close_source_removals(
+        &self,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
+        async { Ok(()) }
+    }
     fn remove_unchanged_source(
         &self,
         source: &Entry,
@@ -723,6 +736,29 @@ impl<E: SyncPlanExecutor> SyncController<E> {
     }
 
     pub async fn execute(&self, plan: SyncPlan) -> Result<SyncSummary> {
+        let operation = self.execute_inner(plan).await;
+        match self.close().await {
+            Ok(()) => operation,
+            Err(source) => match operation {
+                Ok(_) => Err(source),
+                Err(operation) => Err(ControllerError::SourceRemovalDrain {
+                    operation: Box::new(operation),
+                    source: Box::new(source),
+                }),
+            },
+        }
+    }
+
+    /// A cancellation owner must retain the controller and await this after
+    /// dropping execution. Already-admitted native work cannot be rolled back.
+    pub async fn close(&self) -> Result<()> {
+        self.executor
+            .close_source_removals()
+            .await
+            .map_err(|error| ControllerError::backend("source-removal drain", error))
+    }
+
+    async fn execute_inner(&self, plan: SyncPlan) -> Result<SyncSummary> {
         let SyncPlan {
             mut reader,
             mut hardlinks,

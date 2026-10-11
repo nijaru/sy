@@ -1748,6 +1748,30 @@ impl RootedFs {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
+    /// Validate a name against an authenticated SOURCE-owned unlink snapshot.
+    /// This does not adopt a new identity or consult destination retirement.
+    #[cfg(unix)]
+    pub(crate) fn validate_source_continuation_blocking(
+        &self,
+        relative: &RelativePath,
+        original: EntryIdentity,
+        current: &HardlinkSourceState,
+    ) -> Result<()> {
+        let (member, _) =
+            self.open_hardlink_source_member(relative.as_path(), original, Some(current))?;
+        self.verify_parent_binding_blocking(relative.as_path(), &member.parent)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_source_continuation_blocking(
+        &self,
+        _relative: &RelativePath,
+        _original: EntryIdentity,
+        _current: &HardlinkSourceState,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     /// Unlink one deferred hardlink source name while allowing only the
     /// ctime/nlink transition caused by our own previous unlink in the same
     /// group. The returned state becomes the next expected group anchor.
