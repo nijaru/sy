@@ -65,19 +65,10 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
         let (sr, sw) = tokio::io::split(server_io);
         let client =
             FrameRouter::start(cr, cw, RouterRole::Client, RouterConfig::default()).unwrap();
-        let server = tokio::spawn(async move {
-            let mut router =
-                FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
-            let incoming = router.incoming().recv().await.unwrap().unwrap();
-            serve(
-                rooted,
-                incoming,
-                &router.sender(),
-                Platform::current().os,
-                ResolvedOperand::Tree,
-            )
-            .await
-        });
+        // The transport outlives one handler, as in the real session. A queued
+        // terminal acknowledgement must survive until the client receives it.
+        let mut peer =
+            FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
         let sender = client.sender();
         let mut inbox = sender.open_stream().unwrap();
         let open = WireGroupOpen {
@@ -96,6 +87,18 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             ),
         };
         send(&sender, &inbox, FrameKind::GroupOpen, open.encode()).await;
+        let incoming = peer.incoming().recv().await.unwrap().unwrap();
+        let peer_sender = peer.sender();
+        let server = tokio::spawn(async move {
+            serve(
+                rooted,
+                incoming,
+                &peer_sender,
+                Platform::current().os,
+                ResolvedOperand::Tree,
+            )
+            .await
+        });
         for member in &members {
             send(&sender, &inbox, FrameKind::GroupMember, member.encode()).await;
         }

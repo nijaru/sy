@@ -45,6 +45,7 @@ fn old_group() -> TempDir {
 struct Session {
     root: TempDir,
     _client: FrameRouter,
+    _peer: FrameRouter,
     sender: RouterSender,
     inbox: StreamInbox,
     server: JoinHandle<Result<()>>,
@@ -110,34 +111,46 @@ impl Session {
         let (sr, sw) = tokio::io::split(server_io);
         let client =
             FrameRouter::start(cr, cw, RouterRole::Client, RouterConfig::default()).unwrap();
+        let mut peer =
+            FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
+        let sender = client.sender();
+        let inbox = sender.open_stream().unwrap();
+        sender
+            .send(
+                Frame::new(
+                    FrameKind::GroupOpen,
+                    FrameFlags::empty(),
+                    inbox.stream_id(),
+                    open.encode(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let incoming = peer.incoming().recv().await.unwrap().unwrap();
+        let peer_sender = peer.sender();
+        // Keep the session transport alive beyond the handler: send queues a
+        // terminal reply, so dropping its router here can discard that receipt.
         let server = tokio::spawn(async move {
-            let mut router =
-                FrameRouter::start(sr, sw, RouterRole::Server, RouterConfig::default()).unwrap();
-            let incoming = router.incoming().recv().await.unwrap().unwrap();
-            // Exercise the integration-facing wrapper, not a replacement mock.
             crate::remote::group::serve_destination(
                 rooted,
                 incoming,
-                &router.sender(),
+                &peer_sender,
                 Platform::current().os,
                 ResolvedOperand::Tree,
             )
             .await
         });
-        let sender = client.sender();
-        let inbox = sender.open_stream().unwrap();
         let mut session = Self {
             root,
             _client: client,
+            _peer: peer,
             sender,
             inbox,
             server,
             seal,
             open,
         };
-        session
-            .send(FrameKind::GroupOpen, session.open.encode())
-            .await;
         for member in members {
             session.send(FrameKind::GroupMember, member.encode()).await;
         }
