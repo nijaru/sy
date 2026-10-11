@@ -351,7 +351,7 @@ negotiated semantics
 
 Do not guess remote capabilities from endpoint type.
 
-The exact wire contract is **3.10**, with no earlier-minor compatibility.
+The exact wire contract is **3.11**, with no earlier-minor compatibility.
 Version refusal precedes operand classification or filesystem root opening.
 `SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
 
