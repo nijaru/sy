@@ -198,10 +198,10 @@ impl RootedFs {
         modified: Option<Timestamp>,
         preservation: &MetadataPreservation<'_>,
     ) -> Result<bool> {
-        preservation.validate()?;
-        modified.map(modified_timespecs).transpose()?;
         #[cfg(unix)]
         {
+            preservation.validate()?;
+            modified.map(modified_timespecs).transpose()?;
             self.read_observed_metadata_blocking(relative, EntryKind::File, expected, |file| {
                 if !preservation.matches(file, unix_mode, modified)? {
                     return Ok(false);
@@ -214,7 +214,7 @@ impl RootedFs {
         }
         #[cfg(not(unix))]
         {
-            let _ = (relative, expected, unix_mode, modified);
+            let _ = (relative, expected, unix_mode, modified, preservation);
             Err(RootedFsError::UnsupportedPlatform)
         }
     }
