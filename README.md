@@ -182,7 +182,7 @@ identity and root-confined filesystem operations are not implemented.
 | Filters (--exclude/--include) | Stable | rsync-style patterns, `--filter`, templates |
 | Delete mode (--delete) | Stable | Local/push, with `--max-delete` safety threshold; pull `--delete` is refused |
 | Compression (-z) | Stable | zstd, auto/always/never |
-| Hard links (-H) | Limited | Local/push/pull transfer groups; complete-group metadata isolation and restoration of retained destination topology remain incomplete |
+| Hard links (-H) | Limited | Local whole-group topology and metadata; SSH groups remain transfer-only |
 | Symlinks | Stable | `--links=preserve/follow/skip` |
 | Backup mode (--backup) | Stable | Replacements and deletions |
 | Atomic writes | Stable | Private staging, verified, atomic replace |
@@ -216,8 +216,10 @@ after commit and required preservation succeed. Remote-to-local pulls refuse
 `--remove-source-files`. An unchanged regular file is eligible only
 with `--checksum`: sy re-reads both files and checks requested permissions,
 mtime, xattrs, ACLs and flags against the observed identities before removing
-its source. A changed destination or preservation mismatch stops the operation
-and retains the source. Quick-check skips and unchanged symlinks are retained.
+its source. Local `-H` groups also verify actual byte parity before any member's
+source removal, including quick-equal members. A changed destination or required
+preservation failure stops the operation and retains the source. Other quick-check
+skips and unchanged symlinks are retained.
 Source/destination namespace aliases are refused; distinct hardlink names are
 allowed. Remote files with indistinguishable inode and namespace identifiers
 are conservatively treated as aliases. These checks are not atomic with source
@@ -230,19 +232,24 @@ cannot interrupt it or undo publication. A lost acknowledgement leaves completio
 uncertain. This cutoff does not yet cover every directory, link, backup or
 in-place metadata operation.
 
-With `-H`, quick-equal files retain their old destination bytes. Before file
-writes, sy rejects selected groups whose retained bytes disagree with each other
-or with a planned source-byte update. `--checksum` compares content and can
-turn a quick-equal file into a source-byte update. Excluded and policy-skipped
-names are not members to coalesce. This preflight does not provide a snapshot;
-execution still has to revalidate its observations.
+Local `-H` completes one selected group at a time. The first selected path in
+catalogue order supplies baseline metadata; explicit preservation overrides it.
+If any member transfers or destination links need repair, source bytes become
+canonical for the group—even for quick-equal members. Already-linked groups
+needing only metadata retain destination bytes; a private staged replacement
+isolates changes from outside aliases. Fully matching linked groups stay
+unchanged. Excluded and policy-skipped names are not members to coalesce.
 
-In-place metadata writes to regular files with multiple hardlinks are refused,
-locally and over SSH: an alias may belong to the source, even an excluded file.
-This includes permissions, timestamps, xattrs, ACLs and BSD flags. Supporting
-these updates requires group-aware staged replacement; sy does not silently
-break hardlink topology or modify the shared inode. The link-count check is not
-atomic with the write and cannot prevent concurrent creation of new aliases.
+SSH `-H` still handles transfer groups only. It rejects conflicting retained-byte
+commitments before file writes and does not yet repair quick-equal topology or
+isolate complete-group metadata. `--checksum` can turn quick-equal files into
+source-byte updates.
+
+Outside local `-H` group replacement, needed metadata writes to shared regular
+files are refused: an alias may belong to the source, even an excluded file.
+Matching requested state needs no write. Observation checks are not snapshots
+or atomic compare-and-swap; earlier published members remain if a later member
+fails. Source removal waits for verified completion of every selected member.
 
 Deletion backups apply to regular files only. Symlink targets are never copied.
 A backup is staged and identity-checked before publication; failure leaves the

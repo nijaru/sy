@@ -67,61 +67,74 @@ impl RootedPublishedFile {
         }
     }
 
-    pub fn finalize_blocking(self, flags: Option<u32>) -> Result<PublishedFileProof> {
-        let finalize = || {
-            self.verify_binding()?;
-            let identity = if let Some(flags) = flags {
-                #[cfg(target_os = "macos")]
-                {
-                    // Namespace admission ended with cleanup. This distinct
-                    // metadata mutation needs late admission of its own.
-                    let _permits = self
-                        .rooted
-                        .admit_mutation_with_transaction_blocking(self.admission.as_deref())?;
-                    self.verify_binding()?;
-                    if !super::apply_bsd_flags_fd(&self.file, flags)? {
-                        // No native effect can justify advancing ctime. Retain
-                        // the original creator-FD observation for completion.
-                        return self.verify_binding();
-                    }
-                    let after = stat_fd(self.file.as_raw_fd())?;
-                    let before = &self.observed;
-                    // Advance only the requested flags and their native ctime
-                    // bookkeeping. This is observational, not syscall isolation
-                    // from a foreign ctime-only edit during our own mutation.
-                    if after.st_flags != flags
-                        || before.st_dev != after.st_dev
-                        || before.st_ino != after.st_ino
-                        || before.st_mode != after.st_mode
-                        || before.st_uid != after.st_uid
-                        || before.st_gid != after.st_gid
-                        || before.st_rdev != after.st_rdev
-                        || before.st_size != after.st_size
-                        || before.st_nlink != after.st_nlink
-                        || before.st_mtime != after.st_mtime
-                        || before.st_mtime_nsec != after.st_mtime_nsec
-                    {
-                        return Err(RootedFsError::DestinationChanged(
-                            self.path.as_path().to_path_buf(),
-                        ));
-                    }
-                    self.verify_observation_binding(&after)?
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = flags;
-                    return Err(RootedFsError::UnsupportedPlatform);
-                }
-            } else {
-                self.verify_binding()?
-            };
-            Ok(identity)
-        };
-        let identity = finalize().map_err(|error| Self::finalization_error(&self.path, error))?;
+    pub fn finalize_blocking(mut self, flags: Option<u32>) -> Result<PublishedFileProof> {
+        let identity = self
+            .finalize_in_place(flags)
+            .map_err(|error| Self::finalization_error(&self.path, error))?;
         Ok(PublishedFileProof {
             path: self.path,
             identity,
         })
+    }
+
+    /// Groups retain the creator FD after flags for their bounded catalogue
+    /// binding pass. No visible member is reopened to acquire authority.
+    pub(super) fn finalize_owned_blocking(mut self, flags: Option<u32>) -> Result<Self> {
+        self.finalize_in_place(flags)
+            .map_err(|error| Self::finalization_error(&self.path, error))?;
+        Ok(self)
+    }
+
+    fn finalize_in_place(&mut self, flags: Option<u32>) -> Result<EntryIdentity> {
+        self.verify_binding()?;
+        let identity = if let Some(flags) = flags {
+            #[cfg(target_os = "macos")]
+            {
+                // Namespace admission ended with cleanup. This distinct
+                // metadata mutation needs late admission of its own.
+                let _permits = self
+                    .rooted
+                    .admit_mutation_with_transaction_blocking(self.admission.as_deref())?;
+                self.verify_binding()?;
+                if !super::apply_bsd_flags_fd(&self.file, flags)? {
+                    // No native effect can justify advancing ctime. Retain
+                    // the original creator-FD observation for completion.
+                    return self.verify_binding();
+                }
+                let after = stat_fd(self.file.as_raw_fd())?;
+                let before = &self.observed;
+                // Advance only the requested flags and their native ctime
+                // bookkeeping. This is observational, not syscall isolation
+                // from a foreign ctime-only edit during our own mutation.
+                if after.st_flags != flags
+                    || before.st_dev != after.st_dev
+                    || before.st_ino != after.st_ino
+                    || before.st_mode != after.st_mode
+                    || before.st_uid != after.st_uid
+                    || before.st_gid != after.st_gid
+                    || before.st_rdev != after.st_rdev
+                    || before.st_size != after.st_size
+                    || before.st_nlink != after.st_nlink
+                    || before.st_mtime != after.st_mtime
+                    || before.st_mtime_nsec != after.st_mtime_nsec
+                {
+                    return Err(RootedFsError::DestinationChanged(
+                        self.path.as_path().to_path_buf(),
+                    ));
+                }
+                let identity = self.verify_observation_binding(&after)?;
+                self.observed = after;
+                identity
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = flags;
+                return Err(RootedFsError::UnsupportedPlatform);
+            }
+        } else {
+            self.verify_binding()?
+        };
+        Ok(identity)
     }
 
     fn finalization_error(path: &RelativePath, error: RootedFsError) -> RootedFsError {
@@ -142,23 +155,54 @@ impl RootedPublishedFile {
         }
     }
 
+    pub(super) fn proof_for_member_blocking(
+        &self,
+        path: &RelativePath,
+    ) -> Result<PublishedFileProof> {
+        #[cfg(unix)]
+        {
+            let identity = verify_file_binding(&self.file, &self.rooted, path, &self.observed)?;
+            Ok(PublishedFileProof {
+                path: path.clone(),
+                identity,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+
     #[cfg(unix)]
     fn verify_observation_binding(&self, observation: &libc::stat) -> Result<EntryIdentity> {
-        let identity = identity_from_stat(observation)
-            .ok_or_else(|| RootedFsError::NotRegularFile(self.path.as_path().to_path_buf()))?;
-        let (parent, leaf) = self.rooted.open_parent_blocking(self.path.as_path())?;
-        let named = super::stat_at_optional(parent.as_raw_fd(), &leaf)?;
-        if !super::staging::same_observation(observation, &stat_fd(self.file.as_raw_fd())?)
-            || !named
-                .as_ref()
-                .is_some_and(|named| super::staging::same_observation(observation, named))
-        {
-            return Err(RootedFsError::DestinationChanged(
-                self.path.as_path().to_path_buf(),
-            ));
-        }
-        Ok(identity)
+        verify_file_binding(&self.file, &self.rooted, &self.path, observation)
     }
+}
+
+/// Check a namespace binding against an original descriptor's sealed state.
+/// This is observational stat, not a source snapshot or namespace CAS.
+#[cfg(unix)]
+pub(super) fn verify_file_binding(
+    file: &File,
+    rooted: &RootedFs,
+    path: &RelativePath,
+    observation: &libc::stat,
+) -> Result<EntryIdentity> {
+    let identity = identity_from_stat(observation)
+        .ok_or_else(|| RootedFsError::NotRegularFile(path.as_path().to_path_buf()))?;
+    let (parent, leaf) = rooted.open_parent_blocking(path.as_path())?;
+    let named = super::stat_at_optional(parent.as_raw_fd(), &leaf)?;
+    if !super::staging::same_observation(observation, &stat_fd(file.as_raw_fd())?)
+        || !named
+            .as_ref()
+            .is_some_and(|named| super::staging::same_observation(observation, named))
+    {
+        return Err(RootedFsError::DestinationChanged(
+            path.as_path().to_path_buf(),
+        ));
+    }
+    Ok(identity)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -210,24 +210,9 @@ async fn run_with_authorities(
     }
 
     if config.preserve.hardlinks {
-        plan.validate_hardlink_bytes(|commitment| {
-            let (endpoint, follow) = match &commitment {
-                sy::engine::hardlink_preflight::ByteCommitment::Source(_) => (
-                    source_authority.endpoint(),
-                    config.preserve.symlink_mode == SymlinkMode::Follow,
-                ),
-                sy::engine::hardlink_preflight::ByteCommitment::Destination(_) => {
-                    (destination_endpoint.clone(), false)
-                }
-            };
-            async move {
-                observed_hash(&endpoint, commitment.entry(), follow)
-                    .await
-                    .map_err(|error| ControllerError::backend("hardlink byte commitment", error))
-            }
-        })
-        .await
-        .map_err(map_controller_error)?;
+        plan.seal_hardlink_membership()
+            .await
+            .map_err(map_controller_error)?;
     }
 
     if config.dry_run {
@@ -621,11 +606,6 @@ mod tests {
             SyncScope::Tree,
         )
         .await
-    }
-
-    #[tokio::test]
-    async fn hardlink_preflight_byte_commitments() {
-        super::super::hardlink_tests::assert_byte_commitments(execute_hardlink_fixture).await;
     }
 
     #[tokio::test]

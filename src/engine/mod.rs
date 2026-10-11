@@ -10,6 +10,7 @@ pub mod finalize_journal;
 pub(crate) mod hardlink_groups;
 pub mod hardlink_preflight;
 pub(crate) mod hardlink_removals;
+pub mod hardlink_runtime;
 pub mod ignore_scope;
 pub mod namespace;
 pub(crate) mod native_path;

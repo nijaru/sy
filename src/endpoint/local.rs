@@ -508,7 +508,7 @@ pub(crate) fn write_acl_blocking(full_path: &Path, acl: &str) -> Result<()> {
 /// Copy from a held source descriptor into the still-private staging inode.
 /// macOS `fcopyfile` keeps the operating system's native copy path available
 /// without reopening a user-visible destination pathname.
-fn copy_native_file_blocking(
+pub(crate) fn copy_native_file_blocking(
     source: &mut std::fs::File,
     destination: &mut std::fs::File,
 ) -> std::io::Result<u64> {
@@ -663,7 +663,7 @@ fn visit_sparse_extents(
 }
 
 #[cfg(unix)]
-fn copy_sparse_native_file_blocking(
+pub(crate) fn copy_sparse_native_file_blocking(
     source: &mut std::fs::File,
     destination: &mut std::fs::File,
 ) -> std::io::Result<Option<u64>> {

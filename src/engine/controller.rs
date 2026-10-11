@@ -38,6 +38,9 @@ pub enum ControllerError {
     #[error(transparent)]
     Namespace(#[from] crate::engine::namespace::NamespacePreflightError),
 
+    #[error(transparent)]
+    HardlinkGroup(#[from] crate::engine::hardlink_runtime::GroupError),
+
     #[error("sync {phase} failed: {source}")]
     Backend {
         phase: &'static str,
@@ -175,6 +178,25 @@ impl SyncPlan {
             validate(operation).await?;
         }
         self.reader.rewind()?;
+        Ok(())
+    }
+
+    /// Record complete selection for whole-group execution. Byte disposition is
+    /// chosen once by the group, rather than frozen independently per member.
+    pub async fn seal_hardlink_membership(&mut self) -> Result<()> {
+        if matches!(self.hardlinks, HardlinkPreflight::Failed) {
+            return self.hardlinks.revalidate(&self.reader).await;
+        }
+        self.reader.rewind()?;
+        self.hardlinks = HardlinkPreflight::Failed;
+        let mut membership = crate::engine::hardlink_preflight::HardlinkCommitments::default();
+        while let Some(record) = self.reader.next_record().await? {
+            membership.collect(record).await?;
+        }
+        self.reader.rewind()?;
+        let mut catalogue = membership.seal().await?;
+        catalogue.revalidate(&self.reader).await?;
+        self.hardlinks = HardlinkPreflight::Ready(catalogue);
         Ok(())
     }
 
@@ -668,6 +690,18 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
     ) -> std::result::Result<Option<WorkItem<Self::Action>>, Self::Error>;
     fn is_directory_action(&self, action: &Self::Action) -> bool;
 
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        false
+    }
+
+    fn execute_hardlink_group(
+        &self,
+        _group: &mut crate::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        _policy: ExecutionPolicy,
+    ) -> impl Future<Output = std::result::Result<Option<()>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
+
     fn execute(
         &self,
         item: WorkItem<Self::Action>,
@@ -734,11 +768,87 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             .await?;
         reader.rewind()?;
         let mut workers = JoinSet::<std::result::Result<WorkResult, E::Error>>::new();
+        let completed_groups = crate::engine::hardlink_runtime::CompletedGroups::default();
 
         let main_result: Result<()> = async {
-            while let Some(operation) = reader.next().await? {
+            while let Some(record) = reader.next_record().await? {
+                let operation = record.operation;
                 if operation.source().is_directory() {
                     continue;
+                }
+                if self.executor.supports_whole_hardlink_groups()
+                    && operation.source().is_file()
+                    && !matches!(operation, SyncOp::Skip { .. })
+                {
+                    if let Some(key) = operation.source().hardlink_group {
+                        let HardlinkPreflight::Ready(catalogue) = &hardlinks else {
+                            return Err(crate::engine::hardlink_runtime::GroupError::Invalid(
+                                "group execution requires sealed membership",
+                            )
+                            .into());
+                        };
+                        let key = *key.as_bytes();
+                        let mut group = crate::engine::hardlink_runtime::HardlinkGroupPlan::new(
+                            catalogue, &reader, key,
+                        )
+                        .await?;
+                        let first = group.members().await?.first_position().await?;
+                        if completed_groups.contains(key, first).await? {
+                            continue;
+                        }
+                        if first != record.position {
+                            return Err(crate::engine::hardlink_runtime::GroupError::Invalid(
+                                "later member encountered before exact group completion",
+                            )
+                            .into());
+                        }
+                        // One live group owns its inode. Drain ordinary work so
+                        // group admission cannot nest behind occupied budgets.
+                        while !workers.is_empty() {
+                            collect_one::<E>(&mut workers, &mut summary).await?;
+                        }
+                        self.executor
+                            .execute_hardlink_group(&mut group, execution_policy)
+                            .await
+                            .map_err(|error| ControllerError::backend("hardlink group", error))?
+                            .ok_or(crate::engine::hardlink_runtime::GroupError::Invalid(
+                                "backend did not execute selected group",
+                            ))?;
+                        let (work, seal) = group.finish().await?;
+                        completed_groups.insert(key, first, seal).await?;
+                        summary.main_operations = checked_add(
+                            summary.main_operations,
+                            work.main_operations,
+                            "group operation",
+                        )?;
+                        summary.files_updated = checked_add(
+                            summary.files_updated,
+                            work.files_updated,
+                            "topology repair",
+                        )?;
+                        summary.files_skipped = summary
+                            .files_skipped
+                            .checked_sub(work.files_skipped)
+                            .ok_or(ControllerError::CounterOverflow("topology repair skipped"))?;
+                        summary.files_transferred = checked_add(
+                            summary.files_transferred,
+                            work.files_transferred,
+                            "group transfer",
+                        )?;
+                        summary.delta_files =
+                            checked_add(summary.delta_files, work.delta_files, "group delta")?;
+                        summary.literal_bytes = checked_add(
+                            summary.literal_bytes,
+                            work.literal_bytes,
+                            "group literal-byte",
+                        )?;
+                        summary.reused_bytes = checked_add(
+                            summary.reused_bytes,
+                            work.reused_bytes,
+                            "group reused-byte",
+                        )?;
+                        continue;
+                    }
                 }
                 if let SyncOp::Unchanged {
                     source,
@@ -1014,7 +1124,7 @@ async fn collect_one<E: SyncPlanExecutor>(
     }
 }
 
-fn record_work_result(summary: &mut SyncSummary, result: WorkResult) -> Result<()> {
+pub(crate) fn record_work_result(summary: &mut SyncSummary, result: WorkResult) -> Result<()> {
     match result {
         WorkResult::Transfer(transfer) => record_transfer(summary, transfer),
         WorkResult::Metadata => Ok(()),

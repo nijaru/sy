@@ -56,6 +56,22 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     fn is_directory_action(&self, action: &E::Action) -> bool {
         self.inner.is_directory_action(action)
     }
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        self.inner.supports_whole_hardlink_groups()
+    }
+    async fn execute_hardlink_group(
+        &self,
+        group: &mut sy::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        policy: ExecutionPolicy,
+    ) -> Result<Option<()>, E::Error> {
+        for parent in &self.prepared_parents {
+            assert!(
+                parent.is_dir(),
+                "group work preceded preparation of {parent:?}"
+            );
+        }
+        self.inner.execute_hardlink_group(group, policy).await
+    }
     async fn execute(&self, item: WorkItem<E::Action>) -> Result<WorkResult, E::Error> {
         if !self.inner.is_directory_action(item.action()) {
             for parent in &self.prepared_parents {

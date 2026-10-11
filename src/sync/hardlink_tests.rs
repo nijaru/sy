@@ -147,6 +147,12 @@ pub(super) fn is_original_root_change(error: &(dyn std::error::Error + 'static))
     if let Some(error) = error.downcast_ref::<crate::rooted_fs::RootedFsError>() {
         return matches!(error, crate::rooted_fs::RootedFsError::RootChanged(_));
     }
+    if let Some(crate::remote::local_executor::LocalSyncError::Existing(
+        crate::endpoint::existing::ExistingDestinationError::Rooted(error),
+    )) = error.downcast_ref::<crate::remote::local_executor::LocalSyncError>()
+    {
+        return is_original_root_change(error);
+    }
     if let Some(crate::remote::local_executor::LocalSyncError::Rooted(error)) =
         error.downcast_ref::<crate::remote::local_executor::LocalSyncError>()
     {
@@ -215,6 +221,16 @@ impl<E: crate::engine::controller::SyncPlanExecutor> crate::engine::controller::
     }
     fn is_directory_action(&self, action: &Self::Action) -> bool {
         self.inner.is_directory_action(action)
+    }
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        self.inner.supports_whole_hardlink_groups()
+    }
+    async fn execute_hardlink_group(
+        &self,
+        group: &mut crate::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        policy: crate::engine::planner::ExecutionPolicy,
+    ) -> std::result::Result<Option<()>, Self::Error> {
+        self.inner.execute_hardlink_group(group, policy).await
     }
     async fn execute(
         &self,

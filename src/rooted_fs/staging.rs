@@ -125,6 +125,16 @@ impl RootedNamespaceTransaction {
         {
             return Err(self.staging_changed());
         }
+        if self.strict_cleanup {
+            let owned = self.staged.as_ref().ok_or_else(|| self.staging_changed())?;
+            if same_inode(&owned.created, &named) {
+                // A group inode can already be visible. Only its sealed full
+                // observation permits an owned unlink; never clean foreign
+                // edits merely because the inode number still matches.
+                self.sealed.ok_or_else(|| self.staging_changed())?;
+                self.observe_staging()?;
+            }
+        }
         // Mutable private directory children do not invalidate inode ownership.
         // Never recursively delete them: rmdir retains a nonempty artifact.
         unlink_at(

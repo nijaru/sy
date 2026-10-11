@@ -59,7 +59,7 @@ impl MetadataPreservation<'_> {
     /// Demand-read only requested fields. Unknown ACL read permission cannot
     /// establish an effect-free request, but does not forbid an exclusive SET.
     #[cfg(unix)]
-    fn matches(
+    pub(super) fn matches(
         &self,
         file: &File,
         unix_mode: Option<u32>,
@@ -188,6 +188,37 @@ pub(super) fn apply_acl_and_verify_mode(
 }
 
 impl RootedFs {
+    /// Compare without setters before deciding whether a shared group needs
+    /// isolation. The original expected identity remains authoritative.
+    pub(crate) fn observed_file_preservation_matches_blocking(
+        &self,
+        relative: &RelativePath,
+        expected: EntryIdentity,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+        preservation: &MetadataPreservation<'_>,
+    ) -> Result<bool> {
+        preservation.validate()?;
+        modified.map(modified_timespecs).transpose()?;
+        #[cfg(unix)]
+        {
+            self.read_observed_metadata_blocking(relative, EntryKind::File, expected, |file| {
+                if !preservation.matches(file, unix_mode, modified)? {
+                    return Ok(false);
+                }
+                // Matching state is an admitted no-effect operation. Compare
+                // again through the SAME original descriptor after admission.
+                let _permits = self.admit_mutation_with_transaction_blocking(None)?;
+                preservation.matches(file, unix_mode, modified)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative, expected, unix_mode, modified);
+            Err(RootedFsError::UnsupportedPlatform)
+        }
+    }
+
     /// Validate the scanned destination and apply every requested field through
     /// that single no-follow FD. Shared regular files are refused before the
     /// first field unless the entire request is already fulfilled. This is an

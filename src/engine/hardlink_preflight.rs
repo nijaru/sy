@@ -13,7 +13,7 @@ use super::plan_journal::{
     MAX_RECORD_PAYLOAD,
 };
 
-mod catalogue;
+pub(crate) mod catalogue;
 use super::scheduler::{ResourceRequest, Scheduler, SchedulerError};
 pub(crate) use catalogue::HardlinkCatalogue;
 use catalogue::{Membership, GROUP_HEADER_BYTES};
@@ -138,6 +138,53 @@ impl HardlinkCommitments {
         })
         .await
         .map_err(|error| HardlinkPreflightError::Worker(error.to_string()))?
+    }
+
+    /// Seal selected membership without imposing per-member byte promises.
+    /// Whole-group execution chooses one coherent byte and metadata policy.
+    pub(crate) async fn collect(&mut self, record: PlanRecord) -> Result<()> {
+        if !self.ready {
+            return Err(invalid("incomplete hardlink catalogue collection").into());
+        }
+        self.ready = false;
+        if ByteCommitment::from_operation(&record.operation).is_some() {
+            if let SyncOp::Update { destination, .. }
+            | SyncOp::Replace { destination, .. }
+            | SyncOp::Metadata { destination, .. }
+            | SyncOp::Unchanged { destination, .. } = &record.operation
+            {
+                destination.identity.ok_or_else(|| {
+                    HardlinkPreflightError::MissingObservation(destination.path.clone())
+                })?;
+            }
+            let source = record.operation.source();
+            let group = *source
+                .hardlink_group
+                .ok_or_else(|| invalid("missing hardlink group"))?
+                .as_bytes();
+            let identity = source
+                .identity
+                .ok_or_else(|| HardlinkPreflightError::MissingObservation(source.path.clone()))?;
+            let baseline = self.with_disk(move |disk| disk.get(group)).await?;
+            match baseline {
+                Some(baseline) if baseline.operation.source().identity != Some(identity) => {
+                    return Err(HardlinkPreflightError::SourceChanged {
+                        first: baseline.operation.source().path.clone(),
+                        second: source.path.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    let operation = record.operation;
+                    self.with_disk(move |disk| disk.insert(group, &operation))
+                        .await?;
+                }
+            }
+            self.with_disk(move |disk| disk.append_member(group, record.position))
+                .await?;
+        }
+        self.ready = true;
+        Ok(())
     }
 
     pub(crate) async fn check<F, Fut, E>(

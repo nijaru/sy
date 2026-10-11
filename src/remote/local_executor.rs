@@ -11,6 +11,8 @@
 //! entire point of local sync and must not regress behind a generic
 //! streaming loop.
 
+mod group;
+
 use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptions};
 use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
@@ -36,6 +38,8 @@ pub enum LocalSyncError {
     HardlinkState(#[from] std::io::Error),
     #[error(transparent)]
     Existing(#[from] ExistingDestinationError),
+    #[error(transparent)]
+    Group(#[from] crate::engine::hardlink_runtime::GroupError),
     #[error(transparent)]
     Scheduler(#[from] crate::engine::scheduler::SchedulerError),
 
@@ -458,22 +462,11 @@ impl LocalSyncExecutor {
                 metadata,
                 source_removal,
             } => {
-                // -H: members after the first link to the representative.
-                if self.hardlinks {
-                    if let Some(identity) = source.hardlink_group {
-                        let group = *identity.as_bytes();
-                        return self
-                            .execute_grouped_file(
-                                source,
-                                destination_path,
-                                destination,
-                                metadata,
-                                group,
-                                source_removal,
-                            )
-                            .await
-                            .map(crate::engine::work::WorkResult::Transfer);
-                    }
+                if self.hardlinks && source.hardlink_group.is_some() {
+                    return Err(crate::engine::hardlink_runtime::GroupError::Invalid(
+                        "selected hardlink members require whole-group execution",
+                    )
+                    .into());
                 }
                 let is_update = destination.is_some();
                 // BSD flags remain a post-commit phase; xattrs and ACLs are
@@ -603,130 +596,6 @@ impl LocalSyncExecutor {
                 Ok(crate::engine::work::WorkResult::Metadata)
             }
         }
-    }
-
-    /// One grouped file under `-H`: transfer the representative or link
-    /// subsequent members to it. The linking member revalidates its scan
-    /// identity first so a source replaced after the scan fails loudly
-    /// instead of linking stale bytes. The group mutex serializes members.
-    async fn execute_grouped_file(
-        &self,
-        source: Entry,
-        destination_path: RelativePath,
-        destination: Option<Entry>,
-        metadata: LocalTransferMetadata,
-        group: [u8; 32],
-        source_removal: bool,
-    ) -> Result<crate::engine::work::TransferSummary> {
-        let groups = self.hardlink_groups.lock().await;
-        if let Some(first) = groups.get(group).await? {
-            self.check_source_identity(&source).await?;
-            let dest_abs = self.destination_path(&destination_path);
-            first.validate_metadata(metadata.unix_mode, metadata.modified)?;
-            let is_update = destination.is_some();
-            if let Some(existing) = destination
-                .as_ref()
-                .filter(|entry| self.backup && entry.is_file())
-            {
-                self.backup_replacement_file(&existing.path, existing.identity)
-                    .await?;
-            }
-            let expected = match destination.as_ref() {
-                None => crate::endpoint::ExpectedDestination::Absent,
-                Some(entry) => {
-                    crate::endpoint::ExpectedDestination::Unchanged(entry.identity.ok_or_else(
-                        || LocalSyncError::MissingDestinationIdentity(dest_abs.clone()),
-                    )?)
-                }
-            };
-            let rooted = self.metadata_authority().await?;
-            let first_path = first.path.clone();
-            let destination_path_for_worker = destination_path.clone();
-            let publication = tokio::task::spawn_blocking(move || {
-                rooted.verify_root_path_blocking()?;
-                let proof = rooted.publish_hardlink_blocking(
-                    &first_path,
-                    &destination_path_for_worker,
-                    first.publication,
-                    expected,
-                )?;
-                crate::endpoint::local::verify_committed_root(
-                    &rooted,
-                    &rooted
-                        .root_path()
-                        .join(destination_path_for_worker.as_path()),
-                )?;
-                Ok::<_, LocalSyncError>(proof)
-            })
-            .await
-            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
-            groups.advance(group, publication.identity).await?;
-            let receipt = PublishedDestinationReceipt::for_hardlink(
-                source.path.clone(),
-                destination_path.clone(),
-                source.identity,
-                publication,
-            );
-            if source_removal {
-                self.defer_grouped_source_removal(group, &receipt, &source)
-                    .await?;
-            }
-            let op = if is_update {
-                crate::sync::output::ItemizeOp::Update
-            } else {
-                crate::sync::output::ItemizeOp::Create
-            };
-            self.report_transfer(op, &destination_path, source.size, 0);
-            return Ok(crate::engine::work::TransferSummary {
-                file_size: source.size,
-                digest: [0_u8; 32],
-                literal_bytes: 0,
-                reused_bytes: source.size,
-            });
-        }
-        let is_update = destination.is_some();
-        // BSD flags remain a post-commit phase; xattrs and ACLs are captured
-        // from the held source that supplies the representative's bytes.
-        let bsd_flags = self.read_source_bsd_flags(&source).await?;
-        let (transfer, receipt) = self
-            .transfer_source_file(
-                &source,
-                &destination_path,
-                &destination,
-                &metadata,
-                crate::endpoint::io::PreservationRequest {
-                    xattrs: self.xattrs && !source.is_symlink(),
-                    acl: self.acls && !source.is_symlink(),
-                },
-                bsd_flags,
-            )
-            .await?;
-        groups
-            .insert(
-                group,
-                HardlinkRepresentative {
-                    path: destination_path.clone(),
-                    publication: receipt
-                        .publication()
-                        .map_err(std::io::Error::other)?
-                        .identity,
-                    unix_mode: metadata.unix_mode,
-                    modified: metadata.modified,
-                },
-            )
-            .await?;
-        if source_removal {
-            self.defer_grouped_source_removal(group, &receipt, &source)
-                .await?;
-        }
-        drop(groups);
-        let op = if is_update {
-            crate::sync::output::ItemizeOp::Update
-        } else {
-            crate::sync::output::ItemizeOp::Create
-        };
-        self.report_transfer(op, &destination_path, source.size, transfer.literal_bytes);
-        Ok(transfer)
     }
 
     async fn defer_grouped_source_removal(
@@ -1186,6 +1055,19 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
 
     fn is_directory_action(&self, action: &LocalSyncAction) -> bool {
         matches!(action, LocalSyncAction::CreateDirectory { .. })
+    }
+
+    fn supports_whole_hardlink_groups(&self) -> bool {
+        self.hardlinks
+    }
+
+    async fn execute_hardlink_group(
+        &self,
+        group: &mut crate::engine::hardlink_runtime::HardlinkGroupPlan<'_>,
+        policy: ExecutionPolicy,
+    ) -> Result<Option<()>> {
+        self.execute_whole_group(group, policy).await?;
+        Ok(Some(()))
     }
 
     async fn execute(
@@ -1811,10 +1693,10 @@ mod tests {
     #[tokio::test]
     async fn hardlink_members_preserve_group_fidelity_and_observed_entries() {
         use futures::TryStreamExt;
+        use std::io::Write;
         use std::os::unix::fs::MetadataExt;
-
-        // Unchanged observations, source modification, observed-destination
-        // replacement, and a foreign name arriving after an Absent preflight.
+        // Exercise actual partial publication with the held source callback,
+        // not the superseded visible-representative executor cache.
         for race in 0..4 {
             let source_root = tempfile::tempdir().unwrap();
             let dest_root = tempfile::tempdir().unwrap();
@@ -1831,6 +1713,13 @@ mod tests {
                     .await
                     .unwrap();
             let entries: Vec<Entry> = authority.entries(request).try_collect().await.unwrap();
+            let original = authority
+                .rooted()
+                .open_regular_blocking(&entries[0].path)
+                .unwrap();
+            let rooted = crate::rooted_fs::RootedFs::open(dest_root.path().to_path_buf())
+                .await
+                .unwrap();
             let destination = crate::endpoint::local_entry_scan::local_entry_stream(
                 dest_root.path().to_path_buf(),
                 request,
@@ -1838,51 +1727,54 @@ mod tests {
             .try_next()
             .await
             .unwrap();
-            let executor = LocalSyncExecutor::new(
-                authority,
-                crate::endpoint::local::LocalEndpoint::new(dest_root.path().to_path_buf()),
-                Scheduler::new(ResourceBudget::default()).unwrap(),
-            )
-            .with_hardlinks(true);
-            let first = lower_local_op(
-                SyncOp::Create {
-                    destination_path: entries[0].path.clone(),
-                    source: entries[0].clone(),
-                },
-                ExecutionPolicy::default(),
-            )
-            .unwrap()
-            .unwrap();
-            executor.execute(first).await.unwrap();
+            let mut staged = rooted
+                .begin_staged_file_with_expectation_blocking(
+                    &entries[0].path,
+                    crate::endpoint::ExpectedDestination::Absent,
+                )
+                .unwrap();
+            staged.file_mut().write_all(b"new").unwrap();
+            staged
+                .apply_metadata_blocking(entries[0].unix_mode, None)
+                .unwrap();
+            staged.staged_hash_blocking().unwrap();
+            let mut owner = staged.into_group_blocking().unwrap();
+            let admission = Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+            owner
+                .publish_member_blocking(
+                    &entries[0].path,
+                    crate::endpoint::ExpectedDestination::Absent,
+                    &admission,
+                    || group::validate_source(&authority, &entries[0], Some(&original), false),
+                )
+                .unwrap();
             if race == 1 {
                 std::fs::write(source_root.path().join("b"), b"bad").unwrap();
             } else if race >= 2 {
                 std::fs::write(dest_root.path().join("b"), b"foreign").unwrap();
             }
-            let op = match destination {
-                Some(destination) => SyncOp::Update {
-                    source: entries[1].clone(),
-                    destination,
-                },
-                None => SyncOp::Create {
-                    source: entries[1].clone(),
-                    destination_path: entries[1].path.clone(),
-                },
-            };
-            let member = lower_local_op(op, ExecutionPolicy::default())
-                .unwrap()
-                .unwrap();
-            let result = executor.execute(member).await;
+            let expected = destination
+                .map_or(crate::endpoint::ExpectedDestination::Absent, |entry| {
+                    crate::endpoint::ExpectedDestination::Unchanged(entry.identity.unwrap())
+                });
+            let result =
+                owner.publish_member_blocking(&entries[1].path, expected, &admission, || {
+                    group::validate_source(&authority, &entries[1], Some(&original), false)
+                });
             assert_eq!(std::fs::read(dest_root.path().join("a")).unwrap(), b"new");
             if race != 0 {
                 assert!(result.is_err());
+                owner.abort_blocking().unwrap();
                 let expected: &[u8] = if race == 1 { b"old" } else { b"foreign" };
                 assert_eq!(std::fs::read(dest_root.path().join("b")).unwrap(), expected);
             } else {
-                let crate::engine::work::WorkResult::Transfer(transfer) = result.unwrap() else {
-                    panic!("expected transfer receipt")
-                };
-                assert_eq!(transfer.reused_bytes, 3);
+                result.unwrap();
+                let completed = owner
+                    .finish_blocking(entries[0].path.clone(), None, admission)
+                    .unwrap();
+                for entry in &entries {
+                    completed.proof_for_member_blocking(&entry.path).unwrap();
+                }
                 assert_eq!(
                     std::fs::metadata(dest_root.path().join("a")).unwrap().ino(),
                     std::fs::metadata(dest_root.path().join("b")).unwrap().ino()
@@ -1891,6 +1783,35 @@ mod tests {
             assert!(source_root.path().join("b").exists());
             assert_eq!(std::fs::read_dir(dest_root.path()).unwrap().count(), 2);
         }
+    }
+
+    #[cfg(unix)]
+    async fn execute_test_group(executor: &LocalSyncExecutor, operations: Vec<SyncOp>) {
+        let mut journal = crate::engine::plan_journal::PlanJournal::new()
+            .await
+            .unwrap();
+        for operation in operations {
+            journal.append(&operation).await.unwrap();
+        }
+        let mut journal = journal.seal().await.unwrap();
+        let mut membership = crate::engine::hardlink_preflight::HardlinkCommitments::default();
+        while let Some(record) = journal.next_record().await.unwrap() {
+            membership.collect(record).await.unwrap();
+        }
+        let mut catalogue = membership.seal().await.unwrap();
+        catalogue.revalidate(&journal).await.unwrap();
+        journal.rewind().unwrap();
+        let operation = journal.next().await.unwrap().unwrap();
+        let key = *operation.source().hardlink_group.unwrap().as_bytes();
+        let mut group =
+            crate::engine::hardlink_runtime::HardlinkGroupPlan::new(&catalogue, &journal, key)
+                .await
+                .unwrap();
+        executor
+            .execute_whole_group(&mut group, ExecutionPolicy::default())
+            .await
+            .unwrap();
+        group.finish().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1919,18 +1840,17 @@ mod tests {
             .with_hardlinks(true)
             .with_remove_source_files(true);
 
-            for source in entries {
-                let work = lower_local_op(
-                    SyncOp::Create {
+            execute_test_group(
+                &executor,
+                entries
+                    .into_iter()
+                    .map(|source| SyncOp::Create {
                         destination_path: source.path.clone(),
                         source,
-                    },
-                    ExecutionPolicy::default(),
-                )
-                .unwrap()
-                .unwrap();
-                executor.execute(work).await.unwrap();
-            }
+                    })
+                    .collect(),
+            )
+            .await;
             let raced_root = if replace_destination {
                 dest_root.path()
             } else {

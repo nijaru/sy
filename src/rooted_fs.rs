@@ -4,6 +4,10 @@ mod directory;
 mod metadata;
 #[cfg(all(unix, feature = "acl"))]
 use acl_state::{acl_matches_fd, apply_acl_fd, desired_acl_entries, read_acl_entries_fd};
+mod group;
+mod group_metadata;
+#[cfg(all(test, unix))]
+mod group_tests;
 pub mod operand;
 mod publication;
 mod staging;
@@ -82,6 +86,22 @@ pub enum RootedFsError {
 
     #[error("backup destination aliases its source: {0}")]
     BackupAliasesSource(PathBuf),
+
+    #[error(
+        "hardlink group is empty or a member publication failed; no finalized proof is available"
+    )]
+    IncompleteStagedGroup,
+
+    #[error("hardlink group partially committed {committed_members} member(s); publication at {path} failed: {source}")]
+    PartialGroupPublication {
+        path: PathBuf,
+        committed_members: u64,
+        #[source]
+        source: Box<RootedFsError>,
+    },
+
+    #[error("hardlink group member count exhausted")]
+    StagedGroupCountExhausted,
 
     #[error("in-place metadata update refused for shared regular file {path} ({links} links); group-aware staged replacement is required")]
     SharedFileMetadata { path: PathBuf, links: u64 },
@@ -490,6 +510,9 @@ struct RootedNamespaceTransaction {
     #[cfg(unix)]
     cleanup_owned: Option<libc::stat>,
     sealed: Option<VerifiedObservation>,
+    // Group aliases/anchor may already share a visible inode. Refuse cleanup
+    // after foreign metadata edits and account only our verified own unlink.
+    strict_cleanup: bool,
     committed: bool,
 }
 
@@ -695,6 +718,16 @@ impl RootedNamespaceTransaction {
         admission: Option<&PublicationAdmission>,
         validate_source: impl Fn() -> Result<()>,
     ) -> Result<VerifiedObservation> {
+        self.commit_prepared_in_place(admission, validate_source)
+    }
+
+    // Group publication keeps this owner until it has propagated verified own
+    // namespace observations, including an abort's link-count decrement.
+    fn commit_prepared_in_place(
+        &mut self,
+        admission: Option<&PublicationAdmission>,
+        validate_source: impl Fn() -> Result<()>,
+    ) -> Result<VerifiedObservation> {
         #[cfg(unix)]
         if let Err(operation) = self.seal_staging() {
             return Err(self.abort_after(operation));
@@ -727,7 +760,15 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn abort_blocking(&mut self) -> Result<()> {
-        let remove_file = self.remove_owned_contents().err();
+        let remove_file = self
+            .remove_owned_contents()
+            .and_then(|removed| {
+                if removed && self.strict_cleanup {
+                    self.advance_staging(-1)?;
+                }
+                Ok(())
+            })
+            .err();
         let remove_dir = remove_owned_staging_dir_at(
             self.parent_fd.as_raw_fd(),
             self.staging_dir_fd.as_raw_fd(),
@@ -2456,6 +2497,7 @@ impl RootedFs {
                 staged: None,
                 cleanup_owned: None,
                 sealed: None,
+                strict_cleanup: false,
                 committed: false,
             });
         }
