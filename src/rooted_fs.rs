@@ -357,11 +357,20 @@ struct RootedCopySource<'a> {
     expected: EntryIdentity,
 }
 
-#[cfg(unix)]
-struct RootedHardlinkSourceMember {
+/// Original read-only file and the parent/name that opened it. This is source
+/// authority only; destination retirement cannot advance its observation.
+pub(crate) struct RootedSourceFile {
+    #[cfg(unix)]
     parent: OwnedFd,
+    #[cfg(unix)]
     leaf: OsString,
     file: File,
+}
+
+impl RootedSourceFile {
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
 }
 
 #[cfg(unix)]
@@ -1734,7 +1743,7 @@ impl RootedFs {
         expected: EntryIdentity,
     ) -> Result<()> {
         self.verify_source_root_path_blocking()?;
-        let (_, state) = self.open_hardlink_source_member(relative.as_path(), expected, None)?;
+        let (_, state) = self.open_source_member_blocking(relative.as_path(), expected, None)?;
         let _ = state;
         Ok(())
     }
@@ -1758,7 +1767,7 @@ impl RootedFs {
         current: &HardlinkSourceState,
     ) -> Result<()> {
         let (member, _) =
-            self.open_hardlink_source_member(relative.as_path(), original, Some(current))?;
+            self.open_source_member_blocking(relative.as_path(), original, Some(current))?;
         self.verify_parent_binding_blocking(relative.as_path(), &member.parent)
     }
 
@@ -1784,7 +1793,7 @@ impl RootedFs {
     ) -> Result<HardlinkSourceState> {
         self.verify_source_root_path_blocking()?;
         let (member, before) =
-            self.open_hardlink_source_member(relative.as_path(), scanned, expected)?;
+            self.open_source_member_blocking(relative.as_path(), scanned, expected)?;
         self.verify_parent_binding_blocking(relative.as_path(), &member.parent)?;
         let _permit = self.admit_mutation_blocking()?;
         // The pathname guard detects divergence; the syscall still uses the
@@ -2637,12 +2646,50 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn open_hardlink_source_member(
+    pub(crate) fn capture_source_file_blocking(
+        &self,
+        relative: &RelativePath,
+        scanned: EntryIdentity,
+    ) -> Result<RootedSourceFile> {
+        let (source, _) = self.open_source_member_blocking(relative.as_path(), scanned, None)?;
+        self.validate_source_file_parent_blocking(relative, &source)?;
+        Ok(source)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn capture_source_file_blocking(
+        &self,
+        _relative: &RelativePath,
+        _scanned: EntryIdentity,
+    ) -> Result<RootedSourceFile> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_source_file_parent_blocking(
+        &self,
+        relative: &RelativePath,
+        source: &RootedSourceFile,
+    ) -> Result<()> {
+        self.verify_parent_binding_blocking(relative.as_path(), &source.parent)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_source_file_parent_blocking(
+        &self,
+        _relative: &RelativePath,
+        _source: &RootedSourceFile,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    fn open_source_member_blocking(
         &self,
         relative: &Path,
         scanned: EntryIdentity,
         expected: Option<&HardlinkSourceState>,
-    ) -> Result<(RootedHardlinkSourceMember, HardlinkSourceState)> {
+    ) -> Result<(RootedSourceFile, HardlinkSourceState)> {
         let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let file = open_file_at(parent.as_raw_fd(), &leaf)?;
@@ -2663,7 +2710,7 @@ impl RootedFs {
                 }
             }
         }
-        Ok((RootedHardlinkSourceMember { parent, leaf, file }, state))
+        Ok((RootedSourceFile { parent, leaf, file }, state))
     }
 
     #[cfg(unix)]

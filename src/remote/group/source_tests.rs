@@ -21,18 +21,37 @@ async fn reply(inbox: &mut StreamInbox) -> WireGroupResult {
 
 #[tokio::test]
 async fn lease_keeps_source_authority_through_each_member_and_exact_completion() {
-    for outcome in ["complete", "changed-parent", "premature-completion"] {
+    for outcome in [
+        "complete",
+        "changed-parent",
+        "original-parent-alias",
+        "premature-completion",
+    ] {
         let change_second_parent = outcome == "changed-parent";
+        let replace_original_parent = outcome == "original-parent-alias";
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("owner")).unwrap();
         std::fs::create_dir(root.path().join("dir")).unwrap();
-        std::fs::write(root.path().join("first"), b"original").unwrap();
-        std::fs::hard_link(root.path().join("first"), root.path().join("dir/second")).unwrap();
+        std::fs::write(root.path().join("owner/first"), b"original").unwrap();
+        std::fs::hard_link(
+            root.path().join("owner/first"),
+            root.path().join("dir/second"),
+        )
+        .unwrap();
+        if replace_original_parent {
+            std::fs::create_dir(root.path().join("alternate")).unwrap();
+            std::fs::hard_link(
+                root.path().join("owner/first"),
+                root.path().join("alternate/first"),
+            )
+            .unwrap();
+        }
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
         let rooted_for_worker = rooted.clone();
         let identity = tokio::task::spawn_blocking(move || {
             rooted_for_worker
                 .path_identity_blocking(
-                    &decode_relative_path(path("first"), Platform::current().os).unwrap(),
+                    &decode_relative_path(path("owner/first"), Platform::current().os).unwrap(),
                 )
                 .unwrap()
                 .unwrap()
@@ -43,7 +62,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
         let members = [
             WireGroupMember {
                 ordinal: 0,
-                path: path("first"),
+                path: path("owner/first"),
                 observation: Some((WireEntryKind::File, *identity.as_bytes())),
             },
             WireGroupMember {
@@ -81,7 +100,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             verify_bytes: false,
             compression: WireFetchCompression::None,
             file: WireFileBegin::delta(
-                path("first"),
+                path("owner/first"),
                 8,
                 WireFileBasis::new(8, *identity.as_bytes()),
             ),
@@ -134,7 +153,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             .await;
             assert!(matches!(server.await.unwrap(), Err(GroupError::Phase(_))));
             assert_eq!(
-                std::fs::read(root.path().join("first")).unwrap(),
+                std::fs::read(root.path().join("owner/first")).unwrap(),
                 b"original"
             );
             continue;
@@ -144,6 +163,18 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             std::fs::create_dir(root.path().join("dir")).unwrap();
             std::fs::write(root.path().join("dir/second"), b"original").unwrap();
         }
+        if replace_original_parent {
+            std::fs::rename(root.path().join("owner"), root.path().join("held-owner")).unwrap();
+            std::fs::rename(root.path().join("alternate"), root.path().join("owner")).unwrap();
+            assert_eq!(
+                crate::endpoint::local_identity::metadata_identity(
+                    &std::fs::metadata(root.path().join("owner/first")).unwrap(),
+                    crate::engine::domain::EntryKind::File,
+                ),
+                Some(identity),
+                "directory renames leave the scanned file observation unchanged"
+            );
+        }
         send(
             &sender,
             &inbox,
@@ -151,10 +182,15 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             WireGroupStep::Validate(1).encode(),
         )
         .await;
-        if change_second_parent {
+        if change_second_parent || replace_original_parent {
             assert!(matches!(server.await.unwrap(), Err(GroupError::Source(_))));
+            let retained = if replace_original_parent {
+                "held-owner/first"
+            } else {
+                "held-dir/second"
+            };
             assert_eq!(
-                std::fs::read(root.path().join("held-dir/second")).unwrap(),
+                std::fs::read(root.path().join(retained)).unwrap(),
                 b"original"
             );
         } else {
@@ -174,7 +210,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             server.await.unwrap().unwrap();
         }
         assert_eq!(
-            std::fs::read(root.path().join("first")).unwrap(),
+            std::fs::read(root.path().join("owner/first")).unwrap(),
             b"original"
         );
     }

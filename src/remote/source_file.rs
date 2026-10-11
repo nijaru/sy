@@ -5,7 +5,7 @@
 
 use crate::endpoint::io::Preservation;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath};
-use crate::rooted_fs::{RootedFs, RootedFsError};
+use crate::rooted_fs::{RootedFs, RootedFsError, RootedSourceFile};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -28,12 +28,13 @@ pub(crate) struct SourceMetadataRequest {
     pub(crate) bsd_flags: bool,
 }
 
-/// Owns exactly one original regular-file FD and the root that opened it.
-/// No retirement lineage, fresh stat, or pathname reopen can advance its scan
-/// identity. All methods and destruction belong on a blocking worker.
+/// Owns the original regular-file FD, its opening parent and the rooted
+/// authority. No retirement lineage, fresh stat, or pathname reopen can advance
+/// its scan identity or opening binding. All methods and destruction belong on
+/// a blocking worker.
 pub(crate) struct SourceFile {
     rooted: RootedFs,
-    file: File,
+    member: RootedSourceFile,
     relative: RelativePath,
     identity: EntryIdentity,
     size: u64,
@@ -50,10 +51,17 @@ impl SourceFile {
             return Err(RootedFsError::UnsupportedPlatform.into());
         }
         // RootedFs opens O_RDONLY, no-follow, through its held root directory.
-        let file = rooted.open_regular_blocking(&relative)?;
+        let member = rooted
+            .capture_source_file_blocking(&relative, identity)
+            .map_err(|error| match error {
+                RootedFsError::DestinationChanged(_) => SourceFileError::Changed {
+                    path: relative.as_path().to_path_buf(),
+                },
+                error => error.into(),
+            })?;
         let source = Self {
             rooted,
-            file,
+            member,
             relative,
             identity,
             size,
@@ -73,7 +81,7 @@ impl SourceFile {
         relative: &RelativePath,
         expected: EntryIdentity,
     ) -> Result<()> {
-        self.validate_fd_blocking()?;
+        self.validate_owner_blocking()?;
         if expected != self.identity {
             return Err(SourceFileError::Changed {
                 path: relative.as_path().to_path_buf(),
@@ -83,14 +91,14 @@ impl SourceFile {
         if relative != &self.relative {
             self.validate_name_blocking(relative, expected)?;
         }
-        self.validate_fd_blocking()
+        self.validate_owner_blocking()
     }
 
-    fn validate_fd_blocking(&self) -> Result<()> {
+    fn validate_owner_blocking(&self) -> Result<()> {
         if !cfg!(unix) {
             return Err(RootedFsError::UnsupportedPlatform.into());
         }
-        let metadata = self.file.metadata()?;
+        let metadata = self.member.file().metadata()?;
         if !metadata.is_file()
             || metadata.len() != self.size
             || crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
@@ -100,7 +108,14 @@ impl SourceFile {
                 path: self.relative.as_path().to_path_buf(),
             });
         }
-        Ok(())
+        self.rooted
+            .validate_source_file_parent_blocking(&self.relative, &self.member)
+            .map_err(|error| match error {
+                RootedFsError::DestinationChanged(_) => SourceFileError::Changed {
+                    path: self.relative.as_path().to_path_buf(),
+                },
+                error => error.into(),
+            })
     }
 
     fn validate_name_blocking(
@@ -120,7 +135,7 @@ impl SourceFile {
     /// ORIGINAL open-file description; the carrier only stats/reads metadata.
     pub(crate) fn clone_reader_blocking(&self) -> Result<File> {
         self.validate_blocking()?;
-        Ok(self.file.try_clone()?)
+        Ok(self.member.file().try_clone()?)
     }
 
     /// Bounded, demand-driven native metadata from the original content FD.
@@ -132,7 +147,7 @@ impl SourceFile {
         let xattrs = if request.xattrs {
             let value = self
                 .rooted
-                .read_open_file_xattrs_blocking(&self.file, &self.relative)?;
+                .read_open_file_xattrs_blocking(self.member.file(), &self.relative)?;
             self.validate_blocking()?;
             Some(value)
         } else {
@@ -141,7 +156,7 @@ impl SourceFile {
         let acl = if request.acls {
             let value = self
                 .rooted
-                .read_open_file_acl_blocking(&self.file, &self.relative)?
+                .read_open_file_acl_blocking(self.member.file(), &self.relative)?
                 .unwrap_or_default();
             self.validate_blocking()?;
             Some(value)
@@ -149,7 +164,9 @@ impl SourceFile {
             None
         };
         let bsd_flags = if request.bsd_flags {
-            let value = self.rooted.read_open_file_bsd_flags_blocking(&self.file)?;
+            let value = self
+                .rooted
+                .read_open_file_bsd_flags_blocking(self.member.file())?;
             self.validate_blocking()?;
             Some(value)
         } else {
@@ -185,7 +202,7 @@ mod tests {
         let moved = temp.path().join("moved");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("file"), b"original").unwrap();
-        let mut source = capture(&root, "file");
+        let source = capture(&root, "file");
         let mut reader = source.clone_reader_blocking().unwrap();
         let error = reader.write_all(b"must not write").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
@@ -193,7 +210,7 @@ mod tests {
         reader.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"ori");
         // dup, not reopen: the offset advances on the original description.
-        assert_eq!(source.file.stream_position().unwrap(), 3);
+        assert_eq!(source.member.file().stream_position().unwrap(), 3);
         drop(reader);
         std::fs::rename(&root, &moved).unwrap();
         std::fs::create_dir(&root).unwrap();
@@ -215,14 +232,52 @@ mod tests {
         std::fs::write(root.path().join("file"), b"same bytes").unwrap();
         std::fs::write(root.path().join("other"), b"same bytes").unwrap();
         let mut source = capture(root.path(), "file");
-        source.file = source
-            .rooted
-            .open_regular_blocking(&relative("other"))
-            .unwrap();
+        source.member = capture(root.path(), "other").member;
         assert!(matches!(
             source.validate_blocking(),
             Err(SourceFileError::Changed { .. })
         ));
+    }
+
+    #[test]
+    fn foreign_parent_with_the_original_inode_cannot_replace_the_opening_binding() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("selected")).unwrap();
+        std::fs::create_dir(root.path().join("alternate")).unwrap();
+        std::fs::write(root.path().join("selected/file"), b"original").unwrap();
+        std::fs::hard_link(
+            root.path().join("selected/file"),
+            root.path().join("alternate/file"),
+        )
+        .unwrap();
+        let source = capture(root.path(), "selected/file");
+        let original = source.identity;
+        std::fs::rename(root.path().join("selected"), root.path().join("held")).unwrap();
+        std::fs::rename(root.path().join("alternate"), root.path().join("selected")).unwrap();
+        assert_eq!(
+            source
+                .rooted
+                .path_identity_blocking(&source.relative)
+                .unwrap(),
+            Some((EntryKind::File, original)),
+            "the named inode observation alone still passes"
+        );
+        assert_eq!(
+            crate::endpoint::local_identity::metadata_identity(
+                &source.member.file().metadata().unwrap(),
+                EntryKind::File,
+            ),
+            Some(original)
+        );
+        assert!(matches!(
+            source.validate_blocking(),
+            Err(SourceFileError::Changed { .. })
+        ));
+        assert!(source.clone_reader_blocking().is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("held/file")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]
@@ -264,7 +319,13 @@ mod tests {
         .unwrap();
         std::fs::create_dir(root.path().join("old-dir")).unwrap();
         std::fs::write(root.path().join("old-dir/member"), b"original").unwrap();
-        nested.validate_fd_blocking().unwrap();
+        assert_eq!(
+            crate::endpoint::local_identity::metadata_identity(
+                &nested.member.file().metadata().unwrap(),
+                EntryKind::File,
+            ),
+            Some(nested.identity)
+        );
         assert!(matches!(
             nested.validate_blocking(),
             Err(SourceFileError::Changed { .. })
@@ -282,7 +343,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         xattr::set(&path, "user.sy-source-lease", b"value").unwrap();
         let source = capture(root.path(), "file");
-        let before = source.file.metadata().unwrap();
+        let before = source.member.file().metadata().unwrap();
         let (empty, flags) = source
             .read_metadata_blocking(SourceMetadataRequest::default())
             .unwrap();
@@ -318,7 +379,7 @@ mod tests {
             ));
         }
         source.validate_blocking().unwrap();
-        let after = source.file.metadata().unwrap();
+        let after = source.member.file().metadata().unwrap();
         assert_eq!(
             (
                 before.mode(),
@@ -363,7 +424,7 @@ mod tests {
         assert_eq!(
             source
                 .rooted
-                .read_open_file_bsd_flags_blocking(&source.file)
+                .read_open_file_bsd_flags_blocking(source.member.file())
                 .unwrap(),
             original.metadata().unwrap().st_flags()
         );
