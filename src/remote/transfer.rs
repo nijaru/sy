@@ -1005,13 +1005,11 @@ fn reconstruct_file(
                         field: "modified_nanoseconds",
                         reason: "nanoseconds must be below 1,000,000,000",
                     })?;
-                prepared
-                    .staged
-                    .apply_metadata_blocking(begin.unix_mode(), modified)?;
                 prepared.staged.apply_preservation_blocking(
+                    begin.unix_mode(),
+                    modified,
                     xattrs.as_deref(),
                     acls.as_deref(),
-                    begin.unix_mode(),
                 )?;
                 if prepared.staged.staged_hash_blocking()?.as_bytes() != &digest {
                     return Err(RemoteTransferError::DigestMismatch);
@@ -2043,7 +2041,15 @@ mod tests {
     #[tokio::test]
     async fn staged_preservation_applies_before_commit() {
         let root = tempfile::TempDir::new().unwrap();
+        let source_path = root.path().join("source");
+        std::fs::write(&source_path, b"new").unwrap();
+        xattr::set(&source_path, "user.sy_test", b"v").unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let source_relative = RelativePath::new(PathBuf::from("source")).unwrap();
+        let source = rooted.open_regular_blocking(&source_relative).unwrap();
+        let source_xattrs = rooted
+            .read_open_file_xattrs_blocking(&source, &source_relative)
+            .unwrap();
         let relative = RelativePath::new(PathBuf::from("file")).unwrap();
         let prepared = tokio::task::spawn_blocking({
             let relative = relative.clone();
@@ -2071,12 +2077,9 @@ mod tests {
         )))
         .await
         .unwrap();
-        tx.send(ReconstructionOp::Xattrs(vec![(
-            OsString::from("user.sy_test"),
-            b"v".to_vec(),
-        )]))
-        .await
-        .unwrap();
+        tx.send(ReconstructionOp::Xattrs(source_xattrs))
+            .await
+            .unwrap();
         let digest = blake3::hash(b"new");
         tx.send(ReconstructionOp::End(WireFileEnd::new(
             3,

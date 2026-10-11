@@ -2516,13 +2516,18 @@ mod tests {
     async fn preservation_is_applied_before_commit() {
         let fixture = Fixture::new();
         std::fs::write(fixture.source_file(), b"NEW!").unwrap();
+        xattr::set(fixture.source_file(), "user.sy_test", b"v").unwrap();
         let identity = create_identity(&fixture);
         let mut opts = options(identity, false);
         opts.preservation = Preservation {
-            xattrs: Some(vec![(
-                std::ffi::OsString::from("user.sy_test"),
-                b"v".to_vec(),
-            )]),
+            // A complete native source set includes mandatory security labels.
+            xattrs: Some(
+                fixture
+                    .source_endpoint()
+                    .read_xattrs(Path::new(NAME))
+                    .await
+                    .unwrap(),
+            ),
             acl: None,
         };
 

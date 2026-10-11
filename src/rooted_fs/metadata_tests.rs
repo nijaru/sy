@@ -518,6 +518,68 @@ fn fd_fixture_path(file: &File) -> PathBuf {
 
 #[cfg(all(target_os = "linux", feature = "acl"))]
 #[tokio::test]
+async fn staged_native_acl_xattr_precedes_intended_mode() {
+    use std::io::Write;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    std::fs::write(&source, b"source bytes").unwrap();
+    let mut acl = exacl::from_mode(0o640);
+    acl.push(exacl::AclEntry::allow_user(
+        "12345",
+        exacl::Perm::READ | exacl::Perm::WRITE,
+        exacl::Flag::empty(),
+    ));
+    acl.push(exacl::AclEntry::allow_mask(
+        exacl::Perm::READ,
+        exacl::Flag::empty(),
+    ));
+    exacl::setfacl(&[&source], &acl, None).unwrap();
+    let native_acl = xattr::get(&source, "system.posix_acl_access")
+        .unwrap()
+        .unwrap();
+    let source_before = std::fs::metadata(&source).unwrap();
+    let source_xattrs = read_xattrs_from_file(&File::open(&source).unwrap()).unwrap();
+
+    // Independent native reference for -X without -A: the copied ACL xattr
+    // precedes the representative's intended mode. chmod adjusts the mask;
+    // a separately requested -A would instead apply its explicit ACL last.
+    let reference = fixture.path().join("reference");
+    std::fs::write(&reference, b"source bytes").unwrap();
+    xattr::set(&reference, "system.posix_acl_access", &native_acl).unwrap();
+    std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected_acl = exacl::getfacl(&reference, None).unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(destination.path().join("file"), b"old bytes").unwrap();
+    let rooted = RootedFs::open(destination.path().into()).await.unwrap();
+    let mut staged = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative(),
+            ExpectedDestination::SnapshotAtOpen,
+        )
+        .unwrap();
+    staged.file_mut().write_all(b"source bytes").unwrap();
+    staged
+        .apply_preservation_blocking(Some(0o600), None, Some(&source_xattrs), None)
+        .unwrap();
+    staged.commit().unwrap().finalize_blocking(None).unwrap();
+    let output = destination.path().join("file");
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(exacl::getfacl(&output, None).unwrap(), expected_acl);
+    assert_eq!(std::fs::read(&output).unwrap(), b"source bytes");
+    assert_eq!(
+        crate::endpoint::local_identity::identity_for_metadata(&source_before),
+        crate::endpoint::local_identity::identity_for_metadata(&std::fs::metadata(source).unwrap()),
+        "metadata preparation must not mutate the source inode",
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "acl"))]
+#[tokio::test]
 async fn native_acl_outcome_is_verified_without_rewriting_its_mask() {
     use std::io::Write;
 
@@ -571,10 +633,8 @@ async fn native_acl_outcome_is_verified_without_rewriting_its_mask() {
                     )
                     .unwrap();
                 writer.file_mut().write_all(b"new bytes").unwrap();
-                writer
-                    .apply_metadata_blocking(requested_mode, None)
-                    .unwrap();
-                let result = writer.apply_preservation_blocking(None, Some(&text), requested_mode);
+                let result =
+                    writer.apply_preservation_blocking(requested_mode, None, None, Some(&text));
                 assert_eq!(
                     exacl::getfacl(fd_alias_path(&writer.file), None).unwrap(),
                     entries

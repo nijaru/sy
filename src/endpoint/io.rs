@@ -116,19 +116,6 @@ impl From<&FileMetadata> for StagedMetadata {
     }
 }
 
-impl StagedMetadata {
-    pub const fn preserved_mode(&self) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            self.unix_mode
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
-    }
-}
-
 /// Transactional destination write.
 ///
 /// Implementations write into endpoint-private staging state. The writer must
@@ -141,23 +128,15 @@ impl StagedMetadata {
 #[async_trait]
 pub trait StagedWriter: Send {
     async fn write(&mut self, data: &[u8]) -> Result<()>;
-    async fn set_metadata(&mut self, metadata: &StagedMetadata) -> Result<()>;
-
-    /// Apply the preservation payload (xattrs/ACLs) to private staging state
-    /// before commit, then prove the effective mode still matches `metadata`.
-    ///
-    /// An error aborts staging: preservation failures never commit content
-    /// without its requested attributes.
-    async fn apply_preservation(
+    /// Apply xattrs, then mode/time, then ACLs, and verify the requested mode.
+    /// Keep this one endpoint-owned operation: xattrs may include a native ACL,
+    /// while ACL application can change the mode's mask. A final chmod is not
+    /// permission to silently rewrite the requested ACL.
+    async fn prepare_metadata(
         &mut self,
+        metadata: &StagedMetadata,
         preservation: &Preservation,
-        expected_mode: Option<u32>,
-    ) -> Result<()> {
-        let _ = (preservation, expected_mode);
-        Err(SyncError::Config(
-            "endpoint cannot apply staged preservation".to_string(),
-        ))
-    }
+    ) -> Result<()>;
 
     /// Hash the bytes currently in staging without making them visible.
     ///
@@ -280,10 +259,7 @@ pub(crate) async fn finalize_staged_writer(
     flags: Option<u32>,
 ) -> Result<FinalizationOutcome> {
     let prepared = async {
-        writer.set_metadata(metadata).await?;
-        writer
-            .apply_preservation(preservation, metadata.preserved_mode())
-            .await?;
+        writer.prepare_metadata(metadata, preservation).await?;
 
         let verification = if let Some(expected) = expected_hash {
             let actual = writer.staged_hash().await?.ok_or_else(|| {

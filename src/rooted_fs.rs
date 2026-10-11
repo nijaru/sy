@@ -595,30 +595,30 @@ impl RootedStagedFile {
         }
     }
 
-    /// Mirror a preservation set onto the staging inode before commit, then
-    /// prove the effective mode still matches `unix_mode` (ACL application can
-    /// rewrite the shared mode bits). Staging is a fresh inode, so mirroring
-    /// means setting exactly this set.
-    pub fn apply_preservation_blocking(
+    /// Prepare native metadata on the original private inode in one order:
+    /// xattrs -> mode/time -> ACL -> explicit mode proof. Xattrs can contain a
+    /// native ACL, so they must not run after the intended mode is established.
+    /// Never repair an ACL/mode conflict by chmod after applying the ACL.
+    pub(crate) fn apply_preservation_blocking(
         &mut self,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
         xattrs: Option<&[(OsString, Vec<u8>)]>,
         acl: Option<&str>,
-        unix_mode: Option<u32>,
     ) -> Result<()> {
         #[cfg(unix)]
         {
-            use xattr::FileExt;
-
-            if let Some(xattrs) = xattrs {
-                for (name, value) in xattrs {
-                    self.file.set_xattr(name, value)?;
-                }
-            }
-            metadata::apply_acl_and_verify_mode(&self.file, acl, unix_mode)
+            let preservation = MetadataPreservation {
+                xattrs,
+                acl,
+                bsd_flags: None,
+            };
+            preservation.validate()?;
+            preservation.apply(&self.file, unix_mode, modified)
         }
         #[cfg(not(unix))]
         {
-            let _ = (xattrs, acl, unix_mode);
+            let _ = (unix_mode, modified, xattrs, acl);
             Err(RootedFsError::UnsupportedPlatform)
         }
     }

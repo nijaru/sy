@@ -860,7 +860,11 @@ impl StagedWriter for LocalStagedWriter {
         Ok(())
     }
 
-    async fn set_metadata(&mut self, metadata: &super::io::StagedMetadata) -> Result<()> {
+    async fn prepare_metadata(
+        &mut self,
+        metadata: &super::io::StagedMetadata,
+        preservation: &crate::endpoint::io::Preservation,
+    ) -> Result<()> {
         self.file_mut()?.flush().await?;
         let modified = metadata
             .modified
@@ -871,8 +875,16 @@ impl StagedWriter for LocalStagedWriter {
             })
             .transpose()?;
         let unix_mode = metadata.unix_mode;
-        self.with_staged(move |staged| staged.apply_metadata_blocking(unix_mode, modified))
-            .await
+        let preservation = preservation.clone();
+        self.with_staged(move |staged| {
+            staged.apply_preservation_blocking(
+                unix_mode,
+                modified,
+                preservation.xattrs.as_deref(),
+                preservation.acl.as_deref(),
+            )
+        })
+        .await
     }
 
     async fn staged_hash(&mut self) -> Result<Option<blake3::Hash>> {
@@ -930,23 +942,6 @@ impl StagedWriter for LocalStagedWriter {
                 source_size,
             )?;
             Ok((source, destination_basis, bytes_written))
-        })
-        .await
-    }
-
-    async fn apply_preservation(
-        &mut self,
-        preservation: &crate::endpoint::io::Preservation,
-        expected_mode: Option<u32>,
-    ) -> Result<()> {
-        self.file_mut()?.flush().await?;
-        let preservation = preservation.clone();
-        self.with_staged(move |staged| {
-            staged.apply_preservation_blocking(
-                preservation.xattrs.as_deref(),
-                preservation.acl.as_deref(),
-                expected_mode,
-            )
         })
         .await
     }
@@ -1508,10 +1503,13 @@ mod tests {
         writer.write(b"private bytes").await.unwrap();
         let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123);
         writer
-            .set_metadata(&crate::endpoint::io::StagedMetadata {
-                modified: Some(old),
-                unix_mode: Some(0o600),
-            })
+            .prepare_metadata(
+                &crate::endpoint::io::StagedMetadata {
+                    modified: Some(old),
+                    unix_mode: Some(0o600),
+                },
+                &crate::endpoint::io::Preservation::default(),
+            )
             .await
             .unwrap();
         let metadata = crate::endpoint::io::StagedMetadata {
@@ -2375,7 +2373,10 @@ mod tests {
             .unwrap();
         writer.write(b"content").await.unwrap();
         writer
-            .set_metadata(&crate::endpoint::io::StagedMetadata::from(&make_meta()))
+            .prepare_metadata(
+                &crate::endpoint::io::StagedMetadata::from(&make_meta()),
+                &crate::endpoint::io::Preservation::default(),
+            )
             .await
             .unwrap();
         writer.commit().await.unwrap().finalize(None).await.unwrap();
