@@ -41,6 +41,7 @@ struct BeforeFinalize<E> {
     destination: PathBuf,
     outside: PathBuf,
     mutation: Mutation,
+    prepared_parents: Vec<PathBuf>,
 }
 impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     type Action = E::Action;
@@ -56,6 +57,14 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
         self.inner.is_directory_action(action)
     }
     async fn execute(&self, item: WorkItem<E::Action>) -> Result<WorkResult, E::Error> {
+        if !self.inner.is_directory_action(item.action()) {
+            for parent in &self.prepared_parents {
+                assert!(
+                    parent.is_dir(),
+                    "leaf work preceded preparation of {parent:?}"
+                );
+            }
+        }
         self.inner.execute(item).await
     }
     async fn execute_delete(&self, action: DeleteAction) -> Result<(), E::Error> {
@@ -228,6 +237,7 @@ async fn run_case(
         destination: destination.path().to_path_buf(),
         outside: outside.path().to_path_buf(),
         mutation,
+        prepared_parents: Vec::new(),
     };
     let result = match direction {
         Direction::Local => {
@@ -282,6 +292,7 @@ async fn run_case(
                         destination: destination.path().to_path_buf(),
                         outside: outside.path().to_path_buf(),
                         mutation,
+                        prepared_parents: Vec::new(),
                     },
                     NonZeroUsize::new(2).unwrap(),
                 )
@@ -304,6 +315,7 @@ async fn run_case(
                         destination: destination.path().to_path_buf(),
                         outside: outside.path().to_path_buf(),
                         mutation,
+                        prepared_parents: Vec::new(),
                     },
                     NonZeroUsize::new(2).unwrap(),
                 )
@@ -414,6 +426,107 @@ async fn run_case(
             // SAFETY: path is live and NUL-terminated; clear fixture flags for cleanup.
             assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0) }, 0);
         }
+    }
+}
+
+#[tokio::test]
+async fn interleaved_hardlink_parents_are_prepared_before_leaves_and_finalized_last() {
+    use std::os::unix::fs::MetadataExt;
+
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    for parent in ["a", "z", "z/inner"] {
+        std::fs::create_dir(source.path().join(parent)).unwrap();
+    }
+    for (name, bytes) in [("one", b"first".as_slice()), ("two", b"second".as_slice())] {
+        std::fs::write(source.path().join("a").join(name), bytes).unwrap();
+        std::fs::hard_link(
+            source.path().join("a").join(name),
+            source.path().join("z/inner").join(name),
+        )
+        .unwrap();
+    }
+    for parent in ["a", "z", "z/inner"] {
+        std::fs::set_permissions(
+            source.path().join(parent),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            source.path().join(parent),
+            filetime::FileTime::from_unix_time(1_600_000_000, 123),
+        )
+        .unwrap();
+    }
+    let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
+        .await
+        .unwrap();
+    let mut request = ScanRequest::default();
+    request.metadata.unix_mode = true;
+    request.metadata.hardlink_group = true;
+    let mut plan = preflight_sync(
+        authority.entries(request),
+        local_entry_stream(destination.path().into(), request),
+        ComparisonPolicy {
+            preserve_permissions: true,
+            preserve_times: true,
+            ..Default::default()
+        },
+        None,
+        |_| true,
+    )
+    .await
+    .unwrap();
+    plan.validate_hardlink_bytes(|_| async { panic!("new groups need no comparison hash") })
+        .await
+        .unwrap();
+    let summary = SyncController::new(
+        BeforeFinalize {
+            inner: LocalSyncExecutor::new(
+                authority,
+                sy::endpoint::local::LocalEndpoint::new(destination.path().into()),
+                Scheduler::new(ResourceBudget::default()).unwrap(),
+            )
+            .with_hardlinks(true),
+            source: source.path().into(),
+            destination: destination.path().into(),
+            outside: destination.path().into(),
+            mutation: Mutation::None,
+            prepared_parents: vec![
+                destination.path().join("a"),
+                destination.path().join("z/inner"),
+            ],
+        },
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .execute(plan)
+    .await
+    .unwrap();
+    assert_eq!(
+        (summary.planned_operations, summary.main_operations),
+        (7, 7)
+    );
+    assert_eq!((summary.dirs_created, summary.finalized_metadata), (3, 3));
+    assert_eq!((summary.files_created, summary.literal_bytes), (4, 11));
+    for parent in ["a", "z", "z/inner"] {
+        let path = destination.path().join(parent);
+        assert_eq!(mode(&path), 0o750);
+        let modified =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap());
+        assert_eq!(
+            (modified.unix_seconds(), modified.nanoseconds()),
+            (1_600_000_000, 123)
+        );
+    }
+    for name in ["one", "two"] {
+        let first = std::fs::metadata(destination.path().join("a").join(name)).unwrap();
+        let second = std::fs::metadata(destination.path().join("z/inner").join(name)).unwrap();
+        assert_eq!((first.dev(), first.ino()), (second.dev(), second.ino()));
+        assert_eq!(first.nlink(), 2);
+        assert_eq!(
+            std::fs::read(destination.path().join("a").join(name)).unwrap(),
+            std::fs::read(source.path().join("a").join(name)).unwrap(),
+        );
     }
 }
 

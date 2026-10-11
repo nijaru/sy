@@ -693,8 +693,10 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
 
 /// Executes one preflighted v3 sync with bounded task fan-out.
 ///
-/// Directory creation is awaited in preorder before reconciliation advances to
-/// descendants. Independent leaf work may run concurrently, but at most
+/// An authenticated first pass prepares every directory in preorder; the
+/// second pass executes leaves. This lets contiguous hardlink work span parents
+/// without trying to publish into a directory not prepared yet. Independent
+/// leaf work may run concurrently, but at most
 /// `max_in_flight` worker futures exist even before scheduler admission. All
 /// directory metadata is preflighted into a reverse journal and replayed
 /// child-before-parent only after main work and reverse deletes complete.
@@ -727,27 +729,16 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             delete_candidates,
             ..SyncSummary::default()
         };
+        let runtime_finalize = self
+            .prepare_directories(&mut reader, &mut finalize, execution_policy, &mut summary)
+            .await?;
+        reader.rewind()?;
         let mut workers = JoinSet::<std::result::Result<WorkResult, E::Error>>::new();
-        let mut runtime_finalize = FinalizeJournal::new().await?;
-        let mut next_directory = finalize.next_forward().await?;
 
         let main_result: Result<()> = async {
             while let Some(operation) = reader.next().await? {
-                record_semantic_operation(&mut summary, &operation)?;
-                let directory = if next_directory
-                    .as_ref()
-                    .is_some_and(|record| &record.path == operation.path())
-                {
-                    let record = next_directory.take();
-                    next_directory = finalize.next_forward().await?;
-                    record
-                } else {
-                    None
-                };
-                if let Some(record) = &directory {
-                    if matches!(record.target, DirectoryTarget::Observed(_)) {
-                        runtime_finalize.append(record).await?;
-                    }
+                if operation.source().is_directory() {
+                    continue;
                 }
                 if let SyncOp::Unchanged {
                     source,
@@ -791,32 +782,13 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                     .lower(operation, execution_policy)
                     .map_err(|error| ControllerError::backend("execution", error))?;
                 let Some(main) = lowered else {
-                    if directory.is_some_and(|record| record.target == DirectoryTarget::Create) {
-                        return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
-                    }
                     continue;
                 };
                 summary.main_operations =
                     checked_add(summary.main_operations, 1, "main operation")?;
 
                 if self.executor.is_directory_action(main.action()) {
-                    let result = self
-                        .executor
-                        .execute(main)
-                        .await
-                        .map_err(|error| ControllerError::backend("execution", error))?;
-                    let Some(mut record) = directory else {
-                        return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
-                    };
-                    let WorkResult::DirectoryPrepared(identity) = result else {
-                        return Err(ControllerError::InvalidDirectoryReceipt(record.path));
-                    };
-                    if record.target != DirectoryTarget::Create {
-                        return Err(ControllerError::InvalidDirectoryReceipt(record.path));
-                    }
-                    record.target = DirectoryTarget::Observed(identity);
-                    runtime_finalize.append(&record).await?;
-                    continue;
+                    return Err(ControllerError::InvalidDirectoryReceipt(operation_path));
                 }
 
                 while workers.len() >= self.max_in_flight.get() {
@@ -852,11 +824,7 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             return Err(error);
         }
 
-        if let Some(record) = next_directory {
-            return Err(ControllerError::InvalidDirectoryReceipt(record.path));
-        }
-
-        let mut finalize = runtime_finalize.seal().await?;
+        let mut finalize = runtime_finalize;
 
         if let Some(delete) = delete {
             let mut replay = delete.into_replay();
@@ -888,6 +856,80 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             .map_err(|error| ControllerError::backend("execution", error))?;
 
         Ok(summary)
+    }
+
+    async fn prepare_directories(
+        &self,
+        reader: &mut PlanJournalReader,
+        finalize: &mut FinalizeJournalReader,
+        policy: ExecutionPolicy,
+        summary: &mut SyncSummary,
+    ) -> Result<FinalizeJournalReader> {
+        let mut runtime_finalize = FinalizeJournal::new().await?;
+        let mut next_directory = finalize.next_forward().await?;
+        while let Some(operation) = reader.next().await? {
+            // Count the original semantic operations, not execution strategy
+            // decisions or the second replay of the same authenticated records.
+            record_semantic_operation(summary, &operation)?;
+            let directory = if next_directory
+                .as_ref()
+                .is_some_and(|record| &record.path == operation.path())
+            {
+                let record = next_directory.take();
+                next_directory = finalize.next_forward().await?;
+                record
+            } else {
+                None
+            };
+            if let Some(record) = &directory {
+                if matches!(record.target, DirectoryTarget::Observed(_)) {
+                    runtime_finalize.append(record).await?;
+                }
+            }
+            if !operation.source().is_directory() {
+                if directory.is_some() {
+                    return Err(ControllerError::InvalidDirectoryReceipt(
+                        operation.path().clone(),
+                    ));
+                }
+                continue;
+            }
+            let path = operation.path().clone();
+            let main = self
+                .executor
+                .lower(operation, policy)
+                .map_err(|error| ControllerError::backend("directory preparation", error))?;
+            let Some(main) = main else {
+                if directory.is_some_and(|record| record.target == DirectoryTarget::Create) {
+                    return Err(ControllerError::InvalidDirectoryReceipt(path));
+                }
+                continue;
+            };
+            if !self.executor.is_directory_action(main.action()) {
+                return Err(ControllerError::InvalidDirectoryReceipt(path));
+            }
+            summary.main_operations = checked_add(summary.main_operations, 1, "main operation")?;
+            let result = self
+                .executor
+                .execute(main)
+                .await
+                .map_err(|error| ControllerError::backend("directory preparation", error))?;
+            let Some(mut record) = directory else {
+                return Err(ControllerError::InvalidDirectoryReceipt(path));
+            };
+            let WorkResult::DirectoryPrepared(identity) = result else {
+                return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+            };
+            if record.target != DirectoryTarget::Create {
+                return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+            }
+            record.target = DirectoryTarget::Observed(identity);
+            runtime_finalize.append(&record).await?;
+        }
+        if let Some(record) = next_directory {
+            return Err(ControllerError::InvalidDirectoryReceipt(record.path));
+        }
+        Ok(runtime_finalize.seal().await?)
     }
 }
 
