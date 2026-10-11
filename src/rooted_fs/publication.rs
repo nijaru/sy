@@ -79,10 +79,10 @@ impl RootedPublishedFile {
                         .rooted
                         .admit_mutation_with_transaction_blocking(self.admission.as_deref())?;
                     self.verify_binding()?;
-                    // SAFETY: the live descriptor is the original staged inode,
-                    // checked against its recorded publication state, not a reopen.
-                    if unsafe { libc::fchflags(self.file.as_raw_fd(), flags) } != 0 {
-                        return Err(RootedFsError::Io(std::io::Error::last_os_error()));
+                    if !super::apply_bsd_flags_fd(&self.file, flags)? {
+                        // No native effect can justify advancing ctime. Retain
+                        // the original creator-FD observation for completion.
+                        return self.verify_binding();
                     }
                     let after = stat_fd(self.file.as_raw_fd())?;
                     let before = &self.observed;

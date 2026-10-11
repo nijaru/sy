@@ -15,11 +15,8 @@
 //! divergence from exacl's mapping is a bug; the differential tests below
 //! (fd implementation vs exacl path API on the same file) prove agreement.
 //!
-//! Linux does not need this module: there `/proc/self/fd/N` resolves to the
-//! open inode for `acl_get_file`/`acl_set_file` (verified on Fedora,
-//! including default entries and writes through read-only descriptors), so
-//! the Linux implementation reuses exacl's public API on the fd-aliased
-//! path with zero conversion code.
+//! Linux uses exacl on the held-FD alias for wire reads and SET, but reads
+//! numeric native qualifiers separately for effect-free comparison.
 
 use exacl::{AclEntry, AclEntryKind, Flag, Perm};
 use std::ffi::{CStr, CString};
@@ -136,6 +133,14 @@ extern "C" {
 /// caller holds a no-follow leaf through the pinned root); every syscall
 /// below operates on the open file description, never on a path.
 pub(super) fn read_fd_entries(fd: RawFd) -> io::Result<Vec<AclEntry>> {
+    read_fd_native_entries(fd)?
+        .into_iter()
+        .map(NativeEntry::into_entry)
+        .collect()
+}
+
+/// Comparison must retain the kernel's UUID, not UUID -> ID -> name -> UUID.
+pub(super) fn read_fd_native_entries(fd: RawFd) -> io::Result<Vec<NativeEntry>> {
     // SAFETY: `acl_get_fd` reads the ACL of the open file description `fd`,
     // which the caller guarantees is a live held descriptor. A null return
     // means no ACL (or an error distinguished below via errno).
@@ -152,7 +157,7 @@ pub(super) fn read_fd_entries(fd: RawFd) -> io::Result<Vec<AclEntry>> {
     }
     // SAFETY: `acl` is a live object from `acl_get_fd`; freed exactly once
     // on every return path below.
-    let result = read_entries(acl);
+    let result = read_native_entries(acl);
     unsafe { acl_free(acl.cast()) };
     result
 }
@@ -164,6 +169,26 @@ pub(super) fn read_fd_entries(fd: RawFd) -> io::Result<Vec<AclEntry>> {
 /// as exacl's macOS backend, so text produced from these entries is identical
 /// to the path-based implementation's.
 pub(super) fn write_fd_entries(fd: RawFd, entries: &[AclEntry]) -> io::Result<()> {
+    let acl = build_acl(entries)?;
+    // SAFETY: acl is a valid owned native object and fd is held by the caller.
+    let ret = unsafe { acl_set_fd(fd, acl) };
+    let error = (ret != 0).then(io::Error::last_os_error);
+    // SAFETY: build_acl returned this owned object, freed exactly once.
+    unsafe { acl_free(acl.cast()) };
+    error.map_or(Ok(()), Err)
+}
+
+/// Use SET's native conversion without changing a filesystem ACL or resolving
+/// the resulting UUID back to a name. ACE order is never sorted away.
+pub(super) fn desired_native_entries(entries: &[AclEntry]) -> io::Result<Vec<NativeEntry>> {
+    let acl = build_acl(entries)?;
+    let result = read_native_entries(acl);
+    // SAFETY: build_acl returned this owned object, freed exactly once.
+    unsafe { acl_free(acl.cast()) };
+    result
+}
+
+fn build_acl(entries: &[AclEntry]) -> io::Result<AclT> {
     let count = i32::try_from(entries.len())
         .ok()
         .filter(|_| entries.len() <= ACL_MAX_ENTRIES)
@@ -178,23 +203,48 @@ pub(super) fn write_fd_entries(fd: RawFd, entries: &[AclEntry]) -> io::Result<()
             add_entry(&mut acl, entry)
                 .map_err(|err| io::Error::new(err.kind(), format!("entry {i}: {err}")))?;
         }
-        // SAFETY: `acl` is a live object built above; `fd` is the caller's
-        // live held descriptor.
-        let ret = unsafe { acl_set_fd(fd, acl) };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
         Ok(())
     })();
-    // SAFETY: `acl` is live here on every path (freed exactly once); even
-    // `acl_create_entry` reallocations keep it valid via the `&mut` handoff.
-    unsafe { acl_free(acl.cast()) };
-    result
+    if let Err(error) = result {
+        // SAFETY: acl is owned here, including after create-entry reallocations.
+        unsafe { acl_free(acl.cast()) };
+        return Err(error);
+    }
+    Ok(acl)
 }
 
-// MARK: read conversion (native acl_t -> exacl entries)
+// MARK: read conversion (native acl_t -> comparison state / exacl wire entries)
 
-fn read_entries(acl: AclT) -> io::Result<Vec<AclEntry>> {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct NativeEntry {
+    tag: AclTagT,
+    guid: Option<[u8; 16]>,
+    perms: Perm,
+    flags: Flag,
+}
+
+impl NativeEntry {
+    fn into_entry(self) -> io::Result<AclEntry> {
+        let qualifier = match self.guid {
+            Some(guid) => Qualifier::from_guid(guid)?,
+            None => Qualifier::Unknown(format!("@tag {}", self.tag)),
+        };
+        let (kind, name) = match qualifier {
+            Qualifier::Unknown(text) => (AclEntryKind::Unknown, text),
+            Qualifier::User(_) | Qualifier::Guid(_) => (AclEntryKind::User, qualifier.name()?),
+            Qualifier::Group(_) => (AclEntryKind::Group, qualifier.name()?),
+        };
+        Ok(AclEntry {
+            kind,
+            name,
+            perms: self.perms,
+            flags: self.flags,
+            allow: self.tag == ACL_EXTENDED_ALLOW,
+        })
+    }
+}
+
+fn read_native_entries(acl: AclT) -> io::Result<Vec<NativeEntry>> {
     let mut out = Vec::new();
     let mut raw: AclEntryT = ptr::null_mut();
     // macOS reports success with 0 (unlike Linux/FreeBSD, which use 1).
@@ -206,40 +256,31 @@ fn read_entries(acl: AclT) -> io::Result<Vec<AclEntry>> {
         if ret != 0 {
             break;
         }
-        out.push(read_entry(raw)?);
+        out.push(read_native_entry(raw)?);
         id = ACL_NEXT_ENTRY;
     }
     Ok(out)
 }
 
-fn read_entry(raw: AclEntryT) -> io::Result<AclEntry> {
+fn read_native_entry(raw: AclEntryT) -> io::Result<NativeEntry> {
     let mut tag: AclTagT = 0;
     // SAFETY: `raw` is a live entry handle from iteration.
     if unsafe { acl_get_tag_type(raw, &mut tag) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let (allow, qualifier) = match tag {
-        ACL_EXTENDED_ALLOW => (true, read_qualifier(raw)?),
-        ACL_EXTENDED_DENY => (false, read_qualifier(raw)?),
-        other => (false, Qualifier::Unknown(format!("@tag {other}"))),
+    let guid = match tag {
+        ACL_EXTENDED_ALLOW | ACL_EXTENDED_DENY => Some(read_guid(raw)?),
+        _ => None,
     };
-    let perms = read_perms(raw)?;
-    let flags = read_flags(raw)?;
-    let (kind, name) = match qualifier {
-        Qualifier::Unknown(text) => (AclEntryKind::Unknown, text),
-        Qualifier::User(_) | Qualifier::Guid(_) => (AclEntryKind::User, qualifier.name()?),
-        Qualifier::Group(_) => (AclEntryKind::Group, qualifier.name()?),
-    };
-    Ok(AclEntry {
-        kind,
-        name,
-        perms,
-        flags,
-        allow,
+    Ok(NativeEntry {
+        tag,
+        guid,
+        perms: read_perms(raw)?,
+        flags: read_flags(raw)?,
     })
 }
 
-fn read_qualifier(raw: AclEntryT) -> io::Result<Qualifier> {
+fn read_guid(raw: AclEntryT) -> io::Result<[u8; 16]> {
     // SAFETY: `raw` is live; the returned qualifier buffer is freed below.
     let uuid_ptr = unsafe { acl_get_qualifier(raw).cast::<[u8; 16]>() };
     if uuid_ptr.is_null() {
@@ -251,8 +292,9 @@ fn read_qualifier(raw: AclEntryT) -> io::Result<Qualifier> {
     // SAFETY: non-null qualifier from a live entry is a readable 16-byte
     // UUID; copied out before freeing.
     let guid = unsafe { *uuid_ptr };
+    // SAFETY: this is the owned allocation returned by acl_get_qualifier.
     unsafe { acl_free(uuid_ptr.cast()) };
-    Qualifier::from_guid(guid)
+    Ok(guid)
 }
 
 fn read_perms(raw: AclEntryT) -> io::Result<Perm> {
@@ -736,6 +778,11 @@ mod tests {
         assert_eq!(reread_fd.len(), 1);
         assert_eq!(reread_fd[0].kind, AclEntryKind::User);
         assert!(reread_fd[0].allow);
+        // Wire reads remain named; comparison keeps the exact native UUID,
+        // even when the membership service can turn it into a user name.
+        let native = read_fd_native_entries(fd_of(&file)).unwrap();
+        assert_eq!(native[0].guid, Some(uid_to_guid(uid).unwrap()));
+        assert_eq!(native, desired_native_entries(&planted).unwrap());
 
         // Clearing through the fd matches exacl's empty-set clear.
         write_fd_entries(fd_of(&file), &[]).unwrap();
@@ -772,6 +819,52 @@ mod tests {
         // carries, so this also pins the on-wire format agreement.
         let text = exacl::to_string(&reread_fd).unwrap();
         assert_eq!(exacl::from_str(&text).unwrap(), reread_fd);
+    }
+
+    /// A raw kernel qualifier is authoritative even if membership resolution
+    /// might map it to an ID whose forward UUID is different. No filesystem or
+    /// credential provider changes are needed to exercise the comparison read.
+    #[test]
+    fn native_comparison_retains_original_guids_and_ace_order() {
+        // SAFETY: getuid returns the current process UID without pointer inputs.
+        let uid = unsafe { libc::getuid() };
+        let entries = [
+            AclEntry::allow_user(&uid.to_string(), Perm::READ, Flag::FILE_INHERIT),
+            AclEntry::deny_user(&uid.to_string(), Perm::WRITE, Flag::empty()),
+        ];
+        let acl = build_acl(&entries).unwrap();
+        let original = read_native_entries(acl).unwrap();
+        assert_eq!(original, desired_native_entries(&entries).unwrap());
+        let mut raw = ptr::null_mut();
+        // SAFETY: acl is a live owned native ACL; raw is writable storage.
+        assert_eq!(unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut raw) }, 0);
+        // macOS's compatibility UUID can resolve to this UID while the
+        // forward lookup returns a different directory-service UUID. This is
+        // a real native alias, with no changes to global credential providers.
+        let mut compatibility = parse_guid("ffffeeee-dddd-cccc-bbbb-aaaa00000000").unwrap();
+        compatibility[12..].copy_from_slice(&uid.to_be_bytes());
+        assert_eq!(
+            Qualifier::from_guid(compatibility).unwrap(),
+            Qualifier::User(uid)
+        );
+        for guid in [compatibility, [0x6b; 16]] {
+            // Also cover an opaque qualifier without any membership mapping.
+            // SAFETY: raw is a live ACE; guid provides the 16 readable bytes.
+            assert_eq!(unsafe { acl_set_qualifier(raw, guid.as_ptr().cast()) }, 0);
+            let changed = read_native_entries(acl).unwrap();
+            assert_eq!(changed[0].guid, Some(guid));
+            assert_eq!(changed[1], original[1]);
+            // Equal UID/name is not enough: equality requires the exact UUID.
+            assert_eq!(changed == original, original[0].guid == Some(guid));
+            assert_eq!(changed[0].tag, ACL_EXTENDED_ALLOW);
+            assert_eq!(changed[0].perms, Perm::READ);
+            assert_eq!(changed[0].flags, Flag::FILE_INHERIT);
+        }
+        let mut reversed = original;
+        reversed.reverse();
+        assert_ne!(reversed, desired_native_entries(&entries).unwrap());
+        // SAFETY: acl is owned here; no borrowed handles are used after free.
+        unsafe { acl_free(acl) };
     }
 
     #[cfg(unix)]

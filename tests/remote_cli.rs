@@ -494,6 +494,34 @@ async fn matching_preservation_through_ssh_does_not_touch_the_source() {
     let file = source.join("nested/file");
     std::fs::write(&file, b"original source bytes").unwrap();
     xattr::set(&file, "user.sy-idempotent", b"original attribute").unwrap();
+    #[cfg(feature = "acl")]
+    let original_acls = {
+        [&source, &source.join("nested"), &file].map(|path| {
+            let mut entries = exacl::getfacl(path, None).unwrap();
+            entries.push(exacl::AclEntry::allow_user(
+                "1",
+                exacl::Perm::READ,
+                exacl::Flag::empty(),
+            ));
+            #[cfg(target_os = "linux")]
+            entries.push(exacl::AclEntry::allow_mask(
+                exacl::Perm::READ | exacl::Perm::EXECUTE,
+                exacl::Flag::empty(),
+            ));
+            exacl::setfacl(&[path], &entries, None).unwrap();
+            exacl::getfacl(path, None).unwrap()
+        })
+    };
+    #[cfg(target_os = "macos")]
+    for path in [&source, &source.join("nested"), &file] {
+        use std::os::fd::AsRawFd;
+        let held = std::fs::File::open(path).unwrap();
+        // SAFETY: held is live; this fixture only adds the nonblocking NODUMP flag.
+        assert_eq!(
+            unsafe { libc::fchflags(held.as_raw_fd(), libc::UF_NODUMP) },
+            0
+        );
+    }
     let observe = || {
         [&source, &source.join("nested"), &file].map(|path| {
             let metadata = std::fs::symlink_metadata(path).unwrap();
@@ -512,13 +540,31 @@ async fn matching_preservation_through_ssh_does_not_touch_the_source() {
     for pull in [false, true] {
         let (mut source_arg, destination_arg) = operands(&source, &source, pull);
         source_arg.push("/");
-        for flags in ["-pX", "-ptX"] {
+        let mut preservation_flags = vec!["-pX", "-ptX"];
+        if cfg!(feature = "acl") {
+            preservation_flags.push("-pA");
+        }
+        if cfg!(all(feature = "acl", target_os = "macos")) {
+            preservation_flags.push("-pAF");
+        }
+        for flags in preservation_flags {
             copy(&source_arg, &destination_arg, &[flags], &search_path).await;
             assert_eq!(
                 observe(),
                 original,
                 "equal preservation mutated source metadata"
             );
+            #[cfg(feature = "acl")]
+            assert_eq!(
+                [&source, &source.join("nested"), &file]
+                    .map(|path| exacl::getfacl(path, None).unwrap()),
+                original_acls
+            );
+            #[cfg(target_os = "macos")]
+            for path in [&source, &source.join("nested"), &file] {
+                use std::os::macos::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(path).unwrap().st_flags(), libc::UF_NODUMP);
+            }
             assert_eq!(std::fs::read(&file).unwrap(), b"original source bytes");
             assert_eq!(
                 xattr::get(&file, "user.sy-idempotent").unwrap().unwrap(),
