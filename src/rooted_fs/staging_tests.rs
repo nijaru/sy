@@ -6,6 +6,61 @@ fn relative(path: &str) -> RelativePath {
     RelativePath::new(path).unwrap()
 }
 
+#[tokio::test]
+async fn transient_destination_kind_cannot_turn_absent_publication_into_exchange() {
+    let root = tempfile::tempdir().unwrap();
+    let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+    let target = root.path().join("target");
+    let mut staged = rooted
+        .begin_staged_file_with_expectation_blocking(
+            &relative("target"),
+            ExpectedDestination::Absent,
+        )
+        .unwrap();
+    staged.file_mut().write_all(b"ours").unwrap();
+    let (before_kind, before_kind_rx) = tokio::sync::oneshot::channel();
+    let (resume_before, resume_before_rx) = std::sync::mpsc::channel();
+    staged.pause_publication(PublicationPause {
+        point: PublicationPausePoint::BeforeDestinationObservation,
+        reached: before_kind,
+        resume: resume_before_rx,
+    });
+    let (after_kind, after_kind_rx) = tokio::sync::oneshot::channel();
+    let (resume_after, resume_after_rx) = std::sync::mpsc::channel();
+    rooted.pause_mutation_at(
+        0,
+        PublicationPause {
+            point: PublicationPausePoint::AfterDestinationObservation,
+            reached: after_kind,
+            resume: resume_after_rx,
+        },
+    );
+    let late_target = target.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let validations = std::sync::atomic::AtomicUsize::new(0);
+        staged.commit_prepared(None, || {
+            if validations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                // After the final absence check, as with a concurrent writer.
+                std::fs::write(&late_target, b"foreign")?;
+            }
+            Ok(())
+        })
+    });
+    before_kind_rx.await.unwrap();
+    std::fs::create_dir(&target).unwrap();
+    resume_before.send(()).unwrap();
+    after_kind_rx.await.unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    resume_after.send(()).unwrap();
+    let result = worker.await.unwrap();
+    assert!(
+        matches!(result, Err(RootedFsError::DestinationChanged(_))),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
 #[test]
 fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
     const CHILD: &str = "SY_STAGING_DUPLICATION_FAILURE_CHILD";

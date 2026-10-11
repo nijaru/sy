@@ -479,6 +479,8 @@ pub struct RootedStagedFile {
 #[cfg(all(test, unix))]
 #[derive(PartialEq, Eq)]
 pub(crate) enum PublicationPausePoint {
+    BeforeDestinationObservation,
+    AfterDestinationObservation,
     BeforeAdmission,
     AfterAdmission,
 }
@@ -839,10 +841,17 @@ impl RootedNamespaceTransaction {
     ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
         self.verify_parent_binding()?;
         self.verify_expected_destination_with_lineage(lineage)?;
+        #[cfg(test)]
+        self.pause_publication(PublicationPausePoint::BeforeDestinationObservation);
 
         let dest_stat = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?;
         let staged_stat = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
-        let is_type_transition = match (dest_stat, staged_stat) {
+        // Original absence authorizes no-replace publication only. A transient
+        // foreign kind must not upgrade it to exchange after an absence ABA.
+        let is_type_transition = !matches!(
+            self.expected_destination,
+            HeldDestinationExpectation::Absent
+        ) && match (dest_stat, staged_stat) {
             (Some(dest), Some(staged)) => {
                 let dest_is_dir = (dest.st_mode & libc::S_IFMT) == libc::S_IFDIR;
                 let staged_is_dir = (staged.st_mode & libc::S_IFMT) == libc::S_IFDIR;
@@ -861,6 +870,9 @@ impl RootedNamespaceTransaction {
                 ));
             }
         }
+        #[cfg(test)]
+        self.rooted
+            .pause_mutation(PublicationPausePoint::AfterDestinationObservation);
         // These checks detect observed races, not an atomic compare-and-swap.
         // A child arriving after the empty check must never be recursively removed.
         self.verify_parent_binding()?;
