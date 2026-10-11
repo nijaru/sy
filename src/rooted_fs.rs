@@ -11,6 +11,7 @@ mod group_metadata;
 mod group_tests;
 pub mod operand;
 mod publication;
+mod source_policy;
 mod staging;
 pub use publication::{PublishedEntryProof, PublishedFileProof, RootedPublishedFile};
 #[cfg(unix)]
@@ -1323,6 +1324,23 @@ impl RootedFs {
         self.entry_stream(request)
     }
 
+    #[cfg(not(unix))]
+    pub(crate) fn source_entry_stream(
+        &self,
+        request: crate::engine::scan::ScanRequest,
+    ) -> crate::engine::reconcile::EntryStream {
+        self.entry_stream(request)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn selected_source_entry_stream(
+        &self,
+        path: RelativePath,
+        request: crate::engine::scan::ScanRequest,
+    ) -> crate::engine::reconcile::EntryStream {
+        self.selected_entry_stream(path, request)
+    }
+
     /// Derive external ignore ancestry from the held directory, not a newly
     /// resolved root operand (which may transiently point at another tree).
     pub(crate) fn source_configuration_root_path_blocking(&self) -> Result<PathBuf> {
@@ -1353,88 +1371,6 @@ impl RootedFs {
         {
             Err(RootedFsError::UnsupportedPlatform)
         }
-    }
-
-    /// Local source configuration follows user-selected repository/config
-    /// symlinks, unlike peer-controlled data paths. Anchor resolution to the
-    /// held root so replacing its pathname cannot select another rule file.
-    // Explicit configuration pointers may use '..' or symlinks outside this
-    // root. This readonly local API is not remote path-confinement authority.
-    #[cfg(unix)]
-    pub(crate) fn open_source_configuration_blocking(&self, relative: &Path) -> Result<File> {
-        if relative.is_absolute() {
-            return Err(RootedFsError::InvalidRelativePath);
-        }
-        self.verify_root_path_blocking()?;
-        let path = component_cstring(relative.as_os_str())?;
-        // SAFETY: the original root FD and relative NUL-terminated path remain
-        // live. This readonly local configuration API deliberately follows
-        // configuration symlinks; O_NONBLOCK prevents adversarial FIFO opens.
-        let fd = unsafe {
-            libc::openat(
-                self.root_fd.as_raw_fd(),
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: successful openat transferred one owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        self.verify_root_path_blocking()?;
-        Ok(file)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn open_source_configuration_blocking(&self, _relative: &Path) -> Result<File> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn source_configuration_is_file_blocking(
-        &self,
-        relative: &Path,
-    ) -> Result<Option<bool>> {
-        if relative.is_absolute() {
-            return Err(RootedFsError::InvalidRelativePath);
-        }
-        self.verify_root_path_blocking()?;
-        let path = component_cstring(relative.as_os_str())?;
-        let mut stat = MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: root FD/path are live and stat is writable. Following here
-        // matches local ignore configuration semantics, not remote data access.
-        let result = unsafe {
-            libc::fstatat(
-                self.root_fd.as_raw_fd(),
-                path.as_ptr(),
-                stat.as_mut_ptr(),
-                0,
-            )
-        };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            return if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) {
-                Ok(None)
-            } else {
-                Err(error.into())
-            };
-        }
-        // SAFETY: successful fstatat initialized the complete stat value.
-        let stat = unsafe { stat.assume_init() };
-        self.verify_root_path_blocking()?;
-        Ok(Some(stat.st_mode & libc::S_IFMT == libc::S_IFREG))
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn source_configuration_is_file_blocking(
-        &self,
-        _relative: &Path,
-    ) -> Result<Option<bool>> {
-        Err(RootedFsError::UnsupportedPlatform)
     }
 
     /// Translate only exact observations already advanced by this root's own

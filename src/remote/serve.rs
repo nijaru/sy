@@ -40,6 +40,7 @@ struct NativeRequestHandlers {
     xattr: ServerXattrHandler,
     acl: ServerAclHandler,
     bsd_flags: ServerBsdFlagsHandler,
+    source_ignore: crate::remote::source_ignore::SourceIgnoreHandler,
     fetch: ServerFetchHandler,
     resolved: crate::protocol::ResolvedOperand,
     group_slot: std::sync::Arc<tokio::sync::Semaphore>,
@@ -178,6 +179,7 @@ impl RequestHandlers {
                     xattr: session.xattr_handler()?,
                     acl: session.acl_handler()?,
                     bsd_flags: session.bsd_flags_handler()?,
+                    source_ignore: session.source_ignore_handler()?,
                     fetch: fetch_handler(session)?,
                     resolved: session.ready().resolved.clone(),
                     group_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -206,6 +208,15 @@ fn spawn_request(
         }
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        IncomingRequest::SourceIgnore(incoming) => {
+            let handler = handlers.native()?.source_ignore.clone();
             tasks.spawn(async move {
                 handler
                     .serve(incoming)

@@ -29,11 +29,8 @@ use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 /// Pull-specific option refusals.
 ///
 /// Refuses operations not yet supported over pull (server-side source removal,
-/// follow-scans, or delete protection).
+/// or follow-scans).
 pub(super) fn pull_unsupported_reason(config: &SyncConfig) -> Option<&'static str> {
-    if config.delete.is_enabled() {
-        return Some("pull --delete is not yet implemented (remote ignore-scope delete protection is the remaining design)");
-    }
     if config.remove_source_files {
         return Some("pull --remove-source-files is not yet implemented (server-side source removal needs a confined mutation design)");
     }
@@ -261,9 +258,14 @@ async fn execute_bound(
     let max_size = config.max_size;
     let skip_symlinks = config.preserve.symlink_mode == SymlinkMode::Skip;
 
-    // The remote source walk is no-follow under root confinement, so no
-    // follow selection exists; symlinks reconcile by target. Delete stays
-    // disabled on v3 pull until the server-side ignore-scope design lands.
+    let delete_filter = config.filter_engine.clone();
+    let max_depth = selection_max_depth(config, scan_options);
+    let include_git_dir = scan_options.include_git_dir;
+    let tree_scope = scope == sy::engine::domain::SyncScope::Tree;
+    let scope_remote = remote.clone();
+    // Source ignore rules are evaluated by the same held remote root as its
+    // scan, not by the local filesystem at a similarly spelled pathname.
+    // Every reply belongs to no-mutation preflight; errors prevent all effects.
     let mut plan = preflight_sync_scoped_with_content(
         OrderedReconciler::with_scope(source, destination, scope),
         comparison_policy(config, namespace_semantics),
@@ -272,7 +274,25 @@ async fn execute_bound(
             entry_in_size_scope(entry, min_size, max_size)
                 && entry_selected_by_symlink_mode(entry, skip_symlinks)
         },
-        |_entry| false,
+        move |entry| {
+            let eligible = tree_scope
+                && delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+                && entry_in_depth_scope(entry, max_depth)
+                && entry_in_vcs_scope(entry, include_git_dir);
+            let path = entry.path.clone();
+            let is_directory = entry.is_directory();
+            let remote = scope_remote.clone();
+            async move {
+                if !eligible {
+                    return Ok(false);
+                }
+                let protected = remote
+                    .source_ignored(&path, is_directory, scan_options.respect_gitignore)
+                    .await
+                    .map_err(|error| ControllerError::backend("source ignore protection", error))?;
+                Ok(!protected)
+            }
+        },
         |source, destination| {
             let remote = remote.clone();
             let executor = &executor;
@@ -364,7 +384,7 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
     ScanRequest {
         // The local destination walk ignores nothing by default: every
         // destination entry must reach reconciliation so --delete (once
-        // enabled) and skip semantics see the true tree.
+        // authorized) and skip semantics see the true tree.
         respect_gitignore: false,
         include_git_dir: true,
         follow_symlinks: false,
@@ -372,6 +392,10 @@ fn destination_scan_request(config: &SyncConfig) -> ScanRequest {
         metadata: metadata_request(config),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "pull_delete_tests.rs"]
+mod delete_tests;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -1098,7 +1122,7 @@ mod tests {
             limit: sy::engine::delete_plan::DeleteLimit::Unlimited,
             force: false,
         };
-        assert!(pull_unsupported_reason(&config).is_some());
+        assert_eq!(pull_unsupported_reason(&config), None);
     }
 
     /// A source modified between the scan and the fetch must fail loudly:

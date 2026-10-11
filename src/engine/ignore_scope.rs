@@ -26,6 +26,7 @@ type RuleCache = VecDeque<(PathBuf, PathBuf, RuleFile)>;
 pub struct SourceIgnoreScope {
     root: PathBuf,
     authority: Option<crate::rooted_fs::RootedFs>,
+    confined_ancestry: bool,
     respect_gitignore: bool,
     canonical_root: Option<PathBuf>,
     initialized: bool,
@@ -40,6 +41,7 @@ impl SourceIgnoreScope {
         Self {
             root: root.to_path_buf(),
             authority: None,
+            confined_ancestry: false,
             respect_gitignore,
             canonical_root: None,
             initialized: false,
@@ -59,6 +61,58 @@ impl SourceIgnoreScope {
         let mut scope = Self::new(rooted.root_path(), respect_gitignore);
         scope.authority = Some(rooted);
         scope
+    }
+
+    /// Remote source policy may follow trusted configuration pointers, but
+    /// never a directory ancestry chosen by a peer query.
+    pub(crate) fn with_remote_authority(
+        rooted: crate::rooted_fs::RootedFs,
+        respect_gitignore: bool,
+    ) -> Self {
+        let mut scope = Self::with_rooted_authority(rooted, respect_gitignore);
+        scope.confined_ancestry = true;
+        scope
+    }
+
+    fn policy_directory<'a>(&self, directory: &'a Path) -> Option<&'a Path> {
+        if !self.confined_ancestry {
+            return None;
+        }
+        directory.strip_prefix(&self.root).ok().or_else(|| {
+            self.canonical_root
+                .as_ref()
+                .and_then(|root| directory.strip_prefix(root).ok())
+        })
+    }
+
+    fn read_config_in(&self, directory: &Path, file: &Path) -> io::Result<Option<Vec<u8>>> {
+        if let (Some(rooted), Some(relative), Ok(config)) = (
+            &self.authority,
+            self.policy_directory(directory),
+            file.strip_prefix(directory),
+        ) {
+            let Some(file_handle) = rooted
+                .open_source_policy_configuration_blocking(relative, config)
+                .map_err(io::Error::other)?
+            else {
+                return Ok(None);
+            };
+            return read_config_file(file_handle, file);
+        }
+        self.read_config(file)
+    }
+
+    fn is_file_in(&self, directory: &Path, file: &Path) -> io::Result<Option<bool>> {
+        if let (Some(rooted), Some(relative), Ok(config)) = (
+            &self.authority,
+            self.policy_directory(directory),
+            file.strip_prefix(directory),
+        ) {
+            return rooted
+                .source_policy_configuration_is_file_blocking(relative, config)
+                .map_err(io::Error::other);
+        }
+        self.is_file(file)
     }
 
     fn internal_relative<'a>(&self, file: &'a Path) -> Option<&'a Path> {
@@ -106,8 +160,12 @@ impl SourceIgnoreScope {
     }
 
     fn has_git(&self, directory: &Path) -> io::Result<bool> {
-        Ok(self.is_file(&directory.join(".git"))?.is_some()
-            || self.is_file(&directory.join(".jj"))?.is_some())
+        Ok(self
+            .is_file_in(directory, &directory.join(".git"))?
+            .is_some()
+            || self
+                .is_file_in(directory, &directory.join(".jj"))?
+                .is_some())
     }
 
     fn canonical_config_path(&self, path: &Path) -> io::Result<Option<PathBuf>> {
@@ -120,7 +178,7 @@ impl SourceIgnoreScope {
     fn initialize(&mut self) -> io::Result<()> {
         if let Some(rooted) = &self.authority {
             rooted
-                .verify_root_path_blocking()
+                .verify_source_root_path_blocking()
                 .map_err(io::Error::other)?;
         }
         if !self.initialized {
@@ -307,7 +365,7 @@ impl SourceIgnoreScope {
         }
     }
 
-    fn deletion_ignored(&mut self, relative: &Path, is_dir: bool) -> io::Result<bool> {
+    pub(crate) fn deletion_ignored(&mut self, relative: &Path, is_dir: bool) -> io::Result<bool> {
         for ancestor in relative
             .ancestors()
             .skip(1)
@@ -402,7 +460,7 @@ impl SourceIgnoreScope {
                 self.dir_rules.push_front(cached);
             }
         } else {
-            let matcher = compile_matcher(root, file, self.read_config(file)?)?;
+            let matcher = compile_matcher(root, file, self.read_config_in(root, file)?)?;
             if self.dir_rules.len() == DIRECTORY_RULE_CACHE_CAPACITY {
                 self.dir_rules.pop_back();
             }
@@ -513,10 +571,10 @@ fn compile_matcher(root: &Path, file: &Path, bytes: Option<Vec<u8>>) -> io::Resu
 // CWD-relative gitdir behavior. It intentionally does not use git's env vars.
 fn resolve_git_dir(directory: &Path, scope: &SourceIgnoreScope) -> io::Result<Option<PathBuf>> {
     let dot_git = directory.join(".git");
-    if scope.is_file(&dot_git)? != Some(true) {
+    if scope.is_file_in(directory, &dot_git)? != Some(true) {
         return Ok(Some(dot_git));
     }
-    let Some(bytes) = scope.read_config(&dot_git)? else {
+    let Some(bytes) = scope.read_config_in(directory, &dot_git)? else {
         return Ok(None);
     };
     let Some(line) = first_line(&bytes) else {
@@ -544,10 +602,10 @@ fn resolve_legacy_git_dir(
     scope: &SourceIgnoreScope,
 ) -> io::Result<Option<PathBuf>> {
     let dot_git = directory.join(".git");
-    if scope.is_file(&dot_git)? != Some(true) {
+    if scope.is_file_in(directory, &dot_git)? != Some(true) {
         return Ok(Some(dot_git));
     }
-    let Some(bytes) = scope.read_config(&dot_git)? else {
+    let Some(bytes) = scope.read_config_in(directory, &dot_git)? else {
         return Ok(Some(dot_git));
     };
     let Ok(contents) = std::str::from_utf8(&bytes) else {

@@ -353,7 +353,8 @@ negotiated semantics
 
 Do not guess remote capabilities from endpoint type.
 
-The exact wire contract is **3.11**, with no earlier-minor compatibility.
+The exact wire contract is **3.12**, with no earlier-minor compatibility,
+including no 3.11 compatibility.
 Version refusal precedes operand classification or filesystem root opening.
 `SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
 
@@ -388,6 +389,28 @@ private creator ownership, cleanup authority, or whole-run rollback. Local
 acquisition also requires original operator-path continuity; remote authority
 permits relocation of the held ancestor/root. Neither adopts a replacement after
 capturing its original root FD.
+
+`SourceIgnoreRequest` (frame kind 39, `FINAL` only) is a read-only Pull RPC
+for local destination deletion protection. Its payload is
+`respect_gitignore:u8, is_directory:u8, path_len:u32, relative_wire_path`.
+Both booleans are strictly 0/1. The bounded path uses the existing canonical
+component codec and encodes the source's physical name, not a renamed local
+destination name; selected-leaf scope checks require that exact source name.
+`SourceIgnoreResult` (frame kind 40, `FINAL|ACK_REQUIRED` only) contains exactly
+one `protected:u8` (0/1), followed by an empty unflagged `Ack` on the same stream.
+Truncated, trailing, noncanonical, and oversized path payloads are rejected.
+
+The Pull server matches through the remote source's held root and source-side
+ignore policy. Query-derived directory ancestry must be resolved no-follow
+through held directory handles. Trusted source-policy configuration is a narrow
+read-only exception to data-root confinement: retain parent/global rules and
+explicit configuration pointers, including configuration-file symlinks. This
+exception never permits following a peer-selected directory ancestor or widens
+file-data, metadata, or mutation authority. Local destination deletion scope
+applies the remote source's ignore matching during completed no-mutation
+preflight; any RPC failure prevents all mutation. The query grants no source
+mutation/removal, directory-discard, or copy-links authority. It is mandatory
+in the exact 3.12 contract and requires no additional capability bit.
 
 ### Metadata phase
 

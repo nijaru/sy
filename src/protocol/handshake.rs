@@ -48,7 +48,7 @@ pub const PROTOCOL_V3_8: ProtocolVersion = ProtocolVersion { major: 3, minor: 8 
 pub const PROTOCOL_V3_9: ProtocolVersion = ProtocolVersion { major: 3, minor: 9 };
 
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_11);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_12);
 
 /// Typed operand binding and deferred destination-root acquisition.
 /// The former root-only SessionOpen/SessionReady layouts are incompatible.
@@ -62,6 +62,13 @@ pub const PROTOCOL_V3_10: ProtocolVersion = ProtocolVersion {
 pub const PROTOCOL_V3_11: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 11,
+};
+
+/// Mandatory read-only source ignore queries for pull deletion protection.
+/// Earlier minors, including 3.11, are incompatible.
+pub const PROTOCOL_V3_12: ProtocolVersion = ProtocolVersion {
+    major: 3,
+    minor: 12,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,15 +449,23 @@ mod tests {
 
     #[test]
     fn current_wire_contract_rejects_previous_minor() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_11));
-        assert!(matches!(
-            negotiate_version(VersionRange::exact(PROTOCOL_V3_8), SUPPORTED_VERSIONS),
-            Err(ProtocolError::NoCompatibleVersion { .. })
-        ));
-        assert!(matches!(
-            negotiate_version(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_8)),
-            Err(ProtocolError::NoCompatibleVersion { .. })
-        ));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_12));
+        assert_eq!(
+            negotiate_version(SUPPORTED_VERSIONS, SUPPORTED_VERSIONS).unwrap(),
+            PROTOCOL_V3_12
+        );
+        for previous in [PROTOCOL_V3_8, PROTOCOL_V3_11] {
+            let previous = VersionRange::exact(previous);
+            for (client, server) in [
+                (previous, SUPPORTED_VERSIONS),
+                (SUPPORTED_VERSIONS, previous),
+            ] {
+                assert!(matches!(
+                    negotiate_version(client, server),
+                    Err(ProtocolError::NoCompatibleVersion { .. })
+                ));
+            }
+        }
     }
 
     #[test]

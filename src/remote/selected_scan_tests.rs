@@ -412,13 +412,6 @@ async fn selected_scan_retains_typed_policy_and_native_failures() {
                 ..Default::default()
             },
         ),
-        (
-            "leaf",
-            ScanRequest {
-                respect_gitignore: true,
-                ..Default::default()
-            },
-        ),
         ("socket", ScanRequest::default()),
     ] {
         let mut entries = client

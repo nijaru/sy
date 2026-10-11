@@ -265,7 +265,6 @@ fn semantic_conflicts_remain_application_errors() {
         vec!["host:/src", "/dest", "--min-size=2M", "--max-size=1M"],
         vec!["host:/src", "/dest", "--verify=only", "--watch"],
         vec!["host:/src", "/dest", "--verify=only", "--dry-run"],
-        vec!["host:/src", "/dest", "--delete"],
         vec!["host:/src", "/dest", "--remove-source-files"],
         vec!["host:/src", "/dest", "--links=follow"],
     ] {

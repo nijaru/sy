@@ -98,6 +98,28 @@ impl ClientRemoteSession {
 }
 
 impl ClientRemoteHandle {
+    pub async fn source_ignored(
+        &self,
+        path: &RelativePath,
+        is_directory: bool,
+        respect_gitignore: bool,
+    ) -> Result<bool> {
+        if self.operation != Operation::Pull {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind: FrameKind::SourceIgnoreRequest,
+            });
+        }
+        Ok(crate::remote::source_ignore::request_source_ignore(
+            &self.sender,
+            path,
+            is_directory,
+            respect_gitignore,
+            self.peer,
+        )
+        .await?)
+    }
+
     pub fn binding(&self) -> &crate::protocol::SessionReady {
         self.binding.ready()
     }

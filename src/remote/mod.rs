@@ -17,6 +17,7 @@ pub mod scan;
 pub mod serve;
 pub mod signature;
 pub(crate) mod source_file;
+pub mod source_ignore;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod transfer;

@@ -88,6 +88,9 @@ pub enum RemoteSessionError {
     Hash(#[from] RemoteHashError),
 
     #[error(transparent)]
+    SourceIgnore(#[from] crate::remote::source_ignore::SourceIgnoreError),
+
+    #[error(transparent)]
     Signature(#[from] RemoteSignatureError),
 
     #[error(transparent)]
@@ -450,6 +453,7 @@ impl ClientRemoteSession {
 pub enum IncomingRequest {
     AcquireRoot(IncomingStream),
     Scan(IncomingStream),
+    SourceIgnore(IncomingStream),
     Hash(IncomingStream),
     Signatures(IncomingStream),
     File(IncomingStream),
@@ -465,13 +469,21 @@ pub enum IncomingRequest {
 #[derive(Clone)]
 pub struct ServerScanHandler {
     rooted: SessionRoot,
+    source: bool,
     sender: RouterSender,
     peer: PlatformOs,
 }
 
 impl ServerScanHandler {
     pub async fn serve(&self, incoming: IncomingStream) -> crate::remote::scan::Result<()> {
-        serve_incoming_scan_session(self.rooted.clone(), incoming, &self.sender, self.peer).await
+        serve_incoming_scan_session(
+            self.rooted.clone(),
+            incoming,
+            &self.sender,
+            self.peer,
+            self.source,
+        )
+        .await
     }
 }
 
@@ -646,6 +658,7 @@ impl ServerRemoteSession {
     pub fn scan_handler(&self) -> ServerScanHandler {
         ServerScanHandler {
             rooted: self.opened.rooted.clone(),
+            source: self.operation() == Operation::Pull,
             sender: self.router.sender(),
             peer: self.opened.client.platform.os,
         }
@@ -661,6 +674,16 @@ impl ServerRemoteSession {
             SessionRoot::Present(rooted) => Ok(rooted.clone()),
             SessionRoot::Pending(_) => Err(RemoteSessionError::PendingRoot),
         }
+    }
+
+    pub fn source_ignore_handler(
+        &self,
+    ) -> Result<crate::remote::source_ignore::SourceIgnoreHandler> {
+        Ok(crate::remote::source_ignore::SourceIgnoreHandler::new(
+            self.scan_handler_rooted()?,
+            self.router.sender(),
+            self.opened.client.platform.os,
+        ))
     }
 
     pub fn hash_handler(&self) -> Result<ServerHashHandler> {
@@ -810,6 +833,13 @@ impl ServerRemoteSession {
                 Ok(Some(IncomingRequest::AcquireRoot(incoming)))
             }
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
+            FrameKind::SourceIgnoreRequest if self.operation() == Operation::Pull => {
+                Ok(Some(IncomingRequest::SourceIgnore(incoming)))
+            }
+            FrameKind::SourceIgnoreRequest => Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation(),
+                kind,
+            }),
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
             FrameKind::FileFetchRequest if self.opened.operation == Operation::Pull => {
@@ -908,6 +938,7 @@ impl ServerRemoteSession {
             let incoming = match request {
                 IncomingRequest::AcquireRoot(incoming)
                 | IncomingRequest::Scan(incoming)
+                | IncomingRequest::SourceIgnore(incoming)
                 | IncomingRequest::Hash(incoming)
                 | IncomingRequest::Signatures(incoming)
                 | IncomingRequest::File(incoming)
@@ -1178,7 +1209,8 @@ mod tests {
                             handler.serve(incoming).await.unwrap();
                         });
                     }
-                    IncomingRequest::Hash(_)
+                    IncomingRequest::SourceIgnore(_)
+                    | IncomingRequest::Hash(_)
                     | IncomingRequest::File(_)
                     | IncomingRequest::FileFetch(_)
                     | IncomingRequest::Group(_)

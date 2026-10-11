@@ -69,6 +69,10 @@ pub enum FrameKind {
     GroupMembersEnd = 36,
     GroupStep = 37,
     GroupResult = 38,
+    /// Read-only pull source ignore query; uses FINAL only.
+    SourceIgnoreRequest = 39,
+    /// Protection decision; uses FINAL|ACK_REQUIRED, then empty unflagged Ack.
+    SourceIgnoreResult = 40,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -113,6 +117,8 @@ impl TryFrom<u8> for FrameKind {
             36 => Ok(Self::GroupMembersEnd),
             37 => Ok(Self::GroupStep),
             38 => Ok(Self::GroupResult),
+            39 => Ok(Self::SourceIgnoreRequest),
+            40 => Ok(Self::SourceIgnoreResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
@@ -401,6 +407,30 @@ mod tests {
         assert_eq!(FrameKind::AclResult as u8, 28);
         assert_eq!(FrameKind::BsdFlagsRequest as u8, 29);
         assert_eq!(FrameKind::BsdFlagsResult as u8, 30);
+    }
+
+    #[test]
+    fn source_ignore_kinds_decode_in_bounded_frame_headers() {
+        for (kind, value, flags) in [
+            (FrameKind::SourceIgnoreRequest, 39, FrameFlags::FINAL),
+            (
+                FrameKind::SourceIgnoreResult,
+                40,
+                FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            ),
+        ] {
+            assert_eq!(kind as u8, value);
+            let header = FrameHeader {
+                payload_len: 1,
+                kind,
+                flags,
+                stream_id: StreamId::new(1),
+            };
+            assert_eq!(
+                FrameHeader::decode(header.encode().unwrap()).unwrap(),
+                header
+            );
+        }
     }
 
     proptest! {

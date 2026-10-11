@@ -20,6 +20,9 @@ pub(crate) enum RootedScanError {
     #[error("gitignore-aware scanning is not yet supported by the descriptor-rooted scanner")]
     GitignoreUnsupported,
 
+    #[error("failed to read source selection policy: {0}")]
+    SourceIgnore(#[source] io::Error),
+
     #[error("failed to spool ordered scan: {0}")]
     Scratch(#[source] io::Error),
 
@@ -74,8 +77,23 @@ impl RootedFs {
     pub(crate) fn entry_stream(&self, request: ScanRequest) -> EntryStream {
         let rooted = self.clone();
         EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
-            scan_worker(rooted, request, sender)
+            scan_worker(rooted, request, sender, false)
         })
+    }
+
+    pub(crate) fn source_entry_stream(&self, request: ScanRequest) -> EntryStream {
+        let rooted = self.clone();
+        EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
+            scan_worker(rooted, request, sender, true)
+        })
+    }
+
+    pub(crate) fn selected_source_entry_stream(
+        &self,
+        path: RelativePath,
+        request: ScanRequest,
+    ) -> EntryStream {
+        self.selected_entry_stream_with_policy(path, request, true)
     }
 
     /// Inspect exactly one physical name beneath the held destination root.
@@ -85,10 +103,28 @@ impl RootedFs {
         path: RelativePath,
         request: ScanRequest,
     ) -> EntryStream {
+        self.selected_entry_stream_with_policy(path, request, false)
+    }
+
+    fn selected_entry_stream_with_policy(
+        &self,
+        path: RelativePath,
+        request: ScanRequest,
+        source: bool,
+    ) -> EntryStream {
         let rooted = self.clone();
         EntryStream::spawn_blocking(1, move |sender| {
-            if request.respect_gitignore {
+            if request.respect_gitignore && !source {
                 return Err(Box::new(RootedScanError::GitignoreUnsupported) as BoxError);
+            }
+            let mut scope = source.then(|| {
+                crate::engine::ignore_scope::SourceIgnoreScope::with_remote_authority(
+                    rooted.clone(),
+                    request.respect_gitignore,
+                )
+            });
+            if let Some(scope) = &mut scope {
+                scope.prepare_source()?;
             }
             let name = path
                 .as_path()
@@ -111,6 +147,16 @@ impl RootedFs {
                 Err(error) => return Err(Box::new(error)),
                 Ok(stat) => stat,
             };
+            if let Some(scope) = &mut scope {
+                if (!request.include_git_dir && name == OsStr::new(".git"))
+                    || scope.source_match(
+                        path.as_path(),
+                        stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                    )?
+                {
+                    return Ok(());
+                }
+            }
             let inspected = inspect_entry(rooted.root_fd.as_raw_fd(), name, &path, request, stat)?;
             let _ = sender.blocking_send(Ok(inspected.entry));
             Ok(())
@@ -122,14 +168,30 @@ fn scan_worker(
     rooted: RootedFs,
     request: ScanRequest,
     sender: tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
+    source: bool,
 ) -> Result<(), BoxError> {
-    if request.respect_gitignore {
+    if request.respect_gitignore && !source {
         return Err(Box::new(RootedScanError::GitignoreUnsupported));
+    }
+    let mut scope = source.then(|| {
+        crate::engine::ignore_scope::SourceIgnoreScope::with_remote_authority(
+            rooted.clone(),
+            request.respect_gitignore,
+        )
+    });
+    if let Some(scope) = &mut scope {
+        scope.prepare_source()?;
     }
     if request.max_depth == Some(0) {
         return Ok(());
     }
-    match walk_tree(&rooted, request, &sender, SortBudget::default()) {
+    match walk_tree(
+        &rooted,
+        request,
+        &sender,
+        SortBudget::default(),
+        scope.as_mut(),
+    ) {
         Ok(()) => Ok(()),
         Err(RootedScanError::Scratch(error))
             if sender.is_closed() && error.kind() == io::ErrorKind::Interrupted =>
@@ -306,6 +368,7 @@ fn walk_tree(
     request: ScanRequest,
     sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
     budget: SortBudget,
+    mut scope: Option<&mut crate::engine::ignore_scope::SourceIgnoreScope>,
 ) -> Result<(), RootedScanError> {
     let scratch_parent = tempfile::env::temp_dir();
     let held_root = File::from(
@@ -368,6 +431,17 @@ fn walk_tree(
         let relative = RelativePath::new(relative_path.clone())
             .map_err(|_| RootedScanError::InvalidRelativePath(relative_path))?;
         let stat = lstat_at(directory.as_raw_fd(), &name, relative.as_path())?;
+        if let Some(scope) = &mut scope {
+            if scope
+                .source_match(
+                    relative.as_path(),
+                    stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                )
+                .map_err(RootedScanError::SourceIgnore)?
+            {
+                continue;
+            }
+        }
         let inspected = inspect_entry(directory.as_raw_fd(), &name, &relative, request, stat)?;
         if sender.blocking_send(Ok(inspected.entry)).is_err() {
             return Ok(());
@@ -969,6 +1043,7 @@ mod tests {
                     records: 3,
                     fan_in: 2,
                 },
+                None,
             )
         });
         (receiver, worker)

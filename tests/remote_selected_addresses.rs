@@ -94,7 +94,7 @@ async fn selected_plan(source: &Path, destination: &Path, case: Case) -> SyncPla
             force: false,
         }),
         |_| true,
-        |_| true,
+        |_| futures::future::ready(Ok(true)),
         |_, _| async { panic!("size-only/always plans do not request content comparison") },
     )
     .await
@@ -400,7 +400,7 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
             Default::default(),
             None,
             |_| true,
-            |_| false,
+            |_| futures::future::ready(Ok(false)),
             |_, _| async { panic!("new leaf requires no content comparison") },
         )
         .await

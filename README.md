@@ -103,9 +103,9 @@ sy user@host:/remote /local
 sy /local user@host:/remote --timeout 30
 ```
 
-Remote-to-local pulls use the v3 engine, but `--delete`,
-`--remove-source-files`, and `--copy-links` are refused for pulls until their
-server-side confinement designs are complete.
+Remote-to-local pulls support `--delete` with remote source-ignore protection
+and the same `--max-delete` safety threshold as local sync and push.
+`--remove-source-files` and `--copy-links` remain unsupported for pulls.
 
 ### Filters
 
@@ -180,7 +180,7 @@ identity and root-confined filesystem operations are not implemented.
 | SSH pull | Stable | Whole-file fetch with staged verification |
 | Delta sync (push) | Stable | Rolling weak checksums + BLAKE3 strong block signatures |
 | Filters (--exclude/--include) | Stable | rsync-style patterns, `--filter`, templates |
-| Delete mode (--delete) | Stable | Local/push, with `--max-delete` safety threshold; pull `--delete` is refused |
+| Delete mode (--delete) | Supported | Local/push/pull, with source-ignore protection and `--max-delete` safety threshold |
 | Compression (-z) | Stable | zstd, auto/always/never |
 | Hard links (-H) | Supported | Whole-group topology and metadata for local, SSH push and SSH pull |
 | Symlinks | Stable | `--links=preserve/follow/skip` |
@@ -240,7 +240,7 @@ needing only metadata retain destination bytes; a private staged replacement
 isolates changes from outside aliases. Fully matching linked groups stay
 unchanged. Excluded and policy-skipped names are not members to coalesce.
 
-SSH peers must support the same exact protocol version, currently v3.11.
+SSH peers must support the same exact protocol version, currently v3.12.
 Group declarations and final acknowledgements bind all selected names; a lost
 final acknowledgement does not authorize source removal.
 

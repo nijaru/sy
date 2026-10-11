@@ -159,11 +159,11 @@ async fn run_with_authorities(
                     && entry_selected_by_symlink_mode(entry, skip_symlinks)
             },
             move |entry| {
-                tree_scope
+                futures::future::ready(Ok(tree_scope
                     && delete_filter.should_include(entry.path.as_path(), entry.is_directory())
                     && entry_in_depth_scope(entry, max_depth)
                     && entry_in_vcs_scope(entry, include_git_dir)
-                    && entry_not_source_ignored(&ignore_scope, entry)
+                    && entry_not_source_ignored(&ignore_scope, entry)))
             },
             move |source: Entry, destination: Entry| {
                 let source_authority = source_authority.clone();

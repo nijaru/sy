@@ -19,6 +19,7 @@ mod path;
 mod scan;
 mod session;
 mod signature;
+mod source_ignore;
 mod source_metadata;
 mod transfer;
 mod xattr;
@@ -37,8 +38,8 @@ pub use group::{
 pub use handshake::{
     negotiate_version, CapabilitySet, ClientHello, Platform, PlatformArch, PlatformOs,
     ProtocolVersion, ServerHello, VersionRange, PROTOCOL_V3, PROTOCOL_V3_1, PROTOCOL_V3_10,
-    PROTOCOL_V3_11, PROTOCOL_V3_2, PROTOCOL_V3_3, PROTOCOL_V3_4, PROTOCOL_V3_5, PROTOCOL_V3_6,
-    PROTOCOL_V3_7, PROTOCOL_V3_8, PROTOCOL_V3_9, SUPPORTED_VERSIONS,
+    PROTOCOL_V3_11, PROTOCOL_V3_12, PROTOCOL_V3_2, PROTOCOL_V3_3, PROTOCOL_V3_4, PROTOCOL_V3_5,
+    PROTOCOL_V3_6, PROTOCOL_V3_7, PROTOCOL_V3_8, PROTOCOL_V3_9, SUPPORTED_VERSIONS,
 };
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::{WireMetadata, WireMetadataTarget};
@@ -57,6 +58,7 @@ pub use signature::{
     SignatureBlockSize, WireSignature, WireSignatureEnd, WireSignatureRequest,
     MAX_SIGNATURE_BLOCK_SIZE, MIN_SIGNATURE_BLOCK_SIZE, STRONG_SIGNATURE_LEN,
 };
+pub use source_ignore::{WireSourceIgnoreRequest, WireSourceIgnoreResult};
 pub use source_metadata::WireSourceMetadataRead;
 pub use transfer::{
     WireData, WireDeltaCopy, WireFileAck, WireFileBasis, WireFileBegin, WireFileEnd,

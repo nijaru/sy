@@ -69,6 +69,9 @@ pub(crate) fn authorize(
             };
         }
         FrameKind::AcquireRoot => AcquireRoot::decode(payload)?.create,
+        FrameKind::SourceIgnoreRequest => {
+            crate::protocol::WireSourceIgnoreRequest::decode(payload)?.path
+        }
         FrameKind::HashRequest => WireHashRequest::decode(payload)?.path,
         FrameKind::SignatureRequest => WireSignatureRequest::decode(payload)?.path,
         FrameKind::FileFetchRequest => WireFileFetchRequest::decode(payload)?.path,

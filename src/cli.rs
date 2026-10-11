@@ -394,20 +394,10 @@ impl Cli {
         // Flags the v3 pull path does not implement yet are rejected up
         // front rather than silently ignored mid-sync. Each of these has a
         // concrete remaining design, not a legacy-transport excuse:
-        // - --delete needs remote ignore-scope evaluation so destination
-        //   counterparts of source-ignored files stay protected;
         // - --remove-source-files needs confined server-side source removal;
         // - --copy-links needs a confined remote follow-walk.
         if let (Some(source), Some(dest)) = (&self.source, &self.destination) {
             if source.is_remote() && dest.is_local() {
-                if self.delete {
-                    anyhow::bail!(
-                        "--delete is not yet supported for remote->local pulls: the v3 \
-                         engine must evaluate the remote source's ignore rules for delete \
-                         protection before deletions can be authorized. Refusing beats \
-                         risking destination data."
-                    );
-                }
                 let unsupported = [
                     (self.remove_source_files, "--remove-source-files"),
                     // Both routes into Follow mode need the confined remote
@@ -796,15 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_pull_rejects_delete() {
-        // remote source -> local destination with --delete must be refused
-        // before any connection: v3 pull must evaluate the remote source's
-        // ignore rules for delete protection before deletions are authorized.
-        let cli = parse_cli(&["host:/src", "/tmp/dst", "--delete"]);
-        assert!(cli.validate().is_err());
-    }
-
-    #[test]
     fn test_validate_pull_rejects_unimplemented_v3_flags() {
         for flag in ["--remove-source-files", "--copy-links"] {
             let cli = parse_cli(&["host:/src", "/tmp/dst", flag]);
@@ -817,6 +798,7 @@ mod tests {
         // The v3 engine honors these on pulls now: backup, output options,
         // and timeouts are real (not silent no-ops) on the pull path.
         for flag in [
+            "--delete",
             "--backup",
             "--backup-dir=/tmp/b",
             "--itemize-changes",

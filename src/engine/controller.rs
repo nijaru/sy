@@ -277,14 +277,14 @@ pub async fn preflight_sync_scoped(
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
-    delete_in_scope: impl FnMut(&Entry) -> bool,
+    mut delete_in_scope: impl FnMut(&Entry) -> bool,
 ) -> Result<SyncPlan> {
     preflight_sync_scoped_with_content(
         OrderedReconciler::new(source, destination),
         policy,
         delete_policy,
         plan_in_scope,
-        delete_in_scope,
+        |entry| futures::future::ready(Ok(delete_in_scope(entry))),
         |source, _destination| async move {
             Err::<bool, _>(ControllerError::UnsupportedContentComparison(source.path))
         },
@@ -299,20 +299,22 @@ fn is_descendant_of(path: &RelativePath, ancestor: &RelativePath) -> bool {
 /// Complete remote-push preflight with asynchronous content comparison
 /// for planner decisions that cannot be resolved from scan metadata.
 ///
-/// The comparison future runs while the controller is still in the
-/// no-mutation phase. A comparison failure therefore prevents a plan,
+/// Content comparison and deletion-scope futures run while the controller is
+/// still in the no-mutation phase. A failure therefore prevents a plan,
 /// delete replay, and all namespace or file mutations.
-pub async fn preflight_sync_scoped_with_content<F, Fut>(
+pub async fn preflight_sync_scoped_with_content<F, Fut, D, DFut>(
     mut reconciler: OrderedReconciler,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
-    delete_in_scope: impl FnMut(&Entry) -> bool,
+    delete_in_scope: D,
     compare_content: F,
 ) -> Result<SyncPlan>
 where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
+    D: FnMut(&Entry) -> DFut,
+    DFut: Future<Output = Result<bool>>,
 {
     let result = collect_preflight_plan(
         &mut reconciler,
@@ -335,17 +337,19 @@ where
     }
 }
 
-async fn collect_preflight_plan<F, Fut>(
+async fn collect_preflight_plan<F, Fut, D, DFut>(
     reconciler: &mut OrderedReconciler,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
     mut plan_in_scope: impl FnMut(&Entry) -> bool,
-    mut delete_in_scope: impl FnMut(&Entry) -> bool,
+    mut delete_in_scope: D,
     mut compare_content: F,
 ) -> Result<SyncPlan>
 where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
+    D: FnMut(&Entry) -> DFut,
+    DFut: Future<Output = Result<bool>>,
 {
     let mut journal = PlanJournal::new().await?;
     let mut finalize = FinalizeJournal::new().await?;
@@ -393,7 +397,7 @@ where
         if let Some((replaced_path, discarded_count)) = &mut active_replaced_dir {
             match item {
                 ReconcileItem::DestinationOnly(destination) => {
-                    let in_scope = delete_in_scope(&destination);
+                    let in_scope = delete_in_scope(&destination).await?;
                     if !in_scope {
                         return Err(
                             ControllerError::CannotReplaceDirectoryWithProtectedDescendant {
@@ -444,7 +448,7 @@ where
                 destination,
             } => {
                 if let Some(delete) = &mut delete {
-                    let in_scope = delete_in_scope(&destination);
+                    let in_scope = delete_in_scope(&destination).await?;
                     delete.observe_matched(&destination, in_scope).await?;
                 }
                 if !plan_in_scope(&source) {
@@ -457,8 +461,8 @@ where
                 plan_entry(source, Some(destination), destination_path, policy)
             }
             ReconcileItem::DestinationOnly(destination) => {
-                let in_scope = delete_in_scope(&destination);
                 if let Some(delete) = &mut delete {
+                    let in_scope = delete_in_scope(&destination).await?;
                     delete
                         .observe_destination_only(&destination, in_scope)
                         .await?;
@@ -499,7 +503,7 @@ where
                         destination_kind: destination.kind,
                     });
                 }
-                if !delete_in_scope(destination) {
+                if !delete_in_scope(destination).await? {
                     return Err(
                         ControllerError::CannotReplaceDirectoryWithProtectedDescendant {
                             path: destination.path.clone(),
@@ -1674,7 +1678,7 @@ mod tests {
             policy,
             None,
             |_| true,
-            |_| true,
+            |_| futures::future::ready(Ok(true)),
             |_source, _destination| async { Ok(true) },
         )
         .await
@@ -1692,7 +1696,7 @@ mod tests {
             policy,
             None,
             |_| true,
-            |_| true,
+            |_| futures::future::ready(Ok(true)),
             |_source, _destination| async { Ok(false) },
         )
         .await
@@ -1872,6 +1876,7 @@ mod tests {
                         order.push("metadata");
                         metadata_handler.serve(incoming).await.unwrap();
                     }
+                    IncomingRequest::SourceIgnore(_) => panic!("unexpected source ignore request"),
                     IncomingRequest::Hash(_) => panic!("unexpected hash request"),
                     IncomingRequest::FileFetch(_) => panic!("unexpected fetch request"),
                     IncomingRequest::Group(_) => panic!("unexpected group request"),

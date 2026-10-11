@@ -146,7 +146,14 @@ pub async fn serve_incoming_scan_rooted(
     sender: &RouterSender,
     peer: PlatformOs,
 ) -> Result<()> {
-    serve_incoming_scan_session(super::SessionRoot::Present(rooted), incoming, sender, peer).await
+    serve_incoming_scan_session(
+        super::SessionRoot::Present(rooted),
+        incoming,
+        sender,
+        peer,
+        false,
+    )
+    .await
 }
 
 pub(super) async fn serve_incoming_scan_session(
@@ -154,6 +161,7 @@ pub(super) async fn serve_incoming_scan_session(
     incoming: IncomingStream,
     sender: &RouterSender,
     peer: PlatformOs,
+    source: bool,
 ) -> Result<()> {
     let IncomingStream { first, mut inbox } = incoming;
     let stream_id = inbox.stream_id();
@@ -173,7 +181,7 @@ pub(super) async fn serve_incoming_scan_session(
 
     match root {
         super::SessionRoot::Present(rooted) => {
-            serve_scan(rooted, request, selection, sender, stream_id).await?
+            serve_scan(rooted, request, selection, sender, stream_id, source).await?
         }
         super::SessionRoot::Pending(_) => {
             sender
@@ -208,11 +216,14 @@ async fn serve_scan(
     selection: Option<RelativePath>,
     sender: &RouterSender,
     stream_id: StreamId,
+    source: bool,
 ) -> Result<()> {
     require_data_stream(stream_id)?;
-    let mut entries = match selection {
-        None => rooted.entry_stream(request),
-        Some(path) => rooted.selected_entry_stream(path, request),
+    let mut entries = match (selection, source) {
+        (None, false) => rooted.entry_stream(request),
+        (Some(path), false) => rooted.selected_entry_stream(path, request),
+        (None, true) => rooted.source_entry_stream(request),
+        (Some(path), true) => rooted.selected_source_entry_stream(path, request),
     };
 
     let sent: Result<()> = tokio::select! {
@@ -254,6 +265,7 @@ async fn serve_scan(
     _selection: Option<RelativePath>,
     _sender: &RouterSender,
     stream_id: StreamId,
+    _source: bool,
 ) -> Result<()> {
     require_data_stream(stream_id)?;
     Err(RemoteScanError::LocalScan(Box::new(

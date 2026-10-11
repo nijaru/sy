@@ -42,7 +42,7 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
         },
         None,
         |_| true,
-        |_| true,
+        |_| futures::future::ready(Ok(true)),
         move |source, dest| {
             let source_rooted = source_rooted.clone();
             let dest_rooted = dest_rooted.clone();

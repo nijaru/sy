@@ -208,10 +208,11 @@ async fn execute_bound(
                 && entry_selected_by_symlink_mode(entry, skip_symlinks)
         },
         move |entry| {
-            delete_filter.should_include(entry.path.as_path(), entry.is_directory())
+            futures::future::ready(Ok(delete_filter
+                .should_include(entry.path.as_path(), entry.is_directory())
                 && entry_in_depth_scope(entry, max_depth)
                 && entry_in_vcs_scope(entry, include_git_dir)
-                && entry_not_source_ignored(&ignore_scope, entry)
+                && entry_not_source_ignored(&ignore_scope, entry)))
         },
         move |source, destination| {
             let source_rooted = source_rooted.clone();
