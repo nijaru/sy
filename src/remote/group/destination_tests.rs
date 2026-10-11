@@ -432,7 +432,14 @@ async fn captured_metadata_applies_at_file_end_and_rejects_late_duplicates() {
         request.xattrs = true;
         request.acls = cfg!(feature = "acl");
         let root = old_group();
-        xattr::set(root.path().join("first"), "user.retained", b"old metadata").unwrap();
+        // SOURCE's exact set discards these values: the receiver must not
+        // read an oversized OLD default before applying the supplied metadata.
+        let old_metadata = if cfg!(target_os = "macos") && !duplicate {
+            vec![b'x'; crate::protocol::MAX_XATTR_TOTAL_BYTES + 1]
+        } else {
+            b"old metadata".to_vec()
+        };
+        xattr::set(root.path().join("first"), "user.retained", &old_metadata).unwrap();
         let mut session = Session::start(root, request, &["first", "second"], false).await;
         // A complete mirror must include native required attributes (notably
         // SELinux labels), just as a real original-source FD capture does.
@@ -514,7 +521,7 @@ async fn captured_metadata_applies_at_file_end_and_rejects_late_duplicates() {
                 xattr::get(session.root.path().join("outside"), "user.retained")
                     .unwrap()
                     .unwrap(),
-                b"old metadata"
+                old_metadata
             );
             session.complete().await;
         }

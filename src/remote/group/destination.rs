@@ -149,6 +149,7 @@ impl Destination {
             bsd_flags: open.file.bsd_flags(),
         }
         .validate()?;
+        let overrides = preservation.request();
         self.validate_all(peer, !open.source_bytes)?;
         if open.retain_metadata || !open.source_bytes {
             self.capture_old()?;
@@ -233,7 +234,7 @@ impl Destination {
                     let mut stage = rooted
                         .begin_staged_file_with_expectation_blocking(relative, expectation)?;
                     if let Some(old) = retained {
-                        let operation = stage.copy_retained_metadata_blocking(old);
+                        let operation = stage.copy_retained_metadata_blocking(old, overrides);
                         if let Err(operation) = operation {
                             return Err(abort_stage(stage, operation).into());
                         }
@@ -260,7 +261,7 @@ impl Destination {
             .begin_staged_file_with_expectation_blocking(&self.first, expected(&member))?;
         let operation: Result<u64> = (|| {
             if open.retain_metadata {
-                stage.copy_retained_metadata_blocking(&old.file)?;
+                stage.copy_retained_metadata_blocking(&old.file, overrides)?;
             }
             self.validate_old()?;
             let mut input = old.file.try_clone()?;

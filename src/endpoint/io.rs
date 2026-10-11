@@ -41,6 +41,13 @@ pub struct Preservation {
 }
 
 impl Preservation {
+    pub(crate) const fn request(&self) -> PreservationRequest {
+        PreservationRequest {
+            xattrs: self.xattrs.is_some(),
+            acl: self.acl.is_some(),
+        }
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.xattrs.is_none() && self.acl.is_none()
     }

@@ -250,6 +250,7 @@ impl RemotePullExecutor {
         )
         .await?;
         let prepared: Result<(Option<TransferSummary>, Option<u32>)> = async {
+            let overrides = preservation.request();
             let retained_flags = if let (Some(old), Some(observed)) = (&old, &representative) {
                 staged
                     .with_staged({
@@ -269,7 +270,7 @@ impl RemotePullExecutor {
                                 })?,
                             )?;
                             if retain_metadata {
-                                stage.copy_retained_metadata_blocking(&old)?;
+                                stage.copy_retained_metadata_blocking(&old, overrides)?;
                             }
                             if retained_bytes {
                                 let mut input = old.try_clone()?;

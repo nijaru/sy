@@ -168,6 +168,92 @@ fn coalesced_metadata_isolation_retains_old_bytes_and_protects_outside_alias() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn source_xattr_override_does_not_read_discarded_old_values() {
+    for source_xattrs in [true, false] {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let destination = fixture.path().join("destination");
+        for directory in [&source, &destination] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        file(&source.join("a"), b"NEW!", 0o640, 1_600_000_000);
+        std::fs::hard_link(source.join("a"), source.join("b")).unwrap();
+        xattr::set(source.join("a"), "user.sy-source", b"requested").unwrap();
+        file(&destination.join("a"), b"OLD!", 0o600, 1_600_000_000);
+        std::fs::hard_link(destination.join("a"), destination.join("b")).unwrap();
+        let outside = fixture.path().join("outside");
+        std::fs::hard_link(destination.join("a"), &outside).unwrap();
+        let large = vec![b'x'; sy::protocol::MAX_XATTR_TOTAL_BYTES + 1];
+        xattr::set(&outside, "user.sy-old-large", &large).unwrap();
+        let source_before = observe(&source.join("a"));
+        let old_before = observe(&outside);
+        let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+            .args(["-rH", "--no-hooks"])
+            .arg(if source_xattrs { "-X" } else { "-p" })
+            .arg(format!("{}/", source.display()))
+            .arg(&destination)
+            .env("HOME", fixture.path())
+            .env("XDG_CONFIG_HOME", fixture.path())
+            .output()
+            .unwrap();
+        assert_eq!(observe(&source.join("a")), source_before);
+        assert_eq!(std::fs::read(source.join("b")).unwrap(), b"NEW!");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"OLD!");
+        assert_eq!(
+            xattr::get(&outside, "user.sy-old-large").unwrap(),
+            Some(large)
+        );
+        if source_xattrs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let a = observe(&destination.join("a"));
+            assert_eq!(a, observe(&destination.join("b")));
+            assert_ne!(a.1, old_before.1);
+            assert_eq!((a.2, a.5, a.6, a.7), (2, 0o600, 1_600_000_000, 0));
+            assert_eq!(
+                xattr::get(destination.join("a"), "user.sy-source").unwrap(),
+                Some(b"requested".to_vec())
+            );
+            assert_eq!(
+                xattr::get(destination.join("a"), "user.sy-old-large").unwrap(),
+                None
+            );
+            assert_eq!(std::fs::read(destination.join("a")).unwrap(), b"OLD!");
+            let outside_after = observe(&outside);
+            assert_eq!(outside_after.2, 1);
+            assert_eq!(
+                (
+                    outside_after.0,
+                    outside_after.1,
+                    outside_after.5,
+                    outside_after.6,
+                    outside_after.7
+                ),
+                (
+                    old_before.0,
+                    old_before.1,
+                    old_before.5,
+                    old_before.6,
+                    old_before.7
+                )
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "unrequested OLD xattrs still require bounded native reads"
+            );
+            assert_eq!(observe(&outside), old_before);
+            assert_eq!(observe(&destination.join("a")), old_before);
+            assert_eq!(observe(&destination.join("b")), old_before);
+        }
+    }
+}
+
 #[test]
 fn matching_coalesced_group_is_effect_free_even_with_unequal_quick_bytes() {
     let fixture = tempfile::tempdir().unwrap();

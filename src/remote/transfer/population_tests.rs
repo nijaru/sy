@@ -1,6 +1,7 @@
 //! Protection for the new readiness boundary and retained receiver ownership.
 use super::population::{prepare_reconstruction_with_stage_blocking, ReconstructionReceiver};
 use super::*;
+use crate::endpoint::io::PreservationRequest;
 use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -32,7 +33,9 @@ async fn supplied_stage_population_retains_creator_and_metadata_until_explicit_c
             )
             .unwrap();
         // The parent group owner supplies the retained representative baseline.
-        staged.copy_retained_metadata_blocking(&original).unwrap();
+        staged
+            .copy_retained_metadata_blocking(&original, PreservationRequest::default())
+            .unwrap();
         let inode = staged.file_mut().metadata().unwrap().ino();
         let prepared = prepare_reconstruction_with_stage_blocking(
             rooted,

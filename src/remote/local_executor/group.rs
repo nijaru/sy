@@ -212,6 +212,7 @@ impl LocalSyncExecutor {
                 if retained {
                     staged.copy_retained_metadata_blocking(
                         old.as_ref().ok_or(GroupError::Invalid("missing old FD"))?,
+                        preservation.request(),
                     )?;
                 }
                 let input = if canonical_source {

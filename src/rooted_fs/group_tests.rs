@@ -320,6 +320,70 @@ fn prepared_group_preservation_survives_all_links_without_source_mutation() {
     ));
 }
 
+#[cfg(all(target_os = "macos", feature = "acl"))]
+#[test]
+fn source_acl_override_skips_only_the_discarded_old_acl_read() {
+    for override_acl in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("old");
+        std::fs::write(&path, b"OLD bytes").unwrap();
+        xattr::set(&path, "user.sy-default", b"retained").unwrap();
+        let original = File::open(&path).unwrap();
+        let uid = stat_fd(original.as_raw_fd()).unwrap().st_uid;
+        assert_ne!(uid, 0);
+        exacl::setfacl(
+            &[&path],
+            &[exacl::AclEntry::deny_user(
+                &uid.to_string(),
+                exacl::Perm::READSECURITY,
+                exacl::Flag::empty(),
+            )],
+            None,
+        )
+        .unwrap();
+        let before = stat_fd(original.as_raw_fd()).unwrap();
+        let rooted = RootedFs::open_blocking(root.path().into()).unwrap();
+        // The held OLD descriptor is intentional: macOS also denies pathname
+        // stat under this ACE. This test does not waive namespace validation.
+        assert!(matches!(
+            rooted.read_open_file_acl_blocking(&original, &relative("old")),
+            Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        let requested = crate::endpoint::io::Preservation {
+            acl: override_acl.then(String::new),
+            ..Default::default()
+        };
+        let mut stage = prepared(&rooted);
+        let operation = stage.copy_retained_metadata_blocking(&original, requested.request());
+        if override_acl {
+            operation.unwrap();
+            stage
+                .apply_preservation_blocking(None, None, None, requested.acl.as_deref())
+                .unwrap();
+            assert!(read_acl_entries_fd(stage.file_mut()).unwrap().is_empty());
+            assert_eq!(
+                read_xattrs_from_file(stage.file_mut()).unwrap(),
+                read_xattrs_from_file(&original).unwrap()
+            );
+        } else {
+            assert!(
+                matches!(operation, Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+        }
+        stage.abort().unwrap();
+        assert!(staging::same_observation(
+            &before,
+            &stat_fd(original.as_raw_fd()).unwrap()
+        ));
+        assert!(
+            matches!(read_acl_entries_fd(&original), Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        exacl::setfacl(&[&path], &[], None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"OLD bytes");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
 #[test]
 fn finalized_group_rejects_foreign_member_binding_and_inode_edits() {
     for replace_name in [false, true] {

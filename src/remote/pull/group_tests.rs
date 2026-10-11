@@ -283,7 +283,14 @@ async fn requested_xattrs_override_retained_metadata_without_refetching_bytes() 
         stamp(&root.join("a"), 0o640);
     }
     xattr::set(source.path().join("a"), "user.sy-pull", b"source-md").unwrap();
-    xattr::set(destination.path().join("a"), "user.sy-pull", b"old-md").unwrap();
+    // Native oversized defaults must not enter the bounded SOURCE metadata
+    // path when the captured SOURCE set will replace them completely.
+    let old_metadata = if cfg!(target_os = "macos") {
+        vec![b'x'; crate::protocol::MAX_XATTR_TOTAL_BYTES + 1]
+    } else {
+        b"old-md".to_vec()
+    };
+    xattr::set(destination.path().join("a"), "user.sy-pull", &old_metadata).unwrap();
     for repeat in [false, true] {
         let before = observation(&destination.path().join("a"));
         let (executor, plan, client, server) =

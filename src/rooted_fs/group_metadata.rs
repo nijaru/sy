@@ -3,7 +3,11 @@ use super::*;
 
 impl RootedStagedFile {
     #[allow(clippy::unnecessary_cast)] // libc mode widths differ across Unix.
-    pub(crate) fn copy_retained_metadata_blocking(&mut self, original: &File) -> Result<()> {
+    pub(crate) fn copy_retained_metadata_blocking(
+        &mut self,
+        original: &File,
+        overrides: crate::endpoint::io::PreservationRequest,
+    ) -> Result<()> {
         #[cfg(unix)]
         {
             let before = stat_fd(original.as_raw_fd())?;
@@ -16,9 +20,15 @@ impl RootedStagedFile {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
-            let attrs = read_xattrs_from_file(original)?;
-            metadata::mirror_xattrs_fd(&self.file, &attrs)?;
-            copy_native_acl(original, &self.file)?;
+            // Explicit SOURCE fields supersede OLD defaults. Reading those
+            // discarded fields can fail unnecessarily or exceed their budget.
+            if !overrides.xattrs {
+                let attrs = read_xattrs_from_file(original)?;
+                metadata::mirror_xattrs_fd(&self.file, &attrs)?;
+            }
+            if !overrides.acl {
+                copy_native_acl(original, &self.file)?;
+            }
             apply_fd_metadata(
                 self.file.as_raw_fd(),
                 Some(before.st_mode as u32 & 0o7777),
@@ -40,7 +50,7 @@ impl RootedStagedFile {
         }
         #[cfg(not(unix))]
         {
-            let _ = original;
+            let _ = (original, overrides);
             Err(RootedFsError::UnsupportedPlatform)
         }
     }
